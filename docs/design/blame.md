@@ -15,7 +15,7 @@ Blame/Provenance Design
   - Core does NOT know about asset360 metadata.
 - Implement provenance in asset360:
   - asset360 maps NodeId → Asset360ChangeMeta (“last writer wins”).
-  - Provide a Python wrapper (BlameView) that mirrors navigation and exposes `provenance()` based on the current node’s NodeId.
+  - Provide a simple Python helper `get_blame_info(value, blame_map)` that looks up the current node’s NodeId in the blame map and returns the stage metadata (or None).
 - NodeId generation must be cheap and predictable:
   - Use a global atomic counter (u64) to assign NodeIds to created nodes.
   - Preserve NodeIds for unchanged nodes; assign fresh NodeIds for newly created/replaced nodes.
@@ -34,7 +34,7 @@ Blame/Provenance Design
 4) Asset360 updates its blame map:
    - For every NodeId in `added ∪ updated`, set `blame[node_id] = stage.meta` (last-writer-wins).
    - `deleted` is informational; those NodeIds are gone.
-5) Return the final value and blame map; in Python, wrap into a `BlameView` so callers can query `provenance()` at any node.
+5) Return the final value and blame map; in Python, call `get_blame_info(value, blame_map)` on any LinkMLValue to retrieve that node's provenance.
 
 4. Core Changes (rust-linkml-core)
 ----------------------------------
@@ -71,8 +71,8 @@ Blame/Provenance Design
     - `value = value2`
 - Python API
   - Provide `apply_changes_with_blame(stages, sv, base=None) -> (value, blame_map)`.
-  - Add `attach_blame(value, blame_map) -> BlameView` that mirrors navigation and exposes `provenance()` by reading `value.node_id` and looking up in `blame_map`.
-  - `provenance()` returns the stage metadata as a Python dict (serialize Rust struct via serde_json → Python object).
+  - Provide `get_blame_info(value, blame_map) -> dict | None` that returns the stage metadata dict for `value.node_id`, or `None` if absent.
+  - Metadata dicts are created by serializing the Rust struct via `serde_json` into Python objects.
 
 6. Semantics and Edge Cases
 ---------------------------
@@ -96,8 +96,7 @@ Blame/Provenance Design
 9. Migration & Compatibility
 ----------------------------
 - Core: `patch/apply` return type changes; Python binding changes accordingly.
-- asset360: implements new `apply_changes_with_blame` and BlameView; callers adapt to the new return values.
+- asset360: implements new `apply_changes_with_blame` and `get_blame_info`; callers adapt to the new return values.
 
 ---
 This document captures the agreed architecture to deliver provenance with minimal core impact, high performance, and an idiomatic Python API.
-
