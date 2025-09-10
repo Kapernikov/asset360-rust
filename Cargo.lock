@@ -95,8 +95,12 @@ checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
 name = "asset360-rust"
 version = "0.1.0"
 dependencies = [
+ "linkml_meta",
  "linkml_runtime_python",
  "pyo3",
+ "schemaview",
+ "serde_path_to_error",
+ "serde_yml",
 ]
 
 [[package]]

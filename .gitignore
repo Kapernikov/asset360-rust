@@ -9,6 +9,8 @@ __pycache__/
 /dist/
 /build/
 /.maturin/
+/.venv/
+python/**/__pycache__/
 
 # Editors/OS
 .vscode/
