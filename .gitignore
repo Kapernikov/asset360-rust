@@ -1,0 +1,20 @@
+# Rust build
+/target/
+**/*.rs.bk
+
+# Python / packaging (future-proofing)
+__pycache__/
+*.py[cod]
+*.pyo
+/dist/
+/build/
+/.maturin/
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*.log
+*~

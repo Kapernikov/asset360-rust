@@ -1,0 +1,12 @@
+[package]
+name = "asset360-rust"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "asset360_rust"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.25.0" }
+linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python" }
