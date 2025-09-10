@@ -178,6 +178,8 @@ jobs:
           sed -i '' -E "s/^version = \".*\"/version = \"${VER}\"/" Cargo.toml
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
