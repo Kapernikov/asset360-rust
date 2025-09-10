@@ -40,3 +40,6 @@
 
 ## Notes
 - Network resolution is feature-gated; default builds include `resolve`. Only triggers when loading remote schemas.
+
+## Agent Updates
+- whenever you learn something new that needs to be remembered for always, autonomously update your agents.md, but keep it short and conscise so beware of adding general stuff that you already knew.
