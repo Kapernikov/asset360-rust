@@ -23,14 +23,14 @@ Blame/Provenance Design
   - When a delta creates a whole subtree, the trace will contain all NodeIds for that subtree in `added`.
   - Assign the stage’s metadata to all of them (O(size_of_subtree)).
 - Python ergonomics:
-  - LinkMLValue exposes a read-only `node_id` string.
+  - LinkMLValue exposes a read-only `node_id` integer (u64 in Rust, int in Python).
   - Blame is carried separately and attached via a thin view that keeps navigation idiomatic.
 
 3. High-Level Flow
 -------------------
 1) Start from a base LinkMLValue (or empty/new).
 2) For each stage in order: apply the stage’s deltas using core’s patch/apply.
-3) The core returns `(new_value, PatchTrace)` where `PatchTrace = { added, deleted, updated }` NodeIds.
+3) The core returns `(new_value, PatchTrace)` where `PatchTrace = { added, deleted, updated }` NodeIds (ints).
 4) Asset360 updates its blame map:
    - For every NodeId in `added ∪ updated`, set `blame[node_id] = stage.meta` (last-writer-wins).
    - `deleted` is informational; those NodeIds are gone.
@@ -46,17 +46,17 @@ Blame/Provenance Design
   - `static NEXT_ID: AtomicU64 = AtomicU64::new(1);`
   - `fn new_node_id() -> NodeId { NodeId(NEXT_ID.fetch_add(1, Ordering::Relaxed)) }`
 - Patch trace
-  - Define `PatchTrace { added: Vec<u64>, deleted: Vec<u64>, updated: Vec<u64> }`.
+  - Define `PatchTrace { added: Vec<u64>, deleted: Vec<u64>, updated: Vec<u64> }` (NodeIds are ints in Python).
   - Change existing `patch/apply` to return `(LinkMLValue, PatchTrace)`.
   - Implementation:
-    - Pre-snapshot: traverse to collect `pre_ids`.
+    - Pre-snapshot: traverse to collect `pre_ids` (HashSet<u64>).
     - Apply deltas (assign NodeIds for any new nodes).
-    - Post-snapshot: traverse to collect `post_ids`.
+    - Post-snapshot: traverse to collect `post_ids` (HashSet<u64>).
     - `added = post_ids - pre_ids`, `deleted = pre_ids - post_ids`.
-    - `updated`: mark nodes whose NodeId persisted but content/structure changed (scalar set, container mutation), excluding full replacements where children are new.
+    - `updated`: NodeIds that persist across patch and whose content/structure mutated in place (e.g., scalar set, container change). Full subtree replacements should not report `updated` for replaced children; only the parent container (if structurally changed) may be `updated`.
 - Python bindings
-  - Expose a read-only `node_id` property on LinkMLValue (string formatting from u64 on demand).
-  - Change `py_patch/py_apply` to return `(LinkMLValue, {"added": [...], "deleted": [...], "updated": [...]})`.
+  - Expose a read-only `node_id` property on LinkMLValue as an int.
+  - Change `py_patch/py_apply` to return `(LinkMLValue, {"added": [int], "deleted": [int], "updated": [int]})`.
 
 5. Asset360 Changes (this crate)
 ---------------------------------
@@ -71,13 +71,13 @@ Blame/Provenance Design
     - `value = value2`
 - Python API
   - Provide `apply_changes_with_blame(stages, sv, base=None) -> (value, blame_map)`.
-  - Provide `get_blame_info(value, blame_map) -> dict | None` that returns the stage metadata dict for `value.node_id`, or `None` if absent.
+  - Provide `get_blame_info(value, blame_map) -> dict | None` that returns the stage metadata dict for `value.node_id` (an int), or `None` if absent.
   - Metadata dicts are created by serializing the Rust struct via `serde_json` into Python objects.
 
 6. Semantics and Edge Cases
 ---------------------------
 - Last-writer-wins: if multiple stages write the same node, the later stage’s metadata overwrites prior blame.
-- Full subtree replacement: children of the replaced subtree appear in `added`; all those NodeIds get the stage’s metadata. The old subtree’s NodeIds appear in `deleted` and are discarded.
+- Full subtree replacement: children of the replaced subtree appear in `added`; all those NodeIds get the stage’s metadata. The old subtree’s NodeIds appear in `deleted` and are discarded. The parent container may be listed in `updated` if its structure changed.
 - In-place container change (list append/pop, object add/remove field): container NodeId appears in `updated`.
 - Pure scalar change: target scalar NodeId appears in `updated`.
 
@@ -86,6 +86,7 @@ Blame/Provenance Design
 - NodeId assignment is a single relaxed atomic increment per created node (very cheap).
 - Trace computation uses two traversals per patch call (pre and post), linear in tree size.
 - If needed later, we can optimize updated detection per-delta or offer a compact blame mode (record only at subtree roots with a parent map), without changing the Python-facing API.
+ - NodeIds are ints in Python, avoiding string formatting/allocations on hot paths.
 
 8. Alternatives Considered
 --------------------------
