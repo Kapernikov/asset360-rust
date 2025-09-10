@@ -156,39 +156,7 @@ jobs:
           name: wheels-windows-${{ matrix.platform.target }}
           path: dist
 
-  macos:
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: macos-14
-            target: aarch64
-        python-version: [ '3.11' ]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Set crate version from tag
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          VER="${GITHUB_REF#refs/tags/}"
-          VER="${VER#v}"
-          echo "Setting Cargo.toml version to ${VER}"
-          sed -i '' -E "s/^version = \".*\"/version = \"${VER}\"/" Cargo.toml
-      - name: Build wheels (macOS)
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.platform.target }}
-          # Build only for selected interpreters to avoid flaky combos
-          args: --release --out dist --interpreter python3.11
-          sccache: 'true'
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-macos-${{ matrix.platform.target }}
-          path: dist
+  # macos job temporarily disabled due to unresolved CPython symbol link errors on arm64
 
   sdist:
     runs-on: ubuntu-latest
@@ -217,7 +185,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: [linux, musllinux, windows, macos, sdist]
+    needs: [linux, musllinux, windows, sdist]
     permissions:
       id-token: write
       contents: write
