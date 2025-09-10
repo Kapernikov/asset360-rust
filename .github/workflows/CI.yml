@@ -163,7 +163,7 @@ jobs:
         platform:
           - runner: macos-14
             target: aarch64
-        python-version: [ '3.11' ]
+        python-version: [ '3.11', '3.12' ]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -181,8 +181,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          # Build only for the configured Python to avoid flaky combos
-          args: --release --out dist --interpreter python
+          # Build only for selected interpreters to avoid flaky combos
+          args: --release --out dist --interpreter python3.11 python3.12
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
