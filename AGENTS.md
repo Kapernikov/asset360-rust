@@ -38,6 +38,13 @@
 - Run `cargo fmt --all` to format Rust code.
 - Run `cargo clippy -p schemaview -p linkml_runtime -p linkml_tools -p linkml_runtime_python -p linkml_wasm --all-targets --all-features -- -D warnings --no-deps` and address all warnings (the generated `linkml_meta` crate is excluded).
 
+## CI Triage Tips
+- Always run `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings` locally before committing.
+- Don’t wait on in-progress pipelines just to see failures. Use GitHub CLI:
+  - List runs: `gh run list -R Kapernikov/asset360-rust --limit 5`
+  - Inspect failed jobs without waiting: `gh run view <run-id> -R Kapernikov/asset360-rust --json jobs --jq '.jobs[] | select(.conclusion=="failure") | {name, url}'`
+  - Fetch logs only once the run completes; avoid `gh run watch` for already-failed info.
+
 ## Notes
 - Network resolution is feature-gated; default builds include `resolve`. Only triggers when loading remote schemas.
 
