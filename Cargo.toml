@@ -12,3 +12,7 @@ pyo3 = { version = "0.25.0" }
 linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python" }
 linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta", features = ["pyo3"] }
 linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview" }
+
+[dev-dependencies]
+serde_yml = "0.0.12"
+serde_path_to_error = "0.1.17"
