@@ -101,3 +101,62 @@ Blame/Provenance Design
 
 ---
 This document captures the agreed architecture to deliver provenance with minimal core impact, high performance, and an idiomatic Python API.
+
+
+10. Rust API Signatures
+-----------------------
+
+Core (rust-linkml-core)
+
+```rust
+// Node identifiers
+pub type NodeId = u64;
+
+// Trace returned by patch/apply
+#[derive(Debug, Clone, Default)]
+pub struct PatchTrace {
+    pub added:   Vec<NodeId>,
+    pub deleted: Vec<NodeId>,
+    pub updated: Vec<NodeId>,
+}
+
+// Apply deltas and return new value plus trace
+pub fn patch(
+    value: &LinkMLValue,
+    deltas: &[Delta],
+    sv: &SchemaView,
+) -> (LinkMLValue, PatchTrace);
+
+// Optional helpers (read-only)
+pub fn node_id_of(v: &LinkMLValue) -> NodeId;
+pub fn iter_nodes<'a>(v: &'a LinkMLValue) -> impl Iterator<Item = &'a LinkMLValue>;
+// pub fn resolve_path<'a>(v: &'a LinkMLValue, path: &DeltaPath) -> Option<&'a LinkMLValue>;
+```
+
+Asset360 (this crate)
+
+```rust
+// Asset-specific metadata attached as blame
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Asset360ChangeMeta {
+    pub author: String,
+    pub timestamp: String,
+    // other fields as needed
+}
+
+pub struct ChangeStage<M> {
+    pub meta: M,
+    pub deltas: Vec<Delta>,
+}
+
+pub fn apply_changes_with_blame(
+    base: Option<LinkMLValue>,
+    stages: Vec<ChangeStage<Asset360ChangeMeta>>,
+    sv: &SchemaView,
+) -> (LinkMLValue, std::collections::HashMap<NodeId, Asset360ChangeMeta>);
+
+pub fn get_blame_info<'a>(
+    value: &LinkMLValue,
+    blame_map: &'a std::collections::HashMap<NodeId, Asset360ChangeMeta>,
+) -> Option<&'a Asset360ChangeMeta>;
+```
