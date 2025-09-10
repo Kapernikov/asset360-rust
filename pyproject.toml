@@ -15,6 +15,6 @@ dynamic = ["version"]
 [tool.maturin]
 # Build as a Python extension module
 features = ["pyo3/extension-module"]
-# Expose the module defined in src/lib.rs
-module-name = "asset360_native"
-
+# Expose the module defined in src/lib.rs (dotted to include python package)
+module-name = "asset360_rust._native2"
+python-source = "python"
