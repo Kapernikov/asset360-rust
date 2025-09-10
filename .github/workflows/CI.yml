@@ -163,11 +163,12 @@ jobs:
         platform:
           - runner: macos-14
             target: aarch64
+        python-version: [ '3.11' ]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: 3.x
+          python-version: ${{ matrix.python-version }}
       - name: Set crate version from tag
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
@@ -176,11 +177,12 @@ jobs:
           VER="${VER#v}"
           echo "Setting Cargo.toml version to ${VER}"
           sed -i '' -E "s/^version = \".*\"/version = \"${VER}\"/" Cargo.toml
-      - name: Build wheels
+      - name: Build wheels (macOS)
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          # Build only for the configured Python to avoid flaky combos
+          args: --release --out dist --interpreter python
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
