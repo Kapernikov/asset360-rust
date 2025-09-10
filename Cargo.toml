@@ -8,10 +8,15 @@ name = "asset360_rust"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.25.0", features = ["extension-module"] }
+pyo3 = { version = "0.25.0" }
 linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python" }
 linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta", features = ["pyo3"] }
 linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview" }
+
+[features]
+default = []
+# Enable Python extension-module linking only in packaging builds (maturin)
+python-extension = ["pyo3/extension-module"]
 
 [dev-dependencies]
 serde_yml = "0.0.12"

@@ -13,8 +13,8 @@ classifiers = [
 dynamic = ["version"]
 
 [tool.maturin]
-# Build as a Python extension module
-features = ["pyo3/extension-module"]
+# Build as a Python extension module (via crate feature)
+features = ["python-extension"]
 # Expose the module defined in src/lib.rs (dotted to include python package)
 module-name = "asset360_rust._native2"
 python-source = "python"
