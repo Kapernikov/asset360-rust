@@ -7,6 +7,8 @@ use linkml_meta::{Annotation, ClassDefinition};
 use linkml_runtime_python::PySchemaView;
 use linkml_schemaview::schemaview::SchemaView;
 
+pub mod blame;
+
 /// Python bindings entrypoint mirroring the dependency's module.
 /// Name is different to avoid symbol clashes with the dependency.
 #[pymodule(name = "_native2")]
