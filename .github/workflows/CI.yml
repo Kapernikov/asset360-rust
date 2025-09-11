@@ -169,6 +169,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
       - name: Set crate version from tag
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
