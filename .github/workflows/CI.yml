@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: pepibru
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,7 +29,7 @@ jobs:
       - name: Format (check)
         run: cargo fmt --all -- --check
       - name: Lint (clippy)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings --no-deps
       - name: Build
         run: cargo build
       - name: Test
@@ -40,17 +40,17 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: x86_64
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: x86
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: aarch64
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: armv7
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: s390x
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: ppc64le
     steps:
       - uses: actions/checkout@v4
@@ -83,13 +83,13 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: x86_64
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: x86
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: aarch64
-          - runner: ubuntu-latest
+          - runner: pepibru
             target: armv7
     steps:
       - uses: actions/checkout@v4
@@ -159,7 +159,7 @@ jobs:
   # macos job temporarily disabled due to unresolved CPython symbol link errors on arm64
 
   sdist:
-    runs-on: ubuntu-latest
+    runs-on: pepibru
     steps:
       - uses: actions/checkout@v4
       - name: Set crate version from tag
@@ -183,7 +183,7 @@ jobs:
 
   release:
     name: Release
-    runs-on: ubuntu-latest
+    runs-on: pepibru
     if: ${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     needs: [linux, musllinux, windows, sdist]
     permissions:
