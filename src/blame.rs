@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use linkml_runtime::{patch, node_id_of, Delta, LinkMLValue, NodeId, PatchTrace};
+use linkml_runtime::{Delta, LinkMLValue, NodeId, PatchTrace, node_id_of, patch};
 use linkml_schemaview::schemaview::SchemaView;
 
 /// Asset-specific metadata attached as blame.
@@ -56,8 +56,14 @@ mod tests {
     fn test_get_blame_info_with_manual_map() {
         // Build a tiny manual blame map and a dummy value
         let mut blame = HashMap::new();
-        let meta1 = Asset360ChangeMeta { author: "a".into(), timestamp: "t1".into() };
-        let meta2 = Asset360ChangeMeta { author: "b".into(), timestamp: "t2".into() };
+        let meta1 = Asset360ChangeMeta {
+            author: "a".into(),
+            timestamp: "t1".into(),
+        };
+        let meta2 = Asset360ChangeMeta {
+            author: "b".into(),
+            timestamp: "t2".into(),
+        };
 
         // Create a value and obtain its id
         let v: LinkMLValue = LinkMLValue::default();
@@ -84,4 +90,3 @@ mod tests {
         assert_eq!(node_id_of(&out), node_id_of(&base));
     }
 }
-
