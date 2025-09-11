@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use linkml_runtime::{Delta, LinkMLValue, NodeId, PatchTrace, node_id_of, patch};
+use linkml_runtime::{Delta, LinkMLValue, NodeId, PatchTrace, patch};
 use linkml_schemaview::schemaview::SchemaView;
 
 /// Asset-specific metadata attached as blame.
@@ -24,11 +24,14 @@ pub fn apply_changes_with_blame(
     stages: Vec<ChangeStage<Asset360ChangeMeta>>,
     sv: &SchemaView,
 ) -> (LinkMLValue, HashMap<NodeId, Asset360ChangeMeta>) {
-    let mut value = base.unwrap_or_default();
+    // For now, require a base value with proper class context; creating a root value
+    // from scratch requires a target class.
+    let mut value = base.expect("base LinkMLValue required (with class context)");
     let mut blame: HashMap<NodeId, Asset360ChangeMeta> = HashMap::new();
 
     for stage in stages.into_iter() {
-        let (new_value, trace): (LinkMLValue, PatchTrace) = patch(&value, &stage.deltas, sv);
+        let (new_value, trace): (LinkMLValue, PatchTrace) = patch(&value, &stage.deltas, sv)
+            .expect("patch failed");
         // Last-writer-wins on added and updated nodes
         for id in trace.added.iter().chain(trace.updated.iter()) {
             blame.insert(*id, stage.meta.clone());
@@ -44,7 +47,7 @@ pub fn get_blame_info<'a>(
     value: &LinkMLValue,
     blame_map: &'a HashMap<NodeId, Asset360ChangeMeta>,
 ) -> Option<&'a Asset360ChangeMeta> {
-    let id = node_id_of(value);
+    let id = value.node_id();
     blame_map.get(&id)
 }
 
@@ -65,9 +68,31 @@ mod tests {
             timestamp: "t2".into(),
         };
 
-        // Create a value and obtain its id
-        let v: LinkMLValue = LinkMLValue::default();
-        let id = node_id_of(&v);
+        // Create a minimal value by parsing an empty object for a dummy class
+        use linkml_meta::SchemaDefinition;
+        use serde_yml as yml;
+        use serde_path_to_error as p2e;
+
+        let schema_yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+classes:
+  Root: {}
+"#;
+        let deser = yml::Deserializer::from_str(schema_yaml);
+        let schema: SchemaDefinition = p2e::deserialize(deser).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        let conv = sv.converter_for_primary_schema().unwrap();
+        let class = sv.get_class(&linkml_schemaview::identifier::Identifier::new("Root"), conv)
+            .unwrap()
+            .unwrap();
+        let v = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
+        let id = v.node_id();
 
         // First writer
         blame.insert(id, meta1.clone());
@@ -80,13 +105,34 @@ mod tests {
     #[test]
     fn test_apply_changes_with_blame_no_stages() {
         // When there are no stages, the base is returned and blame is empty.
-        let base: LinkMLValue = LinkMLValue::default();
-        let sv = SchemaView::new();
+        use linkml_meta::SchemaDefinition;
+        use serde_yml as yml;
+        use serde_path_to_error as p2e;
+
+        let schema_yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+classes:
+  Root: {}
+"#;
+        let deser = yml::Deserializer::from_str(schema_yaml);
+        let schema: SchemaDefinition = p2e::deserialize(deser).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        let conv = sv.converter_for_primary_schema().unwrap();
+        let class = sv.get_class(&linkml_schemaview::identifier::Identifier::new("Root"), conv)
+            .unwrap()
+            .unwrap();
+        let base = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
         let (out, b) = apply_changes_with_blame(Some(base.clone()), vec![], &sv);
         // Can't assert structural equality without schema context, but Default base should be preserved.
         // We can at least ensure the map is empty.
         assert!(b.is_empty());
         // Ensure node_id remains the same when no stages are applied
-        assert_eq!(node_id_of(&out), node_id_of(&base));
+        assert_eq!(out.node_id(), base.node_id());
     }
 }

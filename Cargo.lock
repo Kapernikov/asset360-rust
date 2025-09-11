@@ -96,9 +96,11 @@ name = "asset360-rust"
 version = "0.1.0"
 dependencies = [
  "linkml_meta",
+ "linkml_runtime",
  "linkml_runtime_python",
  "pyo3",
  "schemaview",
+ "serde",
  "serde_path_to_error",
  "serde_yml",
 ]
@@ -844,7 +846,6 @@ dependencies = [
 [[package]]
 name = "linkml_meta"
 version = "0.0.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#0d2fc68ec94a10946bbbd3b20ad70e222c12620b"
 dependencies = [
  "chrono",
  "merge",
@@ -858,7 +859,6 @@ dependencies = [
 [[package]]
 name = "linkml_runtime"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#0d2fc68ec94a10946bbbd3b20ad70e222c12620b"
 dependencies = [
  "clap",
  "curies",
@@ -878,7 +878,6 @@ dependencies = [
 [[package]]
 name = "linkml_runtime_python"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#0d2fc68ec94a10946bbbd3b20ad70e222c12620b"
 dependencies = [
  "linkml_meta",
  "linkml_runtime",
@@ -1586,7 +1585,6 @@ dependencies = [
 [[package]]
 name = "schemaview"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#0d2fc68ec94a10946bbbd3b20ad70e222c12620b"
 dependencies = [
  "curies",
  "itertools",

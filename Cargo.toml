@@ -9,9 +9,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.25.0" }
-linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python" }
-linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta", features = ["pyo3"] }
-linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview" }
+# Use local upstream checkout to ensure matching versions/APIs
+linkml_runtime_python = { path = "../rust-linkml-core/src/python" }
+linkml_meta = { path = "../rust-linkml-core/src/metamodel", features = ["pyo3"] }
+linkml_schemaview = { path = "../rust-linkml-core/src/schemaview", package = "schemaview" }
+linkml_runtime = { path = "../rust-linkml-core/src/runtime" }
+serde = { version = "1.0", features = ["derive"] }
 
 [features]
 default = []
