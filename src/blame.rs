@@ -30,8 +30,8 @@ pub fn apply_changes_with_blame(
     let mut blame: HashMap<NodeId, Asset360ChangeMeta> = HashMap::new();
 
     for stage in stages.into_iter() {
-        let (new_value, trace): (LinkMLValue, PatchTrace) = patch(&value, &stage.deltas, sv)
-            .expect("patch failed");
+        let (new_value, trace): (LinkMLValue, PatchTrace) =
+            patch(&value, &stage.deltas, sv).expect("patch failed");
         // Last-writer-wins on added and updated nodes
         for id in trace.added.iter().chain(trace.updated.iter()) {
             blame.insert(*id, stage.meta.clone());
@@ -70,8 +70,8 @@ mod tests {
 
         // Create a minimal value by parsing an empty object for a dummy class
         use linkml_meta::SchemaDefinition;
-        use serde_yml as yml;
         use serde_path_to_error as p2e;
+        use serde_yml as yml;
 
         let schema_yaml = r#"
 id: https://example.org/test
@@ -88,7 +88,11 @@ classes:
         let mut sv = SchemaView::new();
         sv.add_schema(schema).unwrap();
         let conv = sv.converter_for_primary_schema().unwrap();
-        let class = sv.get_class(&linkml_schemaview::identifier::Identifier::new("Root"), conv)
+        let class = sv
+            .get_class(
+                &linkml_schemaview::identifier::Identifier::new("Root"),
+                conv,
+            )
             .unwrap()
             .unwrap();
         let v = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
@@ -106,8 +110,8 @@ classes:
     fn test_apply_changes_with_blame_no_stages() {
         // When there are no stages, the base is returned and blame is empty.
         use linkml_meta::SchemaDefinition;
-        use serde_yml as yml;
         use serde_path_to_error as p2e;
+        use serde_yml as yml;
 
         let schema_yaml = r#"
 id: https://example.org/test
@@ -124,7 +128,11 @@ classes:
         let mut sv = SchemaView::new();
         sv.add_schema(schema).unwrap();
         let conv = sv.converter_for_primary_schema().unwrap();
-        let class = sv.get_class(&linkml_schemaview::identifier::Identifier::new("Root"), conv)
+        let class = sv
+            .get_class(
+                &linkml_schemaview::identifier::Identifier::new("Root"),
+                conv,
+            )
             .unwrap()
             .unwrap();
         let base = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
