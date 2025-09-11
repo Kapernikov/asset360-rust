@@ -34,15 +34,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config
-      - name: Diagnostics: Python used for PyO3
-        run: |
-          which python
-          python -V
-          python - << 'PY'
-          import sys, sysconfig
-          print('exe:', sys.executable)
-          print('include:', sysconfig.get_config_var('INCLUDEPY'))
-          PY
       - uses: Swatinem/rust-cache@v2
       - name: Format (check)
         run: cargo fmt --all -- --check
