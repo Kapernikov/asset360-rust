@@ -20,3 +20,4 @@ python/**/__pycache__/
 *.swo
 *.log
 *~
+*.so
