@@ -19,7 +19,7 @@ pub struct ChangeStage<M> {
 }
 
 /// Apply a sequence of change stages, collecting blame (last-writer-wins) per NodeId.
-pub fn apply_changes_with_blame(
+pub fn apply_deltas(
     base: Option<LinkMLValue>,
     stages: Vec<ChangeStage<Asset360ChangeMeta>>,
     sv: &SchemaView,
@@ -107,7 +107,7 @@ classes:
     }
 
     #[test]
-    fn test_apply_changes_with_blame_no_stages() {
+    fn test_apply_deltas_no_stages() {
         // When there are no stages, the base is returned and blame is empty.
         use linkml_meta::SchemaDefinition;
         use serde_path_to_error as p2e;
@@ -136,7 +136,7 @@ classes:
             .unwrap()
             .unwrap();
         let base = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
-        let (out, b) = apply_changes_with_blame(Some(base.clone()), vec![], &sv);
+        let (out, b) = apply_deltas(Some(base.clone()), vec![], &sv);
         // Can't assert structural equality without schema context, but Default base should be preserved.
         // We can at least ensure the map is empty.
         assert!(b.is_empty());

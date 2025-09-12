@@ -64,13 +64,13 @@ Blame/Provenance Design
   - `pub struct Asset360ChangeMeta { /* author, timestamp, ticket, etc. */ }`
   - `pub struct ChangeStage<M> { pub meta: M, pub deltas: Vec<Delta> }`
 - Apply with blame
-  - `pub fn apply_changes_with_blame(base: Option<LinkMLValue>, stages: Vec<ChangeStage<Asset360ChangeMeta>>, sv: &SchemaView) -> (LinkMLValue, HashMap<u64 /*NodeId*/, Asset360ChangeMeta>)`
+  - `pub fn apply_deltas(base: Option<LinkMLValue>, stages: Vec<ChangeStage<Asset360ChangeMeta>>, sv: &SchemaView) -> (LinkMLValue, HashMap<u64 /*NodeId*/, Asset360ChangeMeta>)`
   - For each stage:
     - `(value2, trace) = core::patch(value, &stage.deltas, sv)`
     - For every id in `trace.added` and `trace.updated`: `blame.insert(id, stage.meta.clone())`
     - `value = value2`
 - Python API
-  - Provide `apply_changes_with_blame(stages, sv, base=None) -> (value, blame_map)`.
+  - Provide `apply_deltas(stages, sv, base=None) -> (value, blame_map)`.
   - Provide `get_blame_info(value, blame_map) -> dict | None` that returns the stage metadata dict for `value.node_id` (an int), or `None` if absent.
   - Metadata dicts are created by serializing the Rust struct via `serde_json` into Python objects.
 
@@ -97,7 +97,7 @@ Blame/Provenance Design
 9. Migration & Compatibility
 ----------------------------
 - Core: `patch/apply` return type changes; Python binding changes accordingly.
-- asset360: implements new `apply_changes_with_blame` and `get_blame_info`; callers adapt to the new return values.
+- asset360: implements new `apply_deltas` and `get_blame_info`; callers adapt to the new return values.
 
 ---
 This document captures the agreed architecture to deliver provenance with minimal core impact, high performance, and an idiomatic Python API.
@@ -149,7 +149,7 @@ pub struct ChangeStage<M> {
     pub deltas: Vec<Delta>,
 }
 
-pub fn apply_changes_with_blame(
+pub fn apply_deltas(
     base: Option<LinkMLValue>,
     stages: Vec<ChangeStage<Asset360ChangeMeta>>,
     sv: &SchemaView,
