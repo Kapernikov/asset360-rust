@@ -1,6 +1,6 @@
-"""Utilities for pretty-printing LinkMLValue trees.
+"""Utilities for pretty-printing LinkMLInstance trees.
 
-This module provides a pure Python helper to render a :class:`LinkMLValue`
+This module provides a pure Python helper to render a :class:`LinkMLInstance`
 as a human readable tree. It is intended for debugging and diagnostic use.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 try:  # pragma: no cover - runtime optional during type checking
-    from . import LinkMLValue
+    from . import LinkMLInstance as LinkMLValue
 except Exception:  # pragma: no cover - fallback when extension missing
     LinkMLValue = Any  # type: ignore[misc]
 
@@ -21,7 +21,7 @@ def pretty_linkml_value(value: "LinkMLValue", prefix: str = '', nofirstline: boo
 
     Parameters
     ----------
-    value: LinkMLValue
+    value: LinkMLInstance
         The value to render.
     """
     prefix
@@ -51,4 +51,3 @@ def pretty_linkml_value(value: "LinkMLValue", prefix: str = '', nofirstline: boo
         txt = f"[UNKNOWN KIND={value.kind}]\n"
         
     return txt
-

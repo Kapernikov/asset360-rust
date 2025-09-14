@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use linkml_runtime::{Delta, LinkMLValue, NodeId, PatchTrace, patch};
+use linkml_runtime::diff::PatchOptions;
+use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, patch};
 use linkml_schemaview::schemaview::SchemaView;
 
 /// Asset-specific metadata attached as blame.
@@ -20,18 +21,18 @@ pub struct ChangeStage<M> {
 
 /// Apply a sequence of change stages, collecting blame (last-writer-wins) per NodeId.
 pub fn apply_deltas(
-    base: Option<LinkMLValue>,
+    base: Option<LinkMLInstance>,
     stages: Vec<ChangeStage<Asset360ChangeMeta>>,
     sv: &SchemaView,
-) -> (LinkMLValue, HashMap<NodeId, Asset360ChangeMeta>) {
+) -> (LinkMLInstance, HashMap<NodeId, Asset360ChangeMeta>) {
     // For now, require a base value with proper class context; creating a root value
     // from scratch requires a target class.
-    let mut value = base.expect("base LinkMLValue required (with class context)");
+    let mut value = base.expect("base LinkMLInstance required (with class context)");
     let mut blame: HashMap<NodeId, Asset360ChangeMeta> = HashMap::new();
 
     for stage in stages.into_iter() {
-        let (new_value, trace): (LinkMLValue, PatchTrace) =
-            patch(&value, &stage.deltas, sv).expect("patch failed");
+        let (new_value, trace): (LinkMLInstance, PatchTrace) =
+            patch(&value, &stage.deltas, sv, PatchOptions::default()).expect("patch failed");
         // Last-writer-wins on added and updated nodes
         for id in trace.added.iter().chain(trace.updated.iter()) {
             blame.insert(*id, stage.meta.clone());
@@ -44,7 +45,7 @@ pub fn apply_deltas(
 
 /// Retrieve blame info for a given value from a blame map.
 pub fn get_blame_info<'a>(
-    value: &LinkMLValue,
+    value: &LinkMLInstance,
     blame_map: &'a HashMap<NodeId, Asset360ChangeMeta>,
 ) -> Option<&'a Asset360ChangeMeta> {
     let id = value.node_id();
