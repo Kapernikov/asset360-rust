@@ -82,6 +82,7 @@ jobs:
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
+          retention-days: 1
 
   musllinux:
     runs-on: ${{ matrix.platform.runner }}
@@ -122,6 +123,7 @@ jobs:
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
+          retention-days: 1
 
   windows:
     # Disabled: no Windows self-hosted runners available
@@ -163,6 +165,7 @@ jobs:
         with:
           name: wheels-windows-${{ matrix.platform.target }}
           path: dist
+          retention-days: 1
 
   # macos job temporarily disabled due to unresolved CPython symbol link errors on arm64
 
@@ -193,6 +196,7 @@ jobs:
         with:
           name: wheels-sdist
           path: dist
+          retention-days: 1
 
   release:
     name: Release
