@@ -1,6 +1,7 @@
 use pyo3::Bound;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use pyo3_stub_gen::{define_stub_info_gatherer, derive::gen_stub_pyfunction};
 use std::collections::HashMap;
 
 use linkml_meta::{Annotation, ClassDefinition};
@@ -89,21 +90,39 @@ fn compute_classes_by_type_designator(
     out
 }
 
+/// Return every class keyed by its resolved type designator.
+///
+/// * `schemaview` – existing [`SchemaView`] instance to inspect.
+/// * `only_registered` – require the ``data.infrabel.be/asset360/managed``
+///   annotation to be truthy.
+/// * `only_default` – restrict to each class' primary type designator instead of
+///   all accepted aliases.
+#[gen_stub_pyfunction]
+#[gen_stub(
+    override_return_type(
+        type_repr = "dict[str, linkml_meta.ClassDefinition]",
+        imports = ("linkml_meta",)
+    )
+)]
 #[pyfunction(
     name = "get_all_classes_by_type_designator_and_schema",
-    signature = (schemaview=None, only_registered=true, only_default=true)
+    signature = (schemaview, only_registered=true, only_default=true)
 )]
 fn get_all_classes_by_type_designator_and_schema(
     py: Python<'_>,
-    schemaview: Option<Py<PySchemaView>>,
+    #[gen_stub(
+        override_type(
+            type_repr = "asset360_rust.SchemaView",
+            imports = ("asset360_rust",)
+        )
+    )]
+    schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
 ) -> PyResult<HashMap<String, ClassDefinition>> {
-    let sv_arc: std::sync::Arc<SchemaView> = if let Some(py_sv) = schemaview {
-        let bound = py_sv.bind(py);
+    let sv_arc: std::sync::Arc<SchemaView> = {
+        let bound = schemaview.bind(py);
         std::sync::Arc::new(bound.borrow().as_rust().clone())
-    } else {
-        std::sync::Arc::new(SchemaView::new())
     };
     Ok(compute_classes_by_type_designator(
         &sv_arc,
@@ -112,6 +131,8 @@ fn get_all_classes_by_type_designator_and_schema(
         Some(py),
     ))
 }
+
+define_stub_info_gatherer!(stub_info);
 
 #[cfg(test)]
 mod tests {

@@ -38,6 +38,7 @@
 ### Pre-commit checklist
 - Run `cargo fmt --all` to format Rust code.
  - Run `cargo clippy --all-targets --all-features -- -D warnings --no-deps` and address all warnings.
+ - Run `cargo run --bin stub_gen -- --check` to ensure generated stubs are up to date.
 
 ## CI Triage Tips
 - Always run `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings --no-deps` locally before committing.
