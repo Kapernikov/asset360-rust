@@ -1,9 +1,15 @@
+#[cfg(feature = "stubgen")]
 use asset360_rust::stub_info;
+#[cfg(feature = "stubgen")]
 use pyo3_stub_gen::Result;
+#[cfg(feature = "stubgen")]
 use std::env;
+#[cfg(feature = "stubgen")]
 use std::fs;
+#[cfg(feature = "stubgen")]
 use std::io::ErrorKind;
 
+#[cfg(feature = "stubgen")]
 fn main() -> Result<()> {
     let check_only = env::args().skip(1).any(|arg| arg == "--check");
     let stub = stub_info()?;
@@ -15,6 +21,7 @@ fn main() -> Result<()> {
     }
 }
 
+#[cfg(feature = "stubgen")]
 fn check_stubs(stub: &pyo3_stub_gen::StubInfo) -> Result<()> {
     let mut issues = Vec::new();
 
@@ -57,6 +64,11 @@ fn check_stubs(stub: &pyo3_stub_gen::StubInfo) -> Result<()> {
             msg.push('\n');
         }
         msg.push_str("Run `cargo run --bin stub_gen` to regenerate.");
-        Err(std::io::Error::new(ErrorKind::Other, msg).into())
+        Err(std::io::Error::other(msg).into())
     }
+}
+
+#[cfg(not(feature = "stubgen"))]
+fn main() {
+    eprintln!("Enable the `stubgen` feature to run this generator.");
 }
