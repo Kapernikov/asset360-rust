@@ -110,3 +110,11 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
 else
   wasm-pack "${PACK_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
 fi
+
+if command -v zip >/dev/null 2>&1; then
+  ZIP_OUTPUT="${OUT_DIR%/}.zip"
+  rm -f "$ZIP_OUTPUT"
+  zip -qr "$ZIP_OUTPUT" "$OUT_DIR"
+else
+  echo "warning: zip not found; skipping archive creation" >&2
+fi

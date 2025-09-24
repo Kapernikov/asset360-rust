@@ -21,3 +21,5 @@ python/**/__pycache__/
 *.log
 *~
 *.so
+pkg/
+pkg.zip
