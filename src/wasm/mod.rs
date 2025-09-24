@@ -4,11 +4,12 @@
 
 #![cfg(feature = "wasm-bindings")]
 
+use serde::Serialize;
+use serde_wasm_bindgen::to_value;
 use wasm_bindgen::prelude::*;
 
 use linkml_meta::SchemaDefinition;
 use linkml_schemaview::schemaview::SchemaView;
-use serde_wasm_bindgen::to_value;
 
 /// Wrapper around [`SchemaView`] that can be owned from JavaScript.
 #[wasm_bindgen]
@@ -26,22 +27,14 @@ impl SchemaViewHandle {
 
     /// Return the schema definition for the provided identifier.
     #[wasm_bindgen(js_name = schemaDefinition)]
-    pub fn schema_definition(&self, schema_id: &str) -> Result<JsValue, JsValue> {
-        let schema: &SchemaDefinition = self
-            .inner
-            .get_schema_definition(schema_id)
-            .ok_or_else(|| JsValue::from_str(&format!("schema '{schema_id}' not found")))?;
-        to_value(schema).map_err(|err| JsValue::from_str(&err.to_string()))
+    pub fn schema_definition(&self, schema_id: &str) -> Result<Option<JsValue>, JsValue> {
+        option_to_js(self.inner.get_schema_definition(schema_id))
     }
 
     /// Return the primary schema definition, if one was registered.
     #[wasm_bindgen(js_name = primarySchemaDefinition)]
-    pub fn primary_schema_definition(&self) -> Result<JsValue, JsValue> {
-        let schema = self
-            .inner
-            .primary_schema()
-            .ok_or_else(|| JsValue::from_str("no primary schema registered"))?;
-        to_value(schema).map_err(|err| JsValue::from_str(&err.to_string()))
+    pub fn primary_schema_definition(&self) -> Result<Option<JsValue>, JsValue> {
+        option_to_js(self.inner.primary_schema())
     }
 }
 
@@ -60,6 +53,21 @@ fn parse_schema_definition(yaml: &str) -> Result<SchemaDefinition, JsValue> {
     let schema: SchemaDefinition = serde_path_to_error::deserialize(deserializer)
         .map_err(|err| JsValue::from_str(&err.to_string()))?;
     Ok(schema)
+}
+
+fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+    to_value(value).map_err(format_err)
+}
+
+fn option_to_js<T>(value: Option<T>) -> Result<Option<JsValue>, JsValue>
+where
+    T: Serialize,
+{
+    value.map(|inner| to_js(&inner)).transpose()
+}
+
+fn format_err<E: ToString>(err: E) -> JsValue {
+    JsValue::from_str(&err.to_string())
 }
 
 #[cfg(test)]
@@ -83,8 +91,23 @@ classes:
             handle.primary_schema_id().as_deref(),
             Some("https://example.org/test")
         );
-        assert!(handle.primary_schema_definition().is_ok());
-        assert!(handle.schema_definition("https://example.org/test").is_ok());
-        assert!(handle.schema_definition("missing").is_err());
+        assert!(
+            handle
+                .primary_schema_definition()
+                .expect("primary schema definition")
+                .is_some()
+        );
+        assert!(
+            handle
+                .schema_definition("https://example.org/test")
+                .expect("schema definition")
+                .is_some()
+        );
+        assert!(
+            handle
+                .schema_definition("missing")
+                .expect("missing schema should map to null")
+                .is_none()
+        );
     }
 }
