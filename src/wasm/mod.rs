@@ -58,20 +58,32 @@ impl SchemaViewHandle {
     /// Return every class identifier indexed in this view.
     #[wasm_bindgen(js_name = classIds)]
     pub fn class_ids(&self) -> Vec<String> {
-        self.inner.get_class_ids()
+        let mut ids = Vec::new();
+        for (_, schema) in self.inner.iter_schemas() {
+            if let Some(classes) = &schema.classes {
+                ids.extend(classes.keys().cloned());
+            }
+        }
+        ids
     }
 
     /// Return every slot identifier indexed in this view.
     #[wasm_bindgen(js_name = slotIds)]
     pub fn slot_ids(&self) -> Vec<String> {
-        self.inner.get_slot_ids()
+        let mut ids = Vec::new();
+        for (_, schema) in self.inner.iter_schemas() {
+            if let Some(slots) = &schema.slot_definitions {
+                ids.extend(slots.keys().cloned());
+            }
+        }
+        ids
     }
 
     /// Return every enum identifier discovered across all schemas.
     #[wasm_bindgen(js_name = enumIds)]
     pub fn enum_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
-        for (_, schema) in self.inner.all_schema_definitions() {
+        for (_, schema) in self.inner.iter_schemas() {
             if let Some(enums) = &schema.enums {
                 ids.extend(enums.keys().cloned());
             }
@@ -94,52 +106,31 @@ impl SchemaViewHandle {
 
     /// Retrieve a [`SlotView`] scoped to a specific schema by name.
     #[wasm_bindgen(js_name = slotView)]
-    pub fn slot_view(
-        &self,
-        schema_id: &str,
-        slot_name: &str,
-    ) -> Result<Option<SlotViewHandle>, JsValue> {
-        match self.inner.get_schema(schema_id) {
-            Some(schema) => {
-                let slot_def = schema
-                    .slot_definitions
-                    .as_ref()
-                    .and_then(|defs| defs.get(slot_name));
-                if let Some(def) = slot_def {
-                    let slot_view = SlotView::new(
-                        slot_name.to_string(),
-                        vec![def.clone()],
-                        schema_id,
-                        &self.inner,
-                    );
-                    Ok(Some(SlotViewHandle::from_inner(slot_view)))
-                } else {
-                    Ok(None)
-                }
-            }
-            None => Ok(None),
-        }
+    pub fn slot_view(&self, schema_id: &str, slot_name: &str) -> Option<SlotViewHandle> {
+        self.inner
+            .get_schema(schema_id)
+            .and_then(|schema| schema.slot_definitions.as_ref())
+            .and_then(|defs| defs.get(slot_name))
+            .map(|def| {
+                SlotView::new(
+                    slot_name.to_string(),
+                    vec![def.clone()],
+                    schema_id,
+                    &self.inner,
+                )
+            })
+            .map(SlotViewHandle::from_inner)
     }
 
     /// Retrieve an [`EnumView`] scoped to a specific schema by name.
     #[wasm_bindgen(js_name = enumView)]
-    pub fn enum_view(
-        &self,
-        schema_id: &str,
-        enum_name: &str,
-    ) -> Result<Option<EnumViewHandle>, JsValue> {
-        match self.inner.get_schema(schema_id) {
-            Some(schema) => {
-                let enum_def = schema.enums.as_ref().and_then(|defs| defs.get(enum_name));
-                if let Some(def) = enum_def {
-                    let enum_view = EnumView::new(def, &self.inner, schema_id);
-                    Ok(Some(EnumViewHandle::from_inner(enum_view)))
-                } else {
-                    Ok(None)
-                }
-            }
-            None => Ok(None),
-        }
+    pub fn enum_view(&self, schema_id: &str, enum_name: &str) -> Option<EnumViewHandle> {
+        self.inner
+            .get_schema(schema_id)
+            .and_then(|schema| schema.enums.as_ref())
+            .and_then(|defs| defs.get(enum_name))
+            .map(|def| EnumView::new(def, &self.inner, schema_id))
+            .map(EnumViewHandle::from_inner)
     }
 }
 
@@ -489,17 +480,20 @@ classes:
         assert_eq!(class_handle.schema_id(), "https://example.org/test");
         assert!(class_handle.definition().is_ok());
         assert!(class_handle.slot_views().is_empty());
+        assert!(class_handle.type_designator_slot().unwrap().is_none());
+        assert!(class_handle.canonical_identifier().is_ok());
+        assert!(class_handle.parent_class().unwrap().is_none());
+        assert!(class_handle.key_or_identifier_slot().unwrap().is_none());
+        assert!(class_handle.identifier_slot().unwrap().is_none());
 
         assert!(
             handle
                 .slot_view("https://example.org/test", "unknown")
-                .unwrap()
                 .is_none()
         );
         assert!(
             handle
                 .enum_view("https://example.org/test", "unknown")
-                .unwrap()
                 .is_none()
         );
     }

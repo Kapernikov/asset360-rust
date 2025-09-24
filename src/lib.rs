@@ -16,6 +16,8 @@ use linkml_meta::{Annotation, ClassDefinition};
 #[cfg(feature = "python-bindings")]
 use linkml_runtime_python::PySchemaView;
 #[cfg(feature = "python-bindings")]
+use linkml_schemaview::converter::Converter;
+#[cfg(feature = "python-bindings")]
 use linkml_schemaview::schemaview::SchemaView;
 
 pub mod blame;
@@ -62,46 +64,50 @@ fn compute_classes_by_type_designator(
     py: Option<Python<'_>>,
 ) -> HashMap<String, ClassDefinition> {
     let mut out: HashMap<String, ClassDefinition> = HashMap::new();
-    let Some(primary) = sv.primary_schema() else {
-        return out;
-    };
-    let schema_id = primary.id.clone();
-    let conv = sv
-        .converter_for_schema(&schema_id)
-        .unwrap_or_else(|| sv.converter_for_primary_schema().expect("no converter"));
 
-    if let Some(classes) = &primary.classes {
-        for (class_name, class_def) in classes.iter() {
-            if only_registered {
-                let managed = class_def
-                    .annotations
-                    .as_ref()
-                    .and_then(|m| m.get("data.infrabel.be/asset360/managed"));
-                let managed_truthy = managed.map(|ann| match py {
-                    Some(py) => is_truthy(py, ann),
-                    None => true,
-                });
-                if !managed_truthy.unwrap_or(false) {
-                    continue;
+    for (schema_id, schema) in sv.all_schema_definitions() {
+        let mut process_classes = |conv: &Converter| {
+            if let Some(classes) = &schema.classes {
+                for (class_name, class_def) in classes {
+                    if only_registered {
+                        let managed = class_def
+                            .annotations
+                            .as_ref()
+                            .and_then(|m| m.get("data.infrabel.be/asset360/managed"));
+                        let managed_truthy = managed.map(|ann| match py {
+                            Some(py) => is_truthy(py, ann),
+                            None => true,
+                        });
+                        if !managed_truthy.unwrap_or(false) {
+                            out.remove(class_name);
+                            continue;
+                        }
+                    }
+
+                    if let Ok(Some(cv)) = sv.get_class_by_schema(schema_id, class_name) {
+                        if let Some(td_slot) = cv.get_type_designator_slot() {
+                            if only_default {
+                                if let Ok(id) = cv.get_type_designator_value(td_slot, conv) {
+                                    out.insert(id.to_string(), class_def.clone());
+                                }
+                            } else if let Ok(ids) =
+                                cv.get_accepted_type_designator_values(td_slot, conv)
+                            {
+                                for id in ids {
+                                    out.insert(id.to_string(), class_def.clone());
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        };
 
-            let Ok(Some(cv)) = sv.get_class_by_schema(&schema_id, class_name) else {
-                continue;
-            };
-            let Some(td_slot) = cv.get_type_designator_slot() else {
-                continue;
-            };
-
-            if only_default {
-                if let Ok(id) = cv.get_type_designator_value(td_slot, conv) {
-                    out.insert(id.to_string(), class_def.clone());
-                }
-            } else if let Ok(ids) = cv.get_accepted_type_designator_values(td_slot, conv) {
-                for id in ids {
-                    out.insert(id.to_string(), class_def.clone());
-                }
-            }
+        if let Some(conv) = sv.converter_for_schema(schema_id) {
+            process_classes(conv);
+        } else {
+            let conv_owned = sv.converter();
+            process_classes(&conv_owned);
         }
     }
     out
