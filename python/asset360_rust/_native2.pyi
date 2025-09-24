@@ -5200,7 +5200,14 @@ class UnitOfMeasure:
     def iec61360code(self, value: typing.Optional[builtins.str]) -> None: ...
     def __new__(cls, symbol:typing.Optional[builtins.str], abbreviation:typing.Optional[builtins.str], descriptive_name:typing.Optional[builtins.str], exact_mappings:typing.Optional[typing.Sequence[builtins.str]], ucum_code:typing.Optional[builtins.str], derivation:typing.Optional[builtins.str], has_quantity_kind:typing.Optional[builtins.str], iec61360code:typing.Optional[builtins.str]) -> UnitOfMeasure: ...
 
-def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:typing.Optional[builtins.bool]=None) -> builtins.list[Delta]: ...
+def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:builtins.bool=False, treat_changed_identifier_as_new_object:builtins.bool=True) -> builtins.list[Delta]:
+    r"""
+    Compute deltas between two instances.
+    
+    Defaults mirror `linkml_runtime.diff.DiffOptions::default()`: missing assignments are
+    treated as absent (`treat_missing_as_null=False`) and identifier changes are emitted as
+    whole-object replacements (`treat_changed_identifier_as_new_object=True`).
+    """
 
 def get_all_classes_by_type_designator_and_schema(schemaview:asset360_rust.SchemaView, only_registered:builtins.bool=True, only_default:builtins.bool=True) -> dict[str, linkml_meta.ClassDefinition]:
     r"""
