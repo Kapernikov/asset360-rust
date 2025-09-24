@@ -12,7 +12,7 @@ use linkml_meta::SchemaDefinition;
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::enumview::EnumView;
 use linkml_schemaview::schemaview::{SchemaView, SchemaViewError};
-use linkml_schemaview::slotview::SlotView;
+use linkml_schemaview::slotview::{RangeInfo, SlotContainerMode, SlotInlineMode, SlotView};
 
 /// Wrapper around [`SchemaView`] that can be owned from JavaScript.
 #[wasm_bindgen]
@@ -31,13 +31,19 @@ impl SchemaViewHandle {
     /// Return the schema definition for the provided identifier.
     #[wasm_bindgen(js_name = schemaDefinition)]
     pub fn schema_definition(&self, schema_id: &str) -> Result<Option<JsValue>, JsValue> {
-        option_to_js(self.inner.get_schema_definition(schema_id))
+        self.inner
+            .get_schema_definition(schema_id)
+            .map(|schema| to_js(schema))
+            .transpose()
     }
 
     /// Return the primary schema definition, if one was registered.
     #[wasm_bindgen(js_name = primarySchemaDefinition)]
     pub fn primary_schema_definition(&self) -> Result<Option<JsValue>, JsValue> {
-        option_to_js(self.inner.primary_schema())
+        self.inner
+            .primary_schema()
+            .map(|schema| to_js(schema))
+            .transpose()
     }
 
     /// Return every schema identifier loaded in this view.
@@ -158,13 +164,6 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
     to_value(value).map_err(format_err)
 }
 
-fn option_to_js<T>(value: Option<T>) -> Result<Option<JsValue>, JsValue>
-where
-    T: Serialize,
-{
-    value.map(|inner| to_js(&inner)).transpose()
-}
-
 fn format_err<E: ToString>(err: E) -> JsValue {
     JsValue::from_str(&err.to_string())
 }
@@ -178,6 +177,7 @@ pub struct ClassViewHandle {
     inner: ClassView,
 }
 
+#[wasm_bindgen]
 impl ClassViewHandle {
     fn from_inner(inner: ClassView) -> Self {
         Self { inner }
@@ -210,6 +210,45 @@ impl ClassViewHandle {
             .map(SlotViewHandle::from_inner)
             .collect()
     }
+
+    #[wasm_bindgen(js_name = typeDesignatorSlot)]
+    pub fn type_designator_slot(&self) -> Result<Option<JsValue>, JsValue> {
+        self.inner
+            .get_type_designator_slot()
+            .map(|slot| to_js(slot))
+            .transpose()
+    }
+
+    #[wasm_bindgen(js_name = canonicalIdentifier)]
+    pub fn canonical_identifier(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.inner.canonical_uri())
+    }
+
+    #[wasm_bindgen(js_name = parentClass)]
+    pub fn parent_class(&self) -> Result<Option<ClassViewHandle>, JsValue> {
+        self.inner
+            .parent_class()
+            .map(|opt| opt.map(ClassViewHandle::from_inner))
+            .map_err(map_schema_error)
+    }
+
+    #[wasm_bindgen(js_name = keyOrIdentifierSlot)]
+    pub fn key_or_identifier_slot(&self) -> Result<Option<JsValue>, JsValue> {
+        self.inner
+            .key_or_identifier_slot()
+            .cloned()
+            .map(|slot| to_js(&slot))
+            .transpose()
+    }
+
+    #[wasm_bindgen(js_name = identifierSlot)]
+    pub fn identifier_slot(&self) -> Result<Option<JsValue>, JsValue> {
+        self.inner
+            .identifier_slot()
+            .cloned()
+            .map(|slot| to_js(&slot))
+            .transpose()
+    }
 }
 
 #[wasm_bindgen]
@@ -239,6 +278,41 @@ impl SlotViewHandle {
     pub fn definition(&self) -> Result<JsValue, JsValue> {
         to_js(self.inner.definition())
     }
+
+    #[wasm_bindgen(js_name = permissibleValueKeys)]
+    pub fn permissible_value_keys(&self) -> Result<Vec<String>, JsValue> {
+        self.inner
+            .permissible_value_keys()
+            .map(|keys| keys.clone())
+            .map_err(map_schema_error)
+    }
+
+    #[wasm_bindgen(js_name = definitions)]
+    pub fn definitions(&self) -> Result<JsValue, JsValue> {
+        to_js(self.inner.definitions())
+    }
+
+    #[wasm_bindgen(js_name = rangeInfos)]
+    pub fn range_infos(&self) -> Vec<RangeInfoHandle> {
+        self.inner
+            .get_range_info()
+            .clone()
+            .into_iter()
+            .map(RangeInfoHandle::from_inner)
+            .collect()
+    }
+
+    #[wasm_bindgen(js_name = rangeClass)]
+    pub fn range_class(&self) -> Option<ClassViewHandle> {
+        self.inner
+            .get_range_class()
+            .map(ClassViewHandle::from_inner)
+    }
+
+    #[wasm_bindgen(js_name = rangeEnum)]
+    pub fn range_enum(&self) -> Option<EnumViewHandle> {
+        self.inner.get_range_enum().map(EnumViewHandle::from_inner)
+    }
 }
 
 #[wasm_bindgen]
@@ -249,6 +323,69 @@ pub struct EnumViewHandle {
 impl EnumViewHandle {
     fn from_inner(inner: EnumView) -> Self {
         Self { inner }
+    }
+}
+
+#[wasm_bindgen]
+pub struct RangeInfoHandle {
+    inner: RangeInfo,
+}
+
+impl RangeInfoHandle {
+    fn from_inner(inner: RangeInfo) -> Self {
+        Self { inner }
+    }
+}
+
+#[wasm_bindgen]
+impl RangeInfoHandle {
+    #[wasm_bindgen(js_name = slotExpression)]
+    pub fn slot_expression(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.inner.e)
+    }
+
+    #[wasm_bindgen(js_name = slotView)]
+    pub fn slot_view(&self) -> SlotViewHandle {
+        SlotViewHandle::from_inner(self.inner.slotview.clone())
+    }
+
+    #[wasm_bindgen(js_name = rangeClass)]
+    pub fn range_class(&self) -> Option<ClassViewHandle> {
+        self.inner
+            .range_class
+            .clone()
+            .map(ClassViewHandle::from_inner)
+    }
+
+    #[wasm_bindgen(js_name = rangeEnum)]
+    pub fn range_enum(&self) -> Option<EnumViewHandle> {
+        self.inner
+            .range_enum
+            .clone()
+            .map(EnumViewHandle::from_inner)
+    }
+
+    #[wasm_bindgen(js_name = isRangeScalar)]
+    pub fn is_range_scalar(&self) -> bool {
+        self.inner.is_range_scalar
+    }
+
+    #[wasm_bindgen(js_name = slotContainerMode)]
+    pub fn slot_container_mode(&self) -> String {
+        match self.inner.slot_container_mode {
+            SlotContainerMode::SingleValue => "single".to_string(),
+            SlotContainerMode::Mapping => "mapping".to_string(),
+            SlotContainerMode::List => "list".to_string(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = slotInlineMode)]
+    pub fn slot_inline_mode(&self) -> String {
+        match self.inner.slot_inline_mode {
+            SlotInlineMode::Inline => "inline".to_string(),
+            SlotInlineMode::Primitive => "primitive".to_string(),
+            SlotInlineMode::Reference => "reference".to_string(),
+        }
     }
 }
 
@@ -267,6 +404,33 @@ impl EnumViewHandle {
     #[wasm_bindgen(js_name = definition)]
     pub fn definition(&self) -> Result<JsValue, JsValue> {
         to_js(self.inner.definition())
+    }
+
+    #[wasm_bindgen(js_name = definitions)]
+    pub fn definitions(&self) -> Result<JsValue, JsValue> {
+        to_js(self.inner.definitions())
+    }
+
+    #[wasm_bindgen(js_name = rangeInfos)]
+    pub fn range_infos(&self) -> Vec<RangeInfoHandle> {
+        self.inner
+            .get_range_info()
+            .clone()
+            .into_iter()
+            .map(RangeInfoHandle::from_inner)
+            .collect()
+    }
+
+    #[wasm_bindgen(js_name = rangeClass)]
+    pub fn range_class(&self) -> Option<ClassViewHandle> {
+        self.inner
+            .get_range_class()
+            .map(ClassViewHandle::from_inner)
+    }
+
+    #[wasm_bindgen(js_name = rangeEnum)]
+    pub fn range_enum(&self) -> Option<EnumViewHandle> {
+        self.inner.get_range_enum().map(EnumViewHandle::from_inner)
     }
 }
 
