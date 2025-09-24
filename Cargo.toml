@@ -29,3 +29,9 @@ stubgen = [
 [dev-dependencies]
 serde_yml = "0.0.12"
 serde_path_to_error = "0.1.17"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
