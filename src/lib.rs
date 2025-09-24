@@ -84,18 +84,18 @@ fn compute_classes_by_type_designator(
                         }
                     }
 
-                    if let Ok(Some(cv)) = sv.get_class_by_schema(schema_id, class_name) {
-                        if let Some(td_slot) = cv.get_type_designator_slot() {
-                            if only_default {
-                                if let Ok(id) = cv.get_type_designator_value(td_slot, conv) {
-                                    out.insert(id.to_string(), class_def.clone());
-                                }
-                            } else if let Ok(ids) =
-                                cv.get_accepted_type_designator_values(td_slot, conv)
-                            {
-                                for id in ids {
-                                    out.insert(id.to_string(), class_def.clone());
-                                }
+                    if let Ok(Some(cv)) = sv.get_class_by_schema(schema_id, class_name)
+                        && let Some(td_slot) = cv.get_type_designator_slot()
+                    {
+                        if only_default {
+                            if let Ok(id) = cv.get_type_designator_value(td_slot, conv) {
+                                out.insert(id.to_string(), class_def.clone());
+                            }
+                        } else if let Ok(ids) =
+                            cv.get_accepted_type_designator_values(td_slot, conv)
+                        {
+                            for id in ids {
+                                out.insert(id.to_string(), class_def.clone());
                             }
                         }
                     }

@@ -2,8 +2,6 @@
 //! This module currently offers a minimal handle for loading LinkML schemas
 //! from YAML text so that higher-level APIs can be layered on gradually.
 
-#![cfg(feature = "wasm-bindings")]
-
 use serde::Serialize;
 use serde_wasm_bindgen::to_value;
 use wasm_bindgen::prelude::*;
@@ -371,7 +369,7 @@ impl EnumViewHandle {
     pub fn permissible_value_keys(&self) -> Result<Vec<String>, JsValue> {
         self.inner
             .permissible_value_keys()
-            .map(|keys| keys.clone())
+            .map(|keys| keys.to_vec())
             .map_err(map_schema_error)
     }
 }
