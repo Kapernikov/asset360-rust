@@ -8,4 +8,11 @@ from ._resolver import resolve_schemas
 from .schemaview import SchemaView
 from .debug_utils import pretty_linkml_value
 
-__all__ = [name for name in globals() if not name.startswith("_")]
+# Build an explicit export list so type checkers don't flag the backing module.
+_native_exports = [name for name in dir(_native) if not name.startswith("_")]
+
+__all__ = _native_exports + [
+    "resolve_schemas",
+    "SchemaView",
+    "pretty_linkml_value",
+]
