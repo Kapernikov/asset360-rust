@@ -3,24 +3,26 @@ set -euo pipefail
 
 PROFILE=debug
 OUT_DIR="pkg"
-TARGET="wasm32-unknown-unknown"
 BINDGEN_TARGET="bundler"
 FEATURES="wasm-bindings"
+SCOPE=""
 EXTRA_ARGS=()
+CARGO_EXTRA_ARGS=()
 
 usage() {
   cat <<'USAGE'
 Usage: build_wasm.sh [options]
 
-Build the wasm32 artifact for asset360-rust and run wasm-bindgen to emit JS/TS bindings.
+Build the wasm32 artifact for asset360-rust using wasm-pack and emit npm-ready JS/TS bindings.
 
 Options:
   --release           Build with --release (default builds debug)
-  --features <list>   Comma-separated feature list to use (default: wasm-bindings)
-  --profile <name>    Cargo profile (default: debug or release when --release is set)
-  --target-dir <dir>  Output directory passed to wasm-bindgen (default: pkg)
-  --bindgen-target <t>  wasm-bindgen target (default: bundler)
-  --extra <args>      Extra arguments to pass to wasm-bindgen (repeatable)
+  --features <list>   Comma-separated feature list to pass to Cargo (default: wasm-bindings)
+  --profile <name>    Cargo profile (debug or release; default debug unless --release)
+  --target-dir <dir>  Output directory passed to wasm-pack (default: pkg)
+  --bindgen-target <t>  wasm-pack target (default: bundler)
+  --scope <scope>     npm scope for the generated package (e.g. kapernikov)
+  --extra <args>      Extra arguments to pass directly to wasm-pack (repeatable)
   -h, --help          Show this help message
 USAGE
 }
@@ -41,14 +43,19 @@ while [[ $# -gt 0 ]]; do
       PROFILE="$2"
       shift 2
       ;;
+    --bindgen-target)
+      [[ $# -ge 2 ]] || { echo "--bindgen-target requires an argument" >&2; exit 1; }
+      BINDGEN_TARGET="$2"
+      shift 2
+      ;;
     --target-dir)
       [[ $# -ge 2 ]] || { echo "--target-dir requires an argument" >&2; exit 1; }
       OUT_DIR="$2"
       shift 2
       ;;
-    --bindgen-target)
-      [[ $# -ge 2 ]] || { echo "--bindgen-target requires an argument" >&2; exit 1; }
-      BINDGEN_TARGET="$2"
+    --scope)
+      [[ $# -ge 2 ]] || { echo "--scope requires an argument" >&2; exit 1; }
+      SCOPE="$2"
       shift 2
       ;;
     --extra)
@@ -68,48 +75,38 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! command -v wasm-bindgen >/dev/null 2>&1; then
-  echo "wasm-bindgen not found in PATH. Install it with 'cargo install wasm-bindgen-cli' or use wasm-pack." >&2
+if ! command -v wasm-pack >/dev/null 2>&1; then
+  echo "wasm-pack not found in PATH. Install it with 'cargo install wasm-pack' or use the official installer." >&2
   exit 1
 fi
 
-BUILD_FLAGS=("--target" "$TARGET" "--no-default-features" "--features" "$FEATURES")
+if [[ "$PROFILE" != "release" && "$PROFILE" != "debug" ]]; then
+  echo "Unsupported profile '$PROFILE'. Use --release or omit for debug." >&2
+  exit 1
+fi
+
+PACK_ARGS=("build")
+PACK_ARGS+=("--target" "$BINDGEN_TARGET")
+PACK_ARGS+=("--out-dir" "$OUT_DIR")
+
 if [[ "$PROFILE" == "release" ]]; then
-  BUILD_FLAGS+=("--release")
+  PACK_ARGS+=("--release")
+else
+  PACK_ARGS+=("--dev")
 fi
+
+if [[ -n "$SCOPE" ]]; then
+  PACK_ARGS+=("--scope" "$SCOPE")
+fi
+
+CARGO_EXTRA_ARGS=("--no-default-features" "--features" "$FEATURES")
 
 if [[ -n "${CARGO_TARGET_DIR-}" ]]; then
-  cargo_target_dir_opt=("--target-dir" "$CARGO_TARGET_DIR")
+  CARGO_EXTRA_ARGS+=("--target-dir" "$CARGO_TARGET_DIR")
+fi
+
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  wasm-pack "${PACK_ARGS[@]}" "${EXTRA_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
 else
-  cargo_target_dir_opt=()
+  wasm-pack "${PACK_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
 fi
-
-cargo build "${BUILD_FLAGS[@]}" "${cargo_target_dir_opt[@]}"
-
-if [[ -n "${CARGO_TARGET_DIR-}" ]]; then
-  ARTIFACT_BASE="$CARGO_TARGET_DIR"
-else
-  ARTIFACT_BASE="target"
-fi
-
-ARTIFACT="${ARTIFACT_BASE}/${TARGET}/${PROFILE}/asset360_rust.wasm"
-if [[ ! -f "$ARTIFACT" ]]; then
-  echo "Expected wasm artifact not found at $ARTIFACT" >&2
-  exit 1
-fi
-
-mkdir -p "$OUT_DIR"
-
-if command -v wasm-opt >/dev/null 2>&1; then
-  OPT_ARTIFACT="${ARTIFACT%.wasm}-opt.wasm"
-  wasm-opt -Oz -o "$OPT_ARTIFACT" "$ARTIFACT"
-  ARTIFACT="$OPT_ARTIFACT"
-else
-  echo "warning: wasm-opt not found; skipping size optimization" >&2
-fi
-
-wasm-bindgen "$ARTIFACT" \
-  --target "$BINDGEN_TARGET" \
-  --out-dir "$OUT_DIR" \
-  --typescript \
-  "${EXTRA_ARGS[@]}"

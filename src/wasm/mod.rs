@@ -30,20 +30,20 @@ impl SchemaViewHandle {
 
     /// Return the schema definition for the provided identifier.
     #[wasm_bindgen(js_name = schemaDefinition)]
-    pub fn schema_definition(&self, schema_id: &str) -> Result<Option<JsValue>, JsValue> {
-        self.inner
-            .get_schema_definition(schema_id)
-            .map(|schema| to_js(schema))
-            .transpose()
+    pub fn schema_definition(&self, schema_id: &str) -> Result<JsValue, JsValue> {
+        match self.inner.get_schema_definition(schema_id) {
+            Some(schema) => to_js(schema),
+            None => Ok(JsValue::NULL),
+        }
     }
 
     /// Return the primary schema definition, if one was registered.
     #[wasm_bindgen(js_name = primarySchemaDefinition)]
-    pub fn primary_schema_definition(&self) -> Result<Option<JsValue>, JsValue> {
-        self.inner
-            .primary_schema()
-            .map(|schema| to_js(schema))
-            .transpose()
+    pub fn primary_schema_definition(&self) -> Result<JsValue, JsValue> {
+        match self.inner.primary_schema() {
+            Some(schema) => to_js(schema),
+            None => Ok(JsValue::NULL),
+        }
     }
 
     /// Return every schema identifier loaded in this view.
@@ -139,14 +139,16 @@ impl SchemaViewHandle {
             .and_then(|schema| schema.slot_definitions.as_ref())
             .and_then(|defs| defs.get(slot_name))
             .map(|def| {
-                SlotView::new(
-                    slot_name.to_string(),
-                    vec![def.clone()],
-                    schema_id,
-                    &self.inner,
+                SlotViewHandle::from_inner_with_schema(
+                    SlotView::new(
+                        slot_name.to_string(),
+                        vec![def.clone()],
+                        schema_id,
+                        &self.inner,
+                    ),
+                    schema_id.to_string(),
                 )
             })
-            .map(SlotViewHandle::from_inner)
     }
 
     /// Retrieve an [`EnumView`] scoped to a specific schema by name.
@@ -179,11 +181,11 @@ fn parse_schema_definition(yaml: &str) -> Result<SchemaDefinition, JsValue> {
 }
 
 fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
-    to_value(value).map_err(format_err)
+    to_value(value).map_err(|err| format_err(&err))
 }
 
-fn format_err<E: ToString>(err: E) -> JsValue {
-    JsValue::from_str(&err.to_string())
+fn format_err<E: std::fmt::Debug>(err: E) -> JsValue {
+    JsValue::from_str(&format!("{err:?}"))
 }
 
 fn map_schema_error(err: SchemaViewError) -> JsValue {
@@ -221,25 +223,26 @@ impl ClassViewHandle {
 
     #[wasm_bindgen(js_name = slotViews)]
     pub fn slot_views(&self) -> Vec<SlotViewHandle> {
+        let schema_id = self.schema_id().to_string();
         self.inner
             .slots()
             .iter()
             .cloned()
-            .map(SlotViewHandle::from_inner)
+            .map(|slot| SlotViewHandle::from_inner_with_schema(slot, schema_id.clone()))
             .collect()
     }
 
     #[wasm_bindgen(js_name = typeDesignatorSlot)]
-    pub fn type_designator_slot(&self) -> Result<Option<JsValue>, JsValue> {
-        self.inner
-            .get_type_designator_slot()
-            .map(|slot| to_js(slot))
-            .transpose()
+    pub fn type_designator_slot(&self) -> Result<JsValue, JsValue> {
+        match self.inner.get_type_designator_slot() {
+            Some(slot) => to_js(slot),
+            None => Ok(JsValue::NULL),
+        }
     }
 
     #[wasm_bindgen(js_name = canonicalIdentifier)]
-    pub fn canonical_identifier(&self) -> Result<JsValue, JsValue> {
-        to_js(&self.inner.canonical_uri())
+    pub fn canonical_identifier(&self) -> String {
+        self.inner.canonical_uri().to_string()
     }
 
     #[wasm_bindgen(js_name = parentClass)]
@@ -251,32 +254,41 @@ impl ClassViewHandle {
     }
 
     #[wasm_bindgen(js_name = keyOrIdentifierSlot)]
-    pub fn key_or_identifier_slot(&self) -> Result<Option<JsValue>, JsValue> {
+    pub fn key_or_identifier_slot(&self) -> Option<SlotViewHandle> {
+        let schema_id = self.schema_id().to_string();
         self.inner
             .key_or_identifier_slot()
-            .cloned()
-            .map(|slot| to_js(&slot))
-            .transpose()
+            .map(|slot| SlotViewHandle::from_inner_with_schema(slot.clone(), schema_id))
     }
 
     #[wasm_bindgen(js_name = identifierSlot)]
-    pub fn identifier_slot(&self) -> Result<Option<JsValue>, JsValue> {
+    pub fn identifier_slot(&self) -> Option<SlotViewHandle> {
+        let schema_id = self.schema_id().to_string();
         self.inner
             .identifier_slot()
-            .cloned()
-            .map(|slot| to_js(&slot))
-            .transpose()
+            .map(|slot| SlotViewHandle::from_inner_with_schema(slot.clone(), schema_id))
     }
 }
 
 #[wasm_bindgen]
 pub struct SlotViewHandle {
     inner: SlotView,
+    schema_id: Option<String>,
 }
 
 impl SlotViewHandle {
     fn from_inner(inner: SlotView) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            schema_id: None,
+        }
+    }
+
+    fn from_inner_with_schema(inner: SlotView, schema_id: String) -> Self {
+        Self {
+            inner,
+            schema_id: Some(schema_id),
+        }
     }
 }
 
@@ -288,21 +300,15 @@ impl SlotViewHandle {
     }
 
     #[wasm_bindgen(js_name = schemaId)]
-    pub fn schema_id(&self) -> String {
-        self.inner.schema_uri.clone()
+    pub fn schema_id(&self) -> Option<String> {
+        self.schema_id
+            .clone()
+            .or_else(|| Some(self.inner.schema_id().to_string()))
     }
 
     #[wasm_bindgen(js_name = definition)]
     pub fn definition(&self) -> Result<JsValue, JsValue> {
         to_js(self.inner.definition())
-    }
-
-    #[wasm_bindgen(js_name = permissibleValueKeys)]
-    pub fn permissible_value_keys(&self) -> Result<Vec<String>, JsValue> {
-        self.inner
-            .permissible_value_keys()
-            .map(|keys| keys.clone())
-            .map_err(map_schema_error)
     }
 
     #[wasm_bindgen(js_name = definitions)]
@@ -345,6 +351,32 @@ impl EnumViewHandle {
 }
 
 #[wasm_bindgen]
+impl EnumViewHandle {
+    #[wasm_bindgen(js_name = name)]
+    pub fn name(&self) -> String {
+        self.inner.name().to_string()
+    }
+
+    #[wasm_bindgen(js_name = schemaId)]
+    pub fn schema_id(&self) -> String {
+        self.inner.schema_id().to_string()
+    }
+
+    #[wasm_bindgen(js_name = definition)]
+    pub fn definition(&self) -> Result<JsValue, JsValue> {
+        to_js(self.inner.definition())
+    }
+
+    #[wasm_bindgen(js_name = permissibleValueKeys)]
+    pub fn permissible_value_keys(&self) -> Result<Vec<String>, JsValue> {
+        self.inner
+            .permissible_value_keys()
+            .map(|keys| keys.clone())
+            .map_err(map_schema_error)
+    }
+}
+
+#[wasm_bindgen]
 pub struct RangeInfoHandle {
     inner: RangeInfo,
 }
@@ -364,7 +396,8 @@ impl RangeInfoHandle {
 
     #[wasm_bindgen(js_name = slotView)]
     pub fn slot_view(&self) -> SlotViewHandle {
-        SlotViewHandle::from_inner(self.inner.slotview.clone())
+        let schema_id = self.inner.slotview.schema_id().to_string();
+        SlotViewHandle::from_inner_with_schema(self.inner.slotview.clone(), schema_id)
     }
 
     #[wasm_bindgen(js_name = rangeClass)]
@@ -407,51 +440,6 @@ impl RangeInfoHandle {
     }
 }
 
-#[wasm_bindgen]
-impl EnumViewHandle {
-    #[wasm_bindgen(js_name = name)]
-    pub fn name(&self) -> String {
-        self.inner.name().to_string()
-    }
-
-    #[wasm_bindgen(js_name = schemaId)]
-    pub fn schema_id(&self) -> String {
-        self.inner.schema_id().to_string()
-    }
-
-    #[wasm_bindgen(js_name = definition)]
-    pub fn definition(&self) -> Result<JsValue, JsValue> {
-        to_js(self.inner.definition())
-    }
-
-    #[wasm_bindgen(js_name = definitions)]
-    pub fn definitions(&self) -> Result<JsValue, JsValue> {
-        to_js(self.inner.definitions())
-    }
-
-    #[wasm_bindgen(js_name = rangeInfos)]
-    pub fn range_infos(&self) -> Vec<RangeInfoHandle> {
-        self.inner
-            .get_range_info()
-            .clone()
-            .into_iter()
-            .map(RangeInfoHandle::from_inner)
-            .collect()
-    }
-
-    #[wasm_bindgen(js_name = rangeClass)]
-    pub fn range_class(&self) -> Option<ClassViewHandle> {
-        self.inner
-            .get_range_class()
-            .map(ClassViewHandle::from_inner)
-    }
-
-    #[wasm_bindgen(js_name = rangeEnum)]
-    pub fn range_enum(&self) -> Option<EnumViewHandle> {
-        self.inner.get_range_enum().map(EnumViewHandle::from_inner)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,24 +471,18 @@ classes:
         assert_eq!(handle.class_views().unwrap().len(), 1);
         assert!(handle.slot_views().unwrap().is_empty());
         assert!(handle.enum_views().unwrap().is_empty());
-        assert!(
-            handle
-                .primary_schema_definition()
-                .expect("primary schema definition")
-                .is_some()
-        );
-        assert!(
-            handle
-                .schema_definition("https://example.org/test")
-                .expect("schema definition")
-                .is_some()
-        );
-        assert!(
-            handle
-                .schema_definition("missing")
-                .expect("missing schema should map to null")
-                .is_none()
-        );
+        let primary_schema = handle
+            .primary_schema_definition()
+            .expect("primary schema definition");
+        assert!(!primary_schema.is_null());
+        let schema_def = handle
+            .schema_definition("https://example.org/test")
+            .expect("schema definition");
+        assert!(!schema_def.is_null());
+        let missing_schema = handle
+            .schema_definition("missing")
+            .expect("missing schema should map to null");
+        assert!(missing_schema.is_null());
 
         let class_handle = handle
             .class_view("https://example.org/test", "Person")
@@ -510,11 +492,11 @@ classes:
         assert_eq!(class_handle.schema_id(), "https://example.org/test");
         assert!(class_handle.definition().is_ok());
         assert!(class_handle.slot_views().is_empty());
-        assert!(class_handle.type_designator_slot().unwrap().is_none());
-        assert!(class_handle.canonical_identifier().is_ok());
+        assert!(class_handle.type_designator_slot().unwrap().is_null());
+        assert!(!class_handle.canonical_identifier().is_empty());
         assert!(class_handle.parent_class().unwrap().is_none());
-        assert!(class_handle.key_or_identifier_slot().unwrap().is_none());
-        assert!(class_handle.identifier_slot().unwrap().is_none());
+        assert!(class_handle.key_or_identifier_slot().is_none());
+        assert!(class_handle.identifier_slot().is_none());
 
         assert!(
             handle
