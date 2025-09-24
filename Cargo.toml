@@ -8,27 +8,35 @@ name = "asset360_rust"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.25.0" }
+pyo3 = { version = "0.25.0", optional = true }
 pyo3-stub-gen = { version = "0.13.1", optional = true }
-linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python" }
-linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta", features = ["pyo3"] }
-linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview" }
-linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime" }
+linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python", optional = true }
+linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta" }
+linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview", default-features = false }
+linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
+serde_path_to_error = "0.1.17"
+serde_yml = "0.0.12"
+wasm-bindgen = { version = "0.2", optional = true, features = ["serde-serialize"] }
 
 [features]
 default = ["stubgen"]
 # Enable Python extension-module linking only in packaging builds (maturin)
-python-extension = ["pyo3/extension-module"]
+python-extension = ["python-bindings", "pyo3/extension-module"]
+python-bindings = [
+    "dep:pyo3",
+    "dep:linkml_runtime_python",
+    "linkml_meta/pyo3"
+]
 stubgen = [
+    "python-bindings",
     "dep:pyo3-stub-gen",
     "linkml_runtime_python/stubgen",
     "linkml_meta/stubgen"
 ]
+wasm-bindings = ["dep:wasm-bindgen"]
 
 [dev-dependencies]
-serde_yml = "0.0.12"
-serde_path_to_error = "0.1.17"
 
 [profile.release]
 opt-level = "z"

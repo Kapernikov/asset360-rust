@@ -26,3 +26,13 @@ Notes
 - The native extension module is named `asset360_native` to avoid symbol
   clashes with the dependency’s own `_native` module. The Python package
   `asset360_rust` re-exports the same API.
+
+Experimental Wasm bindings
+--------------------------
+
+- Install the Wasm target once: `rustup target add wasm32-unknown-unknown`.
+- Build the crate with the new bindings enabled (Python features off):
+  - `cargo build --target wasm32-unknown-unknown --no-default-features --features wasm-bindings`
+- Run `wasm-bindgen` (or `wasm-pack`) to emit the `.js` shim and `.d.ts` typings, for example:
+  - `wasm-bindgen --target bundler --typescript --out-dir pkg target/wasm32-unknown-unknown/debug/asset360_rust.wasm`
+- The generated `pkg/asset360_rust.d.ts` exposes `loadSchemaView`, returning a `SchemaViewHandle` with trivial inspection helpers for now.

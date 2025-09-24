@@ -1,20 +1,32 @@
+#[cfg(feature = "python-bindings")]
 use pyo3::Bound;
+#[cfg(feature = "python-bindings")]
 use pyo3::prelude::*;
+#[cfg(feature = "python-bindings")]
 use pyo3::types::PyModule;
 
-#[cfg(feature = "stubgen")]
+#[cfg(all(feature = "python-bindings", feature = "stubgen"))]
 use pyo3_stub_gen::{define_stub_info_gatherer, derive::gen_stub_pyfunction};
 
+#[cfg(feature = "python-bindings")]
 use std::collections::HashMap;
 
+#[cfg(feature = "python-bindings")]
 use linkml_meta::{Annotation, ClassDefinition};
+#[cfg(feature = "python-bindings")]
 use linkml_runtime_python::PySchemaView;
+#[cfg(feature = "python-bindings")]
 use linkml_schemaview::schemaview::SchemaView;
 
 pub mod blame;
 
+#[cfg(feature = "wasm-bindings")]
+pub mod wasm;
+
+#[cfg(feature = "python-bindings")]
 /// Python bindings entrypoint mirroring the dependency's module.
 /// Name is different to avoid symbol clashes with the dependency.
+#[cfg(feature = "python-bindings")]
 #[pymodule(name = "_native2")]
 pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     linkml_runtime_python::runtime_module(m)?;
@@ -25,6 +37,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "python-bindings")]
 fn is_truthy(py: Python<'_>, ann: &Annotation) -> bool {
     // Try python-level truthiness for annotation values
     let Ok(obj) = ann.extension_value.clone().into_pyobject(py) else {
@@ -41,6 +54,7 @@ fn is_truthy(py: Python<'_>, ann: &Annotation) -> bool {
     any.is_truthy().unwrap_or(false)
 }
 
+#[cfg(feature = "python-bindings")]
 fn compute_classes_by_type_designator(
     sv: &SchemaView,
     only_registered: bool,
@@ -100,6 +114,7 @@ fn compute_classes_by_type_designator(
 ///   annotation to be truthy.
 /// * `only_default` – restrict to each class' primary type designator instead of
 ///   all accepted aliases.
+#[cfg(feature = "python-bindings")]
 fn get_all_classes_by_type_designator_and_schema_impl(
     py: Python<'_>,
     schemaview: Py<PySchemaView>,
@@ -118,7 +133,7 @@ fn get_all_classes_by_type_designator_and_schema_impl(
     ))
 }
 
-#[cfg(feature = "stubgen")]
+#[cfg(all(feature = "python-bindings", feature = "stubgen"))]
 /// Return every class keyed by its resolved type designator.
 ///
 /// * `schemaview` – existing [`SchemaView`] instance to inspect.
@@ -157,7 +172,7 @@ fn get_all_classes_by_type_designator_and_schema(
     )
 }
 
-#[cfg(not(feature = "stubgen"))]
+#[cfg(all(feature = "python-bindings", not(feature = "stubgen")))]
 /// Return every class keyed by its resolved type designator.
 ///
 /// * `schemaview` – existing [`SchemaView`] instance to inspect.
@@ -183,10 +198,10 @@ fn get_all_classes_by_type_designator_and_schema(
     )
 }
 
-#[cfg(feature = "stubgen")]
+#[cfg(all(feature = "python-bindings", feature = "stubgen"))]
 define_stub_info_gatherer!(stub_info);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "python-bindings"))]
 mod tests {
     use super::*;
     use linkml_meta::SchemaDefinition;
