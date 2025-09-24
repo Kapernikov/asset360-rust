@@ -8,6 +8,7 @@ use wasm_bindgen::prelude::*;
 
 use linkml_meta::SchemaDefinition;
 use linkml_schemaview::schemaview::SchemaView;
+use serde_wasm_bindgen::to_value;
 
 /// Wrapper around [`SchemaView`] that can be owned from JavaScript.
 #[wasm_bindgen]
@@ -23,14 +24,24 @@ impl SchemaViewHandle {
         self.inner.primary_schema().map(|schema| schema.id.clone())
     }
 
-    /// Return basic metadata to aid with smoke-testing in JS.
-    #[wasm_bindgen(js_name = classCount)]
-    pub fn class_count(&self) -> usize {
-        self.inner
+    /// Return the schema definition for the provided identifier.
+    #[wasm_bindgen(js_name = schemaDefinition)]
+    pub fn schema_definition(&self, schema_id: &str) -> Result<JsValue, JsValue> {
+        let schema: &SchemaDefinition = self
+            .inner
+            .get_schema_definition(schema_id)
+            .ok_or_else(|| JsValue::from_str(&format!("schema '{schema_id}' not found")))?;
+        to_value(schema).map_err(|err| JsValue::from_str(&err.to_string()))
+    }
+
+    /// Return the primary schema definition, if one was registered.
+    #[wasm_bindgen(js_name = primarySchemaDefinition)]
+    pub fn primary_schema_definition(&self) -> Result<JsValue, JsValue> {
+        let schema = self
+            .inner
             .primary_schema()
-            .and_then(|schema| schema.classes.as_ref())
-            .map(|classes| classes.len())
-            .unwrap_or(0)
+            .ok_or_else(|| JsValue::from_str("no primary schema registered"))?;
+        to_value(schema).map_err(|err| JsValue::from_str(&err.to_string()))
     }
 }
 
@@ -72,6 +83,8 @@ classes:
             handle.primary_schema_id().as_deref(),
             Some("https://example.org/test")
         );
-        assert_eq!(handle.class_count(), 1);
+        assert!(handle.primary_schema_definition().is_ok());
+        assert!(handle.schema_definition("https://example.org/test").is_ok());
+        assert!(handle.schema_definition("missing").is_err());
     }
 }
