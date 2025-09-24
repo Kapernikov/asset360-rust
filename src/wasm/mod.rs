@@ -91,6 +91,33 @@ impl SchemaViewHandle {
         ids
     }
 
+    /// Return all classes as handles across every schema.
+    #[wasm_bindgen(js_name = classViews)]
+    pub fn class_views(&self) -> Result<Vec<ClassViewHandle>, JsValue> {
+        self.inner
+            .class_views()
+            .map(|views| views.into_iter().map(ClassViewHandle::from_inner).collect())
+            .map_err(map_schema_error)
+    }
+
+    /// Return all slots as handles across every schema.
+    #[wasm_bindgen(js_name = slotViews)]
+    pub fn slot_views(&self) -> Result<Vec<SlotViewHandle>, JsValue> {
+        self.inner
+            .slot_views()
+            .map(|views| views.into_iter().map(SlotViewHandle::from_inner).collect())
+            .map_err(map_schema_error)
+    }
+
+    /// Return all enums as handles across every schema.
+    #[wasm_bindgen(js_name = enumViews)]
+    pub fn enum_views(&self) -> Result<Vec<EnumViewHandle>, JsValue> {
+        self.inner
+            .enum_views()
+            .map(|views| views.into_iter().map(EnumViewHandle::from_inner).collect())
+            .map_err(map_schema_error)
+    }
+
     /// Retrieve a [`ClassView`] scoped to a specific schema by name.
     #[wasm_bindgen(js_name = classView)]
     pub fn class_view(
@@ -453,6 +480,9 @@ classes:
         assert_eq!(handle.class_ids().len(), 1);
         assert!(handle.slot_ids().is_empty());
         assert!(handle.enum_ids().is_empty());
+        assert_eq!(handle.class_views().unwrap().len(), 1);
+        assert!(handle.slot_views().unwrap().is_empty());
+        assert!(handle.enum_views().unwrap().is_empty());
         assert!(
             handle
                 .primary_schema_definition()
