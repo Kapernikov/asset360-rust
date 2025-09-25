@@ -1,13 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 PROFILE=release
 OUT_DIR="pkg"
-BINDGEN_TARGET="bundler"
+BINDGEN_TARGET="web"
 FEATURES="wasm-bindings"
 SCOPE=""
 EXTRA_ARGS=()
 CARGO_EXTRA_ARGS=()
+BINARYEN_VERSION="${BINARYEN_VERSION:-124}"
+BINARYEN_BASE_URL="${BINARYEN_BASE_URL:-https://github.com/WebAssembly/binaryen/releases/download}"
+BINARYEN_CACHE_DIR="${BINARYEN_CACHE_DIR:-${REPO_ROOT}/.cache/binaryen}"
+USE_SYSTEM_BINARYEN="${USE_SYSTEM_BINARYEN:-0}"
 
 usage() {
   cat <<'USAGE'
@@ -20,11 +28,78 @@ Options:
   --features <list>   Comma-separated feature list to pass to Cargo (default: wasm-bindings)
   --profile <name>    Cargo profile (debug or release; default debug unless --release)
   --target-dir <dir>  Output directory passed to wasm-pack (default: pkg)
-  --bindgen-target <t>  wasm-pack target (default: bundler)
+  --bindgen-target <t>  wasm-pack target (default: web)
   --scope <scope>     npm scope for the generated package (e.g. kapernikov)
   --extra <args>      Extra arguments to pass directly to wasm-pack (repeatable)
   -h, --help          Show this help message
+
+Environment:
+  BINARYEN_VERSION      Binaryen release version (default: 124)
+  BINARYEN_BASE_URL     Base URL for Binaryen downloads
+  BINARYEN_CACHE_DIR    Directory to cache downloaded Binaryen (default: .cache/binaryen)
+  USE_SYSTEM_BINARYEN   Set to 1 to use system wasm-opt if available
 USAGE
+}
+
+download_binaryen() {
+  local archive="binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+  local url="${BINARYEN_BASE_URL}/version_${BINARYEN_VERSION}/${archive}"
+  local archive_path="${BINARYEN_CACHE_DIR}/${archive}"
+
+  mkdir -p "${BINARYEN_CACHE_DIR}"
+
+  if [[ ! -f "${archive_path}" ]]; then
+    echo "Downloading Binaryen ${BINARYEN_VERSION} from ${url}" >&2
+    if command -v curl >/dev/null 2>&1; then
+      if ! curl -Lsf -o "${archive_path}" "${url}"; then
+        rm -f "${archive_path}"
+        echo "Failed to download Binaryen" >&2
+        exit 1
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if ! wget -q -O "${archive_path}" "${url}"; then
+        rm -f "${archive_path}"
+        echo "Failed to download Binaryen" >&2
+        exit 1
+      fi
+    else
+      echo "curl or wget required to download Binaryen" >&2
+      exit 1
+    fi
+  fi
+
+  echo "${archive_path}"
+}
+
+ensure_binaryen() {
+  if [[ "${USE_SYSTEM_BINARYEN}" == "1" ]]; then
+    if ! command -v wasm-opt >/dev/null 2>&1; then
+      echo "USE_SYSTEM_BINARYEN=1 but wasm-opt not found on PATH" >&2
+      exit 1
+    fi
+    command -v wasm-opt
+    return
+  fi
+
+  local install_dir="${BINARYEN_CACHE_DIR}/binaryen-version_${BINARYEN_VERSION}"
+  local wasm_opt_path="${install_dir}/bin/wasm-opt"
+
+  if [[ ! -x "${wasm_opt_path}" ]]; then
+    local archive_path
+    archive_path="$(download_binaryen)"
+    echo "Extracting Binaryen to ${BINARYEN_CACHE_DIR}" >&2
+    if ! tar -xf "${archive_path}" -C "${BINARYEN_CACHE_DIR}"; then
+      echo "Failed to extract Binaryen" >&2
+      exit 1
+    fi
+  fi
+
+  if [[ ! -x "${wasm_opt_path}" ]]; then
+    echo "Binaryen wasm-opt not found after extraction" >&2
+    exit 1
+  fi
+
+  echo "${wasm_opt_path}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -75,11 +150,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! command -v wasm-opt >/dev/null 2>&1; then
-  echo "binaryen (wasm-opt) not found on PATH. install it with 'apt install binaryen'" >&2
-  exit 1
-fi
-
 if ! command -v wasm-pack >/dev/null 2>&1; then
   echo "wasm-pack not found in PATH. Install it with 'cargo install wasm-pack' or use the official installer." >&2
   exit 1
@@ -93,6 +163,7 @@ fi
 PACK_ARGS=("build")
 PACK_ARGS+=("--target" "$BINDGEN_TARGET")
 PACK_ARGS+=("--out-dir" "$OUT_DIR")
+PACK_ARGS+=("--no-opt")
 
 if [[ "$PROFILE" == "release" ]]; then
   PACK_ARGS+=("--release")
@@ -111,9 +182,11 @@ if [[ -n "${CARGO_TARGET_DIR-}" ]]; then
 fi
 
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
-  wasm-pack "${PACK_ARGS[@]}" "${EXTRA_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
+  : "${WASM_BINDGEN_NO_EXTERNREF:=1}"
+  WASM_BINDGEN_NO_EXTERNREF="$WASM_BINDGEN_NO_EXTERNREF" wasm-pack "${PACK_ARGS[@]}" "${EXTRA_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
 else
-  wasm-pack "${PACK_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
+  : "${WASM_BINDGEN_NO_EXTERNREF:=1}"
+  WASM_BINDGEN_NO_EXTERNREF="$WASM_BINDGEN_NO_EXTERNREF" wasm-pack "${PACK_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
 fi
 
 shopt -s nullglob
@@ -125,9 +198,13 @@ if [[ ${#WASM_FILES[@]} -eq 0 ]]; then
   exit 1
 fi
 
+WASM_OPT_BIN="$(ensure_binaryen)"
+
 for wasm_path in "${WASM_FILES[@]}"; do
-  tmp_opt="${wasm_path%.wasm}.opt.wasm"
-  wasm-opt -Oz "$wasm_path" -o "$tmp_opt"
+  wasm_dir=$(dirname "$wasm_path")
+  wasm_file=$(basename "$wasm_path")
+  tmp_opt="${wasm_dir}/${wasm_file}.opt"
+  "${WASM_OPT_BIN}" -Oz "$wasm_path" -o "$tmp_opt"
   mv "$tmp_opt" "$wasm_path"
 done
 

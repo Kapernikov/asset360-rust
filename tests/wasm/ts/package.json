@@ -1,0 +1,19 @@
+{
+  "name": "asset360-wasm-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Local TypeScript harness for asset360 wasm bindings",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "test": "npm run build --silent && mocha dist/**/*.test.js"
+  },
+  "devDependencies": {
+    "@types/chai": "^4.3.11",
+    "@types/mocha": "^10.0.6",
+    "chai": "^4.5.0",
+    "mocha": "^10.7.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}

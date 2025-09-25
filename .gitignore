@@ -11,7 +11,6 @@ __pycache__/
 /.maturin/
 /.venv/
 python/**/__pycache__/
-
 # Editors/OS
 .vscode/
 .idea/
@@ -21,5 +20,12 @@ python/**/__pycache__/
 *.log
 *~
 *.so
-pkg/
+pkg/*
+!pkg/index.js
+!pkg/index.d.ts
+!pkg/package.json
+!pkg/README.md
 pkg.zip
+node_modules/
+.cache/
+tests/wasm/ts/dist/

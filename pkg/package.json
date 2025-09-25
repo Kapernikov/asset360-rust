@@ -1,0 +1,13 @@
+{
+  "name": "asset360-rust",
+  "version": "0.1.0",
+  "files": [
+    "asset360_rust_bg.wasm",
+    "asset360_rust.js",
+    "asset360_rust.d.ts",
+    "index.js",
+    "index.d.ts"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts"
+}

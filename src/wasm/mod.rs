@@ -119,6 +119,35 @@ impl SchemaViewHandle {
             .map_err(map_schema_error)
     }
 
+    /// Add a schema payload that fulfills an unresolved import reference.
+    #[wasm_bindgen(js_name = addSchemaStrWithImportRef)]
+    pub fn add_schema_str_with_import_ref(
+        &mut self,
+        data: &str,
+        schema_id: &str,
+        uri: &str,
+    ) -> Result<bool, JsValue> {
+        let schema = parse_schema_definition(data)?;
+        self.inner
+            .add_schema_with_import_ref(
+                schema,
+                Some((schema_id.to_string(), uri.to_string())),
+            )
+            .map_err(|err| JsValue::from_str(&err))
+    }
+
+    /// List unresolved import references as `(schema_id, uri)` tuples.
+    #[wasm_bindgen(js_name = getUnresolvedSchemaRefs)]
+    pub fn get_unresolved_schema_refs(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.inner.get_unresolved_schemas())
+    }
+
+    /// Return the resolution URI for a schema identifier, if known.
+    #[wasm_bindgen(js_name = getResolutionUriOfSchema)]
+    pub fn get_resolution_uri_of_schema(&self, schema_id: &str) -> Option<String> {
+        self.inner.get_resolution_uri_of_schema(schema_id)
+    }
+
     /// Retrieve a [`ClassView`] scoped to a specific schema by name.
     #[wasm_bindgen(js_name = classView)]
     pub fn class_view(
@@ -460,6 +489,20 @@ impl LinkMLInstanceHandle {
         }
     }
 
+    #[wasm_bindgen(js_name = slotView)]
+    pub fn slot_view(&self) -> Option<SlotViewHandle> {
+        match &self.inner {
+            LinkMLInstance::Scalar { slot, .. }
+            | LinkMLInstance::List { slot, .. }
+            | LinkMLInstance::Null { slot, .. }
+            | LinkMLInstance::Mapping { slot, .. } => Some(SlotViewHandle::from_inner_with_schema(
+                slot.clone(),
+                slot.schema_id().to_string(),
+            )),
+            LinkMLInstance::Object { .. } => None,
+        }
+    }
+
     #[wasm_bindgen(js_name = className)]
     pub fn class_name(&self) -> Option<String> {
         match &self.inner {
@@ -468,6 +511,22 @@ impl LinkMLInstanceHandle {
             | LinkMLInstance::List { class: Some(c), .. }
             | LinkMLInstance::Mapping { class: Some(c), .. }
             | LinkMLInstance::Null { class: Some(c), .. } => Some(c.def().name.clone()),
+            _ => None,
+        }
+    }
+
+    #[wasm_bindgen(js_name = classView)]
+    pub fn class_view(&self) -> Option<ClassViewHandle> {
+        match &self.inner {
+            LinkMLInstance::Object { class, .. } => {
+                Some(ClassViewHandle::from_inner(class.clone()))
+            }
+            LinkMLInstance::Scalar { class: Some(c), .. }
+            | LinkMLInstance::List { class: Some(c), .. }
+            | LinkMLInstance::Mapping { class: Some(c), .. }
+            | LinkMLInstance::Null { class: Some(c), .. } => {
+                Some(ClassViewHandle::from_inner(c.clone()))
+            }
             _ => None,
         }
     }
