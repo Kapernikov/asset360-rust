@@ -19,6 +19,7 @@ serde_path_to_error = "0.1.17"
 serde_yml = "0.0.12"
 serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true, features = ["serde-serialize"] }
+js-sys = { version = "0.3", optional = true }
 
 [features]
 default = ["stubgen"]
@@ -35,7 +36,7 @@ stubgen = [
     "linkml_runtime_python/stubgen",
     "linkml_meta/stubgen"
 ]
-wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
+wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys"]
 
 [dev-dependencies]
 

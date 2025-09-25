@@ -2,13 +2,16 @@
 //! This module currently offers a minimal handle for loading LinkML schemas
 //! from YAML text so that higher-level APIs can be layered on gradually.
 
+use js_sys::{Array, JSON};
 use serde::Serialize;
 use serde_wasm_bindgen::to_value;
 use wasm_bindgen::prelude::*;
 
 use linkml_meta::SchemaDefinition;
+use linkml_runtime::{LinkMLInstance, load_json_str};
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::enumview::EnumView;
+use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::{SchemaView, SchemaViewError};
 use linkml_schemaview::slotview::{RangeInfo, SlotContainerMode, SlotInlineMode, SlotView};
 
@@ -158,6 +161,44 @@ impl SchemaViewHandle {
             .and_then(|defs| defs.get(enum_name))
             .map(|def| EnumView::new(def, &self.inner, schema_id))
             .map(EnumViewHandle::from_inner)
+    }
+
+    /// Create a [`LinkMLInstance`] from JSON text for the given class.
+    #[wasm_bindgen(js_name = loadInstanceFromJson)]
+    pub fn load_instance_from_json(
+        &self,
+        class_name: &str,
+        json: &str,
+    ) -> Result<LinkMLInstanceHandle, JsValue> {
+        let converter = self.inner.converter();
+        let identifier = Identifier::new(class_name);
+        let class_view = self
+            .inner
+            .get_class(&identifier, &converter)
+            .map_err(map_schema_error)?
+            .ok_or_else(|| JsValue::from_str(&format!("class `{class_name}` not found")))?;
+        let instance = load_json_str(json, &self.inner, &class_view, &converter)
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
+        Ok(LinkMLInstanceHandle::from_inner(instance))
+    }
+
+    /// Create a [`LinkMLInstance`] from a JavaScript value for the given class.
+    #[wasm_bindgen(js_name = createInstance)]
+    pub fn create_instance(
+        &self,
+        class_name: &str,
+        value: JsValue,
+    ) -> Result<LinkMLInstanceHandle, JsValue> {
+        if let Some(text) = value.as_string() {
+            return self.load_instance_from_json(class_name, &text);
+        }
+        if value.is_undefined() {
+            return Err(JsValue::from_str(
+                "cannot create LinkMLInstance from undefined value",
+            ));
+        }
+        let json_text: String = JSON::stringify(&value)?.into();
+        self.load_instance_from_json(class_name, &json_text)
     }
 }
 
@@ -375,6 +416,186 @@ impl EnumViewHandle {
 }
 
 #[wasm_bindgen]
+pub struct LinkMLInstanceHandle {
+    inner: LinkMLInstance,
+}
+
+impl LinkMLInstanceHandle {
+    fn from_inner(inner: LinkMLInstance) -> Self {
+        Self { inner }
+    }
+
+    #[cfg(test)]
+    fn as_inner(&self) -> &LinkMLInstance {
+        &self.inner
+    }
+}
+
+#[wasm_bindgen]
+impl LinkMLInstanceHandle {
+    #[wasm_bindgen(js_name = kind)]
+    pub fn kind(&self) -> String {
+        match &self.inner {
+            LinkMLInstance::Scalar { .. } => "scalar".to_string(),
+            LinkMLInstance::Null { .. } => "null".to_string(),
+            LinkMLInstance::List { .. } => "list".to_string(),
+            LinkMLInstance::Mapping { .. } => "mapping".to_string(),
+            LinkMLInstance::Object { .. } => "object".to_string(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = nodeId)]
+    pub fn node_id(&self) -> u64 {
+        self.inner.node_id()
+    }
+
+    #[wasm_bindgen(js_name = slotName)]
+    pub fn slot_name(&self) -> Option<String> {
+        match &self.inner {
+            LinkMLInstance::Scalar { slot, .. }
+            | LinkMLInstance::List { slot, .. }
+            | LinkMLInstance::Null { slot, .. }
+            | LinkMLInstance::Mapping { slot, .. } => Some(slot.name.clone()),
+            LinkMLInstance::Object { .. } => None,
+        }
+    }
+
+    #[wasm_bindgen(js_name = className)]
+    pub fn class_name(&self) -> Option<String> {
+        match &self.inner {
+            LinkMLInstance::Object { class, .. } => Some(class.def().name.clone()),
+            LinkMLInstance::Scalar { class: Some(c), .. }
+            | LinkMLInstance::List { class: Some(c), .. }
+            | LinkMLInstance::Mapping { class: Some(c), .. }
+            | LinkMLInstance::Null { class: Some(c), .. } => Some(c.def().name.clone()),
+            _ => None,
+        }
+    }
+
+    #[wasm_bindgen(js_name = length)]
+    pub fn length(&self) -> usize {
+        match &self.inner {
+            LinkMLInstance::Scalar { .. } | LinkMLInstance::Null { .. } => 0,
+            LinkMLInstance::List { values, .. } => values.len(),
+            LinkMLInstance::Mapping { values, .. } | LinkMLInstance::Object { values, .. } => {
+                values.len()
+            }
+        }
+    }
+
+    #[wasm_bindgen(js_name = keys)]
+    pub fn keys(&self) -> Vec<String> {
+        match &self.inner {
+            LinkMLInstance::Object { values, .. } | LinkMLInstance::Mapping { values, .. } => {
+                values.keys().cloned().collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = values)]
+    pub fn values(&self) -> Vec<LinkMLInstanceHandle> {
+        match &self.inner {
+            LinkMLInstance::Object { values, .. } | LinkMLInstance::Mapping { values, .. } => {
+                values
+                    .values()
+                    .cloned()
+                    .map(LinkMLInstanceHandle::from_inner)
+                    .collect()
+            }
+            LinkMLInstance::List { values, .. } => values
+                .iter()
+                .cloned()
+                .map(LinkMLInstanceHandle::from_inner)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = get)]
+    pub fn get(&self, key: &str) -> Option<LinkMLInstanceHandle> {
+        match &self.inner {
+            LinkMLInstance::Object { values, .. } | LinkMLInstance::Mapping { values, .. } => {
+                values
+                    .get(key)
+                    .cloned()
+                    .map(LinkMLInstanceHandle::from_inner)
+            }
+            _ => None,
+        }
+    }
+
+    #[wasm_bindgen(js_name = at)]
+    pub fn at(&self, index: usize) -> Option<LinkMLInstanceHandle> {
+        match &self.inner {
+            LinkMLInstance::List { values, .. } => values
+                .get(index)
+                .cloned()
+                .map(LinkMLInstanceHandle::from_inner),
+            _ => None,
+        }
+    }
+
+    #[wasm_bindgen(js_name = navigate)]
+    pub fn navigate(&self, path: JsValue) -> Result<Option<LinkMLInstanceHandle>, JsValue> {
+        let segments: Vec<String> = if path.is_undefined() || path.is_null() {
+            Vec::new()
+        } else {
+            if !Array::is_array(&path) {
+                return Err(JsValue::from_str("path must be an array"));
+            }
+            let array = Array::from(&path);
+            let mut segs = Vec::with_capacity(array.length() as usize);
+            for entry in array.iter() {
+                if let Some(seg) = entry.as_string() {
+                    segs.push(seg);
+                } else if let Some(idx) = entry.as_f64() {
+                    if !idx.is_finite() || idx.fract() != 0.0 || idx < 0.0 {
+                        return Err(JsValue::from_str(
+                            "numeric path segments must be finite, non-negative integers",
+                        ));
+                    }
+                    if idx > (usize::MAX as f64) {
+                        return Err(JsValue::from_str("path index out of range"));
+                    }
+                    segs.push(format!("{}", idx as usize));
+                } else {
+                    return Err(JsValue::from_str(
+                        "path entries must be strings or integers",
+                    ));
+                }
+            }
+            segs
+        };
+
+        Ok(self
+            .inner
+            .navigate_path(segments.iter().map(|s| s.as_str()))
+            .map(|value| LinkMLInstanceHandle::from_inner(value.clone())))
+    }
+
+    #[wasm_bindgen(js_name = scalarValue)]
+    pub fn scalar_value(&self) -> Result<JsValue, JsValue> {
+        match &self.inner {
+            LinkMLInstance::Scalar { value, .. } => to_js(value),
+            LinkMLInstance::Null { .. } => Ok(JsValue::NULL),
+            _ => Err(JsValue::from_str("value is not a scalar")),
+        }
+    }
+
+    #[wasm_bindgen(js_name = toPlainJson)]
+    pub fn to_plain_json(&self) -> Result<JsValue, JsValue> {
+        let json = self.inner.to_json();
+        to_js(&json)
+    }
+
+    #[wasm_bindgen(js_name = cloneHandle)]
+    pub fn clone_handle(&self) -> LinkMLInstanceHandle {
+        LinkMLInstanceHandle::from_inner(self.inner.clone())
+    }
+}
+
+#[wasm_bindgen]
 pub struct RangeInfoHandle {
     inner: RangeInfo,
 }
@@ -442,6 +663,7 @@ impl RangeInfoHandle {
 mod tests {
     use super::*;
 
+    #[cfg(target_arch = "wasm32")]
     #[test]
     fn loads_basic_schema() {
         let yaml = r#"
@@ -506,5 +728,70 @@ classes:
                 .enum_view("https://example.org/test", "unknown")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn creates_instances_and_navigates() {
+        let yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+classes:
+  Person:
+    slots:
+      - name
+      - aliases
+slots:
+  name:
+    range: string
+  aliases:
+    range: string
+    multivalued: true
+"#;
+        let view = load_schema_view(yaml).expect("schema loads");
+        let json_data = r#"{"name": "Alice", "aliases": ["Al"]}"#;
+        let instance = view
+            .load_instance_from_json("Person", json_data)
+            .expect("instance loads");
+        assert_eq!(instance.kind(), "object");
+        assert_eq!(instance.class_name().as_deref(), Some("Person"));
+
+        let mut keys = instance.keys();
+        keys.sort();
+        assert_eq!(keys, vec!["aliases".to_string(), "name".to_string()]);
+
+        let alias_list = instance.get("aliases").expect("aliases slot");
+        assert_eq!(alias_list.kind(), "list");
+        assert_eq!(alias_list.length(), 1);
+        match alias_list.as_inner() {
+            LinkMLInstance::List { values, .. } => {
+                assert_eq!(values.len(), 1);
+                match &values[0] {
+                    LinkMLInstance::Scalar { value, .. } => {
+                        assert_eq!(value.as_str(), Some("Al"));
+                    }
+                    _ => panic!("expected scalar list entry"),
+                }
+            }
+            _ => panic!("expected list variant"),
+        }
+
+        let plain = instance.as_inner().to_json();
+        assert_eq!(plain["name"], "Alice");
+        assert_eq!(plain["aliases"][0], "Al");
+
+        let navigated = instance
+            .as_inner()
+            .navigate_path(["aliases", "0"])
+            .expect("navigate inner");
+        match navigated {
+            LinkMLInstance::Scalar { value, .. } => {
+                assert_eq!(value.as_str(), Some("Al"));
+            }
+            _ => panic!("expected scalar result"),
+        }
     }
 }
