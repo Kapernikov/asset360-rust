@@ -3614,10 +3614,10 @@ class SchemaView:
         from linkml_runtime import make_schema_view
         
         sv = make_schema_view()
-        remote_text = """imports:
+        remote_text = '''imports:
           - alias: personinfo
             import_from: https://example.org/personinfo.yaml
-        """
+        '''
         sv.add_schema_str_with_import_ref(
             remote_text,
             "personinfo",
