@@ -250,6 +250,52 @@ The shared derive strategy feeds both bindings: wasm gains concrete `.d.ts` sign
   - `wasm-pack build` (or existing wasm build pipeline)
 - Inspect the generated `.pyi` and `.d.ts` to confirm `definition(): SlotDefinition` with structured fields.
 
+## Unsolved Problems
+
+- **Untagged unions remain opaque to TypeScript tooling.** The metamodel relies on constructs such as:
+
+  ```rust
+  #[derive(Serialize, Deserialize, Clone)]
+  #[serde(untagged)]
+  pub enum AnonymousClassExpression {
+      SlotUsage(SlotUsageExpression),
+      InlineClass(Box<ClassDefinition>),
+  }
+  ```
+
+  `tsify` rejects `serde(untagged)` enums, so the design currently falls back to `JsValue`/`PyObject`. *Possible mitigation:* introduce binding-specific wrappers that inject an explicit tag while converting from the untagged core type:
+
+  ```rust
+  #[cfg_attr(feature = "bindings-types", derive(tsify::Tsify, Serialize, Deserialize))]
+  #[cfg_attr(feature = "bindings-types", tsify(from_wasm_abi, into_wasm_abi))]
+  #[serde(tag = "kind", rename_all = "camelCase")]
+  pub enum BindingAnonymousClassExpression {
+      SlotUsage(SlotUsageExpression),
+      InlineClass(ClassDefinition),
+  }
+
+  impl From<&AnonymousClassExpression> for BindingAnonymousClassExpression {
+      fn from(expr: &AnonymousClassExpression) -> Self {
+          match expr {
+              AnonymousClassExpression::SlotUsage(value) => Self::SlotUsage(value.clone()),
+              AnonymousClassExpression::InlineClass(value) => {
+                  Self::InlineClass((**value).clone())
+              }
+          }
+      }
+  }
+  ```
+
+- **Generated `tsify(type = ...)` annotations need stable type names.** The generator still has to map nested paths like `Box<AnonymousClassExpression>` to exported identifiers (and fail fast if the name is missing from the `register_types!` list).
+
+- **Returning concrete structs from wasm hides existing error paths.** Replacing `Result<JsValue, JsValue>` with `ClassDefinition` changes failure handling; we need to confirm these APIs are truly infallible or keep a fallible signature.
+
+- **`register_types!` must be gated to wasm builds.** Without a `cfg(target_arch = "wasm32")`, enabling the feature for Python-only targets drags wasm-only dependencies into every build.
+
+- **Python bindings still deep-clone definitions.** The proposed getters allocate full copies of `SlotDefinition`/`ClassDefinition`; heavier schemas will amplify the cost unless we add borrowed or iterator-based accessors.
+
+- **Feature plumbing across crates is unresolved.** Enabling `bindings-types` in `asset360-rust` requires matching feature propagation through `rust-linkml-core` and any downstream crates; the design does not yet define how cargo features stay in sync.
+
 ## Risks and Mitigations
 - **Large surface area**: start with high-value structs; introduce lightweight view structs if exposing full metamodel is undesirable.
 - **Derive gaps**: some enums may need manual `#[tsify]` annotations; fallback wrappers keep progress unblocked.
