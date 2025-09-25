@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PROFILE=debug
+PROFILE=release
 OUT_DIR="pkg"
 BINDGEN_TARGET="bundler"
 FEATURES="wasm-bindings"
@@ -16,7 +16,7 @@ Usage: build_wasm.sh [options]
 Build the wasm32 artifact for asset360-rust using wasm-pack and emit npm-ready JS/TS bindings.
 
 Options:
-  --release           Build with --release (default builds debug)
+  --release           Build with --release (default)
   --features <list>   Comma-separated feature list to pass to Cargo (default: wasm-bindings)
   --profile <name>    Cargo profile (debug or release; default debug unless --release)
   --target-dir <dir>  Output directory passed to wasm-pack (default: pkg)
@@ -75,6 +75,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if ! command -v wasm-opt >/dev/null 2>&1; then
+  echo "binaryen (wasm-opt) not found on PATH. install it with 'apt install binaryen'" >&2
+  exit 1
+fi
+
 if ! command -v wasm-pack >/dev/null 2>&1; then
   echo "wasm-pack not found in PATH. Install it with 'cargo install wasm-pack' or use the official installer." >&2
   exit 1
@@ -110,6 +115,21 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
 else
   wasm-pack "${PACK_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
 fi
+
+shopt -s nullglob
+WASM_FILES=("$OUT_DIR"/*.wasm)
+shopt -u nullglob
+
+if [[ ${#WASM_FILES[@]} -eq 0 ]]; then
+  echo "error: wasm-pack did not produce any .wasm artifacts in '$OUT_DIR'" >&2
+  exit 1
+fi
+
+for wasm_path in "${WASM_FILES[@]}"; do
+  tmp_opt="${wasm_path%.wasm}.opt.wasm"
+  wasm-opt -Oz "$wasm_path" -o "$tmp_opt"
+  mv "$tmp_opt" "$wasm_path"
+done
 
 if command -v zip >/dev/null 2>&1; then
   ZIP_OUTPUT="${OUT_DIR%/}.zip"
