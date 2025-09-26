@@ -6,8 +6,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 PROFILE=release
-OUT_DIR="pkg"
-BINDGEN_TARGET="web"
+OUT_DIR="target/wasm/asset360_rust"
+BINDGEN_TARGETS=()
 FEATURES="wasm-bindings"
 SCOPE=""
 EXTRA_ARGS=()
@@ -16,6 +16,20 @@ BINARYEN_VERSION="${BINARYEN_VERSION:-124}"
 BINARYEN_BASE_URL="${BINARYEN_BASE_URL:-https://github.com/WebAssembly/binaryen/releases/download}"
 BINARYEN_CACHE_DIR="${BINARYEN_CACHE_DIR:-${REPO_ROOT}/.cache/binaryen}"
 USE_SYSTEM_BINARYEN="${USE_SYSTEM_BINARYEN:-0}"
+
+DEFAULT_CARGO_HOME="${REPO_ROOT}/target/wasm/.cargo"
+DEFAULT_CARGO_INSTALL_ROOT="${REPO_ROOT}/target/wasm/cargo-install"
+
+if [[ -z "${CARGO_HOME:-}" ]]; then
+  export CARGO_HOME="${DEFAULT_CARGO_HOME}"
+fi
+
+if [[ -z "${CARGO_INSTALL_ROOT:-}" ]]; then
+  export CARGO_INSTALL_ROOT="${DEFAULT_CARGO_INSTALL_ROOT}"
+fi
+
+mkdir -p "${CARGO_HOME}" "${CARGO_HOME}/bin" "${CARGO_INSTALL_ROOT}" "${CARGO_INSTALL_ROOT}/bin"
+export PATH="${CARGO_INSTALL_ROOT}/bin:${CARGO_HOME}/bin:${PATH}"
 
 usage() {
   cat <<'USAGE'
@@ -27,8 +41,8 @@ Options:
   --release           Build with --release (default)
   --features <list>   Comma-separated feature list to pass to Cargo (default: wasm-bindings)
   --profile <name>    Cargo profile (debug or release; default debug unless --release)
-  --target-dir <dir>  Output directory passed to wasm-pack (default: pkg)
-  --bindgen-target <t>  wasm-pack target (default: web)
+  --target-dir <dir>  Base output directory for generated packages (default: target/wasm/asset360_rust)
+  --bindgen-target <t>  wasm-pack target (repeatable; default: bundler, web, nodejs)
   --scope <scope>     npm scope for the generated package (e.g. kapernikov)
   --extra <args>      Extra arguments to pass directly to wasm-pack (repeatable)
   -h, --help          Show this help message
@@ -120,7 +134,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bindgen-target)
       [[ $# -ge 2 ]] || { echo "--bindgen-target requires an argument" >&2; exit 1; }
-      BINDGEN_TARGET="$2"
+      BINDGEN_TARGETS+=("$2")
       shift 2
       ;;
     --target-dir)
@@ -160,20 +174,24 @@ if [[ "$PROFILE" != "release" && "$PROFILE" != "debug" ]]; then
   exit 1
 fi
 
-PACK_ARGS=("build")
-PACK_ARGS+=("--target" "$BINDGEN_TARGET")
-PACK_ARGS+=("--out-dir" "$OUT_DIR")
-PACK_ARGS+=("--no-opt")
-
-if [[ "$PROFILE" == "release" ]]; then
-  PACK_ARGS+=("--release")
-else
-  PACK_ARGS+=("--dev")
+if [[ ${#BINDGEN_TARGETS[@]} -eq 0 ]]; then
+  BINDGEN_TARGETS=("bundler" "web" "nodejs")
 fi
 
-if [[ -n "$SCOPE" ]]; then
-  PACK_ARGS+=("--scope" "$SCOPE")
-fi
+VALID_TARGETS=("bundler" "web" "nodejs")
+for target in "${BINDGEN_TARGETS[@]}"; do
+  case "$target" in
+    bundler|web|nodejs)
+      ;;
+    *)
+      echo "Unsupported wasm-pack target '$target'. Supported targets: bundler, web, nodejs" >&2
+      exit 1
+      ;;
+  esac
+done
+
+rm -rf "$OUT_DIR"
+mkdir -p "$OUT_DIR"
 
 CARGO_EXTRA_ARGS=("--no-default-features" "--features" "$FEATURES")
 
@@ -181,37 +199,206 @@ if [[ -n "${CARGO_TARGET_DIR-}" ]]; then
   CARGO_EXTRA_ARGS+=("--target-dir" "$CARGO_TARGET_DIR")
 fi
 
-if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
-  : "${WASM_BINDGEN_NO_EXTERNREF:=1}"
-  WASM_BINDGEN_NO_EXTERNREF="$WASM_BINDGEN_NO_EXTERNREF" wasm-pack "${PACK_ARGS[@]}" "${EXTRA_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
-else
-  : "${WASM_BINDGEN_NO_EXTERNREF:=1}"
-  WASM_BINDGEN_NO_EXTERNREF="$WASM_BINDGEN_NO_EXTERNREF" wasm-pack "${PACK_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
-fi
+WASM_OPT_BIN="$(ensure_binaryen)"
 
-shopt -s nullglob
-WASM_FILES=("$OUT_DIR"/*.wasm)
-shopt -u nullglob
+build_target() {
+  local target="$1"
+  local out_dir="$2"
 
-if [[ ${#WASM_FILES[@]} -eq 0 ]]; then
-  echo "error: wasm-pack did not produce any .wasm artifacts in '$OUT_DIR'" >&2
+  mkdir -p "$out_dir"
+
+  local pack_args=("build" "--target" "$target" "--out-dir" "$out_dir" "--no-opt")
+
+  if [[ "$PROFILE" == "release" ]]; then
+    pack_args+=("--release")
+  else
+    pack_args+=("--dev")
+  fi
+
+  if [[ -n "$SCOPE" ]]; then
+    pack_args+=("--scope" "$SCOPE")
+  fi
+
+  : "${WASM_BINDGEN_NO_EXTERNREF:=1}"
+
+  if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    WASM_BINDGEN_NO_EXTERNREF="$WASM_BINDGEN_NO_EXTERNREF" \
+    wasm-pack "${pack_args[@]}" "${EXTRA_ARGS[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
+  else
+    WASM_BINDGEN_NO_EXTERNREF="$WASM_BINDGEN_NO_EXTERNREF" \
+    wasm-pack "${pack_args[@]}" -- "${CARGO_EXTRA_ARGS[@]}"
+  fi
+
+  shopt -s nullglob
+  local wasm_files=("${out_dir}"/*.wasm)
+  shopt -u nullglob
+
+  if [[ ${#wasm_files[@]} -eq 0 ]]; then
+    echo "error: wasm-pack did not produce any .wasm artifacts in '$out_dir'" >&2
+    exit 1
+  fi
+
+  for wasm_path in "${wasm_files[@]}"; do
+    local wasm_dir="$(dirname "$wasm_path")"
+    local wasm_file="$(basename "$wasm_path")"
+    local tmp_opt="${wasm_dir}/${wasm_file}.opt"
+    "${WASM_OPT_BIN}" -Oz "$wasm_path" -o "$tmp_opt"
+    mv "$tmp_opt" "$wasm_path"
+  done
+}
+
+for target in "${BINDGEN_TARGETS[@]}"; do
+  build_target "$target" "${OUT_DIR}/${target}"
+done
+
+find "${OUT_DIR}" -name '.gitignore' -delete
+
+PRIMARY_TARGET="${BINDGEN_TARGETS[0]}"
+PRIMARY_DIR="${OUT_DIR}/${PRIMARY_TARGET}"
+PRIMARY_PACKAGE_JSON="${PRIMARY_DIR}/package.json"
+
+if [[ ! -f "$PRIMARY_PACKAGE_JSON" ]]; then
+  echo "error: expected '$PRIMARY_PACKAGE_JSON' to exist after wasm-pack build" >&2
   exit 1
 fi
 
-WASM_OPT_BIN="$(ensure_binaryen)"
+readarray -t PACKAGE_META < <(python3 - "$PRIMARY_PACKAGE_JSON" <<'PY'
+import json
+import sys
 
-for wasm_path in "${WASM_FILES[@]}"; do
-  wasm_dir=$(dirname "$wasm_path")
-  wasm_file=$(basename "$wasm_path")
-  tmp_opt="${wasm_dir}/${wasm_file}.opt"
-  "${WASM_OPT_BIN}" -Oz "$wasm_path" -o "$tmp_opt"
-  mv "$tmp_opt" "$wasm_path"
+pkg_path = sys.argv[1]
+with open(pkg_path, 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+
+print(data.get('name', 'asset360-rust'))
+print(data.get('version', '0.0.0'))
+PY
+)
+
+PACKAGE_NAME="${PACKAGE_META[0]}"
+PACKAGE_VERSION="${PACKAGE_META[1]}"
+
+for doc in README.md LICENSE COPYING; do
+  if [[ -f "${PRIMARY_DIR}/${doc}" ]]; then
+    cp "${PRIMARY_DIR}/${doc}" "${OUT_DIR}/${doc}"
+  fi
 done
 
-if command -v zip >/dev/null 2>&1; then
-  ZIP_OUTPUT="${OUT_DIR%/}.zip"
-  rm -f "$ZIP_OUTPUT"
-  zip -qr "$ZIP_OUTPUT" "$OUT_DIR"
+cat >"${OUT_DIR}/index.mjs" <<'INDEX_MJS'
+import * as bindings from './bundler/asset360_rust.js';
+
+export * from './bundler/asset360_rust.js';
+
+let readyPromise = null;
+
+export async function init() {
+  if (readyPromise === null) {
+    readyPromise = Promise.resolve(bindings);
+  }
+  return readyPromise;
+}
+
+export function ready() {
+  return init();
+}
+
+export default init;
+INDEX_MJS
+
+cat >"${OUT_DIR}/index.cjs" <<'INDEX_CJS'
+'use strict';
+
+const bindings = require('./nodejs/asset360_rust.js');
+
+let readyPromise = null;
+
+async function init() {
+  if (readyPromise === null) {
+    readyPromise = Promise.resolve(bindings);
+  }
+  return readyPromise;
+}
+
+function ready() {
+  return init();
+}
+
+const exported = Object.assign({}, bindings, { init, ready });
+exported.default = init;
+
+module.exports = exported;
+INDEX_CJS
+
+cat >"${OUT_DIR}/index.d.ts" <<'INDEX_DTS'
+export * from './bundler/asset360_rust.js';
+
+export type Asset360Bindings = typeof import('./bundler/asset360_rust.js');
+
+export declare function init(): Promise<Asset360Bindings>;
+export declare function ready(): Promise<Asset360Bindings>;
+
+declare const _default: typeof init;
+export default _default;
+INDEX_DTS
+
+FILES_ENTRIES=()
+for target in "${BINDGEN_TARGETS[@]}"; do
+  FILES_ENTRIES+=("\"${target}\"")
+done
+if [[ -f "${OUT_DIR}/README.md" ]]; then
+  FILES_ENTRIES+=("\"README.md\"")
+fi
+if [[ -f "${OUT_DIR}/LICENSE" ]]; then
+  FILES_ENTRIES+=("\"LICENSE\"")
+fi
+FILES_ENTRIES+=("\"index.mjs\"")
+FILES_ENTRIES+=("\"index.cjs\"")
+FILES_ENTRIES+=("\"index.d.ts\"")
+FILES_JSON="["
+for entry in "${FILES_ENTRIES[@]}"; do
+  FILES_JSON+="${entry},"
+done
+FILES_JSON="${FILES_JSON%,}]"
+
+cat >"${OUT_DIR}/package.json" <<PACKAGE_JSON
+{
+  "name": "${PACKAGE_NAME}",
+  "version": "${PACKAGE_VERSION}",
+  "files": ${FILES_JSON},
+  "main": "./index.cjs",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "browser": "./index.mjs",
+      "import": "./index.mjs",
+      "node": "./index.cjs",
+      "require": "./index.cjs",
+      "default": "./index.cjs"
+    },
+    "./web": "./web/asset360_rust.js",
+    "./bundler": "./bundler/asset360_rust.js",
+    "./node": "./nodejs/asset360_rust.js"
+  }
+}
+PACKAGE_JSON
+
+OUT_PARENT="$(dirname "$OUT_DIR")"
+mkdir -p "$OUT_PARENT"
+
+if command -v npm >/dev/null 2>&1; then
+  PACK_BASENAME=$(printf '%s\n' "${PACKAGE_NAME}-${PACKAGE_VERSION}" | sed 's/[^A-Za-z0-9._-]/_/g')
+  if [[ -z "$PACK_BASENAME" ]]; then
+    PACK_BASENAME="asset360-rust-${PACKAGE_VERSION}"
+  fi
+  rm -f "${OUT_PARENT}/${PACK_BASENAME}.tgz"
+  PACK_RESULT=$(cd "$OUT_PARENT" && npm pack "./$(basename "$OUT_DIR")")
+  if [[ -n "${PACK_RESULT-}" ]]; then
+    PACK_FILE="${PACK_RESULT##*$'\n'}"
+    if [[ ! -f "${OUT_PARENT}/${PACK_FILE}" ]]; then
+      echo "warning: npm pack reported '${PACK_FILE}' but file not found" >&2
+    fi
+  fi
 else
-  echo "warning: zip not found; skipping archive creation" >&2
+  echo "warning: npm not found; skipping npm pack tarball creation" >&2
 fi

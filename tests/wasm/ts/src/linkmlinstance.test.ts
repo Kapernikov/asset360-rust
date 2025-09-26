@@ -1,4 +1,5 @@
-import * as asset360 from '../../../../pkg';
+import { ready as readyAsset360 } from 'asset360-rust';
+import * as asset360 from 'asset360-rust';
 const { expect } = require('chai');
 
 const SCHEMA_YAML = `
@@ -32,9 +33,7 @@ const PERSON_JSON = JSON.stringify({ name: 'Alice', aliases: ['Al'], role: 'mana
 
 describe('LinkMLInstance wasm bindings', () => {
   before(async () => {
-    if (typeof asset360.init === 'function') {
-      await asset360.init();
-    }
+    await readyAsset360();
   });
 
   it('creates and inspects instances via wasm', () => {
