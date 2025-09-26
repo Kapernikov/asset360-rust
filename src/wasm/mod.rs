@@ -129,10 +129,7 @@ impl SchemaViewHandle {
     ) -> Result<bool, JsValue> {
         let schema = parse_schema_definition(data)?;
         self.inner
-            .add_schema_with_import_ref(
-                schema,
-                Some((schema_id.to_string(), uri.to_string())),
-            )
+            .add_schema_with_import_ref(schema, Some((schema_id.to_string(), uri.to_string())))
             .map_err(|err| JsValue::from_str(&err))
     }
 

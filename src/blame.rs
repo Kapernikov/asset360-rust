@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use linkml_runtime::diff::PatchOptions;
 use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, patch};
-use linkml_schemaview::schemaview::SchemaView;
 
 /// Asset-specific metadata attached as blame.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -23,7 +22,6 @@ pub struct ChangeStage<M> {
 pub fn apply_deltas(
     base: Option<LinkMLInstance>,
     stages: Vec<ChangeStage<Asset360ChangeMeta>>,
-    sv: &SchemaView,
 ) -> (LinkMLInstance, HashMap<NodeId, Asset360ChangeMeta>) {
     // For now, require a base value with proper class context; creating a root value
     // from scratch requires a target class.
@@ -32,7 +30,7 @@ pub fn apply_deltas(
 
     for stage in stages.into_iter() {
         let (new_value, trace): (LinkMLInstance, PatchTrace) =
-            patch(&value, &stage.deltas, sv, PatchOptions::default()).expect("patch failed");
+            patch(&value, &stage.deltas, PatchOptions::default()).expect("patch failed");
         // Last-writer-wins on added and updated nodes
         for id in trace.added.iter().chain(trace.updated.iter()) {
             blame.insert(*id, stage.meta.clone());
@@ -55,6 +53,7 @@ pub fn get_blame_info<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use linkml_schemaview::schemaview::SchemaView;
 
     #[test]
     fn test_get_blame_info_with_manual_map() {
@@ -137,7 +136,7 @@ classes:
             .unwrap()
             .unwrap();
         let base = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
-        let (out, b) = apply_deltas(Some(base.clone()), vec![], &sv);
+        let (out, b) = apply_deltas(Some(base.clone()), vec![]);
         // Can't assert structural equality without schema context, but Default base should be preserved.
         // We can at least ensure the map is empty.
         assert!(b.is_empty());

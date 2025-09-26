@@ -64,13 +64,13 @@ Blame/Provenance Design
   - `pub struct Asset360ChangeMeta { /* author, timestamp, ticket, etc. */ }`
   - `pub struct ChangeStage<M> { pub meta: M, pub deltas: Vec<Delta> }`
 - Apply with blame
-  - `pub fn apply_deltas(base: Option<LinkMLInstance>, stages: Vec<ChangeStage<Asset360ChangeMeta>>, sv: &SchemaView) -> (LinkMLInstance, HashMap<u64 /*NodeId*/, Asset360ChangeMeta>)`
+  - `pub fn apply_deltas(base: Option<LinkMLInstance>, stages: Vec<ChangeStage<Asset360ChangeMeta>>) -> (LinkMLInstance, HashMap<u64 /*NodeId*/, Asset360ChangeMeta>)`
   - For each stage:
-    - `(value2, trace) = core::patch(value, &stage.deltas, sv)`
+    - `(value2, trace) = core::patch(value, &stage.deltas)`
     - For every id in `trace.added` and `trace.updated`: `blame.insert(id, stage.meta.clone())`
     - `value = value2`
 - Python API
-  - Provide `apply_deltas(stages, sv, base=None) -> (value, blame_map)`.
+  - Provide `apply_deltas(stages, base=None) -> (value, blame_map)`.
   - Provide `get_blame_info(value, blame_map) -> dict | None` that returns the stage metadata dict for `value.node_id` (an int), or `None` if absent.
   - Metadata dicts are created by serializing the Rust struct via `serde_json` into Python objects.
 
