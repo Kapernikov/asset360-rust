@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use linkml_runtime::diff::PatchOptions;
 use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, patch};
@@ -50,10 +50,73 @@ pub fn get_blame_info<'a>(
     blame_map.get(&id)
 }
 
+/// Convert a blame map into a dictionary keyed by dot-separated paths.
+///
+/// Paths use `"<root>"` for the root node. List indices are expressed using
+/// dot notation (for example `items.0.title`).
+pub fn blame_map_to_path_stage_map(
+    value: &LinkMLInstance,
+    blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
+) -> BTreeMap<String, Asset360ChangeMeta> {
+    fn format_path(segments: &[String]) -> String {
+        if segments.is_empty() {
+            return "<root>".to_string();
+        }
+
+        let mut out = String::new();
+        for segment in segments {
+            if out.is_empty() {
+                out.push_str(segment);
+            } else {
+                out.push('.');
+                out.push_str(segment);
+            }
+        }
+        out
+    }
+
+    fn collect(
+        node: &LinkMLInstance,
+        blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
+        path: &mut Vec<String>,
+        out: &mut BTreeMap<String, Asset360ChangeMeta>,
+    ) {
+        if let Some(meta) = blame_map.get(&node.node_id()) {
+            out.insert(format_path(path), meta.clone());
+        }
+
+        match node {
+            LinkMLInstance::Object { values, .. } | LinkMLInstance::Mapping { values, .. } => {
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+                for (key, child) in entries {
+                    path.push(key.clone());
+                    collect(child, blame_map, path, out);
+                    path.pop();
+                }
+            }
+            LinkMLInstance::List { values, .. } => {
+                for (idx, child) in values.iter().enumerate() {
+                    path.push(idx.to_string());
+                    collect(child, blame_map, path, out);
+                    path.pop();
+                }
+            }
+            LinkMLInstance::Scalar { .. } | LinkMLInstance::Null { .. } => {}
+        }
+    }
+
+    let mut entries: BTreeMap<String, Asset360ChangeMeta> = BTreeMap::new();
+    let mut path = Vec::new();
+    collect(value, blame_map, &mut path, &mut entries);
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use linkml_schemaview::schemaview::SchemaView;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_get_blame_info_with_manual_map() {
@@ -142,5 +205,138 @@ classes:
         assert!(b.is_empty());
         // Ensure node_id remains the same when no stages are applied
         assert_eq!(out.node_id(), base.node_id());
+    }
+
+    #[test]
+    fn test_blame_map_to_path_stage_map() {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+
+        let schema_yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+slots:
+  name:
+    range: string
+  child:
+    range: Child
+  items:
+    range: Child
+    multivalued: true
+  title:
+    range: string
+classes:
+  Root:
+    slots:
+      - name
+      - child
+      - items
+  Child:
+    slots:
+      - title
+"#;
+        let deser = yml::Deserializer::from_str(schema_yaml);
+        let schema: SchemaDefinition = p2e::deserialize(deser).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        let conv = sv.converter_for_primary_schema().unwrap();
+        let class = sv
+            .get_class(
+                &linkml_schemaview::identifier::Identifier::new("Root"),
+                conv,
+            )
+            .unwrap()
+            .unwrap();
+
+        let data = r#"
+name: Rooty
+child:
+  title: Kid
+items:
+  - title: First
+  - title: Second
+"#;
+        let value = linkml_runtime::load_yaml_str(data, &sv, &class, conv).unwrap();
+
+        let mut blame = HashMap::new();
+        let root_meta = Asset360ChangeMeta {
+            author: "root-author".into(),
+            timestamp: "t0".into(),
+        };
+        blame.insert(value.node_id(), root_meta.clone());
+
+        let child_title_node = match &value {
+            LinkMLInstance::Object { values, .. } => values
+                .get("child")
+                .and_then(|child| match child {
+                    LinkMLInstance::Object { values, .. } => values.get("title"),
+                    _ => None,
+                })
+                .expect("child.title node present"),
+            _ => panic!("expected root object"),
+        };
+        let child_meta = Asset360ChangeMeta {
+            author: "child-author".into(),
+            timestamp: "t1".into(),
+        };
+        blame.insert(child_title_node.node_id(), child_meta.clone());
+
+        let items_title_nodes = match &value {
+            LinkMLInstance::Object { values, .. } => values
+                .get("items")
+                .and_then(|items| match items {
+                    LinkMLInstance::List { values, .. } => {
+                        if values.len() == 2 {
+                            let first = match &values[0] {
+                                LinkMLInstance::Object { values, .. } => {
+                                    values.get("title").expect("items[0].title")
+                                }
+                                _ => panic!("expected object for items[0]"),
+                            };
+                            let second = match &values[1] {
+                                LinkMLInstance::Object { values, .. } => {
+                                    values.get("title").expect("items[1].title")
+                                }
+                                _ => panic!("expected object for items[1]"),
+                            };
+                            Some((first, second))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .expect("items list present"),
+            _ => panic!("expected root object"),
+        };
+
+        let (item0_title_node, item1_title_node) = items_title_nodes;
+
+        let item0_meta = Asset360ChangeMeta {
+            author: "item0-author".into(),
+            timestamp: "t2".into(),
+        };
+        blame.insert(item0_title_node.node_id(), item0_meta.clone());
+
+        let item1_meta = Asset360ChangeMeta {
+            author: "item1-author".into(),
+            timestamp: "t3".into(),
+        };
+        blame.insert(item1_title_node.node_id(), item1_meta.clone());
+
+        let entries = blame_map_to_path_stage_map(&value, &blame);
+
+        let mut expected = BTreeMap::new();
+        expected.insert("<root>".to_string(), root_meta);
+        expected.insert("child.title".to_string(), child_meta);
+        expected.insert("items.0.title".to_string(), item0_meta);
+        expected.insert("items.1.title".to_string(), item1_meta);
+
+        assert_eq!(entries, expected);
     }
 }
