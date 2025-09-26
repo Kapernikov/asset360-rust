@@ -3,6 +3,23 @@ use std::collections::{BTreeMap, HashMap};
 use linkml_runtime::diff::PatchOptions;
 use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, patch};
 
+pub(crate) fn format_path(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return "<root>".to_string();
+    }
+
+    let mut out = String::new();
+    for segment in segments {
+        if out.is_empty() {
+            out.push_str(segment);
+        } else {
+            out.push('.');
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
 /// Asset-specific metadata attached as blame.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Asset360ChangeMeta {
@@ -58,23 +75,6 @@ pub fn blame_map_to_path_stage_map(
     value: &LinkMLInstance,
     blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
 ) -> BTreeMap<String, Asset360ChangeMeta> {
-    fn format_path(segments: &[String]) -> String {
-        if segments.is_empty() {
-            return "<root>".to_string();
-        }
-
-        let mut out = String::new();
-        for segment in segments {
-            if out.is_empty() {
-                out.push_str(segment);
-            } else {
-                out.push('.');
-                out.push_str(segment);
-            }
-        }
-        out
-    }
-
     fn collect(
         node: &LinkMLInstance,
         blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
@@ -110,6 +110,46 @@ pub fn blame_map_to_path_stage_map(
     let mut path = Vec::new();
     collect(value, blame_map, &mut path, &mut entries);
     entries
+}
+
+#[cfg(feature = "python-bindings")]
+mod py_conversions {
+    use super::Asset360ChangeMeta;
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+
+    impl<'py> FromPyObject<'py> for Asset360ChangeMeta {
+        fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+            let dict = ob.downcast::<PyDict>()?;
+            let author_field = dict
+                .get_item("author")?
+                .ok_or_else(|| PyValueError::new_err("missing 'author' in metadata"))?;
+            let timestamp_field = dict
+                .get_item("timestamp")?
+                .ok_or_else(|| PyValueError::new_err("missing 'timestamp' in metadata"))?;
+            Ok(Asset360ChangeMeta {
+                author: author_field.extract()?,
+                timestamp: timestamp_field.extract()?,
+            })
+        }
+    }
+
+    impl<'py> pyo3::IntoPyObject<'py> for Asset360ChangeMeta {
+        type Target = PyAny;
+        type Output = Bound<'py, PyAny>;
+        type Error = PyErr;
+
+        fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+            let dict = PyDict::new(py);
+            let Asset360ChangeMeta {
+                author, timestamp, ..
+            } = self;
+            dict.set_item("author", author)?;
+            dict.set_item("timestamp", timestamp)?;
+            Ok(dict.into_any())
+        }
+    }
 }
 
 #[cfg(test)]

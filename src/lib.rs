@@ -9,16 +9,25 @@ use pyo3::types::PyModule;
 use pyo3_stub_gen::{define_stub_info_gatherer, derive::gen_stub_pyfunction};
 
 #[cfg(feature = "python-bindings")]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[cfg(feature = "python-bindings")]
 use linkml_meta::{Annotation, ClassDefinition};
+#[cfg(feature = "python-bindings")]
+use linkml_runtime::NodeId;
+#[cfg(feature = "python-bindings")]
+use linkml_runtime_python::PyLinkMLInstance;
 #[cfg(feature = "python-bindings")]
 use linkml_runtime_python::PySchemaView;
 #[cfg(feature = "python-bindings")]
 use linkml_schemaview::converter::Converter;
 #[cfg(feature = "python-bindings")]
 use linkml_schemaview::schemaview::SchemaView;
+#[cfg(feature = "python-bindings")]
+use pyo3::types::{PyAny, PyAnyMethods};
+
+#[cfg(feature = "python-bindings")]
+use crate::blame::{Asset360ChangeMeta, format_path};
 
 pub mod blame;
 
@@ -36,6 +45,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         get_all_classes_by_type_designator_and_schema,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(blame_map_to_path_stage_map, m)?)?;
     Ok(())
 }
 
@@ -202,6 +212,76 @@ fn get_all_classes_by_type_designator_and_schema(
         only_registered,
         only_default,
     )
+}
+
+#[cfg(feature = "python-bindings")]
+fn collect_paths_from_py_value(
+    py: Python<'_>,
+    node: &Bound<'_, PyAny>,
+    blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
+    path: &mut Vec<String>,
+    out: &mut BTreeMap<String, Asset360ChangeMeta>,
+) -> PyResult<()> {
+    let node_id: u64 = node.getattr("node_id")?.extract()?;
+    if let Some(meta) = blame_map.get(&node_id) {
+        out.insert(format_path(path), meta.clone());
+    }
+
+    let kind: String = node.getattr("kind")?.extract()?;
+    match kind.as_str() {
+        "object" | "mapping" => {
+            let mut keys: Vec<String> = node.call_method0("keys")?.extract()?;
+            keys.sort();
+            for key in keys {
+                let child = node.get_item(key.as_str())?;
+                path.push(key);
+                collect_paths_from_py_value(py, &child, blame_map, path, out)?;
+                path.pop();
+            }
+        }
+        "list" => {
+            let len = node.len()?;
+            for idx in 0..len {
+                let child = node.get_item(idx)?;
+                path.push(idx.to_string());
+                collect_paths_from_py_value(py, &child, blame_map, path, out)?;
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[cfg(feature = "stubgen")]
+#[gen_stub(override_return_type(type_repr = "dict[str, dict[str, str]]"))]
+#[pyfunction(
+    name = "blame_map_to_path_stage_map",
+    signature = (value, blame_map)
+)]
+fn blame_map_to_path_stage_map(
+    py: Python<'_>,
+    #[cfg(feature = "stubgen")]
+    #[gen_stub(
+        override_type(
+            type_repr = "asset360_rust.LinkMLInstance",
+            imports = ("asset360_rust",)
+        )
+    )]
+    value: Py<PyLinkMLInstance>,
+    #[cfg(feature = "stubgen")]
+    #[gen_stub(override_type(type_repr = "dict[int, dict[str, str]]"))]
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<BTreeMap<String, Asset360ChangeMeta>> {
+    let mut entries: BTreeMap<String, Asset360ChangeMeta> = BTreeMap::new();
+    let mut path = Vec::new();
+
+    let value_any = value.into_bound(py).into_any();
+    collect_paths_from_py_value(py, &value_any, &blame_map, &mut path, &mut entries)?;
+
+    Ok(entries)
 }
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
