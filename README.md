@@ -20,6 +20,13 @@ Build wheels
 
 - `maturin build` (artifacts in `./target/wheels` or `./dist`)
 
+Makefile targets
+----------------
+
+- `make wheel` builds the Python wheel via `scripts/build_py.sh` (optional `PYTHON_VERSION=x.y`).
+- `make npm` builds the Wasm bundle under `pkg/`.
+- `make test-ts` runs the TypeScript tests, rebuilding the Wasm bundle first.
+
 Notes
 -----
 
