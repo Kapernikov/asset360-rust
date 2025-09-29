@@ -3,23 +3,6 @@ use std::collections::{BTreeMap, HashMap};
 use linkml_runtime::diff::PatchOptions;
 use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, patch};
 
-pub(crate) fn format_path(segments: &[String]) -> String {
-    if segments.is_empty() {
-        return "<root>".to_string();
-    }
-
-    let mut out = String::new();
-    for segment in segments {
-        if out.is_empty() {
-            out.push_str(segment);
-        } else {
-            out.push('.');
-            out.push_str(segment);
-        }
-    }
-    out
-}
-
 /// Asset-specific metadata attached as blame.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Asset360ChangeMeta {
@@ -70,22 +53,22 @@ pub fn get_blame_info<'a>(
     blame_map.get(&id)
 }
 
-/// Convert a blame map into a dictionary keyed by dot-separated paths.
+/// Convert a blame map into ordered `(path_segments, metadata)` pairs.
 ///
-/// Paths use `"<root>"` for the root node. List indices are expressed using
-/// dot notation (for example `items.0.title`).
+/// Each path is represented as the list of path components from the root to
+/// the node. The root path is an empty list.
 pub fn blame_map_to_path_stage_map(
     value: &LinkMLInstance,
     blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
-) -> BTreeMap<String, Asset360ChangeMeta> {
+) -> Vec<(Vec<String>, Asset360ChangeMeta)> {
     fn collect(
         node: &LinkMLInstance,
         blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
         path: &mut Vec<String>,
-        out: &mut BTreeMap<String, Asset360ChangeMeta>,
+        out: &mut BTreeMap<Vec<String>, Asset360ChangeMeta>,
     ) {
         if let Some(meta) = blame_map.get(&node.node_id()) {
-            out.insert(format_path(path), meta.clone());
+            out.insert(path.clone(), meta.clone());
         }
 
         match node {
@@ -109,10 +92,10 @@ pub fn blame_map_to_path_stage_map(
         }
     }
 
-    let mut entries: BTreeMap<String, Asset360ChangeMeta> = BTreeMap::new();
+    let mut entries: BTreeMap<Vec<String>, Asset360ChangeMeta> = BTreeMap::new();
     let mut path = Vec::new();
     collect(value, blame_map, &mut path, &mut entries);
-    entries
+    entries.into_iter().collect()
 }
 
 #[cfg(feature = "python-bindings")]
@@ -168,8 +151,6 @@ mod py_conversions {
 mod tests {
     use super::*;
     use linkml_schemaview::schemaview::SchemaView;
-    use std::collections::BTreeMap;
-
     #[test]
     fn test_get_blame_info_with_manual_map() {
         // Build a tiny manual blame map and a dummy value
@@ -401,11 +382,18 @@ items:
 
         let entries = blame_map_to_path_stage_map(&value, &blame);
 
-        let mut expected = BTreeMap::new();
-        expected.insert("<root>".to_string(), root_meta);
-        expected.insert("child.title".to_string(), child_meta);
-        expected.insert("items.0.title".to_string(), item0_meta);
-        expected.insert("items.1.title".to_string(), item1_meta);
+        let expected = vec![
+            (vec![], root_meta),
+            (vec!["child".to_string(), "title".to_string()], child_meta),
+            (
+                vec!["items".to_string(), "0".to_string(), "title".to_string()],
+                item0_meta,
+            ),
+            (
+                vec!["items".to_string(), "1".to_string(), "title".to_string()],
+                item1_meta,
+            ),
+        ];
 
         assert_eq!(entries, expected);
     }

@@ -25,7 +25,7 @@ use linkml_schemaview::schemaview::SchemaView;
 use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyList, PyModule};
 
 #[cfg(feature = "python-bindings")]
-use crate::blame::{Asset360ChangeMeta, format_path};
+use crate::blame::Asset360ChangeMeta;
 
 pub mod blame;
 
@@ -222,11 +222,11 @@ fn collect_paths_from_py_value(
     node: &Bound<'_, PyAny>,
     blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
     path: &mut Vec<String>,
-    out: &mut BTreeMap<String, Asset360ChangeMeta>,
+    out: &mut BTreeMap<Vec<String>, Asset360ChangeMeta>,
 ) -> PyResult<()> {
     let node_id: u64 = node.getattr("node_id")?.extract()?;
     if let Some(meta) = blame_map.get(&node_id) {
-        out.insert(format_path(path), meta.clone());
+        out.insert(path.clone(), meta.clone());
     }
 
     let kind: String = node.getattr("kind")?.extract()?;
@@ -260,7 +260,7 @@ fn collect_paths_from_py_value(
 #[cfg(feature = "stubgen")]
 #[gen_stub(
     override_return_type(
-        type_repr = "dict[str, dict[str, typing.Any]]",
+        type_repr = "list[tuple[list[str], dict[str, typing.Any]]]",
         imports = ("typing",)
     )
 )]
@@ -286,14 +286,14 @@ fn blame_map_to_path_stage_map(
         )
     )]
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
-) -> PyResult<BTreeMap<String, Asset360ChangeMeta>> {
-    let mut entries: BTreeMap<String, Asset360ChangeMeta> = BTreeMap::new();
+) -> PyResult<Vec<(Vec<String>, Asset360ChangeMeta)>> {
+    let mut entries: BTreeMap<Vec<String>, Asset360ChangeMeta> = BTreeMap::new();
     let mut path = Vec::new();
 
     let value_any = value.into_bound(py).into_any();
     collect_paths_from_py_value(py, &value_any, &blame_map, &mut path, &mut entries)?;
 
-    Ok(entries)
+    Ok(entries.into_iter().collect())
 }
 
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
