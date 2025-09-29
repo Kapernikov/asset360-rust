@@ -9,23 +9,29 @@ use pyo3_stub_gen::{
 };
 
 #[cfg(feature = "python-bindings")]
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 #[cfg(feature = "python-bindings")]
 use linkml_meta::{Annotation, ClassDefinition};
 #[cfg(feature = "python-bindings")]
-use linkml_runtime::NodeId;
+use linkml_runtime::{LinkMLInstance, NodeId, diff::Delta};
 #[cfg(feature = "python-bindings")]
-use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView};
+use linkml_runtime_python::{PyClassView, PyLinkMLInstance, PySchemaView};
 #[cfg(feature = "python-bindings")]
 use linkml_schemaview::converter::Converter;
 #[cfg(feature = "python-bindings")]
+use linkml_schemaview::identifier::Identifier;
+#[cfg(feature = "python-bindings")]
 use linkml_schemaview::schemaview::SchemaView;
 #[cfg(feature = "python-bindings")]
-use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyList, PyModule};
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python-bindings")]
+use pyo3::types::{PyDict, PyModule};
+#[cfg(feature = "python-bindings")]
+use serde_json;
 
 #[cfg(feature = "python-bindings")]
-use crate::blame::Asset360ChangeMeta;
+use crate::blame::{Asset360ChangeMeta, ChangeStage};
 
 pub mod blame;
 
@@ -125,6 +131,61 @@ fn compute_classes_by_type_designator(
     out
 }
 
+#[cfg(feature = "python-bindings")]
+fn pylinkml_to_rust_instance(
+    py: Python<'_>,
+    value: &Py<PyLinkMLInstance>,
+) -> PyResult<(LinkMLInstance, Py<PySchemaView>, Py<PyClassView>)> {
+    let value_bound = value.clone_ref(py).into_bound(py);
+    let value_any = value_bound.as_any();
+    let sv_py: Py<PySchemaView> = value_any.getattr("schema_view")?.extract()?;
+    let class_name: String = value_any
+        .getattr("class_name")?
+        .extract::<Option<String>>()?
+        .ok_or_else(|| PyValueError::new_err("LinkMLInstance missing class name"))?;
+    let class_view_py: Py<PyClassView> = sv_py
+        .bind(py)
+        .call_method1("get_class_view", (class_name.as_str(),))?
+        .extract::<Option<Py<PyClassView>>>()?
+        .ok_or_else(|| PyValueError::new_err(format!("class '{class_name}' not found")))?;
+    let json_state = value_any.call_method0("as_python")?;
+
+    let sv_clone = {
+        let sv_bound = sv_py.bind(py);
+        sv_bound.borrow().as_rust().clone()
+    };
+    let converter: Converter = sv_clone.converter();
+    let class_view = sv_clone
+        .get_class(&Identifier::new(&class_name), &converter)
+        .map_err(|e| PyValueError::new_err(format!("{e:?}")))?
+        .ok_or_else(|| PyValueError::new_err(format!("class '{class_name}' not found")))?;
+
+    let json_mod = PyModule::import(py, "json")?;
+    let json_text: String = json_mod.call_method1("dumps", (json_state,))?.extract()?;
+
+    let linkml = linkml_runtime::load_json_str(&json_text, &sv_clone, &class_view, &converter)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((linkml, sv_py, class_view_py))
+}
+
+#[cfg(feature = "python-bindings")]
+fn rust_instance_to_py(
+    py: Python<'_>,
+    value: &LinkMLInstance,
+    schemaview: Py<PySchemaView>,
+    class_view: Py<PyClassView>,
+) -> PyResult<Py<PyLinkMLInstance>> {
+    let json_value = value.to_json();
+    let json_text =
+        serde_json::to_string(&json_value).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let module = PyModule::import(py, "asset360_rust._native2")?;
+    let load_json = module.getattr("load_json")?;
+    load_json
+        .call1((json_text, schemaview, class_view))?
+        .extract()
+}
+
 /// Return every class keyed by its resolved type designator.
 ///
 /// * `schemaview` – existing [`SchemaView`] instance to inspect.
@@ -216,52 +277,12 @@ fn get_all_classes_by_type_designator_and_schema(
     )
 }
 
-#[cfg(feature = "python-bindings")]
-fn collect_paths_from_py_value(
-    py: Python<'_>,
-    node: &Bound<'_, PyAny>,
-    blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
-    path: &mut Vec<String>,
-    out: &mut BTreeMap<Vec<String>, Asset360ChangeMeta>,
-) -> PyResult<()> {
-    let node_id: u64 = node.getattr("node_id")?.extract()?;
-    if let Some(meta) = blame_map.get(&node_id) {
-        out.insert(path.clone(), meta.clone());
-    }
-
-    let kind: String = node.getattr("kind")?.extract()?;
-    match kind.as_str() {
-        "object" | "mapping" => {
-            let mut keys: Vec<String> = node.call_method0("keys")?.extract()?;
-            keys.sort();
-            for key in keys {
-                let child = node.get_item(key.as_str())?;
-                path.push(key);
-                collect_paths_from_py_value(py, &child, blame_map, path, out)?;
-                path.pop();
-            }
-        }
-        "list" => {
-            let len = node.len()?;
-            for idx in 0..len {
-                let child = node.get_item(idx)?;
-                path.push(idx.to_string());
-                collect_paths_from_py_value(py, &child, blame_map, path, out)?;
-                path.pop();
-            }
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[cfg(feature = "stubgen")]
 #[gen_stub(
     override_return_type(
-        type_repr = "list[tuple[list[str], dict[str, typing.Any]]]",
-        imports = ("typing",)
+        type_repr = "list[tuple[list[str], asset360_rust.Asset360ChangeMeta]]",
+        imports = ("typing", "asset360_rust")
     )
 )]
 #[pyfunction(
@@ -287,13 +308,11 @@ fn blame_map_to_path_stage_map(
     )]
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<Vec<(Vec<String>, Asset360ChangeMeta)>> {
-    let mut entries: BTreeMap<Vec<String>, Asset360ChangeMeta> = BTreeMap::new();
-    let mut path = Vec::new();
-
-    let value_any = value.into_bound(py).into_any();
-    collect_paths_from_py_value(py, &value_any, &blame_map, &mut path, &mut entries)?;
-
-    Ok(entries.into_iter().collect())
+    let (rust_value, _, _) = pylinkml_to_rust_instance(py, &value)?;
+    Ok(crate::blame::blame_map_to_path_stage_map(
+        &rust_value,
+        &blame_map,
+    ))
 }
 
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
@@ -363,37 +382,63 @@ impl From<Asset360ChangeMeta> for PyAsset360ChangeMeta {
     }
 }
 
+impl PyAsset360ChangeMeta {
+    fn clone_inner(&self) -> Asset360ChangeMeta {
+        self.inner.clone()
+    }
+}
+
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass(name = "ChangeStage")]
 struct PyChangeStage {
-    meta: PyAsset360ChangeMeta,
-    deltas: Vec<Py<PyDelta>>,
+    inner: ChangeStage<Asset360ChangeMeta>,
 }
 
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl PyChangeStage {
     #[new]
-    fn new(meta: PyAsset360ChangeMeta, deltas: Vec<Py<PyDelta>>) -> Self {
-        Self { meta, deltas }
+    fn new(meta: PyAsset360ChangeMeta, deltas: Vec<String>) -> PyResult<Self> {
+        let mut rust_deltas: Vec<Delta> = Vec::with_capacity(deltas.len());
+        for delta_json in deltas {
+            let delta_struct: Delta = serde_json::from_str(&delta_json)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            rust_deltas.push(delta_struct);
+        }
+        Ok(Self {
+            inner: ChangeStage {
+                meta: meta.clone_inner(),
+                deltas: rust_deltas,
+            },
+        })
     }
 
     #[getter]
     fn meta(&self) -> PyAsset360ChangeMeta {
-        self.meta.clone()
+        PyAsset360ChangeMeta::from(self.inner.meta.clone())
     }
 
     #[getter]
-    fn deltas<'py>(&self, py: Python<'py>) -> Vec<Py<PyDelta>> {
-        self.deltas.iter().map(|d| d.clone_ref(py)).collect()
+    fn deltas(&self) -> PyResult<Vec<String>> {
+        self.inner
+            .deltas
+            .iter()
+            .map(|d| serde_json::to_string(d).map_err(|e| PyValueError::new_err(e.to_string())))
+            .collect()
     }
 
     fn __repr__(&self) -> String {
         format!(
             "ChangeStage(meta={}, deltas_len={})",
-            self.meta.__repr__(),
-            self.deltas.len()
+            PyAsset360ChangeMeta::from(self.inner.meta.clone()).__repr__(),
+            self.inner.deltas.len()
         )
+    }
+}
+
+impl PyChangeStage {
+    fn clone_inner(&self) -> ChangeStage<Asset360ChangeMeta> {
+        self.inner.clone()
     }
 }
 
@@ -407,42 +452,28 @@ fn apply_deltas_py(
     base: Py<PyLinkMLInstance>,
     stages: Vec<Py<PyChangeStage>>,
 ) -> PyResult<(Py<PyLinkMLInstance>, Py<PyDict>)> {
-    let module = PyModule::import(py, "asset360_rust._native2")?;
-    let patch_fn = module.getattr("patch")?;
+    let (base_rust, sv_py, class_view_py) = pylinkml_to_rust_instance(py, &base)?;
 
-    let mut current = base;
-    let blame_dict = PyDict::new(py);
-
+    let mut rust_stages: Vec<ChangeStage<Asset360ChangeMeta>> = Vec::with_capacity(stages.len());
     for stage in stages {
-        let (meta_py, deltas_refs) = {
-            let bound = stage.bind(py);
-            let stage_ref = bound.borrow();
-            let meta_py = Py::new(py, stage_ref.meta.clone())?;
-            let deltas = stage_ref
-                .deltas
-                .iter()
-                .map(|d| d.clone_ref(py))
-                .collect::<Vec<_>>();
-            (meta_py, deltas)
-        };
-
-        let deltas_list = PyList::empty(py);
-        for delta in &deltas_refs {
-            deltas_list.append(delta.clone_ref(py))?;
-        }
-
-        let patch_result = patch_fn.call1((current.clone_ref(py), deltas_list))?;
-        let trace = patch_result.getattr("trace")?;
-        let mut ids: Vec<NodeId> = trace.getattr("added")?.extract()?;
-        ids.extend(trace.getattr("updated")?.extract::<Vec<NodeId>>()?);
-        for node_id in ids {
-            blame_dict.set_item(node_id, meta_py.clone_ref(py))?;
-        }
-
-        current = patch_result.getattr("value")?.extract()?;
+        let bound = stage.bind(py);
+        rust_stages.push(bound.borrow().clone_inner());
     }
 
-    Ok((current, Py::from(blame_dict)))
+    let (updated, blame_map) = crate::blame::apply_deltas(Some(base_rust), rust_stages);
+    let py_instance = rust_instance_to_py(
+        py,
+        &updated,
+        sv_py.clone_ref(py),
+        class_view_py.clone_ref(py),
+    )?;
+
+    let blame_dict = PyDict::new(py);
+    for (node_id, meta) in blame_map {
+        blame_dict.set_item(node_id, Py::new(py, PyAsset360ChangeMeta::from(meta))?)?;
+    }
+
+    Ok((py_instance, Py::from(blame_dict)))
 }
 
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
@@ -450,25 +481,29 @@ fn apply_deltas_py(
     name = "get_blame_info",
     signature = (value, blame_map)
 )]
+#[cfg(feature = "stubgen")]
+#[gen_stub(
+    override_return_type(
+        type_repr = "typing.Optional[asset360_rust.Asset360ChangeMeta]",
+        imports = ("typing", "asset360_rust")
+    )
+)]
 fn get_blame_info_py(
     py: Python<'_>,
     value: Py<PyLinkMLInstance>,
-    blame_map: &Bound<'_, PyDict>,
+    #[cfg(feature = "stubgen")]
+    #[gen_stub(
+        override_type(
+            type_repr = "dict[int, asset360_rust.Asset360ChangeMeta]",
+            imports = ("typing", "asset360_rust")
+        )
+    )]
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<Option<Py<PyAsset360ChangeMeta>>> {
-    let value_any = value.into_bound(py).into_any();
-    let node_id: NodeId = value_any.getattr("node_id")?.extract()?;
-    if let Some(meta_any) = blame_map.get_item(node_id)? {
-        if meta_any.is_instance_of::<PyAsset360ChangeMeta>() {
-            let meta_py: Py<PyAsset360ChangeMeta> = meta_any.extract()?;
-            let cloned = {
-                let bound = meta_py.bind(py);
-                Py::new(py, bound.borrow().clone())?
-            };
-            Ok(Some(cloned))
-        } else {
-            let meta_struct: Asset360ChangeMeta = meta_any.extract()?;
-            Ok(Some(Py::new(py, PyAsset360ChangeMeta::from(meta_struct))?))
-        }
+    let (rust_value, _, _) = pylinkml_to_rust_instance(py, &value)?;
+
+    if let Some(meta) = crate::blame::get_blame_info(&rust_value, &blame_map) {
+        Ok(Some(Py::new(py, PyAsset360ChangeMeta::from(meta.clone()))?))
     } else {
         Ok(None)
     }
