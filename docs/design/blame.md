@@ -141,6 +141,9 @@ Asset360 (this crate)
 pub struct Asset360ChangeMeta {
     pub author: String,
     pub timestamp: String,
+    pub source: String,
+    pub change_id: u64,
+    pub ics_id: u64,
     // other fields as needed
 }
 

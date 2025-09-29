@@ -25,6 +25,9 @@ pub(crate) fn format_path(segments: &[String]) -> String {
 pub struct Asset360ChangeMeta {
     pub author: String,
     pub timestamp: String,
+    pub source: String,
+    pub change_id: u64,
+    pub ics_id: u64,
     // Extend with more fields as needed
 }
 
@@ -122,15 +125,16 @@ mod py_conversions {
     impl<'py> FromPyObject<'py> for Asset360ChangeMeta {
         fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
             let dict = ob.downcast::<PyDict>()?;
-            let author_field = dict
-                .get_item("author")?
-                .ok_or_else(|| PyValueError::new_err("missing 'author' in metadata"))?;
-            let timestamp_field = dict
-                .get_item("timestamp")?
-                .ok_or_else(|| PyValueError::new_err("missing 'timestamp' in metadata"))?;
+            let require = |key: &str| {
+                dict.get_item(key)?
+                    .ok_or_else(|| PyValueError::new_err(format!("missing '{key}' in metadata")))
+            };
             Ok(Asset360ChangeMeta {
-                author: author_field.extract()?,
-                timestamp: timestamp_field.extract()?,
+                author: require("author")?.extract()?,
+                timestamp: require("timestamp")?.extract()?,
+                source: require("source")?.extract()?,
+                change_id: require("change_id")?.extract()?,
+                ics_id: require("ics_id")?.extract()?,
             })
         }
     }
@@ -143,10 +147,18 @@ mod py_conversions {
         fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
             let dict = PyDict::new(py);
             let Asset360ChangeMeta {
-                author, timestamp, ..
+                author,
+                timestamp,
+                source,
+                change_id,
+                ics_id,
+                ..
             } = self;
             dict.set_item("author", author)?;
             dict.set_item("timestamp", timestamp)?;
+            dict.set_item("source", source)?;
+            dict.set_item("change_id", change_id)?;
+            dict.set_item("ics_id", ics_id)?;
             Ok(dict.into_any())
         }
     }
@@ -165,10 +177,16 @@ mod tests {
         let meta1 = Asset360ChangeMeta {
             author: "a".into(),
             timestamp: "t1".into(),
+            source: "manual".into(),
+            change_id: 1,
+            ics_id: 101,
         };
         let meta2 = Asset360ChangeMeta {
             author: "b".into(),
             timestamp: "t2".into(),
+            source: "manual".into(),
+            change_id: 2,
+            ics_id: 102,
         };
 
         // Create a minimal value by parsing an empty object for a dummy class
@@ -307,6 +325,9 @@ items:
         let root_meta = Asset360ChangeMeta {
             author: "root-author".into(),
             timestamp: "t0".into(),
+            source: "import".into(),
+            change_id: 1,
+            ics_id: 10,
         };
         blame.insert(value.node_id(), root_meta.clone());
 
@@ -323,6 +344,9 @@ items:
         let child_meta = Asset360ChangeMeta {
             author: "child-author".into(),
             timestamp: "t1".into(),
+            source: "import".into(),
+            change_id: 2,
+            ics_id: 20,
         };
         blame.insert(child_title_node.node_id(), child_meta.clone());
 
@@ -360,12 +384,18 @@ items:
         let item0_meta = Asset360ChangeMeta {
             author: "item0-author".into(),
             timestamp: "t2".into(),
+            source: "import".into(),
+            change_id: 3,
+            ics_id: 30,
         };
         blame.insert(item0_title_node.node_id(), item0_meta.clone());
 
         let item1_meta = Asset360ChangeMeta {
             author: "item1-author".into(),
             timestamp: "t3".into(),
+            source: "import".into(),
+            change_id: 4,
+            ics_id: 40,
         };
         blame.insert(item1_title_node.node_id(), item1_meta.clone());
 

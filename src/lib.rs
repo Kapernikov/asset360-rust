@@ -256,7 +256,12 @@ fn collect_paths_from_py_value(
 
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[cfg(feature = "stubgen")]
-#[gen_stub(override_return_type(type_repr = "dict[str, dict[str, str]]"))]
+#[gen_stub(
+    override_return_type(
+        type_repr = "dict[str, dict[str, typing.Any]]",
+        imports = ("typing",)
+    )
+)]
 #[pyfunction(
     name = "blame_map_to_path_stage_map",
     signature = (value, blame_map)
@@ -272,7 +277,12 @@ fn blame_map_to_path_stage_map(
     )]
     value: Py<PyLinkMLInstance>,
     #[cfg(feature = "stubgen")]
-    #[gen_stub(override_type(type_repr = "dict[int, dict[str, str]]"))]
+    #[gen_stub(
+        override_type(
+            type_repr = "dict[int, dict[str, typing.Any]]",
+            imports = ("typing",)
+        )
+    )]
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<BTreeMap<String, Asset360ChangeMeta>> {
     let mut entries: BTreeMap<String, Asset360ChangeMeta> = BTreeMap::new();
