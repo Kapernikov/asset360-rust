@@ -137,12 +137,10 @@ fn get_all_classes_by_type_designator_and_schema_impl(
     only_registered: bool,
     only_default: bool,
 ) -> PyResult<HashMap<String, ClassDefinition>> {
-    let sv_arc = {
-        let bound = schemaview.bind(py);
-        bound.borrow().shared_arc()
-    };
+    let bound = schemaview.bind(py);
+    let sv_ref = bound.borrow();
     Ok(compute_classes_by_type_designator(
-        sv_arc.as_ref(),
+        sv_ref.as_rust(),
         only_registered,
         only_default,
         Some(py),
