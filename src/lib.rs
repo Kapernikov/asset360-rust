@@ -14,7 +14,7 @@ use linkml_meta::{Annotation, ClassDefinition};
 #[cfg(feature = "python-bindings")]
 use linkml_runtime::{NodeId, diff::Delta};
 #[cfg(feature = "python-bindings")]
-use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView, node_map_into_pydict};
+use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView};
 #[cfg(feature = "python-bindings")]
 use linkml_schemaview::{Converter, schemaview::SchemaView};
 #[cfg(feature = "python-bindings")]
@@ -246,7 +246,7 @@ fn blame_map_to_path_stage_map(
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<Vec<(Vec<String>, Asset360ChangeMeta)>> {
     let bound = value.bind(py);
-    let rust_value = bound.borrow().clone_value();
+    let rust_value = bound.borrow().value.clone();
     Ok(crate::blame::blame_map_to_path_stage_map(
         &rust_value,
         &blame_map,
@@ -340,7 +340,7 @@ impl PyChangeStage {
         let mut rust_deltas: Vec<Delta> = Vec::with_capacity(deltas.len());
         for delta in deltas {
             let bound = delta.bind(py);
-            rust_deltas.push(bound.borrow().clone_inner());
+            rust_deltas.push(bound.borrow().inner.clone());
         }
         Ok(Self {
             inner: ChangeStage {
@@ -357,11 +357,7 @@ impl PyChangeStage {
 
     #[getter]
     fn deltas<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyDelta>>> {
-        self.inner
-            .deltas
-            .iter()
-            .map(|d| Py::new(py, PyDelta::from(d.clone())))
-            .collect()
+        PyDelta::from_deltas(py, self.inner.deltas.clone())
     }
 
     fn __repr__(&self) -> String {
@@ -391,7 +387,7 @@ fn apply_deltas_py(
 ) -> PyResult<(Py<PyLinkMLInstance>, Py<PyDict>)> {
     let base_bound = base.bind(py);
     let base_instance = base_bound.borrow();
-    let base_value = base_instance.clone_value();
+    let base_value = base_instance.value.clone();
 
     let rust_stages: Vec<_> = stages
         .into_iter()
@@ -402,17 +398,19 @@ fn apply_deltas_py(
         .collect();
 
     let (updated, blame_map) = crate::blame::apply_deltas(Some(base_value), rust_stages);
-    let py_instance = base_instance.wrap_with_value(py, updated)?;
+    let py_instance = Py::new(
+        py,
+        PyLinkMLInstance::new(updated, base_instance.sv.clone_ref(py)),
+    )?;
+    drop(base_instance);
 
-    let blame_entries = blame_map
-        .into_iter()
-        .map(|(node_id, meta)| {
-            Py::new(py, PyAsset360ChangeMeta::from(meta)).map(|py_meta| (node_id, py_meta))
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    let blame_dict = node_map_into_pydict(py, blame_entries)?;
+    let blame_dict = PyDict::new(py);
+    for (node_id, meta) in blame_map {
+        let py_meta = Py::new(py, PyAsset360ChangeMeta::from(meta))?;
+        blame_dict.set_item(node_id, py_meta)?;
+    }
 
-    Ok((py_instance, blame_dict))
+    Ok((py_instance, Py::from(blame_dict)))
 }
 
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
@@ -440,7 +438,7 @@ fn get_blame_info_py(
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<Option<Py<PyAsset360ChangeMeta>>> {
     let bound = value.bind(py);
-    let rust_value = bound.borrow().clone_value();
+    let rust_value = bound.borrow().value.clone();
 
     if let Some(meta) = crate::blame::get_blame_info(&rust_value, &blame_map) {
         Ok(Some(Py::new(py, PyAsset360ChangeMeta::from(meta.clone()))?))
