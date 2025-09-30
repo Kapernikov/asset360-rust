@@ -14,7 +14,7 @@ use linkml_meta::{Annotation, ClassDefinition};
 #[cfg(feature = "python-bindings")]
 use linkml_runtime::{NodeId, diff::Delta};
 #[cfg(feature = "python-bindings")]
-use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView};
+use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView, node_map_into_pydict};
 #[cfg(feature = "python-bindings")]
 use linkml_schemaview::{Converter, schemaview::SchemaView};
 #[cfg(feature = "python-bindings")]
@@ -404,13 +404,15 @@ fn apply_deltas_py(
     )?;
     drop(base_instance);
 
-    let blame_dict = PyDict::new(py);
-    for (node_id, meta) in blame_map {
-        let py_meta = Py::new(py, PyAsset360ChangeMeta::from(meta))?;
-        blame_dict.set_item(node_id, py_meta)?;
-    }
+    let blame_entries = blame_map
+        .into_iter()
+        .map(|(node_id, meta)| {
+            Py::new(py, PyAsset360ChangeMeta::from(meta)).map(|py_meta| (node_id, py_meta))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let blame_dict = node_map_into_pydict(py, blame_entries)?;
 
-    Ok((py_instance, Py::from(blame_dict)))
+    Ok((py_instance, blame_dict))
 }
 
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
