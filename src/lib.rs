@@ -212,6 +212,7 @@ fn get_all_classes_by_type_designator_and_schema(
     )
 }
 
+#[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[cfg(feature = "stubgen")]
 #[gen_stub(
@@ -251,6 +252,7 @@ fn blame_map_to_path_stage_map(
     ))
 }
 
+#[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass(name = "Asset360ChangeMeta")]
 #[derive(Clone)]
@@ -258,6 +260,7 @@ struct PyAsset360ChangeMeta {
     inner: Asset360ChangeMeta,
 }
 
+#[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl PyAsset360ChangeMeta {
@@ -312,24 +315,28 @@ impl PyAsset360ChangeMeta {
     }
 }
 
+#[cfg(feature = "python-bindings")]
 impl From<Asset360ChangeMeta> for PyAsset360ChangeMeta {
     fn from(inner: Asset360ChangeMeta) -> Self {
         Self { inner }
     }
 }
 
+#[cfg(feature = "python-bindings")]
 impl PyAsset360ChangeMeta {
     fn clone_inner(&self) -> Asset360ChangeMeta {
         self.inner.clone()
     }
 }
 
+#[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass(name = "ChangeStage")]
 struct PyChangeStage {
     inner: ChangeStage<Asset360ChangeMeta>,
 }
 
+#[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl PyChangeStage {
@@ -367,12 +374,14 @@ impl PyChangeStage {
     }
 }
 
+#[cfg(feature = "python-bindings")]
 impl PyChangeStage {
     fn clone_inner(&self) -> ChangeStage<Asset360ChangeMeta> {
         self.inner.clone()
     }
 }
 
+#[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction(
     name = "apply_deltas",
@@ -413,6 +422,7 @@ fn apply_deltas_py(
     Ok((py_instance, blame_dict))
 }
 
+#[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction(
     name = "get_blame_info",
