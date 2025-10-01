@@ -1,12 +1,10 @@
 #[cfg(feature = "python-bindings")]
-use pyo3::Bound;
-#[cfg(feature = "python-bindings")]
 use pyo3::prelude::*;
-#[cfg(feature = "python-bindings")]
-use pyo3::types::PyModule;
-
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
-use pyo3_stub_gen::{define_stub_info_gatherer, derive::gen_stub_pyfunction};
+use pyo3_stub_gen::{
+    define_stub_info_gatherer,
+    derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods},
+};
 
 #[cfg(feature = "python-bindings")]
 use std::collections::HashMap;
@@ -14,11 +12,18 @@ use std::collections::HashMap;
 #[cfg(feature = "python-bindings")]
 use linkml_meta::{Annotation, ClassDefinition};
 #[cfg(feature = "python-bindings")]
-use linkml_runtime_python::PySchemaView;
+use linkml_runtime::{NodeId, diff::Delta};
 #[cfg(feature = "python-bindings")]
-use linkml_schemaview::converter::Converter;
+use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView, node_map_into_pydict};
 #[cfg(feature = "python-bindings")]
-use linkml_schemaview::schemaview::SchemaView;
+use linkml_schemaview::{Converter, schemaview::SchemaView};
+#[cfg(feature = "python-bindings")]
+use pyo3::Bound;
+#[cfg(feature = "python-bindings")]
+use pyo3::types::{PyDict, PyModule};
+
+#[cfg(feature = "python-bindings")]
+use crate::blame::{Asset360ChangeMeta, ChangeStage};
 
 pub mod blame;
 
@@ -32,10 +37,15 @@ pub mod wasm;
 #[pymodule(name = "_native2")]
 pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     linkml_runtime_python::runtime_module(m)?;
+    m.add_class::<PyAsset360ChangeMeta>()?;
+    m.add_class::<PyChangeStage>()?;
     m.add_function(wrap_pyfunction!(
         get_all_classes_by_type_designator_and_schema,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(apply_deltas_py, m)?)?;
+    m.add_function(wrap_pyfunction!(blame_map_to_path_stage_map, m)?)?;
+    m.add_function(wrap_pyfunction!(get_blame_info_py, m)?)?;
     Ok(())
 }
 
@@ -127,12 +137,10 @@ fn get_all_classes_by_type_designator_and_schema_impl(
     only_registered: bool,
     only_default: bool,
 ) -> PyResult<HashMap<String, ClassDefinition>> {
-    let sv_arc: std::sync::Arc<SchemaView> = {
-        let bound = schemaview.bind(py);
-        std::sync::Arc::new(bound.borrow().as_rust().clone())
-    };
+    let bound = schemaview.bind(py);
+    let sv_ref = bound.borrow();
     Ok(compute_classes_by_type_designator(
-        &sv_arc,
+        sv_ref.as_rust(),
         only_registered,
         only_default,
         Some(py),
@@ -202,6 +210,290 @@ fn get_all_classes_by_type_designator_and_schema(
         only_registered,
         only_default,
     )
+}
+
+#[cfg(feature = "python-bindings")]
+fn blame_map_to_path_stage_map_impl(
+    py: Python<'_>,
+    value: Py<PyLinkMLInstance>,
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<Vec<(Vec<String>, Asset360ChangeMeta)>> {
+    let bound = value.bind(py);
+    let rust_value = bound.borrow().value.clone();
+    Ok(crate::blame::blame_map_to_path_stage_map(
+        &rust_value,
+        &blame_map,
+    ))
+}
+
+#[cfg(all(feature = "python-bindings", feature = "stubgen"))]
+#[gen_stub_pyfunction]
+#[gen_stub(
+    override_return_type(
+        type_repr = "list[tuple[list[str], asset360_rust.Asset360ChangeMeta]]",
+        imports = ("typing", "asset360_rust")
+    )
+)]
+#[pyfunction(
+    name = "blame_map_to_path_stage_map",
+    signature = (value, blame_map)
+)]
+fn blame_map_to_path_stage_map(
+    py: Python<'_>,
+    #[gen_stub(
+        override_type(
+            type_repr = "asset360_rust.LinkMLInstance",
+            imports = ("asset360_rust",)
+        )
+    )]
+    value: Py<PyLinkMLInstance>,
+    #[gen_stub(
+        override_type(
+            type_repr = "dict[int, dict[str, typing.Any]]",
+            imports = ("typing",)
+        )
+    )]
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<Vec<(Vec<String>, Asset360ChangeMeta)>> {
+    blame_map_to_path_stage_map_impl(py, value, blame_map)
+}
+
+#[cfg(all(feature = "python-bindings", not(feature = "stubgen")))]
+#[pyfunction(
+    name = "blame_map_to_path_stage_map",
+    signature = (value, blame_map)
+)]
+fn blame_map_to_path_stage_map(
+    py: Python<'_>,
+    value: Py<PyLinkMLInstance>,
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<Vec<(Vec<String>, Asset360ChangeMeta)>> {
+    blame_map_to_path_stage_map_impl(py, value, blame_map)
+}
+
+#[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(name = "Asset360ChangeMeta")]
+#[derive(Clone)]
+struct PyAsset360ChangeMeta {
+    inner: Asset360ChangeMeta,
+}
+
+#[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PyAsset360ChangeMeta {
+    #[new]
+    #[pyo3(signature = (author, timestamp, source, change_id, ics_id))]
+    fn new(author: String, timestamp: String, source: String, change_id: u64, ics_id: u64) -> Self {
+        Self {
+            inner: Asset360ChangeMeta {
+                author,
+                timestamp,
+                source,
+                change_id,
+                ics_id,
+            },
+        }
+    }
+
+    #[getter]
+    fn author(&self) -> &str {
+        &self.inner.author
+    }
+
+    #[getter]
+    fn timestamp(&self) -> &str {
+        &self.inner.timestamp
+    }
+
+    #[getter]
+    fn source(&self) -> &str {
+        &self.inner.source
+    }
+
+    #[getter]
+    fn change_id(&self) -> u64 {
+        self.inner.change_id
+    }
+
+    #[getter]
+    fn ics_id(&self) -> u64 {
+        self.inner.ics_id
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Asset360ChangeMeta(author='{}', timestamp='{}', source='{}', change_id={}, ics_id={})",
+            self.inner.author,
+            self.inner.timestamp,
+            self.inner.source,
+            self.inner.change_id,
+            self.inner.ics_id
+        )
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+impl From<Asset360ChangeMeta> for PyAsset360ChangeMeta {
+    fn from(inner: Asset360ChangeMeta) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+impl PyAsset360ChangeMeta {
+    fn clone_inner(&self) -> Asset360ChangeMeta {
+        self.inner.clone()
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(name = "ChangeStage")]
+struct PyChangeStage {
+    inner: ChangeStage<Asset360ChangeMeta>,
+}
+
+#[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PyChangeStage {
+    #[new]
+    fn new(py: Python<'_>, meta: PyAsset360ChangeMeta, deltas: Vec<Py<PyDelta>>) -> PyResult<Self> {
+        let mut rust_deltas: Vec<Delta> = Vec::with_capacity(deltas.len());
+        for delta in deltas {
+            let bound = delta.bind(py);
+            rust_deltas.push(bound.borrow().inner.clone());
+        }
+        Ok(Self {
+            inner: ChangeStage {
+                meta: meta.clone_inner(),
+                deltas: rust_deltas,
+            },
+        })
+    }
+
+    #[getter]
+    fn meta(&self) -> PyAsset360ChangeMeta {
+        PyAsset360ChangeMeta::from(self.inner.meta.clone())
+    }
+
+    #[getter]
+    fn deltas<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyDelta>>> {
+        PyDelta::from_deltas(py, self.inner.deltas.clone())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ChangeStage(meta={}, deltas_len={})",
+            PyAsset360ChangeMeta::from(self.inner.meta.clone()).__repr__(),
+            self.inner.deltas.len()
+        )
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+impl PyChangeStage {
+    fn clone_inner(&self) -> ChangeStage<Asset360ChangeMeta> {
+        self.inner.clone()
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction(
+    name = "apply_deltas",
+    signature = (base, stages)
+)]
+fn apply_deltas_py(
+    py: Python<'_>,
+    base: Py<PyLinkMLInstance>,
+    stages: Vec<Py<PyChangeStage>>,
+) -> PyResult<(Py<PyLinkMLInstance>, Py<PyDict>)> {
+    let base_bound = base.bind(py);
+    let base_instance = base_bound.borrow();
+    let base_value = base_instance.value.clone();
+
+    let rust_stages: Vec<_> = stages
+        .into_iter()
+        .map(|stage| {
+            let bound = stage.bind(py);
+            bound.borrow().clone_inner()
+        })
+        .collect();
+
+    let (updated, blame_map) = crate::blame::apply_deltas(Some(base_value), rust_stages);
+    let py_instance = Py::new(
+        py,
+        PyLinkMLInstance::new(updated, base_instance.sv.clone_ref(py)),
+    )?;
+    drop(base_instance);
+
+    let blame_entries = blame_map
+        .into_iter()
+        .map(|(node_id, meta)| {
+            Py::new(py, PyAsset360ChangeMeta::from(meta)).map(|py_meta| (node_id, py_meta))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let blame_dict = node_map_into_pydict(py, blame_entries)?;
+
+    Ok((py_instance, blame_dict))
+}
+
+#[cfg(feature = "python-bindings")]
+fn get_blame_info_py_impl(
+    py: Python<'_>,
+    value: Py<PyLinkMLInstance>,
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<Option<Py<PyAsset360ChangeMeta>>> {
+    let bound = value.bind(py);
+    let rust_value = bound.borrow().value.clone();
+
+    if let Some(meta) = crate::blame::get_blame_info(&rust_value, &blame_map) {
+        Ok(Some(Py::new(py, PyAsset360ChangeMeta::from(meta.clone()))?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "stubgen"))]
+#[gen_stub_pyfunction]
+#[gen_stub(
+    override_return_type(
+        type_repr = "typing.Optional[asset360_rust.Asset360ChangeMeta]",
+        imports = ("typing", "asset360_rust")
+    )
+)]
+#[pyfunction(
+    name = "get_blame_info",
+    signature = (value, blame_map)
+)]
+fn get_blame_info_py(
+    py: Python<'_>,
+    value: Py<PyLinkMLInstance>,
+    #[gen_stub(
+        override_type(
+            type_repr = "dict[int, asset360_rust.Asset360ChangeMeta]",
+            imports = ("typing", "asset360_rust")
+        )
+    )]
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<Option<Py<PyAsset360ChangeMeta>>> {
+    get_blame_info_py_impl(py, value, blame_map)
+}
+
+#[cfg(all(feature = "python-bindings", not(feature = "stubgen")))]
+#[pyfunction(
+    name = "get_blame_info",
+    signature = (value, blame_map)
+)]
+fn get_blame_info_py(
+    py: Python<'_>,
+    value: Py<PyLinkMLInstance>,
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<Option<Py<PyAsset360ChangeMeta>>> {
+    get_blame_info_py_impl(py, value, blame_map)
 }
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
