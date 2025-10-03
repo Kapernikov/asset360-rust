@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
+use linkml_runtime::diff::DiffOptions;
 use linkml_runtime::diff::PatchOptions;
-use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, patch};
+use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, diff};
 
 /// Asset-specific metadata attached as blame.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -15,10 +16,60 @@ pub struct Asset360ChangeMeta {
 }
 
 /// One stage of changes with associated metadata.
-#[derive(Clone, Debug)]
+///
+/// Each stage represents the full LinkML value emitted by a change together with
+/// any metadata supplied by Asset360. The `deltas` field can be empty for raw
+/// stages; [`compute_history`] will derive normalized deltas when rebuilding the
+/// timeline.
+#[derive(Clone)]
 pub struct ChangeStage<M> {
     pub meta: M,
+    pub value: LinkMLInstance,
     pub deltas: Vec<Delta>,
+    pub rejected_paths: Vec<Vec<String>>,
+}
+
+/// Rebuild a normalized change history from staged LinkML values.
+///
+/// The first stage seeds the cumulative value. Every subsequent stage is
+/// diffed against the running value, rejected paths are filtered, and the
+/// remaining deltas are applied before continuing. The updated per-stage deltas
+/// are returned alongside the final LinkML value. The function panics if delta
+/// application reports any failed paths or when no stages are provided.
+pub fn compute_history(
+    stages: Vec<ChangeStage<Asset360ChangeMeta>>,
+) -> (LinkMLInstance, Vec<ChangeStage<Asset360ChangeMeta>>) {
+    let mut iter = stages.into_iter();
+    let mut history: Vec<ChangeStage<Asset360ChangeMeta>> = Vec::new();
+    let first = iter
+        .next()
+        .expect("at least one stage required to compute history");
+    let mut value = first.value.clone();
+    history.push(first);
+
+    for stage in iter {
+        let deltas = diff::diff(&value, &stage.value, DiffOptions::default());
+        let real_deltas: Vec<Delta> = deltas
+            .iter()
+            .filter(|d| !stage.rejected_paths.contains(&d.path))
+            .cloned()
+            .collect();
+        let new_stage = ChangeStage {
+            meta: stage.meta.clone(),
+            value: stage.value.clone(),
+            deltas: real_deltas.clone(),
+            rejected_paths: stage.rejected_paths.clone(),
+        };
+        history.push(new_stage);
+        let (new_value, trace) =
+            diff::patch(&value, &real_deltas, PatchOptions::default()).expect("patch failed");
+        if !trace.failed.is_empty() {
+            panic!("patch reported failed paths: {:?}", trace.failed);
+        }
+        value = new_value;
+    }
+
+    (value, history)
 }
 
 /// Apply a sequence of change stages, collecting blame (last-writer-wins) per NodeId.
@@ -33,7 +84,7 @@ pub fn apply_deltas(
 
     for stage in stages.into_iter() {
         let (new_value, trace): (LinkMLInstance, PatchTrace) =
-            patch(&value, &stage.deltas, PatchOptions::default()).expect("patch failed");
+            diff::patch(&value, &stage.deltas, PatchOptions::default()).expect("patch failed");
         // Last-writer-wins on added and updated nodes
         for id in trace.added.iter().chain(trace.updated.iter()) {
             blame.insert(*id, stage.meta.clone());
@@ -151,6 +202,182 @@ mod py_conversions {
 mod tests {
     use super::*;
     use linkml_schemaview::schemaview::SchemaView;
+
+    #[test]
+    #[should_panic(expected = "at least one stage required to compute history")]
+    fn test_compute_history_panics_without_stages() {
+        let stages: Vec<ChangeStage<Asset360ChangeMeta>> = Vec::new();
+        let _ = compute_history(stages);
+    }
+
+    fn setup_schema() -> (SchemaView, linkml_schemaview::schemaview::ClassView) {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+
+        let schema_yaml = r#"
+id: https://example.org/person
+name: person
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+slots:
+  name:
+    range: string
+  age:
+    range: integer
+  city:
+    range: string
+classes:
+  Person:
+    slots:
+      - name
+      - age
+      - city
+"#;
+        let schema: SchemaDefinition =
+            p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        let conv = sv.converter_for_primary_schema().unwrap();
+        let class = sv
+            .get_class(
+                &linkml_schemaview::identifier::Identifier::new("Person"),
+                conv,
+            )
+            .unwrap()
+            .unwrap();
+        (sv, class)
+    }
+
+    #[test]
+    fn test_compute_history_single_stage_returns_value() {
+        let (sv, class) = setup_schema();
+        let conv = sv.converter_for_primary_schema().unwrap();
+        let stage_yaml = r#"
+name: Alice
+age: 30
+"#;
+        let stage_value = linkml_runtime::load_yaml_str(stage_yaml, &sv, &class, conv).unwrap();
+
+        let meta = Asset360ChangeMeta {
+            author: "author0".into(),
+            timestamp: "t0".into(),
+            source: "src0".into(),
+            change_id: 0,
+            ics_id: 0,
+        };
+
+        let stages = vec![ChangeStage {
+            meta: meta.clone(),
+            value: stage_value.clone(),
+            deltas: Vec::new(),
+            rejected_paths: Vec::new(),
+        }];
+
+        let (final_value, history) = compute_history(stages);
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].meta.author, meta.author);
+        assert!(history[0].deltas.is_empty());
+        assert_eq!(final_value.to_json(), stage_value.to_json());
+    }
+
+    #[test]
+    fn test_compute_history_filters_rejected_paths() {
+        let (sv, class) = setup_schema();
+        let conv = sv.converter_for_primary_schema().unwrap();
+
+        let stage_one_yaml = r#"
+name: Alice
+age: 30
+"#;
+        let stage_one_value =
+            linkml_runtime::load_yaml_str(stage_one_yaml, &sv, &class, conv).unwrap();
+
+        let stage_two_yaml = r#"
+name: Alicia
+age: 31
+city: Paris
+"#;
+        let stage_two_value =
+            linkml_runtime::load_yaml_str(stage_two_yaml, &sv, &class, conv).unwrap();
+
+        let meta1 = Asset360ChangeMeta {
+            author: "author1".into(),
+            timestamp: "t1".into(),
+            source: "src1".into(),
+            change_id: 1,
+            ics_id: 11,
+        };
+        let meta2 = Asset360ChangeMeta {
+            author: "author2".into(),
+            timestamp: "t2".into(),
+            source: "src2".into(),
+            change_id: 2,
+            ics_id: 22,
+        };
+
+        let stages = vec![
+            ChangeStage {
+                meta: meta1,
+                value: stage_one_value.clone(),
+                deltas: Vec::new(),
+                rejected_paths: Vec::new(),
+            },
+            ChangeStage {
+                meta: meta2,
+                value: stage_two_value.clone(),
+                deltas: Vec::new(),
+                rejected_paths: vec![vec!["name".to_string()]],
+            },
+        ];
+
+        let (final_value, history) = compute_history(stages);
+
+        assert_eq!(history.len(), 2);
+        assert!(
+            history[1]
+                .deltas
+                .iter()
+                .any(|delta| delta.path == vec!["age".to_string()])
+        );
+        assert!(
+            history[1]
+                .deltas
+                .iter()
+                .any(|delta| delta.path == vec!["city".to_string()])
+        );
+        assert!(
+            !history[1]
+                .deltas
+                .iter()
+                .any(|delta| delta.path == vec!["name".to_string()])
+        );
+
+        let final_obj = match &final_value {
+            LinkMLInstance::Object { values, .. } => values,
+            _ => panic!("expected object"),
+        };
+        let name_value = final_obj
+            .get("name")
+            .and_then(|v| match v {
+                LinkMLInstance::Scalar { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("name present");
+        let city_value = final_obj
+            .get("city")
+            .and_then(|v| match v {
+                LinkMLInstance::Scalar { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("city present");
+        assert_eq!(name_value.as_str(), Some("Alice"));
+        assert_eq!(city_value.as_str(), Some("Paris"));
+    }
+
     #[test]
     fn test_get_blame_info_with_manual_map() {
         // Build a tiny manual blame map and a dummy value

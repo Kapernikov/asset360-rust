@@ -44,6 +44,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(apply_deltas_py, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_history_py, m)?)?;
     m.add_function(wrap_pyfunction!(blame_map_to_path_stage_map, m)?)?;
     m.add_function(wrap_pyfunction!(get_blame_info_py, m)?)?;
     Ok(())
@@ -332,6 +333,16 @@ impl PyAsset360ChangeMeta {
             self.inner.ics_id
         )
     }
+
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("author", &self.inner.author)?;
+        dict.set_item("timestamp", &self.inner.timestamp)?;
+        dict.set_item("source", &self.inner.source)?;
+        dict.set_item("change_id", self.inner.change_id)?;
+        dict.set_item("ics_id", self.inner.ics_id)?;
+        Ok(dict.into())
+    }
 }
 
 #[cfg(feature = "python-bindings")]
@@ -353,6 +364,7 @@ impl PyAsset360ChangeMeta {
 #[pyclass(name = "ChangeStage")]
 struct PyChangeStage {
     inner: ChangeStage<Asset360ChangeMeta>,
+    sv: Py<PySchemaView>,
 }
 
 #[cfg(feature = "python-bindings")]
@@ -360,7 +372,19 @@ struct PyChangeStage {
 #[pymethods]
 impl PyChangeStage {
     #[new]
-    fn new(py: Python<'_>, meta: PyAsset360ChangeMeta, deltas: Vec<Py<PyDelta>>) -> PyResult<Self> {
+    #[pyo3(signature = (meta, value, deltas, rejected_paths=None))]
+    fn new(
+        py: Python<'_>,
+        meta: PyAsset360ChangeMeta,
+        value: Py<PyLinkMLInstance>,
+        deltas: Vec<Py<PyDelta>>,
+        rejected_paths: Option<Vec<Vec<String>>>,
+    ) -> PyResult<Self> {
+        let (stage_value, schema_view) = {
+            let bound = value.bind(py);
+            let borrowed = bound.borrow();
+            (borrowed.value.clone(), borrowed.sv.clone_ref(py))
+        };
         let mut rust_deltas: Vec<Delta> = Vec::with_capacity(deltas.len());
         for delta in deltas {
             let bound = delta.bind(py);
@@ -369,8 +393,11 @@ impl PyChangeStage {
         Ok(Self {
             inner: ChangeStage {
                 meta: meta.clone_inner(),
+                value: stage_value,
                 deltas: rust_deltas,
+                rejected_paths: rejected_paths.unwrap_or_default(),
             },
+            sv: schema_view,
         })
     }
 
@@ -380,15 +407,29 @@ impl PyChangeStage {
     }
 
     #[getter]
+    fn value(&self, py: Python<'_>) -> PyResult<Py<PyLinkMLInstance>> {
+        Py::new(
+            py,
+            PyLinkMLInstance::new(self.inner.value.clone(), self.sv.clone_ref(py)),
+        )
+    }
+
+    #[getter]
     fn deltas<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyDelta>>> {
         PyDelta::from_deltas(py, self.inner.deltas.clone())
     }
 
+    #[getter]
+    fn rejected_paths(&self) -> Vec<Vec<String>> {
+        self.inner.rejected_paths.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "ChangeStage(meta={}, deltas_len={})",
+            "ChangeStage(meta={}, deltas_len={}, rejected_paths_len={})",
             PyAsset360ChangeMeta::from(self.inner.meta.clone()).__repr__(),
-            self.inner.deltas.len()
+            self.inner.deltas.len(),
+            self.inner.rejected_paths.len()
         )
     }
 }
@@ -398,6 +439,30 @@ impl PyChangeStage {
     fn clone_inner(&self) -> ChangeStage<Asset360ChangeMeta> {
         self.inner.clone()
     }
+
+    fn from_inner_py(
+        py: Python<'_>,
+        inner: ChangeStage<Asset360ChangeMeta>,
+        sv: &Py<PySchemaView>,
+    ) -> PyResult<Py<PyChangeStage>> {
+        Py::new(
+            py,
+            PyChangeStage {
+                inner,
+                sv: sv.clone_ref(py),
+            },
+        )
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+fn py_change_stage_to_rust(
+    py: Python<'_>,
+    stage: &Py<PyChangeStage>,
+) -> PyResult<(ChangeStage<Asset360ChangeMeta>, Py<PySchemaView>)> {
+    let bound = stage.bind(py);
+    let borrowed = bound.borrow();
+    Ok((borrowed.clone_inner(), borrowed.sv.clone_ref(py)))
 }
 
 #[cfg(feature = "python-bindings")]
@@ -439,6 +504,61 @@ fn apply_deltas_py(
     let blame_dict = node_map_into_pydict(py, blame_entries)?;
 
     Ok((py_instance, blame_dict))
+}
+
+#[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction(
+    name = "compute_history",
+    signature = (stages,)
+)]
+/// Python wrapper for [`crate::blame::compute_history`].
+///
+/// Accepts a sequence of `ChangeStage` objects, recomputes their semantic
+/// deltas while respecting rejected paths, and returns the final
+/// `LinkMLInstance` together with updated stages.
+fn compute_history_py(
+    py: Python<'_>,
+    stages: Vec<Py<PyChangeStage>>,
+) -> PyResult<(Py<PyLinkMLInstance>, Vec<Py<PyChangeStage>>)> {
+    use pyo3::exceptions::PyValueError;
+
+    if stages.is_empty() {
+        return Err(PyValueError::new_err(
+            "compute_history requires at least one stage",
+        ));
+    }
+
+    let mut schema_view: Option<Py<PySchemaView>> = None;
+    let mut rust_stages: Vec<ChangeStage<Asset360ChangeMeta>> = Vec::with_capacity(stages.len());
+
+    for stage in stages.iter() {
+        let (rust_stage, sv) = py_change_stage_to_rust(py, stage)?;
+        if let Some(existing) = &schema_view {
+            if existing.as_ptr() != sv.as_ptr() {
+                return Err(PyValueError::new_err(
+                    "all stages must share the same SchemaView",
+                ));
+            }
+        } else {
+            schema_view = Some(sv.clone_ref(py));
+        }
+        rust_stages.push(rust_stage);
+    }
+
+    let schema_view = schema_view.expect("non-empty stages validated above");
+    let (final_value, history) = crate::blame::compute_history(rust_stages);
+
+    let py_value = Py::new(
+        py,
+        PyLinkMLInstance::new(final_value, schema_view.clone_ref(py)),
+    )?;
+    let py_history = history
+        .into_iter()
+        .map(|stage| PyChangeStage::from_inner_py(py, stage, &schema_view))
+        .collect::<PyResult<Vec<_>>>()?;
+
+    Ok((py_value, py_history))
 }
 
 #[cfg(feature = "python-bindings")]
