@@ -250,8 +250,8 @@ fn blame_map_to_path_stage_map(
     value: Py<PyLinkMLInstance>,
     #[gen_stub(
         override_type(
-            type_repr = "dict[int, dict[str, typing.Any]]",
-            imports = ("typing",)
+            type_repr = "dict[int, asset360_rust.Asset360ChangeMeta]",
+            imports = ("asset360_rust",)
         )
     )]
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,

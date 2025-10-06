@@ -1,0 +1,459 @@
+id: https://w3id.org/infrabel/asset360-test
+name: asset360
+title: asset360
+description: |-
+  This is the project description.
+license: Apache Software License 2.0
+see_also:
+  - https://infrabel.github.io/asset360-test
+
+prefixes:
+  asset360: https://data.infrabel.be/asset360/
+  linkml: https://w3id.org/linkml/
+  eulynx: http://ontorail.org/src/Eulynx/eul2207a/
+  xsd: http://www.w3.org/2001/XMLSchema#
+  rdfs: http://www.w3.org/2000/01/rdf-schema#
+
+default_prefix: asset360
+default_range: string
+
+imports:
+  - ./types
+  - ./rsm
+  - ./eulynx
+
+classes:
+
+  LifeCycle:
+    description: >-
+      describes the current lifecycle phase of an asset. rework needed.
+    attributes:
+      LifeCycle_isActive:
+        description: >-
+          deprecated, do not use, rework needed. definition of "active" needs to be clarified
+        range: boolean
+      installationDate:
+        description: >-
+          installationDate won't be a string and probably it will be modeled in a different way
+          than currently the case.
+        range: string
+      outOfExploitation:
+        range: boolean
+
+  MaintenanceUnit:
+    description: >-
+      the maintenance division responsible for the maintenance of this asset.
+      note that responsible does not necessarily means that this is the division that does the maintenance.
+      (it might have been subcontracted, or an agreement might exist with another maintenance unit to delegate parts of the work)
+      TODO: now this is slightly denormalized, as zoneName is repeated, same for districtName
+      TODO: make the hasCode slot the identifier slot
+    attributes:
+      MaintenanceUnit_hasCode:
+        annotations:
+          data.infrabel.be/linkml/label/short/fr-be: SCST
+          data.infrabel.be/linkml/label/short/nl-be: Ploeg
+          data.infrabel.be/linkml/label/long/nl-be: Onderhoudseenheid
+          data.infrabel.be/linkml/label/long/fr-be: Unité d'entretien
+        description: >-
+          the code (4 to 6 digits) uniquely (within Infrabel) identifying the maintenance unit.
+        range: string
+      districtCode:
+        range: string
+      districtName:
+        range: string
+      zoneCode:
+        annotations:
+          data.infrabel.be/linkml/label/short/fr-be: Area
+          data.infrabel.be/linkml/label/short/nl-be: Area
+          data.infrabel.be/linkml/label/short/en-us: Area code
+          data.infrabel.be/linkml/label/long/nl-be: Area code
+          data.infrabel.be/linkml/label/long/fr-be: Area code
+          data.infrabel.be/linkml/label/long/en-us: Area code
+        range: integer
+      zoneName:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: Area
+          data.infrabel.be/linkml/label/nl-be: Area
+          data.infrabel.be/linkml/label/en-us: Area
+        range: string
+    annotations:
+      data.infrabel.be/locale/nl-be/description: De eenheid die verantwoordelijk is voor het onderhoud van deze asset.
+      data.infrabel.be/locale/fr-be/description: La division responsable de l'entretien de cet actif.
+  
+  SignallingPost:
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    description: >-
+      A signalling post is logical unit of control. Used to be a physical location from which signalling was controlled, but in today's computer age, the location
+      where a human supervises/controls signalling might be a different location from where the central interlocking unit, and might even be flexible. The signalling
+      post now is hence a collection of assets that are under a common control authority.
+      TODO: is signallingPostId the identifier slot ?
+    is_a: OperatingCentre
+    slots:
+      - id
+      - typeURI
+    attributes:
+      SignallingPost_hasCode:
+        range: string
+      signallingPostDescription:
+        range: string
+    slot_usage:
+      id:
+        annotations:
+          data.infrabel.be/linkml/asset360id: true
+
+  LocationInfo:
+    slots:
+      - station
+    description: >-
+      The *conventional* location of an asset used for maintenance purposes: this is the approximate location of an asset as used by maintenance personnel in
+      planning and executing maintenance. This location can sometimes be ambiguous and vague: for instance, the exact definition of which assets belong to a certain station
+      in their locationInfo is at the discretion of the maintenance personnel, rather than being clearly defined.
+      This is in contrast to the RSM location stored in a locatedNetEntity, which needs to be exact and unambigous, but might be hard to interpret for a human and might be missing.
+    attributes:
+      line:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: Ligne
+          data.infrabel.be/linkml/label/nl-be: Lijn
+          data.infrabel.be/linkml/label/en-us: Line
+        range: string
+      track:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: Voie
+          data.infrabel.be/linkml/label/nl-be: Spoor
+          data.infrabel.be/linkml/label/en-us: Track
+        range: string
+      yard:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: Faisceau
+          data.infrabel.be/linkml/label/nl-be: Bundel
+          data.infrabel.be/linkml/label/en-us: Yard
+        range: string
+      stationTrack:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: Voie (gare)
+          data.infrabel.be/linkml/label/nl-be: Spoor (station)
+          data.infrabel.be/linkml/label/en-us: Track (station)
+        range: string
+      trail:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: trail
+          data.infrabel.be/linkml/label/nl-be: trail
+          data.infrabel.be/linkml/label/en-us: trail
+        range: string
+      trail_name:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: trail name
+          data.infrabel.be/linkml/label/nl-be: trail name
+          data.infrabel.be/linkml/label/en-us: trail name
+        range: string
+      position_on_trail:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: numéro de séquence
+          data.infrabel.be/linkml/label/nl-be: volgorde nummer
+          data.infrabel.be/linkml/label/en-us: sequence number
+        range: integer
+      relative_position_on_trail:
+        annotations:
+          data.infrabel.be/linkml/label/fr-be: position relative sur le trail
+          data.infrabel.be/linkml/label/nl-be: relatieve positie op de trail
+          data.infrabel.be/linkml/label/en-us: relative position on trail
+        range: float
+
+
+  # Generic:
+  #   description: >- 
+  #     A generic which contains all fields we want to know for any object.
+  #   slots:
+  #     - id
+  #     - typeURI
+
+  Asset:
+    description: >-
+      An asset is a physical object that is part of the railway infrastructure, or a logical concept (like a track circuit) that is created by the joint working of
+      multiple physical assets (in this case the transmitter, receiver and joint).
+    slots:
+      - id
+      - typeURI
+      - lifeCycle
+      - locationInfo
+      - refersToLocatedNetEntity
+      - signallingPost
+      - maintenanceUnit
+      - externalReferences
+      - controllerTechnology
+    slot_usage:
+      id:
+        annotations:
+          data.infrabel.be/linkml/asset360id: true
+
+  Line:
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    is_a: NetElement
+    slots:
+      - typeURI
+    slot_usage:
+      id:
+        range: uri
+        annotations:
+          data.infrabel.be/linkml/asset360id: true
+
+  Track:
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    is_a: LinearElement
+    slot_usage:
+      id:
+        range: uri
+        annotations:
+          data.infrabel.be/linkml/asset360id: true
+    slots:
+      - typeURI
+    attributes:
+      refersToLine:
+        range: Line
+        inlined: false
+
+
+  Signal:
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    is_a: Asset
+    description: >-
+      A signal with lights.
+      TODO : we have both hasTelephone and telephone. keep one.
+    attributes:
+      NationalUniqueID:
+        range: string
+      signalType:
+        range: SignalTypes
+      refersToEulSignal:
+        range: LightSignal
+      hasTelephone:
+        range: boolean
+      telephone:
+        range: SignalPostTelephone
+        inlined: true
+      regime:
+        range: SignalRegime
+
+
+  BaliseGroup:
+    description: >-
+      A group (often a pair, but sometimes more) of eurobalises that work together in order to send a information to the train, using ETCS or TBL1+ protocols.
+      See https://en.wikipedia.org/wiki/Balise
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    is_a: Asset
+    attributes:
+      NationalUniqueID:
+        range: string
+      baliseGroupType:
+        range: BaliseGroupType
+      amountOfBalises:
+        range: integer
+      BaliseGroup_system:
+        range: string
+      BaliseGroup_technology:
+        range: string
+      refersToEulBaliseGroup:
+        range: EtcsBaliseGroup
+      refersToSignal:
+        range: Signal
+        inlined: false
+      balises:
+        range: Balise
+        inlined_as_list: false
+        inlined: true
+        multivalued: true
+
+
+  Balise:
+    description: >-
+      An individual balise within a balise group.
+    slots:
+      - refersToLocatedNetEntity
+      - npig
+    attributes:
+      baliseType:
+        range: BaliseType
+      refersToEulBalise:
+        range: EULBalise
+      NationalUniqueID:
+        range: string
+
+  Station:
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    description: >-
+      A train station.
+      TODO: now a station is an asset, i'm not sure this should be the case.
+      also the "locationInfo" might be not the most appropriate way to model the location
+      of a station.
+    slots:
+      - id
+      - typeURI
+      - locationInfo
+      - refersToLocatedNetEntity
+      - label
+      - externalReferences
+    attributes:
+        responsible:
+          description: Organisation responsible for maintainance. 
+          range: string
+        code:
+          description: Abbreviation commonly used on signalling plans. 
+          range: string
+    slot_usage:
+      id:
+        annotations:
+          data.infrabel.be/linkml/asset360id: true
+
+
+  Switch:
+    description: >-
+      A mechanical installation to guide trains over the railroad network.
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    is_a: Asset
+    attributes:
+      switchType:
+        range: string
+      switchGroup:
+        range: string
+      switchComplex:
+        range: string
+
+
+  KeyValueObject:
+    description: An object having a unique key and a value.
+    slots:
+      - key 
+    attributes:
+      value:
+        range: anyType
+
+
+  LanguageLabel:
+    description: Label for an object in a certain language.
+    slots:
+      - in_language
+    attributes:
+      label_value:
+        range: string
+    annotations:
+      data.infrabel.be/locale/nl-be/description: Object label in een bepaalde taal.
+      data.infrabel.be/linkml/convert-to-langtag: true
+
+
+
+slots:
+  id:
+    identifier: true
+    range: uri
+    description: A unique identifier, as URI.
+  typeURI:
+    annotations:
+      data.infrabel.be/linkml/label/fr-be: Type URI
+      data.infrabel.be/linkml/label/nl-be: Type URI
+      data.infrabel.be/linkml/label/en-us: Type URI
+    description: The type of this object. Corresponds to the RDF <strong>a</strong> relationship.
+    range: uri
+    designates_type: true
+  lifeCycle:
+    range: LifeCycle
+    inlined: true
+  locationInfo:
+    range: LocationInfo
+    inlined: true
+  refersToLocatedNetEntity:
+    range: LocatedNetEntity
+    inlined: true
+  signallingPost:
+    range: SignallingPost
+    inlined: false
+  maintenanceUnit:
+    range: MaintenanceUnit
+    inlined: true
+  controllerTechnology:
+    range: string
+    inlined: true
+  station:
+    range: Station
+    inlined: false
+  externalReferences:
+    range: KeyValueObject
+    multivalued: true
+    inlined_as_list: false
+    inlined: true
+  label:
+    slot_uri: rdfs:label
+    range: LanguageLabel
+    multivalued: true
+    inlined_as_list: false
+    inlined: true
+  npig:
+    key: true
+    range: integer
+  key:
+    range: string
+    description: the key in a key-value pair
+    key: true
+  in_language:
+    range: string
+    key: true
+    description: the language of a label
+
+enums:
+  SignalTypes:
+    permissible_values:
+      GSA:
+        description: big stop signal
+        meaning: eulynx:EAID_28C3D8B9_69BF_44c8_BF11_A28EA7F1A248
+      PAN_SNELHEID:
+        description: speed panel
+        todos:
+          - map this to an ontology
+      REP_H_D:
+        description: repeating signal
+      KSS:
+        description: small stop signal
+      VERW:
+        description: warning signal
+      VSS:
+        description: simplified stop signal
+      VSS_LO:
+        description: simplified stop signal low
+      VSS_HO:
+        description: simplified stop signal high
+      OTHER:
+        description: other signal
+        todos:
+          - should not be used
+  BaliseGroupType:
+    permissible_values:
+      SwBG:
+        description: switchable balise group
+      FBG:
+        description: fixed balise group
+  BaliseType:
+    permissible_values:
+      SB:
+        description: switchable balise
+      FB:
+        description: fixed balise
+  SignalRegime:
+    permissible_values:
+      VNS:
+        description: normal way / voie normale / normaalspoor
+      CVT:
+        description: counter-track / contre-voie / tegenspoor
+
+types: 
+  weblink:
+    typeof: "uri"
+    description: "clickable weblinks in presentationformat"
+  anyType:
+    uri: xsd:anyType
+    base: object
