@@ -1,0 +1,22 @@
+project_id: P-001
+name: Apollo
+description: Mission plan reviewed
+owner:
+  person_id: PER-002
+  name: Alice Johnson
+  role: lead engineer
+  team: Exploration
+tasks:
+  - id: T-1
+    title: Define mission scope
+    status: done
+  - id: T-2
+    title: Coordinate interfaces
+    status: todo
+  - id: T-3
+    title: Review risk log
+    status: in-review
+notes:
+  - kickoff scheduled
+  - supplier list pending
+  - briefing prepared

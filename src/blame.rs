@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use linkml_runtime::diff::DiffOptions;
 use linkml_runtime::diff::PatchOptions;
 use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, diff};
+use serde_json::Value as JsonValue;
 
 /// Asset-specific metadata attached as blame.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -149,6 +150,134 @@ pub fn blame_map_to_path_stage_map(
     entries.into_iter().collect()
 }
 
+/// Produce a human-readable summary of blame metadata aligned with a YAML-style view.
+pub fn format_blame_map(
+    value: &LinkMLInstance,
+    blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
+) -> String {
+    const META_COL_WIDTH: usize = 72;
+    fn meta_column(meta: Option<&Asset360ChangeMeta>) -> String {
+        let mut text = meta
+            .map(|m| {
+                format!(
+                    "cid={:>3} author={} ts={} src={} ics={}",
+                    m.change_id, m.author, m.timestamp, m.source, m.ics_id
+                )
+            })
+            .unwrap_or_default();
+        if text.len() > META_COL_WIDTH {
+            text.truncate(META_COL_WIDTH);
+        }
+        format!("{text:<width$}", width = META_COL_WIDTH)
+    }
+
+    enum Marker {
+        None,
+        Dash,
+    }
+
+    fn scalar_to_string(v: &JsonValue) -> String {
+        serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".into())
+    }
+
+    fn walk(
+        node: &LinkMLInstance,
+        blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
+        indent: usize,
+        key: Option<&str>,
+        marker: Marker,
+        lines: &mut Vec<String>,
+    ) {
+        let meta = blame_map.get(&node.node_id());
+        let meta_str = meta_column(meta);
+        let indent_str = "  ".repeat(indent);
+        match node {
+            LinkMLInstance::Scalar { value, .. } => {
+                let val = scalar_to_string(value);
+                let yaml_line = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}: {val}"),
+                    (Marker::None, None) => format!("{indent_str}{val}"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}: {val}"),
+                    (Marker::Dash, None) => format!("{indent_str}- {val}"),
+                };
+                lines.push(format!("{meta_str} | {yaml_line}"));
+            }
+            LinkMLInstance::Null { .. } => {
+                let yaml_line = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}: null"),
+                    (Marker::None, None) => format!("{indent_str}null"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}: null"),
+                    (Marker::Dash, None) => format!("{indent_str}- null"),
+                };
+                lines.push(format!("{meta_str} | {yaml_line}"));
+            }
+            LinkMLInstance::Object { values, class, .. } => {
+                let type_hint = format!(" ({})", class.name());
+                let header = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}:{type_hint}"),
+                    (Marker::None, None) => format!("{indent_str}<root>{type_hint}"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}:{type_hint}"),
+                    (Marker::Dash, None) => format!("{indent_str}-{type_hint}"),
+                };
+                lines.push(format!("{meta_str} | {header}"));
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (child_key, child_value) in entries {
+                    walk(
+                        child_value,
+                        blame_map,
+                        indent + 1,
+                        Some(child_key),
+                        Marker::None,
+                        lines,
+                    );
+                }
+            }
+            LinkMLInstance::Mapping { values, .. } => {
+                let header = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}:",),
+                    (Marker::None, None) => format!("{indent_str}<mapping>"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}:",),
+                    (Marker::Dash, None) => format!("{indent_str}-"),
+                };
+                lines.push(format!("{meta_str} | {header}"));
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (child_key, child_value) in entries {
+                    walk(
+                        child_value,
+                        blame_map,
+                        indent + 1,
+                        Some(child_key),
+                        Marker::None,
+                        lines,
+                    );
+                }
+            }
+            LinkMLInstance::List { values, .. } => {
+                let header = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}:",),
+                    (Marker::None, None) => format!("{indent_str}<list>"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}:",),
+                    (Marker::Dash, None) => format!("{indent_str}-"),
+                };
+                lines.push(format!("{meta_str} | {header}"));
+                for child in values {
+                    walk(child, blame_map, indent + 1, None, Marker::Dash, lines);
+                }
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    walk(value, blame_map, 0, None, Marker::None, &mut lines);
+    if lines.is_empty() {
+        "<empty blame map>".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 #[cfg(feature = "python-bindings")]
 mod py_conversions {
     use super::Asset360ChangeMeta;
@@ -203,6 +332,43 @@ mod tests {
     use super::*;
     use linkml_schemaview::schemaview::SchemaView;
 
+    fn path_to_string(segments: &[String]) -> String {
+        if segments.is_empty() {
+            return "<root>".into();
+        }
+        let mut out = String::new();
+        for segment in segments {
+            if segment.chars().all(|c| c.is_ascii_digit()) {
+                out.push_str(&format!("[{segment}]"));
+            } else {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(segment);
+            }
+        }
+        out
+    }
+
+    fn format_stage_entries(entries: &[(Vec<String>, Asset360ChangeMeta)]) -> String {
+        if entries.is_empty() {
+            return "<empty stage map>".to_string();
+        }
+        let mut lines = Vec::with_capacity(entries.len());
+        for (path, meta) in entries {
+            lines.push(format!(
+                "{} => change_id={} author={} timestamp={} source={} ics_id={}",
+                path_to_string(path),
+                meta.change_id,
+                meta.author,
+                meta.timestamp,
+                meta.source,
+                meta.ics_id
+            ));
+        }
+        lines.join("\n")
+    }
+    
     #[test]
     #[should_panic(expected = "at least one stage required to compute history")]
     fn test_compute_history_panics_without_stages() {
@@ -680,5 +846,146 @@ items:
         ];
 
         assert_eq!(entries, expected);
+    }
+
+    #[test]
+    fn test_apply_multiple_stages_preserves_blame_history() {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+
+        const SCHEMA: &str = include_str!("../tests/data/blame_series/schema.yaml");
+        const GENERATIONS: [&str; 4] = [
+            include_str!("../tests/data/blame_series/project_v0.yaml"),
+            include_str!("../tests/data/blame_series/project_v1.yaml"),
+            include_str!("../tests/data/blame_series/project_v2.yaml"),
+            include_str!("../tests/data/blame_series/project_v3.yaml"),
+        ];
+
+        let schema_deser = yml::Deserializer::from_str(SCHEMA);
+        let schema: SchemaDefinition = p2e::deserialize(schema_deser).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        let conv = sv.converter_for_primary_schema().unwrap();
+        let project_class = sv
+            .get_class(
+                &linkml_schemaview::identifier::Identifier::new("Project"),
+                conv,
+            )
+            .unwrap()
+            .unwrap();
+
+        let generations: Vec<LinkMLInstance> = GENERATIONS
+            .iter()
+            .map(|data| linkml_runtime::load_yaml_str(data, &sv, &project_class, conv).unwrap())
+            .collect();
+
+        let base = generations
+            .first()
+            .cloned()
+            .expect("base generation present");
+        let expected_final = generations
+            .last()
+            .cloned()
+            .expect("final generation present");
+
+        let stage_metadata = vec![
+            Asset360ChangeMeta {
+                author: "planner.one".into(),
+                timestamp: "2024-01-01T09:00:00Z".into(),
+                source: "ingest".into(),
+                change_id: 1,
+                ics_id: 1001,
+            },
+            Asset360ChangeMeta {
+                author: "planner.two".into(),
+                timestamp: "2024-01-03T14:00:00Z".into(),
+                source: "ingest".into(),
+                change_id: 2,
+                ics_id: 1002,
+            },
+            Asset360ChangeMeta {
+                author: "planner.three".into(),
+                timestamp: "2024-01-05T08:30:00Z".into(),
+                source: "ingest".into(),
+                change_id: 3,
+                ics_id: 1003,
+            },
+        ];
+
+        let stages: Vec<ChangeStage<Asset360ChangeMeta>> = stage_metadata
+            .into_iter()
+            .enumerate()
+            .map(|(idx, meta)| ChangeStage {
+                meta,
+                deltas: linkml_runtime::diff::diff(
+                    &generations[idx],
+                    &generations[idx + 1],
+                    DiffOptions {
+                        treat_missing_as_null: true,
+                        ..DiffOptions::default()
+                    },
+                ),
+            })
+            .collect();
+
+        let (updated, blame_map) = apply_deltas(Some(base), stages);
+
+        assert_eq!(updated.to_json(), expected_final.to_json());
+
+        let blame_dump = format_blame_map(&updated, &blame_map);
+        println!("Multi-stage blame map:\n{}", blame_dump);
+        let entries = blame_map_to_path_stage_map(&updated, &blame_map);
+        let stage_dump = format_stage_entries(&entries);
+        println!("Stage map entries:\n{}", stage_dump);
+        let mut path_meta: std::collections::BTreeMap<Vec<String>, Asset360ChangeMeta> =
+            entries.into_iter().collect();
+
+        let root_meta = path_meta
+            .remove(&Vec::new())
+            .unwrap_or_else(|| panic!("root blame present\n{blame_dump}"));
+        assert_eq!(root_meta.change_id, 2);
+
+        // Ensure we recorded blame for each stage by checking representative paths
+        let role_meta = path_meta
+            .remove(&vec!["owner".to_string(), "role".to_string()])
+            .unwrap_or_else(|| panic!("owner.role blame present\n{blame_dump}"));
+        assert_eq!(role_meta.change_id, 2);
+
+        let task_title_meta = path_meta
+            .remove(&vec![
+                "tasks".to_string(),
+                "1".to_string(),
+                "title".to_string(),
+            ])
+            .unwrap_or_else(|| panic!("tasks[1].title blame present\n{blame_dump}"));
+        assert_eq!(task_title_meta.change_id, 2);
+
+        let description_meta = path_meta
+            .remove(&vec!["description".to_string()])
+            .unwrap_or_else(|| panic!("description blame present\n{blame_dump}"));
+        assert_eq!(description_meta.change_id, 3);
+
+        // Also ensure a node touched twice ends up with the latest stage metadata
+        let task_status_meta = path_meta
+            .remove(&vec![
+                "tasks".to_string(),
+                "0".to_string(),
+                "status".to_string(),
+            ])
+            .unwrap_or_else(|| panic!("tasks[0].status blame present\n{blame_dump}"));
+        assert_eq!(task_status_meta.change_id, 3);
+
+        // Sanity check: we should see metadata from all stages in the blame map
+        let mut seen_changes: std::collections::BTreeSet<u64> =
+            path_meta.values().map(|meta| meta.change_id).collect();
+        seen_changes.insert(root_meta.change_id);
+        seen_changes.insert(role_meta.change_id);
+        seen_changes.insert(task_title_meta.change_id);
+        seen_changes.insert(description_meta.change_id);
+        seen_changes.insert(task_status_meta.change_id);
+        assert!(seen_changes.contains(&1));
+        assert!(seen_changes.contains(&2));
+        assert!(seen_changes.contains(&3));
     }
 }

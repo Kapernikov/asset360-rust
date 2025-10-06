@@ -1,0 +1,59 @@
+id: https://example.org/project-schema
+name: project-schema
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: https://example.org/
+slots:
+  project_id:
+    identifier: true
+    range: string
+  name:
+    range: string
+  description:
+    range: string
+  owner:
+    range: Person
+    inlined: true
+  tasks:
+    range: Task
+    multivalued: true
+    inlined: true
+    inlined_as_list: true
+  notes:
+    range: string
+    multivalued: true
+  role:
+    range: string
+  team:
+    range: string
+  person_id:
+    range: string
+    identifier: true
+  title:
+    range: string
+  status:
+    range: string
+  id:
+    range: string
+    identifier: true
+classes:
+  Project:
+    slots:
+      - project_id
+      - name
+      - description
+      - owner
+      - tasks
+      - notes
+  Person:
+    slots:
+      - person_id
+      - name
+      - role
+      - team
+  Task:
+    slots:
+      - id
+      - title
+      - status
