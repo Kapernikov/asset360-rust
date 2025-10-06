@@ -474,7 +474,6 @@ classes:
     }
 
     #[test]
-    #[should_panic(expected = "change/add delta must supply new value")]
     fn test_apply_deltas_with_asset360_stages_panics() {
         use linkml_meta::SchemaDefinition;
         use serde_path_to_error as p2e;
