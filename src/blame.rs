@@ -640,7 +640,7 @@ classes:
     }
 
     #[test]
-    fn test_apply_deltas_with_asset360_stages_panics() {
+    fn test_apply_deltas_with_asset360_stages() {
         use linkml_meta::SchemaDefinition;
         use serde_path_to_error as p2e;
         use serde_yml as yml;
@@ -693,7 +693,15 @@ classes:
 
         assert!(stages.len() >= 2);
         let base_stage = stages.remove(0);
-        let _ = apply_deltas(Some(base_stage.value), stages);
+        let (final_value, blame_map) = apply_deltas(Some(base_stage.value), stages.clone());
+
+        let blame_dump = format_blame_map(&final_value, &blame_map);
+        println!("Asset360 stages blame map:\n{}", blame_dump);
+        let stage_entries = blame_map_to_path_stage_map(&final_value, &blame_map);
+        let stage_dump = format_stage_entries(&stage_entries);
+        println!("Asset360 stage map entries:\n{}", stage_dump);
+
+        assert!(!stages.is_empty());
     }
 
     #[test]
@@ -917,7 +925,9 @@ items:
             .into_iter()
             .enumerate()
             .map(|(idx, meta)| ChangeStage {
+                rejected_paths: vec![],
                 meta,
+                value: generations[idx + 1].clone(),
                 deltas: linkml_runtime::diff::diff(
                     &generations[idx],
                     &generations[idx + 1],
