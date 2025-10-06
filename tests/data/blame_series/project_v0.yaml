@@ -1,0 +1,11 @@
+project_id: P-001
+name: Apollo
+owner:
+  person_id: PER-001
+  name: Alice Johnson
+  role: researcher
+  team: Propulsion
+tasks:
+  - id: T-1
+    title: Define mission scope
+    status: todo

@@ -1,0 +1,17 @@
+project_id: P-001
+name: Apollo
+description: Initial mission planning
+owner:
+  person_id: PER-001
+  name: Alice Johnson
+  role: lead engineer
+  team: Exploration
+tasks:
+  - id: T-1
+    title: Define mission scope
+    status: todo
+  - id: T-2
+    title: Draft systems checklist
+    status: todo
+notes:
+  - kickoff scheduled
