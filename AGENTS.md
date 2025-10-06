@@ -26,6 +26,12 @@ communication: assertive and informal. be a good sparring partner. disagree with
   - Convert to TTL: `cargo run -p linkml_tools --bin linkml-convert -- src/runtime/tests/data/schema.yaml src/runtime/tests/data/example_personinfo_data.yaml --class Person --output out.ttl`
   - Diff: `cargo run -p linkml_tools --bin linkml-diff -- src/runtime/tests/data/schema.yaml --class Person src/runtime/tests/data/person_older.yaml src/runtime/tests/data/person_valid.yaml`
 - Python bindings: `maturin develop -m src/python/Cargo.toml` (requires Python and maturin).
+- Python tests (from repository root):
+  1. `python3 -m venv .env` (if the `.env` virtualenv is missing).
+  2. `source .env/bin/activate`.
+  3. `pip install maturin pytest` (first-time setup).
+  4. `maturin develop` to build/install the bindings into the venv.
+  5. `PYTHONPATH=python python -m pytest python/tests` to run the test suite.
 
 ## Testing Guidelines
 - Add integration tests under `src/runtime/tests/` when changing CLI/runtime behavior.

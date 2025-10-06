@@ -368,7 +368,7 @@ mod tests {
         }
         lines.join("\n")
     }
-    
+
     #[test]
     #[should_panic(expected = "at least one stage required to compute history")]
     fn test_compute_history_panics_without_stages() {

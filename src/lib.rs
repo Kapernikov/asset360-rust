@@ -46,6 +46,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(apply_deltas_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_history_py, m)?)?;
     m.add_function(wrap_pyfunction!(blame_map_to_path_stage_map, m)?)?;
+    m.add_function(wrap_pyfunction!(format_blame_map_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_blame_info_py, m)?)?;
     Ok(())
 }
@@ -227,6 +228,17 @@ fn blame_map_to_path_stage_map_impl(
     ))
 }
 
+#[cfg(feature = "python-bindings")]
+fn format_blame_map_impl(
+    py: Python<'_>,
+    value: Py<PyLinkMLInstance>,
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<String> {
+    let bound = value.bind(py);
+    let rust_value = bound.borrow().value.clone();
+    Ok(crate::blame::format_blame_map(&rust_value, &blame_map))
+}
+
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
 #[gen_stub_pyfunction]
 #[gen_stub(
@@ -270,6 +282,45 @@ fn blame_map_to_path_stage_map(
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<Vec<(Vec<String>, Asset360ChangeMeta)>> {
     blame_map_to_path_stage_map_impl(py, value, blame_map)
+}
+
+#[cfg(all(feature = "python-bindings", feature = "stubgen"))]
+#[gen_stub_pyfunction]
+#[pyfunction(
+    name = "format_blame_map",
+    signature = (value, blame_map)
+)]
+fn format_blame_map_py(
+    py: Python<'_>,
+    #[gen_stub(
+        override_type(
+            type_repr = "asset360_rust.LinkMLInstance",
+            imports = ("asset360_rust",)
+        )
+    )]
+    value: Py<PyLinkMLInstance>,
+    #[gen_stub(
+        override_type(
+            type_repr = "dict[int, asset360_rust.Asset360ChangeMeta]",
+            imports = ("asset360_rust",)
+        )
+    )]
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<String> {
+    format_blame_map_impl(py, value, blame_map)
+}
+
+#[cfg(all(feature = "python-bindings", not(feature = "stubgen")))]
+#[pyfunction(
+    name = "format_blame_map",
+    signature = (value, blame_map)
+)]
+fn format_blame_map_py(
+    py: Python<'_>,
+    value: Py<PyLinkMLInstance>,
+    blame_map: HashMap<NodeId, Asset360ChangeMeta>,
+) -> PyResult<String> {
+    format_blame_map_impl(py, value, blame_map)
 }
 
 #[cfg(feature = "python-bindings")]
