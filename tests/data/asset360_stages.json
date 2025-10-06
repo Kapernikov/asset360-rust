@@ -27,7 +27,7 @@
       "maintenanceUnit": {
         "MaintenanceUnit_hasCode": "5255",
         "districtCode": "52",
-        "districtName": "52-La Louvière",
+        "districtName": "52-La Louvi\u00e8re",
         "zoneCode": 5,
         "zoneName": "Charleroi"
       },
@@ -183,19 +183,26 @@
         "new": null
       },
       {
-        "path": ["locationInfo", "line"],
+        "path": [
+          "locationInfo",
+          "line"
+        ],
         "op": "update",
         "old": "L-124A",
         "new": "L-124"
       },
       {
-        "path": ["id"],
+        "path": [
+          "id"
+        ],
         "op": "update",
         "old": "https://data.infrabel.be/ramses/signals/RMS-INV-3-40925",
         "new": "https://data.infrabel.be/e1002/signals/c8986439-4e97-4ea6-b3fd-8c06516a3da3"
       },
       {
-        "path": ["externalReferences"],
+        "path": [
+          "externalReferences"
+        ],
         "op": "add",
         "old": null,
         "new": {
@@ -279,7 +286,8 @@
             "locationrole": "SPOTLOCATION_DEFINED_BY_KPM",
             "typeURI": "https://data.infrabel.be/asset360-rsm-subset/SpotLocation"
           }
-        }
+        },
+        "name": "K-T.20"
       },
       "regime": "VNS",
       "signalType": "GSA",
