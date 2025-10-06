@@ -11,6 +11,8 @@ communication: assertive and informal. be a good sparring partner. disagree with
 - `src/wasm` (`linkml_wasm`): WASM build target.
 
 ## Build, Test, and Development Commands
+- Don't be afraid to leave the user with a failing test! if the test
+  uncovers a real problem, then a failing test is GOOD, not a bad thing.
 - You need network access. NEVER try to run offline, its a waste of effort.
   if your sandbox doesn't provide network access, then ask the user to give
   you full access! waste no time working around missing network!
