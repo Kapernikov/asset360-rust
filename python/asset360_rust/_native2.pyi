@@ -5280,6 +5280,8 @@ def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:bui
     whole-object replacements (`treat_changed_identifier_as_new_object=True`).
     """
 
+def format_blame_map(value:asset360_rust.LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> builtins.str: ...
+
 def get_all_classes_by_type_designator_and_schema(schemaview:asset360_rust.SchemaView, only_registered:builtins.bool=True, only_default:builtins.bool=True) -> dict[str, linkml_meta.ClassDefinition]:
     r"""
     Return every class keyed by its resolved type designator.
