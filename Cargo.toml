@@ -15,6 +15,7 @@ linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package 
 linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview", default-features = false }
 linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 serde_path_to_error = "0.1.17"
 serde_yml = "0.0.12"
 serde-wasm-bindgen = { version = "0.6", optional = true }
@@ -39,6 +40,7 @@ stubgen = [
 wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys"]
 
 [dev-dependencies]
+serde_json = "1.0"
 
 [profile.release]
 opt-level = "z"

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
+use linkml_runtime::diff::DiffOptions;
 use linkml_runtime::diff::PatchOptions;
-use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, patch};
+use linkml_runtime::{Delta, LinkMLInstance, NodeId, PatchTrace, diff};
+use serde_json::Value as JsonValue;
 
 /// Asset-specific metadata attached as blame.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -15,10 +17,67 @@ pub struct Asset360ChangeMeta {
 }
 
 /// One stage of changes with associated metadata.
-#[derive(Clone, Debug)]
+///
+/// Each stage represents the full LinkML value emitted by a change together with
+/// any metadata supplied by Asset360. The `deltas` field can be empty for raw
+/// stages; [`compute_history`] will derive normalized deltas when rebuilding the
+/// timeline.
+#[derive(Clone)]
 pub struct ChangeStage<M> {
     pub meta: M,
+    pub value: LinkMLInstance,
     pub deltas: Vec<Delta>,
+    pub rejected_paths: Vec<Vec<String>>,
+}
+
+/// Rebuild a normalized change history from staged LinkML values.
+///
+/// The first stage seeds the cumulative value. Every subsequent stage is
+/// diffed against the running value, rejected paths are filtered, and the
+/// remaining deltas are applied before continuing. The updated per-stage deltas
+/// are returned alongside the final LinkML value. The function panics if delta
+/// application reports any failed paths or when no stages are provided.
+pub fn compute_history(
+    stages: Vec<ChangeStage<Asset360ChangeMeta>>,
+) -> (LinkMLInstance, Vec<ChangeStage<Asset360ChangeMeta>>) {
+    let mut iter = stages.into_iter();
+    let mut history: Vec<ChangeStage<Asset360ChangeMeta>> = Vec::new();
+    let first = iter
+        .next()
+        .expect("at least one stage required to compute history");
+    let mut value = first.value.clone();
+    history.push(first);
+
+    for stage in iter {
+        let deltas = diff::diff(
+            &value,
+            &stage.value,
+            DiffOptions {
+                treat_changed_identifier_as_new_object: false,
+                ..Default::default()
+            },
+        );
+        let real_deltas: Vec<Delta> = deltas
+            .iter()
+            .filter(|d| !stage.rejected_paths.contains(&d.path))
+            .cloned()
+            .collect();
+        let new_stage = ChangeStage {
+            meta: stage.meta.clone(),
+            value: stage.value.clone(),
+            deltas: real_deltas.clone(),
+            rejected_paths: stage.rejected_paths.clone(),
+        };
+        history.push(new_stage);
+        let (new_value, trace) =
+            diff::patch(&value, &real_deltas, PatchOptions::default()).expect("patch failed");
+        if !trace.failed.is_empty() {
+            panic!("patch reported failed paths: {:?}", trace.failed);
+        }
+        value = new_value;
+    }
+
+    (value, history)
 }
 
 /// Apply a sequence of change stages, collecting blame (last-writer-wins) per NodeId.
@@ -33,7 +92,7 @@ pub fn apply_deltas(
 
     for stage in stages.into_iter() {
         let (new_value, trace): (LinkMLInstance, PatchTrace) =
-            patch(&value, &stage.deltas, PatchOptions::default()).expect("patch failed");
+            diff::patch(&value, &stage.deltas, PatchOptions::default()).expect("patch failed");
         // Last-writer-wins on added and updated nodes
         for id in trace.added.iter().chain(trace.updated.iter()) {
             blame.insert(*id, stage.meta.clone());
@@ -98,15 +157,149 @@ pub fn blame_map_to_path_stage_map(
     entries.into_iter().collect()
 }
 
+/// Produce a human-readable summary of blame metadata aligned with a YAML-style view.
+pub fn format_blame_map(
+    value: &LinkMLInstance,
+    blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
+) -> String {
+    const META_COL_WIDTH: usize = 72;
+    fn meta_column(meta: Option<&Asset360ChangeMeta>) -> String {
+        let mut text = meta
+            .map(|m| {
+                format!(
+                    "cid={:>3} author={} ts={} src={} ics={}",
+                    m.change_id, m.author, m.timestamp, m.source, m.ics_id
+                )
+            })
+            .unwrap_or_default();
+        if text.len() > META_COL_WIDTH {
+            text.truncate(META_COL_WIDTH);
+        }
+        format!("{text:<width$}", width = META_COL_WIDTH)
+    }
+
+    enum Marker {
+        None,
+        Dash,
+    }
+
+    fn scalar_to_string(v: &JsonValue) -> String {
+        serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".into())
+    }
+
+    fn walk(
+        node: &LinkMLInstance,
+        blame_map: &HashMap<NodeId, Asset360ChangeMeta>,
+        indent: usize,
+        key: Option<&str>,
+        marker: Marker,
+        lines: &mut Vec<String>,
+    ) {
+        let meta = blame_map.get(&node.node_id());
+        let meta_str = meta_column(meta);
+        let indent_str = "  ".repeat(indent);
+        match node {
+            LinkMLInstance::Scalar { value, .. } => {
+                let val = scalar_to_string(value);
+                let yaml_line = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}: {val}"),
+                    (Marker::None, None) => format!("{indent_str}{val}"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}: {val}"),
+                    (Marker::Dash, None) => format!("{indent_str}- {val}"),
+                };
+                lines.push(format!("{meta_str} | {yaml_line}"));
+            }
+            LinkMLInstance::Null { .. } => {
+                let yaml_line = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}: null"),
+                    (Marker::None, None) => format!("{indent_str}null"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}: null"),
+                    (Marker::Dash, None) => format!("{indent_str}- null"),
+                };
+                lines.push(format!("{meta_str} | {yaml_line}"));
+            }
+            LinkMLInstance::Object { values, class, .. } => {
+                let type_hint = format!(" ({})", class.name());
+                let header = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}:{type_hint}"),
+                    (Marker::None, None) => format!("{indent_str}<root>{type_hint}"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}:{type_hint}"),
+                    (Marker::Dash, None) => format!("{indent_str}-{type_hint}"),
+                };
+                lines.push(format!("{meta_str} | {header}"));
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (child_key, child_value) in entries {
+                    walk(
+                        child_value,
+                        blame_map,
+                        indent + 1,
+                        Some(child_key),
+                        Marker::None,
+                        lines,
+                    );
+                }
+            }
+            LinkMLInstance::Mapping { values, .. } => {
+                let header = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}:",),
+                    (Marker::None, None) => format!("{indent_str}<mapping>"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}:",),
+                    (Marker::Dash, None) => format!("{indent_str}-"),
+                };
+                lines.push(format!("{meta_str} | {header}"));
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (child_key, child_value) in entries {
+                    walk(
+                        child_value,
+                        blame_map,
+                        indent + 1,
+                        Some(child_key),
+                        Marker::None,
+                        lines,
+                    );
+                }
+            }
+            LinkMLInstance::List { values, .. } => {
+                let header = match (&marker, key) {
+                    (Marker::None, Some(k)) => format!("{indent_str}{k}:",),
+                    (Marker::None, None) => format!("{indent_str}<list>"),
+                    (Marker::Dash, Some(k)) => format!("{indent_str}- {k}:",),
+                    (Marker::Dash, None) => format!("{indent_str}-"),
+                };
+                lines.push(format!("{meta_str} | {header}"));
+                for child in values {
+                    walk(child, blame_map, indent + 1, None, Marker::Dash, lines);
+                }
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    walk(value, blame_map, 0, None, Marker::None, &mut lines);
+    if lines.is_empty() {
+        "<empty blame map>".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 #[cfg(feature = "python-bindings")]
 mod py_conversions {
     use super::Asset360ChangeMeta;
+    use crate::PyAsset360ChangeMeta;
+    use pyo3::PyRef;
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
 
     impl<'py> FromPyObject<'py> for Asset360ChangeMeta {
         fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+            if let Ok(meta_obj) = ob.extract::<PyRef<PyAsset360ChangeMeta>>() {
+                return Ok(meta_obj.clone_inner());
+            }
+
             let dict = ob.downcast::<PyDict>()?;
             let require = |key: &str| {
                 dict.get_item(key)?
@@ -128,273 +321,12 @@ mod py_conversions {
         type Error = PyErr;
 
         fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
-            let dict = PyDict::new(py);
-            let Asset360ChangeMeta {
-                author,
-                timestamp,
-                source,
-                change_id,
-                ics_id,
-                ..
-            } = self;
-            dict.set_item("author", author)?;
-            dict.set_item("timestamp", timestamp)?;
-            dict.set_item("source", source)?;
-            dict.set_item("change_id", change_id)?;
-            dict.set_item("ics_id", ics_id)?;
-            Ok(dict.into_any())
+            let meta = PyAsset360ChangeMeta::from(self);
+            let bound = meta.into_pyobject(py)?;
+            Ok(bound.into_any())
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use linkml_schemaview::schemaview::SchemaView;
-    #[test]
-    fn test_get_blame_info_with_manual_map() {
-        // Build a tiny manual blame map and a dummy value
-        let mut blame = HashMap::new();
-        let meta1 = Asset360ChangeMeta {
-            author: "a".into(),
-            timestamp: "t1".into(),
-            source: "manual".into(),
-            change_id: 1,
-            ics_id: 101,
-        };
-        let meta2 = Asset360ChangeMeta {
-            author: "b".into(),
-            timestamp: "t2".into(),
-            source: "manual".into(),
-            change_id: 2,
-            ics_id: 102,
-        };
-
-        // Create a minimal value by parsing an empty object for a dummy class
-        use linkml_meta::SchemaDefinition;
-        use serde_path_to_error as p2e;
-        use serde_yml as yml;
-
-        let schema_yaml = r#"
-id: https://example.org/test
-name: test
-default_prefix: ex
-prefixes:
-  ex:
-    prefix_reference: http://example.org/
-classes:
-  Root: {}
-"#;
-        let deser = yml::Deserializer::from_str(schema_yaml);
-        let schema: SchemaDefinition = p2e::deserialize(deser).unwrap();
-        let mut sv = SchemaView::new();
-        sv.add_schema(schema).unwrap();
-        let conv = sv.converter_for_primary_schema().unwrap();
-        let class = sv
-            .get_class(
-                &linkml_schemaview::identifier::Identifier::new("Root"),
-                conv,
-            )
-            .unwrap()
-            .unwrap();
-        let v = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
-        let id = v.node_id();
-
-        // First writer
-        blame.insert(id, meta1.clone());
-        // Last writer wins
-        blame.insert(id, meta2.clone());
-
-        assert_eq!(get_blame_info(&v, &blame), Some(&meta2));
-    }
-
-    #[test]
-    fn test_apply_deltas_no_stages() {
-        // When there are no stages, the base is returned and blame is empty.
-        use linkml_meta::SchemaDefinition;
-        use serde_path_to_error as p2e;
-        use serde_yml as yml;
-
-        let schema_yaml = r#"
-id: https://example.org/test
-name: test
-default_prefix: ex
-prefixes:
-  ex:
-    prefix_reference: http://example.org/
-classes:
-  Root: {}
-"#;
-        let deser = yml::Deserializer::from_str(schema_yaml);
-        let schema: SchemaDefinition = p2e::deserialize(deser).unwrap();
-        let mut sv = SchemaView::new();
-        sv.add_schema(schema).unwrap();
-        let conv = sv.converter_for_primary_schema().unwrap();
-        let class = sv
-            .get_class(
-                &linkml_schemaview::identifier::Identifier::new("Root"),
-                conv,
-            )
-            .unwrap()
-            .unwrap();
-        let base = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
-        let (out, b) = apply_deltas(Some(base.clone()), vec![]);
-        // Can't assert structural equality without schema context, but Default base should be preserved.
-        // We can at least ensure the map is empty.
-        assert!(b.is_empty());
-        // Ensure node_id remains the same when no stages are applied
-        assert_eq!(out.node_id(), base.node_id());
-    }
-
-    #[test]
-    fn test_blame_map_to_path_stage_map() {
-        use linkml_meta::SchemaDefinition;
-        use serde_path_to_error as p2e;
-        use serde_yml as yml;
-
-        let schema_yaml = r#"
-id: https://example.org/test
-name: test
-default_prefix: ex
-prefixes:
-  ex:
-    prefix_reference: http://example.org/
-slots:
-  name:
-    range: string
-  child:
-    range: Child
-  items:
-    range: Child
-    multivalued: true
-  title:
-    range: string
-classes:
-  Root:
-    slots:
-      - name
-      - child
-      - items
-  Child:
-    slots:
-      - title
-"#;
-        let deser = yml::Deserializer::from_str(schema_yaml);
-        let schema: SchemaDefinition = p2e::deserialize(deser).unwrap();
-        let mut sv = SchemaView::new();
-        sv.add_schema(schema).unwrap();
-        let conv = sv.converter_for_primary_schema().unwrap();
-        let class = sv
-            .get_class(
-                &linkml_schemaview::identifier::Identifier::new("Root"),
-                conv,
-            )
-            .unwrap()
-            .unwrap();
-
-        let data = r#"
-name: Rooty
-child:
-  title: Kid
-items:
-  - title: First
-  - title: Second
-"#;
-        let value = linkml_runtime::load_yaml_str(data, &sv, &class, conv).unwrap();
-
-        let mut blame = HashMap::new();
-        let root_meta = Asset360ChangeMeta {
-            author: "root-author".into(),
-            timestamp: "t0".into(),
-            source: "import".into(),
-            change_id: 1,
-            ics_id: 10,
-        };
-        blame.insert(value.node_id(), root_meta.clone());
-
-        let child_title_node = match &value {
-            LinkMLInstance::Object { values, .. } => values
-                .get("child")
-                .and_then(|child| match child {
-                    LinkMLInstance::Object { values, .. } => values.get("title"),
-                    _ => None,
-                })
-                .expect("child.title node present"),
-            _ => panic!("expected root object"),
-        };
-        let child_meta = Asset360ChangeMeta {
-            author: "child-author".into(),
-            timestamp: "t1".into(),
-            source: "import".into(),
-            change_id: 2,
-            ics_id: 20,
-        };
-        blame.insert(child_title_node.node_id(), child_meta.clone());
-
-        let items_title_nodes = match &value {
-            LinkMLInstance::Object { values, .. } => values
-                .get("items")
-                .and_then(|items| match items {
-                    LinkMLInstance::List { values, .. } => {
-                        if values.len() == 2 {
-                            let first = match &values[0] {
-                                LinkMLInstance::Object { values, .. } => {
-                                    values.get("title").expect("items[0].title")
-                                }
-                                _ => panic!("expected object for items[0]"),
-                            };
-                            let second = match &values[1] {
-                                LinkMLInstance::Object { values, .. } => {
-                                    values.get("title").expect("items[1].title")
-                                }
-                                _ => panic!("expected object for items[1]"),
-                            };
-                            Some((first, second))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                })
-                .expect("items list present"),
-            _ => panic!("expected root object"),
-        };
-
-        let (item0_title_node, item1_title_node) = items_title_nodes;
-
-        let item0_meta = Asset360ChangeMeta {
-            author: "item0-author".into(),
-            timestamp: "t2".into(),
-            source: "import".into(),
-            change_id: 3,
-            ics_id: 30,
-        };
-        blame.insert(item0_title_node.node_id(), item0_meta.clone());
-
-        let item1_meta = Asset360ChangeMeta {
-            author: "item1-author".into(),
-            timestamp: "t3".into(),
-            source: "import".into(),
-            change_id: 4,
-            ics_id: 40,
-        };
-        blame.insert(item1_title_node.node_id(), item1_meta.clone());
-
-        let entries = blame_map_to_path_stage_map(&value, &blame);
-
-        let expected = vec![
-            (vec![], root_meta),
-            (vec!["child".to_string(), "title".to_string()], child_meta),
-            (
-                vec!["items".to_string(), "0".to_string(), "title".to_string()],
-                item0_meta,
-            ),
-            (
-                vec!["items".to_string(), "1".to_string(), "title".to_string()],
-                item1_meta,
-            ),
-        ];
-
-        assert_eq!(entries, expected);
-    }
-}
+mod tests;

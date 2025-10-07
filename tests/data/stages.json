@@ -1,0 +1,195 @@
+[
+  {
+    "class_id": "https://data.infrabel.be/asset360/Signal",
+    "meta": {
+      "author": "PQG8200",
+      "timestamp": "2025-10-03 13:21:59",
+      "source": "ines",
+      "change_id": 59021,
+      "ics_id": 218
+    },
+    "value": {
+      "controllerTechnology": "PLP",
+      "hasTelephone": true,
+      "id": "https://data.infrabel.be/ramses/signals/RMS-INV-3-40925",
+      "lifeCycle": {
+        "LifeCycle_isActive": true,
+        "installationDate": "1970-01-01",
+        "outOfExploitation": false
+      },
+      "locationInfo": {
+        "line": "L-124A",
+        "station": "https://data.infrabel.be/ramses/station/Monceau",
+        "stationTrack": "885",
+        "track": "A",
+        "yard": null
+      },
+      "maintenanceUnit": {
+        "MaintenanceUnit_hasCode": "5255",
+        "districtCode": "52",
+        "districtName": "52-La Louvi\u00e8re",
+        "zoneCode": 5,
+        "zoneName": "Charleroi"
+      },
+      "refersToEulSignal": {
+        "isOfAutomaticType": "SUBJECT_TO_ARS",
+        "signalFrame": {
+          "MAIN": {
+            "aspects": {},
+            "fixed": true,
+            "signalFrameType": "MAIN"
+          }
+        }
+      },
+      "refersToLocatedNetEntity": {
+        "locations": {
+          "SPOTLOCATION_DEFINED_BY_KPM": {
+            "SpotLocation_coordinates": {
+              "https://data.infrabel.be/asset360-rsm-subset/GeographicCoordinate": {
+                "PositioningSystemCoordinate_positioningSystem": {
+                  "epsgCode": "EPSG:4326",
+                  "typeURI": "http://rsm.uic.org/RSM12#EAID_4160AA98_42AF_4b5f_B03C_F15A39D631BA"
+                },
+                "latitude": 50.42993108588731,
+                "longitude": 4.3930545920871875,
+                "typeURI": "https://data.infrabel.be/asset360-rsm-subset/GeographicCoordinate"
+              },
+              "https://data.infrabel.be/asset360-rsm-subset/LinearCoordinate": {
+                "PositioningSystemCoordinate_positioningSystem": {
+                  "LinearPositioningSystem_isLocatedAt": {
+                    "LinearLocation_associatedNetElements": [
+                      {
+                        "netElement": "https://data.infrabel.be/ramses/track/L%20124A_1"
+                      }
+                    ],
+                    "typeURI": "http://rsm.uic.org/RSM12#EAID_A71951F4_71A1_40dd_B380_3E005A43F9E5"
+                  },
+                  "typeURI": "http://rsm.uic.org/RSM12#EAID_B1BC7D5C_970F_4e62_AB98_D889190D0152"
+                },
+                "anchorPoint": {
+                  "restartValue": {
+                    "NumericQuantity_value": 50.0,
+                    "Quantity_unit": "https://data.infrabel.be/asset360/unit/Meter"
+                  }
+                },
+                "measure": {
+                  "NumericQuantity_value": 648.0,
+                  "Quantity_unit": "https://data.infrabel.be/asset360/unit/Kilometer"
+                },
+                "typeURI": "http://rsm.uic.org/RSM12#EAID_CB107995_3610_4622_824B_708281B24CEA"
+              }
+            },
+            "locationrole": "SPOTLOCATION_DEFINED_BY_KPM",
+            "typeURI": "https://data.infrabel.be/asset360-rsm-subset/SpotLocation"
+          },
+          "SPOTLOCATION_MEASURED_BY_GPS": {
+            "SpotLocation_coordinates": {
+              "https://data.infrabel.be/asset360-rsm-subset/GeographicCoordinate": {
+                "PositioningSystemCoordinate_positioningSystem": {
+                  "epsgCode": "EPSG:4326",
+                  "typeURI": "http://rsm.uic.org/RSM12#EAID_4160AA98_42AF_4b5f_B03C_F15A39D631BA"
+                },
+                "latitude": 50.42992903439764,
+                "longitude": 4.393054789535049,
+                "typeURI": "https://data.infrabel.be/asset360-rsm-subset/GeographicCoordinate"
+              }
+            },
+            "locationrole": "SPOTLOCATION_MEASURED_BY_GPS",
+            "typeURI": "https://data.infrabel.be/asset360-rsm-subset/SpotLocation"
+          }
+        },
+        "name": "K-T.20"
+      },
+      "regime": "VNS",
+      "signalType": "GSA",
+      "signallingPost": "https://data.infrabel.be/ramses/signalposts/10087",
+      "typeURI": "https://data.infrabel.be/asset360/Signal"
+    },
+    "deltas": [],
+    "rejected_paths": []
+  },
+  {
+    "class_id": "https://data.infrabel.be/asset360/Signal",
+    "meta": {
+      "author": "FCR-42",
+      "timestamp": "2025-10-03 13:30:12",
+      "source": "e1002",
+      "change_id": 99688,
+      "ics_id": 865
+    },
+    "value": {
+      "externalReferences": {
+        "Drawin": {
+          "key": "Drawin",
+          "value": "https://drawin.infrabel.be/website/Search/detail.aspx?mid=29018&file=FCR-002-99-pss_fcr_f42.pdf"
+        },
+        "e1002_page": {
+          "key": "e1002_page",
+          "value": "42"
+        },
+        "e1002_zone": {
+          "key": "e1002_zone",
+          "value": "FCR"
+        }
+      },
+      "hasTelephone": true,
+      "id": "https://data.infrabel.be/e1002/signals/c8986439-4e97-4ea6-b3fd-8c06516a3da3",
+      "locationInfo": {
+        "line": "L-124"
+      },
+      "maintenanceUnit": {
+        "zoneCode": 5,
+        "zoneName": "Charleroi"
+      },
+      "refersToLocatedNetEntity": {
+        "locations": {
+          "SPOTLOCATION_DEFINED_BY_KPM": {
+            "SpotLocation_coordinates": {
+              "https://data.infrabel.be/asset360-rsm-subset/GeographicCoordinate": {
+                "PositioningSystemCoordinate_positioningSystem": {
+                  "epsgCode": "EPSG:4326",
+                  "typeURI": "http://rsm.uic.org/RSM12#EAID_4160AA98_42AF_4b5f_B03C_F15A39D631BA"
+                },
+                "latitude": 50.43004229788595,
+                "longitude": 4.393170361151477,
+                "typeURI": "https://data.infrabel.be/asset360-rsm-subset/GeographicCoordinate"
+              },
+              "https://data.infrabel.be/asset360-rsm-subset/LinearCoordinate": {
+                "PositioningSystemCoordinate_positioningSystem": {
+                  "LinearPositioningSystem_isLocatedAt": {
+                    "LinearLocation_associatedNetElements": [
+                      {
+                        "netElement": null
+                      }
+                    ],
+                    "typeURI": "http://rsm.uic.org/RSM12#EAID_A71951F4_71A1_40dd_B380_3E005A43F9E5"
+                  },
+                  "typeURI": "http://rsm.uic.org/RSM12#EAID_B1BC7D5C_970F_4e62_AB98_D889190D0152"
+                },
+                "anchorPoint": {
+                  "restartValue": {
+                    "NumericQuantity_value": 50.0,
+                    "Quantity_unit": "https://data.infrabel.be/asset360/unit/Meter"
+                  }
+                },
+                "measure": {
+                  "NumericQuantity_value": 648.0,
+                  "Quantity_unit": "https://data.infrabel.be/asset360/unit/Kilometer"
+                },
+                "typeURI": "http://rsm.uic.org/RSM12#EAID_CB107995_3610_4622_824B_708281B24CEA"
+              }
+            },
+            "locationrole": "SPOTLOCATION_DEFINED_BY_KPM",
+            "typeURI": "https://data.infrabel.be/asset360-rsm-subset/SpotLocation"
+          }
+        },
+        "name": "K-T.20"
+      },
+      "regime": "VNS",
+      "signalType": "GSA",
+      "typeURI": "https://data.infrabel.be/asset360/Signal"
+    },
+    "deltas": [],
+    "rejected_paths": []
+  }
+]

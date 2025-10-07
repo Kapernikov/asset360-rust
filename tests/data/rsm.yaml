@@ -1,0 +1,596 @@
+id: https://w3id.org/infrabel/rsm
+name: rsm
+title: rsm
+description: |-
+  RSM model subset used by infrabel asset360
+license: Apache Software License 2.0
+
+imports:
+  - ./types
+
+prefixes:
+  linkml: https://w3id.org/linkml/
+  RSM: http://rsm.uic.org/RSM12
+  irsm: https://data.infrabel.be/asset360-rsm-subset/
+
+default_prefix: irsm
+
+classes:
+  BaseObject:
+    description: >-
+      The RSM base object
+    class_uri: RSM:#EAID_204239DE_7A6F_4de1_B213_F6F70D35C617
+
+  NamedResource:
+    description: >-
+      A RSM named resource
+    is_a: BaseObject
+    class_uri: RSM:#EAID_FEDD0D3F_7335_4982_8D57_F3F23E51E6B1
+    attributes:
+      name:
+        range: string
+        slot_uri: RSM:#EAID_080C70AE_7680_4515_B580_0B30E8066364
+      longname:
+        range: string
+        slot_uri: RSM:#EAID_EF76D88A_8B8D_4152_BBD7_D08E0683104C
+  
+  NetworkResource:
+    description: >-
+      A RSM network resource
+    is_a: NamedResource
+    class_uri: RSM:#EAID_D42F96E9_918C_4ea6_BDB3_C684057FD71F
+    attributes:
+      NetworkResource_validityPeriod:
+        range: string
+        slot_uri: RSM:#EAID_687ACF87_9A41_4bd7_9154_7BD21097983C
+
+  NetEntity:
+    is_a: NetworkResource
+    class_uri: RSM:#EAID_FA3D2E7E_FD62_464a_86D4_5E5578857D37
+
+  LocatedNetEntity:
+    description: >-
+      A located net entity
+    is_a: NetEntity
+    class_uri: RSM:#EAID_55DDBCD9_DA3C_4baf_8CBF_21BD9481BE3C
+    slots:
+      - locations
+
+
+  BaseLocation:
+    description: >-
+      A RSM base location
+    is_a: BaseObject
+    class_uri: RSM:#EAID_5CC96D2F_0D85_427c_8DC1_668074F7EE1A
+    slots:
+      - locationrole
+    attributes:
+      typeURI:
+        range: uri
+        designates_type: true
+
+  LinearPositioningSystem:
+    is_a: PositioningSystem
+    class_uri: RSM:#EAID_B1BC7D5C_970F_4e62_AB98_D889190D0152
+    description: >-
+      A referencing system for locations relative to a one-dimensional object (reference line) as
+      measurement along (and optionally offset from) that object. A linear positioning system
+      combines a line of reference (here: a collection of PositioningNetElements) with a single
+      number (linear abscissa, i.e. an instance of class LinearCoordinate) allowing positioning
+      within a railway network, at the chosen level (MACRO, MICRO...). Often called chainage
+      (when yielding the actual "distance along"), or mileage system (when reflecting a conventional
+      kilometric post or mile post system). The start- and end-measures (optional) provide the valid
+      range of linear coordinates within the chosen linear positioning system. The difference between
+      two coordinates is not necessarily the "true distance along" because of possible deviations
+      (jumps or systematic errors), that are taken care of by anchor points and linear referencing methods.
+      The units of linear abscissa are the same as the start and end-measure. For reference,
+      see EN 19148:2021. ISO parameter DistanceAlongDirection is "same", implicitly.    
+    attributes:
+      LinearPositioningSystem_isLocatedAt:
+        range: LinearLocation
+        slot_uri: RSM:#EAID_59ED3166_6C12_46be_89E6_FA15BEAC50C8
+        inlined: true
+      linearReferencingMethodType:
+        range: LRMType
+      startMeasure:
+        range: Length
+        slot_uri: RSM:#EAID_6EE74EB1_637E_4fe5_913D_FE6C9A1C2BAE
+        inlined: true
+      endMeasure:
+        range: Length
+        inlined: true
+        slot_uri: RSM:#EAID_3FE5062F_87E7_4785_964E_5F18A79AF90D
+
+  LinearCoordinate:
+    is_a: PositioningSystemCoordinate
+    class_uri: RSM:#EAID_CB107995_3610_4622_824B_708281B24CEA
+    description: >-
+      A curvilinear abscissa ("distance along"), optionally with vertical and lateral offset. The units
+      are defined by the associated positioning system. See also ISO19148:2012: LR_PositionExpression.
+      Please note that the concepts match: in ISO19148, LR_PositionExpression refers to exactly 1 distance
+      expression (here: instance of Length), one linear element (here: one reference line, via the reference
+      to positioning system), and one linear referencing method (here: referred to, via the linear positioning
+      system).
+    attributes:
+      anchorPoint:
+        range: AnchorPoint
+        slot_uri: RSM:#EAID_6C2B9ED9_6CA1_4ae4_9860_324F42137D9C
+      measure:
+        range: Length
+        slot_uri: RSM:#EAID_9006CC92_63FA_4e72_B27D_82B7C4F1E8DD
+        inlined: true
+      verticalOffset:
+        range: Length
+        slot_uri: RSM:#EAID_2525E18C_60A1_4ac2_9694_571C30534686
+        inlined: true
+      lateralOffset:
+        range: Length
+        slot_uri: RSM:#EAID_1C7D4A58_56DD_49e8_8D11_E56494A00874
+        inlined: true
+
+
+
+  LinearLocation:
+    is_a: BaseLocation
+    class_uri: RSM:#EAID_A71951F4_71A1_40dd_B380_3E005A43F9E5
+    description: >-
+      Linear Location
+    attributes:
+      polylines:
+        range: Polyline
+        multivalued: true
+        inlined_as_list: true
+        slot_uri: RSM:#EAID_60946C15_19A4_402e_888C_D0CAC0C34BB3
+      LinearLocation_associatedNetElements: 
+        range: AssociatedNetElement
+        multivalued: true
+        inlined: false
+        slot_uri: RSM:#EAID_2725D044_9832_437e_B17F_4E42287CA612
+
+  AreaLocation:
+    is_a: BaseLocation
+    class_uri: RSM:#EAID_D67FB4FB_21D5_4336_8902_3A03600F0A7B
+    description: >-
+      Area Location
+    attributes:
+      polygons:
+        range: Polygon
+        multivalued: true
+        inlined_as_list: true
+      AreaLocation_associatedNetElements:
+        range: AssociatedNetElement
+        multivalued: true
+        inlined_as_list: true
+        slot_uri: RSM:#EAID_41661958_72A3_4c0a_B640_B069B86BF01C
+
+
+  NetElement:
+    is_a: NetworkResource
+    description: >-
+      Base class for defining nodes in the connectivity graph representing the topological network.
+    class_uri: RSM:#EAID_90821860_1B9D_4f22_A638_58D45EE4A700
+    attributes:
+      id:
+        identifier: true
+  
+  ElementPartCollection:
+    is_a: BaseObject
+    class_uri: RSM:#EAID_112D2763_2173_4a9b_97EE_0860E71EFF3E
+    description: >-
+      Defines a collection of NetElements that can aggregate into a higher level NetElement class.
+
+  UnorderedCollection:
+    is_a: ElementPartCollection
+    class_uri: RSM:#EAID_A4028773_0C27_4395_AFF7_3BA6DBBB6BD4
+    description: >-
+      An unordered collection has no specific begin and end.
+    attributes:
+      UnorderedCollection_elementParts:
+          range: NetElement
+          inlined_as_list: true
+          slot_uri: RSM:#EAID_61919424_70F9_408f_9AAB_3162706AAA84
+          multivalued: true
+  
+  OrderedCollection:
+    is_a: ElementPartCollection
+    class_uri: RSM:#EAID_30A69D7E_CC8B_485d_ACC8_95A00AC3BDB5
+    description: >-
+      A list, i.e. an ordered set of NetElements that are part of the higher level.
+      The sorting criteria aren't defined but may be established by specialising the class.
+    attributes:
+      sequence:
+        range: integer
+        slot_uri: RSM:#EAID_93EFB875_2344_4d37_B72B_DC1EB157AF6A
+      OrderedCollection_elementParts:
+        range: NetElement
+        inlined_as_list: true
+        slot_uri: RSM:#EAID_037A50C8_74BD_442c_920E_44DBD17EEC95
+        multivalued: true
+
+    
+
+  CompositionNetElement:
+    is_a: NetElement
+    description: >-
+      Aggregation of elements (nodes of the topological network) into bigger nodes. This allows 
+      defining network level(s) to zoom in and out, showing or hiding levels of detail.
+    class_uri: RSM:#EAID_ADB48BBB_757A_4eee_9043_C77E4837A01F
+    attributes:
+      elementCollections:
+        multivalued: true
+        inlined: true
+        range: ElementPartCollection
+        slot_uri: RSM:#EAID_E3F81219_4CB0_4b25_BE2F_E02D1EB0B894
+
+
+  PositioningNetElement:
+    is_a: CompositionNetElement
+    class_uri: RSM:#EAID_FD2FAF72_D5C5_4ace_90E6_A30B51799EEF
+    description: >-
+      Topological element connected and oriented in the network by means of oriented relations.
+  
+  LinearElement:
+    is_a: PositioningNetElement
+    class_uri: RSM:#EAID_C7A032D1_7254_42cf_8768_1FEC8CB281C2
+    description: >-
+      A one-dimensional topological (curvi-)linear element.
+
+  LinearElementWithLength:
+    is_a: LinearElement
+    class_uri: RSM:#EAID_F082DC89_E7B9_4d6f_A246_DFCE5A810740
+    description: >-
+      A linear element that is given a length. This length is used for practical computational purposes.
+    attributes:
+      elementLength:
+        range: Length
+        inlined: true
+        slot_uri: RSM:#EAID_E72F11AD_39B9_4e22_A5F5_7ED4EE3BA949
+
+  QuantityKind:
+    is_a: NamedResource
+    class_uri: RSM:#EAID_AEE68A84_C9DB_4a07_9641_DD6992899F70
+    description: >-
+      Aspect common to mutually comparable quantities. A quantity of a given kind contains
+      a numerical value expressed in a particular measurement unit.
+    attributes:
+      QuantityKind_symbol:
+        range: string
+        slot_uri: RSM:#EAID_F7E31058_5CAA_4c51_9C18_E1188760AB24
+      QuantityKind_definitionURI: 
+        range: uriorcurie
+        slot_uri: RSM:#EAID_2AF05346_C166_46f1_B4D5_01A0AB35CE92
+      QuantityKind_unit:
+        range: Unit
+        multivalued: true
+        inlined_as_list: true
+        slot_uri: RSM:#EAID_57B599BB_FD65_4edf_959F_42302618928E
+      scale: # FIXME custom class Scale instead of str in RSM
+        slot_uri: RSM:#EAID_089FEE98_6107_4e74_BFBC_411BB1203856
+        range: string
+
+
+  AssociatedNetElement:
+    description: >-
+      A RSM Associated Net Element
+    class_uri: RSM:#EAID_3D7A4A0A_2009_4096_88B3_88D59586C935
+    attributes:
+      netElement:
+        range: PositioningNetElement
+        inlined: false
+        slot_uri: RSM:#EAID_ABB3CBB5_20F7_46da_9DC5_AC87309BF772
+      bounds: # FIXME this is actually not optional in the RSM model, custom class IntrinsicCoordinate instead of float in RSM
+        slot_uri: RSM:#EAID_31CCF7FE_27EE_49c5_BBD7_CECF7C43E03A
+        range: float
+        multivalued: true
+        minimum_cardinality: 1
+        maximum_cardinality: 2
+      appliesInDirection:
+        range: string
+        slot_uri: RSM:#EAID_745D3099_28AF_444f_9852_43FC4F36944E
+      lateralPosition:
+        range: string # FIXME custom class LateralPosition instead of str in RSM
+
+
+  Unit:
+    is_a: NamedResource
+    class_uri: RSM:#EAID_DE1084FF_52AF_4e8a_96C9_8137301ED042
+    description: >-
+      The unit used to express a quantity.
+    attributes:
+      id:
+        identifier: true
+      Unit_symbol:
+        slot_uri: RSM:#EAID_C51E74E8_8FC6_409c_B2D0_1A83F8D97403
+        range: string
+      Unit_definitionURI:
+        range: uriorcurie
+        slot_uri: RSM:#EAID_813279E3_FA52_45e1_AC63_BBD9E958DBD3
+      Unit_quantityKind:
+        range: QuantityKind
+        inlined: true
+
+      
+
+  Quantity:
+    is_a: BaseObject
+    class_uri: RSM:#EAID_862909CF_1CF9_43f3_899E_C3EACACECC61
+    description: >-
+      The value of an observable, i.e. measurable, property of a NetEntity or other physical object. 
+      Type "double" is given because it is most generally applicable, and UML2.5 does not provide 
+      abstract supertypes.
+    attributes:
+      Quantity_unit:
+        range: Unit
+        inlined: false
+      Quantity_quantityKind:
+        range: QuantityKind
+        inlined: true
+        slot_uri: RSM:#EAID_02AA3A5E_3136_4684_921B_0BA894BE3934
+
+
+  NumericQuantity:
+    is_a: Quantity
+    class_uri: RSM:#EAID_9E4F614D_7B48_424c_8622_D8D80698B5DF
+    description: >-
+      Any quantity that can be expressed with a number (cardinal or ordinal). For a more exhaustive 
+      list of subclasses, see "Common quantities" diagram.
+    attributes:
+      NumericQuantity_value:
+        range: float
+
+
+  Length:
+    is_a: NumericQuantity
+    class_uri: RSM:#EAID_70FCCC20_542A_4e19_9717_57E48913DC59
+    description: >-
+      Quantity of type length, distance, height, width, etc.
+
+
+  BaseProperty:
+    is_a: NamedResource
+    class_uri: RSM:#EAID_9634A282_6454_4efd_A0DC_A5C3CE53E228
+    description: >-
+      Abstract property class, needed to implement the composite pattern.
+    attributes:
+      definition:
+        range: string
+        slot_uri: RSM:#EAID_D9A9BDFF_B087_48af_A07C_217E319F9638
+      reference:
+        range: string
+        slot_uri: RSM:#EAID_8A3BBE58_4929_4eac_98EB_DD115C7769A3
+
+  ObservableProperty:
+    is_a: BaseProperty
+    class_uri: RSM:#EAID_4EA7F062_FAD2_47aa_B2AD_21E1BBC82A57
+    description: >-
+      An observable property as per w3c sosa ontology (https://www.w3.org/TR/vocab-ssn/#SOSAObservableProperty). 
+      This class embodies all properties that need to be referenced by another class in this model 
+      (or a model using the present model).
+    attributes:
+      quantity:
+        range: Quantity
+        multivalued: true
+        inlined_as_list: true
+
+  PositioningSystem:
+    is_a: NamedResource
+    class_uri: RSM:#EAID_BA22A96B_7ECA_4267_B161_1670955D57D4
+    description: >-
+      A spatial reference system in which a position can be expressed in terms of coordinates.
+    attributes:
+      units:
+        range: Unit
+        multivalued: true
+        inlined: true
+      PositioningSystem_validityPeriod:
+        range: string # FIXME custom class ValidityPeriod instead of str in RSM
+      typeURI:
+        designates_type: true
+        range: uri
+
+  GeographicCoordinateSystem:
+    is_a: PositioningSystem
+    class_uri: RSM:#EAID_4160AA98_42AF_4b5f_B03C_F15A39D631BA
+    description: >-
+        Defines geographic or geodetic reference system used to position instances of NetElement or
+        NetEntity. About epsgCode, see e.g. epsg.io.
+    attributes:
+      epsgCode:
+        range: string
+        slot_uri: RSM:#EAID_83465BF2_F5A6_4b8f_9FDC_456C12372470
+  
+  AnchorPoint:
+    is_a: NamedResource
+    class_uri: RSM:#EAID_779C5CF6_3ADC_42a9_BFD0_E1BFE0B07F42
+    description: >-
+      ISO19148:2012 : LR_AlongReferent ; ISO19148:2021: Referent, of type "referenceMarker" that is
+      implicit in RSM.
+    attributes:
+      AnchorPoint_isLocatedAt:
+        slot_uri: RSM:#EAID_8E49EA2B_4A9D_425d_9236_66C4DA528544
+        range: SpotLocation
+        inlined: true
+      appliesTo:
+        range: LinearPositioningSystem
+        slot_uri: RSM:#EAID_0B089392_3606_4c82_A661_2790349CBF1B
+        inlined: true
+      refersToPrevious:
+        range: AnchorPoint
+        inlined: false
+        slot_uri: RSM:#EAID_01453A1C_6169_4a00_86F5_C4EDA049EAFA
+      measureFromPrevious:
+        range: Length
+        inlined: true
+        slot_uri: RSM:#EAID_17CC1F69_8288_4f8e_9D2E_AF88DCB05826
+      restartValue:
+        range: Length
+        inlined: true
+    
+
+
+
+  Polyline:
+    is_a: NamedResource
+    description: >-
+      Set of consecutive straight segments (no branches) defined by successive vertices. Can
+      be specialized to e.g. prisms, for instance to define 3D "areas". A polyline is expected
+      to have the same number of vertices in all positioning systems, but the model does not
+      enforce this. This flexibility can be useful when the linestring approximates a circle
+      for instance.      
+    class_uri: RSM:#EAID_5437AE03_DDC4_40ff_81F9_D16CFAE628D3
+    attributes:
+      PolyLine_coordinates:
+        range: PositioningSystemCoordinate
+        multivalued: true
+        inlined_as_list: true
+        slot_uri: RSM:#EAID_98CEC1DB_8447_459f_A9A0_6A12C7981CEF
+      PolyLine_positioningSystem:
+        range: PositioningSystem
+        inlined: true
+        slot_uri: RSM:#EAID_B67B74F4_7DFA_4817_A340_3E010C190753
+
+  Polygon:
+    is_a: NamedResource
+    description: >-
+      A closed polyline without any intersections. The first and last vertex define the "closing"
+      segment. A polygon is expected to have the same number of vertices in all positioning systems,
+      but the model does not enforce this. This flexibility can be useful when the polyline
+      approximates a circle for instance.    
+    class_uri: RSM:#EAID_28AF4E06_3B90_4b38_A4AA_17963496BD42
+    attributes:
+      Polygon_coordinates:
+        range: PositioningSystemCoordinate
+        multivalued: true
+        inlined_as_list: true
+      Polygon_positioningSystem:
+        range: PositioningSystem
+        inlined: true
+
+
+
+  PositioningSystemCoordinate:
+    is_a: ObservableProperty
+    description: >-
+      A tuple of coordinates in a given positioning system.
+    slots:
+      - typeURI
+    attributes:
+      PositioningSystemCoordinate_positioningSystem:
+        slot_uri: RSM:#EAID_2220774B_7F05_4c85_ABF5_44AE6DCBD040
+        range: PositioningSystem
+    slot_usage:
+      typeURI:
+        key: true
+
+
+  GeometricCoordinate:
+    is_a: PositioningSystemCoordinate
+    description: >-
+      A set of coordinates in a given geometric positioning system.
+
+
+  CartesianCoordinate:
+    is_a: GeometricCoordinate
+    description: >-
+      Cartesian coordinates. The x,y, z units are defined by the associated positioning system. 
+      The user may retain only elevation (z) if needed, e.g. in conjunction with linear coordinates 
+      (distance along).
+    attributes:
+      x:
+        range: float
+      y:
+        range: float
+      z:
+        range: float
+
+
+  GeographicCoordinate:
+    is_a: GeometricCoordinate
+    description: >-
+      Latitude, longitude and height (synonym: elevation) (ISO 19111). The datum and units are defined 
+      by the associated positioning system. Note: Altitude is a special kind of height (ISO 6709:2008), 
+      and not used here.
+    attributes: ### TODO they have a wrong prefix!
+      elevation:
+        range: float
+        slot_uri: RSM:#EAID_637C31AC_E36A_4193_9437_677447487E8C
+      longitude:
+        range: float
+        slot_uri: RSM:#EAID_AB7134A8_B69E_4954_BB68_514FB1C7A209
+      latitude:
+        range: float
+        slot_uri: RSM:#EAID_ABEB1DF5_8277_452c_9B67_6786E4FA9620
+
+
+
+
+  SpotLocation:
+    is_a: BaseLocation
+    description: >-
+      Spot Location
+    attributes:
+      SpotLocation_associatedNetElements:
+        multivalued: true
+        range: AssociatedNetElement
+        slot_uri: RSM:#EAID_D025945C_27E7_4b73_87D4_3BB8A647B836
+        inlined_as_list: true
+      SpotLocation_coordinates:
+        multivalued: true
+        inlined_as_list: false 
+        inlined: true
+        range: PositioningSystemCoordinate
+        slot_uri: RSM:#EAID_9B4FDB13_51CB_47d8_AD9E_E1F190422B77
+  
+
+  RSMSignal:
+    is_a: LocatedNetEntity
+    description: >-
+      Apparatus by means of which a conventional visual or acoustic indication is given, generally
+      concerning the movements of railway vehicles.
+    class_uri: RSM:#EAID_F609C74D_EEEE_4989_8A3D_00DD454BD36E
+  
+  OnTrackSignallingDevice:
+    is_a: LocatedNetEntity
+    description: >-
+      Superclass for all on-track signalling devices. Encompasses balises, axle counting heads, LZB cables, etc.
+
+  TpsDevice:
+    is_a: OnTrackSignallingDevice
+    description: >-
+      Device that transmits train protection information to a passing train. E.g. crocodile,
+      (Euro-)balise, magnet, loop. On-track TPS devices such as balises or crocodiles are associated
+      with spot locations. Loops are associated with a linear location.
+
+slots:
+  locationrole:
+    range: LocationRoleEnum
+    key: true
+  locations:
+    range: BaseLocation
+    slot_uri: RSM:#EAID_43382C11_960E_40e0_B6E0_198963C97DF8
+    multivalued: true
+    inlined_as_list: false
+    inlined: true
+  # typeURI:
+  #   range: uri
+  #   designates_type: true
+
+enums:
+  LRMType:
+    permissible_values:
+      RELATIVE:
+        description: relative
+      ABSOLUTE:
+        description: absolute
+      INTERPOLATIVE:
+        description: interpolative
+  LocationRoleEnum:
+    permissible_values:
+      DUMMY:
+        description: Dummy where the role makes no sense.
+      LINEARLOCATION:
+        description: Location is defined by a linear location.
+      SPOTLOCATION_MEASURED_BY_GPS:
+        description: Location is derived from geographic coordinates.
+      SPOTLOCATION_DEFINED_BY_KPM:
+        description: Location is derived from KPM values.

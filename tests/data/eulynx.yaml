@@ -1,0 +1,581 @@
+id: https://w3id.org/infrabel/eulynx
+name: eulynx
+title: eulynx
+description: |-
+  Eulynx
+license: Apache Software License 2.0
+see_also:
+  - https://infrabel.github.io/asset360
+
+prefixes:
+  linkml: https://w3id.org/linkml/
+  schema: http://schema.org/
+  eulynx: http://ontorail.org/src/Eulynx/eul2207a/
+  irsm: https://data.infrabel.be/asset360-rsm-subset/
+  ieulynx: https://data.infrabel.be/asset360-eul-subset/
+
+default_prefix: ieulynx
+default_range: string
+
+imports:
+  - ./types
+  - ./rsm
+
+classes:
+  EULBaseObject:
+    class_uri: eulynx:EAID_064B8CA9_87B3_4dec_A009_5D95BB19FFFF
+    is_a: BaseObject ## this is weird why can't i say irsm:BaseObject here ?
+    description: >-
+      The EULYNX base object inherits an identity from the RSM base object. This identity
+      acts as an unique anchor that other objects can refer to.
+
+
+  ConfiguredBaseObject:
+    is_a: EULBaseObject
+    class_uri: eulynx:EAID_CB3CFC45_873F_41bc_AB4E_2114DF78F5D4
+    description: >-
+      Provides an identity plus a configuration.
+
+  TrackAsset:
+    description: >-
+      Named physical or virtual permanent (non-transient) field element that is relevant
+      to signalling.
+    class_uri: eulynx:EAID_64DB332D_381D_4ca9_BDA9_B1C22E90E804
+    is_a: ConfiguredBaseObject
+  
+  PhysicalTrackAsset:
+    is_a: TrackAsset
+    description: >-
+      Tangible asset installed on, near or as part of the track.
+    class_uri: eulynx:EAID_AE308F14_0A9E_4e6c_83AD_E8E3D01906BD
+
+  VirtualTrackAsset:
+    is_a: TrackAsset
+    description: >-
+      An intangible asset.Virtual track assets can be composed of or derived from physical
+      track assets. They may be displayed on the signaller's user interface. Logical entities
+      such as routes are transient, thus not considered track assets.
+
+
+  EULSignal:
+    is_a: TrackAsset
+    class_uri: eulynx:EAID_3E7BF69F_5155_4e25_AC13_3B9C9EAD3327
+    description: >-
+        A Signal is a line side element that sends a message to driver. The signal can consist
+        of several frames each of which carries part of the message to the driver. The signal
+        in the EULYNX DP namespace enriches the RSM information with signalling information.
+
+    attributes:
+      signalFrame:
+        range: SignalFrame
+        multivalued: true
+        inlined_as_list: false
+        inlined: true
+        slot_uri: eulynx:EAID_28C3D8B9_69BF_44c8_BF11_A28EA7F1A248
+      signalLocation: 
+        range: SignalLocation
+        slot_uri: eulynx:EAID_F9BA63C6_8827_4255_B5E9_BCDD220D9D71
+        inlined: true
+      isOfAutomaticType:
+        range: AutomaticTypes
+        slot_uri: eulynx:EAID_2F3FD9C4_A920_4dbc_B4A9_27643C6F8A1A
+      refersToRSMSignal:
+        range: RSMSignal
+        inlined: true
+        slot_uri: eulynx:EAID_F8BC855F_E2B9_4426_A5DB_697D85E25BA4
+      standoutControl:
+        range: boolean
+
+  ActiveSignal:
+    is_a: EULSignal
+    description: >-
+      A signal with an actively controlled aspect.
+    class_uri: eulynx:EAID_78DCB329_C824_472d_B693_311B60BA057C
+
+  LightSignal:
+    is_a: ActiveSignal
+    description: >-
+      A signal with lamps that transmit information to the driver.
+    class_uri: eulynx:EAID_0CB2F623_56D2_4e0d_8CDF_3CFAA152B322
+
+
+  SignalLocation:
+    is_a: ConfiguredBaseObject
+    description: >-
+      Description of the area where the signal is located, to help maintenance workers
+      to find the signal in the field. Can be an informal description (e.g. near junction
+      x) or depend on national regulations (e.g. DE Bezeichnung nach Ril 100).
+    class_uri: eulynx:EAID_1BC9B008_A062_45e2_BDC9_04EA5C697ACC
+    attributes:
+      description:
+        range: string
+        slot_uri: eulynx:EAID_E4B9E6F4_F52A_4151_8228_725A38A9B0EC
+
+  Symbol:
+    is_a: EULBaseObject
+    class_uri: eulynx:EAID_AA908FAE_7F66_4cbf_A2B6_05252DD72366
+    description: >-
+      A symbol that sends a message to the driver. E.g. a fixed letter, an arrow, a letter
+      or a number that can be switched on. The symbol is normalised in the signalling rules
+      and regulations. If the text is not or less regulated, use the class TextInformation.
+      This is a display value and shouldn't be interpreted e.g. by simulation programs or
+      speed profile designers.
+    attributes:
+      Symbol_value:
+        range: string
+        slot_uri: eulynx:EAID_802300F0_BBE8_4195_AAB4_F0A453951E2A
+
+  TextInformation:
+    is_a: EULBaseObject
+    description: >-
+      Text legend written on the signal frame.
+    class_uri: eulynx:EAID_888BF389_651C_4a84_AE66_AB34653C3B1A
+    attributes:
+      TextInformation_value:
+        range: string
+        slot_uri: eulynx:EAID_A97ED15B_29BC_4b59_B891_670F7AFAAB95
+
+  Telephone:
+    is_a: PhysicalTrackAsset
+    class_uri: eulynx:EAID_C84BBFCB_CB6A_4056_985B_0A9148583B18
+    description: >-
+      A telephone near a track.
+    attributes:
+      telephoneType:
+        range: string
+        slot_uri: eulynx:EAID_A8E9DF34_7373_4f48_A004_7B7CEAF5BA84
+      Telephone_function:
+        range: string
+        slot_uri: eulynx:EAID_EB98452F_25A9_4b2e_BE93_2F03C44B0C81
+      restriction:
+        range: string
+        slot_uri: eulynx:EAID_B2F3B9F1_356F_4001_8886_8370EB83095B
+      Telephone_contact:
+        range: string
+        slot_uri: eulynx:EAID_B2C95F6D_5C59_4f35_A92B_D0D9D8D5AF2B
+
+  SignalPostTelephone:
+    is_a: Telephone
+    description: >-
+      Telephone for communication between train driver and signaller.
+    class_uri: eulynx:EAID_509D0AC7_A794_4d0e_8620_5D3B911B04B2
+    attributes:
+      position:
+        range: string
+        slot_uri: eulynx:EAID_86A0BA95_65D8_4366_8EF1_1B7264EE7F11
+      SignalPostTelephone_appliesToSignal:
+        range: EULSignal
+        multivalued: true
+        slot_uri: eulynx:EAID_B5A70C24_F712_463d_828D_EC6DE5E6997B
+
+  SignalFrame:
+    description: >-
+      Generic term for the information-carriers: sign, board, nameplates, lamp-frames,
+      notice boards. It is most often part of a signal.
+    is_a: ConfiguredBaseObject
+    class_uri: eulynx:EAID_CCB71BDA_BF2E_4bd4_9370_0A1A2EC6B987
+    attributes:
+      fixed:
+        slot_uri: eulynx:EAID_46F4254C_82EC_40b9_A66A_08C4F5E265AE
+        range: boolean
+      aspects:
+        range: Aspect
+        slot_uri: eulynx:EAID_5E026220_7605_493c_BE7B_9D856B492717
+        multivalued: true
+        inlined_as_list: false
+        inlined: true
+      refersToCoActingSignalFrame:
+        range: SignalFrame
+        multivalued: true
+        inlined_as_list: true
+        slot_uri: eulynx:EAID_2295E002_0DC3_4e36_AC50_EFB9C26C6A25
+      refersToSubordinatedSignalFrame:
+        range: SignalFrame
+        multivalued: true
+        inlined_as_list: true
+        slot_uri: eulynx:EAID_D074256D_0865_4a62_A1A1_10641BF444D3
+    slots:
+      - signalFrameType
+    slot_usage:
+      signalFrameType:
+        key: true
+
+
+
+  Aspect:
+    description: >-
+      Atomic information displayed by the signal, conveyed by means of light, shape,
+      text, symbol, form, colour.
+    is_a: ConfiguredBaseObject
+    class_uri: eulynx:EAID_4BFD07C1_77B7_4a44_9501_AE04EA0F82B8
+    attributes:
+      aspectId:
+        range: string
+        slot_uri: eulynx:EAID_6D6A5945_C12E_4384_A9C1_4ACE6FB74E51
+      symbol:
+        range: Symbol
+        inlined: true
+        slot_uri: eulynx:EAID_174D9653_1456_4a4c_8287_71E6806D6DC1
+        annotations:
+          data.infrabel.be/linkml/diff/ignore: true
+      textInformation:
+        range: string
+        slot_uri: eulynx:EAID_38F6B0A1_8626_42e6_9CBD_F559F740E044
+        annotations:
+          data.infrabel.be/linkml/diff/ignore: true
+    slots:
+     - aspectType
+    slot_usage:
+      aspectType:
+         key: true
+
+  Controller:
+    description: >-
+      A member of the hierarchy of object types that control the field elements.
+      This controller class can be instantiated when no other appropriate sub-class
+      is available, e.g. when a new kind of controller is introduced.
+    class_uri: eulynx:EAID_35DDD94C_4489_4027_88A5_0936C7BD69F0
+    is_a: PhysicalTrackAsset
+    attributes:
+      typeURI:
+        range: uri
+        designates_type: true
+      controllerTechnology:
+        range: string
+        slot_uri: eulynx:EAID_6F64E179_3BF2_48f4_B175_A396ED04D1BE
+
+  FieldObjectController:
+    is_a: Controller
+    description: >-
+      A device that exchanges commands, information, power with one or a few individual
+      field objects like signal, point, etc. Is in control of active track assets.
+
+
+  ControlArea:
+    is_a: ConfiguredBaseObject
+    class_uri: eulynx:EAID_B16FB582_A515_4be2_8206_B9EBA189C153
+    attributes:
+      controlledByController:
+        slot_uri: eulynx:EAID_8039AB6A_04A8_488f_BA97_83DEAB5AA3E9
+        range: Controller
+      containsTrackAssets:
+        slot_uri: eulynx:EAID_9C1F54F4_55B9_48c7_9C08_8829331B4128
+        range: TrackAsset
+      ControlArea_isLocatedAt:
+        range: AreaLocation
+        slot_uri: eulynx:EAID_AE0F27B7_4DB7_453a_B61F_E6D458670CA3
+
+  Interlocking:
+    is_a: Controller
+    class_uri: eulynx:EAID_CF56B5E7_E10E_4f3e_B247_E9012DBCCD37
+    description: >-
+      An interlocking system that has a control relationship with track-assets
+      and/or controllers in a yard.
+
+  OperatingCentre:
+    is_a: ConfiguredBaseObject
+    class_uri: eulynx:EAID_2FE66592_458F_4bdb_B009_D7208E3352FD
+    description: >-
+      A location from where train traffic is managed.
+    attributes:
+      housedIn:
+        range: Housing
+        slot_uri: eulynx:EAID_FA131C3B_7C11_4b41_92D2_059B0240FC58
+
+  EquipmentSupport:
+    is_a: ConfiguredBaseObject
+    class_uri: eulynx:EAID_09AFD239_7110_4552_BFDC_12FFAFD92BA8
+    description: >-
+      Generalization of fixings and housings, defined as civil structures that can support (or house) signalling equipment.
+    attributes:
+      EquipmentSupport_isLocatedAt:
+        range: SpotLocation
+        slot_uri: eulynx:EAID_6C2F11D5_CEC8_4582_883F_CE95E5FE5ECC
+        multivalued: true
+        inlined_as_list: false 
+        inlined: true
+
+  Housing:
+    is_a: EquipmentSupport
+    class_uri: eulynx:EAID_C302DDE1_4DCF_4e83_8B2B_C49AB0BC6893
+    description: >-
+      Describes the housing, ranging from a control centre building to a keybox mounted
+      on a trackside post. Can be used if the type of housing is (yet) unknown, e.g. during
+      an early design phase. Can also be used if the type of housing does not fit any of
+      the available subtypes.
+    attributes:
+      positionDescription:
+        range: string
+        slot_uri: eulynx:EAID_08C603B2_E929_4868_976E_0CAC163823DD
+      controlsArea:
+        range: ControlArea
+        slot_uri: eulynx:EAID_C7D4F2D7_BD3E_4870_AB43_A27FB60B1AB9
+        inlined: true
+
+  TpsDataTransmissionSystem:
+    is_a: VirtualTrackAsset
+    description: >-
+      System for transmitting train protection data. Also known as Information Point.
+    attributes:
+      TpsDataTransmissionSystem_isLocatedAt:
+        range: SpotLocation
+        inlined: true
+      propertySet:
+        range: TpsDataTransmissionSystemProperties
+        inlined: true
+
+  TpsDataTransmissionSystemProperties:
+    is_a: ConfiguredBaseObject
+    description: >-
+      Property set that applies to the TPS data transmission system.
+    attributes:
+      typeURI:
+        range: uri
+        designates_type: true
+      TpsDataTransmissionSystemProperties_isSwitchable:
+        range: boolean
+      extensionLength:
+        range: Length
+
+  EULTpsDevice:
+    is_a: PhysicalTrackAsset
+    description: >-
+      Device that transmits train protection information to a passing train.
+      This class can be instantiated if the device is not (yet) planned and located in detail.
+    attributes:
+      refersToRSMTpsDevice:
+        range: TpsDevice
+        inlined: true
+      positionInSystem:
+        range: integer
+      implementsTpsDataTxSystem:
+        range: TpsDataTransmissionSystem
+
+  TpsSpotDevice:
+    is_a: TpsDevice
+    description: >-
+      A TPS device of limited length.
+    
+  EULBalise:
+    is_a: TpsSpotDevice
+    description: >-
+      TPS Device using balise technology, e.g. euro balise, ATB NG or metro balises.
+      A balise is energised by a passing train antenna and returns a series of bits to the antenna.
+    attributes:
+      Balise_isSwitchable:
+        range: boolean
+
+  EULBaliseGroup:
+    is_a: TpsDataTransmissionSystem
+    description: >-
+      A group of train protection balises.
+
+  TpsRelation:
+    is_a: ConfiguredBaseObject
+    description: >-
+      Informs at what distance the TP device or system is placed on approach to the signal.
+      The signal could be a speed restriction board (NR approach).
+    attributes:
+      appliesToTpsDevice:
+        range: TpsDevice
+      TpsRelation_appliesToSignal:
+        range: EULSignal
+      distanceFromTpsToSignal:
+        range: Length
+      appliesToTpsDataTxSystem:
+        range: TpsDataTransmissionSystem
+
+  EtcsBalise:
+    is_a: EULBalise
+    description: >-
+      Eurobalise in an ETCS system.
+    attributes:
+      duplicatesEtcsBalise:
+        range: EtcsBalise
+      controlledByLeuPort:
+        range: LeuPort
+
+  EtcsBaliseGroup:
+    is_a: EULBaliseGroup
+    description: >-
+      Group of one or more ETCS balises that share a balise group identifier.
+    attributes:
+      nid_bg:
+        range: integer
+      nid_c:
+        range: integer
+      m_version:
+        range: integer
+      q_link:
+        range: integer
+      q_media:
+        range: integer
+      q_updown:
+        range: integer
+      controlledBy:
+        range: Controller
+        multivalued: true
+
+
+  BaliseGroupFunction:
+    is_a: ConfiguredBaseObject
+    description: >-
+      A function allocated to a balise group such as "Call RBC, open doors, stop if in SR,
+      national values, speed control". Typically refined in the national domain.
+    attributes:
+      baliseGroupFunctionType:
+        range: string
+
+
+  BaliseGroupPurpose:
+    is_a: EULBaseObject
+    description: >-
+      Describes why the balise is there. The balise group protects or announces the level crossing,
+      big metal mass, signal or other track asset that the train approaches.
+    attributes:
+      direct:
+        range: boolean
+      refersToEULSignal:
+        description: >-
+          in infrabel context we decided to ignore this field because an eulynx signal has no identifier for us.
+          so if we wanted to use this field we would have to copy all information multiple times
+        range: EULSignal
+        inlined: false
+      # BaliseGroupPurpose_refersToLx: Optional[LevelCrossingSystem]  # TODO implement level crossings
+      # BaliseGroupPurpose_refersToBigMetalMassArea: Optional[BigMetalMassArea]   # TODO implement big metal mass areas
+      refersToTrackAsset:
+        range: TrackAsset
+      distance:
+        range: Length
+        inlined: true
+
+
+  EtcsBaliseGroupProperties:
+    is_a: TpsDataTransmissionSystemProperties
+    description: >-
+      ETCS properties that apply to an ETCS balise group. The specialisations state
+      for which level(s) the balise group is used.
+    attributes:
+      implementsFunction:
+        range: BaliseGroupFunction
+        inlined: true
+      purpose:
+        range: BaliseGroupPurpose
+        inlined: true
+
+
+  LeuPort:
+    is_a: EULBaseObject
+    description: >-
+      Port between LEU and individually-controlled balise. The planned and as-built port may differ
+      due to the planning process. Both numbers are stored.
+    attributes:
+      plannedNumber:
+        range: integer
+      asBuildNumber:
+        range: integer
+
+
+  LeuSystem:
+    is_a: FieldObjectController
+    description: >-
+      A Lineside Electronic Unit (LEU) system controls zero or more ETCS balises.
+    attributes:
+      relatedToSignal: 
+        range: EULSignal        
+      # LeuSystem_isRelatedToMovableElement: Optional[MovableElement]   # TODO implement movable elements
+      # LeuSystem_isHousedInCabinet: Optional[conlist(LeuCabinet, max_items=2)] # TODO implement cabinets
+      LeuSystem_hasLeuPort:
+        range: LeuPort
+        multivalued: true
+        inlined_as_list: true
+
+  LeuModule:
+    is_a: ConfiguredBaseObject
+    description: >-
+      Hardware module for controlling Eurobalises.
+    attributes:
+      partOfLeuSystem: 
+        range: LeuSystem
+      getsInputFromLeuSystem:
+        range: LeuSystem # TODO this should be a set
+        multivalued: true
+      getsInputFromLeuModule:
+        range: LeuModule # TODO this should be a set
+      getsInputFromTrackAsset:
+        range: TrackAsset
+        multivalued: true # TODO this should be a set
+      # LeuModule_isHousedInLeuCabinet: LeuCabinet  # TODO implement cabinets
+      LeuModule_hasLeuPort:
+        multivalued: true
+        range: LeuPort   # TODO this should be a set
+        inlined_as_list: true
+
+
+
+slots:
+  aspectType:
+    range: AspectTypes
+    description: >-
+      Type of aspect, e.g. joist, impasse track, over speed, under speed, oeilleton,
+      iot, phone.
+  signalFrameType:
+    range: SignalFrameTypes
+    slot_uri: eulynx:EAID_9383005D_35DA_4c64_A533_425AEA6580FD
+
+enums:
+  AutomaticTypes:
+    permissible_values:
+      AUTOWORKING:
+        description: AUTO WORKING
+      SUBJECT_TO_ARS:
+        description: SUBJECT TO ARS
+      OTHER:
+        description: Other
+  
+  SignalFrameTypes:
+    permissible_values:
+      MAIN:
+        description: main
+      NAME_PLATE:
+        description: namePlate
+      SIGN:
+        description: sign
+      SLAB:
+        description: slab
+      CERAMIC_BODY:
+        description: ceramicBody
+      INDICATOR:
+        description: indicator
+      SHUNTING:
+        description: >-
+          shunting
+      PAINTED_POST:
+        description: >-
+          paintedPost
+      REPEATER:
+        description: >-
+          repeater
+      AUXILIARY:
+        description: >-
+          auxiliary
+      OTHER:
+        description: >-
+          other
+
+  AspectTypes:
+    permissible_values:
+      JOIST:
+        description: joist
+      IMPASSE_TRACK:
+        description: impasse_track
+      OVER_SPEED:
+        description: over_speed
+      UNDER_SPEED:
+        description: under_speed
+      OEILLETON:
+        description: oeilleton
+      IOT:
+        description: iot
+      PHONE:
+        description: phone
