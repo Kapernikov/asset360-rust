@@ -61,12 +61,9 @@ def _load_schema_view() -> SchemaView:
     return sv
 
 
-@pytest.mark.usefixtures("ensure_pythonpath")
-def test_apply_deltas_with_asset360_stages_python() -> None:
-    sv = _load_schema_view()
-    class_id = "https://data.infrabel.be/asset360/Signal"
+def _build_change_stages(sv: SchemaView, class_id: str) -> list[ChangeStage]:
     cv = sv.get_class_view(class_id)
-    assert cv is not None, "expected Signal class in schema"
+    assert cv is not None, f"expected class '{class_id}' in schema"
 
     stages_path = ROOT / "tests" / "data" / "asset360_stages.json"
     stages_payload = json.loads(stages_path.read_text())
@@ -88,19 +85,21 @@ def test_apply_deltas_with_asset360_stages_python() -> None:
         ]
         rejected_paths = entry.get("rejected_paths")
         stages.append(ChangeStage(meta, value, deltas, rejected_paths))
+    return stages
+
+
+@pytest.mark.usefixtures("ensure_pythonpath")
+def test_apply_deltas_with_asset360_stages_python() -> None:
+    sv = _load_schema_view()
+    class_id = "https://data.infrabel.be/asset360/Signal"
+    stages = _build_change_stages(sv, class_id)
 
     assert len(stages) >= 2, "fixture should contain base stage and updates"
     base_stage, *rest_stages = stages
 
     final_value, blame_map = apply_deltas(base_stage.value, rest_stages)
 
-    blame_map_payload = {
-        node_id: dict(meta.to_dict()) if hasattr(meta, "to_dict") else meta
-        for node_id, meta in blame_map.items()
-    }
-
-    blame_dump = format_blame_map(final_value, blame_map_payload)
-    print("Asset360 stages blame map:\n" + blame_dump)
+    blame_map_payload = {node_id: meta for node_id, meta in blame_map.items()}
 
     stage_entries = blame_map_to_path_stage_map(final_value, blame_map_payload)
     stage_dump = _format_stage_entries(stage_entries)
@@ -109,6 +108,26 @@ def test_apply_deltas_with_asset360_stages_python() -> None:
     seen_changes = {meta["change_id"] for meta in blame_map_payload.values() if isinstance(meta, dict)}
     expected_changes = {stage.meta.change_id for stage in rest_stages}
     assert expected_changes.issubset(seen_changes)
+
+
+def test_change_stage_json_roundtrip() -> None:
+    sv = _load_schema_view()
+    class_id = "https://data.infrabel.be/asset360/Signal"
+    stages = _build_change_stages(sv, class_id)
+    assert stages, "change stages fixture should not be empty"
+
+    original = stages[0]
+    payload = original.to_json()
+    assert payload["class_id"] == class_id
+    # Ensure payload is JSON-serializable and normalize it through JSON encode/decode.
+    roundtrip_payload = json.loads(json.dumps(payload))
+
+    reconstructed = ChangeStage.from_json(sv, roundtrip_payload)
+
+    assert reconstructed.meta.change_id == original.meta.change_id
+    assert reconstructed.rejected_paths == original.rejected_paths
+    assert reconstructed.to_json() == roundtrip_payload
+    assert reconstructed.value.equals(original.value)
 
 
 @pytest.fixture

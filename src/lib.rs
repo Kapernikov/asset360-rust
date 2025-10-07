@@ -12,11 +12,14 @@ use std::collections::HashMap;
 #[cfg(feature = "python-bindings")]
 use linkml_meta::{Annotation, ClassDefinition};
 #[cfg(feature = "python-bindings")]
-use linkml_runtime::{NodeId, diff::Delta};
+use linkml_runtime::{LinkMLInstance, NodeId, diff::Delta};
 #[cfg(feature = "python-bindings")]
 use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView, node_map_into_pydict};
 #[cfg(feature = "python-bindings")]
-use linkml_schemaview::{Converter, schemaview::SchemaView};
+#[cfg(feature = "python-bindings")]
+use linkml_schemaview::classview::ClassView;
+#[cfg(feature = "python-bindings")]
+use linkml_schemaview::{Converter, identifier::Identifier, schemaview::SchemaView};
 #[cfg(feature = "python-bindings")]
 use pyo3::Bound;
 #[cfg(feature = "python-bindings")]
@@ -475,6 +478,152 @@ impl PyChangeStage {
         self.inner.rejected_paths.clone()
     }
 
+    fn to_json(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        let class_id = Self::value_class_identifier(&self.inner.value).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "ChangeStage value missing class context; cannot serialize",
+            )
+        })?;
+        dict.set_item("class_id", &class_id)?;
+        dict.set_item(
+            "meta",
+            PyAsset360ChangeMeta::from(self.inner.meta.clone()).to_dict(py)?,
+        )?;
+        let json_mod = PyModule::import(py, "json")?;
+
+        let value_json = self.inner.value.to_json();
+        let value_str = serde_json::to_string(&value_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to encode LinkML value as JSON string: {e}"
+            ))
+        })?;
+        let value_py = json_mod.call_method1("loads", (value_str.as_str(),))?;
+        dict.set_item("value", value_py)?;
+
+        let deltas_str = serde_json::to_string(&self.inner.deltas).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to encode deltas as JSON string: {e}"
+            ))
+        })?;
+        let deltas_py = json_mod.call_method1("loads", (deltas_str.as_str(),))?;
+        dict.set_item("deltas", deltas_py)?;
+
+        dict.set_item("rejected_paths", &self.inner.rejected_paths)?;
+        Ok(dict.into())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (schemaview, data))]
+    fn from_json(
+        py: Python<'_>,
+        schemaview: Py<PySchemaView>,
+        data: &Bound<'_, PyDict>,
+    ) -> PyResult<Self> {
+        let json_mod = PyModule::import(py, "json")?;
+
+        let class_id_obj = data.get_item("class_id")?.ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("missing 'class_id' in ChangeStage JSON")
+        })?;
+        let class_id: String = class_id_obj.extract()?;
+        let meta_obj = data.get_item("meta")?.ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("missing 'meta' in ChangeStage JSON")
+        })?;
+        let meta = match meta_obj.extract::<PyAsset360ChangeMeta>() {
+            Ok(py_meta) => py_meta.clone_inner(),
+            Err(_) => {
+                let meta_str: String = json_mod
+                    .call_method1("dumps", (&meta_obj,))?
+                    .extract()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "failed to serialize 'meta' payload: {e}"
+                        ))
+                    })?;
+                serde_json::from_str::<Asset360ChangeMeta>(&meta_str).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("invalid 'meta' payload: {e}"))
+                })?
+            }
+        };
+
+        let value_obj = data.get_item("value")?.ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("missing 'value' in ChangeStage JSON")
+        })?;
+        let value_str: String = json_mod
+            .call_method1("dumps", (&value_obj,))?
+            .extract()
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "failed to serialize 'value' payload: {e}"
+                ))
+            })?;
+        let value_json: serde_json::Value = serde_json::from_str(&value_str).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid 'value' payload: {e}"))
+        })?;
+
+        let deltas: Vec<Delta> = data
+            .get_item("deltas")?
+            .map(|obj| {
+                let deltas_str: String = json_mod
+                    .call_method1("dumps", (&obj,))?
+                    .extract()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "failed to serialize 'deltas' payload: {e}"
+                        ))
+                    })?;
+                serde_json::from_str(&deltas_str).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid 'deltas' payload: {e}"
+                    ))
+                })
+            })
+            .transpose()? // PyResult<Option<Vec<Delta>>>
+            .unwrap_or_default();
+
+        let rejected_paths = data
+            .get_item("rejected_paths")?
+            .map(|obj| obj.extract::<Vec<Vec<String>>>())
+            .transpose()?
+            .unwrap_or_default();
+        let bound_sv = schemaview.bind(py);
+        let borrowed_sv = bound_sv.borrow();
+        let rust_sv = borrowed_sv.as_rust();
+        let conv = rust_sv.converter();
+        let class_view = rust_sv
+            .get_class(&Identifier::new(&class_id), &conv)
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "error resolving class '{class_id}': {:?}",
+                    e
+                ))
+            })?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "class '{class_id}' not found in provided SchemaView"
+                ))
+            })?;
+        let value_str = serde_json::to_string(&value_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to encode LinkML value as JSON string: {e}"
+            ))
+        })?;
+        let linkml_value = linkml_runtime::load_json_str(&value_str, rust_sv, &class_view, &conv)
+            .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("failed to load LinkML value: {e}"))
+        })?;
+
+        Ok(Self {
+            inner: ChangeStage {
+                meta,
+                value: linkml_value,
+                deltas,
+                rejected_paths,
+            },
+            sv: schemaview.clone_ref(py),
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ChangeStage(meta={}, deltas_len={}, rejected_paths_len={})",
@@ -489,6 +638,34 @@ impl PyChangeStage {
 impl PyChangeStage {
     fn clone_inner(&self) -> ChangeStage<Asset360ChangeMeta> {
         self.inner.clone()
+    }
+
+    fn class_identifier_from_view(class: &ClassView) -> String {
+        class
+            .def()
+            .class_uri
+            .as_ref()
+            .map(|uri| uri.to_string())
+            .unwrap_or_else(|| class.name().to_string())
+    }
+
+    fn value_class_identifier(value: &LinkMLInstance) -> Option<String> {
+        match value {
+            LinkMLInstance::Object { class, .. } => Some(Self::class_identifier_from_view(class)),
+            LinkMLInstance::Scalar {
+                class: Some(class), ..
+            }
+            | LinkMLInstance::List {
+                class: Some(class), ..
+            }
+            | LinkMLInstance::Mapping {
+                class: Some(class), ..
+            }
+            | LinkMLInstance::Null {
+                class: Some(class), ..
+            } => Some(Self::class_identifier_from_view(class)),
+            _ => None,
+        }
     }
 
     fn from_inner_py(
