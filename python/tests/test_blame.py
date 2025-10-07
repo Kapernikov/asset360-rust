@@ -43,12 +43,18 @@ def _format_stage_entries(entries: list[tuple[list[str], dict]]) -> str:
         return "<empty stage map>"
     lines = []
     for path, meta in entries:
-        if not isinstance(meta, dict):
-            meta = dict(meta)
+        if isinstance(meta, dict):
+            meta_dict = meta
+        elif hasattr(meta, "to_dict"):
+            meta_dict = meta.to_dict()
+            if not isinstance(meta_dict, dict):
+                meta_dict = dict(meta_dict)
+        else:
+            meta_dict = dict(meta)
         lines.append(
-            f"{_format_path(path)} => change_id={meta['change_id']} "
-            f"author={meta['author']} timestamp={meta['timestamp']} "
-            f"source={meta['source']} ics_id={meta['ics_id']}"
+            f"{_format_path(path)} => change_id={meta_dict['change_id']} "
+            f"author={meta_dict['author']} timestamp={meta_dict['timestamp']} "
+            f"source={meta_dict['source']} ics_id={meta_dict['ics_id']}"
         )
     return "\n".join(lines)
 

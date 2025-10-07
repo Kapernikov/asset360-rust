@@ -49,10 +49,14 @@ pub fn compute_history(
     history.push(first);
 
     for stage in iter {
-        let deltas = diff::diff(&value, &stage.value, DiffOptions {
-            treat_changed_identifier_as_new_object: false,
-            ..Default::default()
-        });
+        let deltas = diff::diff(
+            &value,
+            &stage.value,
+            DiffOptions {
+                treat_changed_identifier_as_new_object: false,
+                ..Default::default()
+            },
+        );
         let real_deltas: Vec<Delta> = deltas
             .iter()
             .filter(|d| !stage.rejected_paths.contains(&d.path))
@@ -317,21 +321,9 @@ mod py_conversions {
         type Error = PyErr;
 
         fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
-            let dict = PyDict::new(py);
-            let Asset360ChangeMeta {
-                author,
-                timestamp,
-                source,
-                change_id,
-                ics_id,
-                ..
-            } = self;
-            dict.set_item("author", author)?;
-            dict.set_item("timestamp", timestamp)?;
-            dict.set_item("source", source)?;
-            dict.set_item("change_id", change_id)?;
-            dict.set_item("ics_id", ics_id)?;
-            Ok(dict.into_any())
+            let meta = PyAsset360ChangeMeta::from(self);
+            let bound = meta.into_pyobject(py)?;
+            Ok(bound.into_any())
         }
     }
 }
