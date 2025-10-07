@@ -42,6 +42,14 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     linkml_runtime_python::runtime_module(m)?;
     m.add_class::<PyAsset360ChangeMeta>()?;
     m.add_class::<PyChangeStage>()?;
+    {
+        let py = m.py();
+        let meta_type = py.get_type::<PyAsset360ChangeMeta>();
+        meta_type.setattr("__asset360_original_name__", "Asset360ChangeMeta")?;
+        let hint = "Asset360ChangeMeta (use Asset360ChangeMeta.to_dict() before JSON encoding)";
+        meta_type.setattr("__name__", hint)?;
+        meta_type.setattr("__qualname__", hint)?;
+    }
     m.add_function(wrap_pyfunction!(
         get_all_classes_by_type_designator_and_schema,
         m

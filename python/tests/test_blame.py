@@ -145,6 +145,16 @@ def test_change_stage_json_roundtrip() -> None:
     assert reconstructed.value.equals(original.value)
 
 
+def test_asset360_meta_json_error_message() -> None:
+    meta = Asset360ChangeMeta("author", "ts", "source", 1, 2)
+
+    with pytest.raises(TypeError) as exc:
+        json.dumps(meta)
+    message = str(exc.value)
+    assert "Asset360ChangeMeta" in message
+    assert "to_dict" in message
+
+
 @pytest.fixture
 def ensure_pythonpath():
     # No-op fixture so @pytest.mark.usefixtures hooks into pytest collection even
