@@ -16,7 +16,6 @@ use linkml_runtime::{LinkMLInstance, NodeId, diff::Delta};
 #[cfg(feature = "python-bindings")]
 use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView, node_map_into_pydict};
 #[cfg(feature = "python-bindings")]
-#[cfg(feature = "python-bindings")]
 use linkml_schemaview::classview::ClassView;
 #[cfg(feature = "python-bindings")]
 use linkml_schemaview::{Converter, identifier::Identifier, schemaview::SchemaView};

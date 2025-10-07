@@ -75,7 +75,7 @@ fn sorted_delta_values(deltas: &[Delta]) -> Vec<serde_json::Value> {
         .iter()
         .map(|delta| serde_json::to_value(delta).expect("delta serializable"))
         .collect();
-    json_deltas.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    json_deltas.sort_by_key(|value| value.to_string());
     json_deltas
 }
 
@@ -123,7 +123,7 @@ fn test_compute_history_matches_fixture_and_blame_dump() {
         .expect("at least one stage in history")
         .value
         .clone();
-    let rest_stages: Vec<_> = history.iter().cloned().skip(1).collect();
+    let rest_stages: Vec<_> = history.iter().skip(1).cloned().collect();
     let (applied_value, blame_map) = apply_deltas(Some(base_value), rest_stages);
 
     assert_eq!(applied_value.to_json(), final_value.to_json());
