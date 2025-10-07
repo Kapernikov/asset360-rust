@@ -281,12 +281,18 @@ pub fn format_blame_map(
 #[cfg(feature = "python-bindings")]
 mod py_conversions {
     use super::Asset360ChangeMeta;
+    use crate::PyAsset360ChangeMeta;
+    use pyo3::PyRef;
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
 
     impl<'py> FromPyObject<'py> for Asset360ChangeMeta {
         fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+            if let Ok(meta_obj) = ob.extract::<PyRef<PyAsset360ChangeMeta>>() {
+                return Ok(meta_obj.clone_inner());
+            }
+
             let dict = ob.downcast::<PyDict>()?;
             let require = |key: &str| {
                 dict.get_item(key)?
