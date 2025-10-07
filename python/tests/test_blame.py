@@ -105,7 +105,16 @@ def test_apply_deltas_with_asset360_stages_python() -> None:
     stage_dump = _format_stage_entries(stage_entries)
     print("Asset360 stage map entries:\n" + stage_dump)
 
-    seen_changes = {meta["change_id"] for meta in blame_map_payload.values() if isinstance(meta, dict)}
+    def _extract_change_id(meta: object) -> int | None:
+        if isinstance(meta, dict):
+            return meta.get("change_id")
+        return getattr(meta, "change_id", None)
+
+    seen_changes = {
+        change_id
+        for change_id in (_extract_change_id(meta) for meta in blame_map_payload.values())
+        if change_id is not None
+    }
     expected_changes = {stage.meta.change_id for stage in rest_stages}
     assert expected_changes.issubset(seen_changes)
 

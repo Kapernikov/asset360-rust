@@ -419,6 +419,7 @@ impl PyAsset360ChangeMeta {
 struct PyChangeStage {
     inner: ChangeStage<Asset360ChangeMeta>,
     sv: Py<PySchemaView>,
+    class_id: String,
 }
 
 #[cfg(feature = "python-bindings")]
@@ -434,11 +435,24 @@ impl PyChangeStage {
         deltas: Vec<Py<PyDelta>>,
         rejected_paths: Option<Vec<Vec<String>>>,
     ) -> PyResult<Self> {
-        let (stage_value, schema_view) = {
+        let stage_value: LinkMLInstance;
+        let schema_view: Py<PySchemaView>;
+        let class_id: String;
+        {
             let bound = value.bind(py);
             let borrowed = bound.borrow();
-            (borrowed.value.clone(), borrowed.sv.clone_ref(py))
-        };
+            let bound_sv = borrowed.sv.bind(py);
+            let borrowed_sv = bound_sv.borrow();
+            let conv = borrowed_sv.as_rust().converter();
+            class_id = Self::value_class_identifier(&borrowed.value, &conv).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "ChangeStage value missing class context; cannot serialize",
+                )
+            })?;
+            drop(borrowed_sv);
+            stage_value = borrowed.value.clone();
+            schema_view = borrowed.sv.clone_ref(py);
+        }
         let mut rust_deltas: Vec<Delta> = Vec::with_capacity(deltas.len());
         for delta in deltas {
             let bound = delta.bind(py);
@@ -452,6 +466,7 @@ impl PyChangeStage {
                 rejected_paths: rejected_paths.unwrap_or_default(),
             },
             sv: schema_view,
+            class_id,
         })
     }
 
@@ -480,12 +495,7 @@ impl PyChangeStage {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
-        let class_id = Self::value_class_identifier(&self.inner.value).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
-                "ChangeStage value missing class context; cannot serialize",
-            )
-        })?;
-        dict.set_item("class_id", &class_id)?;
+        dict.set_item("class_id", &self.class_id)?;
         dict.set_item(
             "meta",
             PyAsset360ChangeMeta::from(self.inner.meta.clone()).to_dict(py)?,
@@ -621,6 +631,7 @@ impl PyChangeStage {
                 rejected_paths,
             },
             sv: schemaview.clone_ref(py),
+            class_id,
         })
     }
 
@@ -640,18 +651,26 @@ impl PyChangeStage {
         self.inner.clone()
     }
 
-    fn class_identifier_from_view(class: &ClassView) -> String {
-        class
-            .def()
-            .class_uri
-            .as_ref()
-            .map(|uri| uri.to_string())
-            .unwrap_or_else(|| class.name().to_string())
+    fn class_identifier_from_view(class: &ClassView, conv: &Converter) -> String {
+        match class.get_uri(conv, false, true) {
+            Ok(identifier) => match identifier {
+                Identifier::Name(_) => class.canonical_uri().to_string(),
+                other => other.to_string(),
+            },
+            Err(_) => class
+                .def()
+                .class_uri
+                .as_ref()
+                .map(|uri| uri.to_string())
+                .unwrap_or_else(|| class.canonical_uri().to_string()),
+        }
     }
 
-    fn value_class_identifier(value: &LinkMLInstance) -> Option<String> {
+    fn value_class_identifier(value: &LinkMLInstance, conv: &Converter) -> Option<String> {
         match value {
-            LinkMLInstance::Object { class, .. } => Some(Self::class_identifier_from_view(class)),
+            LinkMLInstance::Object { class, .. } => {
+                Some(Self::class_identifier_from_view(class, conv))
+            }
             LinkMLInstance::Scalar {
                 class: Some(class), ..
             }
@@ -663,7 +682,7 @@ impl PyChangeStage {
             }
             | LinkMLInstance::Null {
                 class: Some(class), ..
-            } => Some(Self::class_identifier_from_view(class)),
+            } => Some(Self::class_identifier_from_view(class, conv)),
             _ => None,
         }
     }
@@ -673,11 +692,22 @@ impl PyChangeStage {
         inner: ChangeStage<Asset360ChangeMeta>,
         sv: &Py<PySchemaView>,
     ) -> PyResult<Py<PyChangeStage>> {
+        let bound_sv = sv.bind(py);
+        let borrowed_sv = bound_sv.borrow();
+        let conv = borrowed_sv.as_rust().converter();
+        let class_id = Self::value_class_identifier(&inner.value, &conv).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "ChangeStage value missing class context; cannot serialize",
+            )
+        })?;
+        drop(borrowed_sv);
+
         Py::new(
             py,
             PyChangeStage {
                 inner,
                 sv: sv.clone_ref(py),
+                class_id,
             },
         )
     }

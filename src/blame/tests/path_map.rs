@@ -8,7 +8,33 @@ fn test_blame_map_to_path_stage_map() {
     use serde_path_to_error as p2e;
     use serde_yml as yml;
 
-    let schema_yaml = r#"id: https://example.org/testname: testdefault_prefix: exprefixes:  ex:    prefix_reference: http://example.org/slots:  name:    range: string  child:    range: Child  items:    range: Child    multivalued: true  title:    range: stringclasses:  Root:    slots:      - name      - child      - items  Child:    slots:      - title"#;
+    let schema_yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+slots:
+  name:
+    range: string
+  child:
+    range: Child
+  items:
+    range: Child
+    multivalued: true
+  title:
+    range: string
+classes:
+  Root:
+    slots:
+      - name
+      - child
+      - items
+  Child:
+    slots:
+      - title
+"#;
     let schema: SchemaDefinition =
         p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
     let mut sv = SchemaView::new();
@@ -22,7 +48,14 @@ fn test_blame_map_to_path_stage_map() {
         .unwrap()
         .unwrap();
 
-    let data = r#"name: Rootychild:  title: Kiditems:  - title: First  - title: Second"#;
+    let data = r#"
+name: Rooty
+child:
+  title: Kid
+items:
+  - title: First
+  - title: Second
+"#;
     let value = linkml_runtime::load_yaml_str(data, &sv, &class, conv).unwrap();
 
     let mut blame = HashMap::new();

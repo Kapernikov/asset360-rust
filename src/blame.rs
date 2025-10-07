@@ -49,7 +49,10 @@ pub fn compute_history(
     history.push(first);
 
     for stage in iter {
-        let deltas = diff::diff(&value, &stage.value, DiffOptions::default());
+        let deltas = diff::diff(&value, &stage.value, DiffOptions {
+            treat_changed_identifier_as_new_object: false,
+            ..Default::default()
+        });
         let real_deltas: Vec<Delta> = deltas
             .iter()
             .filter(|d| !stage.rejected_paths.contains(&d.path))

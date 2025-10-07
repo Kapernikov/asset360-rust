@@ -24,7 +24,16 @@ fn test_get_blame_info_with_manual_map() {
         ics_id: 102,
     };
 
-    let schema_yaml = r#"id: https://example.org/testname: testdefault_prefix: exprefixes:  ex:    prefix_reference: http://example.org/classes:  Root: {}"#;
+    let schema_yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+classes:
+  Root: {}
+"#;
     let schema: SchemaDefinition =
         p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
     let mut sv = SchemaView::new();
@@ -52,7 +61,16 @@ fn test_apply_deltas_no_stages() {
     use serde_path_to_error as p2e;
     use serde_yml as yml;
 
-    let schema_yaml = r#"id: https://example.org/testname: testdefault_prefix: exprefixes:  ex:    prefix_reference: http://example.org/classes:  Root: {}"#;
+    let schema_yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+classes:
+  Root: {}
+"#;
     let schema: SchemaDefinition =
         p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
     let mut sv = SchemaView::new();
