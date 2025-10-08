@@ -7,6 +7,11 @@ use serde::Serialize;
 use serde_wasm_bindgen::to_value;
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "minijinja-wasm")]
+pub mod minijinja;
+#[cfg(feature = "minijinja-wasm")]
+pub use minijinja::*;
+
 use linkml_meta::SchemaDefinition;
 use linkml_runtime::{LinkMLInstance, load_json_str};
 use linkml_schemaview::classview::ClassView;

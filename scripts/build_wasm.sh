@@ -8,7 +8,7 @@ cd "${REPO_ROOT}"
 PROFILE=release
 OUT_DIR="target/wasm/asset360_rust"
 BINDGEN_TARGETS=()
-FEATURES="wasm-bindings"
+FEATURES="wasm-bindings,minijinja-wasm"
 SCOPE=""
 EXTRA_ARGS=()
 CARGO_EXTRA_ARGS=()
@@ -39,7 +39,7 @@ Build the wasm32 artifact for asset360-rust using wasm-pack and emit npm-ready J
 
 Options:
   --release           Build with --release (default)
-  --features <list>   Comma-separated feature list to pass to Cargo (default: wasm-bindings)
+  --features <list>   Comma-separated feature list to pass to Cargo (default: wasm-bindings,minijinja-wasm)
   --profile <name>    Cargo profile (debug or release; default debug unless --release)
   --target-dir <dir>  Base output directory for generated packages (default: target/wasm/asset360_rust)
   --bindgen-target <t>  wasm-pack target (repeatable; default: bundler, web, nodejs)
