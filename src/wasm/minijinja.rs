@@ -1,7 +1,6 @@
 //! MiniJinja wasm bindings adapted from the upstream `minijinja-js` crate.
 //! This copy is gated behind the `minijinja-wasm` feature so the dependency
 //! is only compiled for wasm targets.
-#![cfg(feature = "minijinja-wasm")]
 #![allow(non_snake_case)]
 
 use std::collections::BTreeMap;
@@ -16,6 +15,12 @@ use wasm_bindgen::prelude::*;
 #[derive(Clone)]
 pub struct MiniJinjaEnvironment {
     inner: mj::Environment<'static>,
+}
+
+impl Default for MiniJinjaEnvironment {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[wasm_bindgen]

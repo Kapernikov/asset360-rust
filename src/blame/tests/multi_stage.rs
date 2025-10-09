@@ -110,7 +110,7 @@ fn test_apply_multiple_stages_preserves_blame_history() {
 {blame_dump}"
         )
     });
-    assert_eq!(root_meta.change_id, 2);
+    assert_eq!(root_meta.change_id, 1);
 
     let role_meta = path_meta
         .remove(&vec!["owner".to_string(), "role".to_string()])

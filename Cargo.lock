@@ -889,7 +889,7 @@ dependencies = [
 [[package]]
 name = "linkml_meta"
 version = "0.0.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#6dcbe98559aefe3d939f3a1fe87e7c93f7080f16"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#598b3abe11a6a8325515c670f3e5decfe6c10ed1"
 dependencies = [
  "chrono",
  "merge",
@@ -904,7 +904,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#6dcbe98559aefe3d939f3a1fe87e7c93f7080f16"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#598b3abe11a6a8325515c670f3e5decfe6c10ed1"
 dependencies = [
  "clap",
  "linkml_meta",
@@ -923,7 +923,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime_python"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#6dcbe98559aefe3d939f3a1fe87e7c93f7080f16"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#598b3abe11a6a8325515c670f3e5decfe6c10ed1"
 dependencies = [
  "linkml_meta",
  "linkml_runtime",
@@ -1774,12 +1774,13 @@ dependencies = [
 [[package]]
 name = "schemaview"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#6dcbe98559aefe3d939f3a1fe87e7c93f7080f16"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#598b3abe11a6a8325515c670f3e5decfe6c10ed1"
 dependencies = [
  "curies",
  "itertools 0.14.0",
  "linkml_meta",
  "reqwest",
+ "serde",
  "serde_path_to_error",
  "serde_yml",
  "thiserror 1.0.69",
