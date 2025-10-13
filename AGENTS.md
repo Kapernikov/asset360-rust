@@ -62,3 +62,4 @@ communication: assertive and informal. be a good sparring partner. disagree with
 - never upstream code without a corresponding test
 - the upstream code has specific instructions for quality and testing. so when the code has been written, ask the user to finish the process in a separate openAI codex session in the upstream codebase.
   you can provide the user with the prompt he should use in this new session so he's able to start quickly. in this new session, things like running tests, pre-commit (clippy and ...) branch and commit will be done.
+  these instructions need to have a bit of a "why" explainer too because they will be for a fresh codex session that doesn't know what was our intent with the change and why we did things the way we did.
