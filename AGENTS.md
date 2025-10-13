@@ -54,3 +54,11 @@ communication: assertive and informal. be a good sparring partner. disagree with
 
 ## Agent Updates
 - whenever you learn something new that needs to be remembered for always, autonomously update your agents.md, but keep it short and conscise so beware of adding general stuff that you already knew.
+
+## Upstreaming stuff to rust-linkml-core
+
+- sometimes the user will ask to upstream stuff to rust-linkml-core. in that  case, expect to find a writable git checkout in ../rust-linkml-core (bail out if you cant' find it)
+- for upstreaming, make sure you also make the code generic (eg don't leak any asset360 specific datastructures in the upstreamed code, if needed introduce type parameters)
+- never upstream code without a corresponding test
+- the upstream code has specific instructions for quality and testing. so when the code has been written, ask the user to finish the process in a separate openAI codex session in the upstream codebase.
+  you can provide the user with the prompt he should use in this new session so he's able to start quickly. in this new session, things like running tests, pre-commit (clippy and ...) branch and commit will be done.
