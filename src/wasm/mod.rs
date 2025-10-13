@@ -52,6 +52,12 @@ impl SchemaViewHandle {
         }
     }
 
+    /// Serialize this view into snapshot YAML.
+    #[wasm_bindgen(js_name = toSnapshotYaml)]
+    pub fn to_snapshot_yaml(&self) -> Result<String, JsValue> {
+        self.inner.to_snapshot_yaml().map_err(map_schema_error)
+    }
+
     /// Return every schema identifier loaded in this view.
     #[wasm_bindgen(js_name = schemaIds)]
     pub fn schema_ids(&self) -> Vec<String> {
@@ -240,6 +246,13 @@ pub fn load_schema_view(yaml: &str) -> Result<SchemaViewHandle, JsValue> {
     let mut view = SchemaView::new();
     view.add_schema(schema)
         .map_err(|err| JsValue::from_str(&err))?;
+    Ok(SchemaViewHandle { inner: view })
+}
+
+/// Load a [`SchemaView`] from snapshot YAML.
+#[wasm_bindgen(js_name = loadSchemaViewFromSnapshot)]
+pub fn load_schema_view_from_snapshot(yaml: &str) -> Result<SchemaViewHandle, JsValue> {
+    let view = SchemaView::from_snapshot_yaml(yaml).map_err(map_schema_error)?;
     Ok(SchemaViewHandle { inner: view })
 }
 
@@ -854,5 +867,37 @@ slots:
             }
             _ => panic!("expected scalar result"),
         }
+    }
+
+    #[test]
+    fn roundtrips_snapshot_yaml() {
+        let yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+classes:
+  Person: {}
+"#;
+        let view = load_schema_view(yaml).expect("schema loads");
+        let snapshot_yaml = view.to_snapshot_yaml().expect("snapshot serializes");
+
+        let restored = load_schema_view_from_snapshot(&snapshot_yaml).expect("snapshot loads");
+
+        let mut original_ids = view.schema_ids();
+        original_ids.sort();
+        let mut restored_ids = restored.schema_ids();
+        restored_ids.sort();
+        assert_eq!(restored_ids, original_ids);
+
+        let mut original_classes = view.class_ids();
+        original_classes.sort();
+        let mut restored_classes = restored.class_ids();
+        restored_classes.sort();
+        assert_eq!(restored_classes, original_classes);
+
+        assert_eq!(restored.primary_schema_id(), view.primary_schema_id());
     }
 }
