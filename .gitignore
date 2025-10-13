@@ -21,10 +21,6 @@ python/**/__pycache__/
 *~
 *.so
 pkg/*
-!pkg/index.js
-!pkg/index.d.ts
-!pkg/package.json
-!pkg/README.md
 pkg.zip
 node_modules/
 .cache/
