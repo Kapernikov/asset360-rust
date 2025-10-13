@@ -200,6 +200,22 @@ impl SchemaViewHandle {
             .map(EnumViewHandle::from_inner)
     }
 
+    #[wasm_bindgen(js_name = toString)]
+    pub fn to_string_js(&self) -> String {
+        let schema_count = self.inner.iter_schemas().count();
+        let class_count = self.class_ids().len();
+        let slot_count = self.slot_ids().len();
+        let enum_count = self.enum_ids().len();
+        match self.primary_schema_id() {
+            Some(primary) => format!(
+                "SchemaViewHandle(primary={primary}, schemas={schema_count}, classes={class_count}, slots={slot_count}, enums={enum_count})"
+            ),
+            None => format!(
+                "SchemaViewHandle(schemas={schema_count}, classes={class_count}, slots={slot_count}, enums={enum_count})"
+            ),
+        }
+    }
+
     /// Create a [`LinkMLInstance`] from JSON text for the given class.
     #[wasm_bindgen(js_name = loadInstanceFromJson)]
     pub fn load_instance_from_json(
@@ -351,6 +367,15 @@ impl ClassViewHandle {
             .identifier_slot()
             .map(|slot| SlotViewHandle::from_inner_with_schema(slot.clone(), schema_id))
     }
+
+    #[wasm_bindgen(js_name = toString)]
+    pub fn to_string_js(&self) -> String {
+        format!(
+            "ClassViewHandle(name={}, schema={})",
+            self.name(),
+            self.schema_id()
+        )
+    }
 }
 
 #[wasm_bindgen]
@@ -420,6 +445,12 @@ impl SlotViewHandle {
     pub fn range_enum(&self) -> Option<EnumViewHandle> {
         self.inner.get_range_enum().map(EnumViewHandle::from_inner)
     }
+
+    #[wasm_bindgen(js_name = toString)]
+    pub fn to_string_js(&self) -> String {
+        let schema = self.schema_id().unwrap_or_else(|| "<unknown>".to_string());
+        format!("SlotViewHandle(name={}, schema={schema})", self.name())
+    }
 }
 
 #[wasm_bindgen]
@@ -456,6 +487,15 @@ impl EnumViewHandle {
             .permissible_value_keys()
             .map(|keys| keys.to_vec())
             .map_err(map_schema_error)
+    }
+
+    #[wasm_bindgen(js_name = toString)]
+    pub fn to_string_js(&self) -> String {
+        format!(
+            "EnumViewHandle(name={}, schema={})",
+            self.name(),
+            self.schema_id()
+        )
     }
 }
 
@@ -667,6 +707,20 @@ impl LinkMLInstanceHandle {
     pub fn clone_handle(&self) -> LinkMLInstanceHandle {
         LinkMLInstanceHandle::from_inner(self.inner.clone())
     }
+
+    #[wasm_bindgen(js_name = toString)]
+    pub fn to_string_js(&self) -> String {
+        let kind = self.kind();
+        let mut details = Vec::new();
+        if let Some(class) = self.class_name() {
+            details.push(format!("class={class}"));
+        }
+        if let Some(slot) = self.slot_name() {
+            details.push(format!("slot={slot}"));
+        }
+        details.push(format!("node={}", self.node_id()));
+        format!("LinkMLInstanceHandle(kind={kind}, {})", details.join(", "))
+    }
 }
 
 #[wasm_bindgen]
@@ -730,6 +784,25 @@ impl RangeInfoHandle {
             SlotInlineMode::Primitive => "primitive".to_string(),
             SlotInlineMode::Reference => "reference".to_string(),
         }
+    }
+
+    #[wasm_bindgen(js_name = toString)]
+    pub fn to_string_js(&self) -> String {
+        let slot_name = self.inner.slotview.name.clone();
+        let schema_id = self.inner.slotview.schema_id().to_string();
+        let range_desc = if let Some(class) = &self.inner.range_class {
+            format!("class={}", class.name())
+        } else if let Some(enum_view) = &self.inner.range_enum {
+            format!("enum={}", enum_view.name())
+        } else if self.inner.is_range_scalar {
+            "scalar".to_string()
+        } else {
+            "unknown".to_string()
+        };
+        format!(
+            "RangeInfoHandle(slot={}, schema={}, range={range_desc})",
+            slot_name, schema_id
+        )
     }
 }
 
@@ -899,5 +972,80 @@ classes:
         assert_eq!(restored_classes, original_classes);
 
         assert_eq!(restored.primary_schema_id(), view.primary_schema_id());
+    }
+
+    #[test]
+    fn to_string_handles_are_informative() {
+        let yaml = r#"
+id: https://example.org/test
+name: test
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+classes:
+  Person:
+    slots:
+      - name
+      - aliases
+slots:
+  name:
+    range: string
+  aliases:
+    range: string
+    multivalued: true
+"#;
+        let view = load_schema_view(yaml).expect("schema loads");
+
+        let view_summary = view.to_string_js();
+        assert!(view_summary.contains("SchemaViewHandle"));
+        assert!(view_summary.contains("classes=1"));
+        assert!(view_summary.contains("slots=2"));
+
+        let class_handle = view
+            .class_view("https://example.org/test", "Person")
+            .expect("class lookup")
+            .expect("class exists");
+        assert_eq!(
+            class_handle.to_string_js(),
+            "ClassViewHandle(name=Person, schema=https://example.org/test)"
+        );
+
+        let slot_handles = class_handle.slot_views();
+        let mut slot_summaries: Vec<String> = slot_handles
+            .iter()
+            .map(|slot| slot.to_string_js())
+            .collect();
+        slot_summaries.sort();
+        assert_eq!(
+            slot_summaries,
+            vec![
+                "SlotViewHandle(name=aliases, schema=https://example.org/test)".to_string(),
+                "SlotViewHandle(name=name, schema=https://example.org/test)".to_string()
+            ]
+        );
+
+        let name_slot = slot_handles
+            .iter()
+            .find(|slot| slot.name() == "name")
+            .expect("name slot present");
+        let range_summaries: Vec<String> = name_slot
+            .range_infos()
+            .into_iter()
+            .map(|info| info.to_string_js())
+            .collect();
+        assert!(
+            range_summaries
+                .iter()
+                .any(|summary| summary.contains("range=scalar"))
+        );
+
+        let instance = view
+            .load_instance_from_json("Person", r#"{"name": "Alice", "aliases": ["Al"]}"#)
+            .expect("instance loads");
+        let instance_summary = instance.to_string_js();
+        assert!(instance_summary.contains("LinkMLInstanceHandle"));
+        assert!(instance_summary.contains("kind=object"));
+        assert!(instance_summary.contains("class=Person"));
     }
 }
