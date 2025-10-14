@@ -6,10 +6,6 @@ Python bindings and package wrapper around the Asset360 Rust module.
 Install from GitHub release
 ---------------------------
 
-> ⚠️ Releases are staged entirely on GitHub. The examples below assume you are
-> installing version `vX.Y.Z`. Replace the tag and the filename that matches
-> your platform/interpreter.
-
 ### Python (wheel)
 
 ```bash
