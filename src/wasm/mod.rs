@@ -179,12 +179,7 @@ impl SchemaViewHandle {
             .and_then(|mut defs| defs.remove(slot_name))
             .map(|def| {
                 SlotViewHandle::from_inner_with_schema(
-                    SlotView::new(
-                        slot_name.to_string(),
-                        vec![def],
-                        schema_id,
-                        &self.inner,
-                    ),
+                    SlotView::new(slot_name.to_string(), vec![def], schema_id, &self.inner),
                     schema_id.to_string(),
                 )
             })
