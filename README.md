@@ -3,6 +3,40 @@ asset360-rust
 
 Python bindings and package wrapper around the Asset360 Rust module.
 
+Install from GitHub release
+---------------------------
+
+> ⚠️ Releases are staged entirely on GitHub. The examples below assume you are
+> installing version `vX.Y.Z`. Replace the tag and the filename that matches
+> your platform/interpreter.
+
+### Python (wheel)
+
+```bash
+pip install \
+  https://github.com/Kapernikov/asset360-rust/releases/download/vX.Y.Z/asset360_rust-X.Y.Z-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+```
+
+Pick the wheel whose `cpXYZ`/`manylinux` tags line up with your Python version
+and OS. The release page lists one wheel per supported interpreter/ABI.
+
+### Node / bundler (npm tarball)
+
+```bash
+npm install \
+  https://github.com/Kapernikov/asset360-rust/releases/download/vX.Y.Z/asset360-rust-X.Y.Z.tgz
+```
+
+You can also reference the tarball in `package.json`:
+
+```json
+{
+  "dependencies": {
+    "asset360-rust": "https://github.com/Kapernikov/asset360-rust/releases/download/vX.Y.Z/asset360-rust-X.Y.Z.tgz"
+  }
+}
+```
+
 Develop with maturin
 --------------------
 
