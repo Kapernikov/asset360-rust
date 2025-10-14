@@ -235,6 +235,13 @@ jobs:
           sed -i -E "s/^version = \".*\"/version = \"${VER}\"/" Cargo.toml
       - name: Build npm package
         run: bash scripts/build_wasm.sh --target-dir pkg
+      - name: Collect npm tarball
+        run: |
+          shopt -s nullglob
+          for tarball in *.tgz; do
+            mv "$tarball" pkg/
+          done
+          shopt -u nullglob
       - name: Upload npm package to release
         uses: softprops/action-gh-release@v1
         with:
