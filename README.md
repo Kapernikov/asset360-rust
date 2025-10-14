@@ -14,64 +14,38 @@ Install from GitHub release
 
 ```bash
 pip install "$(
-  python - <<'PY'
-import json
-import sys
-import urllib.request
-
-OWNER = "Kapernikov"
-REPO = "asset360-rust"
-
-with urllib.request.urlopen(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest") as resp:
-    release = json.load(resp)
-
-py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
-abi_tag = py_tag
-preferred_platforms = ["manylinux", "musllinux"]
-
-for platform in preferred_platforms:
-    for asset in release.get("assets", []):
-        name = asset.get("name", "")
-        if name.endswith(".whl") and py_tag in name and abi_tag in name and platform in name:
-            print(asset["browser_download_url"])
-            raise SystemExit
-
-raise SystemExit("No matching wheel found in the latest release.")
-PY
+  curl -sfL https://api.github.com/repos/Kapernikov/asset360-rust/releases/latest |
+    jq -r --arg py_tag "cp$(python -c 'import sys; print(sys.version_info.major, sys.version_info.minor, sep=\"\")')" '
+      .assets
+      | map(select(.name | endswith(".whl")))
+      | map(select(.name | test($py_tag)))
+      | (map(select(.name | test("manylinux"))) + map(select(.name | test("musllinux"))))
+      | first
+      | .browser_download_url
+    '
 )"
 ```
 
-The script above queries the latest GitHub release, picks the wheel matching the
-current interpreter (`cpXY`) and prefers manylinux builds, falling back to
-musllinux if needed.
+The command fetches the latest release metadata from GitHub, filters for wheels
+matching the active Python `cpXY` tag, prefers manylinux builds, and falls back
+to musllinux if that’s all that’s available.
 
 ### Node / bundler (npm tarball)
 
 ```bash
 npm install "$(
-  python - <<'PY'
-import json
-import urllib.request
-
-OWNER = "Kapernikov"
-REPO = "asset360-rust"
-
-with urllib.request.urlopen(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest") as resp:
-    release = json.load(resp)
-
-for asset in release.get("assets", []):
-    name = asset.get("name", "")
-    if name.endswith(".tgz") and name.startswith("asset360-rust-"):
-        print(asset["browser_download_url"])
-        raise SystemExit
-
-raise SystemExit("No npm tarball found in the latest release.")
-PY
+  curl -sfL https://api.github.com/repos/Kapernikov/asset360-rust/releases/latest |
+    jq -r '
+      .assets
+      | map(select(.name | startswith("asset360-rust-") and endswith(".tgz")))
+      | first
+      | .browser_download_url
+    '
 )"
 ```
 
-This resolves the tarball URL from the latest release and hands it to `npm
-install`, so you always grab the newest published package.
+`npm install` receives the tarball URL for the newest published release
+automatically.
 
 Develop with maturin
 --------------------
