@@ -13,29 +13,65 @@ Install from GitHub release
 ### Python (wheel)
 
 ```bash
-pip install \
-  https://github.com/Kapernikov/asset360-rust/releases/download/vX.Y.Z/asset360_rust-X.Y.Z-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+pip install "$(
+  python - <<'PY'
+import json
+import sys
+import urllib.request
+
+OWNER = "Kapernikov"
+REPO = "asset360-rust"
+
+with urllib.request.urlopen(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest") as resp:
+    release = json.load(resp)
+
+py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+abi_tag = py_tag
+preferred_platforms = ["manylinux", "musllinux"]
+
+for platform in preferred_platforms:
+    for asset in release.get("assets", []):
+        name = asset.get("name", "")
+        if name.endswith(".whl") and py_tag in name and abi_tag in name and platform in name:
+            print(asset["browser_download_url"])
+            raise SystemExit
+
+raise SystemExit("No matching wheel found in the latest release.")
+PY
+)"
 ```
 
-Pick the wheel whose `cpXYZ`/`manylinux` tags line up with your Python version
-and OS. The release page lists one wheel per supported interpreter/ABI.
+The script above queries the latest GitHub release, picks the wheel matching the
+current interpreter (`cpXY`) and prefers manylinux builds, falling back to
+musllinux if needed.
 
 ### Node / bundler (npm tarball)
 
 ```bash
-npm install \
-  https://github.com/Kapernikov/asset360-rust/releases/download/vX.Y.Z/asset360-rust-X.Y.Z.tgz
+npm install "$(
+  python - <<'PY'
+import json
+import urllib.request
+
+OWNER = "Kapernikov"
+REPO = "asset360-rust"
+
+with urllib.request.urlopen(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest") as resp:
+    release = json.load(resp)
+
+for asset in release.get("assets", []):
+    name = asset.get("name", "")
+    if name.endswith(".tgz") and name.startswith("asset360-rust-"):
+        print(asset["browser_download_url"])
+        raise SystemExit
+
+raise SystemExit("No npm tarball found in the latest release.")
+PY
+)"
 ```
 
-You can also reference the tarball in `package.json`:
-
-```json
-{
-  "dependencies": {
-    "asset360-rust": "https://github.com/Kapernikov/asset360-rust/releases/download/vX.Y.Z/asset360-rust-X.Y.Z.tgz"
-  }
-}
-```
+This resolves the tarball URL from the latest release and hands it to `npm
+install`, so you always grab the newest published package.
 
 Develop with maturin
 --------------------
