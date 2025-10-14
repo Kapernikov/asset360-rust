@@ -15,7 +15,7 @@ Install from GitHub release
 ```bash
 pip install "$(
   curl -sfL https://api.github.com/repos/Kapernikov/asset360-rust/releases/latest |
-    jq -r --arg py_tag "cp$(python -c 'import sys; print(sys.version_info.major, sys.version_info.minor, sep=\"\")')" '
+    jq -r --arg py_tag "cp$(python -c 'import sys; print(sys.version_info.major, sys.version_info.minor, sep="")')" '
       .assets
       | map(select(.name | endswith(".whl")))
       | map(select(.name | test($py_tag)))
@@ -28,7 +28,8 @@ pip install "$(
 
 The command fetches the latest release metadata from GitHub, filters for wheels
 matching the active Python `cpXY` tag, prefers manylinux builds, and falls back
-to musllinux if that’s all that’s available.
+to musllinux if that’s all that’s available. Requires `curl`, `jq`, and `python`
+on the PATH.
 
 ### Node / bundler (npm tarball)
 
@@ -45,7 +46,7 @@ npm install "$(
 ```
 
 `npm install` receives the tarball URL for the newest published release
-automatically.
+automatically. Requires `curl` and `jq`.
 
 Develop with maturin
 --------------------
