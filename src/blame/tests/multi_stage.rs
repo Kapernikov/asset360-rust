@@ -24,14 +24,14 @@ fn test_apply_multiple_stages_preserves_blame_history() {
     let project_class = sv
         .get_class(
             &linkml_schemaview::identifier::Identifier::new("Project"),
-            conv,
+            &conv,
         )
         .unwrap()
         .unwrap();
 
     let generations: Vec<LinkMLInstance> = GENERATIONS
         .iter()
-        .map(|data| linkml_runtime::load_yaml_str(data, &sv, &project_class, conv).unwrap())
+        .map(|data| linkml_runtime::load_yaml_str(data, &sv, &project_class, &conv).unwrap())
         .collect();
 
     let base = generations

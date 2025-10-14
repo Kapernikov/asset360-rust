@@ -38,7 +38,7 @@ impl SchemaViewHandle {
     #[wasm_bindgen(js_name = schemaDefinition)]
     pub fn schema_definition(&self, schema_id: &str) -> Result<JsValue, JsValue> {
         match self.inner.get_schema_definition(schema_id) {
-            Some(schema) => to_js(schema),
+            Some(schema) => to_js(&schema),
             None => Ok(JsValue::NULL),
         }
     }
@@ -47,7 +47,7 @@ impl SchemaViewHandle {
     #[wasm_bindgen(js_name = primarySchemaDefinition)]
     pub fn primary_schema_definition(&self) -> Result<JsValue, JsValue> {
         match self.inner.primary_schema() {
-            Some(schema) => to_js(schema),
+            Some(schema) => to_js(&schema),
             None => Ok(JsValue::NULL),
         }
     }
@@ -63,7 +63,8 @@ impl SchemaViewHandle {
     pub fn schema_ids(&self) -> Vec<String> {
         self.inner
             .all_schema_definitions()
-            .map(|(id, _)| id.clone())
+            .into_iter()
+            .map(|(id, _)| id)
             .collect()
     }
 
@@ -174,13 +175,13 @@ impl SchemaViewHandle {
     pub fn slot_view(&self, schema_id: &str, slot_name: &str) -> Option<SlotViewHandle> {
         self.inner
             .get_schema(schema_id)
-            .and_then(|schema| schema.slot_definitions.as_ref())
-            .and_then(|defs| defs.get(slot_name))
+            .and_then(|schema| schema.slot_definitions)
+            .and_then(|mut defs| defs.remove(slot_name))
             .map(|def| {
                 SlotViewHandle::from_inner_with_schema(
                     SlotView::new(
                         slot_name.to_string(),
-                        vec![def.clone()],
+                        vec![def],
                         schema_id,
                         &self.inner,
                     ),
@@ -194,15 +195,15 @@ impl SchemaViewHandle {
     pub fn enum_view(&self, schema_id: &str, enum_name: &str) -> Option<EnumViewHandle> {
         self.inner
             .get_schema(schema_id)
-            .and_then(|schema| schema.enums.as_ref())
-            .and_then(|defs| defs.get(enum_name))
-            .map(|def| EnumView::new(def, &self.inner, schema_id))
+            .and_then(|schema| schema.enums)
+            .and_then(|mut defs| defs.remove(enum_name))
+            .map(|def| EnumView::new(&def, &self.inner, schema_id))
             .map(EnumViewHandle::from_inner)
     }
 
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
-        let schema_count = self.inner.iter_schemas().count();
+        let schema_count = self.inner.iter_schemas().len();
         let class_count = self.class_ids().len();
         let slot_count = self.slot_ids().len();
         let enum_count = self.enum_ids().len();

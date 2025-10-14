@@ -43,7 +43,7 @@ classes:
     let class = sv
         .get_class(
             &linkml_schemaview::identifier::Identifier::new("Root"),
-            conv,
+            &conv,
         )
         .unwrap()
         .unwrap();
@@ -56,7 +56,7 @@ items:
   - title: First
   - title: Second
 "#;
-    let value = linkml_runtime::load_yaml_str(data, &sv, &class, conv).unwrap();
+    let value = linkml_runtime::load_yaml_str(data, &sv, &class, &conv).unwrap();
 
     let mut blame = HashMap::new();
     let root_meta = Asset360ChangeMeta {

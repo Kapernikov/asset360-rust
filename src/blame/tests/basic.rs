@@ -42,11 +42,11 @@ classes:
     let class = sv
         .get_class(
             &linkml_schemaview::identifier::Identifier::new("Root"),
-            conv,
+            &conv,
         )
         .unwrap()
         .unwrap();
-    let value = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
+    let value = linkml_runtime::load_yaml_str("{}", &sv, &class, &conv).unwrap();
 
     let id = value.node_id();
     blame.insert(id, meta1.clone());
@@ -79,12 +79,12 @@ classes:
     let class = sv
         .get_class(
             &linkml_schemaview::identifier::Identifier::new("Root"),
-            conv,
+            &conv,
         )
         .unwrap()
         .unwrap();
 
-    let base = linkml_runtime::load_yaml_str("{}", &sv, &class, conv).unwrap();
+    let base = linkml_runtime::load_yaml_str("{}", &sv, &class, &conv).unwrap();
     let (out, blame) = apply_deltas(Some(base.clone()), vec![]);
 
     assert!(blame.is_empty());

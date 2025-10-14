@@ -106,7 +106,7 @@ fn compute_classes_by_type_designator(
                         }
                     }
 
-                    if let Ok(Some(cv)) = sv.get_class_by_schema(schema_id, class_name)
+                    if let Ok(Some(cv)) = sv.get_class_by_schema(&schema_id, class_name)
                         && let Some(td_slot) = cv.get_type_designator_slot()
                     {
                         if only_default {
@@ -125,8 +125,8 @@ fn compute_classes_by_type_designator(
             }
         };
 
-        if let Some(conv) = sv.converter_for_schema(schema_id) {
-            process_classes(conv);
+        if let Some(conv) = sv.converter_for_schema(&schema_id) {
+            process_classes(&conv);
         } else {
             let conv_owned = sv.converter();
             process_classes(&conv_owned);

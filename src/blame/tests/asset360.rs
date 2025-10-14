@@ -25,7 +25,7 @@ fn test_apply_deltas_with_asset360_stages() {
             &linkml_schemaview::identifier::Identifier::new(
                 "https://data.infrabel.be/asset360/Signal",
             ),
-            conv,
+            &conv,
         )
         .unwrap()
         .unwrap();
@@ -39,7 +39,7 @@ fn test_apply_deltas_with_asset360_stages() {
             serde_json::from_value(entry.get("meta").cloned().expect("meta present")).unwrap();
         let value_json = entry.get("value").cloned().expect("value present");
         let value_str = serde_json::to_string(&value_json).unwrap();
-        let value = linkml_runtime::load_json_str(&value_str, &sv, &signal_class, conv)
+        let value = linkml_runtime::load_json_str(&value_str, &sv, &signal_class, &conv)
             .expect("stage value conversion");
         let deltas: Vec<Delta> =
             serde_json::from_value(entry.get("deltas").cloned().expect("deltas present")).unwrap();
