@@ -230,7 +230,7 @@ jobs:
           echo "Setting Cargo.toml version to ${VER}"
           sed -i -E "s/^version = \".*\"/version = \"${VER}\"/" Cargo.toml
       - name: Build npm package
-        run: make npm
+        run: bash scripts/build_wasm.sh --target-dir pkg
       - name: Upload npm package to release
         uses: softprops/action-gh-release@v1
         with:
