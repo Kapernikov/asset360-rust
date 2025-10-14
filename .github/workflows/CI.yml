@@ -214,6 +214,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install build prerequisites (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
       - uses: jetli/wasm-pack-action@v0.4.0
