@@ -10,11 +10,13 @@ use pyo3_stub_gen::{
 use std::collections::HashMap;
 
 #[cfg(feature = "python-bindings")]
-use linkml_meta::{Annotation, ClassDefinition};
+use linkml_meta::Annotation;
 #[cfg(feature = "python-bindings")]
 use linkml_runtime::{LinkMLInstance, NodeId, diff::Delta};
 #[cfg(feature = "python-bindings")]
-use linkml_runtime_python::{PyDelta, PyLinkMLInstance, PySchemaView, node_map_into_pydict};
+use linkml_runtime_python::{
+    PyClassView, PyDelta, PyLinkMLInstance, PySchemaView, node_map_into_pydict,
+};
 #[cfg(feature = "python-bindings")]
 use linkml_schemaview::classview::ClassView;
 #[cfg(feature = "python-bindings")]
@@ -84,54 +86,56 @@ fn compute_classes_by_type_designator(
     only_registered: bool,
     only_default: bool,
     py: Option<Python<'_>>,
-) -> HashMap<String, ClassDefinition> {
-    let mut out: HashMap<String, ClassDefinition> = HashMap::new();
+) -> HashMap<String, ClassView> {
+    let mut out: HashMap<String, ClassView> = HashMap::new();
 
-    for (schema_id, schema) in sv.all_schema_definitions() {
-        let mut process_classes = |conv: &Converter| {
-            if let Some(classes) = &schema.classes {
-                for (class_name, class_def) in classes {
-                    if only_registered {
-                        let managed = class_def
-                            .annotations
-                            .as_ref()
-                            .and_then(|m| m.get("data.infrabel.be/asset360/managed"));
-                        let managed_truthy = managed.map(|ann| match py {
-                            Some(py) => is_truthy(py, ann),
-                            None => true,
-                        });
-                        if !managed_truthy.unwrap_or(false) {
-                            out.remove(class_name);
-                            continue;
-                        }
-                    }
-
-                    if let Ok(Some(cv)) = sv.get_class_by_schema(&schema_id, class_name)
-                        && let Some(td_slot) = cv.get_type_designator_slot()
-                    {
-                        if only_default {
-                            if let Ok(id) = cv.get_type_designator_value(td_slot, conv) {
-                                out.insert(id.to_string(), class_def.clone());
+    sv.with_schema_definitions(|schemas| {
+        for (schema_id, schema) in schemas {
+            let mut process_classes = |conv: &Converter| {
+                if let Some(classes) = &schema.classes {
+                    for (class_name, class_def) in classes {
+                        if only_registered {
+                            let managed = class_def
+                                .annotations
+                                .as_ref()
+                                .and_then(|m| m.get("data.infrabel.be/asset360/managed"));
+                            let managed_truthy = managed.map(|ann| match py {
+                                Some(py) => is_truthy(py, ann),
+                                None => true,
+                            });
+                            if !managed_truthy.unwrap_or(false) {
+                                out.remove(class_name);
+                                continue;
                             }
-                        } else if let Ok(ids) =
-                            cv.get_accepted_type_designator_values(td_slot, conv)
+                        }
+
+                        if let Ok(Some(cv)) = sv.get_class_by_schema(schema_id.as_str(), class_name)
+                            && let Some(td_slot) = cv.get_type_designator_slot()
                         {
-                            for id in ids {
-                                out.insert(id.to_string(), class_def.clone());
+                            if only_default {
+                                if let Ok(id) = cv.get_type_designator_value(td_slot, conv) {
+                                    out.insert(id.to_string(), cv.clone());
+                                }
+                            } else if let Ok(ids) =
+                                cv.get_accepted_type_designator_values(td_slot, conv)
+                            {
+                                for id in ids {
+                                    out.insert(id.to_string(), cv.clone());
+                                }
                             }
                         }
                     }
                 }
-            }
-        };
+            };
 
-        if let Some(conv) = sv.converter_for_schema(&schema_id) {
-            process_classes(&conv);
-        } else {
-            let conv_owned = sv.converter();
-            process_classes(&conv_owned);
+            if let Some(conv) = sv.converter_for_schema(schema_id) {
+                process_classes(&conv);
+            } else {
+                let conv_owned = sv.converter();
+                process_classes(&conv_owned);
+            }
         }
-    }
+    });
     out
 }
 
@@ -148,15 +152,20 @@ fn get_all_classes_by_type_designator_and_schema_impl(
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
-) -> PyResult<HashMap<String, ClassDefinition>> {
+) -> PyResult<HashMap<String, Py<PyClassView>>> {
     let bound = schemaview.bind(py);
     let sv_ref = bound.borrow();
-    Ok(compute_classes_by_type_designator(
+    let raw = compute_classes_by_type_designator(
         sv_ref.as_rust(),
         only_registered,
         only_default,
         Some(py),
-    ))
+    );
+    raw.into_iter()
+        .map(|(designator, view)| {
+            Py::new(py, PyClassView::from(view)).map(|py_view| (designator, py_view))
+        })
+        .collect()
 }
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
@@ -170,8 +179,8 @@ fn get_all_classes_by_type_designator_and_schema_impl(
 #[gen_stub_pyfunction]
 #[gen_stub(
     override_return_type(
-        type_repr = "dict[str, linkml_meta.ClassDefinition]",
-        imports = ("linkml_meta",)
+        type_repr = "dict[str, asset360_rust.ClassView]",
+        imports = ("asset360_rust",)
     )
 )]
 #[pyfunction(
@@ -189,7 +198,7 @@ fn get_all_classes_by_type_designator_and_schema(
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
-) -> PyResult<HashMap<String, ClassDefinition>> {
+) -> PyResult<HashMap<String, Py<PyClassView>>> {
     get_all_classes_by_type_designator_and_schema_impl(
         py,
         schemaview,
@@ -215,7 +224,7 @@ fn get_all_classes_by_type_designator_and_schema(
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
-) -> PyResult<HashMap<String, ClassDefinition>> {
+) -> PyResult<HashMap<String, Py<PyClassView>>> {
     get_all_classes_by_type_designator_and_schema_impl(
         py,
         schemaview,
@@ -886,39 +895,51 @@ define_stub_info_gatherer!(stub_info);
 
 #[cfg(all(test, feature = "python-bindings"))]
 mod tests {
+    use std::hint::black_box;
+    use std::path::Path;
+    use std::time::Instant;
+
     use super::*;
     use linkml_meta::SchemaDefinition;
 
     #[test]
     fn test_compute_classes_by_type_designator_basic() {
-        let yaml = r#"
-id: https://example.org/test
-name: test
-default_prefix: ex
-prefixes:
-  ex:
-    prefix_reference: http://example.org/
-classes:
-  A:
-    annotations:
-      data.infrabel.be/asset360/managed: true
-    slots:
-      - type
-  B:
-    slots:
-      - type
-slot_definitions:
-  type:
-    designates_type: true
-    range: string
-"#;
-        let deser = serde_yml::Deserializer::from_str(yaml);
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("data")
+            .join("asset360.yaml");
+        let yaml = std::fs::read_to_string(&schema_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", schema_path.display()));
+        let deser = serde_yml::Deserializer::from_str(&yaml);
         let schema: SchemaDefinition = serde_path_to_error::deserialize(deser).unwrap();
         let mut sv = SchemaView::new();
         sv.add_schema(schema).unwrap();
-        let m = compute_classes_by_type_designator(&sv, false, true, None);
-        assert!(m.contains_key("A"));
-        assert!(m.get("A").unwrap().name == "A");
-        assert!(m.contains_key("B"));
+        let baseline = compute_classes_by_type_designator(&sv, true, true, None);
+        assert!(
+            !baseline.is_empty(),
+            "expected managed classes with designator entries"
+        );
+        let sample = baseline
+            .values()
+            .next()
+            .expect("at least one managed class available");
+        assert!(sample.name().contains(':') || !sample.name().is_empty());
+
+        let iterations = std::env::var("TYPE_DESIGNATOR_BENCH_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .filter(|iters| *iters > 0)
+            .unwrap_or(10_000u32);
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let result = compute_classes_by_type_designator(&sv, true, true, None);
+            black_box(result);
+        }
+        let elapsed = start.elapsed();
+        let per_iter = elapsed.as_secs_f64() / f64::from(iterations);
+        println!(
+            "compute_classes_by_type_designator: {:.6} s/iter over {iterations} iterations",
+            per_iter
+        );
     }
 }

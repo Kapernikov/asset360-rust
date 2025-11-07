@@ -61,11 +61,11 @@ impl SchemaViewHandle {
     /// Return every schema identifier loaded in this view.
     #[wasm_bindgen(js_name = schemaIds)]
     pub fn schema_ids(&self) -> Vec<String> {
-        self.inner
-            .all_schema_definitions()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect()
+        let mut ids = Vec::new();
+        self.inner.with_schema_definitions(|schemas| {
+            ids.extend(schemas.keys().cloned());
+        });
+        ids
     }
 
     /// Return every class identifier indexed in this view.
