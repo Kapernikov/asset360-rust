@@ -48,7 +48,9 @@ fn load_change_stages(sv: &SchemaView, stages_json: &str) -> Vec<ChangeStage<Ass
         let value_json = entry.get("value").cloned().expect("value present");
         let value_str = serde_json::to_string(&value_json).unwrap();
         let value = linkml_runtime::load_json_str(&value_str, sv, &class_view, &conv)
-            .expect("stage value conversion");
+            .expect("stage value conversion")
+            .into_instance_tolerate_errors()
+            .unwrap();
 
         let deltas: Vec<Delta> = entry
             .get("deltas")

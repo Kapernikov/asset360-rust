@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,15 @@ from asset360_rust import (  # noqa: E402  (import after path tweak)
     SchemaView,
     load_json,
 )
+
+
+def _load_instance(json_payload: str, sv: SchemaView, cv):
+    assert isinstance(json_payload, str), f"expected serialized JSON text, got {type(json_payload)}"
+    value, errors = load_json(json_payload, sv, cv)
+    for issue in errors:
+        warnings.warn(f"linkml validation issue: {issue}")
+    assert value is not None, "expected LinkMLInstance result"
+    return value
 
 
 def _load_schema_view() -> SchemaView:
@@ -46,7 +56,7 @@ def _build_change_stages(sv: SchemaView, class_id: str) -> list[ChangeStage]:
             meta_dict["change_id"],
             meta_dict["ics_id"],
         )
-        value = load_json(json.dumps(entry["value"]), sv, cv)
+        value = _load_instance(json.dumps(entry["value"]), sv, cv)
         deltas = [
             Delta(delta["path"], delta["op"], delta.get("old"), delta.get("new"))
             for delta in entry.get("deltas", [])

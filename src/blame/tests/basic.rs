@@ -46,7 +46,10 @@ classes:
         )
         .unwrap()
         .unwrap();
-    let value = linkml_runtime::load_yaml_str("{}", &sv, &class, &conv).unwrap();
+    let value = linkml_runtime::load_yaml_str("{}", &sv, &class, &conv)
+        .unwrap()
+        .into_instance_tolerate_errors()
+        .unwrap();
 
     let id = value.node_id();
     blame.insert(id, meta1.clone());
@@ -84,7 +87,10 @@ classes:
         .unwrap()
         .unwrap();
 
-    let base = linkml_runtime::load_yaml_str("{}", &sv, &class, &conv).unwrap();
+    let base = linkml_runtime::load_yaml_str("{}", &sv, &class, &conv)
+        .unwrap()
+        .into_instance_tolerate_errors()
+        .unwrap();
     let (out, blame) = apply_deltas(Some(base.clone()), vec![]);
 
     assert!(blame.is_empty());

@@ -33,6 +33,7 @@ communication: assertive and informal. be a good sparring partner. disagree with
   3. `pip install maturin pytest` (first-time setup).
   4. `maturin develop` to build/install the bindings into the venv.
   5. `PYTHONPATH=python python -m pytest python/tests` to run the test suite.
+- Shortcut: `make test-py` handles the virtualenv activation, runs `maturin develop`, and executes the pytest suite; use it to guarantee the native module is rebuilt.
 
 ## Testing Guidelines
 - Add integration tests under `src/runtime/tests/` when changing CLI/runtime behavior.

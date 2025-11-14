@@ -40,7 +40,9 @@ fn test_apply_deltas_with_asset360_stages() {
         let value_json = entry.get("value").cloned().expect("value present");
         let value_str = serde_json::to_string(&value_json).unwrap();
         let value = linkml_runtime::load_json_str(&value_str, &sv, &signal_class, &conv)
-            .expect("stage value conversion");
+            .expect("stage value conversion")
+            .into_instance_tolerate_errors()
+            .unwrap();
         let deltas: Vec<Delta> =
             serde_json::from_value(entry.get("deltas").cloned().expect("deltas present")).unwrap();
 

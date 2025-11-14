@@ -56,7 +56,10 @@ items:
   - title: First
   - title: Second
 "#;
-    let value = linkml_runtime::load_yaml_str(data, &sv, &class, &conv).unwrap();
+    let value = linkml_runtime::load_yaml_str(data, &sv, &class, &conv)
+        .unwrap()
+        .into_instance_tolerate_errors()
+        .unwrap();
 
     let mut blame = HashMap::new();
     let root_meta = Asset360ChangeMeta {

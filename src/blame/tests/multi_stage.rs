@@ -31,7 +31,12 @@ fn test_apply_multiple_stages_preserves_blame_history() {
 
     let generations: Vec<LinkMLInstance> = GENERATIONS
         .iter()
-        .map(|data| linkml_runtime::load_yaml_str(data, &sv, &project_class, &conv).unwrap())
+        .map(|data| {
+            linkml_runtime::load_yaml_str(data, &sv, &project_class, &conv)
+                .unwrap()
+                .into_instance_tolerate_errors()
+                .unwrap()
+        })
         .collect();
 
     let base = generations

@@ -636,8 +636,9 @@ impl PyChangeStage {
         })?;
         let linkml_value = linkml_runtime::load_json_str(&value_str, rust_sv, &class_view, &conv)
             .map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("failed to load LinkML value: {e}"))
-        })?;
+                pyo3::exceptions::PyValueError::new_err(format!("failed to load LinkML value: {e}"))
+            })?
+            .into_instance_tolerate_errors()?;
 
         Ok(Self {
             inner: ChangeStage {

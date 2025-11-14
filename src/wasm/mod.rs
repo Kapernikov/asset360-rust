@@ -227,6 +227,8 @@ impl SchemaViewHandle {
             .map_err(map_schema_error)?
             .ok_or_else(|| JsValue::from_str(&format!("class `{class_name}` not found")))?;
         let instance = load_json_str(json, &self.inner, &class_view, &converter)
+            .map_err(|err| JsValue::from_str(&err.to_string()))?
+            .into_instance_tolerate_errors()
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
         Ok(LinkMLInstanceHandle::from_inner(instance))
     }
