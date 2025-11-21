@@ -285,24 +285,50 @@ for doc in README.md LICENSE COPYING; do
 done
 
 cat >"${OUT_DIR}/index.mjs" <<'INDEX_MJS'
-import * as bindings from './bundler/asset360_rust.js';
+import initWasm, * as wasmBindings from './web/asset360_rust.js';
 
-export * from './bundler/asset360_rust.js';
+// Auto-initialize WASM on first import using import.meta.url to find the WASM file
+let initPromise = null;
 
-let readyPromise = null;
-
-export async function init() {
-  if (readyPromise === null) {
-    readyPromise = Promise.resolve(bindings);
+async function ensureInit() {
+  if (initPromise === null) {
+    // Calculate WASM URL relative to this module
+    const wasmUrl = new URL('./web/asset360_rust_bg.wasm', import.meta.url);
+    initPromise = (async () => {
+      const resp = await fetch(wasmUrl, { credentials: 'same-origin' });
+      if (!resp.ok) {
+        throw new Error(`Failed to load WASM from ${wasmUrl}: ${resp.status} ${resp.statusText}`);
+      }
+      await initWasm(resp);
+    })();
   }
-  return readyPromise;
+  return initPromise;
 }
 
+// Export classes that auto-initialize on first use
+export class MiniJinjaEnvironment {
+  constructor() {
+    this._initPromise = ensureInit().then(() => {
+      this._inner = new wasmBindings.MiniJinjaEnvironment();
+    });
+  }
+
+  async renderStr(template, context) {
+    await this._initPromise;
+    return this._inner.renderStr(template, context);
+  }
+}
+
+// Export other bindings for advanced use
+export { initWasm as init };
+export * from './web/asset360_rust.js';
+
+// Legacy ready() function
 export function ready() {
-  return init();
+  return ensureInit();
 }
 
-export default init;
+export default ensureInit;
 INDEX_MJS
 
 cat >"${OUT_DIR}/index.cjs" <<'INDEX_CJS'
@@ -330,12 +356,18 @@ module.exports = exported;
 INDEX_CJS
 
 cat >"${OUT_DIR}/index.d.ts" <<'INDEX_DTS'
-export * from './bundler/asset360_rust.js';
+// Auto-initializing wrapper class
+export declare class MiniJinjaEnvironment {
+  constructor();
+  renderStr(template: string, context: Record<string, unknown>): Promise<string>;
+}
 
-export type Asset360Bindings = typeof import('./bundler/asset360_rust.js');
+// Re-export all bindings from web build for advanced usage
+export * from './web/asset360_rust.js';
 
-export declare function init(): Promise<Asset360Bindings>;
-export declare function ready(): Promise<Asset360Bindings>;
+// Initialization functions
+export declare function init(): Promise<void>;
+export declare function ready(): Promise<void>;
 
 declare const _default: typeof init;
 export default _default;
@@ -388,8 +420,7 @@ cat >"${OUT_DIR}/package.json" <<PACKAGE_JSON
       "types": "./nodejs/asset360_rust.d.ts",
       "default": "./nodejs/asset360_rust.js"
     },
-    "./web": "./web/asset360_rust.js",
-    "./bundler": "./bundler/asset360_rust.js"
+    "./web": "./web/asset360_rust.js"
   }
 }
 PACKAGE_JSON
