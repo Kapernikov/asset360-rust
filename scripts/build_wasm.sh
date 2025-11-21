@@ -287,22 +287,52 @@ done
 cat >"${OUT_DIR}/index.mjs" <<'INDEX_MJS'
 import initWasm, * as wasmBindings from './web/asset360_rust.js';
 
-// Auto-initialize WASM on first import using import.meta.url to find the WASM file
+// Auto-initialize WASM with configurable path resolution
 let initPromise = null;
+let wasmPathResolver = null;
+
+// Default resolver tries multiple common locations
+async function defaultWasmResolver() {
+  // Try 1: import.meta.url relative (works with Vite, Webpack 5+)
+  const locations = [
+    new URL('./web/asset360_rust_bg.wasm', import.meta.url).href,
+    // Try 2: Common asset paths for different bundlers
+    new URL('/assets/asset360/asset360_rust_bg.wasm', document.baseURI).href,
+    new URL('/web/asset360_rust_bg.wasm', document.baseURI).href,
+  ];
+
+  for (const url of locations) {
+    try {
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      if (resp.ok) return resp;
+    } catch (e) {
+      // Try next location
+    }
+  }
+
+  throw new Error(
+    `Failed to load WASM from any location: ${locations.join(', ')}. ` +
+    `Configure with: import { setWasmPath } from 'asset360-rust'`
+  );
+}
 
 async function ensureInit() {
   if (initPromise === null) {
-    // Calculate WASM URL relative to this module
-    const wasmUrl = new URL('./web/asset360_rust_bg.wasm', import.meta.url);
     initPromise = (async () => {
-      const resp = await fetch(wasmUrl, { credentials: 'same-origin' });
-      if (!resp.ok) {
-        throw new Error(`Failed to load WASM from ${wasmUrl}: ${resp.status} ${resp.statusText}`);
-      }
-      await initWasm(resp);
+      const resolver = wasmPathResolver || defaultWasmResolver;
+      const wasmOrUrl = typeof resolver === 'function' ? await resolver() : resolver;
+      await initWasm(wasmOrUrl);
     })();
   }
   return initPromise;
+}
+
+// Allow users to configure WASM path
+export function setWasmPath(pathOrResolver) {
+  if (initPromise !== null) {
+    throw new Error('WASM already initialized. Call setWasmPath() before any other imports.');
+  }
+  wasmPathResolver = pathOrResolver;
 }
 
 // Export classes that auto-initialize on first use
@@ -323,7 +353,6 @@ export class MiniJinjaEnvironment {
 export { initWasm as init };
 export * from './web/asset360_rust.js';
 
-// Legacy ready() function
 export function ready() {
   return ensureInit();
 }
@@ -361,6 +390,9 @@ export declare class MiniJinjaEnvironment {
   constructor();
   renderStr(template: string, context: Record<string, unknown>): Promise<string>;
 }
+
+// Configure WASM path (optional - auto-detects by default)
+export declare function setWasmPath(pathOrResolver: string | (() => Promise<Response | string>)): void;
 
 // Re-export all bindings from web build for advanced usage
 export * from './web/asset360_rust.js';
