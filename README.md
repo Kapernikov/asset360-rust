@@ -44,6 +44,17 @@ npm install "$(
 `npm install` receives the tarball URL for the newest published release
 automatically. Requires `curl` and `jq`.
 
+Usage (single import, auto-selects node vs browser):
+
+```ts
+import { MiniJinjaEnvironment, ready } from 'asset360-rust';
+await ready();
+const env = new MiniJinjaEnvironment();
+```
+
+If you need to force a specific build, the package also exposes `asset360-rust/node`
+and `asset360-rust/web` subpaths.
+
 Develop with maturin
 --------------------
 

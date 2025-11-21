@@ -370,15 +370,26 @@ cat >"${OUT_DIR}/package.json" <<PACKAGE_JSON
   "types": "./index.d.ts",
   "exports": {
     ".": {
-      "browser": "./index.mjs",
-      "import": "./index.mjs",
+      "types": "./index.d.ts",
+      "browser": {
+        "import": "./index.mjs",
+        "require": "./index.cjs"
+      },
       "node": "./index.cjs",
+      "import": "./index.mjs",
       "require": "./index.cjs",
       "default": "./index.cjs"
     },
+    "./node": {
+      "types": "./nodejs/asset360_rust.d.ts",
+      "default": "./nodejs/asset360_rust.js"
+    },
+    "./nodejs/asset360_rust.js": {
+      "types": "./nodejs/asset360_rust.d.ts",
+      "default": "./nodejs/asset360_rust.js"
+    },
     "./web": "./web/asset360_rust.js",
-    "./bundler": "./bundler/asset360_rust.js",
-    "./node": "./nodejs/asset360_rust.js"
+    "./bundler": "./bundler/asset360_rust.js"
   }
 }
 PACKAGE_JSON
