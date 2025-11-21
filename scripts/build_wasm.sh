@@ -335,16 +335,18 @@ export function setWasmPath(pathOrResolver) {
   wasmPathResolver = pathOrResolver;
 }
 
-// Export classes that auto-initialize on first use
+// Export classes that require explicit initialization
 export class MiniJinjaEnvironment {
   constructor() {
-    this._initPromise = ensureInit().then(() => {
-      this._inner = new wasmBindings.MiniJinjaEnvironment();
-    });
+    if (initPromise === null) {
+      throw new Error(
+        'WASM not initialized. Call await init() or await ready() before creating MiniJinjaEnvironment'
+      );
+    }
+    this._inner = new wasmBindings.MiniJinjaEnvironment();
   }
 
-  async renderStr(template, context) {
-    await this._initPromise;
+  renderStr(template, context) {
     return this._inner.renderStr(template, context);
   }
 }
@@ -385,10 +387,10 @@ module.exports = exported;
 INDEX_CJS
 
 cat >"${OUT_DIR}/index.d.ts" <<'INDEX_DTS'
-// Auto-initializing wrapper class
+// MiniJinjaEnvironment - requires WASM to be initialized first
 export declare class MiniJinjaEnvironment {
   constructor();
-  renderStr(template: string, context: Record<string, unknown>): Promise<string>;
+  renderStr(template: string, context: Record<string, unknown>): string;
 }
 
 // Configure WASM path (optional - auto-detects by default)
@@ -397,7 +399,7 @@ export declare function setWasmPath(pathOrResolver: string | (() => Promise<Resp
 // Re-export all bindings from web build for advanced usage
 export * from './web/asset360_rust.js';
 
-// Initialization functions
+// Initialization functions - call before creating MiniJinjaEnvironment
 export declare function init(): Promise<void>;
 export declare function ready(): Promise<void>;
 
