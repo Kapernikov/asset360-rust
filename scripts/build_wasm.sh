@@ -293,12 +293,11 @@ let wasmPathResolver = null;
 
 // Default resolver tries multiple common locations
 async function defaultWasmResolver() {
-  // Try 1: import.meta.url relative (works with Vite, Webpack 5+)
   const locations = [
-    new URL('./web/asset360_rust_bg.wasm', import.meta.url).href,
-    // Try 2: Common asset paths for different bundlers
-    new URL('/assets/asset360/asset360_rust_bg.wasm', document.baseURI).href,
-    new URL('/web/asset360_rust_bg.wasm', document.baseURI).href,
+    // Prefer locale-aware relative assets path first (works under /en-US/ etc.)
+    new URL('assets/asset360/asset360_rust_bg.wasm', document.baseURI).href,
+    // Fallback to a relative web path
+    new URL('web/asset360_rust_bg.wasm', document.baseURI).href,
   ];
 
   for (const url of locations) {
