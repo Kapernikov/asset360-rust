@@ -293,12 +293,25 @@ let wasmPathResolver = null;
 
 // Default resolver tries multiple common locations
 async function defaultWasmResolver() {
-  // Try 1: import.meta.url relative (works with Vite, Webpack 5+)
+  // Try 1: Bundler-friendly ?url import (esbuild, Vite, Webpack 5+)
+  // This tells bundlers to emit the WASM file as an asset and return its URL
+  try {
+    const wasmUrlModule = await import('./web/asset360_rust_bg.wasm?url');
+    // Return the URL string which can be passed to fetch or used directly
+    return wasmUrlModule.default || wasmUrlModule;
+  } catch (e) {
+    // Not a bundler context or ?url not supported (e.g., Node.js)
+    // Fall through to other resolution methods
+  }
+
+  // Try 2: import.meta.url relative (works in Node.js with --experimental-wasm-modules)
   const locations = [
     new URL('./web/asset360_rust_bg.wasm', import.meta.url).href,
-    // Try 2: Common asset paths for different bundlers
-    new URL('/assets/asset360/asset360_rust_bg.wasm', document.baseURI).href,
-    new URL('/web/asset360_rust_bg.wasm', document.baseURI).href,
+    // Try 3: Common asset paths for different bundlers (browser only)
+    ...(typeof document !== 'undefined' ? [
+      new URL('/assets/asset360/asset360_rust_bg.wasm', document.baseURI).href,
+      new URL('/web/asset360_rust_bg.wasm', document.baseURI).href,
+    ] : [])
   ];
 
   for (const url of locations) {
