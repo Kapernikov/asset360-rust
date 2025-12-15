@@ -116,6 +116,16 @@ ensure_binaryen() {
   echo "${wasm_opt_path}"
 }
 
+compress_wasm() {
+  local wasm_path="$1"
+  if command -v gzip >/dev/null 2>&1; then
+    gzip -kf "$wasm_path" || echo "warning: gzip failed for $wasm_path" >&2
+  fi
+  if command -v brotli >/dev/null 2>&1; then
+    brotli -f -q 11 "$wasm_path" -o "${wasm_path}.br" || echo "warning: brotli failed for $wasm_path" >&2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release)
@@ -244,6 +254,7 @@ build_target() {
     local tmp_opt="${wasm_dir}/${wasm_file}.opt"
     "${WASM_OPT_BIN}" -Oz "$wasm_path" -o "$tmp_opt"
     mv "$tmp_opt" "$wasm_path"
+    compress_wasm "$wasm_path"
   done
 }
 

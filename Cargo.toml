@@ -13,7 +13,7 @@ pyo3-stub-gen = { version = "0.13.1", optional = true }
 linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python", optional = true }
 linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta" }
 linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview", default-features = false }
-linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime", default-features = false }
+linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime", default-features = false, features = ["slim"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_path_to_error = "0.1.17"
