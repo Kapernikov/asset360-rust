@@ -740,7 +740,7 @@ dependencies = [
 [[package]]
 name = "linkml_meta"
 version = "0.0.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#e8a006dfd6c41258043456e79ac75d224fa7b69e"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#e11e546d5c548e137c58b0200f6773367940200d"
 dependencies = [
  "chrono",
  "merge",
@@ -755,7 +755,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#e8a006dfd6c41258043456e79ac75d224fa7b69e"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#e11e546d5c548e137c58b0200f6773367940200d"
 dependencies = [
  "linkml_meta",
  "once_cell",
@@ -776,7 +776,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime_python"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#e8a006dfd6c41258043456e79ac75d224fa7b69e"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#e11e546d5c548e137c58b0200f6773367940200d"
 dependencies = [
  "linkml_meta",
  "linkml_runtime",
@@ -1165,9 +1165,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.105"
+version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "535d180e0ecab6268a3e718bb9fd44db66bbbc256257165fc699dadf70d16fe7"
+checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
@@ -1603,7 +1603,7 @@ dependencies = [
 [[package]]
 name = "schemaview"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#e8a006dfd6c41258043456e79ac75d224fa7b69e"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#e11e546d5c548e137c58b0200f6773367940200d"
 dependencies = [
  "arc-swap",
  "curies",
@@ -2720,6 +2720,6 @@ dependencies = [
 
 [[package]]
 name = "zmij"
-version = "1.0.15"
+version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94f63c051f4fe3c1509da62131a678643c5b6fbdc9273b2b79d4378ebda003d2"
+checksum = "dfcd145825aace48cff44a8844de64bf75feec3080e0aa5cdbde72961ae51a65"
