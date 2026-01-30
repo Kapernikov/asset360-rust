@@ -80,12 +80,17 @@ fn is_truthy(py: Python<'_>, ann: &Annotation) -> bool {
     any.is_truthy().unwrap_or(false)
 }
 
+/// Default annotation key used to mark a class as "managed" by asset360.
+#[cfg(feature = "python-bindings")]
+pub const DEFAULT_MANAGED_ANNOTATION: &str = "data.infrabel.be/asset360/managed";
+
 #[cfg(feature = "python-bindings")]
 fn compute_classes_by_type_designator(
     sv: &SchemaView,
     only_registered: bool,
     only_default: bool,
     py: Option<Python<'_>>,
+    managed_annotation: &str,
 ) -> HashMap<String, ClassView> {
     let mut out: HashMap<String, ClassView> = HashMap::new();
 
@@ -98,7 +103,7 @@ fn compute_classes_by_type_designator(
                             let managed = class_def
                                 .annotations
                                 .as_ref()
-                                .and_then(|m| m.get("data.infrabel.be/asset360/managed"));
+                                .and_then(|m| m.get(managed_annotation));
                             let managed_truthy = managed.map(|ann| match py {
                                 Some(py) => is_truthy(py, ann),
                                 None => true,
@@ -142,16 +147,19 @@ fn compute_classes_by_type_designator(
 /// Return every class keyed by its resolved type designator.
 ///
 /// * `schemaview` – existing [`SchemaView`] instance to inspect.
-/// * `only_registered` – require the ``data.infrabel.be/asset360/managed``
-///   annotation to be truthy.
+/// * `only_registered` – require the annotation named by `managed_annotation`
+///   to be truthy.
 /// * `only_default` – restrict to each class' primary type designator instead of
 ///   all accepted aliases.
+/// * `managed_annotation` – annotation key that marks a class as managed
+///   (default: `data.infrabel.be/asset360/managed`).
 #[cfg(feature = "python-bindings")]
 fn get_all_classes_by_type_designator_and_schema_impl(
     py: Python<'_>,
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
+    managed_annotation: &str,
 ) -> PyResult<HashMap<String, Py<PyClassView>>> {
     let bound = schemaview.bind(py);
     let sv_ref = bound.borrow();
@@ -160,6 +168,7 @@ fn get_all_classes_by_type_designator_and_schema_impl(
         only_registered,
         only_default,
         Some(py),
+        managed_annotation,
     );
     raw.into_iter()
         .map(|(designator, view)| {
@@ -172,10 +181,12 @@ fn get_all_classes_by_type_designator_and_schema_impl(
 /// Return every class keyed by its resolved type designator.
 ///
 /// * `schemaview` – existing [`SchemaView`] instance to inspect.
-/// * `only_registered` – require the ``data.infrabel.be/asset360/managed``
-///   annotation to be truthy.
+/// * `only_registered` – require the annotation named by `managed_annotation`
+///   to be truthy.
 /// * `only_default` – restrict to each class' primary type designator instead of
 ///   all accepted aliases.
+/// * `managed_annotation` – annotation key that marks a class as managed
+///   (default: `"data.infrabel.be/asset360/managed"`).
 #[gen_stub_pyfunction]
 #[gen_stub(
     override_return_type(
@@ -185,7 +196,7 @@ fn get_all_classes_by_type_designator_and_schema_impl(
 )]
 #[pyfunction(
     name = "get_all_classes_by_type_designator_and_schema",
-    signature = (schemaview, only_registered=true, only_default=true)
+    signature = (schemaview, only_registered=true, only_default=true, managed_annotation="data.infrabel.be/asset360/managed")
 )]
 fn get_all_classes_by_type_designator_and_schema(
     py: Python<'_>,
@@ -198,12 +209,14 @@ fn get_all_classes_by_type_designator_and_schema(
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
+    managed_annotation: &str,
 ) -> PyResult<HashMap<String, Py<PyClassView>>> {
     get_all_classes_by_type_designator_and_schema_impl(
         py,
         schemaview,
         only_registered,
         only_default,
+        managed_annotation,
     )
 }
 
@@ -211,25 +224,29 @@ fn get_all_classes_by_type_designator_and_schema(
 /// Return every class keyed by its resolved type designator.
 ///
 /// * `schemaview` – existing [`SchemaView`] instance to inspect.
-/// * `only_registered` – require the ``data.infrabel.be/asset360/managed``
-///   annotation to be truthy.
+/// * `only_registered` – require the annotation named by `managed_annotation`
+///   to be truthy.
 /// * `only_default` – restrict to each class' primary type designator instead of
 ///   all accepted aliases.
+/// * `managed_annotation` – annotation key that marks a class as managed
+///   (default: `"data.infrabel.be/asset360/managed"`).
 #[pyfunction(
     name = "get_all_classes_by_type_designator_and_schema",
-    signature = (schemaview, only_registered=true, only_default=true)
+    signature = (schemaview, only_registered=true, only_default=true, managed_annotation="data.infrabel.be/asset360/managed")
 )]
 fn get_all_classes_by_type_designator_and_schema(
     py: Python<'_>,
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
+    managed_annotation: &str,
 ) -> PyResult<HashMap<String, Py<PyClassView>>> {
     get_all_classes_by_type_designator_and_schema_impl(
         py,
         schemaview,
         only_registered,
         only_default,
+        managed_annotation,
     )
 }
 
@@ -915,7 +932,8 @@ mod tests {
         let schema: SchemaDefinition = serde_path_to_error::deserialize(deser).unwrap();
         let mut sv = SchemaView::new();
         sv.add_schema(schema).unwrap();
-        let baseline = compute_classes_by_type_designator(&sv, true, true, None);
+        let baseline =
+            compute_classes_by_type_designator(&sv, true, true, None, DEFAULT_MANAGED_ANNOTATION);
         assert!(
             !baseline.is_empty(),
             "expected managed classes with designator entries"
@@ -933,7 +951,13 @@ mod tests {
             .unwrap_or(10_000u32);
         let start = Instant::now();
         for _ in 0..iterations {
-            let result = compute_classes_by_type_designator(&sv, true, true, None);
+            let result = compute_classes_by_type_designator(
+                &sv,
+                true,
+                true,
+                None,
+                DEFAULT_MANAGED_ANNOTATION,
+            );
             black_box(result);
         }
         let elapsed = start.elapsed();
