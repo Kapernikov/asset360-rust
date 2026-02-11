@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use oxrdf::{NamedOrBlankNode, Term};
+use oxrdf::{Literal, NamedOrBlankNode, Term};
 use oxttl::TurtleParser;
 
 use crate::shacl_ast::*;
@@ -103,6 +103,38 @@ impl TripleStore {
         })
     }
 
+    /// Pick the best literal for `predicate` given a preferred language.
+    ///
+    /// Priority: exact language match > untagged literal > first available.
+    fn literal_for_language(
+        &self,
+        subject: &str,
+        predicate: &str,
+        language: &str,
+    ) -> Option<String> {
+        let literals: Vec<&Literal> = self
+            .objects(subject, predicate)
+            .into_iter()
+            .filter_map(|t| match t {
+                Term::Literal(lit) => Some(lit),
+                _ => None,
+            })
+            .collect();
+        if literals.is_empty() {
+            return None;
+        }
+        // Exact language match
+        if let Some(lit) = literals.iter().find(|l| l.language() == Some(language)) {
+            return Some(lit.value().to_owned());
+        }
+        // Untagged fallback
+        if let Some(lit) = literals.iter().find(|l| l.language().is_none()) {
+            return Some(lit.value().to_owned());
+        }
+        // First available
+        Some(literals[0].value().to_owned())
+    }
+
     /// List the distinct predicates present on a given subject node (for diagnostics).
     fn list_predicates(&self, subject: &str) -> Vec<String> {
         let mut predicates: Vec<String> = self
@@ -181,7 +213,13 @@ fn iri_local_name(iri: &str) -> &str {
 /// Parse a SHACL Turtle file and extract shapes targeting `target_class`.
 ///
 /// If `target_class` is empty, all shapes are returned.
-pub fn parse_shacl(ttl: &str, target_class: &str) -> Result<Vec<ShapeResult>, ParseError> {
+/// `language` selects the preferred language for `sh:message` (e.g. `"nl"`, `"en"`).
+/// When empty, the first available literal is used.
+pub fn parse_shacl(
+    ttl: &str,
+    target_class: &str,
+    language: &str,
+) -> Result<Vec<ShapeResult>, ParseError> {
     let store = TripleStore::parse(ttl)?;
     let mut results = Vec::new();
 
@@ -231,7 +269,7 @@ pub fn parse_shacl(ttl: &str, target_class: &str) -> Result<Vec<ShapeResult>, Pa
             .unwrap_or(true); // default: attempt introspection
 
         let message = store
-            .first_literal(subj, &sh("message"))
+            .literal_for_language(subj, &sh("message"), language)
             .unwrap_or_default();
 
         // Check if shape uses SPARQL
@@ -242,7 +280,7 @@ pub fn parse_shacl(ttl: &str, target_class: &str) -> Result<Vec<ShapeResult>, Pa
                 .first_literal(&sparql_key, &sh("select"))
                 .unwrap_or_default();
             let sparql_message = store
-                .first_literal(&sparql_key, &sh("message"))
+                .literal_for_language(&sparql_key, &sh("message"), language)
                 .unwrap_or_else(|| message.clone());
 
             // Extract affected fields from SPARQL BIND patterns
@@ -673,7 +711,7 @@ asset360:TunnelComponent_DelegateUniquenessShape
 
     #[test]
     fn test_parse_introspectable_shape() {
-        let results = parse_shacl(STATUS_COMBO_TTL, "TunnelComponent").unwrap();
+        let results = parse_shacl(STATUS_COMBO_TTL, "TunnelComponent", "").unwrap();
         assert_eq!(results.len(), 1);
         let shape = &results[0];
         assert!(shape.introspectable);
@@ -718,7 +756,7 @@ asset360:TunnelComponent_DelegateUniquenessShape
 
     #[test]
     fn test_parse_sparql_shape() {
-        let results = parse_shacl(DELEGATE_TTL, "TunnelComponent").unwrap();
+        let results = parse_shacl(DELEGATE_TTL, "TunnelComponent", "").unwrap();
         assert_eq!(results.len(), 1);
         let shape = &results[0];
         assert!(!shape.introspectable);
@@ -743,7 +781,7 @@ asset360:TunnelComponent_DelegateUniquenessShape
     #[test]
     fn test_parse_combined_file() {
         let combined = format!("{STATUS_COMBO_TTL}\n{DELEGATE_TTL}");
-        let results = parse_shacl(&combined, "TunnelComponent").unwrap();
+        let results = parse_shacl(&combined, "TunnelComponent", "").unwrap();
         assert_eq!(results.len(), 2);
 
         let introspectable_count = results.iter().filter(|r| r.introspectable).count();
@@ -754,13 +792,13 @@ asset360:TunnelComponent_DelegateUniquenessShape
 
     #[test]
     fn test_parse_empty_target_class_returns_all() {
-        let results = parse_shacl(STATUS_COMBO_TTL, "").unwrap();
+        let results = parse_shacl(STATUS_COMBO_TTL, "", "").unwrap();
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn test_parse_wrong_target_class_returns_empty() {
-        let results = parse_shacl(STATUS_COMBO_TTL, "Signal").unwrap();
+        let results = parse_shacl(STATUS_COMBO_TTL, "Signal", "").unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -792,7 +830,7 @@ asset360:TestShape
     sh:pattern "^[A-Z]"
   ] .
 "#;
-        let result = parse_shacl(ttl, "TunnelComponent");
+        let result = parse_shacl(ttl, "TunnelComponent", "");
         assert_error_contains(
             result,
             &[
@@ -820,7 +858,7 @@ asset360:TestShape
     sh:class asset360:TunnelComplex
   ] .
 "#;
-        let result = parse_shacl(ttl, "TunnelComponent");
+        let result = parse_shacl(ttl, "TunnelComponent", "");
         assert_error_contains(
             result,
             &[
@@ -849,7 +887,7 @@ asset360:TestShape
     sh:datatype xsd:decimal
   ] .
 "#;
-        let result = parse_shacl(ttl, "TunnelComponent");
+        let result = parse_shacl(ttl, "TunnelComponent", "");
         assert_error_contains(
             result,
             &[
@@ -876,7 +914,7 @@ asset360:TestShape
     sh:minCount 1
   ] .
 "#;
-        let result = parse_shacl(ttl, "TunnelComponent");
+        let result = parse_shacl(ttl, "TunnelComponent", "");
         assert_error_contains(
             result,
             &[
@@ -885,5 +923,60 @@ asset360:TestShape
                 "sh:inversePath",
             ],
         );
+    }
+
+    // ── Language-tagged message tests ────────────────────────────────
+
+    const MULTILANG_TTL: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:TestShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComponent ;
+  asset360:enforcementLevel "serious" ;
+  asset360:introspectable true ;
+  sh:message "Forbidden status combination"@en ;
+  sh:message "Verboden statuscombinatie"@nl ;
+  sh:message "Combinaison de statuts interdite"@fr ;
+  sh:not [
+    sh:and (
+      [ sh:property [ sh:path asset360:ceAssetPrimaryStatus ; sh:hasValue "In_voorbereiding" ] ]
+      [ sh:property [ sh:path asset360:ceAssetSecondaryStatus ; sh:hasValue "Verkocht" ] ]
+    )
+  ] .
+"#;
+
+    #[test]
+    fn test_language_tagged_message_exact_match() {
+        let results = parse_shacl(MULTILANG_TTL, "TunnelComponent", "nl").unwrap();
+        assert_eq!(results[0].message, "Verboden statuscombinatie");
+    }
+
+    #[test]
+    fn test_language_tagged_message_different_lang() {
+        let results = parse_shacl(MULTILANG_TTL, "TunnelComponent", "fr").unwrap();
+        assert_eq!(results[0].message, "Combinaison de statuts interdite");
+    }
+
+    #[test]
+    fn test_language_tagged_message_fallback_to_first() {
+        // No "de" tag available — should fall back to first available
+        let results = parse_shacl(MULTILANG_TTL, "TunnelComponent", "de").unwrap();
+        // No untagged literal, so picks first available
+        assert!(!results[0].message.is_empty());
+    }
+
+    #[test]
+    fn test_language_tagged_message_empty_lang_picks_any() {
+        let results = parse_shacl(MULTILANG_TTL, "TunnelComponent", "").unwrap();
+        assert!(!results[0].message.is_empty());
+    }
+
+    #[test]
+    fn test_untagged_message_still_works() {
+        // Original STATUS_COMBO_TTL has an untagged sh:message
+        let results = parse_shacl(STATUS_COMBO_TTL, "TunnelComponent", "nl").unwrap();
+        assert!(results[0].message.contains("Forbidden"));
     }
 }

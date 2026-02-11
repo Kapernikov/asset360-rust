@@ -1021,13 +1021,14 @@ fn shacl_derive_scope_predicate_py(
 ///
 /// * `ttl` – SHACL Turtle text
 /// * `target_class` – class name to filter (empty string = all shapes)
+/// * `language` – preferred language for `sh:message` (e.g. `"nl"`, `"en"`; empty = first available)
 ///
 /// Returns JSON array of `ShapeResult` objects.
 #[cfg(all(feature = "python-bindings", feature = "shacl-parser"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction(name = "parse_shacl", signature = (ttl, target_class))]
-fn parse_shacl_py(ttl: &str, target_class: &str) -> PyResult<String> {
-    let results = crate::shacl_parser::parse_shacl(ttl, target_class)
+#[pyfunction(name = "parse_shacl", signature = (ttl, target_class, language=""))]
+fn parse_shacl_py(ttl: &str, target_class: &str, language: &str) -> PyResult<String> {
+    let results = crate::shacl_parser::parse_shacl(ttl, target_class, language)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("SHACL parse error: {e}")))?;
     serde_json::to_string(&results)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
