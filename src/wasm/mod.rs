@@ -804,6 +804,52 @@ impl RangeInfoHandle {
     }
 }
 
+// ── SHACL / Business Rules WASM bindings ────────────────────────────
+// Per decision D2: parse_shacl is server-side only.
+// derive_scope_predicate is backend-only.
+// Only evaluation and backward-solving are exposed to the frontend.
+
+/// Evaluate a SHACL AST against object data (forward validation).
+///
+/// Returns a JSON array of violations (empty array = valid).
+#[wasm_bindgen(js_name = shaclEvaluateForward)]
+pub fn shacl_evaluate_forward_wasm(
+    ast_json: &str,
+    object_data_json: &str,
+    message: &str,
+    enforcement_level: &str,
+) -> Result<JsValue, JsValue> {
+    let ast: crate::shacl_ast::ShaclAst = serde_json::from_str(ast_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid AST JSON: {e}")))?;
+    let data: serde_json::Value = serde_json::from_str(object_data_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid data JSON: {e}")))?;
+    let level: crate::shacl_ast::EnforcementLevel =
+        serde_json::from_value(serde_json::Value::String(enforcement_level.to_owned()))
+            .unwrap_or(crate::shacl_ast::EnforcementLevel::Error);
+    let violations = crate::forward_eval::evaluate_forward(&ast, &data, message, &level);
+    to_js(&violations)
+}
+
+/// Solve backward: given an AST and known field values, produce a Predicate
+/// for the target field describing its allowed values.
+///
+/// Returns the predicate as a JS object, or `null` if no constraints apply.
+#[wasm_bindgen(js_name = shaclSolveBackward)]
+pub fn shacl_solve_backward_wasm(
+    ast_json: &str,
+    known_fields_json: &str,
+    target_field: &str,
+) -> Result<JsValue, JsValue> {
+    let ast: crate::shacl_ast::ShaclAst = serde_json::from_str(ast_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid AST JSON: {e}")))?;
+    let known: serde_json::Map<String, serde_json::Value> = serde_json::from_str(known_fields_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid known fields JSON: {e}")))?;
+    match crate::backward_solver::solve_backward(&ast, &known, target_field) {
+        Some(pred) => to_js(&pred),
+        None => Ok(JsValue::NULL),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

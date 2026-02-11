@@ -5321,15 +5321,17 @@ def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:bui
 
 def format_blame_map(value:asset360_rust.LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> builtins.str: ...
 
-def get_all_classes_by_type_designator_and_schema(schemaview:asset360_rust.SchemaView, only_registered:builtins.bool=True, only_default:builtins.bool=True) -> dict[str, asset360_rust.ClassView]:
+def get_all_classes_by_type_designator_and_schema(schemaview:asset360_rust.SchemaView, only_registered:builtins.bool=True, only_default:builtins.bool=True, managed_annotation:builtins.str='data.infrabel.be/asset360/managed') -> dict[str, asset360_rust.ClassView]:
     r"""
     Return every class keyed by its resolved type designator.
     
     * `schemaview` – existing [`SchemaView`] instance to inspect.
-    * `only_registered` – require the ``data.infrabel.be/asset360/managed``
-      annotation to be truthy.
+    * `only_registered` – require the annotation named by `managed_annotation`
+      to be truthy.
     * `only_default` – restrict to each class' primary type designator instead of
       all accepted aliases.
+    * `managed_annotation` – annotation key that marks a class as managed
+      (default: `"data.infrabel.be/asset360/managed"`).
     """
 
 def get_blame_info(value:LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> typing.Optional[asset360_rust.Asset360ChangeMeta]: ...
@@ -5340,7 +5342,52 @@ def load_yaml(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[t
 
 def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
+def parse_shacl(ttl:builtins.str, target_class:builtins.str) -> builtins.str:
+    r"""
+    Parse a SHACL Turtle file and extract shapes targeting a class.
+    
+    * `ttl` – SHACL Turtle text
+    * `target_class` – class name to filter (empty string = all shapes)
+    
+    Returns JSON array of `ShapeResult` objects.
+    """
+
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
+
+def shacl_derive_scope_predicate(shape_json:builtins.str, focus_data_json:builtins.str, uri_field:builtins.str='asset360_uri') -> typing.Optional[builtins.str]:
+    r"""
+    Derive a scope predicate for fetching peer objects relevant to a constraint.
+    
+    * `shape_json` – JSON-serialized `ShapeResult`
+    * `focus_data_json` – JSON object of the focus object's field values
+    * `uri_field` – field name holding the object URI (default: "asset360_uri")
+    
+    Returns JSON-serialized `Predicate` or `None`.
+    """
+
+def shacl_evaluate_forward(ast_json:builtins.str, object_data_json:builtins.str, message:builtins.str, enforcement_level:builtins.str) -> builtins.str:
+    r"""
+    Evaluate a SHACL AST against object data (forward validation).
+    
+    * `ast_json` – JSON-serialized `ShaclAst`
+    * `object_data_json` – JSON object with field values
+    * `message` – violation message
+    * `enforcement_level` – one of "critical", "serious", "error", "unlikely"
+    
+    Returns JSON array of violations (empty = valid).
+    """
+
+def shacl_solve_backward(ast_json:builtins.str, known_fields_json:builtins.str, target_field:builtins.str) -> typing.Optional[builtins.str]:
+    r"""
+    Solve backward: given an AST and known field values, produce a Predicate
+    for the target field describing its allowed values.
+    
+    * `ast_json` – JSON-serialized `ShaclAst`
+    * `known_fields_json` – JSON object of known field name → value
+    * `target_field` – field name to solve for
+    
+    Returns JSON-serialized `Predicate` or `None`.
+    """
 
 def sum_as_string(a:builtins.int, b:builtins.int) -> builtins.str: ...
 
