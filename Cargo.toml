@@ -31,7 +31,7 @@ oxrdf = { version = "0.3", optional = true }
 [features]
 default = ["stubgen"]
 # Enable Python extension-module linking only in packaging builds (maturin)
-python-extension = ["python-bindings", "pyo3/extension-module"]
+python-extension = ["python-bindings", "pyo3/extension-module", "shacl-parser"]
 python-bindings = [
     "dep:pyo3",
     "dep:linkml_runtime_python",

@@ -52,28 +52,12 @@ jobs:
     permissions:
       contents: write
     needs: rust
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: pepibru
-            target: x86_64
-          # Disabled due to only linux x86_64 runners available
-          # - runner: pepibru
-          #   target: x86
-          # - runner: pepibru
-          #   target: aarch64
-          # - runner: pepibru
-          #   target: armv7
-          # - runner: pepibru
-          #   target: s390x
-          # - runner: pepibru
-          #   target: ppc64le
+    runs-on: pepibru
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: 3.x
+          python-version: '3.13'
       - name: Set crate version from tag
         shell: bash
         run: |
@@ -84,8 +68,8 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter --no-default-features
+          target: x86_64
+          args: --release --out dist --interpreter python3.13 --no-default-features
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels to release
@@ -99,24 +83,12 @@ jobs:
     permissions:
       contents: write
     needs: rust
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: pepibru
-            target: x86_64
-          # Disabled due to only linux x86_64 runners available
-          # - runner: pepibru
-          #   target: x86
-          # - runner: pepibru
-          #   target: aarch64
-          # - runner: pepibru
-          #   target: armv7
+    runs-on: pepibru
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: 3.x
+          python-version: '3.13'
       - name: Set crate version from tag
         shell: bash
         run: |
@@ -127,8 +99,8 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter --no-default-features
+          target: x86_64
+          args: --release --out dist --interpreter python3.13 --no-default-features
           sccache: 'true'
           manylinux: musllinux_1_2
       - name: Upload wheels to release
