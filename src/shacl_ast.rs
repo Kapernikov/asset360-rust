@@ -89,10 +89,11 @@ pub enum ShaclAst {
 ///
 /// - `Critical` / `Serious`: block publication
 /// - `Error` / `Unlikely`: informational only
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EnforcementLevel {
     Critical,
+    #[default]
     Serious,
     Error,
     Unlikely,
@@ -102,12 +103,6 @@ impl EnforcementLevel {
     /// Whether this level blocks publication.
     pub fn is_blocking(&self) -> bool {
         matches!(self, EnforcementLevel::Critical | EnforcementLevel::Serious)
-    }
-}
-
-impl Default for EnforcementLevel {
-    fn default() -> Self {
-        EnforcementLevel::Serious
     }
 }
 

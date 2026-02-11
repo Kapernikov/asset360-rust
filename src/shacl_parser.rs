@@ -497,10 +497,10 @@ fn term_to_json_value(t: &Term) -> serde_json::Value {
             if let Ok(n) = l.value().parse::<i64>() {
                 return serde_json::Value::Number(n.into());
             }
-            if let Ok(n) = l.value().parse::<f64>() {
-                if let Some(num) = serde_json::Number::from_f64(n) {
-                    return serde_json::Value::Number(num);
-                }
+            if let Ok(n) = l.value().parse::<f64>()
+                && let Some(num) = serde_json::Number::from_f64(n)
+            {
+                return serde_json::Value::Number(num);
             }
             // Boolean
             match l.value() {

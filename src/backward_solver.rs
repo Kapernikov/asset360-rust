@@ -124,7 +124,7 @@ fn substitute(
                         serde_json::Value::Null => 0,
                         _ => 1,
                     };
-                    let ok = min.map_or(true, |m| count >= m) && max.map_or(true, |m| count <= m);
+                    let ok = min.is_none_or(|m| count >= m) && max.is_none_or(|m| count <= m);
                     Simplified::Bool(ok)
                 } else {
                     // Can't produce a meaningful predicate for cardinality
@@ -259,14 +259,14 @@ fn extract_predicate(node: &Simplified, target_field: &str) -> Option<Predicate>
                 Predicate::simple(field, "in", serde_json::Value::Array(values.clone()))
             }
             FieldConstraintKind::NotEquals(v) => {
-                Predicate::not(Predicate::simple(field, "equals", v.clone()))
+                Predicate::negate(Predicate::simple(field, "equals", v.clone()))
             }
         }),
         Simplified::FieldConstraint { .. } => None, // Different field, ignore
 
         Simplified::Not(inner) => {
             let inner_pred = extract_predicate(inner, target_field)?;
-            Some(Predicate::not(inner_pred))
+            Some(Predicate::negate(inner_pred))
         }
 
         Simplified::And(children) => {

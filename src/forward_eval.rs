@@ -53,8 +53,8 @@ fn eval_node(ast: &ShaclAst, data: &serde_json::Value) -> bool {
 
         ShaclAst::PropCount { path, min, max } => {
             let count = resolve_count(data, path);
-            let min_ok = min.map_or(true, |m| count >= m);
-            let max_ok = max.map_or(true, |m| count <= m);
+            let min_ok = min.is_none_or(|m| count >= m);
+            let max_ok = max.is_none_or(|m| count <= m);
             min_ok && max_ok
         }
 

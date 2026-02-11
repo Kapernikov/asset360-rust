@@ -128,7 +128,7 @@ impl Predicate {
     }
 
     /// Negate a predicate.
-    pub fn not(predicate: Predicate) -> Self {
+    pub fn negate(predicate: Predicate) -> Self {
         Predicate::Negated {
             operator: NegateOperator::NOT,
             predicate: Box::new(predicate),
@@ -162,7 +162,7 @@ mod tests {
     fn test_expression_json_roundtrip() {
         let pred = Predicate::and(vec![
             Predicate::simple("zone", "equals", "Zone 4"),
-            Predicate::not(Predicate::simple("status", "equals", "deleted")),
+            Predicate::negate(Predicate::simple("status", "equals", "deleted")),
         ]);
         let json = serde_json::to_string(&pred).unwrap();
         let parsed: Predicate = serde_json::from_str(&json).unwrap();
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_negated_json_roundtrip() {
-        let pred = Predicate::not(Predicate::simple("status", "equals", "Verkocht"));
+        let pred = Predicate::negate(Predicate::simple("status", "equals", "Verkocht"));
         let json = serde_json::to_string(&pred).unwrap();
         let parsed: Predicate = serde_json::from_str(&json).unwrap();
         assert_eq!(pred, parsed);

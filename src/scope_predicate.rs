@@ -67,7 +67,7 @@ fn derive_scope_from_sparql(
     }
 
     // Exclude the focus object itself (FILTER(?other != $this))
-    predicates.push(Predicate::not(Predicate::simple(
+    predicates.push(Predicate::negate(Predicate::simple(
         uri_field,
         "equals",
         focus_uri.clone(),
