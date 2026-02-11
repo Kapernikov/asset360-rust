@@ -42,7 +42,9 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::Turtle(e) => write!(f, "Turtle parse error: {e}"),
-            ParseError::UnsupportedConstruct(msg) => write!(f, "Unsupported SHACL construct: {msg}"),
+            ParseError::UnsupportedConstruct(msg) => {
+                write!(f, "Unsupported SHACL construct: {msg}")
+            }
             ParseError::MissingField(msg) => write!(f, "Missing required field: {msg}"),
         }
     }
@@ -399,9 +401,9 @@ fn parse_constraint_node(store: &TripleStore, key: &str) -> Result<ShaclAst, Par
 }
 
 fn parse_property_shape(store: &TripleStore, key: &str) -> Result<ShaclAst, ParseError> {
-    let path_term = store
-        .first_object(key, &sh("path"))
-        .ok_or_else(|| ParseError::MissingField(format!("sh:path missing on property shape {key}")))?;
+    let path_term = store.first_object(key, &sh("path")).ok_or_else(|| {
+        ParseError::MissingField(format!("sh:path missing on property shape {key}"))
+    })?;
     let path = parse_path(store, path_term)?;
 
     // sh:hasValue
@@ -563,8 +565,7 @@ fn collect_fields_recursive(ast: &ShaclAst, fields: &mut Vec<String>) {
                 fields.push(name.to_owned());
             }
         }
-        ShaclAst::PathEquals { path_a, path_b }
-        | ShaclAst::PathDisjoint { path_a, path_b } => {
+        ShaclAst::PathEquals { path_a, path_b } | ShaclAst::PathDisjoint { path_a, path_b } => {
             if let Some(name) = path_a.local_name() {
                 fields.push(name.to_owned());
             }
@@ -668,8 +669,16 @@ asset360:TunnelComponent_DelegateUniquenessShape
         }
 
         // Affected fields
-        assert!(shape.affected_fields.contains(&"ceAssetPrimaryStatus".to_owned()));
-        assert!(shape.affected_fields.contains(&"ceAssetSecondaryStatus".to_owned()));
+        assert!(
+            shape
+                .affected_fields
+                .contains(&"ceAssetPrimaryStatus".to_owned())
+        );
+        assert!(
+            shape
+                .affected_fields
+                .contains(&"ceAssetSecondaryStatus".to_owned())
+        );
     }
 
     #[test]
@@ -681,15 +690,19 @@ asset360:TunnelComponent_DelegateUniquenessShape
         assert!(shape.ast.is_none());
         assert!(shape.sparql.is_some());
         assert_eq!(shape.enforcement_level, EnforcementLevel::Serious);
-        assert!(shape
-            .message
-            .contains("Only one tunnel component"));
+        assert!(shape.message.contains("Only one tunnel component"));
 
         // SPARQL-extracted fields
-        assert!(shape.affected_fields.contains(&"isTunnelDelegate".to_owned()));
-        assert!(shape
-            .affected_fields
-            .contains(&"belongsToTunnelComplex".to_owned()));
+        assert!(
+            shape
+                .affected_fields
+                .contains(&"isTunnelDelegate".to_owned())
+        );
+        assert!(
+            shape
+                .affected_fields
+                .contains(&"belongsToTunnelComplex".to_owned())
+        );
     }
 
     #[test]

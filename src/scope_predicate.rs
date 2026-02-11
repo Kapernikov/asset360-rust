@@ -102,7 +102,10 @@ fn extract_shared_attribute_joins(sparql: &str) -> Vec<String> {
             let predicate = parts[1];
             let object = parts[2];
 
-            if object.starts_with('?') && !predicate.starts_with("FILTER") && !predicate.starts_with("BIND") {
+            if object.starts_with('?')
+                && !predicate.starts_with("FILTER")
+                && !predicate.starts_with("BIND")
+            {
                 let pred_local = iri_local_name(predicate);
                 if subject == "$this" {
                     this_bindings.push((pred_local.to_owned(), object.to_owned()));
@@ -240,9 +243,7 @@ mod tests {
             ],
             introspectable: true,
             ast: Some(crate::shacl_ast::ShaclAst::Not {
-                child: Box::new(crate::shacl_ast::ShaclAst::And {
-                    children: vec![],
-                }),
+                child: Box::new(crate::shacl_ast::ShaclAst::And { children: vec![] }),
             }),
             sparql: None,
         };

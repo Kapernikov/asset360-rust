@@ -84,7 +84,10 @@ fn eval_node(ast: &ShaclAst, data: &serde_json::Value) -> bool {
 /// For IRI paths, extracts the local name and looks it up as a JSON key.
 /// For sequence paths, follows each step. For inverse paths, not resolvable
 /// in a single object (returns None).
-fn resolve_path<'a>(data: &'a serde_json::Value, path: &PropertyPath) -> Option<&'a serde_json::Value> {
+fn resolve_path<'a>(
+    data: &'a serde_json::Value,
+    path: &PropertyPath,
+) -> Option<&'a serde_json::Value> {
     match path {
         PropertyPath::Iri { iri } => {
             let local = iri
@@ -162,8 +165,7 @@ fn collect_paths(ast: &ShaclAst, fields: &mut Vec<String>) {
                 fields.push(name.to_owned());
             }
         }
-        ShaclAst::PathEquals { path_a, path_b }
-        | ShaclAst::PathDisjoint { path_a, path_b } => {
+        ShaclAst::PathEquals { path_a, path_b } | ShaclAst::PathDisjoint { path_a, path_b } => {
             if let Some(name) = path_a.local_name() {
                 fields.push(name.to_owned());
             }
@@ -198,11 +200,15 @@ mod tests {
             .map(|(primary, secondary)| ShaclAst::And {
                 children: vec![
                     ShaclAst::PropEquals {
-                        path: PropertyPath::iri("https://data.infrabel.be/asset360/ceAssetPrimaryStatus"),
+                        path: PropertyPath::iri(
+                            "https://data.infrabel.be/asset360/ceAssetPrimaryStatus",
+                        ),
                         value: json!(primary),
                     },
                     ShaclAst::PropEquals {
-                        path: PropertyPath::iri("https://data.infrabel.be/asset360/ceAssetSecondaryStatus"),
+                        path: PropertyPath::iri(
+                            "https://data.infrabel.be/asset360/ceAssetSecondaryStatus",
+                        ),
                         value: json!(secondary),
                     },
                 ],
@@ -236,7 +242,8 @@ mod tests {
                 "ceAssetPrimaryStatus": primary,
                 "ceAssetSecondaryStatus": secondary,
             });
-            let violations = evaluate_forward(&ast, &data, "Forbidden combo", &EnforcementLevel::Serious);
+            let violations =
+                evaluate_forward(&ast, &data, "Forbidden combo", &EnforcementLevel::Serious);
             assert!(
                 !violations.is_empty(),
                 "Expected violation for {primary}/{secondary}"
@@ -260,7 +267,8 @@ mod tests {
                 "ceAssetPrimaryStatus": primary,
                 "ceAssetSecondaryStatus": secondary,
             });
-            let violations = evaluate_forward(&ast, &data, "Forbidden combo", &EnforcementLevel::Serious);
+            let violations =
+                evaluate_forward(&ast, &data, "Forbidden combo", &EnforcementLevel::Serious);
             assert!(
                 violations.is_empty(),
                 "Unexpected violation for {primary}/{secondary}: {:?}",
@@ -277,7 +285,10 @@ mod tests {
         let ast = status_combo_ast();
         let data = json!({"ceAssetPrimaryStatus": "In_voorbereiding"});
         let violations = evaluate_forward(&ast, &data, "test", &EnforcementLevel::Serious);
-        assert!(violations.is_empty(), "Missing secondary should not violate");
+        assert!(
+            violations.is_empty(),
+            "Missing secondary should not violate"
+        );
     }
 
     #[test]
@@ -313,13 +324,7 @@ mod tests {
     #[test]
     fn test_loose_equality() {
         // String "true" should match boolean true
-        assert!(values_equal(
-            &json!("true"),
-            &json!(true)
-        ));
-        assert!(values_equal(
-            &json!("42"),
-            &json!(42)
-        ));
+        assert!(values_equal(&json!("true"), &json!(true)));
+        assert!(values_equal(&json!("42"), &json!(42)));
     }
 }

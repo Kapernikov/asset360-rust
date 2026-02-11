@@ -59,11 +59,17 @@ fn substitute(
 ) -> Simplified {
     match ast {
         ShaclAst::And { children } => {
-            let subs: Vec<_> = children.iter().map(|c| substitute(c, known, target_field)).collect();
+            let subs: Vec<_> = children
+                .iter()
+                .map(|c| substitute(c, known, target_field))
+                .collect();
             Simplified::And(subs)
         }
         ShaclAst::Or { children } => {
-            let subs: Vec<_> = children.iter().map(|c| substitute(c, known, target_field)).collect();
+            let subs: Vec<_> = children
+                .iter()
+                .map(|c| substitute(c, known, target_field))
+                .collect();
             Simplified::Or(subs)
         }
         ShaclAst::Not { child } => {
@@ -118,8 +124,7 @@ fn substitute(
                         serde_json::Value::Null => 0,
                         _ => 1,
                     };
-                    let ok = min.map_or(true, |m| count >= m)
-                        && max.map_or(true, |m| count <= m);
+                    let ok = min.map_or(true, |m| count >= m) && max.map_or(true, |m| count <= m);
                     Simplified::Bool(ok)
                 } else {
                     // Can't produce a meaningful predicate for cardinality
@@ -165,12 +170,13 @@ fn simplify(node: Simplified) -> Simplified {
             let s = simplify(*inner);
             match s {
                 Simplified::Bool(b) => Simplified::Bool(!b),
-                Simplified::FieldConstraint { field, kind: FieldConstraintKind::Equals(v) } => {
-                    Simplified::FieldConstraint {
-                        field,
-                        kind: FieldConstraintKind::NotEquals(v),
-                    }
-                }
+                Simplified::FieldConstraint {
+                    field,
+                    kind: FieldConstraintKind::Equals(v),
+                } => Simplified::FieldConstraint {
+                    field,
+                    kind: FieldConstraintKind::NotEquals(v),
+                },
                 // De Morgan: Not(Or(a, b, c)) → And(Not(a), Not(b), Not(c))
                 Simplified::Or(children) => {
                     let negated = children
@@ -194,7 +200,10 @@ fn simplify(node: Simplified) -> Simplified {
         Simplified::And(children) => {
             let simplified: Vec<Simplified> = children.into_iter().map(simplify).collect();
             // Short-circuit on false
-            if simplified.iter().any(|c| matches!(c, Simplified::Bool(false))) {
+            if simplified
+                .iter()
+                .any(|c| matches!(c, Simplified::Bool(false)))
+            {
                 return Simplified::Bool(false);
             }
             // Remove true constants
@@ -212,7 +221,10 @@ fn simplify(node: Simplified) -> Simplified {
         Simplified::Or(children) => {
             let simplified: Vec<Simplified> = children.into_iter().map(simplify).collect();
             // Short-circuit on true
-            if simplified.iter().any(|c| matches!(c, Simplified::Bool(true))) {
+            if simplified
+                .iter()
+                .any(|c| matches!(c, Simplified::Bool(true)))
+            {
                 return Simplified::Bool(true);
             }
             // Remove false constants
@@ -241,19 +253,15 @@ fn extract_predicate(node: &Simplified, target_field: &str) -> Option<Predicate>
             Some(Predicate::simple(target_field, "in", serde_json::json!([])))
         }
 
-        Simplified::FieldConstraint { field, kind } if field == target_field => {
-            Some(match kind {
-                FieldConstraintKind::Equals(v) => {
-                    Predicate::simple(field, "equals", v.clone())
-                }
-                FieldConstraintKind::In(values) => {
-                    Predicate::simple(field, "in", serde_json::Value::Array(values.clone()))
-                }
-                FieldConstraintKind::NotEquals(v) => {
-                    Predicate::not(Predicate::simple(field, "equals", v.clone()))
-                }
-            })
-        }
+        Simplified::FieldConstraint { field, kind } if field == target_field => Some(match kind {
+            FieldConstraintKind::Equals(v) => Predicate::simple(field, "equals", v.clone()),
+            FieldConstraintKind::In(values) => {
+                Predicate::simple(field, "in", serde_json::Value::Array(values.clone()))
+            }
+            FieldConstraintKind::NotEquals(v) => {
+                Predicate::not(Predicate::simple(field, "equals", v.clone()))
+            }
+        }),
         Simplified::FieldConstraint { .. } => None, // Different field, ignore
 
         Simplified::Not(inner) => {
@@ -310,11 +318,15 @@ mod tests {
             .map(|(p, s)| ShaclAst::And {
                 children: vec![
                     ShaclAst::PropEquals {
-                        path: PropertyPath::iri("https://data.infrabel.be/asset360/ceAssetPrimaryStatus"),
+                        path: PropertyPath::iri(
+                            "https://data.infrabel.be/asset360/ceAssetPrimaryStatus",
+                        ),
                         value: json!(p),
                     },
                     ShaclAst::PropEquals {
-                        path: PropertyPath::iri("https://data.infrabel.be/asset360/ceAssetSecondaryStatus"),
+                        path: PropertyPath::iri(
+                            "https://data.infrabel.be/asset360/ceAssetSecondaryStatus",
+                        ),
                         value: json!(s),
                     },
                 ],
@@ -322,7 +334,9 @@ mod tests {
             .collect();
 
         ShaclAst::Not {
-            child: Box::new(ShaclAst::Or { children: or_children }),
+            child: Box::new(ShaclAst::Or {
+                children: or_children,
+            }),
         }
     }
 
@@ -340,7 +354,11 @@ mod tests {
         let json = serde_json::to_value(&pred).unwrap();
         assert_eq!(json["operator"], "AND");
         let predicates = json["predicates"].as_array().unwrap();
-        assert_eq!(predicates.len(), 4, "4 forbidden secondary statuses for In_voorbereiding");
+        assert_eq!(
+            predicates.len(),
+            4,
+            "4 forbidden secondary statuses for In_voorbereiding"
+        );
 
         // Each should be a Negated predicate (operator: "NOT")
         for p in predicates {
@@ -358,7 +376,11 @@ mod tests {
         assert!(pred.is_some());
         let json = serde_json::to_value(&pred.unwrap()).unwrap();
         let predicates = json["predicates"].as_array().unwrap();
-        assert_eq!(predicates.len(), 4, "4 forbidden secondary statuses for In_opvolging");
+        assert_eq!(
+            predicates.len(),
+            4,
+            "4 forbidden secondary statuses for In_opvolging"
+        );
     }
 
     #[test]
@@ -410,7 +432,10 @@ mod tests {
 
         // Both fields known, target field also known → no predicate needed
         let pred = solve_backward(&ast, &known, "ceAssetSecondaryStatus");
-        assert!(pred.is_none(), "both fields known, valid combo → no restrictions");
+        assert!(
+            pred.is_none(),
+            "both fields known, valid combo → no restrictions"
+        );
     }
 
     #[test]
@@ -423,7 +448,10 @@ mod tests {
         // producing Not(Or(secondary=X, secondary=Y, ...)) → AND of NOT-EQUALS.
         // The solver CAN produce a predicate: all forbidden secondary values are excluded.
         let pred = solve_backward(&ast, &known, "ceAssetSecondaryStatus");
-        assert!(pred.is_some(), "unknown primary → all secondary constraints survive");
+        assert!(
+            pred.is_some(),
+            "unknown primary → all secondary constraints survive"
+        );
         let json = serde_json::to_value(&pred.unwrap()).unwrap();
         assert_eq!(json["operator"], "AND");
         // 9 Not-Equals (one per forbidden combo; duplicates not eliminated)

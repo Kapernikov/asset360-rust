@@ -27,7 +27,9 @@ impl PropertyPath {
     }
 
     pub fn inverse(path: PropertyPath) -> Self {
-        PropertyPath::Inverse { path: Box::new(path) }
+        PropertyPath::Inverse {
+            path: Box::new(path),
+        }
     }
 
     /// Extract the local name from an IRI path (last segment after `/` or `#`).
@@ -174,20 +176,18 @@ mod tests {
     fn test_ast_json_roundtrip() {
         let ast = ShaclAst::Not {
             child: Box::new(ShaclAst::Or {
-                children: vec![
-                    ShaclAst::And {
-                        children: vec![
-                            ShaclAst::PropEquals {
-                                path: PropertyPath::iri("asset360:ceAssetPrimaryStatus"),
-                                value: serde_json::Value::String("In_voorbereiding".into()),
-                            },
-                            ShaclAst::PropEquals {
-                                path: PropertyPath::iri("asset360:ceAssetSecondaryStatus"),
-                                value: serde_json::Value::String("Verkocht".into()),
-                            },
-                        ],
-                    },
-                ],
+                children: vec![ShaclAst::And {
+                    children: vec![
+                        ShaclAst::PropEquals {
+                            path: PropertyPath::iri("asset360:ceAssetPrimaryStatus"),
+                            value: serde_json::Value::String("In_voorbereiding".into()),
+                        },
+                        ShaclAst::PropEquals {
+                            path: PropertyPath::iri("asset360:ceAssetSecondaryStatus"),
+                            value: serde_json::Value::String("Verkocht".into()),
+                        },
+                    ],
+                }],
             }),
         };
         let json = serde_json::to_string(&ast).unwrap();
@@ -221,7 +221,10 @@ mod tests {
     #[test]
     fn test_violation_json() {
         let v = Violation {
-            fields: vec!["ceAssetPrimaryStatus".into(), "ceAssetSecondaryStatus".into()],
+            fields: vec![
+                "ceAssetPrimaryStatus".into(),
+                "ceAssetSecondaryStatus".into(),
+            ],
             message: "Forbidden status combination".into(),
             enforcement_level: EnforcementLevel::Serious,
             suggested_fix: Some("Change secondary status".into()),

@@ -29,12 +29,12 @@ use pyo3::types::{PyDict, PyModule};
 #[cfg(feature = "python-bindings")]
 use crate::blame::{Asset360ChangeMeta, ChangeStage};
 
-pub mod blame;
-pub mod predicate;
-pub mod shacl_ast;
-pub mod forward_eval;
 pub mod backward_solver;
+pub mod blame;
+pub mod forward_eval;
+pub mod predicate;
 pub mod scope_predicate;
+pub mod shacl_ast;
 
 #[cfg(feature = "shacl-parser")]
 pub mod shacl_parser;
@@ -944,10 +944,9 @@ fn evaluate_forward_py(
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid AST JSON: {e}")))?;
     let data: serde_json::Value = serde_json::from_str(object_data_json)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid data JSON: {e}")))?;
-    let level: crate::shacl_ast::EnforcementLevel = serde_json::from_value(
-        serde_json::Value::String(enforcement_level.to_owned()),
-    )
-    .unwrap_or(crate::shacl_ast::EnforcementLevel::Error);
+    let level: crate::shacl_ast::EnforcementLevel =
+        serde_json::from_value(serde_json::Value::String(enforcement_level.to_owned()))
+            .unwrap_or(crate::shacl_ast::EnforcementLevel::Error);
     let violations = crate::forward_eval::evaluate_forward(&ast, &data, message, &level);
     serde_json::to_string(&violations)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
@@ -971,8 +970,8 @@ fn solve_backward_py(
 ) -> PyResult<Option<String>> {
     let ast: crate::shacl_ast::ShaclAst = serde_json::from_str(ast_json)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid AST JSON: {e}")))?;
-    let known: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(known_fields_json).map_err(|e| {
+    let known: serde_json::Map<String, serde_json::Value> = serde_json::from_str(known_fields_json)
+        .map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid known fields JSON: {e}"))
         })?;
     match crate::backward_solver::solve_backward(&ast, &known, target_field) {
@@ -1001,13 +1000,12 @@ fn derive_scope_predicate_py(
     focus_data_json: &str,
     uri_field: &str,
 ) -> PyResult<Option<String>> {
-    let shape: crate::shacl_ast::ShapeResult = serde_json::from_str(shape_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("invalid shape JSON: {e}"))
+    let shape: crate::shacl_ast::ShapeResult = serde_json::from_str(shape_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid shape JSON: {e}")))?;
+    let focus: serde_json::Map<String, serde_json::Value> = serde_json::from_str(focus_data_json)
+        .map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid focus data JSON: {e}"))
     })?;
-    let focus: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(focus_data_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid focus data JSON: {e}"))
-        })?;
     match crate::scope_predicate::derive_scope_predicate(&shape, &focus, uri_field) {
         Some(pred) => {
             let json = serde_json::to_string(&pred).map_err(|e| {
@@ -1029,9 +1027,8 @@ fn derive_scope_predicate_py(
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction(name = "parse_shacl", signature = (ttl, target_class))]
 fn parse_shacl_py(ttl: &str, target_class: &str) -> PyResult<String> {
-    let results = crate::shacl_parser::parse_shacl(ttl, target_class).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("SHACL parse error: {e}"))
-    })?;
+    let results = crate::shacl_parser::parse_shacl(ttl, target_class)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("SHACL parse error: {e}")))?;
     serde_json::to_string(&results)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
 }

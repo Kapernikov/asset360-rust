@@ -60,7 +60,11 @@ pub enum NegateOperator {
 
 impl Predicate {
     /// Create a simple predicate.
-    pub fn simple(field_id: impl Into<String>, op: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+    pub fn simple(
+        field_id: impl Into<String>,
+        op: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
         Predicate::Simple {
             field_id: field_id.into(),
             predicate_type_id: op.into(),
@@ -82,7 +86,10 @@ impl Predicate {
         let mut flat = Vec::new();
         for p in predicates {
             match p {
-                Predicate::Expression { operator: LogicalOperator::And, predicates: children } => {
+                Predicate::Expression {
+                    operator: LogicalOperator::And,
+                    predicates: children,
+                } => {
                     flat.extend(children);
                 }
                 other => flat.push(other),
@@ -102,7 +109,10 @@ impl Predicate {
         let mut flat = Vec::new();
         for p in predicates {
             match p {
-                Predicate::Expression { operator: LogicalOperator::Or, predicates: children } => {
+                Predicate::Expression {
+                    operator: LogicalOperator::Or,
+                    predicates: children,
+                } => {
                     flat.extend(children);
                 }
                 other => flat.push(other),
@@ -139,7 +149,10 @@ mod tests {
 
         // Verify JSON field names match frontend convention (no "type" field)
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(value.get("type").is_none(), "should not have a 'type' discriminator");
+        assert!(
+            value.get("type").is_none(),
+            "should not have a 'type' discriminator"
+        );
         assert_eq!(value["fieldId"], "zone");
         assert_eq!(value["predicateTypeId"], "equals");
         assert_eq!(value["value"], "Zone 4");
@@ -178,13 +191,13 @@ mod tests {
             Predicate::simple("a", "equals", "1"),
             Predicate::simple("b", "equals", "2"),
         ]);
-        let outer = Predicate::and(vec![
-            inner,
-            Predicate::simple("c", "equals", "3"),
-        ]);
+        let outer = Predicate::and(vec![inner, Predicate::simple("c", "equals", "3")]);
         // Should flatten to a single AND with 3 children
         match &outer {
-            Predicate::Expression { operator: LogicalOperator::And, predicates } => {
+            Predicate::Expression {
+                operator: LogicalOperator::And,
+                predicates,
+            } => {
                 assert_eq!(predicates.len(), 3);
             }
             _ => panic!("expected AND expression"),
@@ -193,9 +206,7 @@ mod tests {
 
     #[test]
     fn test_single_element_and_unwraps() {
-        let pred = Predicate::and(vec![
-            Predicate::simple("zone", "equals", "Zone 4"),
-        ]);
+        let pred = Predicate::and(vec![Predicate::simple("zone", "equals", "Zone 4")]);
         // Single-element AND should unwrap to the element itself
         match &pred {
             Predicate::Simple { field_id, .. } => assert_eq!(field_id, "zone"),
@@ -215,10 +226,16 @@ mod tests {
         }"#;
         let pred: Predicate = serde_json::from_str(frontend_json).unwrap();
         match &pred {
-            Predicate::Expression { operator: LogicalOperator::And, predicates } => {
+            Predicate::Expression {
+                operator: LogicalOperator::And,
+                predicates,
+            } => {
                 assert_eq!(predicates.len(), 2);
                 match &predicates[1] {
-                    Predicate::Negated { operator: NegateOperator::NOT, .. } => {}
+                    Predicate::Negated {
+                        operator: NegateOperator::NOT,
+                        ..
+                    } => {}
                     other => panic!("expected Negated, got {:?}", other),
                 }
             }
