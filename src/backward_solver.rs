@@ -374,7 +374,7 @@ mod tests {
 
         let pred = solve_backward(&ast, &known, "ceAssetSecondaryStatus");
         assert!(pred.is_some());
-        let json = serde_json::to_value(&pred.unwrap()).unwrap();
+        let json = serde_json::to_value(pred.unwrap()).unwrap();
         let predicates = json["predicates"].as_array().unwrap();
         assert_eq!(
             predicates.len(),
@@ -417,7 +417,7 @@ mod tests {
 
         let pred = solve_backward(&ast, &known, "ceAssetPrimaryStatus");
         assert!(pred.is_some());
-        let json = serde_json::to_value(&pred.unwrap()).unwrap();
+        let json = serde_json::to_value(pred.unwrap()).unwrap();
         // Verkocht is forbidden with In_voorbereiding and In_opvolging
         let predicates = json["predicates"].as_array().unwrap();
         assert_eq!(predicates.len(), 2);
@@ -452,7 +452,7 @@ mod tests {
             pred.is_some(),
             "unknown primary → all secondary constraints survive"
         );
-        let json = serde_json::to_value(&pred.unwrap()).unwrap();
+        let json = serde_json::to_value(pred.unwrap()).unwrap();
         assert_eq!(json["operator"], "AND");
         // 9 Not-Equals (one per forbidden combo; duplicates not eliminated)
         let predicates = json["predicates"].as_array().unwrap();
