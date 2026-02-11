@@ -25,6 +25,8 @@ fragile = { version = "2.0", optional = true }
 minijinja = { version = "2.12.0", features = ["loader", "json", "fuel"], optional = true }
 minijinja-contrib = { version = "2.12.0", optional = true, features = ["pycompat"] }
 console_error_panic_hook = { version = "0.1", optional = true }
+oxttl = { version = "0.2", optional = true }
+oxrdf = { version = "0.3", optional = true }
 
 [features]
 default = ["stubgen"]
@@ -37,10 +39,12 @@ python-bindings = [
 ]
 stubgen = [
     "python-bindings",
+    "shacl-parser",
     "dep:pyo3-stub-gen",
     "linkml_runtime_python/stubgen",
     "linkml_meta/stubgen"
 ]
+shacl-parser = ["dep:oxttl", "dep:oxrdf"]
 wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys"]
 minijinja-wasm = [
     "wasm-bindings",

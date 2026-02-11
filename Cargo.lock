@@ -47,6 +47,8 @@ dependencies = [
  "linkml_runtime_python",
  "minijinja",
  "minijinja-contrib",
+ "oxrdf 0.3.2",
+ "oxttl 0.2.2",
  "pyo3",
  "pyo3-stub-gen",
  "schemaview",
@@ -759,8 +761,8 @@ source = "git+https://github.com/Kapernikov/rust-linkml-core#e11e546d5c548e137c5
 dependencies = [
  "linkml_meta",
  "once_cell",
- "oxrdf",
- "oxttl",
+ "oxrdf 0.2.4",
+ "oxttl 0.1.8",
  "percent-encoding",
  "pyo3",
  "regex",
@@ -1072,6 +1074,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxrdf"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "647ec1bce9b009b5ef00d678587ff263d53ac793cfa0652d0f1e85bc9f9699d3"
+dependencies = [
+ "oxilangtag",
+ "oxiri",
+ "rand 0.9.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "oxttl"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1080,7 +1094,20 @@ dependencies = [
  "memchr",
  "oxilangtag",
  "oxiri",
- "oxrdf",
+ "oxrdf 0.2.4",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "oxttl"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee1a35ad74d990aa6be2f3f62cd895fb4e91d64167cb81885ae304628f970f8d"
+dependencies = [
+ "memchr",
+ "oxilangtag",
+ "oxiri",
+ "oxrdf 0.3.2",
  "thiserror 2.0.18",
 ]
 
