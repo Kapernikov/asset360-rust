@@ -812,8 +812,8 @@ impl RangeInfoHandle {
 /// Evaluate a SHACL AST against object data (forward validation).
 ///
 /// Returns a JSON array of violations (empty array = valid).
-#[wasm_bindgen(js_name = evaluateForward)]
-pub fn evaluate_forward_wasm(
+#[wasm_bindgen(js_name = shaclEvaluateForward)]
+pub fn shacl_evaluate_forward_wasm(
     ast_json: &str,
     object_data_json: &str,
     message: &str,
@@ -834,8 +834,8 @@ pub fn evaluate_forward_wasm(
 /// for the target field describing its allowed values.
 ///
 /// Returns the predicate as a JS object, or `null` if no constraints apply.
-#[wasm_bindgen(js_name = solveBackward)]
-pub fn solve_backward_wasm(
+#[wasm_bindgen(js_name = shaclSolveBackward)]
+pub fn shacl_solve_backward_wasm(
     ast_json: &str,
     known_fields_json: &str,
     target_field: &str,

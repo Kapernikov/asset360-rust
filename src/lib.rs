@@ -68,9 +68,9 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blame_map_to_path_stage_map, m)?)?;
     m.add_function(wrap_pyfunction!(format_blame_map_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_blame_info_py, m)?)?;
-    m.add_function(wrap_pyfunction!(evaluate_forward_py, m)?)?;
-    m.add_function(wrap_pyfunction!(solve_backward_py, m)?)?;
-    m.add_function(wrap_pyfunction!(derive_scope_predicate_py, m)?)?;
+    m.add_function(wrap_pyfunction!(shacl_evaluate_forward_py, m)?)?;
+    m.add_function(wrap_pyfunction!(shacl_solve_backward_py, m)?)?;
+    m.add_function(wrap_pyfunction!(shacl_derive_scope_predicate_py, m)?)?;
     #[cfg(feature = "shacl-parser")]
     m.add_function(wrap_pyfunction!(parse_shacl_py, m)?)?;
     Ok(())
@@ -933,8 +933,8 @@ fn get_blame_info_py(
 /// Returns JSON array of violations (empty = valid).
 #[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction(name = "evaluate_forward", signature = (ast_json, object_data_json, message, enforcement_level))]
-fn evaluate_forward_py(
+#[pyfunction(name = "shacl_evaluate_forward", signature = (ast_json, object_data_json, message, enforcement_level))]
+fn shacl_evaluate_forward_py(
     ast_json: &str,
     object_data_json: &str,
     message: &str,
@@ -962,8 +962,8 @@ fn evaluate_forward_py(
 /// Returns JSON-serialized `Predicate` or `None`.
 #[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction(name = "solve_backward", signature = (ast_json, known_fields_json, target_field))]
-fn solve_backward_py(
+#[pyfunction(name = "shacl_solve_backward", signature = (ast_json, known_fields_json, target_field))]
+fn shacl_solve_backward_py(
     ast_json: &str,
     known_fields_json: &str,
     target_field: &str,
@@ -994,8 +994,8 @@ fn solve_backward_py(
 /// Returns JSON-serialized `Predicate` or `None`.
 #[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction(name = "derive_scope_predicate", signature = (shape_json, focus_data_json, uri_field="asset360_uri"))]
-fn derive_scope_predicate_py(
+#[pyfunction(name = "shacl_derive_scope_predicate", signature = (shape_json, focus_data_json, uri_field="asset360_uri"))]
+fn shacl_derive_scope_predicate_py(
     shape_json: &str,
     focus_data_json: &str,
     uri_field: &str,

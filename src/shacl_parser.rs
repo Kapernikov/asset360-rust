@@ -103,6 +103,23 @@ impl TripleStore {
         })
     }
 
+    /// List the distinct predicates present on a given subject node (for diagnostics).
+    fn list_predicates(&self, subject: &str) -> Vec<String> {
+        let mut predicates: Vec<String> = self
+            .by_subject
+            .get(subject)
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|(p, _)| iri_local_name(p).to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        predicates.sort();
+        predicates.dedup();
+        predicates
+    }
+
     /// Collect an RDF list (rdf:first/rdf:rest chain) starting from a term.
     fn collect_rdf_list<'a>(&'a self, head: &'a Term) -> Vec<&'a Term> {
         let mut result = Vec::new();
@@ -395,8 +412,13 @@ fn parse_constraint_node(store: &TripleStore, key: &str) -> Result<ShaclAst, Par
         return parse_property_shape(store, key);
     }
 
+    let predicates = store.list_predicates(key);
     Err(ParseError::UnsupportedConstruct(format!(
-        "cannot parse constraint node {key}"
+        "Unsupported SHACL construct on node {key}.\n\
+         Found predicates: [{}].\n\
+         Supported: sh:not, sh:and, sh:or, sh:property (with sh:path + value constraint).\n\
+         Hint: Set `asset360:introspectable false` and use `sh:sparql` instead.",
+        predicates.join(", ")
     )))
 }
 
@@ -452,8 +474,15 @@ fn parse_property_shape(store: &TripleStore, key: &str) -> Result<ShaclAst, Pars
         });
     }
 
+    let path_name = path.local_name().unwrap_or("(complex path)");
+    let predicates = store.list_predicates(key);
     Err(ParseError::UnsupportedConstruct(format!(
-        "property shape {key} has sh:path but no recognized value constraint"
+        "Unsupported value constraint on property \"{path_name}\" (node {key}).\n\
+         Found predicates: [{}].\n\
+         Supported property constraints: sh:hasValue, sh:in, sh:minCount, sh:maxCount, sh:equals, sh:disjoint.\n\
+         Common unsupported: sh:pattern, sh:class, sh:nodeKind, sh:datatype, sh:minInclusive/maxInclusive, sh:minLength/maxLength.\n\
+         Hint: Set `asset360:introspectable false` and use `sh:sparql` for this constraint.",
+        predicates.join(", ")
     )))
 }
 
@@ -479,12 +508,18 @@ fn parse_path(store: &TripleStore, term: &Term) -> Result<PropertyPath, ParseErr
                 return Ok(PropertyPath::sequence(steps));
             }
 
+            let predicates = store.list_predicates(&key);
             Err(ParseError::UnsupportedConstruct(format!(
-                "cannot parse path at blank node {key}"
+                "Unsupported property path at blank node {key}.\n\
+                 Found predicates: [{}].\n\
+                 Supported paths: simple IRI, sequence (RDF list), sh:inversePath.\n\
+                 Hint: sh:alternativePath, sh:zeroOrMorePath etc. are not supported.",
+                predicates.join(", ")
             )))
         }
         _ => Err(ParseError::UnsupportedConstruct(format!(
-            "unexpected term type in path: {term:?}"
+            "Unexpected term in path position: {term:?}.\n\
+             Paths must be IRIs (e.g. asset360:fieldName) or structured (sh:inversePath, sequence)."
         ))),
     }
 }
@@ -727,5 +762,128 @@ asset360:TunnelComponent_DelegateUniquenessShape
     fn test_parse_wrong_target_class_returns_empty() {
         let results = parse_shacl(STATUS_COMBO_TTL, "Signal").unwrap();
         assert_eq!(results.len(), 0);
+    }
+
+    // ── Error message quality tests ─────────────────────────────────
+
+    fn assert_error_contains(result: Result<Vec<ShapeResult>, ParseError>, needles: &[&str]) {
+        let err = result.expect_err("expected a parse error");
+        let msg = err.to_string();
+        for needle in needles {
+            assert!(
+                msg.contains(needle),
+                "Error message missing expected substring \"{needle}\".\nFull message:\n{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unsupported_sh_pattern_error() {
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:TestShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComponent ;
+  asset360:introspectable true ;
+  sh:property [
+    sh:path asset360:name ;
+    sh:pattern "^[A-Z]"
+  ] .
+"#;
+        let result = parse_shacl(ttl, "TunnelComponent");
+        assert_error_contains(
+            result,
+            &[
+                "Unsupported value constraint",
+                "name",
+                "sh:hasValue",
+                "introspectable false",
+                "pattern",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_unsupported_sh_class_error() {
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:TestShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComponent ;
+  asset360:introspectable true ;
+  sh:property [
+    sh:path asset360:belongsToTunnelComplex ;
+    sh:class asset360:TunnelComplex
+  ] .
+"#;
+        let result = parse_shacl(ttl, "TunnelComponent");
+        assert_error_contains(
+            result,
+            &[
+                "Unsupported value constraint",
+                "belongsToTunnelComplex",
+                "sh:hasValue",
+                "sh:class",
+                "introspectable false",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_unsupported_sh_datatype_error() {
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:TestShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComponent ;
+  asset360:introspectable true ;
+  sh:property [
+    sh:path asset360:length ;
+    sh:datatype xsd:decimal
+  ] .
+"#;
+        let result = parse_shacl(ttl, "TunnelComponent");
+        assert_error_contains(
+            result,
+            &[
+                "Unsupported value constraint",
+                "length",
+                "sh:datatype",
+                "introspectable false",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_unsupported_alternative_path_error() {
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:TestShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComponent ;
+  asset360:introspectable true ;
+  sh:property [
+    sh:path [ sh:alternativePath ( asset360:name asset360:identification ) ] ;
+    sh:minCount 1
+  ] .
+"#;
+        let result = parse_shacl(ttl, "TunnelComponent");
+        assert_error_contains(
+            result,
+            &[
+                "Unsupported property path",
+                "alternativePath",
+                "sh:inversePath",
+            ],
+        );
     }
 }

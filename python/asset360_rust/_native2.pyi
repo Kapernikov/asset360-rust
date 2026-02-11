@@ -5310,17 +5310,6 @@ def compute_history(stages:typing.Sequence[ChangeStage]) -> tuple[LinkMLInstance
     `LinkMLInstance` together with updated stages.
     """
 
-def derive_scope_predicate(shape_json:builtins.str, focus_data_json:builtins.str, uri_field:builtins.str='asset360_uri') -> typing.Optional[builtins.str]:
-    r"""
-    Derive a scope predicate for fetching peer objects relevant to a constraint.
-    
-    * `shape_json` – JSON-serialized `ShapeResult`
-    * `focus_data_json` – JSON object of the focus object's field values
-    * `uri_field` – field name holding the object URI (default: "asset360_uri")
-    
-    Returns JSON-serialized `Predicate` or `None`.
-    """
-
 def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:builtins.bool=False, treat_changed_identifier_as_new_object:builtins.bool=True) -> builtins.list[Delta]:
     r"""
     Compute deltas between two instances.
@@ -5328,18 +5317,6 @@ def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:bui
     Defaults mirror `linkml_runtime.diff.DiffOptions::default()`: missing assignments are
     treated as absent (`treat_missing_as_null=False`) and identifier changes are emitted as
     whole-object replacements (`treat_changed_identifier_as_new_object=True`).
-    """
-
-def evaluate_forward(ast_json:builtins.str, object_data_json:builtins.str, message:builtins.str, enforcement_level:builtins.str) -> builtins.str:
-    r"""
-    Evaluate a SHACL AST against object data (forward validation).
-    
-    * `ast_json` – JSON-serialized `ShaclAst`
-    * `object_data_json` – JSON object with field values
-    * `message` – violation message
-    * `enforcement_level` – one of "critical", "serious", "error", "unlikely"
-    
-    Returns JSON array of violations (empty = valid).
     """
 
 def format_blame_map(value:asset360_rust.LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> builtins.str: ...
@@ -5377,7 +5354,30 @@ def parse_shacl(ttl:builtins.str, target_class:builtins.str) -> builtins.str:
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def solve_backward(ast_json:builtins.str, known_fields_json:builtins.str, target_field:builtins.str) -> typing.Optional[builtins.str]:
+def shacl_derive_scope_predicate(shape_json:builtins.str, focus_data_json:builtins.str, uri_field:builtins.str='asset360_uri') -> typing.Optional[builtins.str]:
+    r"""
+    Derive a scope predicate for fetching peer objects relevant to a constraint.
+    
+    * `shape_json` – JSON-serialized `ShapeResult`
+    * `focus_data_json` – JSON object of the focus object's field values
+    * `uri_field` – field name holding the object URI (default: "asset360_uri")
+    
+    Returns JSON-serialized `Predicate` or `None`.
+    """
+
+def shacl_evaluate_forward(ast_json:builtins.str, object_data_json:builtins.str, message:builtins.str, enforcement_level:builtins.str) -> builtins.str:
+    r"""
+    Evaluate a SHACL AST against object data (forward validation).
+    
+    * `ast_json` – JSON-serialized `ShaclAst`
+    * `object_data_json` – JSON object with field values
+    * `message` – violation message
+    * `enforcement_level` – one of "critical", "serious", "error", "unlikely"
+    
+    Returns JSON array of violations (empty = valid).
+    """
+
+def shacl_solve_backward(ast_json:builtins.str, known_fields_json:builtins.str, target_field:builtins.str) -> typing.Optional[builtins.str]:
     r"""
     Solve backward: given an AST and known field values, produce a Predicate
     for the target field describing its allowed values.
