@@ -31,6 +31,7 @@ use crate::blame::{Asset360ChangeMeta, ChangeStage};
 
 pub mod backward_solver;
 pub mod blame;
+pub mod constraint_set;
 pub mod forward_eval;
 pub mod predicate;
 pub mod scope_predicate;
@@ -68,11 +69,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blame_map_to_path_stage_map, m)?)?;
     m.add_function(wrap_pyfunction!(format_blame_map_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_blame_info_py, m)?)?;
-    m.add_function(wrap_pyfunction!(shacl_evaluate_forward_py, m)?)?;
-    m.add_function(wrap_pyfunction!(shacl_solve_backward_py, m)?)?;
-    m.add_function(wrap_pyfunction!(shacl_derive_scope_predicate_py, m)?)?;
-    #[cfg(feature = "shacl-parser")]
-    m.add_function(wrap_pyfunction!(parse_shacl_py, m)?)?;
+    m.add_class::<PyConstraintSet>()?;
     Ok(())
 }
 
@@ -921,117 +918,138 @@ fn get_blame_info_py(
     get_blame_info_py_impl(py, value, blame_map)
 }
 
-// ── SHACL / Business Rules Python bindings ──────────────────────────
+// ── ConstraintSet Python bindings ────────────────────────────────────
 
-/// Evaluate a SHACL AST against object data (forward validation).
-///
-/// * `ast_json` – JSON-serialized `ShaclAst`
-/// * `object_data_json` – JSON object with field values
-/// * `message` – violation message
-/// * `enforcement_level` – one of "critical", "serious", "error", "unlikely"
-///
-/// Returns JSON array of violations (empty = valid).
 #[cfg(feature = "python-bindings")]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction(name = "shacl_evaluate_forward", signature = (ast_json, object_data_json, message, enforcement_level))]
-fn shacl_evaluate_forward_py(
-    ast_json: &str,
-    object_data_json: &str,
-    message: &str,
-    enforcement_level: &str,
-) -> PyResult<String> {
-    let ast: crate::shacl_ast::ShaclAst = serde_json::from_str(ast_json)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid AST JSON: {e}")))?;
-    let data: serde_json::Value = serde_json::from_str(object_data_json)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid data JSON: {e}")))?;
-    let level: crate::shacl_ast::EnforcementLevel =
-        serde_json::from_value(serde_json::Value::String(enforcement_level.to_owned()))
-            .unwrap_or(crate::shacl_ast::EnforcementLevel::Error);
-    let violations = crate::forward_eval::evaluate_forward(&ast, &data, message, &level);
-    serde_json::to_string(&violations)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(name = "ConstraintSet")]
+struct PyConstraintSet {
+    inner: crate::constraint_set::ConstraintSet,
 }
 
-/// Solve backward: given an AST and known field values, produce a Predicate
-/// for the target field describing its allowed values.
-///
-/// * `ast_json` – JSON-serialized `ShaclAst`
-/// * `known_fields_json` – JSON object of known field name → value
-/// * `target_field` – field name to solve for
-///
-/// Returns JSON-serialized `Predicate` or `None`.
 #[cfg(feature = "python-bindings")]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction(name = "shacl_solve_backward", signature = (ast_json, known_fields_json, target_field))]
-fn shacl_solve_backward_py(
-    ast_json: &str,
-    known_fields_json: &str,
-    target_field: &str,
-) -> PyResult<Option<String>> {
-    let ast: crate::shacl_ast::ShaclAst = serde_json::from_str(ast_json)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid AST JSON: {e}")))?;
-    let known: serde_json::Map<String, serde_json::Value> = serde_json::from_str(known_fields_json)
-        .map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid known fields JSON: {e}"))
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PyConstraintSet {
+    /// Create a ConstraintSet from a JSON array of ShapeResult objects.
+    #[staticmethod]
+    #[pyo3(signature = (json,))]
+    fn from_json(json: &str) -> PyResult<Self> {
+        let inner = crate::constraint_set::ConstraintSet::from_json(json)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Parse SHACL Turtle text into a ConstraintSet.
+    #[cfg(feature = "shacl-parser")]
+    #[staticmethod]
+    #[pyo3(signature = (ttl, target_class, language="", schema_view=None))]
+    fn from_shacl(
+        py: Python<'_>,
+        ttl: &str,
+        target_class: &str,
+        language: &str,
+        schema_view: Option<Py<PySchemaView>>,
+    ) -> PyResult<Self> {
+        let sv_option = schema_view.as_ref().map(|sv| {
+            let bound = sv.bind(py);
+            let borrowed = bound.borrow();
+            borrowed.as_rust().clone()
+        });
+        let inner = crate::constraint_set::ConstraintSet::from_shacl(
+            ttl,
+            target_class,
+            language,
+            sv_option.as_ref(),
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Attach a schema view (returns a new ConstraintSet with schema awareness).
+    #[pyo3(signature = (schema_view, target_class))]
+    fn with_schema_view(
+        &self,
+        py: Python<'_>,
+        schema_view: Py<PySchemaView>,
+        target_class: &str,
+    ) -> PyResult<Self> {
+        let bound = schema_view.bind(py);
+        let borrowed = bound.borrow();
+        let sv = borrowed.as_rust();
+        let new_inner = self
+            .inner
+            .clone()
+            .with_schema_view(sv, target_class)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(Self { inner: new_inner })
+    }
+
+    /// Serialize the shapes to JSON.
+    fn to_json(&self) -> PyResult<String> {
+        self.inner
+            .to_json()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
+    }
+
+    /// Evaluate all shapes against object data, returning JSON array of violations.
+    #[pyo3(signature = (object_data_json,))]
+    fn evaluate(&self, object_data_json: &str) -> PyResult<String> {
+        let data: serde_json::Value = serde_json::from_str(object_data_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid data JSON: {e}"))
         })?;
-    match crate::backward_solver::solve_backward(&ast, &known, target_field) {
-        Some(pred) => {
-            let json = serde_json::to_string(&pred).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}"))
-            })?;
-            Ok(Some(json))
-        }
-        None => Ok(None),
+        let violations = self.inner.evaluate(&data);
+        serde_json::to_string(&violations)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
     }
-}
 
-/// Derive a scope predicate for fetching peer objects relevant to a constraint.
-///
-/// * `shape_json` – JSON-serialized `ShapeResult`
-/// * `focus_data_json` – JSON object of the focus object's field values
-/// * `uri_field` – field name holding the object URI (default: "asset360_uri")
-///
-/// Returns JSON-serialized `Predicate` or `None`.
-#[cfg(feature = "python-bindings")]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction(name = "shacl_derive_scope_predicate", signature = (shape_json, focus_data_json, uri_field="asset360_uri"))]
-fn shacl_derive_scope_predicate_py(
-    shape_json: &str,
-    focus_data_json: &str,
-    uri_field: &str,
-) -> PyResult<Option<String>> {
-    let shape: crate::shacl_ast::ShapeResult = serde_json::from_str(shape_json)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid shape JSON: {e}")))?;
-    let focus: serde_json::Map<String, serde_json::Value> = serde_json::from_str(focus_data_json)
-        .map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("invalid focus data JSON: {e}"))
-    })?;
-    match crate::scope_predicate::derive_scope_predicate(&shape, &focus, uri_field) {
-        Some(pred) => {
-            let json = serde_json::to_string(&pred).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}"))
-            })?;
-            Ok(Some(json))
+    /// Solve backward for a target field, returning JSON FieldConstraint or None.
+    #[pyo3(signature = (object_data_json, target_field))]
+    fn solve(&self, object_data_json: &str, target_field: &str) -> PyResult<Option<String>> {
+        let data: serde_json::Value = serde_json::from_str(object_data_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid data JSON: {e}"))
+        })?;
+        match self.inner.solve(&data, target_field) {
+            Some(fc) => {
+                let json = serde_json::to_string(&fc).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}"))
+                })?;
+                Ok(Some(json))
+            }
+            None => Ok(None),
         }
-        None => Ok(None),
     }
-}
 
-/// Parse a SHACL Turtle file and extract shapes targeting a class.
-///
-/// * `ttl` – SHACL Turtle text
-/// * `target_class` – class name to filter (empty string = all shapes)
-/// * `language` – preferred language for `sh:message` (e.g. `"nl"`, `"en"`; empty = first available)
-///
-/// Returns JSON array of `ShapeResult` objects.
-#[cfg(all(feature = "python-bindings", feature = "shacl-parser"))]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction(name = "parse_shacl", signature = (ttl, target_class, language=""))]
-fn parse_shacl_py(ttl: &str, target_class: &str, language: &str) -> PyResult<String> {
-    let results = crate::shacl_parser::parse_shacl(ttl, target_class, language)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("SHACL parse error: {e}")))?;
-    serde_json::to_string(&results)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
+    /// Derive scope predicate, returning JSON Predicate or None.
+    #[pyo3(signature = (focus_data_json, uri_field="asset360_uri"))]
+    fn scope(&self, focus_data_json: &str, uri_field: &str) -> PyResult<Option<String>> {
+        let focus: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(focus_data_json).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid focus data JSON: {e}"))
+            })?;
+        match self.inner.scope(&focus, uri_field) {
+            Some(pred) => {
+                let json = serde_json::to_string(&pred).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}"))
+                })?;
+                Ok(Some(json))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Return all field names referenced by any shape.
+    fn affected_fields(&self) -> Vec<String> {
+        self.inner.affected_fields()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ConstraintSet(shapes={}, has_schema={})",
+            self.inner.shape_count(),
+            self.inner.has_schema()
+        )
+    }
 }
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
