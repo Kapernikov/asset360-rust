@@ -1386,11 +1386,30 @@ class ClassView:
     def definition(self) -> ClassDefinition: ...
     @classmethod
     def most_specific_common_ancestor(cls, class_views:typing.Sequence[ClassView], include_mixins:builtins.bool=False) -> typing.Optional[ClassView]: ...
-    def slots(self) -> builtins.list[SlotView]: ...
-    def parent_class(self) -> typing.Optional[ClassView]: ...
-    def identifier_slot(self) -> typing.Optional[SlotView]: ...
-    def key_or_identifier_slot(self) -> typing.Optional[SlotView]: ...
-    def get_descendants(self, recurse:builtins.bool, include_mixins:builtins.bool) -> builtins.list[ClassView]: ...
+    def slots(self) -> builtins.list[SlotView]:
+        r"""
+        Returns the effective slots for this class, including inherited slots
+        from ``is_a`` parents and mixins, with ``slot_usage`` overrides applied.
+        """
+    def parent_class(self) -> typing.Optional[ClassView]:
+        r"""
+        Returns the ``is_a`` parent class, or ``None`` for a root class.
+        """
+    def identifier_slot(self) -> typing.Optional[SlotView]:
+        r"""
+        Returns the slot marked ``identifier=True`` (globally unique key), if any.
+        """
+    def key_or_identifier_slot(self) -> typing.Optional[SlotView]:
+        r"""
+        Returns the slot marked ``key=True`` or ``identifier=True``, if any.
+        """
+    def get_descendants(self, recurse:builtins.bool, include_mixins:builtins.bool) -> builtins.list[ClassView]:
+        r"""
+        Returns classes that inherit from this class.
+        
+        With ``recurse=True`` the full transitive closure is returned.
+        With ``include_mixins=True`` classes using this as a mixin are included.
+        """
     def schema_id(self) -> builtins.str: ...
     def canonical_uri(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
@@ -1530,6 +1549,43 @@ class CommonMetadata:
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     def __new__(cls, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> CommonMetadata: ...
+
+class ConstraintSet:
+    @staticmethod
+    def from_json(json:builtins.str) -> ConstraintSet:
+        r"""
+        Create a ConstraintSet from a JSON array of ShapeResult objects.
+        """
+    @staticmethod
+    def from_shacl(ttl:builtins.str, target_class:builtins.str, language:builtins.str='', schema_view:typing.Optional[SchemaView]=None) -> ConstraintSet:
+        r"""
+        Parse SHACL Turtle text into a ConstraintSet.
+        """
+    def with_schema_view(self, schema_view:SchemaView, target_class:builtins.str) -> ConstraintSet:
+        r"""
+        Attach a schema view (returns a new ConstraintSet with schema awareness).
+        """
+    def to_json(self) -> builtins.str:
+        r"""
+        Serialize the shapes to JSON.
+        """
+    def evaluate(self, object_data_json:builtins.str) -> builtins.str:
+        r"""
+        Evaluate all shapes against object data, returning JSON array of violations.
+        """
+    def solve(self, object_data_json:builtins.str, target_field:builtins.str) -> typing.Optional[builtins.str]:
+        r"""
+        Solve backward for a target field, returning JSON FieldConstraint or None.
+        """
+    def scope(self, focus_data_json:builtins.str, uri_field:builtins.str='asset360_uri') -> typing.Optional[builtins.str]:
+        r"""
+        Derive scope predicate, returning JSON Predicate or None.
+        """
+    def affected_fields(self) -> builtins.list[builtins.str]:
+        r"""
+        Return all field names referenced by any shape.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 class Definition:
     @property
@@ -2544,7 +2600,10 @@ class EnumView:
     def name(self) -> builtins.str: ...
     @property
     def definition(self) -> EnumDefinition: ...
-    def permissible_value_keys(self) -> builtins.list[builtins.str]: ...
+    def permissible_value_keys(self) -> builtins.list[builtins.str]:
+        r"""
+        Returns the sorted keys of all permissible values, including inherited ones.
+        """
     def schema_id(self) -> builtins.str: ...
     def canonical_uri(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
@@ -3627,13 +3686,34 @@ class SchemaDefinition:
 
 class SchemaView:
     def __new__(cls, source:typing.Optional[typing.Any]=None) -> SchemaView: ...
-    def _get_resolved_schema_imports(self) -> builtins.dict[tuple[builtins.str, builtins.str], builtins.str]: ...
+    def _get_resolved_schema_imports(self) -> builtins.dict[tuple[builtins.str, builtins.str], builtins.str]:
+        r"""
+        Returns the map of resolved imports: ``{(importing_schema_id, import_uri): resolved_schema_id}``.
+        """
     def get_default_prefix_for_schema(self, schema_id:builtins.str, expand:builtins.bool) -> typing.Optional[builtins.str]: ...
-    def add_schema_from_path(self, path:builtins.str) -> builtins.bool: ...
-    def add_schema_str(self, data:builtins.str) -> builtins.bool: ...
-    def get_unresolved_schemas(self) -> builtins.list[builtins.str]: ...
-    def get_unresolved_schema_refs(self) -> builtins.list[tuple[builtins.str, builtins.str]]: ...
-    def get_resolution_uri_of_schema(self, id:builtins.str) -> typing.Optional[builtins.str]: ...
+    def add_schema_from_path(self, path:builtins.str) -> builtins.bool:
+        r"""
+        Parse a YAML schema file and add it to the view.
+        """
+    def add_schema_str(self, data:builtins.str) -> builtins.bool:
+        r"""
+        Parse a YAML/JSON schema string and add it to the view.
+        """
+    def get_unresolved_schemas(self) -> builtins.list[builtins.str]:
+        r"""
+        Returns import URIs that have not yet been satisfied.
+        
+        Use ``get_unresolved_schema_refs()`` if you also need the importing
+        schema ID for each entry.
+        """
+    def get_unresolved_schema_refs(self) -> builtins.list[tuple[builtins.str, builtins.str]]:
+        r"""
+        Returns ``(importing_schema_id, import_uri)`` pairs for unsatisfied imports.
+        """
+    def get_resolution_uri_of_schema(self, id:builtins.str) -> typing.Optional[builtins.str]:
+        r"""
+        Returns the import URI that was used to resolve the given schema ID.
+        """
     def add_schema_str_with_import_ref(self, data:builtins.str, schema_id:builtins.str, uri:builtins.str) -> None:
         r"""
         Add a schema payload that satisfies an unresolved import reference.
@@ -3669,18 +3749,49 @@ class SchemaView:
     def from_snapshot_file(cls, path:builtins.str) -> SchemaView: ...
     def to_snapshot_yaml(self) -> builtins.str: ...
     def to_snapshot_file(self, path:builtins.str) -> None: ...
-    def get_class_view(self, id:builtins.str) -> typing.Optional[ClassView]: ...
-    def get_class_view_by_uri(self, uri:builtins.str) -> typing.Optional[ClassView]: ...
-    def get_slot_view(self, id:builtins.str) -> typing.Optional[SlotView]: ...
-    def get_slot_view_by_uri(self, uri:builtins.str) -> typing.Optional[SlotView]: ...
-    def get_enum_view(self, id:builtins.str) -> typing.Optional[EnumView]: ...
+    def get_class_view(self, id:builtins.str) -> typing.Optional[ClassView]:
+        r"""
+        Look up a class by name, CURIE, or URI.
+        """
+    def get_class_view_by_uri(self, uri:builtins.str) -> typing.Optional[ClassView]:
+        r"""
+        Look up a class by its expanded URI.
+        """
+    def get_slot_view(self, id:builtins.str) -> typing.Optional[SlotView]:
+        r"""
+        Look up a top-level slot by name, CURIE, or URI.
+        """
+    def get_slot_view_by_uri(self, uri:builtins.str) -> typing.Optional[SlotView]:
+        r"""
+        Look up a slot by its expanded URI.
+        """
+    def get_enum_view(self, id:builtins.str) -> typing.Optional[EnumView]:
+        r"""
+        Look up an enum by name, CURIE, or URI.
+        """
     def schema_ids(self) -> builtins.list[builtins.str]: ...
     def get_class_ids(self) -> builtins.list[builtins.str]: ...
     def get_slot_ids(self) -> builtins.list[builtins.str]: ...
-    def class_views(self) -> builtins.list[ClassView]: ...
-    def enum_views(self) -> builtins.list[EnumView]: ...
-    def slot_views(self) -> builtins.list[SlotView]: ...
-    def slots_for_path(self, class_id:builtins.str, path:typing.Sequence[builtins.str]) -> builtins.list[SlotView]: ...
+    def class_views(self) -> builtins.list[ClassView]:
+        r"""
+        Returns all classes across every loaded schema.
+        """
+    def enum_views(self) -> builtins.list[EnumView]:
+        r"""
+        Returns all enums across every loaded schema.
+        """
+    def slot_views(self) -> builtins.list[SlotView]:
+        r"""
+        Returns all unique slots across every loaded schema.
+        """
+    def slots_for_path(self, class_id:builtins.str, path:typing.Sequence[builtins.str]) -> builtins.list[SlotView]:
+        r"""
+        Resolve a sequence of slot names starting from ``class_id``, walking
+        through range classes at each step.
+        
+        Returns multiple ``SlotView``s when the path is ambiguous (e.g. a slot
+        exists on several subclasses of an intermediate range class).
+        """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
 
@@ -4292,11 +4403,51 @@ class SlotView:
     def definition(self) -> SlotDefinition: ...
     def schema_id(self) -> builtins.str: ...
     def canonical_uri(self) -> builtins.str: ...
-    def range_class(self) -> typing.Optional[ClassView]: ...
-    def range_enum(self) -> typing.Optional[EnumView]: ...
-    def is_range_scalar(self) -> builtins.bool: ...
-    def container_mode(self) -> builtins.str: ...
-    def inline_mode(self) -> builtins.str: ...
+    def range_class(self) -> typing.Optional[ClassView]:
+        r"""
+        Returns the range class, if the range is a class (not a type or enum).
+        """
+    def range_enum(self) -> typing.Optional[EnumView]:
+        r"""
+        Returns the range enum, if the range is an enum.
+        """
+    def is_range_scalar(self) -> builtins.bool:
+        r"""
+        Returns ``True`` when the range is a scalar (type, enum, or
+        ``Anything``/``AnyValue``) rather than a regular class.
+        """
+    def container_mode(self) -> builtins.str:
+        r"""
+        Resolved container shape for this slot's serialized form.
+        
+        Returns one of:
+          - ``"SingleValue"`` — the slot holds a single value.
+          - ``"List"`` — the slot serializes as a list.
+          - ``"Mapping"`` — the slot serializes as a dict keyed by the range
+            class's key/identifier slot.
+        
+        This resolves the interacting ``multivalued``, ``inlined``, and
+        ``inlined_as_list`` booleans from the LinkML slot definition, also
+        considering whether the range class has a key or identifier slot.
+        
+        For the raw booleans, use ``slot.definition.multivalued`` etc.
+        """
+    def inline_mode(self) -> builtins.str:
+        r"""
+        Resolved inline behavior for this slot's serialized form.
+        
+        Returns one of:
+          - ``"Inline"`` — the range object is serialized inline (nested).
+          - ``"Primitive"`` — the range is a primitive type or enum, not a class.
+          - ``"Reference"`` — the slot holds a reference (foreign key) to the
+            range class rather than the object itself.
+        
+        This resolves the interacting ``inlined`` and ``inlined_as_list``
+        booleans, also considering whether the range class has an identifier
+        slot (classes without an identifier slot are always inlined).
+        
+        For the raw booleans, use ``slot.definition.inlined`` etc.
+        """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
 
@@ -5342,52 +5493,7 @@ def load_yaml(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[t
 
 def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
-def parse_shacl(ttl:builtins.str, target_class:builtins.str) -> builtins.str:
-    r"""
-    Parse a SHACL Turtle file and extract shapes targeting a class.
-    
-    * `ttl` – SHACL Turtle text
-    * `target_class` – class name to filter (empty string = all shapes)
-    
-    Returns JSON array of `ShapeResult` objects.
-    """
-
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
-
-def shacl_derive_scope_predicate(shape_json:builtins.str, focus_data_json:builtins.str, uri_field:builtins.str='asset360_uri') -> typing.Optional[builtins.str]:
-    r"""
-    Derive a scope predicate for fetching peer objects relevant to a constraint.
-    
-    * `shape_json` – JSON-serialized `ShapeResult`
-    * `focus_data_json` – JSON object of the focus object's field values
-    * `uri_field` – field name holding the object URI (default: "asset360_uri")
-    
-    Returns JSON-serialized `Predicate` or `None`.
-    """
-
-def shacl_evaluate_forward(ast_json:builtins.str, object_data_json:builtins.str, message:builtins.str, enforcement_level:builtins.str) -> builtins.str:
-    r"""
-    Evaluate a SHACL AST against object data (forward validation).
-    
-    * `ast_json` – JSON-serialized `ShaclAst`
-    * `object_data_json` – JSON object with field values
-    * `message` – violation message
-    * `enforcement_level` – one of "critical", "serious", "error", "unlikely"
-    
-    Returns JSON array of violations (empty = valid).
-    """
-
-def shacl_solve_backward(ast_json:builtins.str, known_fields_json:builtins.str, target_field:builtins.str) -> typing.Optional[builtins.str]:
-    r"""
-    Solve backward: given an AST and known field values, produce a Predicate
-    for the target field describing its allowed values.
-    
-    * `ast_json` – JSON-serialized `ShaclAst`
-    * `known_fields_json` – JSON object of known field name → value
-    * `target_field` – field name to solve for
-    
-    Returns JSON-serialized `Predicate` or `None`.
-    """
 
 def sum_as_string(a:builtins.int, b:builtins.int) -> builtins.str: ...
 

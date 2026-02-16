@@ -804,49 +804,87 @@ impl RangeInfoHandle {
     }
 }
 
-// ── SHACL / Business Rules WASM bindings ────────────────────────────
-// Per decision D2: parse_shacl is server-side only.
-// derive_scope_predicate is backend-only.
-// Only evaluation and backward-solving are exposed to the frontend.
+// ── ConstraintSet WASM bindings ──────────────────────────────────────
+// Per decision D2: parse_shacl and scope are server-side only.
 
-/// Evaluate a SHACL AST against object data (forward validation).
-///
-/// Returns a JSON array of violations (empty array = valid).
-#[wasm_bindgen(js_name = shaclEvaluateForward)]
-pub fn shacl_evaluate_forward_wasm(
-    ast_json: &str,
-    object_data_json: &str,
-    message: &str,
-    enforcement_level: &str,
-) -> Result<JsValue, JsValue> {
-    let ast: crate::shacl_ast::ShaclAst = serde_json::from_str(ast_json)
-        .map_err(|e| JsValue::from_str(&format!("invalid AST JSON: {e}")))?;
-    let data: serde_json::Value = serde_json::from_str(object_data_json)
-        .map_err(|e| JsValue::from_str(&format!("invalid data JSON: {e}")))?;
-    let level: crate::shacl_ast::EnforcementLevel =
-        serde_json::from_value(serde_json::Value::String(enforcement_level.to_owned()))
-            .unwrap_or(crate::shacl_ast::EnforcementLevel::Error);
-    let violations = crate::forward_eval::evaluate_forward(&ast, &data, message, &level);
-    to_js(&violations)
+/// Handle wrapping a [`ConstraintSet`] for JavaScript usage.
+#[wasm_bindgen]
+pub struct ConstraintSetHandle {
+    inner: crate::constraint_set::ConstraintSet,
 }
 
-/// Solve backward: given an AST and known field values, produce a Predicate
-/// for the target field describing its allowed values.
-///
-/// Returns the predicate as a JS object, or `null` if no constraints apply.
-#[wasm_bindgen(js_name = shaclSolveBackward)]
-pub fn shacl_solve_backward_wasm(
-    ast_json: &str,
-    known_fields_json: &str,
-    target_field: &str,
-) -> Result<JsValue, JsValue> {
-    let ast: crate::shacl_ast::ShaclAst = serde_json::from_str(ast_json)
-        .map_err(|e| JsValue::from_str(&format!("invalid AST JSON: {e}")))?;
-    let known: serde_json::Map<String, serde_json::Value> = serde_json::from_str(known_fields_json)
-        .map_err(|e| JsValue::from_str(&format!("invalid known fields JSON: {e}")))?;
-    match crate::backward_solver::solve_backward(&ast, &known, target_field) {
-        Some(pred) => to_js(&pred),
-        None => Ok(JsValue::NULL),
+#[wasm_bindgen]
+impl ConstraintSetHandle {
+    /// Create a ConstraintSet from a JSON array of ShapeResult objects.
+    #[wasm_bindgen(js_name = fromJson)]
+    pub fn from_json(json: &str) -> Result<ConstraintSetHandle, JsValue> {
+        let inner = crate::constraint_set::ConstraintSet::from_json(json)
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(Self { inner })
+    }
+
+    /// Attach a schema view and target class (returns a new handle).
+    #[wasm_bindgen(js_name = withSchemaView)]
+    pub fn with_schema_view(
+        self,
+        sv: &SchemaViewHandle,
+        target_class: &str,
+    ) -> Result<ConstraintSetHandle, JsValue> {
+        // Roundtrip through JSON to get a fresh ConstraintSet (avoids needing Clone)
+        let json = self
+            .inner
+            .to_json()
+            .map_err(|e| JsValue::from_str(&format!("serialize error: {e}")))?;
+        let new_inner = crate::constraint_set::ConstraintSet::from_json(&json)
+            .map_err(|e| JsValue::from_str(&e))?
+            .with_schema_view(&sv.inner, target_class)
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(Self { inner: new_inner })
+    }
+
+    /// Forward-evaluate all shapes against object data.
+    /// Returns a JS array of violation objects.
+    #[wasm_bindgen(js_name = evaluate)]
+    pub fn evaluate(&self, object_data_json: &str) -> Result<JsValue, JsValue> {
+        let data: serde_json::Value = serde_json::from_str(object_data_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid data JSON: {e}")))?;
+        let violations = self.inner.evaluate(&data);
+        to_js(&violations)
+    }
+
+    /// Backward-solve for a target field.
+    /// Returns a FieldConstraint JS object, or null if no constraints apply.
+    #[wasm_bindgen(js_name = solve)]
+    pub fn solve(&self, object_data_json: &str, target_field: &str) -> Result<JsValue, JsValue> {
+        let data: serde_json::Value = serde_json::from_str(object_data_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid data JSON: {e}")))?;
+        match self.inner.solve(&data, target_field) {
+            Some(fc) => to_js(&fc),
+            None => Ok(JsValue::NULL),
+        }
+    }
+
+    /// Return all field names referenced by any shape.
+    #[wasm_bindgen(js_name = affectedFields)]
+    pub fn affected_fields(&self) -> Vec<String> {
+        self.inner.affected_fields()
+    }
+
+    /// Serialize the shapes to JSON.
+    #[wasm_bindgen(js_name = toJson)]
+    pub fn to_json(&self) -> Result<String, JsValue> {
+        self.inner
+            .to_json()
+            .map_err(|e| JsValue::from_str(&format!("serialize error: {e}")))
+    }
+
+    #[wasm_bindgen(js_name = toString)]
+    pub fn to_string_js(&self) -> String {
+        format!(
+            "ConstraintSetHandle(shapes={}, has_schema={})",
+            self.inner.shape_count(),
+            self.inner.has_schema()
+        )
     }
 }
 
