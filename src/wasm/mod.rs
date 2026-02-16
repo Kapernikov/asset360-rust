@@ -830,13 +830,8 @@ impl ConstraintSetHandle {
         sv: &SchemaViewHandle,
         target_class: &str,
     ) -> Result<ConstraintSetHandle, JsValue> {
-        // Roundtrip through JSON to get a fresh ConstraintSet (avoids needing Clone)
-        let json = self
+        let new_inner = self
             .inner
-            .to_json()
-            .map_err(|e| JsValue::from_str(&format!("serialize error: {e}")))?;
-        let new_inner = crate::constraint_set::ConstraintSet::from_json(&json)
-            .map_err(|e| JsValue::from_str(&e))?
             .with_schema_view(&sv.inner, target_class)
             .map_err(|e| JsValue::from_str(&e))?;
         Ok(Self { inner: new_inner })

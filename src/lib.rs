@@ -977,12 +977,9 @@ impl PyConstraintSet {
         let bound = schema_view.bind(py);
         let borrowed = bound.borrow();
         let sv = borrowed.as_rust();
-        // Clone self.inner's shapes via JSON roundtrip to avoid needing Clone on ConstraintSet
-        let json = self.inner.to_json().map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}"))
-        })?;
-        let new_inner = crate::constraint_set::ConstraintSet::from_json(&json)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?
+        let new_inner = self
+            .inner
+            .clone()
             .with_schema_view(sv, target_class)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(Self { inner: new_inner })

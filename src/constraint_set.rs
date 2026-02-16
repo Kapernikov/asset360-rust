@@ -25,6 +25,7 @@ pub enum FieldConstraint {
 }
 
 /// A set of SHACL shapes that can be evaluated, solved, and scoped as a unit.
+#[derive(Clone)]
 pub struct ConstraintSet {
     shapes: Vec<ShapeResult>,
     schema_view: Option<SchemaView>,
