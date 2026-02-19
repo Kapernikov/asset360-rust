@@ -251,6 +251,124 @@ impl SchemaViewHandle {
         let json_text: String = JSON::stringify(&value)?.into();
         self.load_instance_from_json(class_name, &json_text)
     }
+
+    /// Retrieve a [`ClassView`] by name or CURIE (without requiring a schema id).
+    #[wasm_bindgen(js_name = classViewByName)]
+    pub fn class_view_by_name(&self, name: &str) -> Result<Option<ClassViewHandle>, JsValue> {
+        let conv = self.inner.converter();
+        self.inner
+            .get_class(&Identifier::new(name), &conv)
+            .map(|opt| opt.map(ClassViewHandle::from_inner))
+            .map_err(map_schema_error)
+    }
+
+    /// Retrieve a [`ClassView`] by its canonical URI.
+    #[wasm_bindgen(js_name = classViewByUri)]
+    pub fn class_view_by_uri(&self, uri: &str) -> Result<Option<ClassViewHandle>, JsValue> {
+        self.inner
+            .get_class_by_uri(uri)
+            .map(|opt| opt.map(ClassViewHandle::from_inner))
+            .map_err(map_schema_error)
+    }
+
+    /// Retrieve a [`SlotView`] by name or CURIE (without requiring a schema id).
+    #[wasm_bindgen(js_name = slotViewByName)]
+    pub fn slot_view_by_name(&self, name: &str) -> Result<Option<SlotViewHandle>, JsValue> {
+        let conv = self.inner.converter();
+        self.inner
+            .get_slot(&Identifier::new(name), &conv)
+            .map(|opt| opt.map(SlotViewHandle::from_inner))
+            .map_err(|e| map_schema_error(SchemaViewError::from(e)))
+    }
+
+    /// Retrieve a [`SlotView`] by its canonical URI.
+    #[wasm_bindgen(js_name = slotViewByUri)]
+    pub fn slot_view_by_uri(&self, uri: &str) -> Result<Option<SlotViewHandle>, JsValue> {
+        self.inner
+            .get_slot_by_uri(uri)
+            .map(|opt| opt.map(SlotViewHandle::from_inner))
+            .map_err(map_schema_error)
+    }
+
+    /// Retrieve an [`EnumView`] by name or CURIE (without requiring a schema id).
+    #[wasm_bindgen(js_name = enumViewByName)]
+    pub fn enum_view_by_name(&self, name: &str) -> Result<Option<EnumViewHandle>, JsValue> {
+        let conv = self.inner.converter();
+        self.inner
+            .get_enum(&Identifier::new(name), &conv)
+            .map(|opt| opt.map(EnumViewHandle::from_inner))
+            .map_err(|e| map_schema_error(SchemaViewError::from(e)))
+    }
+
+    /// Check whether a class with the given name or CURIE exists.
+    #[wasm_bindgen(js_name = existsClass)]
+    pub fn exists_class(&self, name: &str) -> Result<bool, JsValue> {
+        let conv = self.inner.converter();
+        self.inner
+            .exists_class(&Identifier::new(name), &conv)
+            .map_err(map_schema_error)
+    }
+
+    /// Return the tree root class, optionally overridden by name.
+    #[wasm_bindgen(js_name = getTreeRoot)]
+    pub fn get_tree_root(&self, class_name: Option<String>) -> Option<ClassViewHandle> {
+        self.inner
+            .get_tree_root_or(class_name.as_deref())
+            .map(ClassViewHandle::from_inner)
+    }
+
+    /// Resolve a path of slot names starting from a class, returning the
+    /// [`SlotView`] handles reachable at the terminal segment.
+    #[wasm_bindgen(js_name = slotsForPath)]
+    pub fn slots_for_path(
+        &self,
+        class_id: &str,
+        path: JsValue,
+    ) -> Result<Vec<SlotViewHandle>, JsValue> {
+        let segments: Vec<String> = if path.is_undefined() || path.is_null() {
+            Vec::new()
+        } else if !Array::is_array(&path) {
+            return Err(JsValue::from_str("path must be an array of strings"));
+        } else {
+            let array = Array::from(&path);
+            let mut segs = Vec::with_capacity(array.length() as usize);
+            for entry in array.iter() {
+                match entry.as_string() {
+                    Some(s) => segs.push(s),
+                    None => {
+                        return Err(JsValue::from_str("path entries must be strings"));
+                    }
+                }
+            }
+            segs
+        };
+        let id = Identifier::new(class_id);
+        self.inner
+            .slots_for_path(&id, segments.iter().map(|s| s.as_str()))
+            .map(|slots| slots.into_iter().map(SlotViewHandle::from_inner).collect())
+            .map_err(map_schema_error)
+    }
+
+    /// Add a schema from a YAML string (without an import reference).
+    #[wasm_bindgen(js_name = addSchemaStr)]
+    pub fn add_schema_str(&mut self, data: &str) -> Result<bool, JsValue> {
+        let schema = parse_schema_definition(data)?;
+        self.inner
+            .add_schema(schema)
+            .map_err(|err| JsValue::from_str(&err))
+    }
+
+    /// Return the default prefix for a schema, optionally expanded to a URI.
+    #[wasm_bindgen(js_name = getDefaultPrefix)]
+    pub fn get_default_prefix(&self, schema_id: &str, expand: bool) -> Option<String> {
+        self.inner.get_default_prefix_for_schema(schema_id, expand)
+    }
+
+    /// Check whether two views reference the same underlying schema data.
+    #[wasm_bindgen(js_name = isSame)]
+    pub fn is_same(&self, other: &SchemaViewHandle) -> bool {
+        self.inner.is_same(&other.inner)
+    }
 }
 
 /// Load a [`SchemaView`] from a YAML schema definition.
@@ -366,6 +484,19 @@ impl ClassViewHandle {
             .map(|slot| SlotViewHandle::from_inner_with_schema(slot.clone(), schema_id))
     }
 
+    /// Returns classes that inherit from this class.
+    #[wasm_bindgen(js_name = descendants)]
+    pub fn descendants(
+        &self,
+        recurse: bool,
+        include_mixins: bool,
+    ) -> Result<Vec<ClassViewHandle>, JsValue> {
+        self.inner
+            .get_descendants(recurse, include_mixins)
+            .map(|views| views.into_iter().map(ClassViewHandle::from_inner).collect())
+            .map_err(map_schema_error)
+    }
+
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!(
@@ -444,6 +575,38 @@ impl SlotViewHandle {
         self.inner.get_range_enum().map(EnumViewHandle::from_inner)
     }
 
+    /// Returns the canonical URI for this slot.
+    #[wasm_bindgen(js_name = canonicalUri)]
+    pub fn canonical_uri(&self) -> String {
+        self.inner.canonical_uri().to_string()
+    }
+
+    /// Returns `true` when the range is a scalar type rather than a class.
+    #[wasm_bindgen(js_name = isRangeScalar)]
+    pub fn is_range_scalar(&self) -> bool {
+        self.inner.is_range_scalar()
+    }
+
+    /// Returns the container mode: `"single"`, `"list"`, or `"mapping"`.
+    #[wasm_bindgen(js_name = slotContainerMode)]
+    pub fn slot_container_mode(&self) -> String {
+        match self.inner.determine_slot_container_mode() {
+            SlotContainerMode::SingleValue => "single".to_string(),
+            SlotContainerMode::List => "list".to_string(),
+            SlotContainerMode::Mapping => "mapping".to_string(),
+        }
+    }
+
+    /// Returns the inline mode: `"inline"`, `"primitive"`, or `"reference"`.
+    #[wasm_bindgen(js_name = slotInlineMode)]
+    pub fn slot_inline_mode(&self) -> String {
+        match self.inner.determine_slot_inline_mode() {
+            SlotInlineMode::Inline => "inline".to_string(),
+            SlotInlineMode::Primitive => "primitive".to_string(),
+            SlotInlineMode::Reference => "reference".to_string(),
+        }
+    }
+
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         let schema = self.schema_id().unwrap_or_else(|| "<unknown>".to_string());
@@ -477,6 +640,12 @@ impl EnumViewHandle {
     #[wasm_bindgen(js_name = definition)]
     pub fn definition(&self) -> Result<JsValue, JsValue> {
         to_js(self.inner.definition())
+    }
+
+    /// Returns the canonical URI for this enum.
+    #[wasm_bindgen(js_name = canonicalUri)]
+    pub fn canonical_uri(&self) -> String {
+        self.inner.canonical_uri().to_string()
     }
 
     #[wasm_bindgen(js_name = permissibleValueKeys)]
