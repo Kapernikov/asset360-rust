@@ -27,6 +27,7 @@ minijinja-contrib = { version = "2.12.0", optional = true, features = ["pycompat
 console_error_panic_hook = { version = "0.1", optional = true }
 oxttl = { version = "0.2", optional = true }
 oxrdf = { version = "0.3", optional = true }
+spargebra = { version = "0.4", optional = true }
 
 [features]
 default = ["stubgen"]
@@ -44,7 +45,7 @@ stubgen = [
     "linkml_runtime_python/stubgen",
     "linkml_meta/stubgen"
 ]
-shacl-parser = ["dep:oxttl", "dep:oxrdf"]
+shacl-parser = ["dep:oxttl", "dep:oxrdf", "dep:spargebra"]
 wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys"]
 minijinja-wasm = [
     "wasm-bindings",
