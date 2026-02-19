@@ -116,7 +116,8 @@ fn substitute(
 
         ShaclAst::PropCount { path, min, max } => {
             // Cardinality constraints are hard to invert symbolically.
-            // If the field is known, evaluate directly. Otherwise, pass through.
+            // If the field is known, evaluate directly. Otherwise, reason about
+            // what concrete values can satisfy the constraint.
             if let Some(field_name) = path.local_name() {
                 if let Some(known_val) = known.get(field_name) {
                     let count = match known_val {
@@ -126,8 +127,16 @@ fn substitute(
                     };
                     let ok = min.is_none_or(|m| count >= m) && max.is_none_or(|m| count <= m);
                     Simplified::Bool(ok)
+                } else if field_name == target_field {
+                    // Target field: reason about what concrete values can satisfy this.
+                    // max=0 means "must be absent" → no concrete value works → false
+                    // Otherwise (e.g. min≥1 "must be present") → any concrete value works → true
+                    match max {
+                        Some(0) => Simplified::Bool(false),
+                        _ => Simplified::Bool(true),
+                    }
                 } else {
-                    // Can't produce a meaningful predicate for cardinality
+                    // Unknown non-target field: can't resolve, be conservative
                     Simplified::Bool(true)
                 }
             } else {
@@ -457,5 +466,207 @@ mod tests {
         // 9 Not-Equals (one per forbidden combo; duplicates not eliminated)
         let predicates = json["predicates"].as_array().unwrap();
         assert_eq!(predicates.len(), 9, "9 forbidden combos → 9 NOT-EQUALS");
+    }
+
+    // ── Allowed-pattern tests ───────────────────────────────────────
+
+    /// Build an allowed-pattern AST matching R1 from the MR:
+    /// Or(
+    ///   And(primary=="In_opvolging", Or(secondary=="In_dienst", secondary=="Uit_dienst")),
+    ///   And(primary=="Uit_opvolging", Or(secondary=="Verkocht", secondary=="Afgebroken")),
+    ///   PropCount(primary, max=0),    ← escape: primary absent
+    ///   PropCount(secondary, max=0),  ← escape: secondary absent
+    /// )
+    fn allowed_pattern_ast() -> ShaclAst {
+        let primary = |v: &str| ShaclAst::PropEquals {
+            path: PropertyPath::iri("https://example.org/primaryStatus"),
+            value: json!(v),
+        };
+        let secondary = |v: &str| ShaclAst::PropEquals {
+            path: PropertyPath::iri("https://example.org/secondaryStatus"),
+            value: json!(v),
+        };
+
+        ShaclAst::Or {
+            children: vec![
+                // Branch 1: In_opvolging → {In_dienst, Uit_dienst}
+                ShaclAst::And {
+                    children: vec![
+                        primary("In_opvolging"),
+                        ShaclAst::Or {
+                            children: vec![secondary("In_dienst"), secondary("Uit_dienst")],
+                        },
+                    ],
+                },
+                // Branch 2: Uit_opvolging → {Verkocht, Afgebroken}
+                ShaclAst::And {
+                    children: vec![
+                        primary("Uit_opvolging"),
+                        ShaclAst::Or {
+                            children: vec![secondary("Verkocht"), secondary("Afgebroken")],
+                        },
+                    ],
+                },
+                // Escape: primary absent
+                ShaclAst::PropCount {
+                    path: PropertyPath::iri("https://example.org/primaryStatus"),
+                    min: None,
+                    max: Some(0),
+                },
+                // Escape: secondary absent
+                ShaclAst::PropCount {
+                    path: PropertyPath::iri("https://example.org/secondaryStatus"),
+                    min: None,
+                    max: Some(0),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_allowed_pattern_solve_primary_known() {
+        let ast = allowed_pattern_ast();
+        let mut known = serde_json::Map::new();
+        known.insert("primaryStatus".into(), json!("In_opvolging"));
+
+        let pred = solve_backward(&ast, &known, "secondaryStatus");
+        assert!(pred.is_some(), "should produce a predicate");
+        let json = serde_json::to_value(pred.unwrap()).unwrap();
+
+        // Should be OR of Equals(In_dienst), Equals(Uit_dienst)
+        assert_eq!(json["operator"], "OR");
+        let predicates = json["predicates"].as_array().unwrap();
+        assert_eq!(predicates.len(), 2, "2 allowed secondary statuses");
+    }
+
+    #[test]
+    fn test_allowed_pattern_solve_bidirectional() {
+        let ast = allowed_pattern_ast();
+        let mut known = serde_json::Map::new();
+        known.insert("secondaryStatus".into(), json!("Verkocht"));
+
+        let pred = solve_backward(&ast, &known, "primaryStatus");
+        assert!(pred.is_some(), "should produce a predicate");
+        let json = serde_json::to_value(pred.unwrap()).unwrap();
+
+        // Verkocht is only allowed with Uit_opvolging → Equals("Uit_opvolging")
+        assert_eq!(json["fieldId"], "primaryStatus");
+        assert_eq!(json["predicateTypeId"], "equals");
+        assert_eq!(json["value"], "Uit_opvolging");
+    }
+
+    #[test]
+    fn test_allowed_pattern_no_known_fields() {
+        let ast = allowed_pattern_ast();
+        let known = serde_json::Map::new();
+
+        // No fields known → escape clause PropCount(primary, max=0) becomes
+        // Bool(true) (unknown non-target), which short-circuits the Or → None.
+        let pred = solve_backward(&ast, &known, "secondaryStatus");
+        assert!(
+            pred.is_none(),
+            "no known fields → escape clause makes it unconstrained"
+        );
+    }
+
+    #[test]
+    fn test_allowed_pattern_wall_type_no_section() {
+        // Simulate R3: wall type requires no sectionType.
+        // Or(
+        //   And(sectionType=="Rectangle", Or(concept=="Bridge", concept=="Tunnel")),
+        //   And(Or(concept=="Gabion_Wall"), PropCount(sectionType, max=0)),
+        //   PropCount(sectionType, max=0),   ← escape
+        //   PropCount(concept, max=0),       ← escape
+        // )
+        let section = |v: &str| ShaclAst::PropEquals {
+            path: PropertyPath::iri("https://example.org/sectionType"),
+            value: json!(v),
+        };
+        let concept = |v: &str| ShaclAst::PropEquals {
+            path: PropertyPath::iri("https://example.org/constructionConcept"),
+            value: json!(v),
+        };
+
+        let ast = ShaclAst::Or {
+            children: vec![
+                ShaclAst::And {
+                    children: vec![
+                        section("Rectangle"),
+                        ShaclAst::Or {
+                            children: vec![concept("Bridge"), concept("Tunnel")],
+                        },
+                    ],
+                },
+                ShaclAst::And {
+                    children: vec![
+                        ShaclAst::Or {
+                            children: vec![concept("Gabion_Wall")],
+                        },
+                        ShaclAst::PropCount {
+                            path: PropertyPath::iri("https://example.org/sectionType"),
+                            min: None,
+                            max: Some(0),
+                        },
+                    ],
+                },
+                ShaclAst::PropCount {
+                    path: PropertyPath::iri("https://example.org/sectionType"),
+                    min: None,
+                    max: Some(0),
+                },
+                ShaclAst::PropCount {
+                    path: PropertyPath::iri("https://example.org/constructionConcept"),
+                    min: None,
+                    max: Some(0),
+                },
+            ],
+        };
+
+        let mut known = serde_json::Map::new();
+        known.insert("constructionConcept".into(), json!("Gabion_Wall"));
+
+        let pred = solve_backward(&ast, &known, "sectionType");
+        assert!(pred.is_some(), "should produce a predicate");
+        let json = serde_json::to_value(pred.unwrap()).unwrap();
+
+        // Gabion_Wall requires no sectionType → impossible predicate (empty in)
+        assert_eq!(json["fieldId"], "sectionType");
+        assert_eq!(json["predicateTypeId"], "in");
+        assert_eq!(json["value"], json!([]));
+    }
+
+    #[test]
+    fn test_propcount_max0_target_field() {
+        // PropCount(target, max=0) alone → should resolve to Bool(false)
+        let ast = ShaclAst::PropCount {
+            path: PropertyPath::iri("https://example.org/myField"),
+            min: None,
+            max: Some(0),
+        };
+        let known = serde_json::Map::new();
+        let pred = solve_backward(&ast, &known, "myField");
+
+        // Bool(false) → impossible predicate
+        assert!(pred.is_some());
+        let json = serde_json::to_value(pred.unwrap()).unwrap();
+        assert_eq!(json["predicateTypeId"], "in");
+        assert_eq!(json["value"], json!([]));
+    }
+
+    #[test]
+    fn test_propcount_min1_target_field() {
+        // PropCount(target, min=1) → should resolve to Bool(true) → None
+        let ast = ShaclAst::PropCount {
+            path: PropertyPath::iri("https://example.org/myField"),
+            min: Some(1),
+            max: None,
+        };
+        let known = serde_json::Map::new();
+        let pred = solve_backward(&ast, &known, "myField");
+
+        assert!(
+            pred.is_none(),
+            "min=1 on target → any concrete value works → None"
+        );
     }
 }
