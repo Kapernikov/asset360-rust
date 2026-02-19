@@ -78,25 +78,125 @@ fn derive_scope_from_sparql(
 
 /// Extract shared attribute names from a SPARQL join pattern.
 ///
-/// Looks for the pattern where `$this` and another variable (`?other`, `?x`, etc.)
-/// are both bound to the same intermediate variable via the same predicate:
+/// Parses the SPARQL into an algebra tree (via spargebra) and walks it to find
+/// the "shared attribute" pattern:
 ///   $this prefix:attr ?joinVar .
 ///   ?other prefix:attr ?joinVar .
+///
+/// Falls back to text-based parsing when the `shacl-parser` feature is disabled.
+#[cfg(feature = "shacl-parser")]
 fn extract_shared_attribute_joins(sparql: &str) -> Vec<String> {
-    // Parse triple patterns: subject predicate object
-    // We're looking for pairs where:
-    //   1. $this has predicate P binding to ?var
-    //   2. Another ?variable has the same predicate P binding to same ?var
+    use spargebra::term::{NamedNodePattern, TermPattern};
+    use spargebra::{Query, SparqlParser};
 
-    let mut this_bindings: Vec<(String, String)> = Vec::new(); // (predicate_local, ?var)
-    let mut other_bindings: Vec<(String, String)> = Vec::new(); // (predicate_local, ?var)
+    let parser = SparqlParser::new()
+        .with_prefix("asset360", "https://data.infrabel.be/asset360/")
+        .expect("hardcoded prefix is valid");
+
+    let query = match parser.parse_query(sparql) {
+        Ok(q) => q,
+        Err(_) => return Vec::new(),
+    };
+
+    let pattern = match query {
+        Query::Select { pattern, .. } => pattern,
+        _ => return Vec::new(),
+    };
+
+    // Collect all BGP triples from the algebra tree
+    let mut triples = Vec::new();
+    collect_bgp_triples(&pattern, &mut triples);
+
+    // Classify triples by subject: $this vs other variables
+    // this_bindings: (predicate_iri, var_name) where subject is ?this ($this)
+    // other_bindings: (predicate_iri, var_name) where subject is any other ?variable
+    let mut this_bindings: Vec<(&str, &str)> = Vec::new();
+    let mut other_bindings: Vec<(&str, &str)> = Vec::new();
+
+    for tp in &triples {
+        let pred_iri = match &tp.predicate {
+            NamedNodePattern::NamedNode(nn) => nn.as_str(),
+            _ => continue,
+        };
+
+        let obj_var = match &tp.object {
+            TermPattern::Variable(v) => v.as_str(),
+            _ => continue,
+        };
+
+        match &tp.subject {
+            TermPattern::Variable(v) if v.as_str() == "this" => {
+                this_bindings.push((pred_iri, obj_var));
+            }
+            TermPattern::Variable(_) => {
+                other_bindings.push((pred_iri, obj_var));
+            }
+            _ => {}
+        }
+    }
+
+    // Find predicates shared between $this and another variable via the same join variable
+    let mut shared = Vec::new();
+    for (pred, var) in &this_bindings {
+        for (other_pred, other_var) in &other_bindings {
+            if pred == other_pred && var == other_var {
+                shared.push(iri_local_name(pred).to_owned());
+            }
+        }
+    }
+
+    shared.sort();
+    shared.dedup();
+    shared
+}
+
+/// Recursively collect all BGP triple patterns from a SPARQL algebra tree.
+#[cfg(feature = "shacl-parser")]
+fn collect_bgp_triples<'a>(
+    pattern: &'a spargebra::algebra::GraphPattern,
+    triples: &mut Vec<&'a spargebra::term::TriplePattern>,
+) {
+    use spargebra::algebra::GraphPattern;
+
+    match pattern {
+        GraphPattern::Bgp { patterns } => {
+            triples.extend(patterns.iter());
+        }
+        GraphPattern::Join { left, right }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => {
+            collect_bgp_triples(left, triples);
+            collect_bgp_triples(right, triples);
+        }
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Group { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Service { inner, .. } => {
+            collect_bgp_triples(inner, triples);
+        }
+        GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+    }
+}
+
+/// Fallback: extract shared attribute names via line-by-line text parsing.
+///
+/// Used when the `shacl-parser` feature (and thus spargebra) is not available.
+#[cfg(not(feature = "shacl-parser"))]
+fn extract_shared_attribute_joins(sparql: &str) -> Vec<String> {
+    let mut this_bindings: Vec<(String, String)> = Vec::new();
+    let mut other_bindings: Vec<(String, String)> = Vec::new();
 
     for line in sparql.lines() {
         let trimmed = line.trim().trim_end_matches(';').trim_end_matches('.');
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
 
-        // Match patterns like: $this prefix:attr ?var
-        // or continuation patterns: prefix:attr ?var (after semicolon)
         if parts.len() >= 3 {
             let subject = parts[0];
             let predicate = parts[1];
@@ -116,7 +216,6 @@ fn extract_shared_attribute_joins(sparql: &str) -> Vec<String> {
         }
     }
 
-    // Find predicates that appear in both $this and ?other with the same join variable
     let mut shared = Vec::new();
     for (pred, var) in &this_bindings {
         for (other_pred, other_var) in &other_bindings {
