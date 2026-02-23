@@ -784,7 +784,7 @@ dependencies = [
 [[package]]
 name = "linkml_meta"
 version = "0.0.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#51ea73252d3ed8b07155fe318d463e1bb3ae9167"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#80df95cd731433d97653836c18f2d754951bb8ba"
 dependencies = [
  "chrono",
  "merge",
@@ -799,7 +799,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#51ea73252d3ed8b07155fe318d463e1bb3ae9167"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#80df95cd731433d97653836c18f2d754951bb8ba"
 dependencies = [
  "linkml_meta",
  "once_cell",
@@ -820,7 +820,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime_python"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#51ea73252d3ed8b07155fe318d463e1bb3ae9167"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#80df95cd731433d97653836c18f2d754951bb8ba"
 dependencies = [
  "linkml_meta",
  "linkml_runtime",
@@ -1709,7 +1709,7 @@ dependencies = [
 [[package]]
 name = "schemaview"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#51ea73252d3ed8b07155fe318d463e1bb3ae9167"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#80df95cd731433d97653836c18f2d754951bb8ba"
 dependencies = [
  "arc-swap",
  "curies",
