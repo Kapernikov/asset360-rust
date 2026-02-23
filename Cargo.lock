@@ -41,6 +41,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "fragile",
+ "getrandom 0.2.17",
  "js-sys",
  "linkml_meta",
  "linkml_runtime",

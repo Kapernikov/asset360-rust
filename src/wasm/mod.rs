@@ -13,6 +13,7 @@ pub mod minijinja;
 pub use minijinja::*;
 
 use linkml_meta::SchemaDefinition;
+use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
 use linkml_runtime::{LinkMLInstance, load_json_str};
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::enumview::EnumView;
@@ -868,6 +869,26 @@ impl LinkMLInstanceHandle {
     pub fn to_plain_json(&self) -> Result<JsValue, JsValue> {
         let json = self.inner.to_json();
         to_js(&json)
+    }
+
+    /// Serialize this instance as Turtle (RDF).
+    #[wasm_bindgen(js_name = toTurtle)]
+    pub fn to_turtle(&self, skolem: Option<bool>) -> Result<String, JsValue> {
+        let sv = self.inner.schema_view();
+        let schema = sv
+            .primary_schema()
+            .ok_or_else(|| JsValue::from_str("no schema loaded"))?;
+        let conv = sv.converter();
+        turtle_to_string(
+            &self.inner,
+            sv,
+            &schema,
+            &conv,
+            TurtleOptions {
+                skolem: skolem.unwrap_or(false),
+            },
+        )
+        .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen(js_name = cloneHandle)]

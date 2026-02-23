@@ -94,6 +94,17 @@ describe('LinkMLInstance wasm bindings', () => {
     expect(navigated!.scalarValue()).to.equal('Al');
   });
 
+  it('serializes instances to turtle', () => {
+    const view = asset360.loadSchemaView(SCHEMA_YAML);
+    const instance = view.loadInstanceFromJson('Person', PERSON_JSON);
+
+    const ttl = instance.toTurtle();
+    expect(ttl).to.be.a('string');
+    expect(ttl).to.include('@prefix');
+    expect(ttl).to.include('ex:name');
+    expect(ttl).to.include('"Alice"');
+  });
+
   it('inspects schema views via wasm', () => {
     const view = asset360.loadSchemaView(SCHEMA_YAML);
 

@@ -13,7 +13,7 @@ pyo3-stub-gen = { version = "0.13.1", optional = true }
 linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python", optional = true }
 linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta" }
 linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview", default-features = false }
-linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime", default-features = false, features = ["slim"] }
+linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime", default-features = false, features = ["slim", "ttl"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_path_to_error = "0.1.17"
@@ -25,6 +25,7 @@ fragile = { version = "2.0", optional = true }
 minijinja = { version = "2.12.0", features = ["loader", "json", "fuel"], optional = true }
 minijinja-contrib = { version = "2.12.0", optional = true, features = ["pycompat"] }
 console_error_panic_hook = { version = "0.1", optional = true }
+getrandom = { version = "0.2", optional = true, features = ["js"] }
 oxttl = { version = "0.2", optional = true }
 oxrdf = { version = "0.3", optional = true }
 spargebra = { version = "0.4", optional = true }
@@ -46,7 +47,7 @@ stubgen = [
     "linkml_meta/stubgen"
 ]
 shacl-parser = ["dep:oxttl", "dep:oxrdf", "dep:spargebra"]
-wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys"]
+wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys", "dep:getrandom"]
 minijinja-wasm = [
     "wasm-bindings",
     "dep:minijinja",
