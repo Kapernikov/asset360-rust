@@ -32,6 +32,7 @@ use crate::blame::{Asset360ChangeMeta, ChangeStage};
 pub mod backward_solver;
 pub mod blame;
 pub mod constraint_set;
+pub mod foreign_references;
 pub mod forward_eval;
 pub mod predicate;
 pub mod scope_predicate;
@@ -69,6 +70,8 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blame_map_to_path_stage_map, m)?)?;
     m.add_function(wrap_pyfunction!(format_blame_map_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_blame_info_py, m)?)?;
+    m.add_function(wrap_pyfunction!(get_foreign_references_py, m)?)?;
+    m.add_class::<PyForeignReference>()?;
     m.add_class::<PyConstraintSet>()?;
     Ok(())
 }
@@ -267,9 +270,9 @@ fn blame_map_to_path_stage_map_impl(
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<Vec<(Vec<String>, Asset360ChangeMeta)>> {
     let bound = value.bind(py);
-    let rust_value = bound.borrow().value.clone();
+    let borrowed = bound.borrow();
     Ok(crate::blame::blame_map_to_path_stage_map(
-        &rust_value,
+        &borrowed.value,
         &blame_map,
     ))
 }
@@ -281,8 +284,8 @@ fn format_blame_map_impl(
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<String> {
     let bound = value.bind(py);
-    let rust_value = bound.borrow().value.clone();
-    Ok(crate::blame::format_blame_map(&rust_value, &blame_map))
+    let borrowed = bound.borrow();
+    Ok(crate::blame::format_blame_map(&borrowed.value, &blame_map))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
@@ -870,9 +873,9 @@ fn get_blame_info_py_impl(
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<Option<Py<PyAsset360ChangeMeta>>> {
     let bound = value.bind(py);
-    let rust_value = bound.borrow().value.clone();
+    let borrowed = bound.borrow();
 
-    if let Some(meta) = crate::blame::get_blame_info(&rust_value, &blame_map) {
+    if let Some(meta) = crate::blame::get_blame_info(&borrowed.value, &blame_map) {
         Ok(Some(Py::new(py, PyAsset360ChangeMeta::from(meta.clone()))?))
     } else {
         Ok(None)
@@ -916,6 +919,128 @@ fn get_blame_info_py(
     blame_map: HashMap<NodeId, Asset360ChangeMeta>,
 ) -> PyResult<Option<Py<PyAsset360ChangeMeta>>> {
     get_blame_info_py_impl(py, value, blame_map)
+}
+
+// ── Foreign references Python bindings ────────────────────────────────
+
+#[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(name = "ForeignReference")]
+#[derive(Clone)]
+struct PyForeignReference {
+    inner: crate::foreign_references::ForeignReference,
+}
+
+#[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PyForeignReference {
+    #[getter]
+    fn uri(&self) -> &str {
+        &self.inner.uri
+    }
+
+    #[getter]
+    fn object_type(&self) -> &str {
+        &self.inner.object_type
+    }
+
+    #[getter]
+    fn object_type_uri(&self) -> &str {
+        &self.inner.object_type_uri
+    }
+
+    #[getter]
+    fn slot_name(&self) -> &str {
+        &self.inner.slot_name
+    }
+
+    #[getter]
+    fn slot_path(&self) -> Vec<String> {
+        self.inner.slot_path.clone()
+    }
+
+    #[getter]
+    fn kind(&self) -> &str {
+        self.inner.kind.as_str()
+    }
+
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("uri", &self.inner.uri)?;
+        dict.set_item("object_type", &self.inner.object_type)?;
+        dict.set_item("object_type_uri", &self.inner.object_type_uri)?;
+        dict.set_item("slot_name", &self.inner.slot_name)?;
+        dict.set_item("slot_path", &self.inner.slot_path)?;
+        dict.set_item("kind", self.inner.kind.as_str())?;
+        Ok(dict.into())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ForeignReference(uri='{}', object_type='{}', slot_name='{}', kind='{}')",
+            self.inner.uri,
+            self.inner.object_type,
+            self.inner.slot_name,
+            self.inner.kind.as_str()
+        )
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+fn get_foreign_references_impl(
+    py: Python<'_>,
+    instance: Py<PyLinkMLInstance>,
+    also_include_id_slots: bool,
+) -> PyResult<Vec<Py<PyForeignReference>>> {
+    let bound = instance.bind(py);
+    let borrowed = bound.borrow();
+    // Borrow the instance rather than cloning the entire tree — this is a hot path.
+    let refs =
+        crate::foreign_references::get_foreign_references(&borrowed.value, also_include_id_slots);
+
+    refs.into_iter()
+        .map(|r| Py::new(py, PyForeignReference { inner: r }))
+        .collect()
+}
+
+#[cfg(all(feature = "python-bindings", feature = "stubgen"))]
+#[gen_stub_pyfunction]
+#[gen_stub(
+    override_return_type(
+        type_repr = "list[asset360_rust.ForeignReference]",
+        imports = ("asset360_rust",)
+    )
+)]
+#[pyfunction(
+    name = "get_foreign_references",
+    signature = (instance, also_include_id_slots=false)
+)]
+fn get_foreign_references_py(
+    py: Python<'_>,
+    #[gen_stub(
+        override_type(
+            type_repr = "asset360_rust.LinkMLInstance",
+            imports = ("asset360_rust",)
+        )
+    )]
+    instance: Py<PyLinkMLInstance>,
+    also_include_id_slots: bool,
+) -> PyResult<Vec<Py<PyForeignReference>>> {
+    get_foreign_references_impl(py, instance, also_include_id_slots)
+}
+
+#[cfg(all(feature = "python-bindings", not(feature = "stubgen")))]
+#[pyfunction(
+    name = "get_foreign_references",
+    signature = (instance, also_include_id_slots=false)
+)]
+fn get_foreign_references_py(
+    py: Python<'_>,
+    instance: Py<PyLinkMLInstance>,
+    also_include_id_slots: bool,
+) -> PyResult<Vec<Py<PyForeignReference>>> {
+    get_foreign_references_impl(py, instance, also_include_id_slots)
 }
 
 // ── ConstraintSet Python bindings ────────────────────────────────────

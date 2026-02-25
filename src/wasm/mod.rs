@@ -909,6 +909,19 @@ impl LinkMLInstanceHandle {
         details.push(format!("node={}", self.node_id()));
         format!("LinkMLInstanceHandle(kind={kind}, {})", details.join(", "))
     }
+
+    /// Return all foreign (and optionally primary/ID) references from this instance tree.
+    #[wasm_bindgen(js_name = getForeignReferences)]
+    pub fn get_foreign_references(
+        &self,
+        also_include_id_slots: Option<bool>,
+    ) -> Result<JsValue, JsValue> {
+        let refs = crate::foreign_references::get_foreign_references(
+            &self.inner,
+            also_include_id_slots.unwrap_or(false),
+        );
+        to_js(&refs)
+    }
 }
 
 #[wasm_bindgen]
