@@ -235,30 +235,6 @@
       },
       {
         "path": [
-          "refersToLocatedNetEntity",
-          "locations",
-          "SPOTLOCATION_MEASURED_BY_GPS"
-        ],
-        "op": "remove",
-        "old": {
-          "SpotLocation_coordinates": {
-            "https://data.infrabel.be/asset360-rsm-subset/GeographicCoordinate": {
-              "PositioningSystemCoordinate_positioningSystem": {
-                "epsgCode": "EPSG:4326",
-                "typeURI": "http://rsm.uic.org/RSM12#EAID_4160AA98_42AF_4b5f_B03C_F15A39D631BA"
-              },
-              "latitude": 50.42992903439764,
-              "longitude": 4.393054789535049,
-              "typeURI": "https://data.infrabel.be/asset360-rsm-subset/GeographicCoordinate"
-            }
-          },
-          "locationrole": "SPOTLOCATION_MEASURED_BY_GPS",
-          "typeURI": "https://data.infrabel.be/asset360-rsm-subset/SpotLocation"
-        },
-        "new": null
-      },
-      {
-        "path": [
           "id"
         ],
         "op": "update",
