@@ -2649,6 +2649,22 @@ class Extension:
     def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     def __new__(cls, extension_tag:builtins.str, extension_value:typing.Any, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None) -> Extension: ...
 
+class ForeignReference:
+    @property
+    def uri(self) -> builtins.str: ...
+    @property
+    def object_type(self) -> builtins.str: ...
+    @property
+    def object_type_uri(self) -> builtins.str: ...
+    @property
+    def slot_name(self) -> builtins.str: ...
+    @property
+    def slot_path(self) -> builtins.list[builtins.str]: ...
+    @property
+    def kind(self) -> builtins.str: ...
+    def to_dict(self) -> dict: ...
+    def __repr__(self) -> builtins.str: ...
+
 class ImportExpression:
     @property
     def import_from(self) -> builtins.str: ...
@@ -5465,9 +5481,23 @@ def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:bui
     r"""
     Compute deltas between two instances.
     
-    Defaults mirror `linkml_runtime.diff.DiffOptions::default()`: missing assignments are
-    treated as absent (`treat_missing_as_null=False`) and identifier changes are emitted as
-    whole-object replacements (`treat_changed_identifier_as_new_object=True`).
+    When ``treat_missing_as_null`` is ``False`` (default), object slots and
+    mapping keys that are present in ``source`` but absent in ``target`` are
+    silently ignored (partial-update semantics). List elements are always
+    treated as complete: a shorter target list produces ``remove`` deltas for
+    trailing source elements regardless of this flag.
+    
+    When ``treat_missing_as_null`` is ``True``, every absent entry is treated as
+    an explicit removal (``update`` to null for object slots, ``remove`` for
+    mapping keys).
+    
+    Note: detecting a mapping key *rename* (delete old key + add new key)
+    requires ``treat_missing_as_null=True``, because the old key is absent from
+    the target and would otherwise be silently ignored.
+    
+    ``treat_changed_identifier_as_new_object`` (default ``True``) emits
+    whole-object replacements when the identifier/key slot of an inlined object
+    changes.
     """
 
 def format_blame_map(value:asset360_rust.LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> builtins.str: ...
@@ -5486,6 +5516,8 @@ def get_all_classes_by_type_designator_and_schema(schemaview:asset360_rust.Schem
     """
 
 def get_blame_info(value:LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> typing.Optional[asset360_rust.Asset360ChangeMeta]: ...
+
+def get_foreign_references(instance:asset360_rust.LinkMLInstance, also_include_id_slots:builtins.bool=False) -> list[asset360_rust.ForeignReference]: ...
 
 def load_json(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[typing.Optional[LinkMLInstance], builtins.list[ValidationResult]]: ...
 

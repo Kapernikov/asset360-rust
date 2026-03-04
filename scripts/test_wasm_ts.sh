@@ -36,14 +36,15 @@ PY
 PKG_NAME="${PKG_META[0]}"
 PKG_VERSION="${PKG_META[1]}"
 
-TARBALL_PATH="${REPO_ROOT}/target/wasm/${PKG_NAME}-${PKG_VERSION}.tgz"
+PKG_PARENT_DIR="$(dirname "${WASM_OUT_DIR}")"
+TARBALL_PATH="${REPO_ROOT}/${PKG_PARENT_DIR}/${PKG_NAME}-${PKG_VERSION}.tgz"
 
 if [[ ! -f "${TARBALL_PATH}" ]]; then
   echo "error: npm tarball '${TARBALL_PATH}' not found. run 'scripts/build_wasm.sh' first." >&2
   exit 1
 fi
 
-TARBALL_CONTAINER_PATH="/work/target/wasm/${PKG_NAME}-${PKG_VERSION}.tgz"
+TARBALL_CONTAINER_PATH="/work/${PKG_PARENT_DIR}/${PKG_NAME}-${PKG_VERSION}.tgz"
 
 DOCKER_CMD="set -euo pipefail; if [[ -f package-lock.json ]]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi; npm install --no-save --no-audit --no-fund '${TARBALL_CONTAINER_PATH}'; npm test"
 

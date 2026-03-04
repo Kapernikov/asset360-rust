@@ -56,13 +56,16 @@ fn derive_scope_from_sparql(
         return None;
     }
 
-    let focus_uri = focus_data.get(uri_field)?;
+    let focus_uri = focus_data.get(uri_field).filter(|v| !v.is_null())?;
 
     let mut predicates: Vec<Predicate> = Vec::new();
 
-    // Add equality constraints for each shared attribute
+    // Add equality constraints for each shared attribute.
+    // Skip when the focus value is null/missing — a null join attribute means
+    // the cross-object constraint doesn't apply (e.g. a CivilEngineeringAsset
+    // that doesn't belong to any TunnelComplex has no delegate uniqueness to check).
     for attr in &shared_attrs {
-        let value = focus_data.get(attr)?;
+        let value = focus_data.get(attr).filter(|v| !v.is_null())?;
         predicates.push(Predicate::simple(attr, "equals", value.clone()));
     }
 
@@ -364,6 +367,39 @@ mod tests {
             pred.is_none(),
             "missing focus data → can't fill scope predicate"
         );
+    }
+
+    #[test]
+    fn test_null_shared_attribute_returns_none() {
+        // When the focus object has belongsToTunnelComplex = null, there is no
+        // tunnel complex to check delegate uniqueness against → no scope needed.
+        // Previously this would produce belongsToTunnelComplex = null, matching
+        // ALL objects where the field is null (potentially thousands).
+        let shape = delegate_shape();
+        let mut focus = serde_json::Map::new();
+        focus.insert(
+            "asset360_uri".into(),
+            json!("https://example.org/tunnel-component-42"),
+        );
+        focus.insert("belongsToTunnelComplex".into(), serde_json::Value::Null);
+        focus.insert("isTunnelDelegate".into(), json!(true));
+
+        let pred = derive_scope_predicate(&shape, &focus, "asset360_uri");
+        assert!(
+            pred.is_none(),
+            "null shared attribute → no scope (constraint does not apply)"
+        );
+    }
+
+    #[test]
+    fn test_null_uri_field_returns_none() {
+        let shape = delegate_shape();
+        let mut focus = serde_json::Map::new();
+        focus.insert("asset360_uri".into(), serde_json::Value::Null);
+        focus.insert("belongsToTunnelComplex".into(), json!("complex-7"));
+
+        let pred = derive_scope_predicate(&shape, &focus, "asset360_uri");
+        assert!(pred.is_none(), "null URI → no scope");
     }
 
     #[test]

@@ -42,7 +42,7 @@ pre-commit:
 	@$(MAKE) test-py
 
 test-ts: npm
-	@NODE_IMAGE=$(NODE_IMAGE) bash scripts/test_wasm_ts.sh
+	@NODE_IMAGE=$(NODE_IMAGE) WASM_OUT_DIR=$(WASM_OUT_DIR) bash scripts/test_wasm_ts.sh
 
 test-py:
 	@bash scripts/test-python.sh
