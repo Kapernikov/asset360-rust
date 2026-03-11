@@ -784,7 +784,7 @@ dependencies = [
 [[package]]
 name = "linkml_meta"
 version = "0.0.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#0e33dfc724c38755b450220d83ed7959510f18ce"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#14cf4aef17e4498c541e64d5761c817a6ade91e4"
 dependencies = [
  "chrono",
  "merge",
@@ -799,7 +799,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#0e33dfc724c38755b450220d83ed7959510f18ce"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#14cf4aef17e4498c541e64d5761c817a6ade91e4"
 dependencies = [
  "linkml_meta",
  "once_cell",
@@ -820,7 +820,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime_python"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#0e33dfc724c38755b450220d83ed7959510f18ce"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#14cf4aef17e4498c541e64d5761c817a6ade91e4"
 dependencies = [
  "linkml_meta",
  "linkml_runtime",
@@ -1705,9 +1705,9 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "schannel"
-version = "0.1.28"
+version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891d81b926048e76efe18581bf793546b4c0eaf8448d72be8de2bbee5fd166e1"
+checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
 ]
@@ -1715,7 +1715,7 @@ dependencies = [
 [[package]]
 name = "schemaview"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#0e33dfc724c38755b450220d83ed7959510f18ce"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#14cf4aef17e4498c541e64d5761c817a6ade91e4"
 dependencies = [
  "arc-swap",
  "curies",
@@ -2116,9 +2116,9 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tempfile"
-version = "3.26.0"
+version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
  "getrandom 0.4.2",
