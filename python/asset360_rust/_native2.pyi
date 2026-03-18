@@ -5502,6 +5502,22 @@ def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:bui
 
 def format_blame_map(value:asset360_rust.LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> builtins.str: ...
 
+def from_turtle(turtle_str:builtins.str, schema_view:SchemaView, root_classes:typing.Sequence[builtins.str]) -> builtins.dict[builtins.str, builtins.list[LinkMLInstance]]:
+    r"""
+    Import RDF/Turtle data into LinkML instances.
+    
+    Parses the given Turtle string and harvests instances of the specified
+    root classes from the RDF graph, guided by the loaded schema.
+    
+    Args:
+        turtle_str: RDF/Turtle content as a string.
+        schema_view: A SchemaView with the schema loaded.
+        root_classes: List of class names to extract as top-level instances.
+    
+    Returns:
+        A dict mapping class names to lists of LinkMLInstance objects.
+    """
+
 def get_all_classes_by_type_designator_and_schema(schemaview:asset360_rust.SchemaView, only_registered:builtins.bool=True, only_default:builtins.bool=True, managed_annotation:builtins.str='data.infrabel.be/asset360/managed') -> dict[str, asset360_rust.ClassView]:
     r"""
     Return every class keyed by its resolved type designator.
