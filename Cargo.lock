@@ -42,6 +42,7 @@ dependencies = [
  "console_error_panic_hook",
  "fragile",
  "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "js-sys",
  "linkml_meta",
  "linkml_runtime",
