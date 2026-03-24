@@ -3410,12 +3410,63 @@ class Prefix:
     def prefix_reference(self, value: builtins.str) -> None: ...
     def __new__(cls, prefix_prefix:builtins.str, prefix_reference:builtins.str) -> Prefix: ...
 
+class PyFilterCondition:
+    r"""
+    A filter condition extracted from the SPARQL query, pushable to SQL.
+    
+    Each condition has an ``operator`` (``"eq"`` or ``"in"``) and one or more
+    string ``values``. The Django view translates these to ORM lookups::
+    
+        for field, conditions in scope.predicate_filters.items():
+            for cond in conditions:
+                if cond.operator == "eq":
+                    qs = qs.filter(**{f"object_data__{field}": cond.value})
+                elif cond.operator == "in":
+                    qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+    """
+    @property
+    def operator(self) -> builtins.str:
+        r"""
+        The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
+        """
+    @property
+    def value(self) -> builtins.str:
+        r"""
+        The filter value (for ``"eq"`` conditions).
+        
+        Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
+        an empty condition (should not happen in practice).
+        """
+    @property
+    def values(self) -> builtins.list[builtins.str]:
+        r"""
+        All filter values as a list.
+        
+        For ``"eq"``: single-element list. For ``"in"``: multiple values.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class PyScopeResult:
     r"""
     Result of analysing a SPARQL query for database scoping.
     
     Tells the Django view which objects to fetch from PostgreSQL and which
     filters to apply. See the ``sparql_scope()`` function.
+    
+    Example::
+    
+        scope = lr.sparql_scope(query, schema_view)
+        if scope.schema_only:
+            instances = []
+        else:
+            for asset_type in scope.asset_types:
+                qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
+                if scope.uri_filters:
+                    qs = qs.filter(asset360_uri__in=scope.uri_filters)
+                for field, conditions in scope.predicate_filters.items():
+                    for cond in conditions:
+                        if cond.operator == "eq":
+                            qs = qs.filter(**{f"object_data__{field}": cond.value})
     """
     @property
     def asset_types(self) -> builtins.list[builtins.str]:
@@ -3447,18 +3498,13 @@ class PyScopeResult:
         need no instance data — answered from schema triples alone.
         """
     @property
-    def predicate_filters(self) -> builtins.dict[builtins.str, builtins.list[builtins.list[builtins.str]]]:
+    def predicate_filters(self) -> builtins.dict[builtins.str, builtins.list[PyFilterCondition]]:
         r"""
         Field-level filters pushable to SQL as JSONB lookups.
         
-        Dict mapping slot names to lists of conditions. Each condition
-        is a list where the first element is the operator:
-        
-        - ``["eq", "BX517"]`` → ``WHERE object_data->>'name' = 'BX517'``
-        - ``["in", "BX517", "BX518"]`` → ``WHERE object_data->>'name' IN (...)``
-        
+        Dict mapping LinkML slot names to lists of :class:`FilterCondition`.
         Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
-        clauses when ``?var`` is bound to a known predicate.
+        clauses where ``?var`` is bound to a known predicate.
         """
     @property
     def sql_limit(self) -> typing.Optional[builtins.int]:

@@ -83,6 +83,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_sparql_execute, m)?)?;
         m.add_function(wrap_pyfunction!(py_schema_to_triples, m)?)?;
         m.add_class::<PyScopeResult>()?;
+        m.add_class::<PyFilterCondition>()?;
     }
     Ok(())
 }
@@ -1191,6 +1192,85 @@ impl PyConstraintSet {
 // ---- SPARQL endpoint PyO3 bindings ----
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass(name = "FilterCondition")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// A filter condition extracted from the SPARQL query, pushable to SQL.
+///
+/// Each condition has an `operator` (`"eq"` or `"in"`) and one or more
+/// string `values`. The Django view translates these to ORM lookups.
+///
+/// Python usage:
+///
+/// ```python
+/// for field, conditions in scope.predicate_filters.items():
+///     for cond in conditions:
+///         if cond.operator == "eq":
+///             qs = qs.filter(**{f"object_data__{field}": cond.value})
+///         elif cond.operator == "in":
+///             qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+/// ```
+pub struct PyFilterCondition {
+    operator: String,
+    values: Vec<String>,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PyFilterCondition {
+    /// The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
+    #[getter]
+    fn operator(&self) -> &str {
+        &self.operator
+    }
+
+    /// The filter value (for ``"eq"`` conditions).
+    ///
+    /// Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
+    /// an empty condition (should not happen in practice).
+    #[getter]
+    fn value(&self) -> PyResult<&str> {
+        self.values
+            .first()
+            .map(|s| s.as_str())
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("empty filter condition"))
+    }
+
+    /// All filter values as a list.
+    ///
+    /// For ``"eq"``: single-element list. For ``"in"``: multiple values.
+    #[getter]
+    fn values(&self) -> Vec<String> {
+        self.values.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        if self.operator == "eq" {
+            format!("FilterCondition(eq={:?})", self.values.first().unwrap_or(&String::new()))
+        } else {
+            format!("FilterCondition(in={:?})", self.values)
+        }
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+impl PyFilterCondition {
+    fn from_rust(cond: &crate::sparql_scoper::FilterCondition) -> Self {
+        match cond {
+            crate::sparql_scoper::FilterCondition::Eq(v) => Self {
+                operator: "eq".to_owned(),
+                values: vec![v.clone()],
+            },
+            crate::sparql_scoper::FilterCondition::In(vs) => Self {
+                operator: "in".to_owned(),
+                values: vs.clone(),
+            },
+        }
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyclass(name = "ScopeResult")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
@@ -1198,13 +1278,30 @@ impl PyConstraintSet {
 ///
 /// Tells the Django view which objects to fetch from PostgreSQL and which
 /// filters to apply. See the ``sparql_scope()`` function.
+///
+/// Python usage:
+///
+/// ```python
+/// scope = lr.sparql_scope(query, schema_view)
+/// if scope.schema_only:
+///     instances = []
+/// else:
+///     for asset_type in scope.asset_types:
+///         qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
+///         if scope.uri_filters:
+///             qs = qs.filter(asset360_uri__in=scope.uri_filters)
+///         for field, conditions in scope.predicate_filters.items():
+///             for cond in conditions:
+///                 if cond.operator == "eq":
+///                     qs = qs.filter(**{f"object_data__{field}": cond.value})
+/// ```
 pub struct PyScopeResult {
     asset_types: Vec<String>,
     uri_filters: Vec<String>,
     is_bounded: bool,
     estimated_count: Option<usize>,
     schema_only: bool,
-    predicate_filters: HashMap<String, Vec<Vec<String>>>,
+    predicate_filters: HashMap<String, Vec<PyFilterCondition>>,
     sql_limit: Option<usize>,
 }
 
@@ -1248,16 +1345,11 @@ impl PyScopeResult {
 
     /// Field-level filters pushable to SQL as JSONB lookups.
     ///
-    /// Dict mapping slot names to lists of conditions. Each condition
-    /// is a list where the first element is the operator:
-    ///
-    /// - ``["eq", "BX517"]`` → ``WHERE object_data->>'name' = 'BX517'``
-    /// - ``["in", "BX517", "BX518"]`` → ``WHERE object_data->>'name' IN (...)``
-    ///
+    /// Dict mapping LinkML slot names to lists of :class:`FilterCondition`.
     /// Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
-    /// clauses when ``?var`` is bound to a known predicate.
+    /// clauses where ``?var`` is bound to a known predicate.
     #[getter]
-    fn predicate_filters(&self) -> HashMap<String, Vec<Vec<String>>> {
+    fn predicate_filters(&self) -> HashMap<String, Vec<PyFilterCondition>> {
         self.predicate_filters.clone()
     }
 
@@ -1302,26 +1394,14 @@ fn py_sparql_scope(
 
     match crate::sparql_scoper::sparql_scope(query, sv) {
         Ok(result) => {
-            // Convert predicate_filters to Python-friendly format:
-            // HashMap<String, Vec<FilterCondition>> → HashMap<String, Vec<Vec<String>>>
-            // Eq("val") → ["eq", "val"], In(["v1","v2"]) → ["in", "v1", "v2"]
-            let mut py_filters: HashMap<String, Vec<Vec<String>>> = HashMap::new();
-            for (field, conditions) in &result.predicate_filters {
-                let mut py_conds = Vec::new();
-                for cond in conditions {
-                    match cond {
-                        crate::sparql_scoper::FilterCondition::Eq(v) => {
-                            py_conds.push(vec!["eq".to_owned(), v.clone()]);
-                        }
-                        crate::sparql_scoper::FilterCondition::In(vs) => {
-                            let mut entry = vec!["in".to_owned()];
-                            entry.extend(vs.iter().cloned());
-                            py_conds.push(entry);
-                        }
-                    }
-                }
-                py_filters.insert(field.clone(), py_conds);
-            }
+            let py_filters: HashMap<String, Vec<PyFilterCondition>> = result
+                .predicate_filters
+                .iter()
+                .map(|(field, conds)| {
+                    let py_conds = conds.iter().map(PyFilterCondition::from_rust).collect();
+                    (field.clone(), py_conds)
+                })
+                .collect();
 
             Ok(PyScopeResult {
                 asset_types: result.asset_types,
