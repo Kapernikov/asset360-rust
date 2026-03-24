@@ -2649,6 +2649,46 @@ class Extension:
     def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     def __new__(cls, extension_tag:builtins.str, extension_value:typing.Any, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None) -> Extension: ...
 
+class FilterCondition:
+    r"""
+    A filter condition extracted from the SPARQL query, pushable to SQL.
+    
+    Each condition has an `operator` (`"eq"` or `"in"`) and one or more
+    string `values`. The Django view translates these to ORM lookups.
+    
+    Python usage:
+    
+    ```python
+    for field, conditions in scope.predicate_filters.items():
+        for cond in conditions:
+            if cond.operator == "eq":
+                qs = qs.filter(**{f"object_data__{field}": cond.value})
+            elif cond.operator == "in":
+                qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+    ```
+    """
+    @property
+    def operator(self) -> builtins.str:
+        r"""
+        The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
+        """
+    @property
+    def value(self) -> builtins.str:
+        r"""
+        The filter value (for ``"eq"`` conditions).
+        
+        Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
+        an empty condition (should not happen in practice).
+        """
+    @property
+    def values(self) -> builtins.list[builtins.str]:
+        r"""
+        All filter values as a list.
+        
+        For ``"eq"``: single-element list. For ``"in"``: multiple values.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class ForeignReference:
     @property
     def uri(self) -> builtins.str: ...
@@ -3410,109 +3450,6 @@ class Prefix:
     def prefix_reference(self, value: builtins.str) -> None: ...
     def __new__(cls, prefix_prefix:builtins.str, prefix_reference:builtins.str) -> Prefix: ...
 
-class PyFilterCondition:
-    r"""
-    A filter condition extracted from the SPARQL query, pushable to SQL.
-    
-    Each condition has an `operator` (`"eq"` or `"in"`) and one or more
-    string `values`. The Django view translates these to ORM lookups.
-    
-    Python usage:
-    
-    ```python
-    for field, conditions in scope.predicate_filters.items():
-        for cond in conditions:
-            if cond.operator == "eq":
-                qs = qs.filter(**{f"object_data__{field}": cond.value})
-            elif cond.operator == "in":
-                qs = qs.filter(**{f"object_data__{field}__in": cond.values})
-    ```
-    """
-    @property
-    def operator(self) -> builtins.str:
-        r"""
-        The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
-        """
-    @property
-    def value(self) -> builtins.str:
-        r"""
-        The filter value (for ``"eq"`` conditions).
-        
-        Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
-        an empty condition (should not happen in practice).
-        """
-    @property
-    def values(self) -> builtins.list[builtins.str]:
-        r"""
-        All filter values as a list.
-        
-        For ``"eq"``: single-element list. For ``"in"``: multiple values.
-        """
-    def __repr__(self) -> builtins.str: ...
-
-class PyScopeResult:
-    r"""
-    Result of analysing a SPARQL query for database scoping.
-    
-    Tells the Django view which objects to fetch from PostgreSQL and which
-    filters to apply. See the ``sparql_scope()`` function.
-    
-    Python usage:
-    
-    ```python
-    scope = lr.sparql_scope(query, schema_view)
-    for asset_type in scope.asset_types:
-        qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
-        if scope.uri_filters:
-            qs = qs.filter(asset360_uri__in=scope.uri_filters)
-        for field, conditions in scope.predicate_filters.items():
-            for cond in conditions:
-                if cond.operator == "eq":
-                    qs = qs.filter(**{f"object_data__{field}": cond.value})
-    ```
-    """
-    @property
-    def asset_types(self) -> builtins.list[builtins.str]:
-        r"""
-        LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
-        Derived from ``rdf:type`` patterns in the query.
-        """
-    @property
-    def uri_filters(self) -> builtins.list[builtins.str]:
-        r"""
-        Specific ``asset360_uri`` values referenced in the query.
-        Used for ``WHERE asset360_uri IN (...)`` lookups.
-        """
-    @property
-    def is_bounded(self) -> builtins.bool:
-        r"""
-        Whether the query scope is bounded (safe to execute).
-        False means the query would load the entire database.
-        """
-    @property
-    def estimated_count(self) -> typing.Optional[builtins.int]:
-        r"""
-        Estimated object count, if determinable. Currently always None.
-        """
-    @property
-    def predicate_filters(self) -> builtins.dict[builtins.str, builtins.list[PyFilterCondition]]:
-        r"""
-        Field-level filters pushable to SQL as JSONB lookups.
-        
-        Dict mapping LinkML slot names to lists of :class:`FilterCondition`.
-        Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
-        clauses where ``?var`` is bound to a known predicate.
-        """
-    @property
-    def sql_limit(self) -> typing.Optional[builtins.int]:
-        r"""
-        SQL LIMIT to push down for single-type queries.
-        
-        Only set when the query targets one asset type and has a top-level
-        ``LIMIT``. For multi-type joins the LIMIT applies to the joined
-        result, not individual fetches, so it cannot be pushed to SQL.
-        """
-
 class ReachabilityQuery:
     @property
     def source_ontology(self) -> typing.Optional[builtins.str]: ...
@@ -3913,6 +3850,69 @@ class SchemaView:
         """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
+
+class ScopeResult:
+    r"""
+    Result of analysing a SPARQL query for database scoping.
+    
+    Tells the Django view which objects to fetch from PostgreSQL and which
+    filters to apply. See the ``sparql_scope()`` function.
+    
+    Python usage:
+    
+    ```python
+    scope = lr.sparql_scope(query, schema_view)
+    for asset_type in scope.asset_types:
+        qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
+        if scope.uri_filters:
+            qs = qs.filter(asset360_uri__in=scope.uri_filters)
+        for field, conditions in scope.predicate_filters.items():
+            for cond in conditions:
+                if cond.operator == "eq":
+                    qs = qs.filter(**{f"object_data__{field}": cond.value})
+    ```
+    """
+    @property
+    def asset_types(self) -> builtins.list[builtins.str]:
+        r"""
+        LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
+        Derived from ``rdf:type`` patterns in the query.
+        """
+    @property
+    def uri_filters(self) -> builtins.list[builtins.str]:
+        r"""
+        Specific ``asset360_uri`` values referenced in the query.
+        Used for ``WHERE asset360_uri IN (...)`` lookups.
+        """
+    @property
+    def is_bounded(self) -> builtins.bool:
+        r"""
+        Whether the query scope is bounded (safe to execute).
+        False means the query would load the entire database.
+        """
+    @property
+    def estimated_count(self) -> typing.Optional[builtins.int]:
+        r"""
+        Estimated object count, if determinable. Currently always None.
+        """
+    @property
+    def predicate_filters(self) -> builtins.dict[builtins.str, builtins.list[FilterCondition]]:
+        r"""
+        Field-level filters pushable to SQL as JSONB lookups.
+        
+        Dict mapping LinkML slot names to lists of :class:`FilterCondition`.
+        Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
+        clauses where ``?var`` is bound to a known predicate.
+        """
+    @property
+    def sql_limit(self) -> typing.Optional[builtins.int]:
+        r"""
+        SQL LIMIT to push down for single-type queries.
+        
+        Only set when the query targets one asset type and has a top-level
+        ``LIMIT``. For multi-type joins the LIMIT applies to the joined
+        result, not individual fetches, so it cannot be pushed to SQL.
+        """
 
 class Setting:
     @property
@@ -5690,7 +5690,7 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             or query execution error.
     """
 
-def sparql_scope(query:builtins.str, schema_view:SchemaView) -> PyScopeResult:
+def sparql_scope(query:builtins.str, schema_view:SchemaView) -> ScopeResult:
     r"""
     Analyse a SPARQL query and determine what to fetch from the database.
     

@@ -81,8 +81,8 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
-        m.add_class::<PyScopeResult>()?;
-        m.add_class::<PyFilterCondition>()?;
+        m.add_class::<ScopeResult>()?;
+        m.add_class::<FilterCondition>()?;
     }
     Ok(())
 }
@@ -1191,7 +1191,7 @@ impl PyConstraintSet {
 // ---- SPARQL endpoint PyO3 bindings ----
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass(name = "FilterCondition")]
+#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
@@ -1209,7 +1209,7 @@ impl PyConstraintSet {
 ///         elif cond.operator == "in":
 ///             qs = qs.filter(**{f"object_data__{field}__in": cond.values})
 /// ```
-pub struct PyFilterCondition {
+pub struct FilterCondition {
     operator: String,
     values: Vec<String>,
 }
@@ -1217,7 +1217,7 @@ pub struct PyFilterCondition {
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
-impl PyFilterCondition {
+impl FilterCondition {
     /// The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
     #[getter]
     fn operator(&self) -> &str {
@@ -1254,7 +1254,7 @@ impl PyFilterCondition {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-impl PyFilterCondition {
+impl FilterCondition {
     fn from_rust(cond: &crate::sparql_scoper::FilterCondition) -> Self {
         match cond {
             crate::sparql_scoper::FilterCondition::Eq(v) => Self {
@@ -1270,7 +1270,7 @@ impl PyFilterCondition {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass(name = "ScopeResult")]
+#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
 /// Result of analysing a SPARQL query for database scoping.
@@ -1291,19 +1291,19 @@ impl PyFilterCondition {
 ///             if cond.operator == "eq":
 ///                 qs = qs.filter(**{f"object_data__{field}": cond.value})
 /// ```
-pub struct PyScopeResult {
+pub struct ScopeResult {
     asset_types: Vec<String>,
     uri_filters: Vec<String>,
     is_bounded: bool,
     estimated_count: Option<usize>,
-    predicate_filters: HashMap<String, Vec<PyFilterCondition>>,
+    predicate_filters: HashMap<String, Vec<FilterCondition>>,
     sql_limit: Option<usize>,
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
-impl PyScopeResult {
+impl ScopeResult {
     /// LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
     /// Derived from ``rdf:type`` patterns in the query.
     #[getter]
@@ -1337,7 +1337,7 @@ impl PyScopeResult {
     /// Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
     /// clauses where ``?var`` is bound to a known predicate.
     #[getter]
-    fn predicate_filters(&self) -> HashMap<String, Vec<PyFilterCondition>> {
+    fn predicate_filters(&self) -> HashMap<String, Vec<FilterCondition>> {
         self.predicate_filters.clone()
     }
 
@@ -1374,23 +1374,23 @@ fn sparql_scope(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
-) -> PyResult<PyScopeResult> {
+) -> PyResult<ScopeResult> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
     match crate::sparql_scoper::sparql_scope(query, sv) {
         Ok(result) => {
-            let py_filters: HashMap<String, Vec<PyFilterCondition>> = result
+            let py_filters: HashMap<String, Vec<FilterCondition>> = result
                 .predicate_filters
                 .iter()
                 .map(|(field, conds)| {
-                    let py_conds = conds.iter().map(PyFilterCondition::from_rust).collect();
+                    let py_conds = conds.iter().map(FilterCondition::from_rust).collect();
                     (field.clone(), py_conds)
                 })
                 .collect();
 
-            Ok(PyScopeResult {
+            Ok(ScopeResult {
                 asset_types: result.asset_types,
                 uri_filters: result.uri_filters,
                 is_bounded: result.is_bounded,
