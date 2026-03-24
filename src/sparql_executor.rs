@@ -1,9 +1,20 @@
-//! SPARQL executor: load LinkML instances into Oxigraph, execute queries, return results.
+//! SPARQL query execution against in-memory Oxigraph.
 //!
-//! This module wraps Oxigraph's in-memory store to:
-//! 1. Pre-load schema triples (class hierarchy, property definitions)
-//! 2. Convert LinkMLInstance objects to RDF via `as_turtle()` and load into store
-//! 3. Execute SPARQL queries and serialize results
+//! This is the second half of the virtual SPARQL endpoint pipeline. After the
+//! scoper ([`crate::sparql_scoper`]) has determined which objects to fetch and
+//! the Django view has loaded them as [`LinkMLInstance`] objects, this module:
+//!
+//! 1. Creates a fresh in-memory Oxigraph store.
+//! 2. Pre-loads **schema triples** (class hierarchy and property definitions
+//!    derived from the LinkML schema) so introspection queries work.
+//! 3. Converts each [`LinkMLInstance`] to Turtle via `as_turtle()` and loads
+//!    the resulting RDF triples into the store.
+//! 4. Executes the SPARQL query against the store.
+//! 5. Serialises the results to SPARQL JSON Results (for SELECT/ASK) or
+//!    N-Triples (for CONSTRUCT/DESCRIBE).
+//!
+//! No data persists between queries — the store is created and destroyed per
+//! request. Caching is planned as a future optimisation.
 
 #[cfg(feature = "sparql-endpoint")]
 use oxigraph::io::RdfFormat;
@@ -16,13 +27,33 @@ use linkml_runtime::LinkMLInstance;
 use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
 use linkml_schemaview::schemaview::SchemaView;
 
-/// Errors from SPARQL execution.
+/// Errors that can occur during SPARQL query execution.
 #[derive(Debug)]
 pub enum ExecuteError {
+    /// A [`LinkMLInstance`] could not be converted to RDF triples.
+    ///
+    /// This is a data quality issue — the object's JSON data is malformed or
+    /// incompatible with the LinkML schema. The `object_uri` identifies which
+    /// object failed so the user can investigate.
+    ///
+    /// The endpoint returns this as HTTP 500 with the object URI in the
+    /// response body. The spec requires failing the entire query rather than
+    /// silently skipping the bad object.
     ConversionError { object_uri: String, message: String },
+
+    /// The total number of RDF triples in the store exceeds the configured
+    /// limit. This prevents memory exhaustion from queries that scope to a
+    /// large number of wide objects (many properties per object).
     TripleLimitExceeded { count: usize, limit: usize },
+
+    /// The query produced more result rows than the configured limit.
+    /// The endpoint returns HTTP 422 with a suggestion to narrow the query.
     ResultLimitExceeded { count: usize, limit: usize },
+
+    /// Oxigraph returned an error while executing the SPARQL query.
     QueryError(String),
+
+    /// Internal error creating or loading data into the Oxigraph store.
     StoreError(String),
 }
 
@@ -44,9 +75,24 @@ impl std::fmt::Display for ExecuteError {
     }
 }
 
-/// Configuration limits for query execution.
+/// Resource limits for query execution.
+///
+/// These prevent denial-of-service from expensive queries. When a limit is
+/// exceeded, the executor returns a descriptive error (not a generic timeout)
+/// so the user knows which limit was hit and how to narrow their query.
 pub struct ExecuteLimits {
+    /// Maximum number of RDF triples allowed in the in-memory store.
+    ///
+    /// Checked after loading all instance data. Each object produces roughly
+    /// `1 + number_of_slots` triples (one `rdf:type` + one per property).
+    /// Default: 500,000.
     pub max_triples: usize,
+
+    /// Maximum number of result rows returned by a SELECT query.
+    ///
+    /// Checked during result iteration — if the query produces more rows
+    /// than this limit, execution stops and an error is returned.
+    /// Default: 10,000.
     pub max_result_rows: usize,
 }
 
@@ -59,10 +105,18 @@ impl Default for ExecuteLimits {
     }
 }
 
-/// Generate RDF triples (as Turtle) from the LinkML schema.
+/// Generate RDF schema triples (as Turtle) from the LinkML schema.
 ///
-/// Produces rdfs:Class, rdfs:subClassOf, rdf:Property, rdfs:domain, rdfs:range
-/// triples for all classes and slots in the schema.
+/// Walks all classes and slots in the schema and produces:
+/// - `<class_uri> a rdfs:Class` for each class
+/// - `<class_uri> rdfs:subClassOf <parent_uri>` for inheritance
+/// - `<slot_uri> a rdf:Property` for each slot
+/// - `<slot_uri> rdfs:domain <class_uri>` for the owning class
+/// - `<slot_uri> rdfs:range <range_uri>` for object-property ranges
+///
+/// These triples are loaded into the Oxigraph store before instance data,
+/// enabling introspection queries like `SELECT ?c WHERE { ?c a rdfs:Class }`
+/// without touching PostgreSQL.
 pub fn schema_to_triples(schema_view: &SchemaView) -> String {
     let mut turtle = String::new();
     turtle.push_str("@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n");
@@ -117,11 +171,34 @@ pub fn schema_to_triples(schema_view: &SchemaView) -> String {
 
 /// Execute a SPARQL query against a set of LinkML instances.
 ///
-/// 1. Creates an in-memory Oxigraph store
-/// 2. Loads schema triples
-/// 3. Converts each instance to Turtle and loads into store
-/// 4. Executes the query
-/// 5. Serializes results to the requested format
+/// This is the main entry point for query execution. The caller (Django view)
+/// has already used [`crate::sparql_scoper::sparql_scope`] to determine which
+/// objects to fetch and has loaded them as [`LinkMLInstance`] objects.
+///
+/// # Arguments
+///
+/// * `query_str` — The SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
+/// * `instances` — The LinkML instances to query against. Each instance is
+///   converted to RDF triples via `as_turtle()` and loaded into an ephemeral
+///   in-memory Oxigraph store. Pass an empty slice for schema-only queries.
+/// * `schema_view` — Used to generate schema triples (class hierarchy,
+///   property definitions) that are pre-loaded into the store.
+/// * `format` — Output serialisation format:
+///   - `"json"` → SPARQL JSON Results (`application/sparql-results+json`)
+///     for SELECT and ASK queries.
+///   - `"turtle"` or `"text/turtle"` → N-Triples output for CONSTRUCT and
+///     DESCRIBE queries.
+/// * `limits` — Resource limits (max triples, max result rows) to prevent
+///   denial-of-service from expensive queries.
+///
+/// # Errors
+///
+/// * [`ExecuteError::ConversionError`] — an instance's `as_turtle()` failed
+///   (data quality issue). The entire query fails; no partial results.
+/// * [`ExecuteError::TripleLimitExceeded`] — too many triples in the store.
+/// * [`ExecuteError::ResultLimitExceeded`] — too many result rows.
+/// * [`ExecuteError::QueryError`] — Oxigraph query execution error.
+/// * [`ExecuteError::StoreError`] — internal store creation/loading error.
 #[cfg(feature = "sparql-endpoint")]
 pub fn sparql_execute(
     query_str: &str,

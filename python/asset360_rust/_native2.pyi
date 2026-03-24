@@ -3411,25 +3411,63 @@ class Prefix:
     def __new__(cls, prefix_prefix:builtins.str, prefix_reference:builtins.str) -> Prefix: ...
 
 class PyScopeResult:
+    r"""
+    Result of analysing a SPARQL query for database scoping.
+    
+    Tells the Django view which objects to fetch from PostgreSQL and which
+    filters to apply. See the ``sparql_scope()`` function.
+    """
     @property
-    def asset_types(self) -> builtins.list[builtins.str]: ...
+    def asset_types(self) -> builtins.list[builtins.str]:
+        r"""
+        LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
+        Derived from ``rdf:type`` patterns in the query.
+        """
     @property
-    def uri_filters(self) -> builtins.list[builtins.str]: ...
+    def uri_filters(self) -> builtins.list[builtins.str]:
+        r"""
+        Specific ``asset360_uri`` values referenced in the query.
+        Used for ``WHERE asset360_uri IN (...)`` lookups.
+        """
     @property
-    def is_bounded(self) -> builtins.bool: ...
+    def is_bounded(self) -> builtins.bool:
+        r"""
+        Whether the query scope is bounded (safe to execute).
+        False means the query would load the entire database.
+        """
     @property
-    def estimated_count(self) -> typing.Optional[builtins.int]: ...
+    def estimated_count(self) -> typing.Optional[builtins.int]:
+        r"""
+        Estimated object count, if determinable. Currently always None.
+        """
     @property
-    def schema_only(self) -> builtins.bool: ...
+    def schema_only(self) -> builtins.bool:
+        r"""
+        True for introspection queries (e.g. ``?c a rdfs:Class``) that
+        need no instance data — answered from schema triples alone.
+        """
     @property
     def predicate_filters(self) -> builtins.dict[builtins.str, builtins.list[builtins.list[builtins.str]]]:
         r"""
-        Field-level filters pushable to SQL: {"field_name": [["eq", "value"], ["in", "v1", "v2"]]}
+        Field-level filters pushable to SQL as JSONB lookups.
+        
+        Dict mapping slot names to lists of conditions. Each condition
+        is a list where the first element is the operator:
+        
+        - ``["eq", "BX517"]`` → ``WHERE object_data->>'name' = 'BX517'``
+        - ``["in", "BX517", "BX518"]`` → ``WHERE object_data->>'name' IN (...)``
+        
+        Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
+        clauses when ``?var`` is bound to a known predicate.
         """
     @property
     def sql_limit(self) -> typing.Optional[builtins.int]:
         r"""
-        SQL LIMIT to push down (single-type queries only).
+        SQL LIMIT to push down for single-type queries.
+        
+        Only set when the query targets one asset type and has a top-level
+        ``LIMIT``. For multi-type joins the LIMIT applies to the joined
+        result, not individual fetches, so it cannot be pushed to SQL.
         """
 
 class ReachabilityQuery:
@@ -5584,11 +5622,68 @@ def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def py_schema_to_triples(schema_view:SchemaView) -> builtins.str: ...
+def py_schema_to_triples(schema_view:SchemaView) -> builtins.str:
+    r"""
+    Generate RDF schema triples (Turtle) from the LinkML schema.
+    
+    Produces ``rdfs:Class``, ``rdfs:subClassOf``, ``rdf:Property``,
+    ``rdfs:domain``, and ``rdfs:range`` triples for all classes and slots.
+    
+    These are pre-loaded into the Oxigraph store before instance data,
+    enabling introspection queries like ``SELECT ?c WHERE { ?c a rdfs:Class }``
+    without any database access.
+    
+    Args:
+        schema_view: The LinkML schema to generate triples from.
+    
+    Returns:
+        Turtle string containing schema triples.
+    """
 
-def py_sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str: ...
+def py_sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str:
+    r"""
+    Execute a SPARQL query against a list of LinkML instances.
+    
+    Converts each instance to RDF, loads into an in-memory store (with
+    pre-loaded schema triples), executes the query, and returns the
+    serialised result.
+    
+    Args:
+        query: SPARQL query string.
+        instances: List of LinkMLInstance objects to query against.
+            Pass an empty list for schema-only (introspection) queries.
+        schema_view: The LinkML schema (for RDF conversion and schema triples).
+        format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
+            ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
+        max_triples: Maximum triples in the store (default 500,000).
+        max_result_rows: Maximum result rows (default 10,000).
+    
+    Returns:
+        JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
+    
+    Raises:
+        RuntimeError: Conversion failure (with object URI), limit exceeded,
+            or query execution error.
+    """
 
-def py_sparql_scope(query:builtins.str, schema_view:SchemaView) -> PyScopeResult: ...
+def py_sparql_scope(query:builtins.str, schema_view:SchemaView) -> PyScopeResult:
+    r"""
+    Analyse a SPARQL query and determine what to fetch from the database.
+    
+    Parses the query, extracts ``rdf:type`` patterns, URI references, and
+    FILTER/VALUES conditions that can be pushed down to SQL.
+    
+    Args:
+        query: SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
+        schema_view: The LinkML schema, used to resolve predicate IRIs to
+            slot names and class IRIs to class names.
+    
+    Returns:
+        ScopeResult with asset_types, uri_filters, predicate_filters, etc.
+    
+    Raises:
+        ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
+    """
 
 def sum_as_string(a:builtins.int, b:builtins.int) -> builtins.str: ...
 

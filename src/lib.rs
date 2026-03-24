@@ -1191,9 +1191,13 @@ impl PyConstraintSet {
 // ---- SPARQL endpoint PyO3 bindings ----
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
+#[pyclass(name = "ScopeResult")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
+/// Result of analysing a SPARQL query for database scoping.
+///
+/// Tells the Django view which objects to fetch from PostgreSQL and which
+/// filters to apply. See the ``sparql_scope()`` function.
 pub struct PyScopeResult {
     asset_types: Vec<String>,
     uri_filters: Vec<String>,
@@ -1208,38 +1212,60 @@ pub struct PyScopeResult {
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl PyScopeResult {
+    /// LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
+    /// Derived from ``rdf:type`` patterns in the query.
     #[getter]
     fn asset_types(&self) -> Vec<String> {
         self.asset_types.clone()
     }
 
+    /// Specific ``asset360_uri`` values referenced in the query.
+    /// Used for ``WHERE asset360_uri IN (...)`` lookups.
     #[getter]
     fn uri_filters(&self) -> Vec<String> {
         self.uri_filters.clone()
     }
 
+    /// Whether the query scope is bounded (safe to execute).
+    /// False means the query would load the entire database.
     #[getter]
     fn is_bounded(&self) -> bool {
         self.is_bounded
     }
 
+    /// Estimated object count, if determinable. Currently always None.
     #[getter]
     fn estimated_count(&self) -> Option<usize> {
         self.estimated_count
     }
 
+    /// True for introspection queries (e.g. ``?c a rdfs:Class``) that
+    /// need no instance data — answered from schema triples alone.
     #[getter]
     fn schema_only(&self) -> bool {
         self.schema_only
     }
 
-    /// Field-level filters pushable to SQL: {"field_name": [["eq", "value"], ["in", "v1", "v2"]]}
+    /// Field-level filters pushable to SQL as JSONB lookups.
+    ///
+    /// Dict mapping slot names to lists of conditions. Each condition
+    /// is a list where the first element is the operator:
+    ///
+    /// - ``["eq", "BX517"]`` → ``WHERE object_data->>'name' = 'BX517'``
+    /// - ``["in", "BX517", "BX518"]`` → ``WHERE object_data->>'name' IN (...)``
+    ///
+    /// Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
+    /// clauses when ``?var`` is bound to a known predicate.
     #[getter]
     fn predicate_filters(&self) -> HashMap<String, Vec<Vec<String>>> {
         self.predicate_filters.clone()
     }
 
-    /// SQL LIMIT to push down (single-type queries only).
+    /// SQL LIMIT to push down for single-type queries.
+    ///
+    /// Only set when the query targets one asset type and has a top-level
+    /// ``LIMIT``. For multi-type joins the LIMIT applies to the joined
+    /// result, not individual fetches, so it cannot be pushed to SQL.
     #[getter]
     fn sql_limit(&self) -> Option<usize> {
         self.sql_limit
@@ -1250,6 +1276,21 @@ impl PyScopeResult {
 #[pyfunction]
 #[pyo3(name = "sparql_scope")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Analyse a SPARQL query and determine what to fetch from the database.
+///
+/// Parses the query, extracts ``rdf:type`` patterns, URI references, and
+/// FILTER/VALUES conditions that can be pushed down to SQL.
+///
+/// Args:
+///     query: SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
+///     schema_view: The LinkML schema, used to resolve predicate IRIs to
+///         slot names and class IRIs to class names.
+///
+/// Returns:
+///     ScopeResult with asset_types, uri_filters, predicate_filters, etc.
+///
+/// Raises:
+///     ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
 fn py_sparql_scope(
     py: Python<'_>,
     query: &str,
@@ -1314,6 +1355,28 @@ fn py_sparql_scope(
 #[pyfunction]
 #[pyo3(name = "sparql_execute", signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Execute a SPARQL query against a list of LinkML instances.
+///
+/// Converts each instance to RDF, loads into an in-memory store (with
+/// pre-loaded schema triples), executes the query, and returns the
+/// serialised result.
+///
+/// Args:
+///     query: SPARQL query string.
+///     instances: List of LinkMLInstance objects to query against.
+///         Pass an empty list for schema-only (introspection) queries.
+///     schema_view: The LinkML schema (for RDF conversion and schema triples).
+///     format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
+///         ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
+///     max_triples: Maximum triples in the store (default 500,000).
+///     max_result_rows: Maximum result rows (default 10,000).
+///
+/// Returns:
+///     JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
+///
+/// Raises:
+///     RuntimeError: Conversion failure (with object URI), limit exceeded,
+///         or query execution error.
 fn py_sparql_execute(
     py: Python<'_>,
     query: &str,
@@ -1366,6 +1429,20 @@ fn py_sparql_execute(
 #[pyfunction]
 #[pyo3(name = "schema_to_triples")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Generate RDF schema triples (Turtle) from the LinkML schema.
+///
+/// Produces ``rdfs:Class``, ``rdfs:subClassOf``, ``rdf:Property``,
+/// ``rdfs:domain``, and ``rdfs:range`` triples for all classes and slots.
+///
+/// These are pre-loaded into the Oxigraph store before instance data,
+/// enabling introspection queries like ``SELECT ?c WHERE { ?c a rdfs:Class }``
+/// without any database access.
+///
+/// Args:
+///     schema_view: The LinkML schema to generate triples from.
+///
+/// Returns:
+///     Turtle string containing schema triples.
 fn py_schema_to_triples(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,

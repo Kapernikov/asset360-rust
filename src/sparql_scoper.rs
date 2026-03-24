@@ -1,11 +1,25 @@
-//! SPARQL query scoping: analyse a query to determine which asset types and
-//! objects need to be fetched from the database.
+//! SPARQL query scoping for the virtual SPARQL endpoint.
 //!
-//! The scoper parses SPARQL via `spargebra`, walks the algebra tree, and extracts:
-//! - `rdf:type` patterns → which asset types to fetch
-//! - URI constants → which specific objects to fetch
-//! - FILTER conditions → pushable to SQL
-//! - Whether the query is bounded (can be safely executed)
+//! The virtual endpoint does not keep a persistent triple store. Instead it
+//! analyses each incoming SPARQL query to determine **which objects to fetch
+//! from PostgreSQL**, materialises only those as RDF, and executes the query
+//! in an in-memory Oxigraph store.
+//!
+//! This module is the "analyse" step: it parses the SPARQL algebra tree
+//! (via `spargebra`) and extracts enough information for the Django view to
+//! build an efficient SQL query. The output is a [`ScopeResult`] that tells
+//! the caller:
+//!
+//! - Which LinkML **asset types** to fetch (derived from `rdf:type` patterns).
+//! - Which specific **URIs** are referenced (for point lookups).
+//! - Which **field-level filters** can be pushed to SQL (e.g. `FILTER(?name = "BX517")`
+//!   when `?name` is bound via `?s asset360:name ?name`).
+//! - Whether the query is **schema-only** (introspection queries like
+//!   `?c a rdfs:Class` that need no instance data at all).
+//! - Whether a **LIMIT** can be pushed to SQL (single-type queries only).
+//!
+//! Queries that cannot be scoped — e.g. `SELECT * WHERE { ?s ?p ?o }` — are
+//! rejected with a descriptive error rather than loading the entire database.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,37 +29,99 @@ use spargebra::{Query, SparqlParser};
 
 use linkml_schemaview::schemaview::SchemaView;
 
-/// Result of scoping a SPARQL query.
+/// The result of analysing a SPARQL query for database scoping.
+///
+/// The Django view uses this to build the SQL `WHERE` clause that fetches
+/// only the objects needed for the query. Each field maps to a SQL filter:
+///
+/// | Field | SQL translation |
+/// |-------|----------------|
+/// | `asset_types` | `WHERE asset_type IN (...)` |
+/// | `uri_filters` | `WHERE asset360_uri IN (...)` |
+/// | `predicate_filters["name"] = [Eq("X")]` | `WHERE object_data->>'name' = 'X'` |
+/// | `sql_limit` | `LIMIT n` on the queryset |
+///
+/// When `schema_only` is true, no SQL query is needed — the executor answers
+/// entirely from pre-loaded schema triples (class hierarchy, properties).
 #[derive(Debug, Clone)]
 pub struct ScopeResult {
-    /// Asset type names to fetch from the database (e.g. ["Signal", "BaliseGroup"]).
+    /// LinkML class names to fetch from the database.
+    ///
+    /// Derived from `rdf:type` triple patterns in the query. For example,
+    /// `?s a asset360:Signal` produces `["Signal"]`. The Django view translates
+    /// this to `GoldenRecord.objects.filter(asset_type__endswith="Signal")`.
+    ///
+    /// Empty when `schema_only` is true (introspection queries).
     pub asset_types: Vec<String>,
-    /// Specific URIs referenced in the query (for direct lookup).
+
+    /// Specific asset360 URIs referenced in the query.
+    ///
+    /// Collected from named-node constants in triple pattern subjects and
+    /// from `VALUES` clauses. The Django view translates this to
+    /// `qs.filter(asset360_uri__in=[...])`.
     pub uri_filters: Vec<String>,
-    /// Field-level filter conditions pushable to SQL.
+
+    /// Field-level filter conditions that can be pushed down to SQL.
+    ///
+    /// Keyed by the LinkML **slot name** (not the predicate IRI). The slot
+    /// name is resolved from the IRI via `SchemaView::get_slot_by_uri()`.
+    ///
+    /// Example: `FILTER(?name = "BX517")` where `?name` is bound via
+    /// `?s asset360:name ?name` produces `{"name": [Eq("BX517")]}`.
+    /// The Django view translates `Eq` to `object_data__name="BX517"`
+    /// and `In` to `object_data__name__in=[...]` (JSONB lookup).
     pub predicate_filters: HashMap<String, Vec<FilterCondition>>,
+
     /// Whether the query scope is bounded (safe to execute).
+    ///
+    /// True when at least one of: `asset_types` is non-empty, `uri_filters`
+    /// is non-empty, or `schema_only` is true. False means the query would
+    /// require loading the entire database, so it is rejected.
     pub is_bounded: bool,
-    /// Estimated number of objects, if determinable.
+
+    /// Estimated number of objects, if determinable from the query structure.
+    /// Currently always `None`; reserved for future use.
     pub estimated_count: Option<usize>,
-    /// Whether this is a schema-only query (no instance data needed).
+
+    /// Whether this query can be answered from schema triples alone.
+    ///
+    /// True for queries like `SELECT ?c WHERE { ?c a rdfs:Class }` that only
+    /// reference RDF Schema vocabulary types. When true, the Django view skips
+    /// the database fetch entirely and passes an empty instance list to the
+    /// executor, which answers from pre-loaded LinkML schema triples.
     pub schema_only: bool,
-    /// SQL LIMIT to push down (for single-type queries with top-level LIMIT).
+
+    /// SQL LIMIT to push down to the database query.
+    ///
+    /// Only set for single-type queries with a top-level `LIMIT` clause
+    /// (e.g. `SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10`). For
+    /// multi-type joins the LIMIT applies to the *joined* result, not to
+    /// individual type fetches, so it cannot be safely pushed to SQL.
     pub sql_limit: Option<usize>,
 }
 
-/// A filter condition that can be pushed down to SQL.
+/// A filter condition extracted from the SPARQL query, pushable to SQL.
+///
+/// These are produced by analysing `FILTER` and `VALUES` clauses in the query
+/// where the filtered variable is bound to a known predicate (slot).
 #[derive(Debug, Clone)]
 pub enum FilterCondition {
+    /// Equality: `FILTER(?var = "value")` → `WHERE object_data->>'field' = 'value'`
     Eq(String),
+    /// Set membership: `VALUES ?var { "a" "b" }` → `WHERE object_data->>'field' IN ('a', 'b')`
     In(Vec<String>),
 }
 
 /// Errors from query scoping.
 #[derive(Debug)]
 pub enum ScopeError {
+    /// The SPARQL query could not be parsed (syntax error).
     ParseError(String),
+    /// The query has no `rdf:type` constraint and cannot be scoped to specific
+    /// asset types. The message includes a suggestion for fixing the query.
     Unscoped(String),
+    /// The input is a SPARQL Update (INSERT/DELETE/LOAD), which is not
+    /// supported — this endpoint is read-only.
     UpdateRejected,
 }
 
@@ -64,10 +140,19 @@ impl std::fmt::Display for ScopeError {
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
 const RDF_PROPERTY: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property";
+
 /// Analyse a SPARQL query and extract scoping information.
 ///
-/// Returns a `ScopeResult` describing which data to fetch, or a `ScopeError`
-/// if the query cannot be scoped (unscoped, parse error, or UPDATE).
+/// Parses the query via `spargebra`, walks the SPARQL algebra tree, and
+/// determines which asset types and objects need to be fetched from
+/// PostgreSQL.
+///
+/// # Errors
+///
+/// - [`ScopeError::ParseError`] — invalid SPARQL syntax.
+/// - [`ScopeError::Unscoped`] — query has no `rdf:type` or URI constraints
+///   and would require loading the entire database.
+/// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update statement.
 pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeResult, ScopeError> {
     // Reject SPARQL Update (INSERT/DELETE/LOAD)
     if SparqlParser::new().parse_update(query_str).is_ok() {
