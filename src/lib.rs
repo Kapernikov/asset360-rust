@@ -79,9 +79,9 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConstraintSet>()?;
     #[cfg(feature = "sparql-endpoint")]
     {
-        m.add_function(wrap_pyfunction!(py_sparql_scope, m)?)?;
-        m.add_function(wrap_pyfunction!(py_sparql_execute, m)?)?;
-        m.add_function(wrap_pyfunction!(py_schema_to_triples, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
+        m.add_function(wrap_pyfunction!(schema_to_triples, m)?)?;
         m.add_class::<PyScopeResult>()?;
         m.add_class::<PyFilterCondition>()?;
     }
@@ -1366,7 +1366,6 @@ impl PyScopeResult {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
-#[pyo3(name = "sparql_scope")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Analyse a SPARQL query and determine what to fetch from the database.
 ///
@@ -1383,7 +1382,7 @@ impl PyScopeResult {
 ///
 /// Raises:
 ///     ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
-fn py_sparql_scope(
+fn sparql_scope(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
@@ -1433,7 +1432,7 @@ fn py_sparql_scope(
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
-#[pyo3(name = "sparql_execute", signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000))]
+#[pyo3(signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Execute a SPARQL query against a list of LinkML instances.
 ///
@@ -1457,7 +1456,7 @@ fn py_sparql_scope(
 /// Raises:
 ///     RuntimeError: Conversion failure (with object URI), limit exceeded,
 ///         or query execution error.
-fn py_sparql_execute(
+fn sparql_execute(
     py: Python<'_>,
     query: &str,
     instances: Vec<Py<PyLinkMLInstance>>,
@@ -1507,7 +1506,6 @@ fn py_sparql_execute(
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
-#[pyo3(name = "schema_to_triples")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Generate RDF schema triples (Turtle) from the LinkML schema.
 ///
@@ -1523,7 +1521,7 @@ fn py_sparql_execute(
 ///
 /// Returns:
 ///     Turtle string containing schema triples.
-fn py_schema_to_triples(
+fn schema_to_triples(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
 ) -> PyResult<String> {

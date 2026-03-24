@@ -3414,15 +3414,19 @@ class PyFilterCondition:
     r"""
     A filter condition extracted from the SPARQL query, pushable to SQL.
     
-    Each condition has an ``operator`` (``"eq"`` or ``"in"``) and one or more
-    string ``values``. The Django view translates these to ORM lookups::
+    Each condition has an `operator` (`"eq"` or `"in"`) and one or more
+    string `values`. The Django view translates these to ORM lookups.
     
-        for field, conditions in scope.predicate_filters.items():
-            for cond in conditions:
-                if cond.operator == "eq":
-                    qs = qs.filter(**{f"object_data__{field}": cond.value})
-                elif cond.operator == "in":
-                    qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+    Python usage:
+    
+    ```python
+    for field, conditions in scope.predicate_filters.items():
+        for cond in conditions:
+            if cond.operator == "eq":
+                qs = qs.filter(**{f"object_data__{field}": cond.value})
+            elif cond.operator == "in":
+                qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+    ```
     """
     @property
     def operator(self) -> builtins.str:
@@ -3453,20 +3457,22 @@ class PyScopeResult:
     Tells the Django view which objects to fetch from PostgreSQL and which
     filters to apply. See the ``sparql_scope()`` function.
     
-    Example::
+    Python usage:
     
-        scope = lr.sparql_scope(query, schema_view)
-        if scope.schema_only:
-            instances = []
-        else:
-            for asset_type in scope.asset_types:
-                qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
-                if scope.uri_filters:
-                    qs = qs.filter(asset360_uri__in=scope.uri_filters)
-                for field, conditions in scope.predicate_filters.items():
-                    for cond in conditions:
-                        if cond.operator == "eq":
-                            qs = qs.filter(**{f"object_data__{field}": cond.value})
+    ```python
+    scope = lr.sparql_scope(query, schema_view)
+    if scope.schema_only:
+        instances = []
+    else:
+        for asset_type in scope.asset_types:
+            qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
+            if scope.uri_filters:
+                qs = qs.filter(asset360_uri__in=scope.uri_filters)
+            for field, conditions in scope.predicate_filters.items():
+                for cond in conditions:
+                    if cond.operator == "eq":
+                        qs = qs.filter(**{f"object_data__{field}": cond.value})
+    ```
     """
     @property
     def asset_types(self) -> builtins.list[builtins.str]:
@@ -5668,7 +5674,7 @@ def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def py_schema_to_triples(schema_view:SchemaView) -> builtins.str:
+def schema_to_triples(schema_view:SchemaView) -> builtins.str:
     r"""
     Generate RDF schema triples (Turtle) from the LinkML schema.
     
@@ -5686,7 +5692,7 @@ def py_schema_to_triples(schema_view:SchemaView) -> builtins.str:
         Turtle string containing schema triples.
     """
 
-def py_sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str:
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
     
@@ -5712,7 +5718,7 @@ def py_sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstan
             or query execution error.
     """
 
-def py_sparql_scope(query:builtins.str, schema_view:SchemaView) -> PyScopeResult:
+def sparql_scope(query:builtins.str, schema_view:SchemaView) -> PyScopeResult:
     r"""
     Analyse a SPARQL query and determine what to fetch from the database.
     
