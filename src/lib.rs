@@ -1277,43 +1277,28 @@ fn sparql_scope_py(
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
-#[pyo3(name = "sparql_execute", signature = (query, objects, schema_view, target_classes, format="json", max_triples=500_000, max_result_rows=10_000))]
+#[pyo3(name = "sparql_execute", signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000))]
 fn sparql_execute_py(
     py: Python<'_>,
     query: &str,
-    objects: &Bound<'_, pyo3::types::PyList>,
+    instances: Vec<Py<PyLinkMLInstance>>,
     schema_view: Py<PySchemaView>,
-    target_classes: Vec<String>,
     format: &str,
     max_triples: usize,
     max_result_rows: usize,
 ) -> PyResult<String> {
-    use pyo3::types::PyAnyMethods;
-
-    // Convert Python list of dicts to Vec<serde_json::Value>
-    let mut json_objects: Vec<serde_json::Value> = Vec::new();
-    for item in objects.iter() {
-        // Use Python's json.dumps to convert dict to JSON string, then parse
-        let json_mod = py.import("json")?;
-        let json_str: String = json_mod
-            .call_method1("dumps", (item,))?
-            .extract()?;
-        let value: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {e}")))?;
-        json_objects.push(value);
-    }
-
     let bound_sv = schema_view.bind(py);
     let sv_ref = bound_sv.borrow();
     let sv = sv_ref.as_rust();
 
-    let tc_refs: Vec<&str> = target_classes.iter().map(|s| s.as_str()).collect();
+    // Borrow all instances and collect references
+    let bound_instances: Vec<_> = instances.iter().map(|i| i.bind(py).borrow()).collect();
+    let instance_refs: Vec<&LinkMLInstance> = bound_instances.iter().map(|b| &b.value).collect();
 
     match crate::sparql_executor::sparql_execute(
         query,
-        &json_objects,
+        &instance_refs,
         sv,
-        &tc_refs,
         format,
         crate::sparql_executor::ExecuteLimits {
             max_triples,

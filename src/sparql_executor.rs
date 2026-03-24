@@ -1,8 +1,8 @@
-//! SPARQL executor: load objects into Oxigraph, execute queries, return results.
+//! SPARQL executor: load LinkML instances into Oxigraph, execute queries, return results.
 //!
 //! This module wraps Oxigraph's in-memory store to:
 //! 1. Pre-load schema triples (class hierarchy, property definitions)
-//! 2. Convert JSON objects to RDF via `as_turtle()` and load into store
+//! 2. Convert LinkMLInstance objects to RDF via `as_turtle()` and load into store
 //! 3. Execute SPARQL queries and serialize results
 
 #[cfg(feature = "sparql-endpoint")]
@@ -12,9 +12,8 @@ use oxigraph::sparql::QueryResults;
 #[cfg(feature = "sparql-endpoint")]
 use oxigraph::store::Store;
 
+use linkml_runtime::LinkMLInstance;
 use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
-use linkml_runtime::load_json_str;
-use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 
 /// Errors from SPARQL execution.
@@ -116,19 +115,18 @@ pub fn schema_to_triples(schema_view: &SchemaView) -> String {
     turtle
 }
 
-/// Execute a SPARQL query against a set of JSON objects.
+/// Execute a SPARQL query against a set of LinkML instances.
 ///
 /// 1. Creates an in-memory Oxigraph store
 /// 2. Loads schema triples
-/// 3. Converts each object to RDF and loads into store
+/// 3. Converts each instance to Turtle and loads into store
 /// 4. Executes the query
 /// 5. Serializes results to the requested format
 #[cfg(feature = "sparql-endpoint")]
 pub fn sparql_execute(
     query_str: &str,
-    objects: &[serde_json::Value],
+    instances: &[&LinkMLInstance],
     schema_view: &SchemaView,
-    target_classes: &[&str],
     format: &str,
     limits: ExecuteLimits,
 ) -> Result<String, ExecuteError> {
@@ -146,74 +144,13 @@ pub fn sparql_execute(
         .primary_schema()
         .ok_or_else(|| ExecuteError::StoreError("No primary schema found".to_owned()))?;
 
-    for obj in objects {
-        let obj_map = obj
-            .as_object()
-            .ok_or_else(|| ExecuteError::ConversionError {
-                object_uri: "unknown".to_owned(),
-                message: "Object is not a JSON object".to_owned(),
-            })?;
-
-        let object_uri = obj_map
-            .get("asset360_uri")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_owned();
-
-        // Determine the target class for this object
-        let target_class_name = if target_classes.len() == 1 {
-            target_classes[0].to_owned()
-        } else {
-            // Try to find the class from the object's asset_type field
-            obj_map
-                .get("asset_type")
-                .and_then(|v| v.as_str())
-                .and_then(|uri| {
-                    schema_view
-                        .get_class_by_uri(uri)
-                        .ok()
-                        .flatten()
-                        .map(|cv| cv.name().to_owned())
-                })
-                .unwrap_or_else(|| {
-                    target_classes.first().map(|s| s.to_string()).unwrap_or_default()
-                })
-        };
-
-        let identifier = Identifier::new(&target_class_name);
-        let class_view = schema_view
-            .get_class(&identifier, &converter)
-            .map_err(|e| ExecuteError::ConversionError {
-                object_uri: object_uri.clone(),
-                message: format!("Failed to resolve class '{target_class_name}': {e}"),
-            })?
-            .ok_or_else(|| ExecuteError::ConversionError {
-                object_uri: object_uri.clone(),
-                message: format!("Class '{target_class_name}' not found in schema"),
-            })?;
-
-        let json_str = serde_json::to_string(obj).map_err(|e| ExecuteError::ConversionError {
-            object_uri: object_uri.clone(),
-            message: format!("Failed to serialize object: {e}"),
-        })?;
-
-        let load_result =
-            load_json_str(&json_str, schema_view, &class_view, &converter).map_err(|e| {
-                ExecuteError::ConversionError {
-                    object_uri: object_uri.clone(),
-                    message: format!("Failed to load JSON: {e}"),
-                }
-            })?;
-
-        let instance = load_result.into_instance_tolerate_errors().map_err(|e| {
-            ExecuteError::ConversionError {
-                object_uri: object_uri.clone(),
-                message: format!("Failed to create instance: {e}"),
-            }
-        })?;
+    for instance in instances {
+        let object_uri = instance
+            .node_id()
+            .to_string();
 
         let turtle_str =
-            turtle_to_string(&instance, schema_view, &primary_schema, &converter, TurtleOptions { skolem: false })
+            turtle_to_string(instance, schema_view, &primary_schema, &converter, TurtleOptions { skolem: false })
                 .map_err(|e| ExecuteError::ConversionError {
                     object_uri: object_uri.clone(),
                     message: e.to_string(),
@@ -341,6 +278,8 @@ fn term_to_json(term: &oxigraph::model::Term) -> serde_json::Value {
 #[cfg(all(test, feature = "sparql-endpoint"))]
 mod tests {
     use super::*;
+    use linkml_runtime::load_json_str;
+    use linkml_schemaview::identifier::Identifier;
     use serde_json::json;
 
     fn test_schema_view() -> SchemaView {
@@ -382,29 +321,31 @@ classes:
         sv
     }
 
-    fn signal_objects() -> Vec<serde_json::Value> {
+    fn load_signal(sv: &SchemaView, json_str: &str) -> LinkMLInstance {
+        let conv = sv.converter();
+        let id = Identifier::new("Signal");
+        let cv = sv.get_class(&id, &conv).unwrap().unwrap();
+        let result = load_json_str(json_str, sv, &cv, &conv).unwrap();
+        result.into_instance_tolerate_errors().unwrap()
+    }
+
+    fn signal_instances(sv: &SchemaView) -> Vec<LinkMLInstance> {
         vec![
-            json!({
-                "asset360_uri": "https://data.infrabel.be/asset360/signal/BX517",
-                "name": "BX517"
-            }),
-            json!({
-                "asset360_uri": "https://data.infrabel.be/asset360/signal/BX518",
-                "name": "BX518"
-            }),
+            load_signal(sv, r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/BX517", "name": "BX517"}"#),
+            load_signal(sv, r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/BX518", "name": "BX518"}"#),
         ]
     }
 
     #[test]
     fn test_select_query() {
         let sv = test_schema_view();
-        let objects = signal_objects();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
         let result = sparql_execute(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name } ORDER BY ?name",
-            &objects,
+            &refs,
             &sv,
-            &["Signal"],
             "json",
             ExecuteLimits::default(),
         )
@@ -420,13 +361,13 @@ classes:
     #[test]
     fn test_ask_query() {
         let sv = test_schema_view();
-        let objects = signal_objects();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
         let result = sparql_execute(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              ASK { ?s a asset360:Signal ; asset360:name \"BX517\" }",
-            &objects,
+            &refs,
             &sv,
-            &["Signal"],
             "json",
             ExecuteLimits::default(),
         )
@@ -439,13 +380,13 @@ classes:
     #[test]
     fn test_ask_query_false() {
         let sv = test_schema_view();
-        let objects = signal_objects();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
         let result = sparql_execute(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              ASK { ?s a asset360:Signal ; asset360:name \"NONEXISTENT\" }",
-            &objects,
+            &refs,
             &sv,
-            &["Signal"],
             "json",
             ExecuteLimits::default(),
         )
@@ -458,12 +399,10 @@ classes:
     #[test]
     fn test_schema_introspection() {
         let sv = test_schema_view();
-        // No instance data needed — schema triples are pre-loaded
         let result = sparql_execute(
             "SELECT ?c WHERE { ?c a <http://www.w3.org/2000/01/rdf-schema#Class> }",
             &[],
             &sv,
-            &[],
             "json",
             ExecuteLimits::default(),
         )
@@ -471,7 +410,6 @@ classes:
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let bindings = parsed["results"]["bindings"].as_array().unwrap();
-        // Should find Signal and BaliseGroup classes
         assert!(bindings.len() >= 2, "Expected at least 2 classes, got {}", bindings.len());
 
         let class_uris: Vec<&str> = bindings
@@ -485,17 +423,17 @@ classes:
     #[test]
     fn test_result_limit_exceeded() {
         let sv = test_schema_view();
-        let objects = signal_objects();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
         let result = sparql_execute(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
-            &objects,
+            &refs,
             &sv,
-            &["Signal"],
             "json",
             ExecuteLimits {
                 max_triples: 500_000,
-                max_result_rows: 1, // Only allow 1 result
+                max_result_rows: 1,
             },
         );
 
@@ -505,16 +443,16 @@ classes:
     #[test]
     fn test_triple_limit_exceeded() {
         let sv = test_schema_view();
-        let objects = signal_objects();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
         let result = sparql_execute(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal }",
-            &objects,
+            &refs,
             &sv,
-            &["Signal"],
             "json",
             ExecuteLimits {
-                max_triples: 1, // Unrealistically low — schema triples alone exceed this
+                max_triples: 1,
                 max_result_rows: 10_000,
             },
         );
@@ -527,31 +465,27 @@ classes:
         let sv = test_schema_view();
         let turtle = schema_to_triples(&sv);
 
-        // Should contain class declarations
         assert!(turtle.contains("rdfs:Class"), "Should declare classes");
-        // Should contain property declarations
         assert!(turtle.contains("rdf:Property"), "Should declare properties");
-        // Should be parseable
         assert!(turtle.contains("@prefix"), "Should have prefix declarations");
     }
 
     #[test]
     fn test_construct_query() {
         let sv = test_schema_view();
-        let objects = signal_objects();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
         let result = sparql_execute(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              CONSTRUCT { ?s a asset360:Signal ; asset360:name ?n } \
              WHERE { ?s a asset360:Signal ; asset360:name ?n }",
-            &objects,
+            &refs,
             &sv,
-            &["Signal"],
             "turtle",
             ExecuteLimits::default(),
         )
         .unwrap();
 
-        // Should produce N-Triples-like output with the signal data
         assert!(result.contains("BX517"), "Should contain signal name");
         assert!(result.contains("Signal"), "Should contain type");
     }
