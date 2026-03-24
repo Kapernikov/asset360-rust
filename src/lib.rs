@@ -38,9 +38,9 @@ pub mod predicate;
 pub mod scope_predicate;
 pub mod shacl_ast;
 
-pub mod sparql_scoper;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
+pub mod sparql_scoper;
 
 #[cfg(feature = "shacl-parser")]
 pub mod shacl_parser;
@@ -1246,7 +1246,10 @@ impl FilterCondition {
 
     fn __repr__(&self) -> String {
         if self.operator == "eq" {
-            format!("FilterCondition(eq={:?})", self.values.first().unwrap_or(&String::new()))
+            format!(
+                "FilterCondition(eq={:?})",
+                self.values.first().unwrap_or(&String::new())
+            )
         } else {
             format!("FilterCondition(in={:?})", self.values)
         }
@@ -1404,16 +1407,12 @@ fn sparql_scope(
                 "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.",
             ))
         }
-        Err(crate::sparql_scoper::ScopeError::ParseError(msg)) => {
-            Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "SPARQL parse error: {msg}"
-            )))
-        }
-        Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => {
-            Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Query is unscoped: {msg}"
-            )))
-        }
+        Err(crate::sparql_scoper::ScopeError::ParseError(msg)) => Err(
+            pyo3::exceptions::PyValueError::new_err(format!("SPARQL parse error: {msg}")),
+        ),
+        Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => Err(
+            pyo3::exceptions::PyValueError::new_err(format!("Query is unscoped: {msg}")),
+        ),
     }
 }
 

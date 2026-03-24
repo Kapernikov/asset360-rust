@@ -119,7 +119,10 @@ impl std::fmt::Display for ScopeError {
             ScopeError::ParseError(msg) => write!(f, "SPARQL parse error: {msg}"),
             ScopeError::Unscoped(msg) => write!(f, "Query is unscoped: {msg}"),
             ScopeError::UpdateRejected => {
-                write!(f, "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.")
+                write!(
+                    f,
+                    "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only."
+                )
             }
         }
     }
@@ -219,8 +222,7 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeRe
     asset_types.dedup();
 
     // Determine if bounded
-    let is_bounded = !asset_types.is_empty()
-        || !uri_filters.is_empty();
+    let is_bounded = !asset_types.is_empty() || !uri_filters.is_empty();
 
     if !is_bounded {
         let suggestion = if type_variables.is_empty() {
@@ -280,10 +282,7 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeRe
 }
 
 /// Recursively collect all BGP triple patterns from a SPARQL algebra tree.
-fn collect_bgp_triples<'a>(
-    pattern: &'a GraphPattern,
-    triples: &mut Vec<&'a TriplePattern>,
-) {
+fn collect_bgp_triples<'a>(pattern: &'a GraphPattern, triples: &mut Vec<&'a TriplePattern>) {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             triples.extend(patterns.iter());
@@ -362,7 +361,10 @@ fn collect_type_var_values(
     iris: &mut Vec<String>,
 ) {
     match pattern {
-        GraphPattern::Values { variables, bindings } => {
+        GraphPattern::Values {
+            variables,
+            bindings,
+        } => {
             for (i, var) in variables.iter().enumerate() {
                 if type_vars.contains(var.as_str()) {
                     for row in bindings {
@@ -489,7 +491,10 @@ fn collect_values_filters(
     filters: &mut HashMap<String, Vec<FilterCondition>>,
 ) {
     match pattern {
-        GraphPattern::Values { variables, bindings } => {
+        GraphPattern::Values {
+            variables,
+            bindings,
+        } => {
             for (i, var) in variables.iter().enumerate() {
                 if let Some(field) = var_to_field.get(var.as_str()) {
                     let mut values = Vec::new();
@@ -651,10 +656,7 @@ classes:
         // `?c a rdfs:Class` are unscoped — rdfs:Class is not an asset type.
         // Schema triple support will be added later (OWL generator).
         let sv = test_schema_view();
-        let result = sparql_scope(
-            "SELECT ?c WHERE { ?c a rdfs:Class }",
-            &sv,
-        );
+        let result = sparql_scope("SELECT ?c WHERE { ?c a rdfs:Class }", &sv);
         assert!(matches!(result, Err(ScopeError::Unscoped(_))));
     }
 
@@ -701,7 +703,10 @@ classes:
         )
         .unwrap();
         assert_eq!(result.asset_types, vec!["Signal"]);
-        let name_filters = result.predicate_filters.get("name").expect("should have name filter");
+        let name_filters = result
+            .predicate_filters
+            .get("name")
+            .expect("should have name filter");
         assert_eq!(name_filters.len(), 1);
         match &name_filters[0] {
             FilterCondition::Eq(v) => assert_eq!(v, "BX517"),
@@ -719,7 +724,10 @@ classes:
             &sv,
         )
         .unwrap();
-        let name_filters = result.predicate_filters.get("name").expect("should have name filter");
+        let name_filters = result
+            .predicate_filters
+            .get("name")
+            .expect("should have name filter");
         assert_eq!(name_filters.len(), 1);
         match &name_filters[0] {
             FilterCondition::Eq(v) => assert_eq!(v, "BX517"),
@@ -736,7 +744,10 @@ classes:
             &sv,
         )
         .unwrap();
-        let name_filters = result.predicate_filters.get("name").expect("should have name filter");
+        let name_filters = result
+            .predicate_filters
+            .get("name")
+            .expect("should have name filter");
         assert_eq!(name_filters.len(), 1);
         match &name_filters[0] {
             FilterCondition::In(vals) => {

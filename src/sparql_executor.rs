@@ -58,7 +58,10 @@ pub enum ExecuteError {
 impl std::fmt::Display for ExecuteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecuteError::ConversionError { object_uri, message } => {
+            ExecuteError::ConversionError {
+                object_uri,
+                message,
+            } => {
                 write!(f, "Failed to convert object {object_uri} to RDF: {message}")
             }
             ExecuteError::TripleLimitExceeded { count, limit } => {
@@ -149,16 +152,19 @@ pub fn sparql_execute(
         .ok_or_else(|| ExecuteError::StoreError("No primary schema found".to_owned()))?;
 
     for instance in instances {
-        let object_uri = instance
-            .node_id()
-            .to_string();
+        let object_uri = instance.node_id().to_string();
 
-        let turtle_str =
-            turtle_to_string(instance, schema_view, &primary_schema, &converter, TurtleOptions { skolem: false })
-                .map_err(|e| ExecuteError::ConversionError {
-                    object_uri: object_uri.clone(),
-                    message: e.to_string(),
-                })?;
+        let turtle_str = turtle_to_string(
+            instance,
+            schema_view,
+            &primary_schema,
+            &converter,
+            TurtleOptions { skolem: false },
+        )
+        .map_err(|e| ExecuteError::ConversionError {
+            object_uri: object_uri.clone(),
+            message: e.to_string(),
+        })?;
 
         store
             .load_from_reader(RdfFormat::Turtle, turtle_str.as_bytes())
@@ -169,7 +175,9 @@ pub fn sparql_execute(
     }
 
     // Check triple limit
-    let triple_count = store.len().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+    let triple_count = store
+        .len()
+        .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
     if triple_count > limits.max_triples {
         return Err(ExecuteError::TripleLimitExceeded {
             count: triple_count,
@@ -193,8 +201,7 @@ pub fn sparql_execute(
 
             let mut bindings: Vec<serde_json::Value> = Vec::new();
             for solution in solutions {
-                let solution =
-                    solution.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+                let solution = solution.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
                 if bindings.len() >= limits.max_result_rows {
                     return Err(ExecuteError::ResultLimitExceeded {
@@ -216,26 +223,26 @@ pub fn sparql_execute(
                 "head": { "vars": vars },
                 "results": { "bindings": bindings }
             });
-            serde_json::to_string(&result)
-                .map_err(|e| ExecuteError::QueryError(e.to_string()))
+            serde_json::to_string(&result).map_err(|e| ExecuteError::QueryError(e.to_string()))
         }
         QueryResults::Boolean(b) => {
             let result = serde_json::json!({ "boolean": b });
-            serde_json::to_string(&result)
-                .map_err(|e| ExecuteError::QueryError(e.to_string()))
+            serde_json::to_string(&result).map_err(|e| ExecuteError::QueryError(e.to_string()))
         }
         QueryResults::Graph(triples) => {
             if format == "turtle" || format == "text/turtle" {
                 let mut buf = Vec::new();
                 for triple in triples {
-                    let triple =
-                        triple.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+                    let triple = triple.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
                     use std::io::Write;
-                    writeln!(buf, "{} {} {} .", triple.subject, triple.predicate, triple.object)
-                        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+                    writeln!(
+                        buf,
+                        "{} {} {} .",
+                        triple.subject, triple.predicate, triple.object
+                    )
+                    .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
                 }
-                String::from_utf8(buf)
-                    .map_err(|e| ExecuteError::QueryError(e.to_string()))
+                String::from_utf8(buf).map_err(|e| ExecuteError::QueryError(e.to_string()))
             } else {
                 Err(ExecuteError::QueryError(format!(
                     "Unsupported format for graph results: {format}"
@@ -334,8 +341,14 @@ classes:
 
     fn signal_instances(sv: &SchemaView) -> Vec<LinkMLInstance> {
         vec![
-            load_signal(sv, r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/BX517", "name": "BX517"}"#),
-            load_signal(sv, r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/BX518", "name": "BX518"}"#),
+            load_signal(
+                sv,
+                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/BX517", "name": "BX517"}"#,
+            ),
+            load_signal(
+                sv,
+                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/BX518", "name": "BX518"}"#,
+            ),
         ]
     }
 
@@ -416,7 +429,10 @@ classes:
             },
         );
 
-        assert!(matches!(result, Err(ExecuteError::ResultLimitExceeded { .. })));
+        assert!(matches!(
+            result,
+            Err(ExecuteError::ResultLimitExceeded { .. })
+        ));
     }
 
     #[test]
@@ -436,7 +452,10 @@ classes:
             },
         );
 
-        assert!(matches!(result, Err(ExecuteError::TripleLimitExceeded { .. })));
+        assert!(matches!(
+            result,
+            Err(ExecuteError::TripleLimitExceeded { .. })
+        ));
     }
 
     #[test]
