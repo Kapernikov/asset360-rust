@@ -439,13 +439,12 @@ fn collect_values_filters(
                     for row in bindings {
                         if let Some(Some(term)) = row.get(i) {
                             match term {
-                                spargebra::term::GroundTerm::Literal(lit) => {
-                                    values.push(lit.value().to_owned());
-                                }
                                 spargebra::term::GroundTerm::NamedNode(nn) => {
                                     values.push(nn.as_str().to_owned());
                                 }
-                                _ => {}
+                                spargebra::term::GroundTerm::Literal(lit) => {
+                                    values.push(lit.value().to_owned());
+                                }
                             }
                         }
                     }
@@ -487,9 +486,7 @@ fn collect_values_filters(
 /// is at the outermost level (Slice pattern wrapping the rest).
 fn extract_top_level_limit(pattern: &GraphPattern) -> Option<usize> {
     match pattern {
-        GraphPattern::Slice { start: _, length, .. } => {
-            length.map(|l| l as usize)
-        }
+        GraphPattern::Slice { length, .. } => *length,
         // Look through Project (SELECT wraps in Project → Slice)
         GraphPattern::Project { inner, .. } => extract_top_level_limit(inner),
         _ => None,

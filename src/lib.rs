@@ -1192,6 +1192,7 @@ impl PyConstraintSet {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
 pub struct PyScopeResult {
     #[pyo3(get)]
@@ -1215,6 +1216,7 @@ pub struct PyScopeResult {
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
 #[pyo3(name = "sparql_scope")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 fn sparql_scope_py(
     py: Python<'_>,
     query: &str,
@@ -1278,6 +1280,7 @@ fn sparql_scope_py(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
 #[pyo3(name = "sparql_execute", signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 fn sparql_execute_py(
     py: Python<'_>,
     query: &str,
@@ -1329,6 +1332,7 @@ fn sparql_execute_py(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
 #[pyo3(name = "schema_to_triples")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 fn schema_to_triples_py(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,

@@ -85,12 +85,12 @@ pub fn schema_to_triples(schema_view: &SchemaView) -> String {
         turtle.push_str(&format!("<{class_uri}> a rdfs:Class .\n"));
 
         // rdfs:subClassOf for parent class
-        if let Ok(Some(parent)) = cv.parent_class() {
-            if let Ok(parent_uri) = parent.canonical_uri().to_uri(&converter) {
-                turtle.push_str(&format!(
-                    "<{class_uri}> rdfs:subClassOf <{parent_uri}> .\n"
-                ));
-            }
+        if let Ok(Some(parent)) = cv.parent_class()
+            && let Ok(parent_uri) = parent.canonical_uri().to_uri(&converter)
+        {
+            turtle.push_str(&format!(
+                "<{class_uri}> rdfs:subClassOf <{parent_uri}> .\n"
+            ));
         }
 
         // Properties for each slot
@@ -104,10 +104,10 @@ pub fn schema_to_triples(schema_view: &SchemaView) -> String {
             turtle.push_str(&format!("<{slot_uri}> rdfs:domain <{class_uri}> .\n"));
 
             // rdfs:range — use the range class URI if it's a class reference
-            if let Some(range_cv) = sv.get_range_class() {
-                if let Ok(range_uri) = range_cv.canonical_uri().to_uri(&converter) {
-                    turtle.push_str(&format!("<{slot_uri}> rdfs:range <{range_uri}> .\n"));
-                }
+            if let Some(range_cv) = sv.get_range_class()
+                && let Ok(range_uri) = range_cv.canonical_uri().to_uri(&converter)
+            {
+                turtle.push_str(&format!("<{slot_uri}> rdfs:range <{range_uri}> .\n"));
             }
         }
     }
@@ -280,7 +280,6 @@ mod tests {
     use super::*;
     use linkml_runtime::load_json_str;
     use linkml_schemaview::identifier::Identifier;
-    use serde_json::json;
 
     fn test_schema_view() -> SchemaView {
         use linkml_meta::SchemaDefinition;

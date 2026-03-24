@@ -44,6 +44,7 @@ python-bindings = [
 stubgen = [
     "python-bindings",
     "shacl-parser",
+    "sparql-endpoint",
     "dep:pyo3-stub-gen",
     "linkml_runtime_python/stubgen",
     "linkml_meta/stubgen"
