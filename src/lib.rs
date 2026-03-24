@@ -79,9 +79,9 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConstraintSet>()?;
     #[cfg(feature = "sparql-endpoint")]
     {
-        m.add_function(wrap_pyfunction!(sparql_scope_py, m)?)?;
-        m.add_function(wrap_pyfunction!(sparql_execute_py, m)?)?;
-        m.add_function(wrap_pyfunction!(schema_to_triples_py, m)?)?;
+        m.add_function(wrap_pyfunction!(py_sparql_scope, m)?)?;
+        m.add_function(wrap_pyfunction!(py_sparql_execute, m)?)?;
+        m.add_function(wrap_pyfunction!(py_schema_to_triples, m)?)?;
         m.add_class::<PyScopeResult>()?;
     }
     Ok(())
@@ -1195,29 +1195,62 @@ impl PyConstraintSet {
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
 pub struct PyScopeResult {
-    #[pyo3(get)]
-    pub asset_types: Vec<String>,
-    #[pyo3(get)]
-    pub uri_filters: Vec<String>,
-    #[pyo3(get)]
-    pub is_bounded: bool,
-    #[pyo3(get)]
-    pub estimated_count: Option<usize>,
-    #[pyo3(get)]
-    pub schema_only: bool,
+    asset_types: Vec<String>,
+    uri_filters: Vec<String>,
+    is_bounded: bool,
+    estimated_count: Option<usize>,
+    schema_only: bool,
+    predicate_filters: HashMap<String, Vec<Vec<String>>>,
+    sql_limit: Option<usize>,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PyScopeResult {
+    #[getter]
+    fn asset_types(&self) -> Vec<String> {
+        self.asset_types.clone()
+    }
+
+    #[getter]
+    fn uri_filters(&self) -> Vec<String> {
+        self.uri_filters.clone()
+    }
+
+    #[getter]
+    fn is_bounded(&self) -> bool {
+        self.is_bounded
+    }
+
+    #[getter]
+    fn estimated_count(&self) -> Option<usize> {
+        self.estimated_count
+    }
+
+    #[getter]
+    fn schema_only(&self) -> bool {
+        self.schema_only
+    }
+
     /// Field-level filters pushable to SQL: {"field_name": [["eq", "value"], ["in", "v1", "v2"]]}
-    #[pyo3(get)]
-    pub predicate_filters: HashMap<String, Vec<Vec<String>>>,
+    #[getter]
+    fn predicate_filters(&self) -> HashMap<String, Vec<Vec<String>>> {
+        self.predicate_filters.clone()
+    }
+
     /// SQL LIMIT to push down (single-type queries only).
-    #[pyo3(get)]
-    pub sql_limit: Option<usize>,
+    #[getter]
+    fn sql_limit(&self) -> Option<usize> {
+        self.sql_limit
+    }
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
 #[pyo3(name = "sparql_scope")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-fn sparql_scope_py(
+fn py_sparql_scope(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
@@ -1281,7 +1314,7 @@ fn sparql_scope_py(
 #[pyfunction]
 #[pyo3(name = "sparql_execute", signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-fn sparql_execute_py(
+fn py_sparql_execute(
     py: Python<'_>,
     query: &str,
     instances: Vec<Py<PyLinkMLInstance>>,
@@ -1333,7 +1366,7 @@ fn sparql_execute_py(
 #[pyfunction]
 #[pyo3(name = "schema_to_triples")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-fn schema_to_triples_py(
+fn py_schema_to_triples(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
 ) -> PyResult<String> {
