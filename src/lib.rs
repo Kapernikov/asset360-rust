@@ -81,7 +81,6 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
-        m.add_function(wrap_pyfunction!(schema_to_triples, m)?)?;
         m.add_class::<PyScopeResult>()?;
         m.add_class::<PyFilterCondition>()?;
     }
@@ -1283,24 +1282,20 @@ impl PyFilterCondition {
 ///
 /// ```python
 /// scope = lr.sparql_scope(query, schema_view)
-/// if scope.schema_only:
-///     instances = []
-/// else:
-///     for asset_type in scope.asset_types:
-///         qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
-///         if scope.uri_filters:
-///             qs = qs.filter(asset360_uri__in=scope.uri_filters)
-///         for field, conditions in scope.predicate_filters.items():
-///             for cond in conditions:
-///                 if cond.operator == "eq":
-///                     qs = qs.filter(**{f"object_data__{field}": cond.value})
+/// for asset_type in scope.asset_types:
+///     qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
+///     if scope.uri_filters:
+///         qs = qs.filter(asset360_uri__in=scope.uri_filters)
+///     for field, conditions in scope.predicate_filters.items():
+///         for cond in conditions:
+///             if cond.operator == "eq":
+///                 qs = qs.filter(**{f"object_data__{field}": cond.value})
 /// ```
 pub struct PyScopeResult {
     asset_types: Vec<String>,
     uri_filters: Vec<String>,
     is_bounded: bool,
     estimated_count: Option<usize>,
-    schema_only: bool,
     predicate_filters: HashMap<String, Vec<PyFilterCondition>>,
     sql_limit: Option<usize>,
 }
@@ -1334,13 +1329,6 @@ impl PyScopeResult {
     #[getter]
     fn estimated_count(&self) -> Option<usize> {
         self.estimated_count
-    }
-
-    /// True for introspection queries (e.g. ``?c a rdfs:Class``) that
-    /// need no instance data — answered from schema triples alone.
-    #[getter]
-    fn schema_only(&self) -> bool {
-        self.schema_only
     }
 
     /// Field-level filters pushable to SQL as JSONB lookups.
@@ -1407,7 +1395,6 @@ fn sparql_scope(
                 uri_filters: result.uri_filters,
                 is_bounded: result.is_bounded,
                 estimated_count: result.estimated_count,
-                schema_only: result.schema_only,
                 predicate_filters: py_filters,
                 sql_limit: result.sql_limit,
             })
@@ -1443,8 +1430,7 @@ fn sparql_scope(
 /// Args:
 ///     query: SPARQL query string.
 ///     instances: List of LinkMLInstance objects to query against.
-///         Pass an empty list for schema-only (introspection) queries.
-///     schema_view: The LinkML schema (for RDF conversion and schema triples).
+///     schema_view: The LinkML schema (for RDF conversion).
 ///     format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
 ///         ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
 ///     max_triples: Maximum triples in the store (default 500,000).
@@ -1502,33 +1488,6 @@ fn sparql_execute(
         }
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyfunction]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-/// Generate RDF schema triples (Turtle) from the LinkML schema.
-///
-/// Produces ``rdfs:Class``, ``rdfs:subClassOf``, ``rdf:Property``,
-/// ``rdfs:domain``, and ``rdfs:range`` triples for all classes and slots.
-///
-/// These are pre-loaded into the Oxigraph store before instance data,
-/// enabling introspection queries like ``SELECT ?c WHERE { ?c a rdfs:Class }``
-/// without any database access.
-///
-/// Args:
-///     schema_view: The LinkML schema to generate triples from.
-///
-/// Returns:
-///     Turtle string containing schema triples.
-fn schema_to_triples(
-    py: Python<'_>,
-    schema_view: Py<PySchemaView>,
-) -> PyResult<String> {
-    let bound = schema_view.bind(py);
-    let sv_ref = bound.borrow();
-    let sv = sv_ref.as_rust();
-    Ok(crate::sparql_executor::schema_to_triples(sv))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]

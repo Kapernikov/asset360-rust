@@ -5,12 +5,10 @@
 //! the Django view has loaded them as [`LinkMLInstance`] objects, this module:
 //!
 //! 1. Creates a fresh in-memory Oxigraph store.
-//! 2. Pre-loads **schema triples** (class hierarchy and property definitions
-//!    derived from the LinkML schema) so introspection queries work.
-//! 3. Converts each [`LinkMLInstance`] to Turtle via `as_turtle()` and loads
+//! 2. Converts each [`LinkMLInstance`] to Turtle via `as_turtle()` and loads
 //!    the resulting RDF triples into the store.
-//! 4. Executes the SPARQL query against the store.
-//! 5. Serialises the results to SPARQL JSON Results (for SELECT/ASK) or
+//! 3. Executes the SPARQL query against the store.
+//! 4. Serialises the results to SPARQL JSON Results (for SELECT/ASK) or
 //!    N-Triples (for CONSTRUCT/DESCRIBE).
 //!
 //! No data persists between queries — the store is created and destroyed per
@@ -105,70 +103,6 @@ impl Default for ExecuteLimits {
     }
 }
 
-/// Generate RDF schema triples (as Turtle) from the LinkML schema.
-///
-/// Walks all classes and slots in the schema and produces:
-/// - `<class_uri> a rdfs:Class` for each class
-/// - `<class_uri> rdfs:subClassOf <parent_uri>` for inheritance
-/// - `<slot_uri> a rdf:Property` for each slot
-/// - `<slot_uri> rdfs:domain <class_uri>` for the owning class
-/// - `<slot_uri> rdfs:range <range_uri>` for object-property ranges
-///
-/// These triples are loaded into the Oxigraph store before instance data,
-/// enabling introspection queries like `SELECT ?c WHERE { ?c a rdfs:Class }`
-/// without touching PostgreSQL.
-pub fn schema_to_triples(schema_view: &SchemaView) -> String {
-    let mut turtle = String::new();
-    turtle.push_str("@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n");
-    turtle.push_str("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n");
-    turtle.push_str("@prefix asset360: <https://data.infrabel.be/asset360/> .\n\n");
-
-    let converter = schema_view.converter();
-
-    let class_views = match schema_view.class_views() {
-        Ok(cvs) => cvs,
-        Err(_) => return turtle,
-    };
-
-    for cv in &class_views {
-        let class_uri = match cv.canonical_uri().to_uri(&converter) {
-            Ok(uri) => uri.to_string(),
-            Err(_) => continue,
-        };
-
-        turtle.push_str(&format!("<{class_uri}> a rdfs:Class .\n"));
-
-        // rdfs:subClassOf for parent class
-        if let Ok(Some(parent)) = cv.parent_class()
-            && let Ok(parent_uri) = parent.canonical_uri().to_uri(&converter)
-        {
-            turtle.push_str(&format!(
-                "<{class_uri}> rdfs:subClassOf <{parent_uri}> .\n"
-            ));
-        }
-
-        // Properties for each slot
-        for sv in cv.slots() {
-            let slot_uri = match sv.canonical_uri().to_uri(&converter) {
-                Ok(uri) => uri.to_string(),
-                Err(_) => continue,
-            };
-
-            turtle.push_str(&format!("<{slot_uri}> a rdf:Property .\n"));
-            turtle.push_str(&format!("<{slot_uri}> rdfs:domain <{class_uri}> .\n"));
-
-            // rdfs:range — use the range class URI if it's a class reference
-            if let Some(range_cv) = sv.get_range_class()
-                && let Ok(range_uri) = range_cv.canonical_uri().to_uri(&converter)
-            {
-                turtle.push_str(&format!("<{slot_uri}> rdfs:range <{range_uri}> .\n"));
-            }
-        }
-    }
-
-    turtle
-}
-
 /// Execute a SPARQL query against a set of LinkML instances.
 ///
 /// This is the main entry point for query execution. The caller (Django view)
@@ -180,9 +114,8 @@ pub fn schema_to_triples(schema_view: &SchemaView) -> String {
 /// * `query_str` — The SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
 /// * `instances` — The LinkML instances to query against. Each instance is
 ///   converted to RDF triples via `as_turtle()` and loaded into an ephemeral
-///   in-memory Oxigraph store. Pass an empty slice for schema-only queries.
-/// * `schema_view` — Used to generate schema triples (class hierarchy,
-///   property definitions) that are pre-loaded into the store.
+///   in-memory Oxigraph store.
+/// * `schema_view` — Used for Turtle serialisation of instances.
 /// * `format` — Output serialisation format:
 ///   - `"json"` → SPARQL JSON Results (`application/sparql-results+json`)
 ///     for SELECT and ASK queries.
@@ -208,12 +141,6 @@ pub fn sparql_execute(
     limits: ExecuteLimits,
 ) -> Result<String, ExecuteError> {
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-
-    // Load schema triples
-    let schema_turtle = schema_to_triples(schema_view);
-    store
-        .load_from_reader(RdfFormat::Turtle, schema_turtle.as_bytes())
-        .map_err(|e| ExecuteError::StoreError(format!("Failed to load schema triples: {e}")))?;
 
     // Load instance data
     let converter = schema_view.converter();
@@ -473,30 +400,6 @@ classes:
     }
 
     #[test]
-    fn test_schema_introspection() {
-        let sv = test_schema_view();
-        let result = sparql_execute(
-            "SELECT ?c WHERE { ?c a <http://www.w3.org/2000/01/rdf-schema#Class> }",
-            &[],
-            &sv,
-            "json",
-            ExecuteLimits::default(),
-        )
-        .unwrap();
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let bindings = parsed["results"]["bindings"].as_array().unwrap();
-        assert!(bindings.len() >= 2, "Expected at least 2 classes, got {}", bindings.len());
-
-        let class_uris: Vec<&str> = bindings
-            .iter()
-            .map(|b| b["c"]["value"].as_str().unwrap())
-            .collect();
-        assert!(class_uris.contains(&"https://data.infrabel.be/asset360/Signal"));
-        assert!(class_uris.contains(&"https://data.infrabel.be/asset360/BaliseGroup"));
-    }
-
-    #[test]
     fn test_result_limit_exceeded() {
         let sv = test_schema_view();
         let instances = signal_instances(&sv);
@@ -534,16 +437,6 @@ classes:
         );
 
         assert!(matches!(result, Err(ExecuteError::TripleLimitExceeded { .. })));
-    }
-
-    #[test]
-    fn test_schema_to_triples_produces_valid_turtle() {
-        let sv = test_schema_view();
-        let turtle = schema_to_triples(&sv);
-
-        assert!(turtle.contains("rdfs:Class"), "Should declare classes");
-        assert!(turtle.contains("rdf:Property"), "Should declare properties");
-        assert!(turtle.contains("@prefix"), "Should have prefix declarations");
     }
 
     #[test]

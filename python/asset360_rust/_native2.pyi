@@ -3461,17 +3461,14 @@ class PyScopeResult:
     
     ```python
     scope = lr.sparql_scope(query, schema_view)
-    if scope.schema_only:
-        instances = []
-    else:
-        for asset_type in scope.asset_types:
-            qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
-            if scope.uri_filters:
-                qs = qs.filter(asset360_uri__in=scope.uri_filters)
-            for field, conditions in scope.predicate_filters.items():
-                for cond in conditions:
-                    if cond.operator == "eq":
-                        qs = qs.filter(**{f"object_data__{field}": cond.value})
+    for asset_type in scope.asset_types:
+        qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
+        if scope.uri_filters:
+            qs = qs.filter(asset360_uri__in=scope.uri_filters)
+        for field, conditions in scope.predicate_filters.items():
+            for cond in conditions:
+                if cond.operator == "eq":
+                    qs = qs.filter(**{f"object_data__{field}": cond.value})
     ```
     """
     @property
@@ -3496,12 +3493,6 @@ class PyScopeResult:
     def estimated_count(self) -> typing.Optional[builtins.int]:
         r"""
         Estimated object count, if determinable. Currently always None.
-        """
-    @property
-    def schema_only(self) -> builtins.bool:
-        r"""
-        True for introspection queries (e.g. ``?c a rdfs:Class``) that
-        need no instance data — answered from schema triples alone.
         """
     @property
     def predicate_filters(self) -> builtins.dict[builtins.str, builtins.list[PyFilterCondition]]:
@@ -5674,24 +5665,6 @@ def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def schema_to_triples(schema_view:SchemaView) -> builtins.str:
-    r"""
-    Generate RDF schema triples (Turtle) from the LinkML schema.
-    
-    Produces ``rdfs:Class``, ``rdfs:subClassOf``, ``rdf:Property``,
-    ``rdfs:domain``, and ``rdfs:range`` triples for all classes and slots.
-    
-    These are pre-loaded into the Oxigraph store before instance data,
-    enabling introspection queries like ``SELECT ?c WHERE { ?c a rdfs:Class }``
-    without any database access.
-    
-    Args:
-        schema_view: The LinkML schema to generate triples from.
-    
-    Returns:
-        Turtle string containing schema triples.
-    """
-
 def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
@@ -5703,8 +5676,7 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
     Args:
         query: SPARQL query string.
         instances: List of LinkMLInstance objects to query against.
-            Pass an empty list for schema-only (introspection) queries.
-        schema_view: The LinkML schema (for RDF conversion and schema triples).
+        schema_view: The LinkML schema (for RDF conversion).
         format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
             ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
         max_triples: Maximum triples in the store (default 500,000).

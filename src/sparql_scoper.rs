@@ -14,8 +14,6 @@
 //! - Which specific **URIs** are referenced (for point lookups).
 //! - Which **field-level filters** can be pushed to SQL (e.g. `FILTER(?name = "BX517")`
 //!   when `?name` is bound via `?s asset360:name ?name`).
-//! - Whether the query is **schema-only** (introspection queries like
-//!   `?c a rdfs:Class` that need no instance data at all).
 //! - Whether a **LIMIT** can be pushed to SQL (single-type queries only).
 //!
 //! Queries that cannot be scoped — e.g. `SELECT * WHERE { ?s ?p ?o }` — are
@@ -41,8 +39,7 @@ use linkml_schemaview::schemaview::SchemaView;
 /// | `predicate_filters["name"] = [Eq("X")]` | `WHERE object_data->>'name' = 'X'` |
 /// | `sql_limit` | `LIMIT n` on the queryset |
 ///
-/// When `schema_only` is true, no SQL query is needed — the executor answers
-/// entirely from pre-loaded schema triples (class hierarchy, properties).
+/// When all fields are empty and `is_bounded` is false, the query is rejected.
 #[derive(Debug, Clone)]
 pub struct ScopeResult {
     /// LinkML class names to fetch from the database.
@@ -51,7 +48,6 @@ pub struct ScopeResult {
     /// `?s a asset360:Signal` produces `["Signal"]`. The Django view translates
     /// this to `GoldenRecord.objects.filter(asset_type__endswith="Signal")`.
     ///
-    /// Empty when `schema_only` is true (introspection queries).
     pub asset_types: Vec<String>,
 
     /// Specific asset360 URIs referenced in the query.
@@ -74,22 +70,14 @@ pub struct ScopeResult {
 
     /// Whether the query scope is bounded (safe to execute).
     ///
-    /// True when at least one of: `asset_types` is non-empty, `uri_filters`
-    /// is non-empty, or `schema_only` is true. False means the query would
-    /// require loading the entire database, so it is rejected.
+    /// True when at least one of: `asset_types` is non-empty or `uri_filters`
+    /// is non-empty. False means the query would require loading the entire
+    /// database, so it is rejected.
     pub is_bounded: bool,
 
     /// Estimated number of objects, if determinable from the query structure.
     /// Currently always `None`; reserved for future use.
     pub estimated_count: Option<usize>,
-
-    /// Whether this query can be answered from schema triples alone.
-    ///
-    /// True for queries like `SELECT ?c WHERE { ?c a rdfs:Class }` that only
-    /// reference RDF Schema vocabulary types. When true, the Django view skips
-    /// the database fetch entirely and passes an empty instance list to the
-    /// executor, which answers from pre-loaded LinkML schema triples.
-    pub schema_only: bool,
 
     /// SQL LIMIT to push down to the database query.
     ///
@@ -138,8 +126,6 @@ impl std::fmt::Display for ScopeError {
 }
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
-const RDF_PROPERTY: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property";
 
 /// Analyse a SPARQL query and extract scoping information.
 ///
@@ -187,7 +173,6 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeRe
     // Extract rdf:type patterns
     let mut type_iris: HashSet<String> = HashSet::new();
     let mut type_variables: HashSet<String> = HashSet::new();
-    let mut schema_type_iris: HashSet<String> = HashSet::new();
     let mut uri_filters: HashSet<String> = HashSet::new();
 
     for tp in &triples {
@@ -199,13 +184,7 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeRe
         if pred_iri == RDF_TYPE {
             match &tp.object {
                 TermPattern::NamedNode(nn) => {
-                    let obj_iri = nn.as_str();
-                    // Check if this is a schema-level type (rdfs:Class, rdf:Property)
-                    if obj_iri == RDFS_CLASS || obj_iri == RDF_PROPERTY {
-                        schema_type_iris.insert(obj_iri.to_owned());
-                    } else {
-                        type_iris.insert(obj_iri.to_owned());
-                    }
+                    type_iris.insert(nn.as_str().to_owned());
                 }
                 TermPattern::Variable(v) => {
                     type_variables.insert(v.as_str().to_owned());
@@ -239,15 +218,9 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeRe
     asset_types.sort();
     asset_types.dedup();
 
-    // Determine if this is a schema-only query
-    let schema_only = asset_types.is_empty()
-        && !schema_type_iris.is_empty()
-        && type_variables.is_empty();
-
     // Determine if bounded
     let is_bounded = !asset_types.is_empty()
-        || !uri_filters.is_empty()
-        || schema_only;
+        || !uri_filters.is_empty();
 
     if !is_bounded {
         let suggestion = if type_variables.is_empty() {
@@ -302,7 +275,6 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeRe
         predicate_filters,
         is_bounded,
         estimated_count: None,
-        schema_only,
         sql_limit,
     })
 }
@@ -631,7 +603,6 @@ classes:
         .unwrap();
         assert_eq!(result.asset_types, vec!["Signal"]);
         assert!(result.is_bounded);
-        assert!(!result.schema_only);
     }
 
     #[test]
@@ -675,16 +646,16 @@ classes:
     }
 
     #[test]
-    fn test_schema_introspection_query() {
+    fn test_schema_introspection_query_rejected() {
+        // Without schema triples loaded, introspection queries like
+        // `?c a rdfs:Class` are unscoped — rdfs:Class is not an asset type.
+        // Schema triple support will be added later (OWL generator).
         let sv = test_schema_view();
         let result = sparql_scope(
             "SELECT ?c WHERE { ?c a rdfs:Class }",
             &sv,
-        )
-        .unwrap();
-        assert!(result.asset_types.is_empty());
-        assert!(result.is_bounded);
-        assert!(result.schema_only);
+        );
+        assert!(matches!(result, Err(ScopeError::Unscoped(_))));
     }
 
     #[test]
