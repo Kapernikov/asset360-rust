@@ -1,25 +1,19 @@
-//! SPARQL query scoping for the virtual SPARQL endpoint.
+//! SPARQL query planning for the virtual SPARQL endpoint.
 //!
-//! The virtual endpoint does not keep a persistent triple store. Instead it
-//! analyses each incoming SPARQL query to determine **which objects to fetch
-//! from PostgreSQL**, materialises only those as RDF, and executes the query
-//! in an in-memory Oxigraph store.
+//! Analyses a SPARQL query and produces a [`QueryPlan`] — a structured
+//! representation of what to fetch from PostgreSQL and how to join it.
 //!
-//! This module is the "analyse" step: it parses the SPARQL algebra tree
-//! (via `spargebra`) and extracts enough information for the Django view to
-//! build an efficient SQL query. The output is a [`ScopeResult`] that tells
-//! the caller:
+//! The plan decomposes the query into **stars** (groups of triple patterns
+//! sharing one subject variable, each bound to one `rdf:type`). Stars
+//! connected by reference properties produce **join edges** that Python
+//! translates to SQL JOINs. Stars without join edges are fetched
+//! independently. Patterns that can't be decomposed (property paths,
+//! complex FILTER expressions) fall back to Oxigraph.
 //!
-//! - Which LinkML **asset types** to fetch (derived from `rdf:type` patterns).
-//! - Which specific **URIs** are referenced (for point lookups).
-//! - Which **field-level filters** can be pushed to SQL (e.g. `FILTER(?name = "BX517")`
-//!   when `?name` is bound via `?s asset360:name ?name`).
-//! - Whether a **LIMIT** can be pushed to SQL (single-type queries only).
-//!
-//! Queries that cannot be scoped — e.g. `SELECT * WHERE { ?s ?p ?o }` — are
-//! rejected with a descriptive error rather than loading the entire database.
+//! The full SPARQL query is always executed in Oxigraph against the loaded
+//! data. The plan only determines *what* to load efficiently.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
@@ -27,71 +21,94 @@ use spargebra::{Query, SparqlParser};
 
 use linkml_schemaview::schemaview::SchemaView;
 
-/// The result of analysing a SPARQL query for database scoping.
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// A structured plan for fetching data from PostgreSQL.
 ///
-/// The Django view uses this to build the SQL `WHERE` clause that fetches
-/// only the objects needed for the query. Each field maps to a SQL filter:
+/// Stars connected by [`JoinEdge`]s are fetched via SQL JOIN.
+/// Stars with no join edges are fetched independently.
 ///
-/// | Field | SQL translation |
-/// |-------|----------------|
-/// | `asset_types` | `WHERE asset_type IN (...)` |
-/// | `uri_filters` | `WHERE asset360_uri IN (...)` |
-/// | `predicate_filters["name"] = [Eq("X")]` | `WHERE object_data->>'name' = 'X'` |
-/// | `sql_limit` | `LIMIT n` on the queryset |
-///
-/// When all fields are empty and `is_bounded` is false, the query is rejected.
+/// Python translates this to ORM queries / raw SQL, fetches the data,
+/// converts to [`LinkMLInstance`]s, and passes them to the executor.
 #[derive(Debug, Clone)]
-pub struct ScopeResult {
-    /// LinkML class names to fetch from the database.
-    ///
-    /// Derived from `rdf:type` triple patterns in the query. For example,
-    /// `?s a asset360:Signal` produces `["Signal"]`. The Django view translates
-    /// this to `GoldenRecord.objects.filter(asset_type__endswith="Signal")`.
-    ///
-    pub asset_types: Vec<String>,
+pub struct QueryPlan {
+    /// Type-scoped subject groups (stars) extracted from the query.
+    pub stars: Vec<Star>,
 
-    /// Specific asset360 URIs referenced in the query.
-    ///
-    /// Collected from named-node constants in triple pattern subjects and
-    /// from `VALUES` clauses. The Django view translates this to
-    /// `qs.filter(asset360_uri__in=[...])`.
-    pub uri_filters: Vec<String>,
+    /// Join edges between stars, pushable to SQL JOINs.
+    pub joins: Vec<JoinEdge>,
 
-    /// Field-level filter conditions that can be pushed down to SQL.
-    ///
-    /// Keyed by the LinkML **slot name** (not the predicate IRI). The slot
-    /// name is resolved from the IRI via `SchemaView::get_slot_by_uri()`.
-    ///
-    /// Example: `FILTER(?name = "BX517")` where `?name` is bound via
-    /// `?s asset360:name ?name` produces `{"name": [Eq("BX517")]}`.
-    /// The Django view translates `Eq` to `object_data__name="BX517"`
-    /// and `In` to `object_data__name__in=[...]` (JSONB lookup).
-    pub predicate_filters: HashMap<String, Vec<FilterCondition>>,
-
-    /// Whether the query scope is bounded (safe to execute).
-    ///
-    /// True when at least one of: `asset_types` is non-empty or `uri_filters`
-    /// is non-empty. False means the query would require loading the entire
-    /// database, so it is rejected.
-    pub is_bounded: bool,
-
-    /// Estimated number of objects, if determinable from the query structure.
-    /// Currently always `None`; reserved for future use.
-    pub estimated_count: Option<usize>,
-
-    /// SQL LIMIT to push down to the database query.
-    ///
-    /// Only set for single-type queries with a top-level `LIMIT` clause
-    /// (e.g. `SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10`). For
-    /// multi-type joins the LIMIT applies to the *joined* result, not to
-    /// individual type fetches, so it cannot be safely pushed to SQL.
+    /// SQL LIMIT — only set for single-star, zero-join queries
+    /// with a top-level SPARQL LIMIT.
     pub sql_limit: Option<usize>,
 }
 
-/// A filter condition extracted from the SPARQL query, pushable to SQL.
+/// A group of triple patterns sharing the same subject variable,
+/// bound to one `rdf:type` (one LinkML class).
 ///
-/// These are produced by analysing `FILTER` and `VALUES` clauses in the query
-/// where the filtered variable is bound to a known predicate (slot).
+/// Named after the SPARQL algebra concept of "star-shaped sub-pattern."
+///
+/// Python translates each star to SQL conditions:
+/// - `class_name` → `WHERE asset_type LIKE '%ClassName'`
+/// - `required_fields` → `WHERE object_data ? 'fieldName'`
+/// - `filters` → `WHERE object_data->>'field' = 'value'`
+#[derive(Debug, Clone)]
+pub struct Star {
+    /// The SPARQL variable name (without `?`), e.g. `"complex"`.
+    pub variable: String,
+
+    /// The LinkML class name, e.g. `"TunnelComplex"`.
+    pub class_name: String,
+
+    /// All slots referenced in triple patterns for this subject.
+    /// Python uses these for field existence checks:
+    /// `WHERE object_data ? 'hasName'`
+    pub required_fields: Vec<String>,
+
+    /// Value-level filter conditions per slot, pushable to SQL.
+    /// From `FILTER(?var = "literal")` and `VALUES ?var { ... }`
+    /// where `?var` is bound to a known slot in this star.
+    pub filters: HashMap<String, Vec<FilterCondition>>,
+}
+
+/// A join between two stars, pushable to a SQL JOIN.
+///
+/// The `right` star has a slot (`right_slot`) whose value is the
+/// `asset360_uri` of the `left` star's subject. Python translates to:
+///
+/// ```sql
+/// JOIN goldenrecords t1
+///   ON t1.object_data->>'right_slot' = t0.asset360_uri
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinEdge {
+    /// Variable of the referenced star (the join target).
+    pub left: String,
+
+    /// Variable of the star holding the foreign key.
+    pub right: String,
+
+    /// The slot on the right star whose value equals left's `asset360_uri`.
+    /// E.g. `"belongsToTunnelComplex"`.
+    pub right_slot: String,
+
+    /// Join type.
+    pub join_type: JoinType,
+}
+
+/// Join type for a [`JoinEdge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    /// SQL INNER JOIN — both sides must have matching rows.
+    Inner,
+    /// SQL LEFT JOIN — left side always present, right may be NULL.
+    /// Future: used for SPARQL OPTIONAL patterns.
+    Left,
+}
+
+/// A filter condition extracted from the SPARQL query, pushable to SQL.
 #[derive(Debug, Clone)]
 pub enum FilterCondition {
     /// Equality: `FILTER(?var = "value")` → `WHERE object_data->>'field' = 'value'`
@@ -100,16 +117,14 @@ pub enum FilterCondition {
     In(Vec<String>),
 }
 
-/// Errors from query scoping.
+/// Errors from query planning.
 #[derive(Debug)]
 pub enum ScopeError {
     /// The SPARQL query could not be parsed (syntax error).
     ParseError(String),
-    /// The query has no `rdf:type` constraint and cannot be scoped to specific
-    /// asset types. The message includes a suggestion for fixing the query.
+    /// The query has no `rdf:type` constraint and cannot be scoped.
     Unscoped(String),
-    /// The input is a SPARQL Update (INSERT/DELETE/LOAD), which is not
-    /// supported — this endpoint is read-only.
+    /// The input is a SPARQL Update (INSERT/DELETE), not supported.
     UpdateRejected,
 }
 
@@ -128,35 +143,37 @@ impl std::fmt::Display for ScopeError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-/// Analyse a SPARQL query and extract scoping information.
+/// Analyse a SPARQL query and produce a [`QueryPlan`].
 ///
-/// Parses the query via `spargebra`, walks the SPARQL algebra tree, and
-/// determines which asset types and objects need to be fetched from
-/// PostgreSQL.
+/// Parses the query via `spargebra`, decomposes the BGP into stars,
+/// detects join edges between stars, and collects filter conditions.
 ///
 /// # Errors
 ///
 /// - [`ScopeError::ParseError`] — invalid SPARQL syntax.
-/// - [`ScopeError::Unscoped`] — query has no `rdf:type` or URI constraints
-///   and would require loading the entire database.
-/// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update statement.
-pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeResult, ScopeError> {
-    // Reject SPARQL Update (INSERT/DELETE/LOAD)
+/// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
+/// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update.
+pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
+    // Reject SPARQL Update
     if SparqlParser::new().parse_update(query_str).is_ok() {
         return Err(ScopeError::UpdateRejected);
     }
 
     let parser = SparqlParser::new()
         .with_prefix("asset360", "https://data.infrabel.be/asset360/")
-        .expect("hardcoded prefix is valid")
+        .expect("hardcoded prefix")
         .with_prefix("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
-        .expect("hardcoded prefix is valid")
+        .expect("hardcoded prefix")
         .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#")
-        .expect("hardcoded prefix is valid")
+        .expect("hardcoded prefix")
         .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#")
-        .expect("hardcoded prefix is valid");
+        .expect("hardcoded prefix");
 
     let query = parser
         .parse_query(query_str)
@@ -169,116 +186,155 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<ScopeRe
         Query::Ask { pattern, .. } => pattern,
     };
 
-    // Collect all BGP triples from the algebra tree
+    // Collect all BGP triples
     let mut triples = Vec::new();
     collect_bgp_triples(pattern, &mut triples);
 
-    // Extract rdf:type patterns
-    let mut type_iris: HashSet<String> = HashSet::new();
-    let mut type_variables: HashSet<String> = HashSet::new();
-    let mut uri_filters: HashSet<String> = HashSet::new();
+    // Phase 1: Build stars — group triples by subject variable
+    let mut star_map: HashMap<String, StarBuilder> = HashMap::new();
 
     for tp in &triples {
+        let subj_var = match &tp.subject {
+            TermPattern::Variable(v) => v.as_str().to_owned(),
+            _ => continue,
+        };
+
         let pred_iri = match &tp.predicate {
             NamedNodePattern::NamedNode(nn) => nn.as_str(),
             _ => continue,
         };
 
+        let builder = star_map
+            .entry(subj_var.clone())
+            .or_insert_with(|| StarBuilder {
+                variable: subj_var,
+                type_iri: None,
+                slots: Vec::new(),
+                object_variables: HashMap::new(),
+            });
+
         if pred_iri == RDF_TYPE {
-            match &tp.object {
-                TermPattern::NamedNode(nn) => {
-                    type_iris.insert(nn.as_str().to_owned());
-                }
-                TermPattern::Variable(v) => {
-                    type_variables.insert(v.as_str().to_owned());
-                }
-                _ => {}
+            if let TermPattern::NamedNode(nn) = &tp.object {
+                builder.type_iri = Some(nn.as_str().to_owned());
+            }
+        } else if let Ok(Some(slot_view)) = schema_view.get_slot_by_uri(pred_iri) {
+            let slot_name = slot_view.name.clone();
+            builder.slots.push(slot_name.clone());
+            if let TermPattern::Variable(v) = &tp.object {
+                builder
+                    .object_variables
+                    .insert(slot_name, v.as_str().to_owned());
             }
         }
-
-        // Collect URI constants used as subjects (for URI-based filtering)
-        if let TermPattern::NamedNode(nn) = &tp.subject {
-            uri_filters.insert(nn.as_str().to_owned());
-        }
     }
 
-    // Also collect URIs from VALUES clauses
-    collect_values_uris(pattern, &mut uri_filters);
+    // Resolve type IRIs to class names, build Star structs
+    let mut stars: Vec<Star> = Vec::new();
+    let mut var_to_class: HashMap<String, String> = HashMap::new();
 
-    // Check if type variables are constrained by VALUES
-    let constrained_type_vars = check_type_variable_constraints(pattern, &type_variables);
-    for iri in constrained_type_vars {
-        type_iris.insert(iri);
+    for builder in star_map.values() {
+        let class_name = match &builder.type_iri {
+            Some(iri) => match schema_view.get_class_by_uri(iri) {
+                Ok(Some(cv)) => cv.name().to_owned(),
+                _ => continue, // unknown type IRI, skip this star
+            },
+            None => continue, // no rdf:type, can't scope
+        };
+
+        let mut required_fields: Vec<String> = builder.slots.clone();
+        required_fields.sort();
+        required_fields.dedup();
+
+        var_to_class.insert(builder.variable.clone(), class_name.clone());
+
+        stars.push(Star {
+            variable: builder.variable.clone(),
+            class_name,
+            required_fields,
+            filters: HashMap::new(), // populated below
+        });
     }
 
-    // Resolve type IRIs to asset type names via schema_view
-    let mut asset_types: Vec<String> = Vec::new();
-    for iri in &type_iris {
-        if let Ok(Some(cv)) = schema_view.get_class_by_uri(iri) {
-            asset_types.push(cv.name().to_owned());
-        }
-    }
-    asset_types.sort();
-    asset_types.dedup();
-
-    // Determine if bounded
-    let is_bounded = !asset_types.is_empty() || !uri_filters.is_empty();
-
-    if !is_bounded {
-        let suggestion = if type_variables.is_empty() {
+    if stars.is_empty() {
+        return Err(ScopeError::Unscoped(
             "Add a triple pattern like '?s rdf:type asset360:Signal' to scope the query."
-        } else {
-            "The type variable is unconstrained. Add VALUES or FILTER to bind it to specific types."
-        };
-        return Err(ScopeError::Unscoped(suggestion.to_owned()));
+                .to_owned(),
+        ));
     }
 
-    // --- Phase 7: Filter pushdown ---
+    // Phase 2: Detect join edges
+    let mut joins: Vec<JoinEdge> = Vec::new();
 
-    // Build variable→field binding map from BGP triples:
-    // ?s asset360:name ?name  →  var_to_field["name"] = "name"
-    // Resolve predicate IRI to slot name via SchemaView.
-    let mut var_to_field: HashMap<String, String> = HashMap::new();
-    for tp in &triples {
-        let pred_iri = match &tp.predicate {
-            NamedNodePattern::NamedNode(nn) => nn.as_str(),
-            _ => continue,
-        };
-        if pred_iri == RDF_TYPE {
+    for builder in star_map.values() {
+        if !var_to_class.contains_key(&builder.variable) {
             continue;
         }
-        if let TermPattern::Variable(v) = &tp.object {
-            // Resolve IRI to slot name via schema
-            if let Ok(Some(slot_view)) = schema_view.get_slot_by_uri(pred_iri) {
-                var_to_field.insert(v.as_str().to_owned(), slot_view.name.clone());
+        for (slot_name, obj_var) in &builder.object_variables {
+            if var_to_class.contains_key(obj_var) {
+                // This star's slot references another star's subject → join edge
+                joins.push(JoinEdge {
+                    left: obj_var.clone(),
+                    right: builder.variable.clone(),
+                    right_slot: slot_name.clone(),
+                    join_type: JoinType::Inner,
+                });
             }
         }
     }
 
-    // Extract FILTER equality conditions on bound variables (T022)
-    let mut predicate_filters: HashMap<String, Vec<FilterCondition>> = HashMap::new();
-    collect_filter_conditions(pattern, &var_to_field, &mut predicate_filters);
+    // Phase 3: Collect filter conditions per star
+    let mut var_to_field: HashMap<String, (String, String)> = HashMap::new();
+    // Map: object_variable → (star_variable, slot_name)
+    for builder in star_map.values() {
+        if !var_to_class.contains_key(&builder.variable) {
+            continue;
+        }
+        for (slot_name, obj_var) in &builder.object_variables {
+            if !var_to_class.contains_key(obj_var) {
+                // obj_var is a value variable (not another star's subject)
+                var_to_field.insert(
+                    obj_var.clone(),
+                    (builder.variable.clone(), slot_name.clone()),
+                );
+            }
+        }
+    }
 
-    // Extract VALUES on subject variables for URI pushdown (T023)
-    // Already handled by collect_values_uris above — subject URIs from VALUES
-    // are in uri_filters. Also collect VALUES on bound variables.
-    collect_values_filters(pattern, &var_to_field, &mut predicate_filters);
+    let mut star_filters: HashMap<String, HashMap<String, Vec<FilterCondition>>> = HashMap::new();
+    collect_filter_conditions(pattern, &var_to_field, &mut star_filters);
+    collect_values_filters(pattern, &var_to_field, &mut star_filters);
 
-    // Extract SQL LIMIT for single-type queries (T024)
-    let sql_limit = if asset_types.len() == 1 {
+    for star in &mut stars {
+        if let Some(filters) = star_filters.remove(&star.variable) {
+            star.filters = filters;
+        }
+    }
+
+    // Phase 4: SQL LIMIT (single-star, zero-join only)
+    let sql_limit = if stars.len() == 1 && joins.is_empty() {
         extract_top_level_limit(pattern)
     } else {
         None
     };
 
-    Ok(ScopeResult {
-        asset_types,
-        uri_filters: uri_filters.into_iter().collect(),
-        predicate_filters,
-        is_bounded,
-        estimated_count: None,
+    Ok(QueryPlan {
+        stars,
+        joins,
         sql_limit,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+struct StarBuilder {
+    variable: String,
+    type_iri: Option<String>,
+    /// Slot names referenced in triple patterns for this subject.
+    slots: Vec<String>,
+    /// Map: slot_name → object variable name (for join detection + filters).
+    object_variables: HashMap<String, String>,
 }
 
 /// Recursively collect all BGP triple patterns from a SPARQL algebra tree.
@@ -310,116 +366,23 @@ fn collect_bgp_triples<'a>(pattern: &'a GraphPattern, triples: &mut Vec<&'a Trip
     }
 }
 
-/// Collect URI constants from VALUES clauses.
-fn collect_values_uris(pattern: &GraphPattern, uris: &mut HashSet<String>) {
-    match pattern {
-        GraphPattern::Values { bindings, .. } => {
-            for row in bindings {
-                for val in row {
-                    if let Some(spargebra::term::GroundTerm::NamedNode(nn)) = val {
-                        uris.insert(nn.as_str().to_owned());
-                    }
-                }
-            }
-        }
-        GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
-            collect_values_uris(left, uris);
-            collect_values_uris(right, uris);
-        }
-        GraphPattern::Filter { inner, .. }
-        | GraphPattern::Extend { inner, .. }
-        | GraphPattern::OrderBy { inner, .. }
-        | GraphPattern::Project { inner, .. }
-        | GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. }
-        | GraphPattern::Group { inner, .. }
-        | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => {
-            collect_values_uris(inner, uris);
-        }
-        _ => {}
-    }
-}
-
-/// Check if type variables are constrained by VALUES clauses.
-fn check_type_variable_constraints(
-    pattern: &GraphPattern,
-    type_vars: &HashSet<String>,
-) -> Vec<String> {
-    let mut constrained_iris = Vec::new();
-    collect_type_var_values(pattern, type_vars, &mut constrained_iris);
-    constrained_iris
-}
-
-fn collect_type_var_values(
-    pattern: &GraphPattern,
-    type_vars: &HashSet<String>,
-    iris: &mut Vec<String>,
-) {
-    match pattern {
-        GraphPattern::Values {
-            variables,
-            bindings,
-        } => {
-            for (i, var) in variables.iter().enumerate() {
-                if type_vars.contains(var.as_str()) {
-                    for row in bindings {
-                        if let Some(Some(spargebra::term::GroundTerm::NamedNode(nn))) = row.get(i) {
-                            iris.push(nn.as_str().to_owned());
-                        }
-                    }
-                }
-            }
-        }
-        GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
-            collect_type_var_values(left, type_vars, iris);
-            collect_type_var_values(right, type_vars, iris);
-        }
-        GraphPattern::Filter { inner, .. }
-        | GraphPattern::Extend { inner, .. }
-        | GraphPattern::OrderBy { inner, .. }
-        | GraphPattern::Project { inner, .. }
-        | GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. }
-        | GraphPattern::Group { inner, .. }
-        | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => {
-            collect_type_var_values(inner, type_vars, iris);
-        }
-        _ => {}
-    }
-}
-
-/// T022: Extract FILTER equality conditions on variables bound to known predicates.
-///
-/// Recognizes patterns like:
-///   FILTER(?name = "BX517")
-///   FILTER("BX517" = ?name)
-/// where ?name is bound via `?s asset360:name ?name`.
+/// Collect FILTER equality conditions, now keyed by (star_variable, slot_name).
 fn collect_filter_conditions(
     pattern: &GraphPattern,
-    var_to_field: &HashMap<String, String>,
-    filters: &mut HashMap<String, Vec<FilterCondition>>,
+    var_to_field: &HashMap<String, (String, String)>,
+    star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
 ) {
     match pattern {
         GraphPattern::Filter { expr, inner } => {
-            extract_equality_from_expr(expr, var_to_field, filters);
-            collect_filter_conditions(inner, var_to_field, filters);
+            extract_equality_from_expr(expr, var_to_field, star_filters);
+            collect_filter_conditions(inner, var_to_field, star_filters);
         }
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
-            collect_filter_conditions(left, var_to_field, filters);
-            collect_filter_conditions(right, var_to_field, filters);
+            collect_filter_conditions(left, var_to_field, star_filters);
+            collect_filter_conditions(right, var_to_field, star_filters);
         }
         GraphPattern::Extend { inner, .. }
         | GraphPattern::OrderBy { inner, .. }
@@ -430,65 +393,60 @@ fn collect_filter_conditions(
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => {
-            collect_filter_conditions(inner, var_to_field, filters);
+            collect_filter_conditions(inner, var_to_field, star_filters);
         }
         _ => {}
     }
 }
 
-/// Extract equality conditions from a FILTER expression.
 fn extract_equality_from_expr(
     expr: &Expression,
-    var_to_field: &HashMap<String, String>,
-    filters: &mut HashMap<String, Vec<FilterCondition>>,
+    var_to_field: &HashMap<String, (String, String)>,
+    star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
 ) {
     match expr {
         Expression::Equal(left, right) => {
-            // Check ?var = "literal" or "literal" = ?var
-            if let Some((field, value)) = match_var_literal(left, right, var_to_field)
+            if let Some((star_var, field, value)) = match_var_literal(left, right, var_to_field)
                 .or_else(|| match_var_literal(right, left, var_to_field))
             {
-                filters
+                star_filters
+                    .entry(star_var)
+                    .or_default()
                     .entry(field)
                     .or_default()
                     .push(FilterCondition::Eq(value));
             }
         }
         Expression::And(left, right) => {
-            extract_equality_from_expr(left, var_to_field, filters);
-            extract_equality_from_expr(right, var_to_field, filters);
+            extract_equality_from_expr(left, var_to_field, star_filters);
+            extract_equality_from_expr(right, var_to_field, star_filters);
         }
         _ => {}
     }
 }
 
-/// Match a (variable, literal) pair in a FILTER expression.
 fn match_var_literal(
     var_expr: &Expression,
     lit_expr: &Expression,
-    var_to_field: &HashMap<String, String>,
-) -> Option<(String, String)> {
+    var_to_field: &HashMap<String, (String, String)>,
+) -> Option<(String, String, String)> {
     let var_name = match var_expr {
         Expression::Variable(v) => v.as_str(),
         _ => return None,
     };
-    let field = var_to_field.get(var_name)?;
+    let (star_var, field) = var_to_field.get(var_name)?;
     let value = match lit_expr {
         Expression::Literal(lit) => lit.value().to_owned(),
         _ => return None,
     };
-    Some((field.clone(), value))
+    Some((star_var.clone(), field.clone(), value))
 }
 
-/// T023: Extract VALUES on bound variables and push as filter conditions.
-///
-/// Recognizes:
-///   VALUES ?name { "BX517" "BX518" }
-/// where ?name is bound via `?s asset360:name ?name`.
+/// Collect VALUES conditions, now keyed by (star_variable, slot_name).
 fn collect_values_filters(
     pattern: &GraphPattern,
-    var_to_field: &HashMap<String, String>,
-    filters: &mut HashMap<String, Vec<FilterCondition>>,
+    var_to_field: &HashMap<String, (String, String)>,
+    star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
 ) {
     match pattern {
         GraphPattern::Values {
@@ -496,7 +454,7 @@ fn collect_values_filters(
             bindings,
         } => {
             for (i, var) in variables.iter().enumerate() {
-                if let Some(field) = var_to_field.get(var.as_str()) {
+                if let Some((star_var, field)) = var_to_field.get(var.as_str()) {
                     let mut values = Vec::new();
                     for row in bindings {
                         if let Some(Some(term)) = row.get(i) {
@@ -511,7 +469,9 @@ fn collect_values_filters(
                         }
                     }
                     if !values.is_empty() {
-                        filters
+                        star_filters
+                            .entry(star_var.clone())
+                            .or_default()
                             .entry(field.clone())
                             .or_default()
                             .push(FilterCondition::In(values));
@@ -523,8 +483,8 @@ fn collect_values_filters(
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
-            collect_values_filters(left, var_to_field, filters);
-            collect_values_filters(right, var_to_field, filters);
+            collect_values_filters(left, var_to_field, star_filters);
+            collect_values_filters(right, var_to_field, star_filters);
         }
         GraphPattern::Filter { inner, .. }
         | GraphPattern::Extend { inner, .. }
@@ -536,24 +496,24 @@ fn collect_values_filters(
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => {
-            collect_values_filters(inner, var_to_field, filters);
+            collect_values_filters(inner, var_to_field, star_filters);
         }
         _ => {}
     }
 }
 
-/// T024: Extract top-level LIMIT from the query pattern.
-///
-/// Only extracts LIMIT from single-type queries where the LIMIT
-/// is at the outermost level (Slice pattern wrapping the rest).
+/// Extract top-level LIMIT from the query pattern.
 fn extract_top_level_limit(pattern: &GraphPattern) -> Option<usize> {
     match pattern {
         GraphPattern::Slice { length, .. } => *length,
-        // Look through Project (SELECT wraps in Project → Slice)
         GraphPattern::Project { inner, .. } => extract_top_level_limit(inner),
         _ => None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -583,6 +543,8 @@ classes:
         identifier: true
       name:
         range: string
+      locatedOnTrack:
+        range: Track
   BaliseGroup:
     class_uri: asset360:BaliseGroup
     attributes:
@@ -590,6 +552,38 @@ classes:
         identifier: true
       refersToSignal:
         range: Signal
+  TunnelComplex:
+    class_uri: asset360:TunnelComplex
+    attributes:
+      asset360_uri:
+        identifier: true
+      hasName:
+        range: string
+  CivilEngineeringAsset:
+    class_uri: asset360:CivilEngineeringAsset
+    attributes:
+      asset360_uri:
+        identifier: true
+      hasName:
+        range: string
+      belongsToTunnelComplex:
+        range: TunnelComplex
+  Track:
+    class_uri: asset360:Track
+    attributes:
+      asset360_uri:
+        identifier: true
+      hasName:
+        range: string
+      belongsToLine:
+        range: Line
+  Line:
+    class_uri: asset360:Line
+    attributes:
+      asset360_uri:
+        identifier: true
+      hasName:
+        range: string
 "#;
         let schema: SchemaDefinition =
             p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
@@ -598,45 +592,166 @@ classes:
         sv
     }
 
+    fn find_star<'a>(plan: &'a QueryPlan, var: &str) -> &'a Star {
+        plan.stars
+            .iter()
+            .find(|s| s.variable == var)
+            .unwrap_or_else(|| panic!("no star for variable '{var}'"))
+    }
+
+    // ---- Single type ----
+
     #[test]
-    fn test_single_type_query() {
+    fn test_single_type() {
         let sv = test_schema_view();
-        let result = sparql_scope(
+        let plan = sparql_scope(
             "SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
             &sv,
         )
         .unwrap();
-        assert_eq!(result.asset_types, vec!["Signal"]);
-        assert!(result.is_bounded);
+
+        assert_eq!(plan.stars.len(), 1);
+        assert_eq!(plan.joins.len(), 0);
+
+        let star = &plan.stars[0];
+        assert_eq!(star.class_name, "Signal");
+        assert!(star.required_fields.contains(&"name".to_owned()));
     }
 
     #[test]
-    fn test_multi_type_join() {
+    fn test_single_type_with_filter() {
         let sv = test_schema_view();
-        let result = sparql_scope(
-            "SELECT ?sig ?bg WHERE { \
-             ?sig a asset360:Signal . \
-             ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?sig . \
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?name . FILTER(?name = \"BX517\") }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert_eq!(star.class_name, "Signal");
+        let name_filters = star.filters.get("name").expect("should have name filter");
+        assert!(matches!(&name_filters[0], FilterCondition::Eq(v) if v == "BX517"));
+    }
+
+    #[test]
+    fn test_single_type_with_limit() {
+        let sv = test_schema_view();
+        let plan = sparql_scope("SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10", &sv).unwrap();
+
+        assert_eq!(plan.sql_limit, Some(10));
+    }
+
+    // ---- Two-type inner join ----
+
+    #[test]
+    fn test_two_type_join() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?complex ?complexName ?component ?componentName WHERE { \
+               ?complex a asset360:TunnelComplex ; asset360:hasName ?complexName . \
+               ?component a asset360:CivilEngineeringAsset ; \
+                          asset360:belongsToTunnelComplex ?complex ; \
+                          asset360:hasName ?componentName . \
              }",
             &sv,
         )
         .unwrap();
-        assert!(result.asset_types.contains(&"Signal".to_owned()));
-        assert!(result.asset_types.contains(&"BaliseGroup".to_owned()));
-        assert!(result.is_bounded);
+
+        assert_eq!(plan.stars.len(), 2);
+        assert_eq!(plan.joins.len(), 1);
+
+        let tc = find_star(&plan, "complex");
+        assert_eq!(tc.class_name, "TunnelComplex");
+        assert!(tc.required_fields.contains(&"hasName".to_owned()));
+
+        let cea = find_star(&plan, "component");
+        assert_eq!(cea.class_name, "CivilEngineeringAsset");
+        assert!(cea.required_fields.contains(&"hasName".to_owned()));
+        assert!(
+            cea.required_fields
+                .contains(&"belongsToTunnelComplex".to_owned())
+        );
+
+        let join = &plan.joins[0];
+        assert_eq!(join.left, "complex");
+        assert_eq!(join.right, "component");
+        assert_eq!(join.right_slot, "belongsToTunnelComplex");
+        assert_eq!(join.join_type, JoinType::Inner);
+
+        // Multi-type join → no SQL LIMIT pushdown
+        assert_eq!(plan.sql_limit, None);
     }
+
+    // ---- Reverse direction join ----
+
+    #[test]
+    fn test_reverse_join_direction() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?bg ?sig ?name WHERE { \
+               ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?sig . \
+               ?sig a asset360:Signal ; asset360:name ?name . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        assert_eq!(plan.stars.len(), 2);
+        assert_eq!(plan.joins.len(), 1);
+
+        let join = &plan.joins[0];
+        assert_eq!(join.left, "sig"); // Signal is referenced
+        assert_eq!(join.right, "bg"); // BaliseGroup holds the FK
+        assert_eq!(join.right_slot, "refersToSignal");
+    }
+
+    // ---- Three-type chain ----
+
+    #[test]
+    fn test_three_type_chain() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?line ?track ?sig WHERE { \
+               ?line a asset360:Line ; asset360:hasName ?ln . \
+               ?track a asset360:Track ; asset360:belongsToLine ?line ; asset360:hasName ?tn . \
+               ?sig a asset360:Signal ; asset360:locatedOnTrack ?track ; asset360:name ?sn . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        assert_eq!(plan.stars.len(), 3);
+        assert_eq!(plan.joins.len(), 2);
+
+        // Track → Line join
+        let line_track_join = plan
+            .joins
+            .iter()
+            .find(|j| j.right_slot == "belongsToLine")
+            .expect("should have belongsToLine join");
+        assert_eq!(line_track_join.left, "line");
+        assert_eq!(line_track_join.right, "track");
+
+        // Signal → Track join
+        let track_sig_join = plan
+            .joins
+            .iter()
+            .find(|j| j.right_slot == "locatedOnTrack")
+            .expect("should have locatedOnTrack join");
+        assert_eq!(track_sig_join.left, "track");
+        assert_eq!(track_sig_join.right, "sig");
+    }
+
+    // ---- Error cases ----
 
     #[test]
     fn test_unscoped_query_rejected() {
         let sv = test_schema_view();
         let result = sparql_scope("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", &sv);
-        assert!(matches!(result, Err(ScopeError::Unscoped(_))));
-    }
-
-    #[test]
-    fn test_variable_type_without_constraint_rejected() {
-        let sv = test_schema_view();
-        let result = sparql_scope("SELECT ?s ?t WHERE { ?s a ?t }", &sv);
         assert!(matches!(result, Err(ScopeError::Unscoped(_))));
     }
 
@@ -651,104 +766,29 @@ classes:
     }
 
     #[test]
-    fn test_schema_introspection_query_rejected() {
-        // Without schema triples loaded, introspection queries like
-        // `?c a rdfs:Class` are unscoped — rdfs:Class is not an asset type.
-        // Schema triple support will be added later (OWL generator).
-        let sv = test_schema_view();
-        let result = sparql_scope("SELECT ?c WHERE { ?c a rdfs:Class }", &sv);
-        assert!(matches!(result, Err(ScopeError::Unscoped(_))));
-    }
-
-    #[test]
-    fn test_construct_query_scoped() {
-        let sv = test_schema_view();
-        let result = sparql_scope(
-            "CONSTRUCT { ?s a asset360:Signal ; asset360:name ?n } \
-             WHERE { ?s a asset360:Signal ; asset360:name ?n }",
-            &sv,
-        )
-        .unwrap();
-        assert_eq!(result.asset_types, vec!["Signal"]);
-        assert!(result.is_bounded);
-    }
-
-    #[test]
-    fn test_ask_query_scoped() {
-        let sv = test_schema_view();
-        let result = sparql_scope(
-            "ASK { ?s a asset360:Signal ; asset360:name \"BX517\" }",
-            &sv,
-        )
-        .unwrap();
-        assert_eq!(result.asset_types, vec!["Signal"]);
-    }
-
-    #[test]
     fn test_parse_error() {
         let sv = test_schema_view();
         let result = sparql_scope("NOT VALID {{{", &sv);
         assert!(matches!(result, Err(ScopeError::ParseError(_))));
     }
 
-    // ---- Phase 7: Filter pushdown tests ----
+    // ---- Filter pushdown ----
 
     #[test]
-    fn test_filter_equality_pushdown() {
+    fn test_values_filter() {
         let sv = test_schema_view();
-        let result = sparql_scope(
+        let plan = sparql_scope(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?name . FILTER(?name = \"BX517\") }",
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal ; asset360:name ?name . \
+               VALUES ?name { \"BX517\" \"BX518\" } \
+             }",
             &sv,
         )
         .unwrap();
-        assert_eq!(result.asset_types, vec!["Signal"]);
-        let name_filters = result
-            .predicate_filters
-            .get("name")
-            .expect("should have name filter");
-        assert_eq!(name_filters.len(), 1);
-        match &name_filters[0] {
-            FilterCondition::Eq(v) => assert_eq!(v, "BX517"),
-            other => panic!("expected Eq, got {:?}", other),
-        }
-    }
 
-    #[test]
-    fn test_filter_reversed_equality() {
-        // "BX517" = ?name (literal on left)
-        let sv = test_schema_view();
-        let result = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?name . FILTER(\"BX517\" = ?name) }",
-            &sv,
-        )
-        .unwrap();
-        let name_filters = result
-            .predicate_filters
-            .get("name")
-            .expect("should have name filter");
-        assert_eq!(name_filters.len(), 1);
-        match &name_filters[0] {
-            FilterCondition::Eq(v) => assert_eq!(v, "BX517"),
-            other => panic!("expected Eq, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_values_field_pushdown() {
-        let sv = test_schema_view();
-        let result = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?name . VALUES ?name { \"BX517\" \"BX518\" } }",
-            &sv,
-        )
-        .unwrap();
-        let name_filters = result
-            .predicate_filters
-            .get("name")
-            .expect("should have name filter");
-        assert_eq!(name_filters.len(), 1);
+        let star = find_star(&plan, "s");
+        let name_filters = star.filters.get("name").expect("should have name filter");
         match &name_filters[0] {
             FilterCondition::In(vals) => {
                 assert!(vals.contains(&"BX517".to_owned()));
@@ -758,41 +798,32 @@ classes:
         }
     }
 
+    // ---- ASK / CONSTRUCT ----
+
     #[test]
-    fn test_limit_pushdown_single_type() {
+    fn test_ask_query() {
         let sv = test_schema_view();
-        let result = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10",
+        let plan = sparql_scope(
+            "ASK { ?s a asset360:Signal ; asset360:name \"BX517\" }",
             &sv,
         )
         .unwrap();
-        assert_eq!(result.sql_limit, Some(10));
+
+        assert_eq!(plan.stars.len(), 1);
+        assert_eq!(plan.stars[0].class_name, "Signal");
     }
 
     #[test]
-    fn test_no_limit_pushdown_multi_type() {
+    fn test_construct_query() {
         let sv = test_schema_view();
-        let result = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s ?bg WHERE { ?s a asset360:Signal . ?bg a asset360:BaliseGroup } LIMIT 10",
+        let plan = sparql_scope(
+            "CONSTRUCT { ?s a asset360:Signal ; asset360:name ?n } \
+             WHERE { ?s a asset360:Signal ; asset360:name ?n }",
             &sv,
         )
         .unwrap();
-        // Multi-type query — LIMIT should not be pushed to SQL
-        assert_eq!(result.sql_limit, None);
-    }
 
-    #[test]
-    fn test_no_filter_for_unbound_var() {
-        // FILTER on a variable that's not bound to a predicate should not produce a filter
-        let sv = test_schema_view();
-        let result = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { ?s a asset360:Signal . FILTER(?s = <http://example.org/x>) }",
-            &sv,
-        )
-        .unwrap();
-        assert!(result.predicate_filters.is_empty());
+        assert_eq!(plan.stars.len(), 1);
+        assert_eq!(plan.stars[0].class_name, "Signal");
     }
 }

@@ -2860,6 +2860,35 @@ class ImportExpression:
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     def __new__(cls, import_from:builtins.str, import_as:typing.Optional[builtins.str]=None, import_map:typing.Optional[builtins.dict[builtins.str, Setting]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ImportExpression: ...
 
+class JoinEdge:
+    r"""
+    A join between two stars, pushable to a SQL JOIN.
+    
+    The ``right`` star has a slot (``right_slot``) whose value equals
+    the ``left`` star's ``asset360_uri``.
+    """
+    @property
+    def left(self) -> builtins.str:
+        r"""
+        Variable of the referenced star (join target).
+        """
+    @property
+    def right(self) -> builtins.str:
+        r"""
+        Variable of the star holding the foreign key.
+        """
+    @property
+    def right_slot(self) -> builtins.str:
+        r"""
+        Slot on the right star whose value = left's ``asset360_uri``.
+        """
+    @property
+    def join_type(self) -> builtins.str:
+        r"""
+        Join type: ``"inner"`` or ``"left"``.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class LinkMLInstance:
     @property
     def slot_name(self) -> typing.Optional[builtins.str]: ...
@@ -3450,6 +3479,30 @@ class Prefix:
     def prefix_reference(self, value: builtins.str) -> None: ...
     def __new__(cls, prefix_prefix:builtins.str, prefix_reference:builtins.str) -> Prefix: ...
 
+class QueryPlan:
+    r"""
+    Structured plan for fetching data from PostgreSQL.
+    
+    Stars connected by :class:`JoinEdge` are fetched via SQL JOIN.
+    Stars with no join edges are fetched independently.
+    """
+    @property
+    def stars(self) -> builtins.list[Star]:
+        r"""
+        All stars (type-scoped subject groups) in the query.
+        """
+    @property
+    def joins(self) -> builtins.list[JoinEdge]:
+        r"""
+        Join edges between stars, pushable to SQL JOINs.
+        """
+    @property
+    def sql_limit(self) -> typing.Optional[builtins.int]:
+        r"""
+        SQL LIMIT — only for single-star, zero-join queries with SPARQL LIMIT.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class ReachabilityQuery:
     @property
     def source_ontology(self) -> typing.Optional[builtins.str]: ...
@@ -3850,69 +3903,6 @@ class SchemaView:
         """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
-
-class ScopeResult:
-    r"""
-    Result of analysing a SPARQL query for database scoping.
-    
-    Tells the Django view which objects to fetch from PostgreSQL and which
-    filters to apply. See the ``sparql_scope()`` function.
-    
-    Python usage:
-    
-    ```python
-    scope = lr.sparql_scope(query, schema_view)
-    for asset_type in scope.asset_types:
-        qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
-        if scope.uri_filters:
-            qs = qs.filter(asset360_uri__in=scope.uri_filters)
-        for field, conditions in scope.predicate_filters.items():
-            for cond in conditions:
-                if cond.operator == "eq":
-                    qs = qs.filter(**{f"object_data__{field}": cond.value})
-    ```
-    """
-    @property
-    def asset_types(self) -> builtins.list[builtins.str]:
-        r"""
-        LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
-        Derived from ``rdf:type`` patterns in the query.
-        """
-    @property
-    def uri_filters(self) -> builtins.list[builtins.str]:
-        r"""
-        Specific ``asset360_uri`` values referenced in the query.
-        Used for ``WHERE asset360_uri IN (...)`` lookups.
-        """
-    @property
-    def is_bounded(self) -> builtins.bool:
-        r"""
-        Whether the query scope is bounded (safe to execute).
-        False means the query would load the entire database.
-        """
-    @property
-    def estimated_count(self) -> typing.Optional[builtins.int]:
-        r"""
-        Estimated object count, if determinable. Currently always None.
-        """
-    @property
-    def predicate_filters(self) -> builtins.dict[builtins.str, builtins.list[FilterCondition]]:
-        r"""
-        Field-level filters pushable to SQL as JSONB lookups.
-        
-        Dict mapping LinkML slot names to lists of :class:`FilterCondition`.
-        Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
-        clauses where ``?var`` is bound to a known predicate.
-        """
-    @property
-    def sql_limit(self) -> typing.Optional[builtins.int]:
-        r"""
-        SQL LIMIT to push down for single-type queries.
-        
-        Only set when the query targets one asset type and has a top-level
-        ``LIMIT``. For multi-type joins the LIMIT applies to the joined
-        result, not individual fetches, so it cannot be pushed to SQL.
-        """
 
 class Setting:
     @property
@@ -4569,6 +4559,36 @@ class SlotView:
         """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
+
+class Star:
+    r"""
+    A star in the query plan — one LinkML class with its constraints.
+    
+    Named after the SPARQL algebra concept of "star-shaped sub-pattern":
+    all triple patterns sharing the same subject variable.
+    """
+    @property
+    def variable(self) -> builtins.str:
+        r"""
+        The SPARQL variable name (without ``?``), e.g. ``"complex"``.
+        """
+    @property
+    def class_name(self) -> builtins.str:
+        r"""
+        The LinkML class name, e.g. ``"TunnelComplex"``.
+        """
+    @property
+    def required_fields(self) -> builtins.list[builtins.str]:
+        r"""
+        Slots referenced in triple patterns. Python uses for existence checks:
+        ``WHERE object_data ? 'hasName'``
+        """
+    @property
+    def filters(self) -> builtins.dict[builtins.str, builtins.list[FilterCondition]]:
+        r"""
+        Value-level filter conditions per slot, pushable to SQL.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 class StructuredAlias:
     @property
@@ -5690,12 +5710,13 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             or query execution error.
     """
 
-def sparql_scope(query:builtins.str, schema_view:SchemaView) -> ScopeResult:
+def sparql_scope(query:builtins.str, schema_view:SchemaView) -> QueryPlan:
     r"""
-    Analyse a SPARQL query and determine what to fetch from the database.
+    Analyse a SPARQL query and produce a structured fetch plan.
     
-    Parses the query, extracts ``rdf:type`` patterns, URI references, and
-    FILTER/VALUES conditions that can be pushed down to SQL.
+    Decomposes the query into stars (one per ``rdf:type``), detects
+    join edges between stars (reference properties), and collects
+    filter conditions. Python translates the plan to SQL.
     
     Args:
         query: SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
@@ -5703,7 +5724,7 @@ def sparql_scope(query:builtins.str, schema_view:SchemaView) -> ScopeResult:
             slot names and class IRIs to class names.
     
     Returns:
-        ScopeResult with asset_types, uri_filters, predicate_filters, etc.
+        QueryPlan with stars, joins, and optional sql_limit.
     
     Raises:
         ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
