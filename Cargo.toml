@@ -29,12 +29,13 @@ getrandom = { version = "0.2", optional = true, features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", optional = true, features = ["wasm_js"] }
 oxttl = { version = "0.2", optional = true }
 oxrdf = { version = "0.3", optional = true }
-spargebra = { version = "0.4", optional = true }
+spargebra = "0.4"
+oxigraph = { version = "0.4", optional = true, default-features = false }
 
 [features]
 default = ["stubgen"]
 # Enable Python extension-module linking only in packaging builds (maturin)
-python-extension = ["python-bindings", "pyo3/extension-module", "shacl-parser"]
+python-extension = ["python-bindings", "pyo3/extension-module", "shacl-parser", "sparql-endpoint"]
 python-bindings = [
     "dep:pyo3",
     "dep:linkml_runtime_python",
@@ -47,7 +48,8 @@ stubgen = [
     "linkml_runtime_python/stubgen",
     "linkml_meta/stubgen"
 ]
-shacl-parser = ["dep:oxttl", "dep:oxrdf", "dep:spargebra"]
+shacl-parser = ["dep:oxttl", "dep:oxrdf"]
+sparql-endpoint = ["shacl-parser", "dep:oxigraph"]
 wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys", "dep:getrandom", "dep:getrandom_03"]
 minijinja-wasm = [
     "wasm-bindings",

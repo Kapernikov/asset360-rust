@@ -38,6 +38,10 @@ pub mod predicate;
 pub mod scope_predicate;
 pub mod shacl_ast;
 
+pub mod sparql_scoper;
+#[cfg(feature = "sparql-endpoint")]
+pub mod sparql_executor;
+
 #[cfg(feature = "shacl-parser")]
 pub mod shacl_parser;
 
@@ -73,6 +77,13 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_foreign_references_py, m)?)?;
     m.add_class::<PyForeignReference>()?;
     m.add_class::<PyConstraintSet>()?;
+    #[cfg(feature = "sparql-endpoint")]
+    {
+        m.add_function(wrap_pyfunction!(sparql_scope_py, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_execute_py, m)?)?;
+        m.add_function(wrap_pyfunction!(schema_to_triples_py, m)?)?;
+        m.add_class::<PyScopeResult>()?;
+    }
     Ok(())
 }
 
@@ -1175,6 +1186,172 @@ impl PyConstraintSet {
             self.inner.has_schema()
         )
     }
+}
+
+// ---- SPARQL endpoint PyO3 bindings ----
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[derive(Clone)]
+pub struct PyScopeResult {
+    #[pyo3(get)]
+    pub asset_types: Vec<String>,
+    #[pyo3(get)]
+    pub uri_filters: Vec<String>,
+    #[pyo3(get)]
+    pub is_bounded: bool,
+    #[pyo3(get)]
+    pub estimated_count: Option<usize>,
+    #[pyo3(get)]
+    pub schema_only: bool,
+    /// Field-level filters pushable to SQL: {"field_name": [["eq", "value"], ["in", "v1", "v2"]]}
+    #[pyo3(get)]
+    pub predicate_filters: HashMap<String, Vec<Vec<String>>>,
+    /// SQL LIMIT to push down (single-type queries only).
+    #[pyo3(get)]
+    pub sql_limit: Option<usize>,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "sparql_scope")]
+fn sparql_scope_py(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<PyScopeResult> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    match crate::sparql_scoper::sparql_scope(query, sv) {
+        Ok(result) => {
+            // Convert predicate_filters to Python-friendly format:
+            // HashMap<String, Vec<FilterCondition>> → HashMap<String, Vec<Vec<String>>>
+            // Eq("val") → ["eq", "val"], In(["v1","v2"]) → ["in", "v1", "v2"]
+            let mut py_filters: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+            for (field, conditions) in &result.predicate_filters {
+                let mut py_conds = Vec::new();
+                for cond in conditions {
+                    match cond {
+                        crate::sparql_scoper::FilterCondition::Eq(v) => {
+                            py_conds.push(vec!["eq".to_owned(), v.clone()]);
+                        }
+                        crate::sparql_scoper::FilterCondition::In(vs) => {
+                            let mut entry = vec!["in".to_owned()];
+                            entry.extend(vs.iter().cloned());
+                            py_conds.push(entry);
+                        }
+                    }
+                }
+                py_filters.insert(field.clone(), py_conds);
+            }
+
+            Ok(PyScopeResult {
+                asset_types: result.asset_types,
+                uri_filters: result.uri_filters,
+                is_bounded: result.is_bounded,
+                estimated_count: result.estimated_count,
+                schema_only: result.schema_only,
+                predicate_filters: py_filters,
+                sql_limit: result.sql_limit,
+            })
+        }
+        Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.",
+            ))
+        }
+        Err(crate::sparql_scoper::ScopeError::ParseError(msg)) => {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "SPARQL parse error: {msg}"
+            )))
+        }
+        Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Query is unscoped: {msg}"
+            )))
+        }
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "sparql_execute", signature = (query, objects, schema_view, target_classes, format="json", max_triples=500_000, max_result_rows=10_000))]
+fn sparql_execute_py(
+    py: Python<'_>,
+    query: &str,
+    objects: &Bound<'_, pyo3::types::PyList>,
+    schema_view: Py<PySchemaView>,
+    target_classes: Vec<String>,
+    format: &str,
+    max_triples: usize,
+    max_result_rows: usize,
+) -> PyResult<String> {
+    use pyo3::types::PyAnyMethods;
+
+    // Convert Python list of dicts to Vec<serde_json::Value>
+    let mut json_objects: Vec<serde_json::Value> = Vec::new();
+    for item in objects.iter() {
+        // Use Python's json.dumps to convert dict to JSON string, then parse
+        let json_mod = py.import("json")?;
+        let json_str: String = json_mod
+            .call_method1("dumps", (item,))?
+            .extract()?;
+        let value: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {e}")))?;
+        json_objects.push(value);
+    }
+
+    let bound_sv = schema_view.bind(py);
+    let sv_ref = bound_sv.borrow();
+    let sv = sv_ref.as_rust();
+
+    let tc_refs: Vec<&str> = target_classes.iter().map(|s| s.as_str()).collect();
+
+    match crate::sparql_executor::sparql_execute(
+        query,
+        &json_objects,
+        sv,
+        &tc_refs,
+        format,
+        crate::sparql_executor::ExecuteLimits {
+            max_triples,
+            max_result_rows,
+        },
+    ) {
+        Ok(result) => Ok(result),
+        Err(crate::sparql_executor::ExecuteError::ConversionError {
+            object_uri,
+            message,
+        }) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Conversion error for {object_uri}: {message}"
+        ))),
+        Err(crate::sparql_executor::ExecuteError::TripleLimitExceeded { count, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Triple limit exceeded: {count} > {limit}"
+            )))
+        }
+        Err(crate::sparql_executor::ExecuteError::ResultLimitExceeded { count, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Result row limit exceeded: {count} > {limit}"
+            )))
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "schema_to_triples")]
+fn schema_to_triples_py(
+    py: Python<'_>,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<String> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+    Ok(crate::sparql_executor::schema_to_triples(sv))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
