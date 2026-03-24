@@ -2649,6 +2649,46 @@ class Extension:
     def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     def __new__(cls, extension_tag:builtins.str, extension_value:typing.Any, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None) -> Extension: ...
 
+class FilterCondition:
+    r"""
+    A filter condition extracted from the SPARQL query, pushable to SQL.
+    
+    Each condition has an `operator` (`"eq"` or `"in"`) and one or more
+    string `values`. The Django view translates these to ORM lookups.
+    
+    Python usage:
+    
+    ```python
+    for field, conditions in scope.predicate_filters.items():
+        for cond in conditions:
+            if cond.operator == "eq":
+                qs = qs.filter(**{f"object_data__{field}": cond.value})
+            elif cond.operator == "in":
+                qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+    ```
+    """
+    @property
+    def operator(self) -> builtins.str:
+        r"""
+        The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
+        """
+    @property
+    def value(self) -> builtins.str:
+        r"""
+        The filter value (for ``"eq"`` conditions).
+        
+        Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
+        an empty condition (should not happen in practice).
+        """
+    @property
+    def values(self) -> builtins.list[builtins.str]:
+        r"""
+        All filter values as a list.
+        
+        For ``"eq"``: single-element list. For ``"in"``: multiple values.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class ForeignReference:
     @property
     def uri(self) -> builtins.str: ...
@@ -3810,6 +3850,69 @@ class SchemaView:
         """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
+
+class ScopeResult:
+    r"""
+    Result of analysing a SPARQL query for database scoping.
+    
+    Tells the Django view which objects to fetch from PostgreSQL and which
+    filters to apply. See the ``sparql_scope()`` function.
+    
+    Python usage:
+    
+    ```python
+    scope = lr.sparql_scope(query, schema_view)
+    for asset_type in scope.asset_types:
+        qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
+        if scope.uri_filters:
+            qs = qs.filter(asset360_uri__in=scope.uri_filters)
+        for field, conditions in scope.predicate_filters.items():
+            for cond in conditions:
+                if cond.operator == "eq":
+                    qs = qs.filter(**{f"object_data__{field}": cond.value})
+    ```
+    """
+    @property
+    def asset_types(self) -> builtins.list[builtins.str]:
+        r"""
+        LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
+        Derived from ``rdf:type`` patterns in the query.
+        """
+    @property
+    def uri_filters(self) -> builtins.list[builtins.str]:
+        r"""
+        Specific ``asset360_uri`` values referenced in the query.
+        Used for ``WHERE asset360_uri IN (...)`` lookups.
+        """
+    @property
+    def is_bounded(self) -> builtins.bool:
+        r"""
+        Whether the query scope is bounded (safe to execute).
+        False means the query would load the entire database.
+        """
+    @property
+    def estimated_count(self) -> typing.Optional[builtins.int]:
+        r"""
+        Estimated object count, if determinable. Currently always None.
+        """
+    @property
+    def predicate_filters(self) -> builtins.dict[builtins.str, builtins.list[FilterCondition]]:
+        r"""
+        Field-level filters pushable to SQL as JSONB lookups.
+        
+        Dict mapping LinkML slot names to lists of :class:`FilterCondition`.
+        Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
+        clauses where ``?var`` is bound to a known predicate.
+        """
+    @property
+    def sql_limit(self) -> typing.Optional[builtins.int]:
+        r"""
+        SQL LIMIT to push down for single-type queries.
+        
+        Only set when the query targets one asset type and has a top-level
+        ``LIMIT``. For multi-type joins the LIMIT applies to the joined
+        result, not individual fetches, so it cannot be pushed to SQL.
+        """
 
 class Setting:
     @property
@@ -5561,6 +5664,50 @@ def load_yaml(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[t
 def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
+
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str:
+    r"""
+    Execute a SPARQL query against a list of LinkML instances.
+    
+    Converts each instance to RDF, loads into an in-memory store (with
+    pre-loaded schema triples), executes the query, and returns the
+    serialised result.
+    
+    Args:
+        query: SPARQL query string.
+        instances: List of LinkMLInstance objects to query against.
+        schema_view: The LinkML schema (for RDF conversion).
+        format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
+            ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
+        max_triples: Maximum triples in the store (default 500,000).
+        max_result_rows: Maximum result rows (default 10,000).
+    
+    Returns:
+        JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
+    
+    Raises:
+        RuntimeError: Conversion failure (with object URI), limit exceeded,
+            or query execution error.
+    """
+
+def sparql_scope(query:builtins.str, schema_view:SchemaView) -> ScopeResult:
+    r"""
+    Analyse a SPARQL query and determine what to fetch from the database.
+    
+    Parses the query, extracts ``rdf:type`` patterns, URI references, and
+    FILTER/VALUES conditions that can be pushed down to SQL.
+    
+    Args:
+        query: SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
+        schema_view: The LinkML schema, used to resolve predicate IRIs to
+            slot names and class IRIs to class names.
+    
+    Returns:
+        ScopeResult with asset_types, uri_filters, predicate_filters, etc.
+    
+    Raises:
+        ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
+    """
 
 def sum_as_string(a:builtins.int, b:builtins.int) -> builtins.str: ...
 

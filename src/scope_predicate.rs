@@ -87,7 +87,6 @@ fn derive_scope_from_sparql(
 ///   ?other prefix:attr ?joinVar .
 ///
 /// Falls back to text-based parsing when the `shacl-parser` feature is disabled.
-#[cfg(feature = "shacl-parser")]
 fn extract_shared_attribute_joins(sparql: &str) -> Vec<String> {
     use spargebra::term::{NamedNodePattern, TermPattern};
     use spargebra::{Query, SparqlParser};
@@ -154,7 +153,6 @@ fn extract_shared_attribute_joins(sparql: &str) -> Vec<String> {
 }
 
 /// Recursively collect all BGP triple patterns from a SPARQL algebra tree.
-#[cfg(feature = "shacl-parser")]
 fn collect_bgp_triples<'a>(
     pattern: &'a spargebra::algebra::GraphPattern,
     triples: &mut Vec<&'a spargebra::term::TriplePattern>,
@@ -186,51 +184,6 @@ fn collect_bgp_triples<'a>(
         }
         GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
     }
-}
-
-/// Fallback: extract shared attribute names via line-by-line text parsing.
-///
-/// Used when the `shacl-parser` feature (and thus spargebra) is not available.
-#[cfg(not(feature = "shacl-parser"))]
-fn extract_shared_attribute_joins(sparql: &str) -> Vec<String> {
-    let mut this_bindings: Vec<(String, String)> = Vec::new();
-    let mut other_bindings: Vec<(String, String)> = Vec::new();
-
-    for line in sparql.lines() {
-        let trimmed = line.trim().trim_end_matches(';').trim_end_matches('.');
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-        if parts.len() >= 3 {
-            let subject = parts[0];
-            let predicate = parts[1];
-            let object = parts[2];
-
-            if object.starts_with('?')
-                && !predicate.starts_with("FILTER")
-                && !predicate.starts_with("BIND")
-            {
-                let pred_local = iri_local_name(predicate);
-                if subject == "$this" {
-                    this_bindings.push((pred_local.to_owned(), object.to_owned()));
-                } else if subject.starts_with('?') {
-                    other_bindings.push((pred_local.to_owned(), object.to_owned()));
-                }
-            }
-        }
-    }
-
-    let mut shared = Vec::new();
-    for (pred, var) in &this_bindings {
-        for (other_pred, other_var) in &other_bindings {
-            if pred == other_pred && var == other_var {
-                shared.push(pred.clone());
-            }
-        }
-    }
-
-    shared.sort();
-    shared.dedup();
-    shared
 }
 
 /// Extract the local name from an IRI or prefixed name.
@@ -416,5 +369,106 @@ mod tests {
         "#;
         let shared = extract_shared_attribute_joins(sparql);
         assert_eq!(shared, vec!["belongsToTunnelComplex"]);
+    }
+
+    // ---- Robustness tests (T003) ----
+    // These edge cases would break the old text-based parser but work with spargebra.
+
+    #[test]
+    fn test_multiline_triple_patterns() {
+        // Triple pattern split across multiple lines — the old line-by-line
+        // parser would not see the predicate and object on separate lines.
+        let sparql = r#"
+            SELECT $this ?path
+            WHERE {
+                $this
+                    asset360:belongsToTunnelComplex
+                    ?complex .
+                ?other
+                    asset360:belongsToTunnelComplex
+                    ?complex .
+                FILTER(?other != $this)
+            }
+        "#;
+        let shared = extract_shared_attribute_joins(sparql);
+        assert_eq!(shared, vec!["belongsToTunnelComplex"]);
+    }
+
+    #[test]
+    fn test_sparql_comments_ignored() {
+        // Comments in the SPARQL query — old parser would try to parse them
+        // as triple patterns.
+        let sparql = r#"
+            # This query checks delegate uniqueness
+            SELECT $this ?path
+            WHERE {
+                # Match the focus object's tunnel complex
+                $this asset360:belongsToTunnelComplex ?complex .
+                # Find other objects in the same complex
+                ?other asset360:belongsToTunnelComplex ?complex .
+                FILTER(?other != $this)
+            }
+        "#;
+        let shared = extract_shared_attribute_joins(sparql);
+        assert_eq!(shared, vec!["belongsToTunnelComplex"]);
+    }
+
+    #[test]
+    fn test_string_literals_with_spaces() {
+        // String literals containing spaces — old parser would split on
+        // whitespace and misparse the triple.
+        let sparql = r#"
+            SELECT $this ?path
+            WHERE {
+                $this asset360:belongsToTunnelComplex ?complex ;
+                      asset360:name "some name with spaces" .
+                ?other asset360:belongsToTunnelComplex ?complex .
+                FILTER(?other != $this)
+            }
+        "#;
+        let shared = extract_shared_attribute_joins(sparql);
+        assert_eq!(shared, vec!["belongsToTunnelComplex"]);
+    }
+
+    #[test]
+    fn test_optional_pattern_in_constraint() {
+        // OPTIONAL block — the algebra walker handles LeftJoin patterns.
+        let sparql = r#"
+            SELECT $this ?path
+            WHERE {
+                $this asset360:belongsToTunnelComplex ?complex .
+                ?other asset360:belongsToTunnelComplex ?complex .
+                OPTIONAL {
+                    $this asset360:zone ?z .
+                    ?other asset360:zone ?z .
+                }
+                FILTER(?other != $this)
+            }
+        "#;
+        let shared = extract_shared_attribute_joins(sparql);
+        // Both belongsToTunnelComplex and zone are shared
+        assert!(shared.contains(&"belongsToTunnelComplex".to_owned()));
+        assert!(shared.contains(&"zone".to_owned()));
+    }
+
+    #[test]
+    fn test_no_shared_join_returns_empty() {
+        // Query where $this and ?other don't share any join variable
+        let sparql = r#"
+            SELECT $this ?path
+            WHERE {
+                $this asset360:name ?thisName .
+                ?other asset360:code ?otherCode .
+                FILTER(?other != $this)
+            }
+        "#;
+        let shared = extract_shared_attribute_joins(sparql);
+        assert!(shared.is_empty(), "no shared join variable → empty");
+    }
+
+    #[test]
+    fn test_invalid_sparql_returns_empty() {
+        let shared = extract_shared_attribute_joins("NOT VALID SPARQL AT ALL {{{");
+        assert!(shared.is_empty(), "parse failure → empty, no panic");
     }
 }

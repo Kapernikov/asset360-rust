@@ -38,6 +38,10 @@ pub mod predicate;
 pub mod scope_predicate;
 pub mod shacl_ast;
 
+#[cfg(feature = "sparql-endpoint")]
+pub mod sparql_executor;
+pub mod sparql_scoper;
+
 #[cfg(feature = "shacl-parser")]
 pub mod shacl_parser;
 
@@ -73,6 +77,13 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_foreign_references_py, m)?)?;
     m.add_class::<PyForeignReference>()?;
     m.add_class::<PyConstraintSet>()?;
+    #[cfg(feature = "sparql-endpoint")]
+    {
+        m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
+        m.add_class::<ScopeResult>()?;
+        m.add_class::<FilterCondition>()?;
+    }
     Ok(())
 }
 
@@ -1174,6 +1185,307 @@ impl PyConstraintSet {
             self.inner.shape_count(),
             self.inner.has_schema()
         )
+    }
+}
+
+// ---- SPARQL endpoint PyO3 bindings ----
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// A filter condition extracted from the SPARQL query, pushable to SQL.
+///
+/// Each condition has an `operator` (`"eq"` or `"in"`) and one or more
+/// string `values`. The Django view translates these to ORM lookups.
+///
+/// Python usage:
+///
+/// ```python
+/// for field, conditions in scope.predicate_filters.items():
+///     for cond in conditions:
+///         if cond.operator == "eq":
+///             qs = qs.filter(**{f"object_data__{field}": cond.value})
+///         elif cond.operator == "in":
+///             qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+/// ```
+pub struct FilterCondition {
+    operator: String,
+    values: Vec<String>,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl FilterCondition {
+    /// The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
+    #[getter]
+    fn operator(&self) -> &str {
+        &self.operator
+    }
+
+    /// The filter value (for ``"eq"`` conditions).
+    ///
+    /// Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
+    /// an empty condition (should not happen in practice).
+    #[getter]
+    fn value(&self) -> PyResult<&str> {
+        self.values
+            .first()
+            .map(|s| s.as_str())
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("empty filter condition"))
+    }
+
+    /// All filter values as a list.
+    ///
+    /// For ``"eq"``: single-element list. For ``"in"``: multiple values.
+    #[getter]
+    fn values(&self) -> Vec<String> {
+        self.values.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        if self.operator == "eq" {
+            format!(
+                "FilterCondition(eq={:?})",
+                self.values.first().unwrap_or(&String::new())
+            )
+        } else {
+            format!("FilterCondition(in={:?})", self.values)
+        }
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+impl FilterCondition {
+    fn from_rust(cond: &crate::sparql_scoper::FilterCondition) -> Self {
+        match cond {
+            crate::sparql_scoper::FilterCondition::Eq(v) => Self {
+                operator: "eq".to_owned(),
+                values: vec![v.clone()],
+            },
+            crate::sparql_scoper::FilterCondition::In(vs) => Self {
+                operator: "in".to_owned(),
+                values: vs.clone(),
+            },
+        }
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// Result of analysing a SPARQL query for database scoping.
+///
+/// Tells the Django view which objects to fetch from PostgreSQL and which
+/// filters to apply. See the ``sparql_scope()`` function.
+///
+/// Python usage:
+///
+/// ```python
+/// scope = lr.sparql_scope(query, schema_view)
+/// for asset_type in scope.asset_types:
+///     qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
+///     if scope.uri_filters:
+///         qs = qs.filter(asset360_uri__in=scope.uri_filters)
+///     for field, conditions in scope.predicate_filters.items():
+///         for cond in conditions:
+///             if cond.operator == "eq":
+///                 qs = qs.filter(**{f"object_data__{field}": cond.value})
+/// ```
+pub struct ScopeResult {
+    asset_types: Vec<String>,
+    uri_filters: Vec<String>,
+    is_bounded: bool,
+    estimated_count: Option<usize>,
+    predicate_filters: HashMap<String, Vec<FilterCondition>>,
+    sql_limit: Option<usize>,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl ScopeResult {
+    /// LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
+    /// Derived from ``rdf:type`` patterns in the query.
+    #[getter]
+    fn asset_types(&self) -> Vec<String> {
+        self.asset_types.clone()
+    }
+
+    /// Specific ``asset360_uri`` values referenced in the query.
+    /// Used for ``WHERE asset360_uri IN (...)`` lookups.
+    #[getter]
+    fn uri_filters(&self) -> Vec<String> {
+        self.uri_filters.clone()
+    }
+
+    /// Whether the query scope is bounded (safe to execute).
+    /// False means the query would load the entire database.
+    #[getter]
+    fn is_bounded(&self) -> bool {
+        self.is_bounded
+    }
+
+    /// Estimated object count, if determinable. Currently always None.
+    #[getter]
+    fn estimated_count(&self) -> Option<usize> {
+        self.estimated_count
+    }
+
+    /// Field-level filters pushable to SQL as JSONB lookups.
+    ///
+    /// Dict mapping LinkML slot names to lists of :class:`FilterCondition`.
+    /// Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
+    /// clauses where ``?var`` is bound to a known predicate.
+    #[getter]
+    fn predicate_filters(&self) -> HashMap<String, Vec<FilterCondition>> {
+        self.predicate_filters.clone()
+    }
+
+    /// SQL LIMIT to push down for single-type queries.
+    ///
+    /// Only set when the query targets one asset type and has a top-level
+    /// ``LIMIT``. For multi-type joins the LIMIT applies to the joined
+    /// result, not individual fetches, so it cannot be pushed to SQL.
+    #[getter]
+    fn sql_limit(&self) -> Option<usize> {
+        self.sql_limit
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Analyse a SPARQL query and determine what to fetch from the database.
+///
+/// Parses the query, extracts ``rdf:type`` patterns, URI references, and
+/// FILTER/VALUES conditions that can be pushed down to SQL.
+///
+/// Args:
+///     query: SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
+///     schema_view: The LinkML schema, used to resolve predicate IRIs to
+///         slot names and class IRIs to class names.
+///
+/// Returns:
+///     ScopeResult with asset_types, uri_filters, predicate_filters, etc.
+///
+/// Raises:
+///     ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
+fn sparql_scope(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<ScopeResult> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    match crate::sparql_scoper::sparql_scope(query, sv) {
+        Ok(result) => {
+            let py_filters: HashMap<String, Vec<FilterCondition>> = result
+                .predicate_filters
+                .iter()
+                .map(|(field, conds)| {
+                    let py_conds = conds.iter().map(FilterCondition::from_rust).collect();
+                    (field.clone(), py_conds)
+                })
+                .collect();
+
+            Ok(ScopeResult {
+                asset_types: result.asset_types,
+                uri_filters: result.uri_filters,
+                is_bounded: result.is_bounded,
+                estimated_count: result.estimated_count,
+                predicate_filters: py_filters,
+                sql_limit: result.sql_limit,
+            })
+        }
+        Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.",
+            ))
+        }
+        Err(crate::sparql_scoper::ScopeError::ParseError(msg)) => Err(
+            pyo3::exceptions::PyValueError::new_err(format!("SPARQL parse error: {msg}")),
+        ),
+        Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => Err(
+            pyo3::exceptions::PyValueError::new_err(format!("Query is unscoped: {msg}")),
+        ),
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Execute a SPARQL query against a list of LinkML instances.
+///
+/// Converts each instance to RDF, loads into an in-memory store (with
+/// pre-loaded schema triples), executes the query, and returns the
+/// serialised result.
+///
+/// Args:
+///     query: SPARQL query string.
+///     instances: List of LinkMLInstance objects to query against.
+///     schema_view: The LinkML schema (for RDF conversion).
+///     format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
+///         ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
+///     max_triples: Maximum triples in the store (default 500,000).
+///     max_result_rows: Maximum result rows (default 10,000).
+///
+/// Returns:
+///     JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
+///
+/// Raises:
+///     RuntimeError: Conversion failure (with object URI), limit exceeded,
+///         or query execution error.
+fn sparql_execute(
+    py: Python<'_>,
+    query: &str,
+    instances: Vec<Py<PyLinkMLInstance>>,
+    schema_view: Py<PySchemaView>,
+    format: &str,
+    max_triples: usize,
+    max_result_rows: usize,
+) -> PyResult<String> {
+    let bound_sv = schema_view.bind(py);
+    let sv_ref = bound_sv.borrow();
+    let sv = sv_ref.as_rust();
+
+    // Borrow all instances and collect references
+    let bound_instances: Vec<_> = instances.iter().map(|i| i.bind(py).borrow()).collect();
+    let instance_refs: Vec<&LinkMLInstance> = bound_instances.iter().map(|b| &b.value).collect();
+
+    match crate::sparql_executor::sparql_execute(
+        query,
+        &instance_refs,
+        sv,
+        format,
+        crate::sparql_executor::ExecuteLimits {
+            max_triples,
+            max_result_rows,
+        },
+    ) {
+        Ok(result) => Ok(result),
+        Err(crate::sparql_executor::ExecuteError::ConversionError {
+            object_uri,
+            message,
+        }) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Conversion error for {object_uri}: {message}"
+        ))),
+        Err(crate::sparql_executor::ExecuteError::TripleLimitExceeded { count, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Triple limit exceeded: {count} > {limit}"
+            )))
+        }
+        Err(crate::sparql_executor::ExecuteError::ResultLimitExceeded { count, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Result row limit exceeded: {count} > {limit}"
+            )))
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }
 
