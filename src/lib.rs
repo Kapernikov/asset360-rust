@@ -81,7 +81,9 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
-        m.add_class::<ScopeResult>()?;
+        m.add_class::<QueryPlan>()?;
+        m.add_class::<Star>()?;
+        m.add_class::<JoinEdge>()?;
         m.add_class::<FilterCondition>()?;
     }
     Ok(())
@@ -1276,92 +1278,166 @@ impl FilterCondition {
 #[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
-/// Result of analysing a SPARQL query for database scoping.
+/// A star in the query plan — one LinkML class with its constraints.
 ///
-/// Tells the Django view which objects to fetch from PostgreSQL and which
-/// filters to apply. See the ``sparql_scope()`` function.
+/// Named after the SPARQL algebra concept of "star-shaped sub-pattern":
+/// all triple patterns sharing the same subject variable.
+pub struct Star {
+    inner: crate::sparql_scoper::Star,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl Star {
+    /// The SPARQL variable name (without ``?``), e.g. ``"complex"``.
+    #[getter]
+    fn variable(&self) -> &str {
+        &self.inner.variable
+    }
+
+    /// The LinkML class name, e.g. ``"TunnelComplex"``.
+    #[getter]
+    fn class_name(&self) -> &str {
+        &self.inner.class_name
+    }
+
+    /// Slots referenced in triple patterns. Python uses for existence checks:
+    /// ``WHERE object_data ? 'hasName'``
+    #[getter]
+    fn required_fields(&self) -> Vec<String> {
+        self.inner.required_fields.clone()
+    }
+
+    /// Value-level filter conditions per slot, pushable to SQL.
+    #[getter]
+    fn filters(&self) -> HashMap<String, Vec<FilterCondition>> {
+        self.inner
+            .filters
+            .iter()
+            .map(|(field, conds)| {
+                let py_conds = conds.iter().map(FilterCondition::from_rust).collect();
+                (field.clone(), py_conds)
+            })
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Star(variable={:?}, class={:?}, fields={:?})",
+            self.inner.variable, self.inner.class_name, self.inner.required_fields
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// A join between two stars, pushable to a SQL JOIN.
 ///
-/// Python usage:
+/// The ``right`` star has a slot (``right_slot``) whose value equals
+/// the ``left`` star's ``asset360_uri``.
+pub struct JoinEdge {
+    inner: crate::sparql_scoper::JoinEdge,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl JoinEdge {
+    /// Variable of the referenced star (join target).
+    #[getter]
+    fn left(&self) -> &str {
+        &self.inner.left
+    }
+
+    /// Variable of the star holding the foreign key.
+    #[getter]
+    fn right(&self) -> &str {
+        &self.inner.right
+    }
+
+    /// Slot on the right star whose value = left's ``asset360_uri``.
+    #[getter]
+    fn right_slot(&self) -> &str {
+        &self.inner.right_slot
+    }
+
+    /// Join type: ``"inner"`` or ``"left"``.
+    #[getter]
+    fn join_type(&self) -> &str {
+        match self.inner.join_type {
+            crate::sparql_scoper::JoinType::Inner => "inner",
+            crate::sparql_scoper::JoinType::Left => "left",
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "JoinEdge(left={:?}, right={:?}, slot={:?}, type={:?})",
+            self.inner.left,
+            self.inner.right,
+            self.inner.right_slot,
+            self.join_type()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// Structured plan for fetching data from PostgreSQL.
 ///
-/// ```python
-/// scope = lr.sparql_scope(query, schema_view)
-/// for asset_type in scope.asset_types:
-///     qs = GoldenRecord.objects.filter(asset_type__endswith=asset_type)
-///     if scope.uri_filters:
-///         qs = qs.filter(asset360_uri__in=scope.uri_filters)
-///     for field, conditions in scope.predicate_filters.items():
-///         for cond in conditions:
-///             if cond.operator == "eq":
-///                 qs = qs.filter(**{f"object_data__{field}": cond.value})
-/// ```
-pub struct ScopeResult {
-    asset_types: Vec<String>,
-    uri_filters: Vec<String>,
-    is_bounded: bool,
-    estimated_count: Option<usize>,
-    predicate_filters: HashMap<String, Vec<FilterCondition>>,
+/// Stars connected by :class:`JoinEdge` are fetched via SQL JOIN.
+/// Stars with no join edges are fetched independently.
+pub struct QueryPlan {
+    stars: Vec<Star>,
+    joins: Vec<JoinEdge>,
     sql_limit: Option<usize>,
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
-impl ScopeResult {
-    /// LinkML class names to fetch (e.g. ``["Signal", "BaliseGroup"]``).
-    /// Derived from ``rdf:type`` patterns in the query.
+impl QueryPlan {
+    /// All stars (type-scoped subject groups) in the query.
     #[getter]
-    fn asset_types(&self) -> Vec<String> {
-        self.asset_types.clone()
+    fn stars(&self) -> Vec<Star> {
+        self.stars.clone()
     }
 
-    /// Specific ``asset360_uri`` values referenced in the query.
-    /// Used for ``WHERE asset360_uri IN (...)`` lookups.
+    /// Join edges between stars, pushable to SQL JOINs.
     #[getter]
-    fn uri_filters(&self) -> Vec<String> {
-        self.uri_filters.clone()
+    fn joins(&self) -> Vec<JoinEdge> {
+        self.joins.clone()
     }
 
-    /// Whether the query scope is bounded (safe to execute).
-    /// False means the query would load the entire database.
-    #[getter]
-    fn is_bounded(&self) -> bool {
-        self.is_bounded
-    }
-
-    /// Estimated object count, if determinable. Currently always None.
-    #[getter]
-    fn estimated_count(&self) -> Option<usize> {
-        self.estimated_count
-    }
-
-    /// Field-level filters pushable to SQL as JSONB lookups.
-    ///
-    /// Dict mapping LinkML slot names to lists of :class:`FilterCondition`.
-    /// Extracted from ``FILTER(?var = "literal")`` and ``VALUES ?var { ... }``
-    /// clauses where ``?var`` is bound to a known predicate.
-    #[getter]
-    fn predicate_filters(&self) -> HashMap<String, Vec<FilterCondition>> {
-        self.predicate_filters.clone()
-    }
-
-    /// SQL LIMIT to push down for single-type queries.
-    ///
-    /// Only set when the query targets one asset type and has a top-level
-    /// ``LIMIT``. For multi-type joins the LIMIT applies to the joined
-    /// result, not individual fetches, so it cannot be pushed to SQL.
+    /// SQL LIMIT — only for single-star, zero-join queries with SPARQL LIMIT.
     #[getter]
     fn sql_limit(&self) -> Option<usize> {
         self.sql_limit
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QueryPlan(stars={}, joins={}, limit={:?})",
+            self.stars.len(),
+            self.joins.len(),
+            self.sql_limit
+        )
     }
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-/// Analyse a SPARQL query and determine what to fetch from the database.
+/// Analyse a SPARQL query and produce a structured fetch plan.
 ///
-/// Parses the query, extracts ``rdf:type`` patterns, URI references, and
-/// FILTER/VALUES conditions that can be pushed down to SQL.
+/// Decomposes the query into stars (one per ``rdf:type``), detects
+/// join edges between stars (reference properties), and collects
+/// filter conditions. Python translates the plan to SQL.
 ///
 /// Args:
 ///     query: SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
@@ -1369,39 +1445,25 @@ impl ScopeResult {
 ///         slot names and class IRIs to class names.
 ///
 /// Returns:
-///     ScopeResult with asset_types, uri_filters, predicate_filters, etc.
+///     QueryPlan with stars, joins, and optional sql_limit.
 ///
 /// Raises:
 ///     ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
-fn sparql_scope(
-    py: Python<'_>,
-    query: &str,
-    schema_view: Py<PySchemaView>,
-) -> PyResult<ScopeResult> {
+fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> PyResult<QueryPlan> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
     match crate::sparql_scoper::sparql_scope(query, sv) {
-        Ok(result) => {
-            let py_filters: HashMap<String, Vec<FilterCondition>> = result
-                .predicate_filters
-                .iter()
-                .map(|(field, conds)| {
-                    let py_conds = conds.iter().map(FilterCondition::from_rust).collect();
-                    (field.clone(), py_conds)
-                })
-                .collect();
-
-            Ok(ScopeResult {
-                asset_types: result.asset_types,
-                uri_filters: result.uri_filters,
-                is_bounded: result.is_bounded,
-                estimated_count: result.estimated_count,
-                predicate_filters: py_filters,
-                sql_limit: result.sql_limit,
-            })
-        }
+        Ok(plan) => Ok(QueryPlan {
+            stars: plan.stars.into_iter().map(|s| Star { inner: s }).collect(),
+            joins: plan
+                .joins
+                .into_iter()
+                .map(|j| JoinEdge { inner: j })
+                .collect(),
+            sql_limit: plan.sql_limit,
+        }),
         Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
             Err(pyo3::exceptions::PyValueError::new_err(
                 "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.",
