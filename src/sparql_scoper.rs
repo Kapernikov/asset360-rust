@@ -319,7 +319,9 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
                 .get(&slot_name)
                 .copied()
                 .unwrap_or(usize::MAX);
-            builder.slot_depth.insert(slot_name.clone(), current.min(*depth));
+            builder
+                .slot_depth
+                .insert(slot_name.clone(), current.min(*depth));
             if let TermPattern::Variable(v) = &tp.object {
                 builder
                     .object_variables
@@ -510,7 +512,11 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
             .collect();
         let optional_joins: Vec<JoinEdge> = joins
             .iter()
-            .filter(|j| !(mandatory_vars.contains(&j.left) && mandatory_vars.contains(&j.right) && j.join_type == JoinType::Inner))
+            .filter(|j| {
+                !(mandatory_vars.contains(&j.left)
+                    && mandatory_vars.contains(&j.right)
+                    && j.join_type == JoinType::Inner)
+            })
             .cloned()
             .collect();
         PlanNode::LeftJoin {
@@ -587,9 +593,7 @@ fn tag_triples_by_depth<'a>(
         | GraphPattern::Slice { inner, .. }
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => {
-            tag_triples_by_depth(inner, depth, out)
-        }
+        | GraphPattern::Service { inner, .. } => tag_triples_by_depth(inner, depth, out),
         GraphPattern::Values { .. } => Ok(()),
         GraphPattern::Union { .. } => Err(ScopeError::UnsupportedConstruct(
             "UNION is not supported yet; issue separate queries and merge client-side".into(),

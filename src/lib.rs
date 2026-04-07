@@ -1448,9 +1448,10 @@ impl PlanNode {
     #[getter]
     fn joins(&self) -> Vec<JoinEdge> {
         match &self.inner {
-            crate::sparql_scoper::PlanNode::Bgp { joins, .. } => {
-                joins.iter().map(|j| JoinEdge { inner: j.clone() }).collect()
-            }
+            crate::sparql_scoper::PlanNode::Bgp { joins, .. } => joins
+                .iter()
+                .map(|j| JoinEdge { inner: j.clone() })
+                .collect(),
             crate::sparql_scoper::PlanNode::LeftJoin { .. } => Vec::new(),
         }
     }
