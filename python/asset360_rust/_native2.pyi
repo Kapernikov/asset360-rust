@@ -3468,6 +3468,50 @@ class PermissibleValue:
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     def __new__(cls, text:builtins.str, description:typing.Optional[builtins.str]=None, meaning:typing.Optional[builtins.str]=None, unit:typing.Optional[UnitOfMeasure]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, is_a:typing.Optional[builtins.str]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> PermissibleValue: ...
 
+class PlanNode:
+    r"""
+    One node in the query plan algebra tree.
+    
+    Today only two kinds are produced: ``"bgp"`` (a Basic Graph Pattern
+    — a group of stars with inner joins) and ``"left_join"`` (SPARQL
+    ``OPTIONAL``: left-join semantics). Future SPARQL constructs
+    (``UNION``, ``MINUS``, ``NOT EXISTS``, property paths) will be
+    added as new kinds — Python consumers MUST pattern-match on
+    ``kind`` and raise ``ValueError("unsupported_plan_node: <kind>")``
+    for anything unknown, so that older clients fail loudly rather
+    than silently miscomputing.
+    """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        Node kind discriminator: ``"bgp"`` or ``"left_join"``.
+        """
+    @property
+    def stars(self) -> builtins.list[Star]:
+        r"""
+        For ``kind=="bgp"``: the stars in this basic graph pattern.
+        For ``kind=="left_join"``: an empty list (use ``.left``/``.right``).
+        """
+    @property
+    def joins(self) -> builtins.list[JoinEdge]:
+        r"""
+        For ``kind=="bgp"``: the join edges in this basic graph
+        pattern. For ``kind=="left_join"``: an empty list.
+        """
+    @property
+    def left(self) -> typing.Optional[PlanNode]:
+        r"""
+        For ``kind=="left_join"``: the left (mandatory) sub-plan.
+        For ``kind=="bgp"``: returns ``None``.
+        """
+    @property
+    def right(self) -> typing.Optional[PlanNode]:
+        r"""
+        For ``kind=="left_join"``: the right (optional) sub-plan.
+        For ``kind=="bgp"``: returns ``None``.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class Prefix:
     @property
     def prefix_prefix(self) -> builtins.str: ...
@@ -3483,23 +3527,33 @@ class QueryPlan:
     r"""
     Structured plan for fetching data from PostgreSQL.
     
-    Stars connected by :class:`JoinEdge` are fetched via SQL JOIN.
-    Stars with no join edges are fetched independently.
+    Shaped as an algebra tree rooted at :class:`PlanNode`. Legacy flat
+    accessors ``.stars`` and ``.joins`` walk the tree and return all
+    stars / joins pre-order for call-sites that don't need the tree
+    structure.
     """
+    @property
+    def root(self) -> PlanNode:
+        r"""
+        Root of the algebra tree.
+        """
     @property
     def stars(self) -> builtins.list[Star]:
         r"""
-        All stars (type-scoped subject groups) in the query.
+        All stars (type-scoped subject groups) in the query, flattened
+        from the algebra tree in pre-order. Legacy accessor.
         """
     @property
     def joins(self) -> builtins.list[JoinEdge]:
         r"""
-        Join edges between stars, pushable to SQL JOINs.
+        All join edges in the query, flattened from the algebra tree
+        in pre-order. Legacy accessor.
         """
     @property
     def sql_limit(self) -> typing.Optional[builtins.int]:
         r"""
-        SQL LIMIT — only for single-star, zero-join queries with SPARQL LIMIT.
+        SQL LIMIT — only for single-star, zero-join, zero-OPTIONAL
+        queries with a top-level SPARQL LIMIT.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -4580,8 +4634,21 @@ class Star:
     @property
     def required_fields(self) -> builtins.list[builtins.str]:
         r"""
-        Slots referenced in triple patterns. Python uses for existence checks:
-        ``WHERE object_data ? 'hasName'``
+        Slots referenced in mandatory triple patterns. Python uses for
+        existence checks: ``WHERE object_data ? 'hasName'``.
+        """
+    @property
+    def optional_fields(self) -> builtins.list[builtins.str]:
+        r"""
+        Slots referenced only inside OPTIONAL blocks. Python fetches
+        them without an existence check so rows missing the slot still
+        reach oxigraph.
+        """
+    @property
+    def is_optional(self) -> builtins.bool:
+        r"""
+        ``True`` if this star itself appears only inside an OPTIONAL
+        block — its ``WHERE`` conditions must be null-guarded by Python.
         """
     @property
     def filters(self) -> builtins.dict[builtins.str, builtins.list[FilterCondition]]:
