@@ -82,6 +82,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
+        m.add_class::<PlanNode>()?;
         m.add_class::<Star>()?;
         m.add_class::<JoinEdge>()?;
         m.add_class::<FilterCondition>()?;
@@ -1302,11 +1303,26 @@ impl Star {
         &self.inner.class_name
     }
 
-    /// Slots referenced in triple patterns. Python uses for existence checks:
-    /// ``WHERE object_data ? 'hasName'``
+    /// Slots referenced in mandatory triple patterns. Python uses for
+    /// existence checks: ``WHERE object_data ? 'hasName'``.
     #[getter]
     fn required_fields(&self) -> Vec<String> {
         self.inner.required_fields.clone()
+    }
+
+    /// Slots referenced only inside OPTIONAL blocks. Python fetches
+    /// them without an existence check so rows missing the slot still
+    /// reach oxigraph.
+    #[getter]
+    fn optional_fields(&self) -> Vec<String> {
+        self.inner.optional_fields.clone()
+    }
+
+    /// ``True`` if this star itself appears only inside an OPTIONAL
+    /// block — its ``WHERE`` conditions must be null-guarded by Python.
+    #[getter]
+    fn is_optional(&self) -> bool {
+        self.inner.is_optional
     }
 
     /// Value-level filter conditions per slot, pushable to SQL.
@@ -1388,13 +1404,98 @@ impl JoinEdge {
 #[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
+/// One node in the query plan algebra tree.
+///
+/// Today only two kinds are produced: ``"bgp"`` (a Basic Graph Pattern
+/// — a group of stars with inner joins) and ``"left_join"`` (SPARQL
+/// ``OPTIONAL``: left-join semantics). Future SPARQL constructs
+/// (``UNION``, ``MINUS``, ``NOT EXISTS``, property paths) will be
+/// added as new kinds — Python consumers MUST pattern-match on
+/// ``kind`` and raise ``ValueError("unsupported_plan_node: <kind>")``
+/// for anything unknown, so that older clients fail loudly rather
+/// than silently miscomputing.
+pub struct PlanNode {
+    inner: crate::sparql_scoper::PlanNode,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PlanNode {
+    /// Node kind discriminator: ``"bgp"`` or ``"left_join"``.
+    #[getter]
+    fn kind(&self) -> &str {
+        match &self.inner {
+            crate::sparql_scoper::PlanNode::Bgp { .. } => "bgp",
+            crate::sparql_scoper::PlanNode::LeftJoin { .. } => "left_join",
+        }
+    }
+
+    /// For ``kind=="bgp"``: the stars in this basic graph pattern.
+    /// For ``kind=="left_join"``: an empty list (use ``.left``/``.right``).
+    #[getter]
+    fn stars(&self) -> Vec<Star> {
+        match &self.inner {
+            crate::sparql_scoper::PlanNode::Bgp { stars, .. } => {
+                stars.iter().map(|s| Star { inner: s.clone() }).collect()
+            }
+            crate::sparql_scoper::PlanNode::LeftJoin { .. } => Vec::new(),
+        }
+    }
+
+    /// For ``kind=="bgp"``: the join edges in this basic graph
+    /// pattern. For ``kind=="left_join"``: an empty list.
+    #[getter]
+    fn joins(&self) -> Vec<JoinEdge> {
+        match &self.inner {
+            crate::sparql_scoper::PlanNode::Bgp { joins, .. } => {
+                joins.iter().map(|j| JoinEdge { inner: j.clone() }).collect()
+            }
+            crate::sparql_scoper::PlanNode::LeftJoin { .. } => Vec::new(),
+        }
+    }
+
+    /// For ``kind=="left_join"``: the left (mandatory) sub-plan.
+    /// For ``kind=="bgp"``: returns ``None``.
+    #[getter]
+    fn left(&self) -> Option<PlanNode> {
+        match &self.inner {
+            crate::sparql_scoper::PlanNode::LeftJoin { left, .. } => Some(PlanNode {
+                inner: (**left).clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// For ``kind=="left_join"``: the right (optional) sub-plan.
+    /// For ``kind=="bgp"``: returns ``None``.
+    #[getter]
+    fn right(&self) -> Option<PlanNode> {
+        match &self.inner {
+            crate::sparql_scoper::PlanNode::LeftJoin { right, .. } => Some(PlanNode {
+                inner: (**right).clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PlanNode(kind={:?})", self.kind())
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
 /// Structured plan for fetching data from PostgreSQL.
 ///
-/// Stars connected by :class:`JoinEdge` are fetched via SQL JOIN.
-/// Stars with no join edges are fetched independently.
+/// Shaped as an algebra tree rooted at :class:`PlanNode`. Legacy flat
+/// accessors ``.stars`` and ``.joins`` walk the tree and return all
+/// stars / joins pre-order for call-sites that don't need the tree
+/// structure.
 pub struct QueryPlan {
-    stars: Vec<Star>,
-    joins: Vec<JoinEdge>,
+    root: PlanNode,
     sql_limit: Option<usize>,
 }
 
@@ -1402,19 +1503,38 @@ pub struct QueryPlan {
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl QueryPlan {
-    /// All stars (type-scoped subject groups) in the query.
+    /// Root of the algebra tree.
+    #[getter]
+    fn root(&self) -> PlanNode {
+        self.root.clone()
+    }
+
+    /// All stars (type-scoped subject groups) in the query, flattened
+    /// from the algebra tree in pre-order. Legacy accessor.
     #[getter]
     fn stars(&self) -> Vec<Star> {
-        self.stars.clone()
+        self.root
+            .inner
+            .all_stars()
+            .into_iter()
+            .map(|s| Star { inner: s.clone() })
+            .collect()
     }
 
-    /// Join edges between stars, pushable to SQL JOINs.
+    /// All join edges in the query, flattened from the algebra tree
+    /// in pre-order. Legacy accessor.
     #[getter]
     fn joins(&self) -> Vec<JoinEdge> {
-        self.joins.clone()
+        self.root
+            .inner
+            .all_joins()
+            .into_iter()
+            .map(|j| JoinEdge { inner: j.clone() })
+            .collect()
     }
 
-    /// SQL LIMIT — only for single-star, zero-join queries with SPARQL LIMIT.
+    /// SQL LIMIT — only for single-star, zero-join, zero-OPTIONAL
+    /// queries with a top-level SPARQL LIMIT.
     #[getter]
     fn sql_limit(&self) -> Option<usize> {
         self.sql_limit
@@ -1422,9 +1542,8 @@ impl QueryPlan {
 
     fn __repr__(&self) -> String {
         format!(
-            "QueryPlan(stars={}, joins={}, limit={:?})",
-            self.stars.len(),
-            self.joins.len(),
+            "QueryPlan(root={:?}, limit={:?})",
+            self.root.kind(),
             self.sql_limit
         )
     }
@@ -1456,12 +1575,7 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
 
     match crate::sparql_scoper::sparql_scope(query, sv) {
         Ok(plan) => Ok(QueryPlan {
-            stars: plan.stars.into_iter().map(|s| Star { inner: s }).collect(),
-            joins: plan
-                .joins
-                .into_iter()
-                .map(|j| JoinEdge { inner: j })
-                .collect(),
+            root: PlanNode { inner: plan.root },
             sql_limit: plan.sql_limit,
         }),
         Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
@@ -1474,6 +1588,9 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
         ),
         Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => Err(
             pyo3::exceptions::PyValueError::new_err(format!("Query is unscoped: {msg}")),
+        ),
+        Err(crate::sparql_scoper::ScopeError::UnsupportedConstruct(msg)) => Err(
+            pyo3::exceptions::PyValueError::new_err(format!("unsupported_construct: {msg}")),
         ),
     }
 }

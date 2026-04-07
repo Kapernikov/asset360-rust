@@ -13,7 +13,7 @@
 //! The full SPARQL query is always executed in Oxigraph against the loaded
 //! data. The plan only determines *what* to load efficiently.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
@@ -27,22 +27,89 @@ use linkml_schemaview::schemaview::SchemaView;
 
 /// A structured plan for fetching data from PostgreSQL.
 ///
-/// Stars connected by [`JoinEdge`]s are fetched via SQL JOIN.
-/// Stars with no join edges are fetched independently.
-///
-/// Python translates this to ORM queries / raw SQL, fetches the data,
-/// converts to [`LinkMLInstance`]s, and passes them to the executor.
+/// Shaped as an algebra tree rooted at [`PlanNode`], so future SPARQL
+/// constructs (`UNION`, `MINUS`, `NOT EXISTS`, …) can be added as new
+/// node variants without breaking the existing `Bgp` / `LeftJoin`
+/// consumers. Today exactly two node kinds are emitted.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
-    /// Type-scoped subject groups (stars) extracted from the query.
-    pub stars: Vec<Star>,
+    /// Root of the algebra tree.
+    pub root: PlanNode,
 
-    /// Join edges between stars, pushable to SQL JOINs.
-    pub joins: Vec<JoinEdge>,
-
-    /// SQL LIMIT — only set for single-star, zero-join queries
-    /// with a top-level SPARQL LIMIT.
+    /// SQL LIMIT — only set for single-star, zero-join, zero-OPTIONAL
+    /// queries with a top-level SPARQL LIMIT.
     pub sql_limit: Option<usize>,
+}
+
+/// One node in the query plan algebra tree.
+///
+/// Only two variants are produced today. Future features will add more
+/// (`Union`, `Minus`, `NotExists`, `Path`) — each variant is added as a
+/// new enum case so Python consumers that don't recognise it can cleanly
+/// reject the query rather than silently miscomputing.
+#[derive(Debug, Clone)]
+pub enum PlanNode {
+    /// A Basic Graph Pattern: a group of stars joined by inner joins.
+    /// This is the single "mandatory" block of triples in the query.
+    Bgp {
+        stars: Vec<Star>,
+        joins: Vec<JoinEdge>,
+    },
+    /// SPARQL `OPTIONAL { ... }` — left-join semantics. The `left` side
+    /// is the mandatory pattern; the `right` side is the optional block.
+    /// Oxigraph evaluates the original SPARQL query against the fetched
+    /// instances, so the only job of this node is to keep the SQL
+    /// prefetch from filtering out mandatory rows.
+    LeftJoin {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+    },
+}
+
+impl PlanNode {
+    /// Walk the tree (pre-order) and collect every star into one flat
+    /// list. Used by Python's SQL builder and by legacy accessors.
+    pub fn all_stars(&self) -> Vec<&Star> {
+        let mut out = Vec::new();
+        self.visit_stars(&mut out);
+        out
+    }
+
+    /// Walk the tree (pre-order) and collect every join edge into one
+    /// flat list.
+    pub fn all_joins(&self) -> Vec<&JoinEdge> {
+        let mut out = Vec::new();
+        self.visit_joins(&mut out);
+        out
+    }
+
+    fn visit_stars<'a>(&'a self, out: &mut Vec<&'a Star>) {
+        match self {
+            PlanNode::Bgp { stars, .. } => {
+                for s in stars {
+                    out.push(s);
+                }
+            }
+            PlanNode::LeftJoin { left, right } => {
+                left.visit_stars(out);
+                right.visit_stars(out);
+            }
+        }
+    }
+
+    fn visit_joins<'a>(&'a self, out: &mut Vec<&'a JoinEdge>) {
+        match self {
+            PlanNode::Bgp { joins, .. } => {
+                for j in joins {
+                    out.push(j);
+                }
+            }
+            PlanNode::LeftJoin { left, right } => {
+                left.visit_joins(out);
+                right.visit_joins(out);
+            }
+        }
+    }
 }
 
 /// A group of triple patterns sharing the same subject variable,
@@ -53,6 +120,7 @@ pub struct QueryPlan {
 /// Python translates each star to SQL conditions:
 /// - `class_name` → `WHERE asset_type LIKE '%ClassName'`
 /// - `required_fields` → `WHERE object_data ? 'fieldName'`
+/// - `optional_fields` → fetched without existence check
 /// - `filters` → `WHERE object_data->>'field' = 'value'`
 #[derive(Debug, Clone)]
 pub struct Star {
@@ -62,10 +130,22 @@ pub struct Star {
     /// The LinkML class name, e.g. `"TunnelComplex"`.
     pub class_name: String,
 
-    /// All slots referenced in triple patterns for this subject.
-    /// Python uses these for field existence checks:
-    /// `WHERE object_data ? 'hasName'`
+    /// Slots that MUST be present on the object. Python emits
+    /// `WHERE object_data ? 'fieldName'` for each.
     pub required_fields: Vec<String>,
+
+    /// Slots that MAY be present (appear only inside an `OPTIONAL`
+    /// block relative to this star). Python does NOT emit a
+    /// `WHERE object_data ? 'fieldName'` check for these, but they
+    /// still flow through to oxigraph via the JSONB payload.
+    pub optional_fields: Vec<String>,
+
+    /// True if this star itself only appears inside one or more
+    /// `OPTIONAL` blocks (its `rdf:type` was declared at a non-zero
+    /// OPTIONAL depth). Python wraps its `WHERE` conditions in
+    /// `(... OR <alias>.asset360_uri IS NULL)` so that a missing
+    /// LEFT JOIN row doesn't get filtered out.
+    pub is_optional: bool,
 
     /// Value-level filter conditions per slot, pushable to SQL.
     /// From `FILTER(?var = "literal")` and `VALUES ?var { ... }`
@@ -126,6 +206,11 @@ pub enum ScopeError {
     Unscoped(String),
     /// The input is a SPARQL Update (INSERT/DELETE), not supported.
     UpdateRejected,
+    /// The query uses a SPARQL construct the scoper recognises but does
+    /// not yet support (`UNION`, `MINUS`, property paths, disconnected
+    /// `OPTIONAL`, `NOT EXISTS`, …). Reject with a clear message rather
+    /// than silently returning wrong results.
+    UnsupportedConstruct(String),
 }
 
 impl std::fmt::Display for ScopeError {
@@ -138,6 +223,9 @@ impl std::fmt::Display for ScopeError {
                     f,
                     "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only."
                 )
+            }
+            ScopeError::UnsupportedConstruct(msg) => {
+                write!(f, "unsupported_construct: {msg}")
             }
         }
     }
@@ -186,14 +274,17 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         Query::Ask { pattern, .. } => pattern,
     };
 
-    // Collect all BGP triples
-    let mut triples = Vec::new();
-    collect_bgp_triples(pattern, &mut triples);
+    // Phase 0: Depth-tag every BGP triple, rejecting unsupported
+    // constructs along the way (UNION, MINUS, property paths).
+    let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
+    tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
 
-    // Phase 1: Build stars — group triples by subject variable
+    // Phase 1: Build stars — group triples by subject variable,
+    // tracking the minimum OPTIONAL depth at which each slot and each
+    // star itself was introduced.
     let mut star_map: HashMap<String, StarBuilder> = HashMap::new();
 
-    for tp in &triples {
+    for (tp, depth) in &triples_with_depth {
         let subj_var = match &tp.subject {
             TermPattern::Variable(v) => v.as_str().to_owned(),
             _ => continue,
@@ -209,17 +300,26 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
             .or_insert_with(|| StarBuilder {
                 variable: subj_var,
                 type_iri: None,
-                slots: Vec::new(),
+                type_depth: usize::MAX,
+                slot_depth: HashMap::new(),
                 object_variables: HashMap::new(),
             });
 
         if pred_iri == RDF_TYPE {
-            if let TermPattern::NamedNode(nn) = &tp.object {
+            if let TermPattern::NamedNode(nn) = &tp.object
+                && *depth < builder.type_depth
+            {
                 builder.type_iri = Some(nn.as_str().to_owned());
+                builder.type_depth = *depth;
             }
         } else if let Ok(Some(slot_view)) = schema_view.get_slot_by_uri(pred_iri) {
             let slot_name = slot_view.name.clone();
-            builder.slots.push(slot_name.clone());
+            let current = builder
+                .slot_depth
+                .get(&slot_name)
+                .copied()
+                .unwrap_or(usize::MAX);
+            builder.slot_depth.insert(slot_name.clone(), current.min(*depth));
             if let TermPattern::Variable(v) = &tp.object {
                 builder
                     .object_variables
@@ -228,9 +328,12 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         }
     }
 
-    // Resolve type IRIs to class names, build Star structs
+    // Resolve type IRIs to class names, build Star structs with
+    // required / optional field split.
     let mut stars: Vec<Star> = Vec::new();
     let mut var_to_class: HashMap<String, String> = HashMap::new();
+    // Track the min OPTIONAL depth at which each star first appears.
+    let mut star_depths: HashMap<String, usize> = HashMap::new();
 
     for builder in star_map.values() {
         let class_name = match &builder.type_iri {
@@ -241,16 +344,30 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
             None => continue, // no rdf:type, can't scope
         };
 
-        let mut required_fields: Vec<String> = builder.slots.clone();
+        let star_is_optional = builder.type_depth > 0;
+        let mut required_fields: Vec<String> = Vec::new();
+        let mut optional_fields: Vec<String> = Vec::new();
+        for (slot, depth) in &builder.slot_depth {
+            if !star_is_optional && *depth == 0 {
+                required_fields.push(slot.clone());
+            } else {
+                optional_fields.push(slot.clone());
+            }
+        }
         required_fields.sort();
         required_fields.dedup();
+        optional_fields.sort();
+        optional_fields.dedup();
 
         var_to_class.insert(builder.variable.clone(), class_name.clone());
+        star_depths.insert(builder.variable.clone(), builder.type_depth);
 
         stars.push(Star {
             variable: builder.variable.clone(),
             class_name,
             required_fields,
+            optional_fields,
+            is_optional: star_is_optional,
             filters: HashMap::new(), // populated below
         });
     }
@@ -262,7 +379,9 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         ));
     }
 
-    // Phase 2: Detect join edges
+    // Phase 2: Detect join edges. A join is `Left` if either endpoint
+    // only appears inside an OPTIONAL block, OR the slot itself was
+    // first mentioned inside an OPTIONAL block.
     let mut joins: Vec<JoinEdge> = Vec::new();
 
     for builder in star_map.values() {
@@ -271,18 +390,62 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         }
         for (slot_name, obj_var) in &builder.object_variables {
             if var_to_class.contains_key(obj_var) {
-                // This star's slot references another star's subject → join edge
+                let slot_d = *builder.slot_depth.get(slot_name).unwrap_or(&0);
+                let left_d = *star_depths.get(obj_var).unwrap_or(&0);
+                let right_d = *star_depths.get(&builder.variable).unwrap_or(&0);
+                let join_type = if slot_d > 0 || left_d > 0 || right_d > 0 {
+                    JoinType::Left
+                } else {
+                    JoinType::Inner
+                };
                 joins.push(JoinEdge {
                     left: obj_var.clone(),
                     right: builder.variable.clone(),
                     right_slot: slot_name.clone(),
-                    join_type: JoinType::Inner,
+                    join_type,
                 });
             }
         }
     }
 
-    // Phase 3: Collect filter conditions per star
+    // Phase 2b: Reject disconnected OPTIONAL. Every star declared
+    // inside an OPTIONAL block MUST share at least one join edge with
+    // either a mandatory star or transitively with another star that
+    // does. Compute reachability from mandatory stars and reject any
+    // orphaned optional star.
+    {
+        use std::collections::HashSet;
+        let mut reachable: HashSet<String> = stars
+            .iter()
+            .filter(|s| !s.is_optional)
+            .map(|s| s.variable.clone())
+            .collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for j in &joins {
+                if reachable.contains(&j.left) && !reachable.contains(&j.right) {
+                    reachable.insert(j.right.clone());
+                    changed = true;
+                }
+                if reachable.contains(&j.right) && !reachable.contains(&j.left) {
+                    reachable.insert(j.left.clone());
+                    changed = true;
+                }
+            }
+        }
+        for s in &stars {
+            if s.is_optional && !reachable.contains(&s.variable) {
+                return Err(ScopeError::UnsupportedConstruct(format!(
+                    "OPTIONAL block introduces ?{} which shares no variable with the mandatory pattern; \
+                     disconnected OPTIONAL is not supported yet",
+                    s.variable
+                )));
+            }
+        }
+    }
+
+    // Phase 3: Collect filter conditions per star.
     let mut var_to_field: HashMap<String, (String, String)> = HashMap::new();
     // Map: object_variable → (star_variable, slot_name)
     for builder in star_map.values() {
@@ -310,18 +473,61 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         }
     }
 
-    // Phase 4: SQL LIMIT (single-star, zero-join only)
-    let sql_limit = if stars.len() == 1 && joins.is_empty() {
+    // Phase 4: SQL LIMIT — only if the query has a single star, no
+    // joins, and no OPTIONAL blocks (otherwise the LIMIT could slice
+    // off the wrong rows).
+    let has_optional = !stars.iter().all(|s| !s.is_optional)
+        || joins.iter().any(|j| j.join_type == JoinType::Left);
+    let sql_limit = if stars.len() == 1 && joins.is_empty() && !has_optional {
         extract_top_level_limit(pattern)
     } else {
         None
     };
 
-    Ok(QueryPlan {
-        stars,
-        joins,
-        sql_limit,
-    })
+    // Phase 5: Wrap the result into a PlanNode tree. If the original
+    // pattern has no OPTIONAL (all joins inner, no optional stars), emit
+    // a single `Bgp` node. If any OPTIONAL is present, split mandatory
+    // and optional stars into the left / right of a single `LeftJoin`.
+    // Nested OPTIONAL flattens to this two-level shape — all the
+    // non-trivial semantics (all-or-nothing per block, sibling
+    // independence) live in oxigraph, not in the plan tree.
+    let root = if has_optional {
+        let mandatory_vars: HashSet<String> = stars
+            .iter()
+            .filter(|s| !s.is_optional)
+            .map(|s| s.variable.clone())
+            .collect();
+        let mandatory_stars: Vec<Star> = stars.iter().filter(|s| !s.is_optional).cloned().collect();
+        let optional_stars: Vec<Star> = stars.iter().filter(|s| s.is_optional).cloned().collect();
+        let mandatory_joins: Vec<JoinEdge> = joins
+            .iter()
+            .filter(|j| {
+                mandatory_vars.contains(&j.left)
+                    && mandatory_vars.contains(&j.right)
+                    && j.join_type == JoinType::Inner
+            })
+            .cloned()
+            .collect();
+        let optional_joins: Vec<JoinEdge> = joins
+            .iter()
+            .filter(|j| !(mandatory_vars.contains(&j.left) && mandatory_vars.contains(&j.right) && j.join_type == JoinType::Inner))
+            .cloned()
+            .collect();
+        PlanNode::LeftJoin {
+            left: Box::new(PlanNode::Bgp {
+                stars: mandatory_stars,
+                joins: mandatory_joins,
+            }),
+            right: Box::new(PlanNode::Bgp {
+                stars: optional_stars,
+                joins: optional_joins,
+            }),
+        }
+    } else {
+        PlanNode::Bgp { stars, joins }
+    };
+
+    Ok(QueryPlan { root, sql_limit })
 }
 
 // ---------------------------------------------------------------------------
@@ -331,24 +537,46 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
 struct StarBuilder {
     variable: String,
     type_iri: Option<String>,
-    /// Slot names referenced in triple patterns for this subject.
-    slots: Vec<String>,
+    /// Minimum OPTIONAL depth at which this star's `rdf:type` appears.
+    /// `0` = mandatory; `> 0` = inside one or more `OPTIONAL` blocks.
+    type_depth: usize,
+    /// Map: slot name → minimum OPTIONAL depth at which the slot is
+    /// referenced on this subject.
+    slot_depth: HashMap<String, usize>,
     /// Map: slot_name → object variable name (for join detection + filters).
     object_variables: HashMap<String, String>,
 }
 
-/// Recursively collect all BGP triple patterns from a SPARQL algebra tree.
-fn collect_bgp_triples<'a>(pattern: &'a GraphPattern, triples: &mut Vec<&'a TriplePattern>) {
+/// Recursively walk the SPARQL algebra tree and collect every BGP
+/// triple pattern, tagged with the OPTIONAL nesting depth at which it
+/// occurs. `depth == 0` means the triple is in the mandatory part of
+/// the query; `depth > 0` means it is inside one or more nested
+/// `OPTIONAL { ... }` blocks.
+///
+/// Along the way, unsupported constructs (`UNION`, `MINUS`, property
+/// paths) are rejected with [`ScopeError::UnsupportedConstruct`].
+fn tag_triples_by_depth<'a>(
+    pattern: &'a GraphPattern,
+    depth: usize,
+    out: &mut Vec<(&'a TriplePattern, usize)>,
+) -> Result<(), ScopeError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
-            triples.extend(patterns.iter());
+            for tp in patterns {
+                out.push((tp, depth));
+            }
+            Ok(())
         }
-        GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
-            collect_bgp_triples(left, triples);
-            collect_bgp_triples(right, triples);
+        GraphPattern::Join { left, right } => {
+            tag_triples_by_depth(left, depth, out)?;
+            tag_triples_by_depth(right, depth, out)
+        }
+        GraphPattern::LeftJoin { left, right, .. } => {
+            // Left side stays at the current depth — it's the mandatory
+            // pattern from the point of view of this OPTIONAL.
+            tag_triples_by_depth(left, depth, out)?;
+            // Right side is one level deeper — it's inside the OPTIONAL.
+            tag_triples_by_depth(right, depth + 1, out)
         }
         GraphPattern::Filter { inner, .. }
         | GraphPattern::Extend { inner, .. }
@@ -360,9 +588,18 @@ fn collect_bgp_triples<'a>(pattern: &'a GraphPattern, triples: &mut Vec<&'a Trip
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => {
-            collect_bgp_triples(inner, triples);
+            tag_triples_by_depth(inner, depth, out)
         }
-        GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+        GraphPattern::Values { .. } => Ok(()),
+        GraphPattern::Union { .. } => Err(ScopeError::UnsupportedConstruct(
+            "UNION is not supported yet; issue separate queries and merge client-side".into(),
+        )),
+        GraphPattern::Minus { .. } => Err(ScopeError::UnsupportedConstruct(
+            "MINUS is not supported yet".into(),
+        )),
+        GraphPattern::Path { .. } => Err(ScopeError::UnsupportedConstruct(
+            "SPARQL property paths are not supported; use explicit triple patterns".into(),
+        )),
     }
 }
 
@@ -593,10 +830,19 @@ classes:
     }
 
     fn find_star<'a>(plan: &'a QueryPlan, var: &str) -> &'a Star {
-        plan.stars
-            .iter()
+        plan.root
+            .all_stars()
+            .into_iter()
             .find(|s| s.variable == var)
             .unwrap_or_else(|| panic!("no star for variable '{var}'"))
+    }
+
+    fn all_stars(plan: &QueryPlan) -> Vec<&Star> {
+        plan.root.all_stars()
+    }
+
+    fn all_joins(plan: &QueryPlan) -> Vec<&JoinEdge> {
+        plan.root.all_joins()
     }
 
     // ---- Single type ----
@@ -610,12 +856,17 @@ classes:
         )
         .unwrap();
 
-        assert_eq!(plan.stars.len(), 1);
-        assert_eq!(plan.joins.len(), 0);
+        assert_eq!(all_stars(&plan).len(), 1);
+        assert_eq!(all_joins(&plan).len(), 0);
 
-        let star = &plan.stars[0];
+        let stars = all_stars(&plan);
+        let star = stars[0];
         assert_eq!(star.class_name, "Signal");
         assert!(star.required_fields.contains(&"name".to_owned()));
+        assert!(!star.is_optional);
+        assert!(star.optional_fields.is_empty());
+        // No OPTIONAL → plan root is a single Bgp node.
+        assert!(matches!(&plan.root, PlanNode::Bgp { .. }));
     }
 
     #[test]
@@ -659,8 +910,8 @@ classes:
         )
         .unwrap();
 
-        assert_eq!(plan.stars.len(), 2);
-        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(all_stars(&plan).len(), 2);
+        assert_eq!(all_joins(&plan).len(), 1);
 
         let tc = find_star(&plan, "complex");
         assert_eq!(tc.class_name, "TunnelComplex");
@@ -674,7 +925,8 @@ classes:
                 .contains(&"belongsToTunnelComplex".to_owned())
         );
 
-        let join = &plan.joins[0];
+        let joins = all_joins(&plan);
+        let join = joins[0];
         assert_eq!(join.left, "complex");
         assert_eq!(join.right, "component");
         assert_eq!(join.right_slot, "belongsToTunnelComplex");
@@ -699,10 +951,11 @@ classes:
         )
         .unwrap();
 
-        assert_eq!(plan.stars.len(), 2);
-        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(all_stars(&plan).len(), 2);
+        assert_eq!(all_joins(&plan).len(), 1);
 
-        let join = &plan.joins[0];
+        let joins = all_joins(&plan);
+        let join = joins[0];
         assert_eq!(join.left, "sig"); // Signal is referenced
         assert_eq!(join.right, "bg"); // BaliseGroup holds the FK
         assert_eq!(join.right_slot, "refersToSignal");
@@ -724,12 +977,13 @@ classes:
         )
         .unwrap();
 
-        assert_eq!(plan.stars.len(), 3);
-        assert_eq!(plan.joins.len(), 2);
+        assert_eq!(all_stars(&plan).len(), 3);
+        assert_eq!(all_joins(&plan).len(), 2);
+
+        let joins = all_joins(&plan);
 
         // Track → Line join
-        let line_track_join = plan
-            .joins
+        let line_track_join = joins
             .iter()
             .find(|j| j.right_slot == "belongsToLine")
             .expect("should have belongsToLine join");
@@ -737,8 +991,7 @@ classes:
         assert_eq!(line_track_join.right, "track");
 
         // Signal → Track join
-        let track_sig_join = plan
-            .joins
+        let track_sig_join = joins
             .iter()
             .find(|j| j.right_slot == "locatedOnTrack")
             .expect("should have locatedOnTrack join");
@@ -809,8 +1062,8 @@ classes:
         )
         .unwrap();
 
-        assert_eq!(plan.stars.len(), 1);
-        assert_eq!(plan.stars[0].class_name, "Signal");
+        assert_eq!(all_stars(&plan).len(), 1);
+        assert_eq!(all_stars(&plan)[0].class_name, "Signal");
     }
 
     #[test]
@@ -823,7 +1076,198 @@ classes:
         )
         .unwrap();
 
-        assert_eq!(plan.stars.len(), 1);
-        assert_eq!(plan.stars[0].class_name, "Signal");
+        assert_eq!(all_stars(&plan).len(), 1);
+        assert_eq!(all_stars(&plan)[0].class_name, "Signal");
+    }
+
+    // ---- OPTIONAL support ----
+
+    /// Simple OPTIONAL on a reference property: one mandatory star,
+    /// one optional star reached via a LEFT join.
+    #[test]
+    fn test_simple_optional() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?complex ?component WHERE { \
+               ?complex a asset360:TunnelComplex ; asset360:hasName ?cn . \
+               OPTIONAL { \
+                 ?component a asset360:CivilEngineeringAsset ; \
+                            asset360:belongsToTunnelComplex ?complex ; \
+                            asset360:hasName ?compn . \
+               } \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        assert_eq!(all_stars(&plan).len(), 2);
+        assert_eq!(all_joins(&plan).len(), 1);
+
+        let complex = find_star(&plan, "complex");
+        assert!(!complex.is_optional);
+        assert!(complex.required_fields.contains(&"hasName".to_owned()));
+
+        let component = find_star(&plan, "component");
+        assert!(component.is_optional);
+        // Inside an OPTIONAL → slots become optional_fields, not required.
+        assert!(component.required_fields.is_empty());
+        assert!(component.optional_fields.contains(&"hasName".to_owned()));
+        assert!(
+            component
+                .optional_fields
+                .contains(&"belongsToTunnelComplex".to_owned())
+        );
+
+        let joins = all_joins(&plan);
+        assert_eq!(joins[0].join_type, JoinType::Left);
+
+        // Root is a LeftJoin wrapping mandatory Bgp + optional Bgp.
+        match &plan.root {
+            PlanNode::LeftJoin { left, right } => {
+                match left.as_ref() {
+                    PlanNode::Bgp { stars, .. } => {
+                        assert_eq!(stars.len(), 1);
+                        assert_eq!(stars[0].variable, "complex");
+                    }
+                    _ => panic!("expected left Bgp"),
+                }
+                match right.as_ref() {
+                    PlanNode::Bgp { stars, joins } => {
+                        assert_eq!(stars.len(), 1);
+                        assert_eq!(stars[0].variable, "component");
+                        assert_eq!(joins.len(), 1);
+                        assert_eq!(joins[0].join_type, JoinType::Left);
+                    }
+                    _ => panic!("expected right Bgp"),
+                }
+            }
+            _ => panic!("expected LeftJoin at root"),
+        }
+    }
+
+    /// Nested OPTIONAL — three levels deep; inner slots become
+    /// optional_fields on their respective stars.
+    #[test]
+    fn test_nested_optional() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { \
+               ?line a asset360:Line ; asset360:hasName ?ln . \
+               OPTIONAL { \
+                 ?track a asset360:Track ; asset360:belongsToLine ?line . \
+                 OPTIONAL { \
+                   ?sig a asset360:Signal ; asset360:locatedOnTrack ?track ; asset360:name ?sn . \
+                 } \
+               } \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let line = find_star(&plan, "line");
+        assert!(!line.is_optional);
+
+        let track = find_star(&plan, "track");
+        assert!(track.is_optional);
+
+        let sig = find_star(&plan, "sig");
+        assert!(sig.is_optional);
+
+        // Every join involving an optional star must be a LEFT join.
+        for j in all_joins(&plan) {
+            assert_eq!(j.join_type, JoinType::Left, "join {j:?} should be LEFT");
+        }
+    }
+
+    /// Attribute-level OPTIONAL on the mandatory entity: the slot is
+    /// parked in `optional_fields`, not `required_fields`, and no new
+    /// star / join is introduced.
+    #[test]
+    fn test_attribute_level_optional() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal . \
+               OPTIONAL { ?s asset360:name ?n } \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        assert_eq!(all_stars(&plan).len(), 1);
+        let star = find_star(&plan, "s");
+        assert!(!star.is_optional);
+        assert!(!star.required_fields.contains(&"name".to_owned()));
+        assert!(star.optional_fields.contains(&"name".to_owned()));
+    }
+
+    /// Mixing mandatory and optional slots on the same subject.
+    #[test]
+    fn test_optional_mixed_with_mandatory() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal ; asset360:name ?n . \
+               OPTIONAL { ?s asset360:locatedOnTrack ?t } \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert!(star.required_fields.contains(&"name".to_owned()));
+        assert!(star.optional_fields.contains(&"locatedOnTrack".to_owned()));
+        assert!(!star.required_fields.contains(&"locatedOnTrack".to_owned()));
+    }
+
+    // ---- Unsupported constructs ----
+
+    #[test]
+    fn test_union_rejected() {
+        let sv = test_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("UNION")),
+            "expected UnsupportedConstruct with UNION, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_minus_rejected() {
+        let sv = test_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { ?s a asset360:Signal . MINUS { ?s asset360:name \"X\" } }",
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("MINUS")),
+            "expected UnsupportedConstruct with MINUS, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_disconnected_optional_rejected() {
+        let sv = test_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { \
+               ?a a asset360:Signal . \
+               OPTIONAL { ?b a asset360:BaliseGroup } \
+             }",
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("disconnected")),
+            "expected UnsupportedConstruct with disconnected, got {result:?}"
+        );
     }
 }
