@@ -303,6 +303,7 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
                 type_depth: usize::MAX,
                 slot_depth: HashMap::new(),
                 object_variables: HashMap::new(),
+                inline_filters: HashMap::new(),
             });
 
         if pred_iri == RDF_TYPE {
@@ -322,10 +323,32 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
             builder
                 .slot_depth
                 .insert(slot_name.clone(), current.min(*depth));
-            if let TermPattern::Variable(v) = &tp.object {
-                builder
-                    .object_variables
-                    .insert(slot_name, v.as_str().to_owned());
+            match &tp.object {
+                TermPattern::Variable(v) => {
+                    builder
+                        .object_variables
+                        .insert(slot_name, v.as_str().to_owned());
+                }
+                // Inline NamedNode constant: `?s :foo <uri>` →
+                // pushable equality filter `object_data->>'foo' = '<uri>'`.
+                // Only at depth 0 — inside an OPTIONAL we leave it to
+                // oxigraph to avoid breaking LEFT JOIN row preservation.
+                TermPattern::NamedNode(nn) if *depth == 0 => {
+                    builder
+                        .inline_filters
+                        .entry(slot_name)
+                        .or_default()
+                        .push(FilterCondition::Eq(nn.as_str().to_owned()));
+                }
+                // Inline literal constant: `?s :foo "bar"`.
+                TermPattern::Literal(lit) if *depth == 0 => {
+                    builder
+                        .inline_filters
+                        .entry(slot_name)
+                        .or_default()
+                        .push(FilterCondition::Eq(lit.value().to_owned()));
+                }
+                _ => {}
             }
         }
     }
@@ -370,7 +393,10 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
             required_fields,
             optional_fields,
             is_optional: star_is_optional,
-            filters: HashMap::new(), // populated below
+            // Seed with inline-constant filters from Phase 1 (e.g.
+            // `?s :foo <uri>`); FILTER(...)/VALUES filters from Phase 3
+            // are merged in below.
+            filters: builder.inline_filters.clone(),
         });
     }
 
@@ -381,16 +407,35 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         ));
     }
 
+    // Sort stars deterministically: mandatory ones first (so the SQL
+    // builder picks a mandatory star as the FROM table), then by
+    // variable name.
+    stars.sort_by(|a, b| {
+        a.is_optional
+            .cmp(&b.is_optional)
+            .then_with(|| a.variable.cmp(&b.variable))
+    });
+
     // Phase 2: Detect join edges. A join is `Left` if either endpoint
     // only appears inside an OPTIONAL block, OR the slot itself was
     // first mentioned inside an OPTIONAL block.
+    //
+    // Iterate `star_map` in a deterministic order (sorted by subject
+    // variable name) so the resulting `joins` vector is reproducible
+    // across runs. The Python SQL builder is order-tolerant, but
+    // determinism still matters for tests, debugging and SQL plan
+    // caching.
     let mut joins: Vec<JoinEdge> = Vec::new();
+    let mut sorted_builders: Vec<&StarBuilder> = star_map.values().collect();
+    sorted_builders.sort_by(|a, b| a.variable.cmp(&b.variable));
 
-    for builder in star_map.values() {
+    for builder in sorted_builders {
         if !var_to_class.contains_key(&builder.variable) {
             continue;
         }
-        for (slot_name, obj_var) in &builder.object_variables {
+        let mut sorted_slots: Vec<(&String, &String)> = builder.object_variables.iter().collect();
+        sorted_slots.sort_by(|a, b| a.0.cmp(b.0));
+        for (slot_name, obj_var) in sorted_slots {
             if var_to_class.contains_key(obj_var) {
                 let slot_d = *builder.slot_depth.get(slot_name).unwrap_or(&0);
                 let left_d = *star_depths.get(obj_var).unwrap_or(&0);
@@ -470,8 +515,11 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
     collect_values_filters(pattern, &var_to_field, &mut star_filters);
 
     for star in &mut stars {
-        if let Some(filters) = star_filters.remove(&star.variable) {
-            star.filters = filters;
+        if let Some(extra) = star_filters.remove(&star.variable) {
+            // Merge into any inline-constant filters seeded in Phase 1.
+            for (slot, conds) in extra {
+                star.filters.entry(slot).or_default().extend(conds);
+            }
         }
     }
 
@@ -551,6 +599,12 @@ struct StarBuilder {
     slot_depth: HashMap<String, usize>,
     /// Map: slot_name → object variable name (for join detection + filters).
     object_variables: HashMap<String, String>,
+    /// Filters extracted from triples whose object is an inline literal
+    /// or NamedNode (e.g. `?s :hasName "X"` or `?s :foo <some/uri>`).
+    /// Only collected at OPTIONAL depth 0 — inside an OPTIONAL block
+    /// these filters can't be safely pushed to SQL without breaking
+    /// LEFT JOIN semantics, so they're left for oxigraph to apply.
+    inline_filters: HashMap<String, Vec<FilterCondition>>,
 }
 
 /// Recursively walk the SPARQL algebra tree and collect every BGP
@@ -1256,6 +1310,143 @@ classes:
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("MINUS")),
             "expected UnsupportedConstruct with MINUS, got {result:?}"
         );
+    }
+
+    // ---- Inline-constant filter extraction (B2 regression) ----
+
+    /// Triples whose object is an inline NamedNode (`?s :foo <uri>`)
+    /// must produce a pushable equality FilterCondition, not just a
+    /// silent existence check.
+    #[test]
+    fn test_inline_namednode_object_becomes_filter() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?comp WHERE { \
+               ?comp a asset360:CivilEngineeringAsset ; \
+                     asset360:belongsToTunnelComplex <https://data.infrabel.be/data/TunnelComplexes/abc> . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "comp");
+        let f = star
+            .filters
+            .get("belongsToTunnelComplex")
+            .expect("inline-NamedNode should produce a filter");
+        match &f[0] {
+            FilterCondition::Eq(v) => {
+                assert_eq!(v, "https://data.infrabel.be/data/TunnelComplexes/abc");
+            }
+            other => panic!("expected Eq, got {other:?}"),
+        }
+        // The slot still appears in required_fields so the JSON key
+        // existence check stays; the filter is layered on top.
+        assert!(
+            star.required_fields
+                .contains(&"belongsToTunnelComplex".to_owned())
+        );
+    }
+
+    /// Triples whose object is an inline literal (`?s :foo "bar"`)
+    /// must also produce a pushable equality FilterCondition.
+    #[test]
+    fn test_inline_literal_object_becomes_filter() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        let f = star
+            .filters
+            .get("name")
+            .expect("inline literal should produce a filter");
+        assert!(matches!(&f[0], FilterCondition::Eq(v) if v == "BX517"));
+    }
+
+    /// Inline filters inside an OPTIONAL block must NOT be pushed to
+    /// SQL — they would break LEFT JOIN row preservation. Oxigraph will
+    /// apply them after the prefetch.
+    #[test]
+    fn test_inline_filter_inside_optional_not_pushed() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { \
+               ?s a asset360:Signal . \
+               OPTIONAL { ?s asset360:name \"BX517\" } \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        // No pushed filter for `name` — it's inside an OPTIONAL.
+        assert!(
+            !star.filters.contains_key("name"),
+            "filter on optional slot must not be pushed: {:?}",
+            star.filters
+        );
+        // But the slot is still tracked as optional_fields so the
+        // SELECT projection includes it for oxigraph.
+        assert!(star.optional_fields.contains(&"name".to_owned()));
+    }
+
+    /// 3-star fan-out: one delegate star referenced by two sibling
+    /// stars (sub-zone + inspection-section). Both join edges must be
+    /// produced and the join order must be deterministic across runs.
+    #[test]
+    fn test_three_star_fan_out_join_order_deterministic() {
+        let sv = test_schema_view();
+        let q = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                 SELECT * WHERE { \
+                   ?s a asset360:BaliseGroup ; asset360:refersToSignal ?sig . \
+                   ?sig a asset360:Signal ; asset360:locatedOnTrack ?t . \
+                   ?t a asset360:Track ; asset360:hasName ?tn . \
+                 }";
+        // Run several times — sort order must be stable.
+        let plan1 = sparql_scope(q, &sv).unwrap();
+        let plan2 = sparql_scope(q, &sv).unwrap();
+        let plan3 = sparql_scope(q, &sv).unwrap();
+
+        let stars1: Vec<&str> = all_stars(&plan1)
+            .iter()
+            .map(|s| s.variable.as_str())
+            .collect();
+        let stars2: Vec<&str> = all_stars(&plan2)
+            .iter()
+            .map(|s| s.variable.as_str())
+            .collect();
+        let stars3: Vec<&str> = all_stars(&plan3)
+            .iter()
+            .map(|s| s.variable.as_str())
+            .collect();
+        assert_eq!(stars1, stars2);
+        assert_eq!(stars2, stars3);
+
+        let joins1: Vec<&str> = all_joins(&plan1)
+            .iter()
+            .map(|j| j.right_slot.as_str())
+            .collect();
+        let joins2: Vec<&str> = all_joins(&plan2)
+            .iter()
+            .map(|j| j.right_slot.as_str())
+            .collect();
+        assert_eq!(joins1, joins2);
+
+        // Both join edges must be present.
+        assert_eq!(all_joins(&plan1).len(), 2);
+        let slots: std::collections::HashSet<&str> = all_joins(&plan1)
+            .iter()
+            .map(|j| j.right_slot.as_str())
+            .collect();
+        assert!(slots.contains("refersToSignal"));
+        assert!(slots.contains("locatedOnTrack"));
     }
 
     #[test]
