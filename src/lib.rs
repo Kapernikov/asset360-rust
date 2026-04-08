@@ -107,9 +107,16 @@ fn is_truthy(py: Python<'_>, ann: &Annotation) -> bool {
     any.is_truthy().unwrap_or(false)
 }
 
-/// Default annotation key used to mark a class as "managed" by asset360.
+/// Default annotation keys used to mark a class as "managed" by asset360.
+/// Both the short and fully-qualified forms are tried so that models using
+/// either convention (e.g. RINF vs asset360) work out of the box.
 #[cfg(feature = "python-bindings")]
-pub const DEFAULT_MANAGED_ANNOTATION: &str = "data.infrabel.be/asset360/managed";
+pub const DEFAULT_MANAGED_ANNOTATIONS: &[&str] = &[
+    "data.infrabel.be/asset360/managed",
+    "asset360/managed",
+    "infraventory/managed",
+    "rinf/managed",
+];
 
 #[cfg(feature = "python-bindings")]
 fn compute_classes_by_type_designator(
@@ -117,7 +124,7 @@ fn compute_classes_by_type_designator(
     only_registered: bool,
     only_default: bool,
     py: Option<Python<'_>>,
-    managed_annotation: &str,
+    managed_annotations: &[&str],
 ) -> HashMap<String, ClassView> {
     let mut out: HashMap<String, ClassView> = HashMap::new();
 
@@ -127,10 +134,9 @@ fn compute_classes_by_type_designator(
                 if let Some(classes) = &schema.classes {
                     for (class_name, class_def) in classes {
                         if only_registered {
-                            let managed = class_def
-                                .annotations
-                                .as_ref()
-                                .and_then(|m| m.get(managed_annotation));
+                            let managed = class_def.annotations.as_ref().and_then(|m| {
+                                managed_annotations.iter().find_map(|key| m.get(*key))
+                            });
                             let managed_truthy = managed.map(|ann| match py {
                                 Some(py) => is_truthy(py, ann),
                                 None => true,
@@ -178,24 +184,30 @@ fn compute_classes_by_type_designator(
 ///   to be truthy.
 /// * `only_default` – restrict to each class' primary type designator instead of
 ///   all accepted aliases.
-/// * `managed_annotation` – annotation key that marks a class as managed
-///   (default: `data.infrabel.be/asset360/managed`).
+/// * `managed_annotations` – annotation keys to try when checking whether a
+///   class is managed.  When `None`, both `"data.infrabel.be/asset360/managed"`
+///   and `"asset360/managed"` are tried so that every known datamodel works out
+///   of the box.
 #[cfg(feature = "python-bindings")]
 fn get_all_classes_by_type_designator_and_schema_impl(
     py: Python<'_>,
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
-    managed_annotation: &str,
+    managed_annotations: Option<Vec<String>>,
 ) -> PyResult<HashMap<String, Py<PyClassView>>> {
     let bound = schemaview.bind(py);
     let sv_ref = bound.borrow();
+    let keys: Vec<&str> = match &managed_annotations {
+        Some(v) => v.iter().map(|s| s.as_str()).collect(),
+        None => DEFAULT_MANAGED_ANNOTATIONS.to_vec(),
+    };
     let raw = compute_classes_by_type_designator(
         sv_ref.as_rust(),
         only_registered,
         only_default,
         Some(py),
-        managed_annotation,
+        &keys,
     );
     raw.into_iter()
         .map(|(designator, view)| {
@@ -208,12 +220,12 @@ fn get_all_classes_by_type_designator_and_schema_impl(
 /// Return every class keyed by its resolved type designator.
 ///
 /// * `schemaview` – existing [`SchemaView`] instance to inspect.
-/// * `only_registered` – require the annotation named by `managed_annotation`
-///   to be truthy.
+/// * `only_registered` – require the annotation named by one of the
+///   `managed_annotations` keys to be truthy.
 /// * `only_default` – restrict to each class' primary type designator instead of
 ///   all accepted aliases.
-/// * `managed_annotation` – annotation key that marks a class as managed
-///   (default: `"data.infrabel.be/asset360/managed"`).
+/// * `managed_annotations` – annotation keys to try (default: `None`, which
+///   tries both `"data.infrabel.be/asset360/managed"` and `"asset360/managed"`).
 #[gen_stub_pyfunction]
 #[gen_stub(
     override_return_type(
@@ -223,7 +235,7 @@ fn get_all_classes_by_type_designator_and_schema_impl(
 )]
 #[pyfunction(
     name = "get_all_classes_by_type_designator_and_schema",
-    signature = (schemaview, only_registered=true, only_default=true, managed_annotation="data.infrabel.be/asset360/managed")
+    signature = (schemaview, only_registered=true, only_default=true, managed_annotations=None)
 )]
 fn get_all_classes_by_type_designator_and_schema(
     py: Python<'_>,
@@ -236,14 +248,14 @@ fn get_all_classes_by_type_designator_and_schema(
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
-    managed_annotation: &str,
+    managed_annotations: Option<Vec<String>>,
 ) -> PyResult<HashMap<String, Py<PyClassView>>> {
     get_all_classes_by_type_designator_and_schema_impl(
         py,
         schemaview,
         only_registered,
         only_default,
-        managed_annotation,
+        managed_annotations,
     )
 }
 
@@ -251,29 +263,29 @@ fn get_all_classes_by_type_designator_and_schema(
 /// Return every class keyed by its resolved type designator.
 ///
 /// * `schemaview` – existing [`SchemaView`] instance to inspect.
-/// * `only_registered` – require the annotation named by `managed_annotation`
-///   to be truthy.
+/// * `only_registered` – require the annotation named by one of the
+///   `managed_annotations` keys to be truthy.
 /// * `only_default` – restrict to each class' primary type designator instead of
 ///   all accepted aliases.
-/// * `managed_annotation` – annotation key that marks a class as managed
-///   (default: `"data.infrabel.be/asset360/managed"`).
+/// * `managed_annotations` – annotation keys to try (default: `None`, which
+///   tries both `"data.infrabel.be/asset360/managed"` and `"asset360/managed"`).
 #[pyfunction(
     name = "get_all_classes_by_type_designator_and_schema",
-    signature = (schemaview, only_registered=true, only_default=true, managed_annotation="data.infrabel.be/asset360/managed")
+    signature = (schemaview, only_registered=true, only_default=true, managed_annotations=None)
 )]
 fn get_all_classes_by_type_designator_and_schema(
     py: Python<'_>,
     schemaview: Py<PySchemaView>,
     only_registered: bool,
     only_default: bool,
-    managed_annotation: &str,
+    managed_annotations: Option<Vec<String>>,
 ) -> PyResult<HashMap<String, Py<PyClassView>>> {
     get_all_classes_by_type_designator_and_schema_impl(
         py,
         schemaview,
         only_registered,
         only_default,
-        managed_annotation,
+        managed_annotations,
     )
 }
 
@@ -1694,7 +1706,7 @@ mod tests {
         let mut sv = SchemaView::new();
         sv.add_schema(schema).unwrap();
         let baseline =
-            compute_classes_by_type_designator(&sv, true, true, None, DEFAULT_MANAGED_ANNOTATION);
+            compute_classes_by_type_designator(&sv, true, true, None, DEFAULT_MANAGED_ANNOTATIONS);
         assert!(
             !baseline.is_empty(),
             "expected managed classes with designator entries"
@@ -1717,7 +1729,7 @@ mod tests {
                 true,
                 true,
                 None,
-                DEFAULT_MANAGED_ANNOTATION,
+                DEFAULT_MANAGED_ANNOTATIONS,
             );
             black_box(result);
         }

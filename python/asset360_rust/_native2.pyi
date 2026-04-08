@@ -5727,17 +5727,17 @@ def from_turtle_tracked(turtle_str:builtins.str, schema_view:SchemaView, root_cl
         subject IRIs that were not consumed during import.
     """
 
-def get_all_classes_by_type_designator_and_schema(schemaview:asset360_rust.SchemaView, only_registered:builtins.bool=True, only_default:builtins.bool=True, managed_annotation:builtins.str='data.infrabel.be/asset360/managed') -> dict[str, asset360_rust.ClassView]:
+def get_all_classes_by_type_designator_and_schema(schemaview:asset360_rust.SchemaView, only_registered:builtins.bool=True, only_default:builtins.bool=True, managed_annotations:typing.Optional[typing.Sequence[builtins.str]]=None) -> dict[str, asset360_rust.ClassView]:
     r"""
     Return every class keyed by its resolved type designator.
     
     * `schemaview` – existing [`SchemaView`] instance to inspect.
-    * `only_registered` – require the annotation named by `managed_annotation`
-      to be truthy.
+    * `only_registered` – require the annotation named by one of the
+      `managed_annotations` keys to be truthy.
     * `only_default` – restrict to each class' primary type designator instead of
       all accepted aliases.
-    * `managed_annotation` – annotation key that marks a class as managed
-      (default: `"data.infrabel.be/asset360/managed"`).
+    * `managed_annotations` – annotation keys to try (default: `None`, which
+      tries both `"data.infrabel.be/asset360/managed"` and `"asset360/managed"`).
     """
 
 def get_blame_info(value:LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> typing.Optional[asset360_rust.Asset360ChangeMeta]: ...
