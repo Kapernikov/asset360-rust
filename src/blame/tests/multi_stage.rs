@@ -84,7 +84,7 @@ fn test_apply_multiple_stages_preserves_blame_history() {
                 &generations[idx + 1],
                 DiffOptions {
                     treat_missing_as_null: true,
-                    ..DiffOptions::default()
+                    treat_changed_identifier_as_new_object: true,
                 },
             ),
         })

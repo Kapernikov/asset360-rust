@@ -55,7 +55,7 @@ pub fn compute_history(
             &stage.value,
             DiffOptions {
                 treat_changed_identifier_as_new_object: false,
-                ..Default::default()
+                treat_missing_as_null: false,
             },
         );
         let real_deltas: Vec<Delta> = deltas
