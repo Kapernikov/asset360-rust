@@ -115,6 +115,16 @@ impl ConstraintSet {
         let mut known = obj.clone();
         known.remove(target_field);
 
+        // Normalize: any affected peer the caller didn't supply is treated as
+        // JSON null, not a wildcard. The inner solver's "missing == wildcard"
+        // is correct for forward eval but wrong for edit-session backward
+        // solving — fix at the API boundary (see MR 438).
+        for field in self.affected_fields() {
+            if field != target_field {
+                known.entry(field).or_insert(serde_json::Value::Null);
+            }
+        }
+
         // Collect predicates from all shapes that have an AST
         let mut predicates: Vec<Predicate> = Vec::new();
         for shape in &self.shapes {
@@ -449,6 +459,154 @@ mod tests {
         });
         let result = cs.solve(&data, "ceAssetSecondaryStatus");
         assert!(result.is_none(), "In_dienst has no forbidden combos");
+    }
+
+    // ── Null-normalization at the solve boundary (MR 438 follow-up) ──
+    //
+    // `backward_solver::substitute` treats a missing non-target field as
+    // `Bool(true)` — correct for forward eval, wrong for edit-session
+    // backward solving. `ConstraintSet::solve` is the boundary that fixes
+    // the contract: any affected peer the caller didn't supply is normalized
+    // to JSON null before delegation.
+
+    #[test]
+    fn test_solve_missing_peer_treated_as_null() {
+        let cs = ConstraintSet {
+            shapes: vec![status_combo_shape()],
+            schema_view: None,
+            target_class: None,
+        };
+        // No primary supplied. After normalization, primary=null causes every
+        // `And(primary==X, secondary==Y)` branch to short-circuit to false,
+        // so the outer `Not(Or(...))` is true and target is free.
+        let result = cs.solve(&json!({}), "ceAssetSecondaryStatus");
+        assert!(
+            result.is_none(),
+            "missing peer must behave like null, not wildcard"
+        );
+    }
+
+    #[test]
+    fn test_solve_missing_peer_matches_explicit_null() {
+        let cs = ConstraintSet {
+            shapes: vec![status_combo_shape()],
+            schema_view: None,
+            target_class: None,
+        };
+        let from_empty = cs.solve(&json!({}), "ceAssetSecondaryStatus");
+        let from_null = cs.solve(
+            &json!({ "ceAssetPrimaryStatus": null }),
+            "ceAssetSecondaryStatus",
+        );
+        let to_json = |fc: Option<FieldConstraint>| serde_json::to_value(&fc).unwrap();
+        assert_eq!(to_json(from_empty), to_json(from_null));
+    }
+
+    #[test]
+    fn test_solve_missing_peer_prop_in() {
+        // Not(And(PropIn(primary, [A,B]), PropEquals(secondary, "X")))
+        // Missing primary → null → PropIn false → And false → Not true → free.
+        let shape = ShapeResult {
+            shape_uri: "asset360:PropInPeerShape".into(),
+            target_class: "Thing".into(),
+            enforcement_level: EnforcementLevel::Serious,
+            message: "Forbidden when primary in {A,B} and secondary=X".into(),
+            affected_fields: vec!["primary".into(), "secondary".into()],
+            introspectable: true,
+            ast: Some(ShaclAst::Not {
+                child: Box::new(ShaclAst::And {
+                    children: vec![
+                        ShaclAst::PropIn {
+                            path: PropertyPath::iri("https://example.org/primary"),
+                            values: vec![json!("A"), json!("B")],
+                        },
+                        ShaclAst::PropEquals {
+                            path: PropertyPath::iri("https://example.org/secondary"),
+                            value: json!("X"),
+                        },
+                    ],
+                }),
+            }),
+            sparql: None,
+        };
+        let cs = ConstraintSet {
+            shapes: vec![shape],
+            schema_view: None,
+            target_class: None,
+        };
+        let result = cs.solve(&json!({}), "secondary");
+        assert!(
+            result.is_none(),
+            "missing peer with PropIn must not over-restrict target"
+        );
+    }
+
+    #[test]
+    fn test_solve_missing_peer_prop_count() {
+        // Not(And(PropCount(primary, min=1), PropEquals(secondary, "X")))
+        // Missing primary → null → count=0, fails min=1 → false → free.
+        let shape = ShapeResult {
+            shape_uri: "asset360:PropCountPeerShape".into(),
+            target_class: "Thing".into(),
+            enforcement_level: EnforcementLevel::Serious,
+            message: "Forbidden when primary present and secondary=X".into(),
+            affected_fields: vec!["primary".into(), "secondary".into()],
+            introspectable: true,
+            ast: Some(ShaclAst::Not {
+                child: Box::new(ShaclAst::And {
+                    children: vec![
+                        ShaclAst::PropCount {
+                            path: PropertyPath::iri("https://example.org/primary"),
+                            min: Some(1),
+                            max: None,
+                        },
+                        ShaclAst::PropEquals {
+                            path: PropertyPath::iri("https://example.org/secondary"),
+                            value: json!("X"),
+                        },
+                    ],
+                }),
+            }),
+            sparql: None,
+        };
+        let cs = ConstraintSet {
+            shapes: vec![shape],
+            schema_view: None,
+            target_class: None,
+        };
+        let result = cs.solve(&json!({}), "secondary");
+        assert!(
+            result.is_none(),
+            "missing peer with PropCount(min=1) must not over-restrict target"
+        );
+    }
+
+    #[test]
+    fn test_solve_target_not_coerced_to_null() {
+        // Target absent from object_data must still produce a meaningful
+        // predicate — normalization must skip the target field.
+        let cs = ConstraintSet {
+            shapes: vec![status_combo_shape()],
+            schema_view: None,
+            target_class: None,
+        };
+        let result = cs.solve(
+            &json!({ "ceAssetPrimaryStatus": "In_voorbereiding" }),
+            "ceAssetSecondaryStatus",
+        );
+        assert!(result.is_some(), "target stays free; constraints survive");
+        match result.unwrap() {
+            FieldConstraint::Query { predicate } => {
+                let j = serde_json::to_value(&predicate).unwrap();
+                assert_eq!(j["operator"], "AND");
+                assert_eq!(
+                    j["predicates"].as_array().unwrap().len(),
+                    4,
+                    "4 forbidden secondaries for In_voorbereiding"
+                );
+            }
+            _ => panic!("expected Query"),
+        }
     }
 
     #[test]
