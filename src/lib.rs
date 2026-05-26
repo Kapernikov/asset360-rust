@@ -1317,6 +1317,18 @@ impl Star {
         &self.inner.class_uri
     }
 
+    /// Values bound to the LinkML identifier slot of this class.
+    /// Schema-resolved (``identifier: true``), never assumed to be
+    /// named ``"id"``. Empty when the query has no identifier predicate.
+    /// Python should translate to ``WHERE asset360_uri IN (...)``
+    /// against the indexed column — NOT JSONB extraction. The
+    /// identifier slot is also absent from ``filters`` and
+    /// ``required_fields``.
+    #[getter]
+    fn identifier_values(&self) -> Vec<String> {
+        self.inner.identifier_values.clone()
+    }
+
     /// Slots referenced in mandatory triple patterns. Python uses for
     /// existence checks: ``WHERE object_data ? 'hasName'``.
     #[getter]

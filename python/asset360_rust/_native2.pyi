@@ -4670,6 +4670,17 @@ class Star:
         Compare against the indexed ``asset_type`` column with ``=``.
         """
     @property
+    def identifier_values(self) -> builtins.list[builtins.str]:
+        r"""
+        Values bound to the LinkML identifier slot of this class.
+        Schema-resolved (``identifier: true``), never assumed to be
+        named ``"id"``. Empty when the query has no identifier predicate.
+        Python should translate to ``WHERE asset360_uri IN (...)``
+        against the indexed column — NOT JSONB extraction. The
+        identifier slot is also absent from ``filters`` and
+        ``required_fields``.
+        """
+    @property
     def required_fields(self) -> builtins.list[builtins.str]:
         r"""
         Slots referenced in mandatory triple patterns. Python uses for
