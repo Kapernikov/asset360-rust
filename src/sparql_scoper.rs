@@ -119,6 +119,7 @@ impl PlanNode {
 ///
 /// Python translates each star to SQL conditions:
 /// - `class_uri` → `WHERE asset_type = '<full-iri>'`
+/// - `identifier_values` → `WHERE asset360_uri IN (...)`  (indexed column)
 /// - `required_fields` → `WHERE object_data ? 'fieldName'`
 /// - `optional_fields` → fetched without existence check
 /// - `filters` → `WHERE object_data->>'field' = 'value'`
@@ -133,6 +134,19 @@ pub struct Star {
     /// name. Downstream callers compare this against the indexed
     /// `asset_type` column with `=`, not `LIKE`.
     pub class_uri: String,
+
+    /// Values bound to this class's LinkML identifier slot (the slot
+    /// marked `identifier: true`) — schema-resolved, never assumed to
+    /// be named `"id"`. Collected from inline literals, inline IRIs,
+    /// `FILTER(?id = "v")`, `FILTER(?id IN (...))`, and `VALUES ?id { ... }`.
+    /// Empty when the query has no identifier predicate bound.
+    ///
+    /// The identifier slot does NOT appear in `filters` or
+    /// `required_fields` — the existence check is structurally always
+    /// true (every row has an identifier by construction), and value
+    /// pushdown happens against the indexed `asset360_uri` column
+    /// rather than the JSONB payload.
+    pub identifier_values: Vec<String>,
 
     /// Slots that MUST be present on the object. Python emits
     /// `WHERE object_data ? 'fieldName'` for each.
@@ -154,6 +168,8 @@ pub struct Star {
     /// Value-level filter conditions per slot, pushable to SQL.
     /// From `FILTER(?var = "literal")` and `VALUES ?var { ... }`
     /// where `?var` is bound to a known slot in this star.
+    ///
+    /// Does NOT include the identifier slot — see `identifier_values`.
     pub filters: HashMap<String, Vec<FilterCondition>>,
 }
 
@@ -363,18 +379,29 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
     let mut var_to_class: HashMap<String, String> = HashMap::new();
     // Track the min OPTIONAL depth at which each star first appears.
     let mut star_depths: HashMap<String, usize> = HashMap::new();
+    // Track the identifier slot name (schema-resolved, `identifier: true`)
+    // per star variable — consumed by the Phase 3 filter merge below
+    // so identifier-slot values land in `identifier_values`, not `filters`.
+    let mut var_to_identifier_slot: HashMap<String, String> = HashMap::new();
 
     for builder in star_map.values() {
-        let class_uri = match &builder.type_iri {
+        let (class_uri, identifier_slot_name) = match &builder.type_iri {
             Some(iri) => match schema_view.get_class_by_uri(iri) {
                 // Schema knows this class — keep the full IRI as the
                 // canonical identifier crossing the Rust↔Python boundary.
-                Ok(Some(_)) => iri.clone(),
+                Ok(Some(class_view)) => {
+                    // Resolve the identifier slot (the one marked
+                    // `identifier: true` in the schema). May be None
+                    // if the class declares no identifier — in that
+                    // case identifier_values stays empty and the slot
+                    // (whatever its name) is treated like any other.
+                    let id_name = class_view.identifier_slot().map(|s| s.name.clone());
+                    (iri.clone(), id_name)
+                }
                 _ => continue, // unknown type IRI, skip this star
             },
             None => continue, // no rdf:type, can't scope
         };
-
         let star_is_optional = builder.type_depth > 0;
         let mut required_fields: Vec<String> = Vec::new();
         let mut optional_fields: Vec<String> = Vec::new();
@@ -390,19 +417,47 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         optional_fields.sort();
         optional_fields.dedup();
 
+        // Hoist inline-constant values on the identifier slot into
+        // identifier_values (Phase 1 source). FILTER/VALUES sources
+        // are hoisted in the Phase 3 merge below. The identifier slot
+        // itself is stripped from required_fields / optional_fields:
+        // every row has an identifier by construction, so a JSONB
+        // existence check would be pointless (and value pushdown
+        // happens against the indexed `asset360_uri` column, not the
+        // JSONB payload).
+        let mut identifier_values: Vec<String> = Vec::new();
+        let mut inline_filters = builder.inline_filters.clone();
+        if let Some(id_name) = identifier_slot_name.as_deref() {
+            if let Some(conds) = inline_filters.remove(id_name) {
+                for cond in conds {
+                    match cond {
+                        FilterCondition::Eq(v) => identifier_values.push(v),
+                        FilterCondition::In(vs) => identifier_values.extend(vs),
+                    }
+                }
+            }
+            required_fields.retain(|s| s != id_name);
+            optional_fields.retain(|s| s != id_name);
+        }
+
         var_to_class.insert(builder.variable.clone(), class_uri.clone());
         star_depths.insert(builder.variable.clone(), builder.type_depth);
+        if let Some(id_name) = identifier_slot_name.clone() {
+            var_to_identifier_slot.insert(builder.variable.clone(), id_name);
+        }
 
         stars.push(Star {
             variable: builder.variable.clone(),
             class_uri,
+            identifier_values,
             required_fields,
             optional_fields,
             is_optional: star_is_optional,
-            // Seed with inline-constant filters from Phase 1 (e.g.
-            // `?s :foo <uri>`); FILTER(...)/VALUES filters from Phase 3
-            // are merged in below.
-            filters: builder.inline_filters.clone(),
+            // Inline-constant filters from Phase 1 (e.g. `?s :foo <uri>`),
+            // minus any entries on the identifier slot that were hoisted
+            // above. FILTER(...)/VALUES filters from Phase 3 are merged
+            // in below.
+            filters: inline_filters,
         });
     }
 
@@ -522,9 +577,22 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
 
     for star in &mut stars {
         if let Some(extra) = star_filters.remove(&star.variable) {
+            let id_slot = var_to_identifier_slot.get(&star.variable).cloned();
             // Merge into any inline-constant filters seeded in Phase 1.
+            // Identifier-slot filters get hoisted into identifier_values
+            // instead of star.filters — they pushdown against the indexed
+            // `asset360_uri` column, not JSONB.
             for (slot, conds) in extra {
-                star.filters.entry(slot).or_default().extend(conds);
+                if Some(&slot) == id_slot.as_ref() {
+                    for cond in conds {
+                        match cond {
+                            FilterCondition::Eq(v) => star.identifier_values.push(v),
+                            FilterCondition::In(vs) => star.identifier_values.extend(vs),
+                        }
+                    }
+                } else {
+                    star.filters.entry(slot).or_default().extend(conds);
+                }
             }
         }
     }
@@ -1385,6 +1453,137 @@ classes:
             .get("name")
             .expect("inline literal should produce a filter");
         assert!(matches!(&f[0], FilterCondition::Eq(v) if v == "BX517"));
+    }
+
+    // ---- Identifier-slot hoist (schema-resolved, never bare "id") ----
+
+    /// Inline literal on the IDENTIFIER slot must be hoisted to
+    /// `identifier_values` — not stored in `filters` (which goes to
+    /// JSONB) and not added to `required_fields` (every row has an
+    /// identifier by construction).
+    #[test]
+    fn test_inline_literal_on_identifier_slot_is_hoisted() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"abc\" }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert_eq!(
+            star.identifier_values,
+            vec!["abc".to_owned()],
+            "inline literal on identifier slot must populate identifier_values"
+        );
+        assert!(
+            !star.filters.contains_key("asset360_uri"),
+            "identifier slot must NOT appear in filters (saw {:?})",
+            star.filters
+        );
+        assert!(
+            !star.required_fields.contains(&"asset360_uri".to_owned()),
+            "identifier slot must NOT appear in required_fields (saw {:?})",
+            star.required_fields
+        );
+    }
+
+    /// Same hoist as the literal case, but with an inline IRI object.
+    #[test]
+    fn test_inline_iri_on_identifier_slot_is_hoisted() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal ; \
+                  asset360:asset360_uri <https://data.infrabel.be/data/Signals/abc> . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert_eq!(
+            star.identifier_values,
+            vec!["https://data.infrabel.be/data/Signals/abc".to_owned()],
+        );
+        assert!(!star.filters.contains_key("asset360_uri"));
+        assert!(!star.required_fields.contains(&"asset360_uri".to_owned()));
+    }
+
+    /// `?s :asset360_uri ?id` (variable object, no filter) must not
+    /// add the identifier slot to required_fields: every row has an
+    /// identifier by construction, so the JSONB existence check is
+    /// structurally always true.
+    #[test]
+    fn test_variable_identifier_not_in_required_fields() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?id WHERE { ?s a asset360:Signal ; asset360:asset360_uri ?id }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert!(
+            star.identifier_values.is_empty(),
+            "no values bound, identifier_values must stay empty"
+        );
+        assert!(
+            !star.required_fields.contains(&"asset360_uri".to_owned()),
+            "identifier slot must not appear in required_fields (saw {:?})",
+            star.required_fields
+        );
+        assert!(!star.filters.contains_key("asset360_uri"));
+    }
+
+    /// VALUES on the identifier slot's bound variable must hoist into
+    /// identifier_values, not filters. Indexed `asset360_uri IN (...)`
+    /// is the right SQL shape — JSONB extraction would defeat the index.
+    #[test]
+    fn test_values_on_identifier_slot_is_hoisted() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal ; asset360:asset360_uri ?id . \
+               VALUES ?id { \"abc\" \"def\" \"ghi\" } \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        let mut got = star.identifier_values.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["abc".to_owned(), "def".to_owned(), "ghi".to_owned()]
+        );
+        assert!(!star.filters.contains_key("asset360_uri"));
+        assert!(!star.required_fields.contains(&"asset360_uri".to_owned()));
+    }
+
+    /// FILTER(?id = "abc") on identifier-bound variable hoists into
+    /// identifier_values via the Phase 3 merge path.
+    #[test]
+    fn test_filter_equality_on_identifier_slot_is_hoisted() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal ; asset360:asset360_uri ?id . \
+               FILTER(?id = \"abc\") \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert_eq!(star.identifier_values, vec!["abc".to_owned()]);
+        assert!(!star.filters.contains_key("asset360_uri"));
     }
 
     /// Inline filters inside an OPTIONAL block must NOT be pushed to
