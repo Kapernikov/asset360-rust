@@ -1469,6 +1469,56 @@ classes:
         );
     }
 
+    /// Same hoist as the literal case, but with an inline IRI object.
+    #[test]
+    fn test_inline_iri_on_identifier_slot_is_hoisted() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal ; \
+                  asset360:asset360_uri <https://data.infrabel.be/data/Signals/abc> . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert_eq!(
+            star.identifier_values,
+            vec!["https://data.infrabel.be/data/Signals/abc".to_owned()],
+        );
+        assert!(!star.filters.contains_key("asset360_uri"));
+        assert!(!star.required_fields.contains(&"asset360_uri".to_owned()));
+    }
+
+    /// `?s :asset360_uri ?id` (variable object, no filter) must not
+    /// add the identifier slot to required_fields: every row has an
+    /// identifier by construction, so the JSONB existence check is
+    /// structurally always true.
+    #[test]
+    fn test_variable_identifier_not_in_required_fields() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?id WHERE { ?s a asset360:Signal ; asset360:asset360_uri ?id }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert!(
+            star.identifier_values.is_empty(),
+            "no values bound, identifier_values must stay empty"
+        );
+        assert!(
+            !star.required_fields.contains(&"asset360_uri".to_owned()),
+            "identifier slot must not appear in required_fields (saw {:?})",
+            star.required_fields
+        );
+        assert!(!star.filters.contains_key("asset360_uri"));
+    }
+
     /// Inline filters inside an OPTIONAL block must NOT be pushed to
     /// SQL — they would break LEFT JOIN row preservation. Oxigraph will
     /// apply them after the prefetch.
