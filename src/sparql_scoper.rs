@@ -379,6 +379,10 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
     let mut var_to_class: HashMap<String, String> = HashMap::new();
     // Track the min OPTIONAL depth at which each star first appears.
     let mut star_depths: HashMap<String, usize> = HashMap::new();
+    // Track the identifier slot name (schema-resolved, `identifier: true`)
+    // per star variable — consumed by the Phase 3 filter merge below
+    // so identifier-slot values land in `identifier_values`, not `filters`.
+    let mut var_to_identifier_slot: HashMap<String, String> = HashMap::new();
 
     for builder in star_map.values() {
         let (class_uri, identifier_slot_name) = match &builder.type_iri {
@@ -438,6 +442,9 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
 
         var_to_class.insert(builder.variable.clone(), class_uri.clone());
         star_depths.insert(builder.variable.clone(), builder.type_depth);
+        if let Some(id_name) = identifier_slot_name.clone() {
+            var_to_identifier_slot.insert(builder.variable.clone(), id_name);
+        }
 
         stars.push(Star {
             variable: builder.variable.clone(),
@@ -570,9 +577,22 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
 
     for star in &mut stars {
         if let Some(extra) = star_filters.remove(&star.variable) {
+            let id_slot = var_to_identifier_slot.get(&star.variable).cloned();
             // Merge into any inline-constant filters seeded in Phase 1.
+            // Identifier-slot filters get hoisted into identifier_values
+            // instead of star.filters — they pushdown against the indexed
+            // `asset360_uri` column, not JSONB.
             for (slot, conds) in extra {
-                star.filters.entry(slot).or_default().extend(conds);
+                if Some(&slot) == id_slot.as_ref() {
+                    for cond in conds {
+                        match cond {
+                            FilterCondition::Eq(v) => star.identifier_values.push(v),
+                            FilterCondition::In(vs) => star.identifier_values.extend(vs),
+                        }
+                    }
+                } else {
+                    star.filters.entry(slot).or_default().extend(conds);
+                }
             }
         }
     }
@@ -1516,6 +1536,53 @@ classes:
             "identifier slot must not appear in required_fields (saw {:?})",
             star.required_fields
         );
+        assert!(!star.filters.contains_key("asset360_uri"));
+    }
+
+    /// VALUES on the identifier slot's bound variable must hoist into
+    /// identifier_values, not filters. Indexed `asset360_uri IN (...)`
+    /// is the right SQL shape — JSONB extraction would defeat the index.
+    #[test]
+    fn test_values_on_identifier_slot_is_hoisted() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal ; asset360:asset360_uri ?id . \
+               VALUES ?id { \"abc\" \"def\" \"ghi\" } \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        let mut got = star.identifier_values.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["abc".to_owned(), "def".to_owned(), "ghi".to_owned()]
+        );
+        assert!(!star.filters.contains_key("asset360_uri"));
+        assert!(!star.required_fields.contains(&"asset360_uri".to_owned()));
+    }
+
+    /// FILTER(?id = "abc") on identifier-bound variable hoists into
+    /// identifier_values via the Phase 3 merge path.
+    #[test]
+    fn test_filter_equality_on_identifier_slot_is_hoisted() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { \
+               ?s a asset360:Signal ; asset360:asset360_uri ?id . \
+               FILTER(?id = \"abc\") \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert_eq!(star.identifier_values, vec!["abc".to_owned()]);
         assert!(!star.filters.contains_key("asset360_uri"));
     }
 
