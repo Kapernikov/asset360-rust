@@ -398,10 +398,6 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
             },
             None => continue, // no rdf:type, can't scope
         };
-        // `identifier_slot_name` will be consumed by the hoisting
-        // logic in later tasks. Silence the unused-warning for now.
-        let _ = &identifier_slot_name;
-
         let star_is_optional = builder.type_depth > 0;
         let mut required_fields: Vec<String> = Vec::new();
         let mut optional_fields: Vec<String> = Vec::new();
@@ -417,20 +413,44 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         optional_fields.sort();
         optional_fields.dedup();
 
+        // Hoist inline-constant values on the identifier slot into
+        // identifier_values (Phase 1 source). FILTER/VALUES sources
+        // are hoisted in the Phase 3 merge below. The identifier slot
+        // itself is stripped from required_fields / optional_fields:
+        // every row has an identifier by construction, so a JSONB
+        // existence check would be pointless (and value pushdown
+        // happens against the indexed `asset360_uri` column, not the
+        // JSONB payload).
+        let mut identifier_values: Vec<String> = Vec::new();
+        let mut inline_filters = builder.inline_filters.clone();
+        if let Some(id_name) = identifier_slot_name.as_deref() {
+            if let Some(conds) = inline_filters.remove(id_name) {
+                for cond in conds {
+                    match cond {
+                        FilterCondition::Eq(v) => identifier_values.push(v),
+                        FilterCondition::In(vs) => identifier_values.extend(vs),
+                    }
+                }
+            }
+            required_fields.retain(|s| s != id_name);
+            optional_fields.retain(|s| s != id_name);
+        }
+
         var_to_class.insert(builder.variable.clone(), class_uri.clone());
         star_depths.insert(builder.variable.clone(), builder.type_depth);
 
         stars.push(Star {
             variable: builder.variable.clone(),
             class_uri,
-            identifier_values: Vec::new(),
+            identifier_values,
             required_fields,
             optional_fields,
             is_optional: star_is_optional,
-            // Seed with inline-constant filters from Phase 1 (e.g.
-            // `?s :foo <uri>`); FILTER(...)/VALUES filters from Phase 3
-            // are merged in below.
-            filters: builder.inline_filters.clone(),
+            // Inline-constant filters from Phase 1 (e.g. `?s :foo <uri>`),
+            // minus any entries on the identifier slot that were hoisted
+            // above. FILTER(...)/VALUES filters from Phase 3 are merged
+            // in below.
+            filters: inline_filters,
         });
     }
 
@@ -1413,6 +1433,40 @@ classes:
             .get("name")
             .expect("inline literal should produce a filter");
         assert!(matches!(&f[0], FilterCondition::Eq(v) if v == "BX517"));
+    }
+
+    // ---- Identifier-slot hoist (schema-resolved, never bare "id") ----
+
+    /// Inline literal on the IDENTIFIER slot must be hoisted to
+    /// `identifier_values` — not stored in `filters` (which goes to
+    /// JSONB) and not added to `required_fields` (every row has an
+    /// identifier by construction).
+    #[test]
+    fn test_inline_literal_on_identifier_slot_is_hoisted() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"abc\" }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        assert_eq!(
+            star.identifier_values,
+            vec!["abc".to_owned()],
+            "inline literal on identifier slot must populate identifier_values"
+        );
+        assert!(
+            !star.filters.contains_key("asset360_uri"),
+            "identifier slot must NOT appear in filters (saw {:?})",
+            star.filters
+        );
+        assert!(
+            !star.required_fields.contains(&"asset360_uri".to_owned()),
+            "identifier slot must NOT appear in required_fields (saw {:?})",
+            star.required_fields
+        );
     }
 
     /// Inline filters inside an OPTIONAL block must NOT be pushed to
