@@ -589,30 +589,74 @@ fn term_to_json_value(t: &Term) -> serde_json::Value {
     }
 }
 
+/// Extract local names of IRIs bound to `?path`-style output variables via
+/// `BIND(<iri> AS ?var)` in a SHACL `sh:select` query.
+///
+/// Parses the query via `spargebra` and walks the algebra for
+/// `GraphPattern::Extend` nodes whose expression is a `NamedNode`. Anything
+/// richer (variables, function calls, arithmetic) is intentionally skipped:
+/// the goal here is the "affected fields" hint for change tracking, not
+/// general SPARQL evaluation.
+///
+/// Returns an empty `Vec` if the query fails to parse.
 fn extract_bind_fields_from_sparql(sparql: &str) -> Vec<String> {
-    // Extract field names from BIND(prefix:xxx AS ?path) patterns in SPARQL
+    use spargebra::{Query, SparqlParser};
+
+    let parser = SparqlParser::new()
+        .with_prefix("asset360", "https://data.infrabel.be/asset360/")
+        .expect("hardcoded prefix is valid");
+
+    let query = match parser.parse_query(sparql) {
+        Ok(q) => q,
+        Err(_) => return Vec::new(),
+    };
+
+    let pattern = match query {
+        Query::Select { pattern, .. } => pattern,
+        _ => return Vec::new(),
+    };
+
     let mut fields = Vec::new();
-    for line in sparql.lines() {
-        let trimmed = line.trim();
-        // Find BIND( anywhere in the line (handles { BIND(...) } wrapping)
-        if let Some(start) = trimmed.find("BIND(") {
-            let rest = &trimmed[start + 5..];
-            if let Some(end) = rest.find(" AS") {
-                let iri = rest[..end].trim();
-                // Handle both full IRIs (asset360/foo) and prefixed names (asset360:foo)
-                let local = iri
-                    .rsplit_once('#')
-                    .or_else(|| iri.rsplit_once('/'))
-                    .or_else(|| iri.rsplit_once(':'))
-                    .map(|(_, name)| name)
-                    .unwrap_or(iri);
-                fields.push(local.to_owned());
-            }
-        }
-    }
+    collect_extend_iris(&pattern, &mut fields);
     fields.sort();
     fields.dedup();
     fields
+}
+
+/// Recursively walk the algebra collecting local names of `BIND(<iri> AS ?v)`
+/// extensions. Non-IRI expressions are skipped.
+fn collect_extend_iris(pattern: &spargebra::algebra::GraphPattern, fields: &mut Vec<String>) {
+    use spargebra::algebra::{Expression, GraphPattern};
+
+    match pattern {
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => {
+            if let Expression::NamedNode(nn) = expression {
+                fields.push(iri_local_name(nn.as_str()).to_owned());
+            }
+            collect_extend_iris(inner, fields);
+        }
+        GraphPattern::Join { left, right }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => {
+            collect_extend_iris(left, fields);
+            collect_extend_iris(right, fields);
+        }
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Group { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Service { inner, .. } => {
+            collect_extend_iris(inner, fields);
+        }
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+    }
 }
 
 fn collect_affected_fields(ast: &ShaclAst) -> Vec<String> {
@@ -978,5 +1022,59 @@ asset360:TestShape
         // Original STATUS_COMBO_TTL has an untagged sh:message
         let results = parse_shacl(STATUS_COMBO_TTL, "TunnelComponent", "nl").unwrap();
         assert!(results[0].message.contains("Forbidden"));
+    }
+
+    // Prefixed-name BIND and UNION-of-BIND cases are already exercised end-to-end
+    // by `test_parse_sparql_shape` via DELEGATE_TTL. These tests cover the cases
+    // the previous substring-based parser got wrong.
+
+    #[test]
+    fn bind_extracts_full_iri_in_angle_brackets() {
+        // The bug the old parser produced "isTunnelDelegate>" for: it didn't
+        // strip the surrounding <>.
+        let q = r#"
+            SELECT $this ?path WHERE {
+                $this ?p ?o .
+                BIND(<https://data.infrabel.be/asset360/isTunnelDelegate> AS ?path)
+            }
+        "#;
+        assert_eq!(
+            extract_bind_fields_from_sparql(q),
+            vec!["isTunnelDelegate".to_string()]
+        );
+    }
+
+    #[test]
+    fn bind_multiline_and_case_insensitive() {
+        // Old parser was line-scoped and case-sensitive on "BIND(" and " AS".
+        let q = r#"
+            select $this ?path where {
+                $this ?p ?o .
+                bind(
+                    asset360:isTunnelDelegate
+                    as
+                    ?path
+                )
+            }
+        "#;
+        assert_eq!(
+            extract_bind_fields_from_sparql(q),
+            vec!["isTunnelDelegate".to_string()]
+        );
+    }
+
+    #[test]
+    fn bind_non_iri_expression_is_skipped() {
+        // Variables and function calls aren't NamedNodes — we skip rather than
+        // emit garbage like "STR(?x)" or "?x" as a field name.
+        let q = r#"
+            SELECT $this ?path WHERE {
+                $this ?p ?x .
+                { BIND(STR(?x) AS ?path) }
+                UNION
+                { BIND(?x AS ?path) }
+            }
+        "#;
+        assert!(extract_bind_fields_from_sparql(q).is_empty());
     }
 }
