@@ -1309,10 +1309,12 @@ impl Star {
         &self.inner.variable
     }
 
-    /// The LinkML class name, e.g. ``"TunnelComplex"``.
+    /// The full RDF class IRI, e.g.
+    /// ``"https://data.infrabel.be/asset360/TunnelComplex"``.
+    /// Compare against the indexed ``asset_type`` column with ``=``.
     #[getter]
-    fn class_name(&self) -> &str {
-        &self.inner.class_name
+    fn class_uri(&self) -> &str {
+        &self.inner.class_uri
     }
 
     /// Slots referenced in mandatory triple patterns. Python uses for
@@ -1352,8 +1354,8 @@ impl Star {
 
     fn __repr__(&self) -> String {
         format!(
-            "Star(variable={:?}, class={:?}, fields={:?})",
-            self.inner.variable, self.inner.class_name, self.inner.required_fields
+            "Star(variable={:?}, class_uri={:?}, fields={:?})",
+            self.inner.variable, self.inner.class_uri, self.inner.required_fields
         )
     }
 }

@@ -4663,9 +4663,11 @@ class Star:
         The SPARQL variable name (without ``?``), e.g. ``"complex"``.
         """
     @property
-    def class_name(self) -> builtins.str:
+    def class_uri(self) -> builtins.str:
         r"""
-        The LinkML class name, e.g. ``"TunnelComplex"``.
+        The full RDF class IRI, e.g.
+        ``"https://data.infrabel.be/asset360/TunnelComplex"``.
+        Compare against the indexed ``asset_type`` column with ``=``.
         """
     @property
     def required_fields(self) -> builtins.list[builtins.str]:
