@@ -118,7 +118,7 @@ impl PlanNode {
 /// Named after the SPARQL algebra concept of "star-shaped sub-pattern."
 ///
 /// Python translates each star to SQL conditions:
-/// - `class_name` → `WHERE asset_type LIKE '%ClassName'`
+/// - `class_uri` → `WHERE asset_type = '<full-iri>'`
 /// - `required_fields` → `WHERE object_data ? 'fieldName'`
 /// - `optional_fields` → fetched without existence check
 /// - `filters` → `WHERE object_data->>'field' = 'value'`
@@ -127,8 +127,12 @@ pub struct Star {
     /// The SPARQL variable name (without `?`), e.g. `"complex"`.
     pub variable: String,
 
-    /// The LinkML class name, e.g. `"TunnelComplex"`.
-    pub class_name: String,
+    /// The full RDF class IRI, e.g.
+    /// `"https://data.infrabel.be/asset360/TunnelComplex"`. Captured
+    /// verbatim from the `?s a <iri>` triple — no stripping to a local
+    /// name. Downstream callers compare this against the indexed
+    /// `asset_type` column with `=`, not `LIKE`.
+    pub class_uri: String,
 
     /// Slots that MUST be present on the object. Python emits
     /// `WHERE object_data ? 'fieldName'` for each.
@@ -361,9 +365,11 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
     let mut star_depths: HashMap<String, usize> = HashMap::new();
 
     for builder in star_map.values() {
-        let class_name = match &builder.type_iri {
+        let class_uri = match &builder.type_iri {
             Some(iri) => match schema_view.get_class_by_uri(iri) {
-                Ok(Some(cv)) => cv.name().to_owned(),
+                // Schema knows this class — keep the full IRI as the
+                // canonical identifier crossing the Rust↔Python boundary.
+                Ok(Some(_)) => iri.clone(),
                 _ => continue, // unknown type IRI, skip this star
             },
             None => continue, // no rdf:type, can't scope
@@ -384,12 +390,12 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         optional_fields.sort();
         optional_fields.dedup();
 
-        var_to_class.insert(builder.variable.clone(), class_name.clone());
+        var_to_class.insert(builder.variable.clone(), class_uri.clone());
         star_depths.insert(builder.variable.clone(), builder.type_depth);
 
         stars.push(Star {
             variable: builder.variable.clone(),
-            class_name,
+            class_uri,
             required_fields,
             optional_fields,
             is_optional: star_is_optional,
@@ -919,7 +925,7 @@ classes:
 
         let stars = all_stars(&plan);
         let star = stars[0];
-        assert_eq!(star.class_name, "Signal");
+        assert_eq!(star.class_uri, "https://data.infrabel.be/asset360/Signal");
         assert!(star.required_fields.contains(&"name".to_owned()));
         assert!(!star.is_optional);
         assert!(star.optional_fields.is_empty());
@@ -938,7 +944,7 @@ classes:
         .unwrap();
 
         let star = find_star(&plan, "s");
-        assert_eq!(star.class_name, "Signal");
+        assert_eq!(star.class_uri, "https://data.infrabel.be/asset360/Signal");
         let name_filters = star.filters.get("name").expect("should have name filter");
         assert!(matches!(&name_filters[0], FilterCondition::Eq(v) if v == "BX517"));
     }
@@ -972,11 +978,17 @@ classes:
         assert_eq!(all_joins(&plan).len(), 1);
 
         let tc = find_star(&plan, "complex");
-        assert_eq!(tc.class_name, "TunnelComplex");
+        assert_eq!(
+            tc.class_uri,
+            "https://data.infrabel.be/asset360/TunnelComplex"
+        );
         assert!(tc.required_fields.contains(&"hasName".to_owned()));
 
         let cea = find_star(&plan, "component");
-        assert_eq!(cea.class_name, "CivilEngineeringAsset");
+        assert_eq!(
+            cea.class_uri,
+            "https://data.infrabel.be/asset360/CivilEngineeringAsset"
+        );
         assert!(cea.required_fields.contains(&"hasName".to_owned()));
         assert!(
             cea.required_fields
@@ -1121,7 +1133,10 @@ classes:
         .unwrap();
 
         assert_eq!(all_stars(&plan).len(), 1);
-        assert_eq!(all_stars(&plan)[0].class_name, "Signal");
+        assert_eq!(
+            all_stars(&plan)[0].class_uri,
+            "https://data.infrabel.be/asset360/Signal"
+        );
     }
 
     #[test]
@@ -1135,7 +1150,10 @@ classes:
         .unwrap();
 
         assert_eq!(all_stars(&plan).len(), 1);
-        assert_eq!(all_stars(&plan)[0].class_name, "Signal");
+        assert_eq!(
+            all_stars(&plan)[0].class_uri,
+            "https://data.infrabel.be/asset360/Signal"
+        );
     }
 
     // ---- OPTIONAL support ----
