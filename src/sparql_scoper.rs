@@ -381,15 +381,26 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
     let mut star_depths: HashMap<String, usize> = HashMap::new();
 
     for builder in star_map.values() {
-        let class_uri = match &builder.type_iri {
+        let (class_uri, identifier_slot_name) = match &builder.type_iri {
             Some(iri) => match schema_view.get_class_by_uri(iri) {
                 // Schema knows this class — keep the full IRI as the
                 // canonical identifier crossing the Rust↔Python boundary.
-                Ok(Some(_)) => iri.clone(),
+                Ok(Some(class_view)) => {
+                    // Resolve the identifier slot (the one marked
+                    // `identifier: true` in the schema). May be None
+                    // if the class declares no identifier — in that
+                    // case identifier_values stays empty and the slot
+                    // (whatever its name) is treated like any other.
+                    let id_name = class_view.identifier_slot().map(|s| s.name.clone());
+                    (iri.clone(), id_name)
+                }
                 _ => continue, // unknown type IRI, skip this star
             },
             None => continue, // no rdf:type, can't scope
         };
+        // `identifier_slot_name` will be consumed by the hoisting
+        // logic in later tasks. Silence the unused-warning for now.
+        let _ = &identifier_slot_name;
 
         let star_is_optional = builder.type_depth > 0;
         let mut required_fields: Vec<String> = Vec::new();
