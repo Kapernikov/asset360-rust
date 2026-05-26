@@ -119,6 +119,7 @@ impl PlanNode {
 ///
 /// Python translates each star to SQL conditions:
 /// - `class_uri` → `WHERE asset_type = '<full-iri>'`
+/// - `identifier_values` → `WHERE asset360_uri IN (...)`  (indexed column)
 /// - `required_fields` → `WHERE object_data ? 'fieldName'`
 /// - `optional_fields` → fetched without existence check
 /// - `filters` → `WHERE object_data->>'field' = 'value'`
@@ -133,6 +134,19 @@ pub struct Star {
     /// name. Downstream callers compare this against the indexed
     /// `asset_type` column with `=`, not `LIKE`.
     pub class_uri: String,
+
+    /// Values bound to this class's LinkML identifier slot (the slot
+    /// marked `identifier: true`) — schema-resolved, never assumed to
+    /// be named `"id"`. Collected from inline literals, inline IRIs,
+    /// `FILTER(?id = "v")`, `FILTER(?id IN (...))`, and `VALUES ?id { ... }`.
+    /// Empty when the query has no identifier predicate bound.
+    ///
+    /// The identifier slot does NOT appear in `filters` or
+    /// `required_fields` — the existence check is structurally always
+    /// true (every row has an identifier by construction), and value
+    /// pushdown happens against the indexed `asset360_uri` column
+    /// rather than the JSONB payload.
+    pub identifier_values: Vec<String>,
 
     /// Slots that MUST be present on the object. Python emits
     /// `WHERE object_data ? 'fieldName'` for each.
@@ -154,6 +168,8 @@ pub struct Star {
     /// Value-level filter conditions per slot, pushable to SQL.
     /// From `FILTER(?var = "literal")` and `VALUES ?var { ... }`
     /// where `?var` is bound to a known slot in this star.
+    ///
+    /// Does NOT include the identifier slot — see `identifier_values`.
     pub filters: HashMap<String, Vec<FilterCondition>>,
 }
 
@@ -396,6 +412,7 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         stars.push(Star {
             variable: builder.variable.clone(),
             class_uri,
+            identifier_values: Vec::new(),
             required_fields,
             optional_fields,
             is_optional: star_is_optional,
