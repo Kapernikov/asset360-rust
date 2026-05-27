@@ -320,11 +320,18 @@ impl SchemaViewHandle {
 
     /// Resolve a path of slot names starting from a class, returning the
     /// [`SlotView`] handles reachable at the terminal segment.
+    ///
+    /// By default, non-inlined (reference) slots are not traversed since they
+    /// only hold foreign keys. Pass `followReferences = true` to follow those
+    /// references into the referenced class; this is union- and
+    /// subclass-fan-out-aware, so the terminal slots may live on an entirely
+    /// different class reached through a reference.
     #[wasm_bindgen(js_name = slotsForPath)]
     pub fn slots_for_path(
         &self,
         class_id: &str,
         path: JsValue,
+        follow_references: Option<bool>,
     ) -> Result<Vec<SlotViewHandle>, JsValue> {
         let segments: Vec<String> = if path.is_undefined() || path.is_null() {
             Vec::new()
@@ -344,8 +351,14 @@ impl SchemaViewHandle {
             segs
         };
         let id = Identifier::new(class_id);
-        self.inner
-            .slots_for_path(&id, segments.iter().map(|s| s.as_str()))
+        let result = if follow_references.unwrap_or(false) {
+            self.inner
+                .slots_for_path_following_references(&id, segments.iter().map(|s| s.as_str()))
+        } else {
+            self.inner
+                .slots_for_path(&id, segments.iter().map(|s| s.as_str()))
+        };
+        result
             .map(|slots| slots.into_iter().map(SlotViewHandle::from_inner).collect())
             .map_err(map_schema_error)
     }

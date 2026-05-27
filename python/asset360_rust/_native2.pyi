@@ -3979,13 +3979,19 @@ class SchemaView:
         r"""
         Returns all unique slots across every loaded schema.
         """
-    def slots_for_path(self, class_id:builtins.str, path:typing.Sequence[builtins.str]) -> builtins.list[SlotView]:
+    def slots_for_path(self, class_id:builtins.str, path:typing.Sequence[builtins.str], follow_references:builtins.bool=False) -> builtins.list[SlotView]:
         r"""
         Resolve a sequence of slot names starting from ``class_id``, walking
         through range classes at each step.
         
         Returns multiple ``SlotView``s when the path is ambiguous (e.g. a slot
         exists on several subclasses of an intermediate range class).
+        
+        By default, non-inlined (reference) slots are not traversed since they
+        only hold foreign keys. Set ``follow_references=True`` to follow those
+        references into the referenced class; this is union- and
+        subclass-fan-out-aware, so the terminal slots may live on an entirely
+        different class reached through a reference.
         """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
