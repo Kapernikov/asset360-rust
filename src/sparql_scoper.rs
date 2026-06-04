@@ -303,10 +303,28 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
     // tracking the minimum OPTIONAL depth at which each slot and each
     // star itself was introduced.
     let mut star_map: HashMap<String, StarBuilder> = HashMap::new();
+    // Synthetic, SQL-safe variable key per distinct constant-IRI subject,
+    // assigned on first encounter so the same IRI maps to the same star.
+    let mut const_subject_keys: HashMap<String, String> = HashMap::new();
 
     for (tp, depth) in &triples_with_depth {
-        let subj_var = match &tp.subject {
-            TermPattern::Variable(v) => v.as_str().to_owned(),
+        // A triple subject is either a query variable or a constant IRI.
+        // Constant-IRI subjects become identifier-scoped stars (keyed by a
+        // synthetic variable name; the IRI itself is the identifier value).
+        // Literal subjects can't occur (the SPARQL parser rejects them);
+        // blank-node subjects act as anonymous variables and are left to
+        // oxigraph — both fall through to the skip arm.
+        let (subj_var, const_iri) = match &tp.subject {
+            TermPattern::Variable(v) => (v.as_str().to_owned(), None),
+            TermPattern::NamedNode(nn) => {
+                let iri = nn.as_str().to_owned();
+                let next = const_subject_keys.len();
+                let key = const_subject_keys
+                    .entry(iri.clone())
+                    .or_insert_with(|| format!("_const_subject_{next}"))
+                    .clone();
+                (key, Some(iri))
+            }
             _ => continue,
         };
 
@@ -319,6 +337,7 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
             .entry(subj_var.clone())
             .or_insert_with(|| StarBuilder {
                 variable: subj_var,
+                const_iri: const_iri.clone(),
                 type_iri: None,
                 type_depth: usize::MAX,
                 slot_depth: HashMap::new(),
@@ -385,22 +404,13 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
     let mut var_to_identifier_slot: HashMap<String, String> = HashMap::new();
 
     for builder in star_map.values() {
-        let (class_uri, identifier_slot_name) = match &builder.type_iri {
-            Some(iri) => match schema_view.get_class_by_uri(iri) {
-                // Schema knows this class — keep the full IRI as the
-                // canonical identifier crossing the Rust↔Python boundary.
-                Ok(Some(class_view)) => {
-                    // Resolve the identifier slot (the one marked
-                    // `identifier: true` in the schema). May be None
-                    // if the class declares no identifier — in that
-                    // case identifier_values stays empty and the slot
-                    // (whatever its name) is treated like any other.
-                    let id_name = class_view.identifier_slot().map(|s| s.name.clone());
-                    (iri.clone(), id_name)
-                }
-                _ => continue, // unknown type IRI, skip this star
-            },
-            None => continue, // no rdf:type, can't scope
+        // Resolve the class (and its identifier slot). A variable subject we
+        // can't scope yields `None` and is skipped (oxigraph handles it). A
+        // constant-IRI subject we can't scope yields `Err` and rejects the
+        // whole query — never a silent drop that returns wrong data.
+        let (class_uri, identifier_slot_name) = match resolve_star_class(builder, schema_view)? {
+            Some(resolved) => resolved,
+            None => continue,
         };
         let star_is_optional = builder.type_depth > 0;
         let mut required_fields: Vec<String> = Vec::new();
@@ -426,6 +436,11 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         // happens against the indexed `asset360_uri` column, not the
         // JSONB payload).
         let mut identifier_values: Vec<String> = Vec::new();
+        // A constant-IRI subject is identified by its own URI, regardless of
+        // whether the class declares a named identifier slot.
+        if let Some(iri) = &builder.const_iri {
+            identifier_values.push(iri.clone());
+        }
         let mut inline_filters = builder.inline_filters.clone();
         if let Some(id_name) = identifier_slot_name.as_deref() {
             if let Some(conds) = inline_filters.remove(id_name) {
@@ -664,6 +679,10 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
 
 struct StarBuilder {
     variable: String,
+    /// `Some(iri)` when the subject is a constant IRI rather than a query
+    /// variable. The IRI is the instance's identifier (seeded into
+    /// `identifier_values`); `variable` then holds a synthetic key.
+    const_iri: Option<String>,
     type_iri: Option<String>,
     /// Minimum OPTIONAL depth at which this star's `rdf:type` appears.
     /// `0` = mandatory; `> 0` = inside one or more `OPTIONAL` blocks.
@@ -679,6 +698,87 @@ struct StarBuilder {
     /// these filters can't be safely pushed to SQL without breaking
     /// LEFT JOIN semantics, so they're left for oxigraph to apply.
     inline_filters: HashMap<String, Vec<FilterCondition>>,
+}
+
+/// Resolve the LinkML class (and identifier slot name) for one star.
+///
+/// Returns:
+/// - `Ok(Some((class_uri, identifier_slot_name)))` — the star is scopable.
+/// - `Ok(None)` — a *variable* subject we can't scope (no/unknown `rdf:type`).
+///   The caller skips it and lets oxigraph evaluate it against the (superset)
+///   prefetch, exactly as before.
+/// - `Err(UnsupportedConstruct)` — a *constant-IRI* subject we can't scope.
+///   Dropping it silently would return wrong data, so the whole query is
+///   rejected with an actionable message instead.
+///
+/// An explicit `rdf:type` always wins and is the escape hatch to disambiguate
+/// a constant subject whose class can't be inferred. Without one, a
+/// constant-IRI subject's class is inferred from the slots it uses: a class is
+/// a candidate when it has *every* slot mentioned on the subject. Exactly one
+/// candidate → inferred; zero or several → rejected (ambiguous).
+fn resolve_star_class(
+    builder: &StarBuilder,
+    schema_view: &SchemaView,
+) -> Result<Option<(String, Option<String>)>, ScopeError> {
+    if let Some(iri) = &builder.type_iri {
+        return match schema_view.get_class_by_uri(iri) {
+            // Schema knows this class — keep the full IRI as the canonical
+            // identifier crossing the Rust↔Python boundary. The identifier
+            // slot may be None if the class declares none.
+            Ok(Some(cv)) => Ok(Some((
+                iri.clone(),
+                cv.identifier_slot().map(|s| s.name.clone()),
+            ))),
+            _ => match &builder.const_iri {
+                Some(subj) => Err(ScopeError::UnsupportedConstruct(format!(
+                    "constant subject <{subj}> has rdf:type <{iri}>, which is not a known class"
+                ))),
+                None => Ok(None), // unknown type on a variable subject — skip
+            },
+        };
+    }
+
+    // No explicit rdf:type.
+    let Some(subj) = &builder.const_iri else {
+        return Ok(None); // variable subject without rdf:type — can't scope, skip
+    };
+
+    // Constant-IRI subject: infer the class from the slots it uses.
+    let used_slots: Vec<&String> = builder.slot_depth.keys().collect();
+    let mut candidates: Vec<linkml_schemaview::classview::ClassView> = Vec::new();
+    if !used_slots.is_empty() {
+        let all_classes = schema_view
+            .class_views()
+            .map_err(|e| ScopeError::ParseError(e.to_string()))?;
+        for cv in all_classes {
+            if used_slots
+                .iter()
+                .all(|slot| cv.slots().iter().any(|s| s.name == **slot))
+            {
+                candidates.push(cv);
+            }
+        }
+    }
+
+    match candidates.as_slice() {
+        [cv] => Ok(Some((
+            cv.canonical_uri().to_string(),
+            cv.identifier_slot().map(|s| s.name.clone()),
+        ))),
+        [] => Err(ScopeError::UnsupportedConstruct(format!(
+            "constant subject <{subj}> has no rdf:type and its class cannot be inferred from \
+             the slots it uses; add an explicit `<{subj}> a asset360:<Class>`"
+        ))),
+        many => {
+            let mut names: Vec<&str> = many.iter().map(|c| c.name()).collect();
+            names.sort_unstable();
+            Err(ScopeError::UnsupportedConstruct(format!(
+                "constant subject <{subj}> matches multiple classes ({}); add an explicit \
+                 `<{subj}> a asset360:<Class>` to disambiguate",
+                names.join(", ")
+            )))
+        }
+    }
 }
 
 /// Recursively walk the SPARQL algebra tree and collect every BGP
@@ -1135,6 +1235,85 @@ classes:
             .expect("should have locatedOnTrack join");
         assert_eq!(track_sig_join.left, "track");
         assert_eq!(track_sig_join.right, "sig");
+    }
+
+    // ---- Constant-IRI subject ----
+
+    #[test]
+    fn test_const_iri_subject_inferred_class() {
+        let sv = test_schema_view();
+        // Bug repro: a triple whose SUBJECT is a constant IRI must not be
+        // silently dropped. Its class is inferred from the slot it uses —
+        // `belongsToTunnelComplex` is declared only on CivilEngineeringAsset.
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?tc WHERE { \
+               <https://data.infrabel.be/asset360/cea/X1> asset360:belongsToTunnelComplex ?tc . \
+               ?tc a asset360:TunnelComplex . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        assert_eq!(all_stars(&plan).len(), 2);
+
+        // The constant-IRI subject became an identifier-scoped star.
+        let subj = all_stars(&plan)
+            .into_iter()
+            .find(|s| s.identifier_values == ["https://data.infrabel.be/asset360/cea/X1"])
+            .expect("constant-IRI subject should become an identifier-scoped star");
+        assert_eq!(
+            subj.class_uri,
+            "https://data.infrabel.be/asset360/CivilEngineeringAsset"
+        );
+
+        // ...joined to the ?tc star via the slot it used.
+        let joins = all_joins(&plan);
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].left, "tc");
+        assert_eq!(joins[0].right_slot, "belongsToTunnelComplex");
+        assert_eq!(joins[0].right, subj.variable);
+    }
+
+    #[test]
+    fn test_const_iri_subject_explicit_type_disambiguates() {
+        let sv = test_schema_view();
+        // `hasName` is declared on many classes, so the class can't be
+        // inferred — but an explicit rdf:type resolves it unambiguously.
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?n WHERE { \
+               <https://data.infrabel.be/asset360/track/T1> a asset360:Track ; \
+                                                            asset360:hasName ?n . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        assert_eq!(all_stars(&plan).len(), 1);
+        let s = &all_stars(&plan)[0];
+        assert_eq!(s.class_uri, "https://data.infrabel.be/asset360/Track");
+        assert_eq!(
+            s.identifier_values,
+            ["https://data.infrabel.be/asset360/track/T1"]
+        );
+        assert!(s.required_fields.contains(&"hasName".to_owned()));
+    }
+
+    #[test]
+    fn test_const_iri_subject_ambiguous_class_rejected() {
+        let sv = test_schema_view();
+        // `hasName` is declared on TunnelComplex, CivilEngineeringAsset, Track
+        // and Line; with no rdf:type the subject's class is ambiguous. Reject
+        // loudly rather than silently dropping the triple (the old bug).
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?n WHERE { \
+               <https://data.infrabel.be/asset360/thing/Y> asset360:hasName ?n . \
+             }",
+            &sv,
+        );
+        assert!(matches!(result, Err(ScopeError::UnsupportedConstruct(_))));
     }
 
     // ---- Error cases ----
