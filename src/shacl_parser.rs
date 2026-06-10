@@ -152,6 +152,27 @@ impl TripleStore {
         predicates
     }
 
+    /// Local names of the predicates on `subject` that live in the SHACL
+    /// namespace. Used to detect SHACL constraints the introspectable engine
+    /// does not support (so we can refuse to claim a shape we cannot fully
+    /// evaluate, rather than silently dropping the unsupported part).
+    fn shacl_predicates(&self, subject: &str) -> Vec<String> {
+        let mut predicates: Vec<String> = self
+            .by_subject
+            .get(subject)
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter(|(p, _)| p.starts_with(SH))
+                    .map(|(p, _)| iri_local_name(p).to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        predicates.sort();
+        predicates.dedup();
+        predicates
+    }
+
     /// Collect an RDF list (rdf:first/rdf:rest chain) starting from a term.
     fn collect_rdf_list<'a>(&'a self, head: &'a Term) -> Vec<&'a Term> {
         let mut result = Vec::new();
@@ -460,11 +481,55 @@ fn parse_constraint_node(store: &TripleStore, key: &str) -> Result<ShaclAst, Par
     )))
 }
 
+/// SHACL constraint/annotation predicates (local names) the introspectable
+/// engine fully understands on a property shape. `sh:path` is the path itself;
+/// the value-constraint set matches what `parse_property_shape` can lower to an
+/// AST; the trailing entries are non-constraint annotations safe to ignore.
+const SUPPORTED_PROPERTY_SHACL: &[&str] = &[
+    "path",
+    // value constraints lowered to an AST below:
+    "hasValue",
+    "in",
+    "minCount",
+    "maxCount",
+    "equals",
+    "disjoint",
+    // non-constraint annotations:
+    "message",
+    "name",
+    "description",
+    "order",
+    "group",
+    "severity",
+    "deactivated",
+];
+
 fn parse_property_shape(store: &TripleStore, key: &str) -> Result<ShaclAst, ParseError> {
     let path_term = store.first_object(key, &sh("path")).ok_or_else(|| {
         ParseError::MissingField(format!("sh:path missing on property shape {key}"))
     })?;
     let path = parse_path(store, path_term)?;
+
+    // Fail-closed: only introspect a property shape if EVERY SHACL constraint on
+    // it is one we can fully lower to the AST. If it carries any other SHACL
+    // constraint (e.g. sh:minLength, sh:pattern, sh:datatype, sh:nodeKind), we
+    // must NOT emit a partial AST that silently ignores it — the forward/backward
+    // evaluators would then report a verdict that omits a real constraint. We
+    // refuse here; the shape falls back to pyshacl (the complete engine) via the
+    // `introspectable false` path, or — if it was marked `introspectable true` —
+    // surfaces as an authoring error in `parse_shacl`.
+    if let Some(unsupported) = store
+        .shacl_predicates(key)
+        .into_iter()
+        .find(|local| !SUPPORTED_PROPERTY_SHACL.contains(&local.as_str()))
+    {
+        let path_name = path.local_name().unwrap_or("(complex path)");
+        return Err(ParseError::UnsupportedConstruct(format!(
+            "Unsupported value constraint sh:{unsupported} on property \"{path_name}\" (node {key}).\n\
+             Supported property constraints: sh:hasValue, sh:in, sh:minCount, sh:maxCount, sh:equals, sh:disjoint.\n\
+             Set `asset360:introspectable false` so pyshacl evaluates this shape."
+        )));
+    }
 
     // sh:hasValue
     if let Some(val_term) = store.first_object(key, &sh("hasValue")) {
@@ -941,6 +1006,66 @@ asset360:TestShape
                 "introspectable false",
             ],
         );
+    }
+
+    #[test]
+    fn test_required_nonempty_marked_introspectable_is_authoring_error() {
+        // "required AND non-empty" = sh:minCount 1 ; sh:minLength 1. minLength is
+        // not introspectable, so a shape carrying it must NOT be lowered to a
+        // partial AST (which would silently ignore minLength). Marked
+        // introspectable=true, that mismatch surfaces as an error.
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:TestShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComplex ;
+  asset360:introspectable true ;
+  sh:property [
+    sh:path asset360:hasName ;
+    sh:minCount 1 ;
+    sh:minLength 1
+  ] .
+"#;
+        let result = parse_shacl(ttl, "TunnelComplex", "");
+        assert_error_contains(
+            result,
+            &[
+                "Unsupported value constraint",
+                "minLength",
+                "hasName",
+                "introspectable false",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_required_nonempty_non_introspectable_is_delegated() {
+        // Same shape marked introspectable=false: parse must succeed but produce
+        // NO AST (ast: None), leaving the whole shape to pyshacl — minCount and
+        // minLength are then both enforced by the complete engine.
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:TestShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComplex ;
+  asset360:introspectable false ;
+  sh:property [
+    sh:path asset360:hasName ;
+    sh:minCount 1 ;
+    sh:minLength 1
+  ] .
+"#;
+        let shapes = parse_shacl(ttl, "TunnelComplex", "").expect("should not error");
+        assert_eq!(shapes.len(), 1);
+        assert!(
+            shapes[0].ast.is_none(),
+            "a shape with an unsupported constraint must not be introspected"
+        );
+        assert!(!shapes[0].introspectable);
     }
 
     #[test]
