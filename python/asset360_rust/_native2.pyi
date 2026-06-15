@@ -1595,6 +1595,12 @@ class ConstraintSet:
         r"""
         Solve backward for a target field, returning JSON FieldConstraint or None.
         """
+    def solve_member(self, object_data_json:builtins.str, array_field:builtins.str, member_field:builtins.str, editing_index:typing.Optional[builtins.int]=None) -> typing.Optional[builtins.str]:
+        r"""
+        Solve allowed values for an array-member field, returning JSON
+        FieldConstraint or None. `editing_index` excludes the edited member's own
+        value from "already used" (None for a new member).
+        """
     def scope(self, focus_data_json:builtins.str, uri_field:builtins.str='asset360_uri') -> typing.Optional[builtins.str]:
         r"""
         Derive scope predicate, returning JSON Predicate or None.

@@ -83,6 +83,17 @@ pub enum ShaclAst {
         path_a: PropertyPath,
         path_b: PropertyPath,
     },
+    /// Members of a multivalued slot at `array_path` must be unique by the
+    /// value of `member_field` (resolved within each member object), and —
+    /// when `allowed_values` is set — that field is restricted to that set.
+    /// Generalizes to "at most `max_count_per_value` members may share a value".
+    UniqueByMemberField {
+        array_path: PropertyPath,
+        member_field: PropertyPath,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_values: Option<Vec<serde_json::Value>>,
+        max_count_per_value: u32,
+    },
 }
 
 /// Enforcement level for a constraint violation.

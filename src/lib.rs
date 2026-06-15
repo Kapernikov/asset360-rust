@@ -1171,6 +1171,34 @@ impl PyConstraintSet {
         }
     }
 
+    /// Solve allowed values for an array-member field, returning JSON
+    /// FieldConstraint or None. `editing_index` excludes the edited member's own
+    /// value from "already used" (None for a new member).
+    #[pyo3(signature = (object_data_json, array_field, member_field, editing_index=None))]
+    fn solve_member(
+        &self,
+        object_data_json: &str,
+        array_field: &str,
+        member_field: &str,
+        editing_index: Option<usize>,
+    ) -> PyResult<Option<String>> {
+        let data: serde_json::Value = serde_json::from_str(object_data_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid data JSON: {e}"))
+        })?;
+        match self
+            .inner
+            .solve_member(&data, array_field, member_field, editing_index)
+        {
+            Some(fc) => {
+                let json = serde_json::to_string(&fc).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}"))
+                })?;
+                Ok(Some(json))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Derive scope predicate, returning JSON Predicate or None.
     #[pyo3(signature = (focus_data_json, uri_field="asset360_uri"))]
     fn scope(&self, focus_data_json: &str, uri_field: &str) -> PyResult<Option<String>> {

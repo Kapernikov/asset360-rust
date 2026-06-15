@@ -539,6 +539,38 @@ fn parse_property_shape(store: &TripleStore, key: &str) -> Result<ShaclAst, Pars
         )));
     }
 
+    // asset360:uniqueByMemberField — members of the multivalued slot at `path`
+    // must be unique by an inner member field, optionally restricted to an
+    // allowed value set (sh:in on the inner node).
+    if let Some(node) = store.first_object(key, &a360("uniqueByMemberField")) {
+        let node_key = term_key(node);
+        let member_field_term = store
+            .first_object(&node_key, &a360("memberField"))
+            .ok_or_else(|| {
+                ParseError::MissingField(format!(
+                    "asset360:memberField missing on uniqueByMemberField node {node_key}"
+                ))
+            })?;
+        let member_field = parse_path(store, member_field_term)?;
+        let max_count_per_value = store
+            .first_literal(&node_key, &a360("maxCountPerValue"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        let allowed_values = store.first_object(&node_key, &sh("in")).map(|head| {
+            store
+                .collect_rdf_list(head)
+                .into_iter()
+                .map(term_to_json_value)
+                .collect()
+        });
+        return Ok(ShaclAst::UniqueByMemberField {
+            array_path: path,
+            member_field,
+            allowed_values,
+            max_count_per_value,
+        });
+    }
+
     // sh:hasValue
     if let Some(val_term) = store.first_object(key, &sh("hasValue")) {
         let value = term_to_json_value(val_term);
@@ -760,6 +792,18 @@ fn collect_fields_recursive(ast: &ShaclAst, fields: &mut Vec<String>) {
                 fields.push(name.to_owned());
             }
             if let Some(name) = path_b.local_name() {
+                fields.push(name.to_owned());
+            }
+        }
+        ShaclAst::UniqueByMemberField {
+            array_path,
+            member_field,
+            ..
+        } => {
+            if let Some(name) = array_path.local_name() {
+                fields.push(name.to_owned());
+            }
+            if let Some(name) = member_field.local_name() {
                 fields.push(name.to_owned());
             }
         }
@@ -1074,6 +1118,71 @@ asset360:TestShape
             "a shape with an unsupported constraint must not be introspected"
         );
         assert!(!shapes[0].introspectable);
+    }
+
+    #[test]
+    fn test_parse_unique_by_member_field() {
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:TunnelComplex_FileLinksTypedShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComplex ;
+  asset360:enforcementLevel "serious" ;
+  asset360:introspectable true ;
+  sh:message "msg"@en ;
+  sh:property [
+    sh:path asset360:fileLinksTyped ;
+    asset360:uniqueByMemberField [
+      asset360:memberField asset360:type ;
+      asset360:maxCountPerValue 1 ;
+      sh:in ( "NetMapExcerpt" "RoadMapExcerpt" "NGIMapExcerpt" "Sketch" )
+    ]
+  ] .
+"#;
+        let shapes = parse_shacl(ttl, "TunnelComplex", "").expect("parse");
+        assert_eq!(shapes.len(), 1);
+        assert!(shapes[0].introspectable);
+        match shapes[0].ast.as_ref().expect("ast") {
+            ShaclAst::UniqueByMemberField {
+                array_path,
+                member_field,
+                allowed_values,
+                max_count_per_value,
+            } => {
+                assert_eq!(array_path.local_name(), Some("fileLinksTyped"));
+                assert_eq!(member_field.local_name(), Some("type"));
+                assert_eq!(*max_count_per_value, 1);
+                let allowed = allowed_values.as_ref().expect("sh:in present");
+                assert_eq!(allowed.len(), 4);
+                assert!(allowed.iter().any(|v| v == "Sketch"));
+            }
+            other => panic!("expected UniqueByMemberField, got {other:?}"),
+        }
+        // Change-tracking sees both the array slot and the member field.
+        assert!(
+            shapes[0]
+                .affected_fields
+                .contains(&"fileLinksTyped".to_owned())
+        );
+        assert!(shapes[0].affected_fields.contains(&"type".to_owned()));
+    }
+
+    #[test]
+    fn test_parse_unique_by_member_field_missing_member_field_errors() {
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:Bad
+  a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
+  asset360:introspectable true ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    asset360:uniqueByMemberField [ asset360:maxCountPerValue 1 ] ] .
+"#;
+        let err = parse_shacl(ttl, "TunnelComplex", "").unwrap_err();
+        assert!(format!("{err}").contains("asset360:memberField missing"));
     }
 
     #[test]

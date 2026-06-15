@@ -180,6 +180,84 @@ impl ConstraintSet {
         })
     }
 
+    /// Backward-solve the allowed values for the `member_field` of a member being
+    /// added or edited in the multivalued slot `array_field`.
+    ///
+    /// `object_data` is the full parent object (contains `array_field`).
+    /// `editing_index` is `Some(i)` when editing the i-th existing member (its own
+    /// value is then excluded from "already used"); `None` for a new member.
+    ///
+    /// Returns `AllowedValues` = (rule's `sh:in` set, or the member field's range
+    /// enum when no `sh:in`) minus the values whose per-value capacity is already
+    /// filled by the OTHER members. `None` when no `UniqueByMemberField` rule
+    /// matches or the allowed universe cannot be determined.
+    pub fn solve_member(
+        &self,
+        object_data: &serde_json::Value,
+        array_field: &str,
+        member_field: &str,
+        editing_index: Option<usize>,
+    ) -> Option<FieldConstraint> {
+        // Member values already present on the OTHER members.
+        let used_values: Vec<serde_json::Value> = match object_data.get(array_field) {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != editing_index)
+                .filter_map(|(_, m)| member_value(m, member_field))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // Find the matching rule and its allowed set + excluded (capacity-filled) values.
+        let solution = self
+            .shapes
+            .iter()
+            .filter(|s| s.introspectable)
+            .find_map(|s| {
+                s.ast.as_ref().and_then(|ast| {
+                    crate::backward_solver::solve_member_field(
+                        ast,
+                        array_field,
+                        member_field,
+                        &used_values,
+                    )
+                })
+            })?;
+
+        // Determine the allowed universe: the rule's sh:in, else the member
+        // field's range enum (via schema).
+        let universe: Vec<serde_json::Value> = match &solution.allowed_values {
+            Some(values) => values.clone(),
+            None => self
+                .member_enum_keys(array_field, member_field)?
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        };
+
+        let allowed: Vec<String> = universe
+            .iter()
+            .filter(|v| !solution.excluded.iter().any(|e| json_eq(e, v)))
+            .map(value_to_key)
+            .collect();
+        Some(FieldConstraint::AllowedValues { values: allowed })
+    }
+
+    /// Permissible enum keys of `member_field` on the range class of `array_field`,
+    /// when a schema view is attached.
+    fn member_enum_keys(&self, array_field: &str, member_field: &str) -> Option<Vec<String>> {
+        let class_view = self.target_class.as_ref()?;
+        let array_slot = class_view.slots().iter().find(|s| s.name == array_field)?;
+        let range_class = array_slot.get_range_class()?;
+        let member_slot = range_class
+            .slots()
+            .iter()
+            .find(|s| s.name == member_field)?;
+        let enum_view = member_slot.get_range_enum()?;
+        enum_view.permissible_value_keys().ok().cloned()
+    }
+
     /// Derive a scope predicate for fetching peer objects relevant to this constraint set.
     pub fn scope(
         &self,
@@ -225,6 +303,25 @@ impl ConstraintSet {
 }
 
 // ── Private helpers ──────────────────────────────────────────────────
+
+/// Resolve the `member_field` value within one array-member JSON object.
+/// `member_field` is a local name (the dotted/sequence case is not used here).
+fn member_value(member: &serde_json::Value, member_field: &str) -> Option<serde_json::Value> {
+    member.get(member_field).cloned()
+}
+
+/// Loose JSON equality mirroring the solver's string coercion.
+fn json_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    value_to_key(a) == value_to_key(b)
+}
+
+/// Stable string key for a JSON value (strings as-is, others stringified).
+fn value_to_key(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
 
 /// Evaluate whether a candidate string value satisfies a predicate for a target field.
 fn evaluate_predicate_for_value(pred: &Predicate, target_field: &str, candidate: &str) -> bool {
@@ -340,6 +437,104 @@ mod tests {
             }),
             sparql: None,
         }
+    }
+
+    fn file_links_shape() -> ShapeResult {
+        ShapeResult {
+            shape_uri: "asset360:FileLinksTypedShape".into(),
+            target_class: "TunnelComplex".into(),
+            enforcement_level: EnforcementLevel::Serious,
+            message: "Each document type must be allowed and unique.".into(),
+            affected_fields: vec!["fileLinksTyped".into(), "type".into()],
+            introspectable: true,
+            ast: Some(ShaclAst::UniqueByMemberField {
+                array_path: PropertyPath::iri("https://data.infrabel.be/asset360/fileLinksTyped"),
+                member_field: PropertyPath::iri("https://data.infrabel.be/asset360/type"),
+                allowed_values: Some(vec![
+                    json!("NetMapExcerpt"),
+                    json!("RoadMapExcerpt"),
+                    json!("NGIMapExcerpt"),
+                    json!("Sketch"),
+                ]),
+                max_count_per_value: 1,
+            }),
+            sparql: None,
+        }
+    }
+
+    fn file_links_cs() -> ConstraintSet {
+        ConstraintSet {
+            shapes: vec![file_links_shape()],
+            schema_view: None,
+            target_class: None,
+        }
+    }
+
+    fn allowed_set(fc: Option<FieldConstraint>) -> Vec<String> {
+        match fc {
+            Some(FieldConstraint::AllowedValues { mut values }) => {
+                values.sort();
+                values
+            }
+            other => panic!("expected AllowedValues, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_solve_member_add_excludes_used() {
+        let cs = file_links_cs();
+        // One member already uses NetMapExcerpt; adding a new member (index None).
+        let data = json!({"fileLinksTyped": [{"type": "NetMapExcerpt", "url": "u"}]});
+        let allowed = allowed_set(cs.solve_member(&data, "fileLinksTyped", "type", None));
+        assert_eq!(allowed, vec!["NGIMapExcerpt", "RoadMapExcerpt", "Sketch"]);
+    }
+
+    #[test]
+    fn test_solve_member_edit_keeps_own_value() {
+        let cs = file_links_cs();
+        let data = json!({"fileLinksTyped": [
+            {"type": "NetMapExcerpt", "url": "a"},
+            {"type": "Sketch", "url": "b"}
+        ]});
+        // Editing row 0 (NetMapExcerpt): its own value stays available, Sketch (row 1) excluded.
+        let allowed = allowed_set(cs.solve_member(&data, "fileLinksTyped", "type", Some(0)));
+        assert_eq!(
+            allowed,
+            vec!["NGIMapExcerpt", "NetMapExcerpt", "RoadMapExcerpt"]
+        );
+    }
+
+    #[test]
+    fn test_solve_member_exhausted_is_empty() {
+        let cs = file_links_cs();
+        let data = json!({"fileLinksTyped": [
+            {"type": "NetMapExcerpt"}, {"type": "RoadMapExcerpt"},
+            {"type": "NGIMapExcerpt"}, {"type": "Sketch"}
+        ]});
+        let allowed = allowed_set(cs.solve_member(&data, "fileLinksTyped", "type", None));
+        assert!(allowed.is_empty());
+    }
+
+    #[test]
+    fn test_solve_member_no_array_returns_full_allowed() {
+        let cs = file_links_cs();
+        let data = json!({});
+        let allowed = allowed_set(cs.solve_member(&data, "fileLinksTyped", "type", None));
+        assert_eq!(
+            allowed,
+            vec!["NGIMapExcerpt", "NetMapExcerpt", "RoadMapExcerpt", "Sketch"]
+        );
+    }
+
+    #[test]
+    fn test_evaluate_blocks_duplicate_and_disallowed() {
+        let cs = file_links_cs();
+        let dup = json!({"fileLinksTyped": [{"type": "Sketch"}, {"type": "Sketch"}]});
+        assert_eq!(cs.evaluate(&dup).len(), 1);
+        let wrong = json!({"fileLinksTyped": [{"type": "Cassandra"}]});
+        assert_eq!(cs.evaluate(&wrong).len(), 1);
+        let ok = json!({"fileLinksTyped": [{"type": "Sketch"}, {"type": "NetMapExcerpt"}]});
+        assert!(cs.evaluate(&ok).is_empty());
     }
 
     #[test]
