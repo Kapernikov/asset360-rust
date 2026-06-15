@@ -552,6 +552,18 @@ fn parse_property_shape(store: &TripleStore, key: &str) -> Result<ShaclAst, Pars
                 ))
             })?;
         let member_field = parse_path(store, member_field_term)?;
+        // Fail closed on complex paths: forward eval would enforce a sequence /
+        // inverse path, but affected-field tracking and the backward solver key
+        // on `local_name()`, which only resolves simple IRI paths — a complex
+        // path would be enforced yet never change-tracked or backward-solved.
+        for (label, p) in [("sh:path", &path), ("asset360:memberField", &member_field)] {
+            if !matches!(p, PropertyPath::Iri { .. }) {
+                return Err(ParseError::UnsupportedConstruct(format!(
+                    "uniqueByMemberField requires a simple IRI for {label} (node {node_key}); \
+                     sequence/inverse paths are not supported."
+                )));
+            }
+        }
         let max_count_per_value = store
             .first_literal(&node_key, &a360("maxCountPerValue"))
             .and_then(|s| s.parse::<u32>().ok())
@@ -1167,6 +1179,27 @@ asset360:TunnelComplex_FileLinksTypedShape
                 .contains(&"fileLinksTyped".to_owned())
         );
         assert!(shapes[0].affected_fields.contains(&"type".to_owned()));
+    }
+
+    #[test]
+    fn test_unique_by_member_field_rejects_complex_path() {
+        // A sequence path on memberField must fail closed (cannot be tracked /
+        // backward-solved by local_name()).
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:Bad
+  a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
+  asset360:introspectable true ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    asset360:uniqueByMemberField [
+      asset360:memberField [ sh:inversePath asset360:type ] ;
+      asset360:maxCountPerValue 1
+    ] ] .
+"#;
+        let err = parse_shacl(ttl, "TunnelComplex", "").unwrap_err();
+        assert!(format!("{err}").contains("simple IRI"));
     }
 
     #[test]

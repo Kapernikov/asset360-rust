@@ -184,12 +184,12 @@ pub fn solve_member_field(
     used_values: &[serde_json::Value],
 ) -> Option<MemberSolution> {
     match ast {
-        ShaclAst::And { children } | ShaclAst::Or { children } => children
+        // Only a conjunctive context yields an unconditional rule. Under `or` /
+        // `not` the rule is conditional, so backward-solving it would over-restrict
+        // the UI and disagree with forward evaluation — treat as unsolvable.
+        ShaclAst::And { children } => children
             .iter()
             .find_map(|c| solve_member_field(c, array_field, member_field, used_values)),
-        ShaclAst::Not { child } => {
-            solve_member_field(child, array_field, member_field, used_values)
-        }
         ShaclAst::UniqueByMemberField {
             array_path,
             member_field: mf,
@@ -381,6 +381,38 @@ fn extract_predicate(node: &Simplified, target_field: &str) -> Option<Predicate>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn member_rule() -> ShaclAst {
+        ShaclAst::UniqueByMemberField {
+            array_path: PropertyPath::iri("https://data.infrabel.be/asset360/fileLinksTyped"),
+            member_field: PropertyPath::iri("https://data.infrabel.be/asset360/type"),
+            allowed_values: Some(vec![json!("A"), json!("B")]),
+            max_count_per_value: 1,
+        }
+    }
+
+    #[test]
+    fn test_solve_member_field_extracted_under_and() {
+        let ast = ShaclAst::And {
+            children: vec![member_rule()],
+        };
+        let sol = solve_member_field(&ast, "fileLinksTyped", "type", &[json!("A")]);
+        assert!(sol.is_some());
+        assert_eq!(sol.unwrap().excluded, vec![json!("A")]);
+    }
+
+    #[test]
+    fn test_solve_member_field_not_extracted_under_or_or_not() {
+        // Conditional contexts must be unsolvable (would over-restrict the UI).
+        let under_or = ShaclAst::Or {
+            children: vec![member_rule()],
+        };
+        let under_not = ShaclAst::Not {
+            child: Box::new(member_rule()),
+        };
+        assert!(solve_member_field(&under_or, "fileLinksTyped", "type", &[]).is_none());
+        assert!(solve_member_field(&under_not, "fileLinksTyped", "type", &[]).is_none());
+    }
 
     fn status_combo_ast() -> ShaclAst {
         let forbidden = vec![
