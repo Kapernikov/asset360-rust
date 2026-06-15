@@ -90,6 +90,9 @@ impl ConstraintSet {
     pub fn evaluate(&self, object_data: &serde_json::Value) -> Vec<Violation> {
         let mut violations = Vec::new();
         for shape in &self.shapes {
+            if !shape.introspectable {
+                continue;
+            }
             if let Some(ref ast) = shape.ast {
                 let vs = crate::forward_eval::evaluate_forward(
                     ast,
@@ -125,10 +128,11 @@ impl ConstraintSet {
             }
         }
 
-        // Collect predicates from all shapes that have an AST
+        // Collect predicates from all introspectable shapes that have an AST
         let mut predicates: Vec<Predicate> = Vec::new();
         for shape in &self.shapes {
-            if let Some(ref ast) = shape.ast
+            if shape.introspectable
+                && let Some(ref ast) = shape.ast
                 && let Some(pred) =
                     crate::backward_solver::solve_backward(ast, &known, target_field)
             {
