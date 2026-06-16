@@ -59,6 +59,9 @@ fn eval_node(ast: &ShaclAst, data: &serde_json::Value) -> bool {
         }
 
         ShaclAst::PathEquals { path_a, path_b } => {
+            if crosses_reference(path_a) || crosses_reference(path_b) {
+                return true; // un-evaluable in memory; pyshacl owns enforcement
+            }
             let val_a = resolve_path(data, path_a);
             let val_b = resolve_path(data, path_b);
             match (val_a, val_b) {
@@ -69,6 +72,9 @@ fn eval_node(ast: &ShaclAst, data: &serde_json::Value) -> bool {
         }
 
         ShaclAst::PathDisjoint { path_a, path_b } => {
+            if crosses_reference(path_a) || crosses_reference(path_b) {
+                return true; // un-evaluable in memory; pyshacl owns enforcement
+            }
             let val_a = resolve_path(data, path_a);
             let val_b = resolve_path(data, path_b);
             match (val_a, val_b) {
@@ -165,6 +171,18 @@ fn resolve_path<'a>(
             // Cannot evaluate sans-IO in a single object context.
             None
         }
+    }
+}
+
+/// True when a path can only be followed by traversing a reference to another
+/// object — a multi-step sequence or any inverse path. Such paths are not
+/// resolvable against a single in-memory object, so forward evaluation defers
+/// them to pyshacl rather than reporting a spurious violation.
+fn crosses_reference(path: &PropertyPath) -> bool {
+    match path {
+        PropertyPath::Iri { .. } => false,
+        PropertyPath::Sequence { steps } => steps.len() > 1 || steps.iter().any(crosses_reference),
+        PropertyPath::Inverse { .. } => true,
     }
 }
 
@@ -389,5 +407,44 @@ mod tests {
         // String "true" should match boolean true
         assert!(values_equal(&json!("true"), &json!(true)));
         assert!(values_equal(&json!("42"), &json!(42)));
+    }
+
+    #[test]
+    fn test_cross_ref_path_equals_is_noop_forward() {
+        // Sequence path crosses a reference; the focus object holds only the
+        // track's IRI, never the embedded Track. Rust cannot evaluate this and
+        // must NOT report a violation — pyshacl owns enforcement.
+        let ast = ShaclAst::PathEquals {
+            path_a: PropertyPath::sequence(vec![
+                PropertyPath::iri("https://data.infrabel.be/asset360/belongsToTrack"),
+                PropertyPath::iri("https://data.infrabel.be/asset360/refersToLine"),
+            ]),
+            path_b: PropertyPath::iri("https://data.infrabel.be/asset360/belongsToLine"),
+        };
+        let data = json!({ "belongsToTrack": "Track-1", "belongsToLine": "Line-9" });
+        let violations = evaluate_forward(&ast, &data, "msg", &EnforcementLevel::Serious);
+        assert!(
+            violations.is_empty(),
+            "cross-ref path-equality must be a forward no-op"
+        );
+    }
+
+    #[test]
+    fn test_same_node_equals_still_evaluated() {
+        // Single-IRI same-object sh:equals stays fully evaluated.
+        let ast = ShaclAst::PathEquals {
+            path_a: PropertyPath::iri("https://data.infrabel.be/asset360/fieldX"),
+            path_b: PropertyPath::iri("https://data.infrabel.be/asset360/fieldY"),
+        };
+        let mismatch = json!({ "fieldX": "a", "fieldY": "b" });
+        assert!(
+            !evaluate_forward(&ast, &mismatch, "m", &EnforcementLevel::Serious).is_empty(),
+            "mismatched same-node equals must still violate"
+        );
+        let matching = json!({ "fieldX": "a", "fieldY": "a" });
+        assert!(
+            evaluate_forward(&ast, &matching, "m", &EnforcementLevel::Serious).is_empty(),
+            "matching same-node equals must pass"
+        );
     }
 }
