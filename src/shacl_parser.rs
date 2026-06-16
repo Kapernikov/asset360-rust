@@ -320,6 +320,26 @@ pub fn parse_shacl(
             continue;
         }
 
+        // A shape explicitly marked `introspectable false` is owned by pyshacl;
+        // the Rust engine must NOT evaluate it, even when its body happens to
+        // parse into a valid AST (e.g. a plain `sh:in` / `sh:minCount` shape).
+        // Keeping an AST here let the forward evaluator and backward solver pick
+        // it up by `ast.is_some()`, corrupting evaluation of the genuinely
+        // introspectable shapes on the same class. Treat it as opaque.
+        if !introspectable_ann {
+            results.push(ShapeResult {
+                shape_uri: subj.clone(),
+                target_class: target_class_name,
+                enforcement_level,
+                message,
+                affected_fields: vec![],
+                introspectable: false,
+                ast: None,
+                sparql: None,
+            });
+            continue;
+        }
+
         // Try to parse as introspectable AST
         match parse_shape_ast(&store, subj) {
             Ok(ast) => {
@@ -330,27 +350,15 @@ pub fn parse_shacl(
                     enforcement_level,
                     message,
                     affected_fields,
-                    introspectable: introspectable_ann,
+                    introspectable: true,
                     ast: Some(ast),
                     sparql: None,
                 });
             }
-            Err(e) if introspectable_ann => {
+            Err(e) => {
+                // Default-introspectable shape whose body is outside the
+                // supported subset and carries no SPARQL — surface the error.
                 return Err(e);
-            }
-            Err(_) => {
-                // Annotation says non-introspectable, but no SPARQL either.
-                // Treat as non-introspectable with no AST.
-                results.push(ShapeResult {
-                    shape_uri: subj.clone(),
-                    target_class: target_class_name,
-                    enforcement_level,
-                    message,
-                    affected_fields: vec![],
-                    introspectable: false,
-                    ast: None,
-                    sparql: None,
-                });
             }
         }
     }
@@ -1066,6 +1074,82 @@ asset360:TestShape
             "a shape with an unsupported constraint must not be introspected"
         );
         assert!(!shapes[0].introspectable);
+    }
+
+    #[test]
+    fn test_introspectable_false_shape_does_not_corrupt_sibling_eval() {
+        // End-to-end regression: an introspectable status-combo shape and a
+        // non-introspectable sh:in shape on the SAME class. Forward evaluation
+        // of valid data must stay clean — before the fix the sh:in shape was
+        // force-evaluated (its parseable AST was kept) and flagged valid rows.
+        use crate::constraint_set::ConstraintSet;
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:StatusComboShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComplex ;
+  asset360:introspectable true ;
+  sh:not [ sh:or (
+    [ sh:and (
+      [ sh:property [ sh:path asset360:primary ; sh:hasValue "TSI" ] ]
+      [ sh:property [ sh:path asset360:secondary ; sh:hasValue "SST" ] ]
+    )]
+  )] .
+
+asset360:AllowedTypesShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComplex ;
+  asset360:introspectable false ;
+  sh:property [
+    sh:path asset360:docType ;
+    sh:in ( "A" "B" )
+  ] .
+"#;
+        let shapes = parse_shacl(ttl, "TunnelComplex", "").expect("parse");
+        assert_eq!(shapes.len(), 2);
+        // Exactly one introspectable shape survives to the Rust evaluator.
+        assert_eq!(shapes.iter().filter(|s| s.introspectable).count(), 1);
+        let cs = ConstraintSet::from_json(&serde_json::to_string(&shapes).unwrap()).unwrap();
+        // Valid status combo, and a docType OUTSIDE the sh:in set — must NOT be
+        // flagged, because the sh:in shape is pyshacl's, not the Rust engine's.
+        let data = serde_json::json!({"primary": "TSI", "secondary": "COM", "docType": "Z"});
+        assert!(
+            cs.evaluate(&data).is_empty(),
+            "non-introspectable sh:in shape must not be evaluated by the Rust engine"
+        );
+    }
+
+    #[test]
+    fn test_introspectable_false_with_parseable_body_is_opaque() {
+        // Regression: a shape marked `introspectable false` whose body IS in the
+        // supported subset (here a plain sh:in) must STILL be left to pyshacl —
+        // no AST kept. Previously the parser produced an AST regardless of the
+        // annotation, so the forward evaluator / backward solver (which select
+        // shapes by `ast.is_some()`) picked it up and corrupted evaluation of
+        // the genuinely introspectable shapes on the same class.
+        let ttl = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+asset360:AllowedTypesShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:TunnelComplex ;
+  asset360:introspectable false ;
+  sh:property [
+    sh:path asset360:someType ;
+    sh:in ( "A" "B" "C" )
+  ] .
+"#;
+        let shapes = parse_shacl(ttl, "TunnelComplex", "").expect("should not error");
+        assert_eq!(shapes.len(), 1);
+        assert!(!shapes[0].introspectable);
+        assert!(
+            shapes[0].ast.is_none(),
+            "introspectable:false must be authoritative even when the body parses"
+        );
+        assert!(shapes[0].affected_fields.is_empty());
     }
 
     #[test]
