@@ -992,4 +992,47 @@ mod tests {
         // absence to JSON null -> no predicate -> no constraint -> unfiltered.
         assert!(cs.solve(&json!({}), "belongsToTrack").is_none());
     }
+
+    #[test]
+    fn test_solve_cross_ref_with_embedded_class_schema() {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+
+        let schema_sources = [
+            include_str!("../tests/data/types.yaml"),
+            include_str!("../tests/data/rsm.yaml"),
+            include_str!("../tests/data/eulynx.yaml"),
+            include_str!("../tests/data/asset360.yaml"),
+        ];
+        let mut sv = SchemaView::new();
+        for raw in schema_sources {
+            let schema: SchemaDefinition =
+                p2e::deserialize(yml::Deserializer::from_str(raw)).unwrap();
+            sv.add_schema(schema).unwrap();
+        }
+
+        // Attaching the schema resolves CoveredSection (an embedded-only class)
+        // via get_class — this is the "small risk" the spec flags.
+        let cs = track_line_cs()
+            .with_schema_view(&sv, "CoveredSection")
+            .unwrap();
+
+        let data = json!({ "belongsToLine": "https://data.infrabel.be/asset360/Line-9" });
+        match cs.solve(&data, "belongsToTrack") {
+            // belongsToTrack's range is the Track class (not an enum), so the
+            // enum branch is skipped and we get a Query, not AllowedValues.
+            Some(FieldConstraint::Query { predicate }) => {
+                assert_eq!(
+                    predicate,
+                    Predicate::simple(
+                        "refersToLine",
+                        "equals",
+                        "https://data.infrabel.be/asset360/Line-9"
+                    )
+                );
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
 }
