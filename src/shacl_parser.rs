@@ -1654,4 +1654,78 @@ asset360:TestShape
         "#;
         assert!(extract_bind_fields_from_sparql(q).is_empty());
     }
+
+    const COVERED_SECTION_TTL: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+asset360:CoveredSection_TrackLineConsistencyShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:CoveredSection ;
+  asset360:enforcementLevel "serious" ;
+  asset360:introspectable true ;
+  sh:property [
+    sh:path ( asset360:belongsToTrack asset360:refersToLine ) ;
+    sh:equals asset360:belongsToLine ;
+  ] .
+"#;
+
+    // Same shape but the property carries an unsupported constraint (sh:pattern),
+    // so the fail-closed property parser must refuse to lower it.
+    const COVERED_SECTION_NEAR_MISS_TTL: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+asset360:CoveredSection_NearMissShape
+  a sh:NodeShape ;
+  sh:targetClass asset360:CoveredSection ;
+  asset360:enforcementLevel "serious" ;
+  asset360:introspectable true ;
+  sh:property [
+    sh:path ( asset360:belongsToTrack asset360:refersToLine ) ;
+    sh:equals asset360:belongsToLine ;
+    sh:pattern "^x" ;
+  ] .
+"#;
+
+    #[test]
+    fn test_parse_cross_ref_path_equals() {
+        let results = parse_shacl(COVERED_SECTION_TTL, "CoveredSection", "").unwrap();
+        assert_eq!(results.len(), 1);
+        let shape = &results[0];
+        assert!(shape.introspectable);
+        assert_eq!(shape.target_class, "CoveredSection");
+
+        match shape.ast.as_ref().unwrap() {
+            ShaclAst::PathEquals { path_a, path_b } => {
+                match path_a {
+                    PropertyPath::Sequence { steps } => {
+                        assert_eq!(steps.len(), 2);
+                        assert_eq!(steps[0].local_name(), Some("belongsToTrack"));
+                        assert_eq!(steps[1].local_name(), Some("refersToLine"));
+                    }
+                    other => panic!("expected sequence path_a, got {other:?}"),
+                }
+                assert_eq!(path_b.local_name(), Some("belongsToLine"));
+            }
+            other => panic!("expected PathEquals, got {other:?}"),
+        }
+
+        // The peer slot must be an affected field: it drives solve()'s
+        // null-normalization and the consumer's re-solve trigger.
+        assert!(shape.affected_fields.contains(&"belongsToLine".to_owned()));
+    }
+
+    #[test]
+    fn test_parse_cross_ref_near_miss_fails_closed() {
+        // An unsupported constraint on the property shape must prevent lowering;
+        // because the shape is introspectable:true with no SPARQL, parse_shacl errors.
+        let result = parse_shacl(COVERED_SECTION_NEAR_MISS_TTL, "CoveredSection", "");
+        assert!(
+            result.is_err(),
+            "near-miss shape must fail closed, got {result:?}"
+        );
+    }
 }
