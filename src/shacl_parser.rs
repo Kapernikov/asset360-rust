@@ -371,6 +371,17 @@ fn parse_shape_ast(store: &TripleStore, shape_key: &str) -> Result<ShaclAst, Par
     // Collect all constraint components on this shape node
     let mut constraints = Vec::new();
 
+    // Recognize the standard-SHACL "unique by member field" idiom (a sequence
+    // sh:in + a cluster of sh:qualifiedValueShape/sh:qualifiedMaxCount blocks on
+    // one slot) and lower it to a single UniqueByMemberField AST. The consumed
+    // sh:property nodes are skipped below so the fail-closed property parser
+    // doesn't reject the (otherwise unsupported) qualified blocks.
+    let mut consumed_props: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some((ast, consumed)) = recognize_unique_by_member(store, shape_key) {
+        constraints.push(ast);
+        consumed_props = consumed;
+    }
+
     // sh:not
     for obj in store.objects(shape_key, &sh("not")) {
         let inner = parse_constraint_node(store, &term_key(obj))?;
@@ -399,9 +410,14 @@ fn parse_shape_ast(store: &TripleStore, shape_key: &str) -> Result<ShaclAst, Par
         constraints.push(ShaclAst::Or { children });
     }
 
-    // sh:property (top-level property shapes)
+    // sh:property (top-level property shapes), skipping any consumed by the
+    // unique-by-member recognizer above.
     for obj in store.objects(shape_key, &sh("property")) {
-        let prop_ast = parse_property_shape(store, &term_key(obj))?;
+        let prop_key = term_key(obj);
+        if consumed_props.contains(&prop_key) {
+            continue;
+        }
+        let prop_ast = parse_property_shape(store, &prop_key)?;
         constraints.push(prop_ast);
     }
 
@@ -539,50 +555,6 @@ fn parse_property_shape(store: &TripleStore, key: &str) -> Result<ShaclAst, Pars
         )));
     }
 
-    // asset360:uniqueByMemberField — members of the multivalued slot at `path`
-    // must be unique by an inner member field, optionally restricted to an
-    // allowed value set (sh:in on the inner node).
-    if let Some(node) = store.first_object(key, &a360("uniqueByMemberField")) {
-        let node_key = term_key(node);
-        let member_field_term = store
-            .first_object(&node_key, &a360("memberField"))
-            .ok_or_else(|| {
-                ParseError::MissingField(format!(
-                    "asset360:memberField missing on uniqueByMemberField node {node_key}"
-                ))
-            })?;
-        let member_field = parse_path(store, member_field_term)?;
-        // Fail closed on complex paths: forward eval would enforce a sequence /
-        // inverse path, but affected-field tracking and the backward solver key
-        // on `local_name()`, which only resolves simple IRI paths — a complex
-        // path would be enforced yet never change-tracked or backward-solved.
-        for (label, p) in [("sh:path", &path), ("asset360:memberField", &member_field)] {
-            if !matches!(p, PropertyPath::Iri { .. }) {
-                return Err(ParseError::UnsupportedConstruct(format!(
-                    "uniqueByMemberField requires a simple IRI for {label} (node {node_key}); \
-                     sequence/inverse paths are not supported."
-                )));
-            }
-        }
-        let max_count_per_value = store
-            .first_literal(&node_key, &a360("maxCountPerValue"))
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(1);
-        let allowed_values = store.first_object(&node_key, &sh("in")).map(|head| {
-            store
-                .collect_rdf_list(head)
-                .into_iter()
-                .map(term_to_json_value)
-                .collect()
-        });
-        return Ok(ShaclAst::UniqueByMemberField {
-            array_path: path,
-            member_field,
-            allowed_values,
-            max_count_per_value,
-        });
-    }
-
     // sh:hasValue
     if let Some(val_term) = store.first_object(key, &sh("hasValue")) {
         let value = term_to_json_value(val_term);
@@ -639,6 +611,102 @@ fn parse_property_shape(store: &TripleStore, key: &str) -> Result<ShaclAst, Pars
          Hint: Set `asset360:introspectable false` and use `sh:sparql` for this constraint.",
         predicates.join(", ")
     )))
+}
+
+/// Recognize the standard-SHACL "members of `slot` are unique by `member`,
+/// restricted to an allowed set" idiom and lower it to `UniqueByMemberField`.
+///
+/// Canonical form on a NodeShape (any validator enforces it directly):
+///   - one `sh:property` with `sh:path ( slot member )` and `sh:in ( … )`
+///     — the allowed value set;
+///   - one or more `sh:property` with `sh:path slot`,
+///     `sh:qualifiedValueShape [ sh:path member ; sh:hasValue X ]` and a uniform
+///     `sh:qualifiedMaxCount` — at most that many members per value.
+///
+/// Returns the lowered AST plus the set of consumed `sh:property` node keys.
+/// Fails safe: any deviation (no qualified blocks, inconsistent slot/member,
+/// non-uniform max count, complex paths) yields `None`, leaving the shape to
+/// pyshacl for enforcement (no introspectable AST, no dropdown solving).
+fn recognize_unique_by_member(
+    store: &TripleStore,
+    shape_key: &str,
+) -> Option<(ShaclAst, std::collections::HashSet<String>)> {
+    let mut allowed: Option<(String, String, Vec<serde_json::Value>, String)> = None; // (slot, member, values, prop_key)
+    let mut qualified: Vec<(String, String, u32, String)> = Vec::new(); // (slot, member, max, prop_key)
+
+    for obj in store.objects(shape_key, &sh("property")) {
+        let prop_key = term_key(obj);
+        let path_term = store.first_object(&prop_key, &sh("path"))?;
+        let path = parse_path(store, path_term).ok()?;
+
+        // (1) allowed-set block: sequence path (slot member) + sh:in
+        if let Some(in_head) = store.first_object(&prop_key, &sh("in"))
+            && let PropertyPath::Sequence { steps } = &path
+            && steps.len() == 2
+            && let (Some(slot), Some(member)) = (steps[0].local_name(), steps[1].local_name())
+        {
+            if allowed.is_some() {
+                return None; // more than one allowed-set block — not canonical
+            }
+            let values = store
+                .collect_rdf_list(in_head)
+                .into_iter()
+                .map(term_to_json_value)
+                .collect();
+            allowed = Some((slot.to_owned(), member.to_owned(), values, prop_key));
+            continue;
+        }
+
+        // (2) qualified block: sh:path slot + qualifiedValueShape[path member; hasValue X] + qualifiedMaxCount
+        if let Some(qvs_term) = store.first_object(&prop_key, &sh("qualifiedValueShape")) {
+            let slot = path.local_name()?;
+            let qvs_key = term_key(qvs_term);
+            let member = parse_path(store, store.first_object(&qvs_key, &sh("path"))?)
+                .ok()?
+                .local_name()?
+                .to_owned();
+            // hasValue presence confirms the per-value disjointness idiom.
+            store.first_object(&qvs_key, &sh("hasValue"))?;
+            let max = store
+                .first_literal(&prop_key, &sh("qualifiedMaxCount"))
+                .and_then(|s| s.parse::<u32>().ok())?;
+            qualified.push((slot.to_owned(), member, max, prop_key));
+            continue;
+        }
+    }
+
+    // Need at least one qualified block; all must agree on slot, member, max.
+    let first = qualified.first()?;
+    let (slot, member, max) = (first.0.clone(), first.1.clone(), first.2);
+    if qualified
+        .iter()
+        .any(|(s, m, mx, _)| *s != slot || *m != member || *mx != max)
+    {
+        return None;
+    }
+
+    // The allowed-set block (if present) must reference the same slot + member.
+    let allowed_values = match &allowed {
+        Some((s, m, vals, _)) if *s == slot && *m == member => Some(vals.clone()),
+        Some(_) => return None, // mismatched allowed block — not canonical
+        None => None,
+    };
+
+    let mut consumed: std::collections::HashSet<String> =
+        qualified.into_iter().map(|(_, _, _, k)| k).collect();
+    if let Some((_, _, _, k)) = allowed {
+        consumed.insert(k);
+    }
+
+    Some((
+        ShaclAst::UniqueByMemberField {
+            array_path: PropertyPath::iri(format!("{ASSET360}{slot}")),
+            member_field: PropertyPath::iri(format!("{ASSET360}{member}")),
+            allowed_values,
+            max_count_per_value: max,
+        },
+        consumed,
+    ))
 }
 
 fn parse_path(store: &TripleStore, term: &Term) -> Result<PropertyPath, ParseError> {
@@ -1132,9 +1200,8 @@ asset360:TestShape
         assert!(!shapes[0].introspectable);
     }
 
-    #[test]
-    fn test_parse_unique_by_member_field() {
-        let ttl = r#"
+    /// The canonical standard-SHACL idiom the recognizer must lower.
+    const UNIQUE_MEMBER_TTL: &str = r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix asset360: <https://data.infrabel.be/asset360/> .
 
@@ -1145,15 +1212,26 @@ asset360:TunnelComplex_FileLinksTypedShape
   asset360:introspectable true ;
   sh:message "msg"@en ;
   sh:property [
-    sh:path asset360:fileLinksTyped ;
-    asset360:uniqueByMemberField [
-      asset360:memberField asset360:type ;
-      asset360:maxCountPerValue 1 ;
-      sh:in ( "NetMapExcerpt" "RoadMapExcerpt" "NGIMapExcerpt" "Sketch" )
-    ]
-  ] .
+    sh:path ( asset360:fileLinksTyped asset360:type ) ;
+    sh:in ( "NetMapExcerpt" "RoadMapExcerpt" "NGIMapExcerpt" "Sketch" )
+  ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "NetMapExcerpt" ] ;
+    sh:qualifiedMaxCount 1 ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "RoadMapExcerpt" ] ;
+    sh:qualifiedMaxCount 1 ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "NGIMapExcerpt" ] ;
+    sh:qualifiedMaxCount 1 ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "Sketch" ] ;
+    sh:qualifiedMaxCount 1 ] .
 "#;
-        let shapes = parse_shacl(ttl, "TunnelComplex", "").expect("parse");
+
+    #[test]
+    fn test_recognize_unique_by_member_from_standard_shacl() {
+        let shapes = parse_shacl(UNIQUE_MEMBER_TTL, "TunnelComplex", "").expect("parse");
         assert_eq!(shapes.len(), 1);
         assert!(shapes[0].introspectable);
         match shapes[0].ast.as_ref().expect("ast") {
@@ -1172,7 +1250,6 @@ asset360:TunnelComplex_FileLinksTypedShape
             }
             other => panic!("expected UniqueByMemberField, got {other:?}"),
         }
-        // Change-tracking sees both the array slot and the member field.
         assert!(
             shapes[0]
                 .affected_fields
@@ -1182,40 +1259,46 @@ asset360:TunnelComplex_FileLinksTypedShape
     }
 
     #[test]
-    fn test_unique_by_member_field_rejects_complex_path() {
-        // A sequence path on memberField must fail closed (cannot be tracked /
-        // backward-solved by local_name()).
+    fn test_recognize_unique_by_member_without_allowed_set() {
+        // Uniqueness-only (no sh:in): still lowered, allowed_values = None.
         let ttl = r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix asset360: <https://data.infrabel.be/asset360/> .
 
-asset360:Bad
-  a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
+asset360:S a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
   asset360:introspectable true ;
   sh:property [ sh:path asset360:fileLinksTyped ;
-    asset360:uniqueByMemberField [
-      asset360:memberField [ sh:inversePath asset360:type ] ;
-      asset360:maxCountPerValue 1
-    ] ] .
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "Sketch" ] ;
+    sh:qualifiedMaxCount 1 ] .
 "#;
-        let err = parse_shacl(ttl, "TunnelComplex", "").unwrap_err();
-        assert!(format!("{err}").contains("simple IRI"));
+        let shapes = parse_shacl(ttl, "TunnelComplex", "").expect("parse");
+        match shapes[0].ast.as_ref().expect("ast") {
+            ShaclAst::UniqueByMemberField { allowed_values, .. } => {
+                assert!(allowed_values.is_none());
+            }
+            other => panic!("expected UniqueByMemberField, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_parse_unique_by_member_field_missing_member_field_errors() {
+    fn test_qualified_without_recognition_fails_closed() {
+        // Inconsistent max counts across blocks → not canonical → recognizer
+        // returns None → the bare sh:qualifiedMaxCount property is unsupported,
+        // so an introspectable:true shape surfaces the authoring error.
         let ttl = r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix asset360: <https://data.infrabel.be/asset360/> .
 
-asset360:Bad
-  a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
+asset360:S a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
   asset360:introspectable true ;
   sh:property [ sh:path asset360:fileLinksTyped ;
-    asset360:uniqueByMemberField [ asset360:maxCountPerValue 1 ] ] .
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
+    sh:qualifiedMaxCount 1 ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "B" ] ;
+    sh:qualifiedMaxCount 2 ] .
 "#;
-        let err = parse_shacl(ttl, "TunnelComplex", "").unwrap_err();
-        assert!(format!("{err}").contains("asset360:memberField missing"));
+        assert!(parse_shacl(ttl, "TunnelComplex", "").is_err());
     }
 
     #[test]
