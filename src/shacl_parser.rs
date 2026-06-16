@@ -631,40 +631,80 @@ fn recognize_unique_by_member(
     store: &TripleStore,
     shape_key: &str,
 ) -> Option<(ShaclAst, std::collections::HashSet<String>)> {
-    let mut allowed: Option<(String, String, Vec<serde_json::Value>, String)> = None; // (slot, member, values, prop_key)
-    let mut qualified: Vec<(String, String, u32, serde_json::Value, String)> = Vec::new(); // (slot, member, max, hasValue, prop_key)
+    struct Allowed {
+        array: PropertyPath,
+        member: PropertyPath,
+        values: Vec<serde_json::Value>,
+        prop_key: String,
+    }
+    struct Qualified {
+        array: PropertyPath,
+        member: PropertyPath,
+        max: u32,
+        has_value: serde_json::Value,
+        prop_key: String,
+    }
+    let mut allowed: Option<Allowed> = None;
+    let mut qualified: Vec<Qualified> = Vec::new();
 
     for obj in store.objects(shape_key, &sh("property")) {
         let prop_key = term_key(obj);
-        let path_term = store.first_object(&prop_key, &sh("path"))?;
-        let path = parse_path(store, path_term).ok()?;
+        let path = parse_path(store, store.first_object(&prop_key, &sh("path"))?).ok()?;
 
-        // (1) allowed-set block: sequence path (slot member) + sh:in
-        if let Some(in_head) = store.first_object(&prop_key, &sh("in"))
-            && let PropertyPath::Sequence { steps } = &path
-            && steps.len() == 2
-            && let (Some(slot), Some(member)) = (steps[0].local_name(), steps[1].local_name())
-        {
+        // (1) allowed-set block: sequence path (array member) + sh:in.
+        if let Some(in_head) = store.first_object(&prop_key, &sh("in")) {
+            // Fully fail-closed: no SHACL predicate beyond sh:path + sh:in.
+            if !shacl_predicates_subset(store, &prop_key, &["path", "in"]) {
+                return None;
+            }
+            let PropertyPath::Sequence { steps } = &path else {
+                return None;
+            };
+            if steps.len() != 2 {
+                return None;
+            }
+            if !matches!(
+                (&steps[0], &steps[1]),
+                (PropertyPath::Iri { .. }, PropertyPath::Iri { .. })
+            ) {
+                return None;
+            }
             if allowed.is_some() {
                 return None; // more than one allowed-set block — not canonical
             }
-            let values = store
-                .collect_rdf_list(in_head)
-                .into_iter()
-                .map(term_to_json_value)
-                .collect();
-            allowed = Some((slot.to_owned(), member.to_owned(), values, prop_key));
+            allowed = Some(Allowed {
+                array: steps[0].clone(),
+                member: steps[1].clone(),
+                values: store
+                    .collect_rdf_list(in_head)
+                    .into_iter()
+                    .map(term_to_json_value)
+                    .collect(),
+                prop_key,
+            });
             continue;
         }
 
-        // (2) qualified block: sh:path slot + qualifiedValueShape[path member; hasValue X] + qualifiedMaxCount
+        // (2) qualified block: sh:path array + qualifiedValueShape[path member; hasValue X] + qualifiedMaxCount.
         if let Some(qvs_term) = store.first_object(&prop_key, &sh("qualifiedValueShape")) {
-            let slot = path.local_name()?;
+            if !shacl_predicates_subset(
+                store,
+                &prop_key,
+                &["path", "qualifiedValueShape", "qualifiedMaxCount"],
+            ) {
+                return None;
+            }
             let qvs_key = term_key(qvs_term);
-            let member = parse_path(store, store.first_object(&qvs_key, &sh("path"))?)
-                .ok()?
-                .local_name()?
-                .to_owned();
+            if !shacl_predicates_subset(store, &qvs_key, &["path", "hasValue"]) {
+                return None;
+            }
+            let member = parse_path(store, store.first_object(&qvs_key, &sh("path"))?).ok()?;
+            if !matches!(
+                (&path, &member),
+                (PropertyPath::Iri { .. }, PropertyPath::Iri { .. })
+            ) {
+                return None;
+            }
             let has_value = term_to_json_value(store.first_object(&qvs_key, &sh("hasValue"))?);
             let max = store
                 .first_literal(&prop_key, &sh("qualifiedMaxCount"))
@@ -674,54 +714,70 @@ fn recognize_unique_by_member(
             if max == 0 {
                 return None;
             }
-            qualified.push((slot.to_owned(), member, max, has_value, prop_key));
+            qualified.push(Qualified {
+                array: path,
+                member,
+                max,
+                has_value,
+                prop_key,
+            });
             continue;
         }
     }
 
-    // Need at least one qualified block; all must agree on slot, member, max.
+    // Need ≥1 qualified block; all must agree on array path, member path, max —
+    // compared on the *full* IRI (PropertyPath: PartialEq), never local names.
     let first = qualified.first()?;
-    let (slot, member, max) = (first.0.clone(), first.1.clone(), first.2);
+    let (array, member, max) = (first.array.clone(), first.member.clone(), first.max);
     if qualified
         .iter()
-        .any(|(s, m, mx, _, _)| *s != slot || *m != member || *mx != max)
+        .any(|q| q.array != array || q.member != member || q.max != max)
     {
         return None;
     }
 
-    // Require the allowed-set block on the same slot+member, and require the
-    // qualified blocks to cover *exactly* the sh:in set. Otherwise lowering would
-    // change semantics vs the standard shapes (capping values the SHACL doesn't,
-    // or vice-versa) — leave it to pyshacl.
-    let allowed_values = match &allowed {
-        Some((s, m, vals, _)) if *s == slot && *m == member => vals.clone(),
-        _ => return None,
-    };
+    // Require the allowed-set block on the same array+member, and require the
+    // qualified blocks to cover *exactly* the sh:in set — otherwise lowering
+    // would change semantics vs the standard shapes; leave it to pyshacl.
+    let allowed = allowed?;
+    if allowed.array != array || allowed.member != member {
+        return None;
+    }
     let in_keys: std::collections::HashSet<String> =
-        allowed_values.iter().map(value_to_key).collect();
+        allowed.values.iter().map(value_to_key).collect();
     let qualified_keys: std::collections::HashSet<String> = qualified
         .iter()
-        .map(|(_, _, _, hv, _)| value_to_key(hv))
+        .map(|q| value_to_key(&q.has_value))
         .collect();
     if in_keys != qualified_keys {
         return None;
     }
 
     let mut consumed: std::collections::HashSet<String> =
-        qualified.into_iter().map(|(_, _, _, _, k)| k).collect();
-    if let Some((_, _, _, k)) = allowed {
-        consumed.insert(k);
-    }
+        qualified.into_iter().map(|q| q.prop_key).collect();
+    consumed.insert(allowed.prop_key);
 
     Some((
         ShaclAst::UniqueByMemberField {
-            array_path: PropertyPath::iri(format!("{ASSET360}{slot}")),
-            member_field: PropertyPath::iri(format!("{ASSET360}{member}")),
-            allowed_values: Some(allowed_values),
+            array_path: array,
+            member_field: member,
+            allowed_values: Some(allowed.values),
             max_count_per_value: max,
         },
         consumed,
     ))
+}
+
+/// True when every SHACL-namespace predicate on `node` is in `allowed` (by
+/// local name). Used to keep the recognizer fully fail-closed: an extra
+/// constraint (e.g. sh:qualifiedMinCount, sh:datatype, sh:minCount) on a
+/// consumed node would otherwise be silently dropped, under-enforcing vs
+/// pyshacl.
+fn shacl_predicates_subset(store: &TripleStore, node: &str, allowed: &[&str]) -> bool {
+    store
+        .shacl_predicates(node)
+        .iter()
+        .all(|p| allowed.contains(&p.as_str()))
 }
 
 /// Stable string key for a JSON value (strings as-is, others stringified) —
@@ -1283,62 +1339,74 @@ asset360:TunnelComplex_FileLinksTypedShape
     }
 
     /// A shape whose qualified blocks won't be recognized: marked
-    /// introspectable:false so it stays opaque (pyshacl-only) rather than
-    /// erroring — lets us assert "not lowered" cleanly.
-    fn non_canonical_unrecognized(body: &str) -> ShapeResult {
+    /// Drive `recognize_unique_by_member` directly (it is private to this
+    /// module). Builds the shape `asset360:S` from the given property block(s)
+    /// and returns whether the recognizer lowered it. This exercises the
+    /// recognizer's own `return None` branches — independent of the #20
+    /// introspectable-false short-circuit in `parse_shacl`.
+    fn recognizes(properties: &str) -> bool {
         let ttl = format!(
             r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix asset360: <https://data.infrabel.be/asset360/> .
 
 asset360:S a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
-  asset360:introspectable false ;
-{body} ."#
+{properties} ."#
         );
-        let shapes = parse_shacl(&ttl, "TunnelComplex", "").expect("parse");
-        assert_eq!(shapes.len(), 1);
-        shapes.into_iter().next().unwrap()
+        let store = TripleStore::parse(&ttl).expect("parse ttl");
+        recognize_unique_by_member(&store, "https://data.infrabel.be/asset360/S").is_some()
+    }
+
+    const CANONICAL_PROPS: &str = r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
+    sh:in ( "A" "B" ) ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
+    sh:qualifiedMaxCount 1 ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "B" ] ;
+    sh:qualifiedMaxCount 1 ]"#;
+
+    #[test]
+    fn test_recognizer_lowers_canonical() {
+        assert!(recognizes(CANONICAL_PROPS));
     }
 
     #[test]
     fn test_not_lowered_without_allowed_set() {
-        // No sh:in → no coverage anchor → not lowered (pyshacl authoritative).
-        let s = non_canonical_unrecognized(
+        // No sh:in → no coverage anchor.
+        assert!(!recognizes(
             r#"  sh:property [ sh:path asset360:fileLinksTyped ;
-    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "Sketch" ] ;
-    sh:qualifiedMaxCount 1 ]"#,
-        );
-        assert!(s.ast.is_none());
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
+    sh:qualifiedMaxCount 1 ]"#
+        ));
     }
 
     #[test]
     fn test_not_lowered_when_qualified_blocks_undercover_sh_in() {
-        // sh:in lists A,B but only A is capped → coverage mismatch → not lowered.
-        let s = non_canonical_unrecognized(
+        // sh:in lists A,B but only A is capped → coverage mismatch.
+        assert!(!recognizes(
             r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
     sh:in ( "A" "B" ) ] ;
   sh:property [ sh:path asset360:fileLinksTyped ;
     sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
-    sh:qualifiedMaxCount 1 ]"#,
-        );
-        assert!(s.ast.is_none());
+    sh:qualifiedMaxCount 1 ]"#
+        ));
     }
 
     #[test]
     fn test_not_lowered_with_zero_max_count() {
-        let s = non_canonical_unrecognized(
+        assert!(!recognizes(
             r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
     sh:in ( "A" ) ] ;
   sh:property [ sh:path asset360:fileLinksTyped ;
     sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
-    sh:qualifiedMaxCount 0 ]"#,
-        );
-        assert!(s.ast.is_none());
+    sh:qualifiedMaxCount 0 ]"#
+        ));
     }
 
     #[test]
     fn test_not_lowered_with_inconsistent_max_counts() {
-        let s = non_canonical_unrecognized(
+        assert!(!recognizes(
             r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
     sh:in ( "A" "B" ) ] ;
   sh:property [ sh:path asset360:fileLinksTyped ;
@@ -1346,9 +1414,34 @@ asset360:S a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
     sh:qualifiedMaxCount 1 ] ;
   sh:property [ sh:path asset360:fileLinksTyped ;
     sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "B" ] ;
-    sh:qualifiedMaxCount 2 ]"#,
-        );
-        assert!(s.ast.is_none());
+    sh:qualifiedMaxCount 2 ]"#
+        ));
+    }
+
+    #[test]
+    fn test_not_lowered_with_extra_constraint_on_qualified_block() {
+        // An extra sh:qualifiedMinCount on a consumed block would be silently
+        // dropped if lowered — the recognizer must refuse (fail closed).
+        assert!(!recognizes(
+            r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
+    sh:in ( "A" ) ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
+    sh:qualifiedMaxCount 1 ; sh:qualifiedMinCount 1 ]"#
+        ));
+    }
+
+    #[test]
+    fn test_not_lowered_with_extra_constraint_on_inner_shape() {
+        // Extra sh:datatype inside the qualifiedValueShape would be dropped.
+        assert!(!recognizes(
+            r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
+    sh:in ( "A" ) ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ;
+      sh:datatype <http://www.w3.org/2001/XMLSchema#string> ] ;
+    sh:qualifiedMaxCount 1 ]"#
+        ));
     }
 
     #[test]
