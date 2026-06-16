@@ -632,7 +632,7 @@ fn recognize_unique_by_member(
     shape_key: &str,
 ) -> Option<(ShaclAst, std::collections::HashSet<String>)> {
     let mut allowed: Option<(String, String, Vec<serde_json::Value>, String)> = None; // (slot, member, values, prop_key)
-    let mut qualified: Vec<(String, String, u32, String)> = Vec::new(); // (slot, member, max, prop_key)
+    let mut qualified: Vec<(String, String, u32, serde_json::Value, String)> = Vec::new(); // (slot, member, max, hasValue, prop_key)
 
     for obj in store.objects(shape_key, &sh("property")) {
         let prop_key = term_key(obj);
@@ -665,12 +665,16 @@ fn recognize_unique_by_member(
                 .ok()?
                 .local_name()?
                 .to_owned();
-            // hasValue presence confirms the per-value disjointness idiom.
-            store.first_object(&qvs_key, &sh("hasValue"))?;
+            let has_value = term_to_json_value(store.first_object(&qvs_key, &sh("hasValue"))?);
             let max = store
                 .first_literal(&prop_key, &sh("qualifiedMaxCount"))
                 .and_then(|s| s.parse::<u32>().ok())?;
-            qualified.push((slot.to_owned(), member, max, prop_key));
+            // qualifiedMaxCount 0 ("never present") has no coherent dropdown
+            // semantics — fail closed so pyshacl stays authoritative.
+            if max == 0 {
+                return None;
+            }
+            qualified.push((slot.to_owned(), member, max, has_value, prop_key));
             continue;
         }
     }
@@ -680,20 +684,31 @@ fn recognize_unique_by_member(
     let (slot, member, max) = (first.0.clone(), first.1.clone(), first.2);
     if qualified
         .iter()
-        .any(|(s, m, mx, _)| *s != slot || *m != member || *mx != max)
+        .any(|(s, m, mx, _, _)| *s != slot || *m != member || *mx != max)
     {
         return None;
     }
 
-    // The allowed-set block (if present) must reference the same slot + member.
+    // Require the allowed-set block on the same slot+member, and require the
+    // qualified blocks to cover *exactly* the sh:in set. Otherwise lowering would
+    // change semantics vs the standard shapes (capping values the SHACL doesn't,
+    // or vice-versa) — leave it to pyshacl.
     let allowed_values = match &allowed {
-        Some((s, m, vals, _)) if *s == slot && *m == member => Some(vals.clone()),
-        Some(_) => return None, // mismatched allowed block — not canonical
-        None => None,
+        Some((s, m, vals, _)) if *s == slot && *m == member => vals.clone(),
+        _ => return None,
     };
+    let in_keys: std::collections::HashSet<String> =
+        allowed_values.iter().map(value_to_key).collect();
+    let qualified_keys: std::collections::HashSet<String> = qualified
+        .iter()
+        .map(|(_, _, _, hv, _)| value_to_key(hv))
+        .collect();
+    if in_keys != qualified_keys {
+        return None;
+    }
 
     let mut consumed: std::collections::HashSet<String> =
-        qualified.into_iter().map(|(_, _, _, k)| k).collect();
+        qualified.into_iter().map(|(_, _, _, _, k)| k).collect();
     if let Some((_, _, _, k)) = allowed {
         consumed.insert(k);
     }
@@ -702,11 +717,20 @@ fn recognize_unique_by_member(
         ShaclAst::UniqueByMemberField {
             array_path: PropertyPath::iri(format!("{ASSET360}{slot}")),
             member_field: PropertyPath::iri(format!("{ASSET360}{member}")),
-            allowed_values,
+            allowed_values: Some(allowed_values),
             max_count_per_value: max,
         },
         consumed,
     ))
+}
+
+/// Stable string key for a JSON value (strings as-is, others stringified) —
+/// used to compare the sh:in set against the qualified-block hasValue set.
+fn value_to_key(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 fn parse_path(store: &TripleStore, term: &Term) -> Result<PropertyPath, ParseError> {
@@ -1258,47 +1282,73 @@ asset360:TunnelComplex_FileLinksTypedShape
         assert!(shapes[0].affected_fields.contains(&"type".to_owned()));
     }
 
-    #[test]
-    fn test_recognize_unique_by_member_without_allowed_set() {
-        // Uniqueness-only (no sh:in): still lowered, allowed_values = None.
-        let ttl = r#"
+    /// A shape whose qualified blocks won't be recognized: marked
+    /// introspectable:false so it stays opaque (pyshacl-only) rather than
+    /// erroring — lets us assert "not lowered" cleanly.
+    fn non_canonical_unrecognized(body: &str) -> ShapeResult {
+        let ttl = format!(
+            r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix asset360: <https://data.infrabel.be/asset360/> .
 
 asset360:S a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
-  asset360:introspectable true ;
-  sh:property [ sh:path asset360:fileLinksTyped ;
-    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "Sketch" ] ;
-    sh:qualifiedMaxCount 1 ] .
-"#;
-        let shapes = parse_shacl(ttl, "TunnelComplex", "").expect("parse");
-        match shapes[0].ast.as_ref().expect("ast") {
-            ShaclAst::UniqueByMemberField { allowed_values, .. } => {
-                assert!(allowed_values.is_none());
-            }
-            other => panic!("expected UniqueByMemberField, got {other:?}"),
-        }
+  asset360:introspectable false ;
+{body} ."#
+        );
+        let shapes = parse_shacl(&ttl, "TunnelComplex", "").expect("parse");
+        assert_eq!(shapes.len(), 1);
+        shapes.into_iter().next().unwrap()
     }
 
     #[test]
-    fn test_qualified_without_recognition_fails_closed() {
-        // Inconsistent max counts across blocks → not canonical → recognizer
-        // returns None → the bare sh:qualifiedMaxCount property is unsupported,
-        // so an introspectable:true shape surfaces the authoring error.
-        let ttl = r#"
-@prefix sh: <http://www.w3.org/ns/shacl#> .
-@prefix asset360: <https://data.infrabel.be/asset360/> .
+    fn test_not_lowered_without_allowed_set() {
+        // No sh:in → no coverage anchor → not lowered (pyshacl authoritative).
+        let s = non_canonical_unrecognized(
+            r#"  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "Sketch" ] ;
+    sh:qualifiedMaxCount 1 ]"#,
+        );
+        assert!(s.ast.is_none());
+    }
 
-asset360:S a sh:NodeShape ; sh:targetClass asset360:TunnelComplex ;
-  asset360:introspectable true ;
+    #[test]
+    fn test_not_lowered_when_qualified_blocks_undercover_sh_in() {
+        // sh:in lists A,B but only A is capped → coverage mismatch → not lowered.
+        let s = non_canonical_unrecognized(
+            r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
+    sh:in ( "A" "B" ) ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
+    sh:qualifiedMaxCount 1 ]"#,
+        );
+        assert!(s.ast.is_none());
+    }
+
+    #[test]
+    fn test_not_lowered_with_zero_max_count() {
+        let s = non_canonical_unrecognized(
+            r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
+    sh:in ( "A" ) ] ;
+  sh:property [ sh:path asset360:fileLinksTyped ;
+    sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
+    sh:qualifiedMaxCount 0 ]"#,
+        );
+        assert!(s.ast.is_none());
+    }
+
+    #[test]
+    fn test_not_lowered_with_inconsistent_max_counts() {
+        let s = non_canonical_unrecognized(
+            r#"  sh:property [ sh:path ( asset360:fileLinksTyped asset360:type ) ;
+    sh:in ( "A" "B" ) ] ;
   sh:property [ sh:path asset360:fileLinksTyped ;
     sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "A" ] ;
     sh:qualifiedMaxCount 1 ] ;
   sh:property [ sh:path asset360:fileLinksTyped ;
     sh:qualifiedValueShape [ sh:path asset360:type ; sh:hasValue "B" ] ;
-    sh:qualifiedMaxCount 2 ] .
-"#;
-        assert!(parse_shacl(ttl, "TunnelComplex", "").is_err());
+    sh:qualifiedMaxCount 2 ]"#,
+        );
+        assert!(s.ast.is_none());
     }
 
     #[test]
