@@ -76,6 +76,62 @@ fn eval_node(ast: &ShaclAst, data: &serde_json::Value) -> bool {
                 _ => true, // if either is absent, they're disjoint
             }
         }
+
+        ShaclAst::UniqueByMemberField {
+            array_path,
+            member_field,
+            allowed_values,
+            max_count_per_value,
+        } => member_ok(
+            data,
+            array_path,
+            member_field,
+            allowed_values.as_deref(),
+            *max_count_per_value,
+        ),
+    }
+}
+
+/// True when every member of the array at `array_path` has a `member_field`
+/// value that is (a) in `allowed_values` when that set is given, and (b) shared
+/// by at most `max_count_per_value` members. An absent/empty array is satisfied.
+fn member_ok(
+    data: &serde_json::Value,
+    array_path: &PropertyPath,
+    member_field: &PropertyPath,
+    allowed_values: Option<&[serde_json::Value]>,
+    max_count_per_value: u32,
+) -> bool {
+    let members = match resolve_path(data, array_path) {
+        Some(serde_json::Value::Array(arr)) => arr,
+        _ => return true,
+    };
+    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for member in members {
+        let Some(value) = resolve_path(member, member_field) else {
+            continue;
+        };
+        if let Some(allowed) = allowed_values
+            && !allowed.iter().any(|a| values_equal(value, a))
+        {
+            return false; // disallowed value
+        }
+        let key = value_key(value);
+        let entry = counts.entry(key).or_insert(0);
+        *entry += 1;
+        if *entry > max_count_per_value {
+            return false; // value used too many times
+        }
+    }
+    true
+}
+
+/// Stable string key for grouping member values (mirrors `values_equal`'s
+/// string-coercion so "1" and 1 group together).
+fn value_key(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -170,6 +226,13 @@ fn collect_paths(ast: &ShaclAst, fields: &mut Vec<String>) {
                 fields.push(name.to_owned());
             }
             if let Some(name) = path_b.local_name() {
+                fields.push(name.to_owned());
+            }
+        }
+        ShaclAst::UniqueByMemberField { array_path, .. } => {
+            // Anchor the violation on the array slot (the form section), not the
+            // inner member field.
+            if let Some(name) = array_path.local_name() {
                 fields.push(name.to_owned());
             }
         }

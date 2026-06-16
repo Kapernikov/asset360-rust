@@ -149,6 +149,79 @@ fn substitute(
             // For now, treat as unconstrained (conservative).
             Simplified::Bool(true)
         }
+
+        ShaclAst::UniqueByMemberField { .. } => {
+            // Array-member uniqueness is not a scalar inter-field constraint;
+            // it is solved by the dedicated `solve_member_field` path, not by
+            // this scalar substitute/simplify/extract pipeline. Treat as
+            // unconstrained here so it never interferes with scalar solving.
+            Simplified::Bool(true)
+        }
+    }
+}
+
+/// Result of solving a multivalued-slot member field for the allowed values of
+/// a new/edited member.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemberSolution {
+    /// Allowed value set from the rule's `sh:in`, if any (before subtracting used).
+    pub allowed_values: Option<Vec<serde_json::Value>>,
+    /// Values already used up by the other members (capacity reached).
+    pub excluded: Vec<serde_json::Value>,
+}
+
+/// Backward-solve a `UniqueByMemberField` rule for the value a new/edited member
+/// may take in `member_field`. `used_values` is the multiset of `member_field`
+/// values already present on the OTHER members (caller excludes the edited row).
+///
+/// Returns `None` when `ast` is not a `UniqueByMemberField` for this
+/// `array_field` / `member_field`. Otherwise the rule's allowed set (if any) plus
+/// the values whose per-value capacity is already reached and so must be excluded.
+pub fn solve_member_field(
+    ast: &ShaclAst,
+    array_field: &str,
+    member_field: &str,
+    used_values: &[serde_json::Value],
+) -> Option<MemberSolution> {
+    match ast {
+        // Only a conjunctive context yields an unconditional rule. Under `or` /
+        // `not` the rule is conditional, so backward-solving it would over-restrict
+        // the UI and disagree with forward evaluation — treat as unsolvable.
+        ShaclAst::And { children } => children
+            .iter()
+            .find_map(|c| solve_member_field(c, array_field, member_field, used_values)),
+        ShaclAst::UniqueByMemberField {
+            array_path,
+            member_field: mf,
+            allowed_values,
+            max_count_per_value,
+        } => {
+            if array_path.local_name() != Some(array_field) || mf.local_name() != Some(member_field)
+            {
+                return None;
+            }
+            // A value is excluded once the OTHER members already fill its capacity.
+            let mut counts: std::collections::HashMap<String, (serde_json::Value, u32)> =
+                std::collections::HashMap::new();
+            for v in used_values {
+                let key = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let entry = counts.entry(key).or_insert_with(|| (v.clone(), 0));
+                entry.1 += 1;
+            }
+            let excluded = counts
+                .into_values()
+                .filter(|(_, n)| *n >= *max_count_per_value)
+                .map(|(v, _)| v)
+                .collect();
+            Some(MemberSolution {
+                allowed_values: allowed_values.clone(),
+                excluded,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -308,6 +381,38 @@ fn extract_predicate(node: &Simplified, target_field: &str) -> Option<Predicate>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn member_rule() -> ShaclAst {
+        ShaclAst::UniqueByMemberField {
+            array_path: PropertyPath::iri("https://data.infrabel.be/asset360/fileLinksTyped"),
+            member_field: PropertyPath::iri("https://data.infrabel.be/asset360/type"),
+            allowed_values: Some(vec![json!("A"), json!("B")]),
+            max_count_per_value: 1,
+        }
+    }
+
+    #[test]
+    fn test_solve_member_field_extracted_under_and() {
+        let ast = ShaclAst::And {
+            children: vec![member_rule()],
+        };
+        let sol = solve_member_field(&ast, "fileLinksTyped", "type", &[json!("A")]);
+        assert!(sol.is_some());
+        assert_eq!(sol.unwrap().excluded, vec![json!("A")]);
+    }
+
+    #[test]
+    fn test_solve_member_field_not_extracted_under_or_or_not() {
+        // Conditional contexts must be unsolvable (would over-restrict the UI).
+        let under_or = ShaclAst::Or {
+            children: vec![member_rule()],
+        };
+        let under_not = ShaclAst::Not {
+            child: Box::new(member_rule()),
+        };
+        assert!(solve_member_field(&under_or, "fileLinksTyped", "type", &[]).is_none());
+        assert!(solve_member_field(&under_not, "fileLinksTyped", "type", &[]).is_none());
+    }
 
     fn status_combo_ast() -> ShaclAst {
         let forbidden = vec![

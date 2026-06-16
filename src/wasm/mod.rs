@@ -1075,6 +1075,32 @@ impl ConstraintSetHandle {
         }
     }
 
+    /// Backward-solve allowed values for a member field of an array slot.
+    ///
+    /// `object_data_json` is the full parent object; `array_field` the
+    /// multivalued slot; `member_field` the member field being edited;
+    /// `editing_index` the index of the member being edited (omit/undefined
+    /// for a new member, so its value is not excluded from "already used").
+    /// Returns a `FieldConstraint` (AllowedValues) or null.
+    #[wasm_bindgen(js_name = solveMember)]
+    pub fn solve_member(
+        &self,
+        object_data_json: &str,
+        array_field: &str,
+        member_field: &str,
+        editing_index: Option<usize>,
+    ) -> Result<JsValue, JsValue> {
+        let data: serde_json::Value = serde_json::from_str(object_data_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid data JSON: {e}")))?;
+        match self
+            .inner
+            .solve_member(&data, array_field, member_field, editing_index)
+        {
+            Some(fc) => to_js(&fc),
+            None => Ok(JsValue::NULL),
+        }
+    }
+
     /// Return all field names referenced by any shape.
     #[wasm_bindgen(js_name = affectedFields)]
     pub fn affected_fields(&self) -> Vec<String> {
