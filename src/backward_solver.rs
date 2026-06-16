@@ -45,9 +45,52 @@ pub fn solve_backward(
     known_fields: &serde_json::Map<String, serde_json::Value>,
     target_field: &str,
 ) -> Option<Predicate> {
+    // Cross-reference path-equality is solved on the *tail* of `path_a`
+    // (e.g. `refersToLine`), not on `target_field` (`belongsToTrack`). The
+    // substitute/simplify/extract pipeline only extracts predicates keyed to
+    // `target_field`, so it cannot carry this; handle it with a dedicated branch.
+    if let ShaclAst::PathEquals { path_a, path_b } = ast {
+        return solve_cross_ref_path_equals(path_a, path_b, known_fields, target_field);
+    }
+
     let substituted = substitute(ast, known_fields, target_field);
     let simplified = simplify(substituted);
     extract_predicate(&simplified, target_field)
+}
+
+/// Solve a cross-reference path-equality (`path_a == path_b`) for the value a
+/// reference `target_field` may take.
+///
+/// Recognized shape: `path_a` is a two-step sequence whose head is
+/// `target_field` and whose single tail step is the slot on the referenced
+/// object that must equal `path_b`'s value (a simple slot on the focus object,
+/// read from `known_fields`). Returns a predicate keyed by the **tail** slot
+/// (e.g. `refersToLine`), or `None` when the shape doesn't match or the peer
+/// value is unbound. `path_b` keeps its value verbatim; an absent or JSON-null
+/// peer yields `None` (caller then returns no constraint -> unfiltered dropdown).
+fn solve_cross_ref_path_equals(
+    path_a: &PropertyPath,
+    path_b: &PropertyPath,
+    known_fields: &serde_json::Map<String, serde_json::Value>,
+    target_field: &str,
+) -> Option<Predicate> {
+    let PropertyPath::Sequence { steps } = path_a else {
+        return None;
+    };
+    // Exactly: head (the target reference slot) + one tail step (the remote slot).
+    if steps.len() != 2 {
+        return None;
+    }
+    if steps[0].local_name()? != target_field {
+        return None;
+    }
+    let tail_field = steps[1].local_name()?;
+    let peer_field = path_b.local_name()?;
+    let value = known_fields.get(peer_field)?;
+    if value.is_null() {
+        return None;
+    }
+    Some(Predicate::simple(tail_field, "equals", value.clone()))
 }
 
 // ── Step 1: Substitute ───────────────────────────────────────────────
@@ -773,5 +816,52 @@ mod tests {
             pred.is_none(),
             "min=1 on target → any concrete value works → None"
         );
+    }
+
+    fn track_line_path_equals() -> ShaclAst {
+        ShaclAst::PathEquals {
+            path_a: PropertyPath::sequence(vec![
+                PropertyPath::iri("https://data.infrabel.be/asset360/belongsToTrack"),
+                PropertyPath::iri("https://data.infrabel.be/asset360/refersToLine"),
+            ]),
+            path_b: PropertyPath::iri("https://data.infrabel.be/asset360/belongsToLine"),
+        }
+    }
+
+    #[test]
+    fn test_solve_cross_ref_path_equals() {
+        let ast = track_line_path_equals();
+        let known = json!({ "belongsToLine": "Line-9" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let pred = solve_backward(&ast, &known, "belongsToTrack");
+        assert_eq!(
+            pred,
+            Some(Predicate::simple("refersToLine", "equals", "Line-9"))
+        );
+    }
+
+    #[test]
+    fn test_solve_cross_ref_unsolvable_cases_are_none() {
+        let ast = track_line_path_equals();
+
+        // Peer field absent entirely.
+        let empty = serde_json::Map::new();
+        assert_eq!(solve_backward(&ast, &empty, "belongsToTrack"), None);
+
+        // Peer field explicitly null.
+        let null_known = json!({ "belongsToLine": null })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(solve_backward(&ast, &null_known, "belongsToTrack"), None);
+
+        // Target field is not the sequence head.
+        let known = json!({ "belongsToLine": "Line-9" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(solve_backward(&ast, &known, "somethingElse"), None);
     }
 }
