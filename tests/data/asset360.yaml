@@ -215,6 +215,16 @@ classes:
         range: Line
         inlined: false
 
+  CoveredSection:
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    attributes:
+      belongsToTrack:
+        range: Track
+        inlined: false
+      belongsToLine:
+        range: Line
+        inlined: false
 
   Signal:
     annotations:
