@@ -947,7 +947,22 @@ fn collect_fields_recursive(ast: &ShaclAst, fields: &mut Vec<String>) {
                 fields.push(name.to_owned());
             }
         }
-        ShaclAst::PathEquals { path_a, path_b } | ShaclAst::PathDisjoint { path_a, path_b } => {
+        ShaclAst::PathEquals { path_a, path_b } => {
+            // Report `path_a`'s HEAD field. For a simple IRI path that is its
+            // local name; for a sequence path (cross-reference, e.g.
+            // `belongsToTrack / refersToLine`) it is the head step
+            // (`belongsToTrack`) — the field that *receives* the solved Query.
+            // Consumers iterate `affected_fields()` to decide which fields to
+            // backward-solve, so the head must be reported or the dropdown is
+            // never filtered (consolidator-server #133, v0.7.2).
+            if let Some(name) = path_head_local_name(path_a) {
+                fields.push(name.to_owned());
+            }
+            if let Some(name) = path_b.local_name() {
+                fields.push(name.to_owned());
+            }
+        }
+        ShaclAst::PathDisjoint { path_a, path_b } => {
             if let Some(name) = path_a.local_name() {
                 fields.push(name.to_owned());
             }
@@ -967,6 +982,18 @@ fn collect_fields_recursive(ast: &ShaclAst, fields: &mut Vec<String>) {
                 fields.push(name.to_owned());
             }
         }
+    }
+}
+
+/// Local name of a property path's HEAD step — the first slot reached on the
+/// focus object. For a simple IRI path this is its own local name; for a
+/// sequence path it is the first step's head (recursing through nested
+/// sequences). Inverse paths have no head on the focus object, so `None`.
+fn path_head_local_name(path: &PropertyPath) -> Option<&str> {
+    match path {
+        PropertyPath::Iri { .. } => path.local_name(),
+        PropertyPath::Sequence { steps } => steps.first().and_then(path_head_local_name),
+        PropertyPath::Inverse { .. } => None,
     }
 }
 
@@ -1716,6 +1743,11 @@ asset360:CoveredSection_NearMissShape
         // The peer slot must be an affected field: it drives solve()'s
         // null-normalization and the consumer's re-solve trigger.
         assert!(shape.affected_fields.contains(&"belongsToLine".to_owned()));
+        // The sequence-path HEAD must also be reported: it is the field that
+        // receives the solved Query, and consumers iterate affected_fields() to
+        // decide which fields to backward-solve. Missing it leaves the dropdown
+        // unfiltered (consolidator-server #133 e2e gap, v0.7.2 fix).
+        assert!(shape.affected_fields.contains(&"belongsToTrack".to_owned()));
     }
 
     #[test]
