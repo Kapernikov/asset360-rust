@@ -14,7 +14,7 @@ pub use minijinja::*;
 
 use linkml_meta::SchemaDefinition;
 use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
-use linkml_runtime::{LinkMLInstance, load_json_str};
+use linkml_runtime::{DiffOptions, LinkMLInstance, diff, load_json_str};
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::enumview::EnumView;
 use linkml_schemaview::identifier::Identifier;
@@ -251,6 +251,43 @@ impl SchemaViewHandle {
         }
         let json_text: String = JSON::stringify(&value)?.into();
         self.load_instance_from_json(class_name, &json_text)
+    }
+
+    /// Diff two instances of `class_name` and return the semantic deltas.
+    ///
+    /// `base` and `current` are each a JSON string or a JS object (same input
+    /// shapes accepted by [`SchemaViewHandle::create_instance`]). The diff runs
+    /// `base` → `current`, so each [`Delta`]'s `old` is the base value and `new`
+    /// the current one — matching the frontend's `computeDelta(current, base)`
+    /// convention. Because alignment uses each class's key/identifier slot, this
+    /// keys inlined arrays by identity instead of position (the whole point of
+    /// reusing the engine on the frontend).
+    ///
+    /// `treat_missing_as_null` mirrors [`DiffOptions::treat_missing_as_null`].
+    /// Returns `Delta[]` (`{ path, op, old?, new? }`).
+    #[wasm_bindgen(js_name = diffJson)]
+    pub fn diff_json(
+        &self,
+        class_name: &str,
+        base: JsValue,
+        current: JsValue,
+        treat_missing_as_null: bool,
+    ) -> Result<JsValue, JsValue> {
+        let base_handle = self.create_instance(class_name, base)?;
+        let current_handle = self.create_instance(class_name, current)?;
+        let deltas = diff(
+            &base_handle.inner,
+            &current_handle.inner,
+            DiffOptions::new(treat_missing_as_null),
+        );
+        // A `Delta`'s `old`/`new` are `serde_json::Value`s; object payloads (e.g.
+        // a removed inlined row) serialise to maps. The default serde_wasm_bindgen
+        // serializer emits JS `Map`s — which `JSON.stringify` renders as `{}`, so
+        // the frontend would see empty removed-row data. The json-compatible
+        // serializer emits plain objects instead.
+        deltas
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|err| format_err(&err))
     }
 
     /// Retrieve a [`ClassView`] by name or CURIE (without requiring a schema id).
