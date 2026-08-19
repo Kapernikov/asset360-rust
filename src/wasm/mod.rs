@@ -259,9 +259,12 @@ impl SchemaViewHandle {
     /// shapes accepted by [`SchemaViewHandle::create_instance`]). The diff runs
     /// `base` → `current`, so each [`Delta`]'s `old` is the base value and `new`
     /// the current one — matching the frontend's `computeDelta(current, base)`
-    /// convention. Because alignment uses each class's key/identifier slot, this
-    /// keys inlined arrays by identity instead of position (the whole point of
-    /// reusing the engine on the frontend).
+    /// convention. Alignment keys inlined arrays by element identity instead of
+    /// position (the whole point of reusing the engine on the frontend): the
+    /// class's key/identifier slot, or failing that a label derived from its
+    /// `unique_keys`. Lists whose elements lack a unique identity diff
+    /// positionally, and a slot annotated `diff.linkml.io/opaque` is one atomic
+    /// unit — any change below it is a single whole-value update at the slot.
     ///
     /// `treat_missing_as_null` mirrors [`DiffOptions::treat_missing_as_null`].
     /// Returns `Delta[]` (`{ path, op, old?, new? }`).

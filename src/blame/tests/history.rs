@@ -82,6 +82,123 @@ fn sorted_delta_values(deltas: &[Delta]) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn test_compute_history_keys_inlined_lists_by_unique_keys() {
+    use linkml_meta::SchemaDefinition;
+    use serde_path_to_error as p2e;
+    use serde_yml as yml;
+
+    // Element identity comes from `unique_keys` alone: Inspection has no
+    // identifier/key slot, so without it the list diffs positionally and a
+    // mid-list removal cascades into index rewrites.
+    const SCHEMA: &str = r#"
+id: https://example.org/inspection-schema
+name: inspection-schema
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: https://example.org/
+slots:
+  asset_id:
+    identifier: true
+    range: string
+  kind:
+    range: string
+  result:
+    range: string
+  inspections:
+    range: Inspection
+    multivalued: true
+    inlined: true
+    inlined_as_list: true
+classes:
+  Asset:
+    slots:
+      - asset_id
+      - inspections
+  Inspection:
+    slots:
+      - kind
+      - result
+    unique_keys:
+      main:
+        unique_key_slots:
+          - kind
+"#;
+    const V0: &str = r#"
+asset_id: A1
+inspections:
+  - kind: visual
+    result: ok
+  - kind: ultrasonic
+    result: ok
+  - kind: magnetic
+    result: ok
+"#;
+    // The middle element is removed and the last one edited — the exact shape
+    // positional diffing corrupts into shifted updates.
+    const V1: &str = r#"
+asset_id: A1
+inspections:
+  - kind: visual
+    result: ok
+  - kind: magnetic
+    result: worn
+"#;
+
+    let schema: SchemaDefinition = p2e::deserialize(yml::Deserializer::from_str(SCHEMA)).unwrap();
+    let mut sv = SchemaView::new();
+    sv.add_schema(schema).unwrap();
+    let conv = sv.converter_for_primary_schema().unwrap();
+    let asset_class = sv
+        .get_class(&Identifier::new("Asset"), &conv)
+        .unwrap()
+        .unwrap();
+
+    let generations: Vec<_> = [V0, V1]
+        .iter()
+        .map(|raw| {
+            linkml_runtime::load_yaml_str(raw, &sv, &asset_class, &conv)
+                .unwrap()
+                .into_instance_tolerate_errors()
+                .unwrap()
+        })
+        .collect();
+
+    let meta = |change_id| Asset360ChangeMeta {
+        author: "inspector".into(),
+        timestamp: "2026-01-01T00:00:00Z".into(),
+        source: "ingest".into(),
+        change_id,
+        ics_id: 1,
+    };
+    let stages = generations
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| ChangeStage {
+            meta: meta(idx as u64),
+            value: value.clone(),
+            deltas: Vec::new(),
+            rejected_paths: Vec::new(),
+        })
+        .collect();
+
+    let (final_value, history) = compute_history(stages);
+    assert_eq!(final_value.to_json(), generations[1].to_json());
+
+    let mut paths: Vec<Vec<String>> = history[1].deltas.iter().map(|d| d.path.clone()).collect();
+    paths.sort();
+    let path = |segments: &[&str]| segments.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            path(&["inspections", "magnetic", "result"]),
+            path(&["inspections", "ultrasonic"]),
+        ],
+        "expected one keyed remove and one keyed field update, not an index cascade",
+    );
+}
+
+#[test]
 fn test_compute_history_matches_fixture_and_blame_dump() {
     let sv = load_asset360_schema();
     let stages_fixture = include_str!("../../../tests/data/stages.json");
