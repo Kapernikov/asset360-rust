@@ -2948,7 +2948,12 @@ class LinkMLInstance:
     def __getitem__(self, key:typing.Any) -> LinkMLInstance: ...
     def navigate(self, path:typing.Any) -> typing.Optional[LinkMLInstance]:
         r"""
-        Navigate by a path of strings (map keys or list indices).
+        Navigate by a path of strings: slot names, mapping keys, and — for
+        lists — element identity labels (identifier/key or `unique_keys` value)
+        when the list carries unique labels, numeric indices otherwise. This is
+        the same addressing `diff` emits and `patch` applies, so delta paths are
+        navigable; a numeric segment aimed at a label-addressed list resolves to
+        nothing rather than to that position.
         Returns a new LinkMLInstance if found, otherwise None.
         """
     def keys(self) -> builtins.list[builtins.str]: ...
@@ -5801,6 +5806,22 @@ def import_ntriples(reader:typing.Any, schema_view:SchemaView, root_classes:typi
 def import_turtle(reader:typing.Any, schema_view:SchemaView, root_classes:typing.Sequence[builtins.str], *, disk_path:typing.Optional[builtins.str]=None, strict:builtins.bool=False) -> RdfStream:
     r"""
     Import RDF/Turtle into a streaming iterator of LinkML instances.
+    """
+
+def lint_element_identity(schema_view:SchemaView) -> builtins.list[ValidationResult]:
+    r"""
+    Schema-level lint: warn for every multivalued inlined slot whose element
+    identity comes from nowhere.
+    
+    Warnings only — the schema stays usable. Results are deterministic: sorted
+    by subject, deduplicated across class URIs, and an inherited slot is
+    reported once, at the class that introduces the problem.
+    """
+
+def lint_instance_identity(instance:LinkMLInstance) -> builtins.list[ValidationResult]:
+    r"""
+    Data-level lint: warn for every list whose elements repeat a declared
+    identity (key/identifier or ``unique_keys`` value).
     """
 
 def load_json(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[typing.Optional[LinkMLInstance], builtins.list[ValidationResult]]: ...

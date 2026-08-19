@@ -38,6 +38,15 @@ pub struct ChangeStage<M> {
 /// remaining deltas are applied before continuing. The updated per-stage deltas
 /// are returned alongside the final LinkML value. The function panics if delta
 /// application reports any failed paths or when no stages are provided.
+///
+/// Inlined lists are keyed by element identity (identifier/key slot, or a
+/// `unique_keys`-derived label) whenever every element on both sides carries a
+/// unique label, so a mid-list removal replays as one keyed `Remove` instead of
+/// an index cascade. Rejected paths therefore use those labels too. Two replay
+/// consequences of the engine's addressing rules: a list that stops having
+/// coherent element identity between stages becomes a single whole-slot
+/// `Update`, and an `Update` addressing an element that no longer exists
+/// reports failure (and panics here) rather than appending.
 pub fn compute_history(
     stages: Vec<ChangeStage<Asset360ChangeMeta>>,
 ) -> (LinkMLInstance, Vec<ChangeStage<Asset360ChangeMeta>>) {
