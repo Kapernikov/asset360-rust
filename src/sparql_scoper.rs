@@ -171,6 +171,17 @@ pub struct Star {
     ///
     /// Does NOT include the identifier slot — see `identifier_values`.
     pub filters: HashMap<String, Vec<FilterCondition>>,
+
+    /// Which SPARQL variable each slot binds to: `?s :hasName ?name`
+    /// contributes `"name" -> "name"` (slot name → variable name).
+    ///
+    /// The star decomposition has to work this out anyway to detect join
+    /// edges; exposing it lets a consumer answer "which column does
+    /// `?name` come from" without re-walking the query — the question
+    /// both the aggregate pushdown (which slot is this group key?) and a
+    /// column projection have to ask. Only object *variables* appear
+    /// here: a constant object is a filter, not a binding.
+    pub slot_variables: HashMap<String, String>,
 }
 
 /// A join between two stars, pushable to a SQL JOIN.
@@ -473,6 +484,7 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
             // above. FILTER(...)/VALUES filters from Phase 3 are merged
             // in below.
             filters: inline_filters,
+            slot_variables: builder.object_variables.clone(),
         });
     }
 
@@ -1024,10 +1036,11 @@ fn has_holistic_modifier(pattern: &GraphPattern) -> bool {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn test_schema_view() -> SchemaView {
+    /// Small hand-written schema shared with the pushdown analyser's tests.
+    pub(crate) fn test_schema_view() -> SchemaView {
         use linkml_meta::SchemaDefinition;
         use serde_path_to_error as p2e;
         use serde_yml as yml;
@@ -1051,6 +1064,8 @@ classes:
         identifier: true
       name:
         range: string
+      length:
+        range: integer
       locatedOnTrack:
         range: Track
   BaliseGroup:

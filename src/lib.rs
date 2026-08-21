@@ -40,6 +40,7 @@ pub mod shacl_ast;
 
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
+pub mod sparql_pushdown;
 pub mod sparql_scoper;
 
 #[cfg(feature = "shacl-parser")]
@@ -80,12 +81,18 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "sparql-endpoint")]
     {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
+        m.add_function(wrap_pyfunction!(py_sparql_pushdown, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
         m.add_class::<Star>()?;
         m.add_class::<JoinEdge>()?;
         m.add_class::<FilterCondition>()?;
+        m.add_class::<PushdownVerdict>()?;
+        m.add_class::<PushdownSolution>()?;
+        m.add_class::<PushdownBinding>()?;
+        m.add_class::<PushdownMeasure>()?;
+        m.add_class::<PushdownOrder>()?;
     }
     Ok(())
 }
@@ -1392,6 +1399,17 @@ impl Star {
             .collect()
     }
 
+    /// Which SPARQL variable each slot binds to, as ``{slot: variable}``.
+    ///
+    /// Answers "where does ``?name`` come from" without re-parsing the
+    /// query: the star decomposition already worked it out to find join
+    /// edges. Only object *variables* appear — a constant object is a
+    /// filter, not a binding.
+    #[getter]
+    fn slot_variables(&self) -> HashMap<String, String> {
+        self.inner.slot_variables.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Star(variable={:?}, class_uri={:?}, fields={:?})",
@@ -1601,6 +1619,410 @@ impl QueryPlan {
             self.root.kind(),
             self.sql_limit
         )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One projected value in a pushdown solution: which slot of which star it
+/// reads, and where that sits in the schema.
+///
+/// Result columns are addressed by *position* in
+/// :attr:`PushdownSolution.bindings`, never by SPARQL variable name — those
+/// come from the request, and unquoted SQL identifiers case-fold and truncate
+/// at 63 bytes, so two distinct variables could silently collide into one
+/// column. ``var`` is for labelling the response only.
+pub struct PushdownBinding {
+    inner: crate::sparql_pushdown::BindingSpec,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownBinding {
+    /// SPARQL variable name (without ``?``) — the result column label.
+    #[getter]
+    fn var(&self) -> &str {
+        &self.inner.var
+    }
+
+    /// The star's variable, which the SQL builder maps to a table alias.
+    #[getter]
+    fn star_var(&self) -> &str {
+        &self.inner.star_var
+    }
+
+    /// Slot path from the object root to the value. Empty means the object's
+    /// own IRI (the indexed ``asset360_uri`` column, not JSONB).
+    #[getter]
+    fn slot_path(&self) -> Vec<String> {
+        self.inner.slot_path.clone()
+    }
+
+    /// Class IRI this binding's slot path is resolved against — the schema
+    /// position to ask for a term descriptor.
+    #[getter]
+    fn class_uri(&self) -> &str {
+        &self.inner.term_ref.class_uri
+    }
+
+    /// ``True`` when the slot's declared range is numeric.
+    ///
+    /// The renderer needs this twice over: a numeric column is cast before
+    /// aggregation, while a text column must be compared and sorted under
+    /// ``COLLATE "C"`` — SPARQL orders simple literals by Unicode codepoint,
+    /// which the database's default collation does not.
+    #[getter]
+    fn numeric(&self) -> bool {
+        self.inner.numeric
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownBinding(var={:?}, slot_path={:?})",
+            self.inner.var, self.inner.slot_path
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One aggregate in the SELECT list.
+pub struct PushdownMeasure {
+    inner: crate::sparql_pushdown::MeasureSpec,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownMeasure {
+    /// The result variable (the ``AS`` name), used to label the column.
+    #[getter]
+    fn var(&self) -> &str {
+        &self.inner.var
+    }
+
+    /// One of ``"count"``, ``"sum"``, ``"avg"``, ``"min"``, ``"max"``.
+    /// Unknown values MUST be rejected rather than guessed: a new aggregate
+    /// appearing here means the Rust side supports something this Python
+    /// does not yet render.
+    #[getter]
+    fn func(&self) -> &str {
+        use crate::sparql_pushdown::Measure;
+        match self.inner.func {
+            Measure::Count { .. } => "count",
+            Measure::Sum { .. } => "sum",
+            Measure::Avg { .. } => "avg",
+            Measure::Min { .. } => "min",
+            Measure::Max { .. } => "max",
+        }
+    }
+
+    /// Index into ``bindings`` of the aggregated value, or ``None`` for
+    /// ``COUNT(*)`` — which counts solutions and has no argument.
+    #[getter]
+    fn arg(&self) -> Option<usize> {
+        use crate::sparql_pushdown::Measure;
+        match self.inner.func {
+            Measure::Count { arg, .. } => arg,
+            Measure::Sum { arg }
+            | Measure::Avg { arg }
+            | Measure::Min { arg }
+            | Measure::Max { arg } => Some(arg),
+        }
+    }
+
+    /// ``True`` for ``COUNT(DISTINCT ...)``. Always ``False`` for the other
+    /// functions, where SPARQL has no DISTINCT form this subset accepts.
+    #[getter]
+    fn distinct(&self) -> bool {
+        use crate::sparql_pushdown::Measure;
+        matches!(self.inner.func, Measure::Count { distinct: true, .. })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownMeasure(var={:?}, func={:?})",
+            self.inner.var,
+            self.func()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One ``ORDER BY`` term.
+///
+/// ``kind`` says whether it sorts on a projected value or on an aggregate
+/// result, which decides whether the SQL builder can place it inside the
+/// binding subquery or must apply it outside the grouping.
+pub struct PushdownOrder {
+    inner: crate::sparql_pushdown::OrderTerm,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownOrder {
+    /// ``"binding"`` or ``"measure"``.
+    #[getter]
+    fn kind(&self) -> &str {
+        use crate::sparql_pushdown::OrderKey;
+        match self.inner.key {
+            OrderKey::Binding(_) => "binding",
+            OrderKey::Measure(_) => "measure",
+        }
+    }
+
+    /// Index into ``bindings`` or ``measures``, per ``kind``.
+    #[getter]
+    fn index(&self) -> usize {
+        use crate::sparql_pushdown::OrderKey;
+        match self.inner.key {
+            OrderKey::Binding(i) | OrderKey::Measure(i) => i,
+        }
+    }
+
+    /// ``True`` for ``DESC``.
+    ///
+    /// Note for the renderer: SPARQL sorts unbound *before* every bound value
+    /// ascending, where Postgres defaults to NULLS LAST for ASC — so the
+    /// generated SQL must say ``NULLS FIRST`` / ``NULLS LAST`` explicitly.
+    #[getter]
+    fn desc(&self) -> bool {
+        self.inner.desc
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownOrder(kind={:?}, index={}, desc={})",
+            self.kind(),
+            self.index(),
+            self.inner.desc
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// What SQL must produce for an eligible query: one row per solution, then
+/// grouping on top.
+pub struct PushdownSolution {
+    inner: crate::sparql_pushdown::SolutionSpec,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownSolution {
+    #[getter]
+    fn bindings(&self) -> Vec<PushdownBinding> {
+        self.inner
+            .bindings
+            .iter()
+            .map(|b| PushdownBinding { inner: b.clone() })
+            .collect()
+    }
+
+    /// Indices into ``bindings`` forming the ``GROUP BY``. Empty is legal and
+    /// means one row over the whole input — SPARQL returns exactly one
+    /// solution for a bare aggregate, where a SQL ``GROUP BY`` over no rows
+    /// would return none, so the renderer must omit ``GROUP BY`` entirely.
+    #[getter]
+    fn group_keys(&self) -> Vec<usize> {
+        self.inner.group_keys.clone()
+    }
+
+    #[getter]
+    fn measures(&self) -> Vec<PushdownMeasure> {
+        self.inner
+            .measures
+            .iter()
+            .map(|m| PushdownMeasure { inner: m.clone() })
+            .collect()
+    }
+
+    #[getter]
+    fn order_by(&self) -> Vec<PushdownOrder> {
+        self.inner
+            .order_by
+            .iter()
+            .map(|o| PushdownOrder { inner: o.clone() })
+            .collect()
+    }
+
+    #[getter]
+    fn distinct(&self) -> bool {
+        self.inner.distinct
+    }
+
+    #[getter]
+    fn limit(&self) -> Option<usize> {
+        self.inner.limit
+    }
+
+    #[getter]
+    fn offset(&self) -> usize {
+        self.inner.offset
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownSolution(bindings={}, group_keys={:?}, measures={})",
+            self.inner.bindings.len(),
+            self.inner.group_keys,
+            self.inner.measures.len()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// Verdict on whether a query's grouping and aggregation can be answered in
+/// SQL.
+///
+/// Three-way on purpose. ``"not_applicable"`` (not an aggregate at all) and
+/// ``"blocked"`` (an aggregate outside the supported subset) must not collapse
+/// into one falsy value: the first keeps the existing route silently, the
+/// second is reportable to whoever wrote the query.
+pub struct PushdownVerdict {
+    inner: crate::sparql_pushdown::Pushdown,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownVerdict {
+    /// ``"not_applicable"``, ``"blocked"`` or ``"eligible"``.
+    #[getter]
+    fn kind(&self) -> &str {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::NotApplicable => "not_applicable",
+            Pushdown::Blocked(_) => "blocked",
+            Pushdown::Eligible(_) => "eligible",
+        }
+    }
+
+    /// Stable machine-readable refusal code, or ``None`` when not blocked.
+    /// Branch on this, never on ``detail``.
+    #[getter]
+    fn code(&self) -> Option<&'static str> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Blocked(b) => Some(b.code.as_str()),
+            _ => None,
+        }
+    }
+
+    /// What blocked, in terms of the query and the data model.
+    #[getter]
+    fn detail(&self) -> Option<String> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Blocked(b) => Some(b.detail.clone()),
+            _ => None,
+        }
+    }
+
+    /// Where in the query, when locatable — a variable or an operator.
+    #[getter]
+    fn at(&self) -> Option<String> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Blocked(b) => b.at.clone(),
+            _ => None,
+        }
+    }
+
+    /// A supported shape to use instead. This is the field that turns a
+    /// refusal into a repair, so it is meant to be shown verbatim.
+    #[getter]
+    fn instead(&self) -> Option<&'static str> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Blocked(b) => Some(b.instead()),
+            _ => None,
+        }
+    }
+
+    /// The solution spec when ``kind == "eligible"``, else ``None``.
+    #[getter]
+    fn solution(&self) -> Option<PushdownSolution> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Eligible(spec) => Some(PushdownSolution {
+                inner: spec.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match self.code() {
+            Some(code) => format!("PushdownVerdict(kind={:?}, code={:?})", self.kind(), code),
+            None => format!("PushdownVerdict(kind={:?})", self.kind()),
+        }
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "sparql_pushdown")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Classify a SPARQL query for aggregate pushdown.
+///
+/// Unlike :func:`sparql_scope`, which decides what to *load* for oxigraph to
+/// query, this decides whether the query's grouping and aggregation can be
+/// answered by SQL without loading anything — the only shape that works for an
+/// aggregate, which by definition touches every object of its class.
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_view: The LinkML schema, for resolving slots and ranges.
+///
+/// Returns:
+///     PushdownVerdict — inspect ``.kind`` first.
+///
+/// Raises:
+///     ValueError: the query does not parse or cannot be scoped at all. A
+///         query that parses but cannot be pushed down is a ``"blocked"``
+///         verdict, not an exception.
+fn py_sparql_pushdown(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<PushdownVerdict> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    match crate::sparql_pushdown::analyse_pushdown(query, sv) {
+        Ok(verdict) => Ok(PushdownVerdict { inner: verdict }),
+        Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.",
+            ))
+        }
+        Err(crate::sparql_scoper::ScopeError::ParseError(msg)) => Err(
+            pyo3::exceptions::PyValueError::new_err(format!("SPARQL parse error: {msg}")),
+        ),
+        Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => Err(
+            pyo3::exceptions::PyValueError::new_err(format!("Query is unscoped: {msg}")),
+        ),
+        Err(crate::sparql_scoper::ScopeError::UnsupportedConstruct(msg)) => Err(
+            pyo3::exceptions::PyValueError::new_err(format!("unsupported_construct: {msg}")),
+        ),
     }
 }
 
