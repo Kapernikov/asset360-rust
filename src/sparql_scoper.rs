@@ -613,15 +613,19 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
     }
 
     // Phase 4: SQL LIMIT — only if the query has a single star, no
-    // joins, and no OPTIONAL blocks (otherwise the LIMIT could slice
-    // off the wrong rows).
+    // joins, no OPTIONAL blocks (otherwise the LIMIT could slice
+    // off the wrong rows), and no operator that must see every solution
+    // before the LIMIT applies (GROUP BY / aggregate / ORDER BY /
+    // DISTINCT — see has_holistic_modifier).
     let has_optional = !stars.iter().all(|s| !s.is_optional)
         || joins.iter().any(|j| j.join_type == JoinType::Left);
-    let sql_limit = if stars.len() == 1 && joins.is_empty() && !has_optional {
-        extract_top_level_limit(pattern)
-    } else {
-        None
-    };
+    let sql_limit =
+        if stars.len() == 1 && joins.is_empty() && !has_optional && !has_holistic_modifier(pattern)
+        {
+            extract_top_level_limit(pattern)
+        } else {
+            None
+        };
 
     // Phase 5: Wrap the result into a PlanNode tree. If the original
     // pattern has no OPTIONAL (all joins inner, no optional stars), emit
@@ -980,6 +984,41 @@ fn extract_top_level_limit(pattern: &GraphPattern) -> Option<usize> {
     }
 }
 
+/// True when the query has an operator that consumes the *whole* solution
+/// sequence before LIMIT applies, which makes pushing LIMIT into the object
+/// fetch unsound.
+///
+/// `Group` covers both `GROUP BY` and bare aggregates (spargebra models
+/// `SELECT (COUNT(*) AS ?n)` as a `Group` with no grouping variables): a
+/// LIMIT applied to the fetch would aggregate over an arbitrary subset and
+/// return a plausible, wrong number with no error. `OrderBy` would sort an
+/// arbitrary subset instead of the top of the full ordering, and `Distinct` /
+/// `Reduced` would deduplicate one, returning fewer distinct values than
+/// exist — the shape a filter dropdown uses.
+fn has_holistic_modifier(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Group { .. }
+        | GraphPattern::OrderBy { .. }
+        | GraphPattern::Distinct { .. }
+        | GraphPattern::Reduced { .. } => true,
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Service { inner, .. } => has_holistic_modifier(inner),
+        GraphPattern::Join { left, right }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => {
+            has_holistic_modifier(left) || has_holistic_modifier(right)
+        }
+        // Left exhaustive on purpose: a new GraphPattern variant should be a
+        // compile error here, not a silent "safe to push the LIMIT down".
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1123,6 +1162,40 @@ classes:
         let plan = sparql_scope("SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10", &sv).unwrap();
 
         assert_eq!(plan.sql_limit, Some(10));
+    }
+
+    /// LIMIT must NOT be pushed into the object fetch when an operator has to
+    /// see every solution first: the fetch would feed the aggregate / sort /
+    /// dedup an arbitrary subset and return a plausible wrong answer with no
+    /// error.
+    #[test]
+    fn test_limit_not_pushed_past_holistic_modifiers() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for (label, query) in [
+            (
+                "group by + count",
+                "SELECT ?name (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; asset360:name ?name } \
+                 GROUP BY ?name LIMIT 10",
+            ),
+            (
+                "bare aggregate",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal } LIMIT 10",
+            ),
+            (
+                "order by",
+                "SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name } \
+                 ORDER BY ?name LIMIT 10",
+            ),
+            (
+                "distinct",
+                "SELECT DISTINCT ?name WHERE { ?s a asset360:Signal ; asset360:name ?name } LIMIT 10",
+            ),
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(plan.sql_limit, None, "sql_limit must be None for: {label}");
+        }
     }
 
     // ---- Two-type inner join ----
