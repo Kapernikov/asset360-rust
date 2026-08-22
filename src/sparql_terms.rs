@@ -138,7 +138,7 @@ pub fn term_descriptor(
 
         let is_last = i + 1 == slot_path.len();
         if is_last {
-            return Some(describe_slot(schema_view, &slot));
+            return describe_slot(schema_view, &slot);
         }
 
         // An intermediate step must be a class to walk into.
@@ -148,10 +148,30 @@ pub fn term_descriptor(
     None
 }
 
+/// Describe a slot's values, or `None` when they are not a term a consumer can
+/// reproduce.
 fn describe_slot(
     schema_view: &SchemaView,
     slot: &linkml_schemaview::slotview::SlotView,
-) -> TermDescriptor {
+) -> Option<TermDescriptor> {
+    // A slot whose range is a class needs care, and the two cases differ:
+    //
+    // * a *reference* stores the target's URI, so the stored value is exactly
+    //   the IRI oxigraph binds — grouping by it answers "how many per parent",
+    //   which is a report people actually want;
+    // * an *inlined* structure stores nested JSON, and oxigraph binds a blank
+    //   node whose label nothing can reproduce — not SQL, not a second
+    //   oxigraph run. Those are traversable (see the path walk in the scoper)
+    //   but never a value.
+    if slot.get_range_class().is_some() {
+        return match slot.determine_slot_inline_mode() {
+            linkml_schemaview::slotview::SlotInlineMode::Reference => {
+                Some(TermDescriptor::subject_iri())
+            }
+            _ => None,
+        };
+    }
+
     let range_info = slot.get_range_info();
     let info = range_info.first();
     let datatype = info.and_then(|ri| ri.rdf_datatype_iri.clone());
@@ -162,23 +182,23 @@ fn describe_slot(
     // safe. A value with no meaning falls through to a literal.
     let enum_map = enum_meanings(schema_view, slot);
     if !enum_map.is_empty() {
-        return TermDescriptor {
+        return Some(TermDescriptor {
             kind: TermKind::EnumIri,
             datatype: None,
             lang: None,
             enum_map,
             numeric: false,
-        };
+        });
     }
 
     if is_iri {
-        return TermDescriptor {
+        return Some(TermDescriptor {
             kind: TermKind::Iri,
             datatype: None,
             lang: None,
             enum_map: Vec::new(),
             numeric: false,
-        };
+        });
     }
 
     // A language tag and a datatype are mutually exclusive in RDF, and the
@@ -194,13 +214,13 @@ fn describe_slot(
         .as_deref()
         .is_some_and(|dt| XSD_NUMERIC.contains(&dt));
 
-    TermDescriptor {
+    Some(TermDescriptor {
         kind: TermKind::Literal,
         datatype,
         lang,
         enum_map: Vec::new(),
         numeric,
-    }
+    })
 }
 
 /// Permissible value → expanded meaning IRI, for enum ranges. Empty when the
@@ -297,11 +317,20 @@ classes:
     attributes:
       longitude:
         range: integer
+  Track:
+    class_uri: asset360:Track
+    attributes:
+      asset360_uri:
+        identifier: true
+      hasName:
+        range: string
   Signal:
     class_uri: asset360:Signal
     attributes:
       asset360_uri:
         identifier: true
+      locatedOnTrack:
+        range: Track
       name:
         range: string
       length:
@@ -398,6 +427,23 @@ classes:
         let d = describe("description");
         assert_eq!(d.lang.as_deref(), Some("en"));
         assert_eq!(d.datatype, None);
+    }
+
+    #[test]
+    fn a_reference_is_the_target_iri() {
+        // A reference stores the target's URI, which is exactly the term
+        // oxigraph binds — so "count per parent" is answerable.
+        let d = term_descriptor(&schema(), SIGNAL, &["locatedOnTrack".to_owned()])
+            .expect("a reference is a renderable term");
+        assert_eq!(d.kind, TermKind::Iri);
+    }
+
+    #[test]
+    fn an_inlined_structure_is_not_a_term() {
+        // Nested JSON serialises as a blank node whose label nothing can
+        // reproduce, so there is nothing to render. Refusing here is what makes
+        // the analyser reject `GROUP BY ?loc`.
+        assert!(term_descriptor(&schema(), SIGNAL, &["location".to_owned()]).is_none());
     }
 
     #[test]

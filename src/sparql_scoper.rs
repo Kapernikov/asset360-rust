@@ -39,7 +39,39 @@ pub struct QueryPlan {
     /// SQL LIMIT — only set for single-star, zero-join, zero-OPTIONAL
     /// queries with a top-level SPARQL LIMIT.
     pub sql_limit: Option<usize>,
+
+    /// Variables reached by walking *into* a star's nested structures, as
+    /// `variable -> (star, path of slots)`.
+    ///
+    /// `?s :location ?l . ?l :longitude ?v` binds `?v` two slots down from
+    /// `?s`, which no star can describe: `?l` has no `rdf:type` and is not an
+    /// object of its own, it is part of `?s`'s JSON. A consumer reading
+    /// `object_data->'location'->>'longitude'` needs the path, and the star
+    /// decomposition is already walking these triples to find join edges.
+    ///
+    /// Only *scalar* leaves appear. An intermediate variable stands for the
+    /// nested structure itself, which serialises as a blank node — nothing a
+    /// consumer can reproduce — so it is traversable but not bindable.
+    pub path_bindings: HashMap<String, PathBinding>,
 }
+
+/// Where a nested variable's value lives, relative to a star.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathBinding {
+    /// The star this path starts from.
+    pub star_var: String,
+    /// Slots to follow from the object root. Always at least two — a
+    /// single-slot binding is already in [`Star::slot_variables`].
+    pub slot_path: Vec<String>,
+}
+
+/// How deep to follow nested structures.
+///
+/// A schema may be cyclic (a class with a slot of its own range), so the walk
+/// needs a bound rather than a visited set: revisiting a class is legitimate
+/// (`?a :child ?b . ?b :child ?c`), it is unbounded *depth* that has to stop.
+/// Real instances are shallow; four is well past anything in the data.
+const MAX_PATH_DEPTH: usize = 4;
 
 /// One node in the query plan algebra tree.
 ///
@@ -743,7 +775,15 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         PlanNode::Bgp { stars, joins }
     };
 
-    Ok(QueryPlan { root, sql_limit })
+    // Phase 6: paths into nested structures. Done after the stars exist so a
+    // variable that *is* a star is never mistaken for a step inside one.
+    let path_bindings = collect_path_bindings(&star_map, &var_to_class, schema_view);
+
+    Ok(QueryPlan {
+        root,
+        sql_limit,
+        path_bindings,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1126,111 @@ fn extract_top_level_limit(pattern: &GraphPattern) -> Option<usize> {
     }
 }
 
+/// Walk each star's nested structures, recording where scalar leaves live.
+///
+/// Only slots that are *inlined* are followed. A reference slot holds another
+/// object's URI, so its value is a join key, not a place to read through: the
+/// nested data simply is not there to walk.
+fn collect_path_bindings(
+    star_map: &HashMap<String, StarBuilder>,
+    var_to_class: &HashMap<String, String>,
+    schema_view: &SchemaView,
+) -> HashMap<String, PathBinding> {
+    let mut out: HashMap<String, PathBinding> = HashMap::new();
+
+    // Deterministic order: two stars could in principle reach the same variable,
+    // and which path wins must not depend on hash iteration order.
+    let mut star_vars: Vec<&String> = var_to_class.keys().collect();
+    star_vars.sort();
+
+    for star_var in star_vars {
+        let Ok(Some(class_view)) = schema_view.get_class_by_uri(&var_to_class[star_var]) else {
+            continue;
+        };
+        walk_paths(
+            star_var,
+            star_var,
+            &class_view,
+            &[],
+            star_map,
+            var_to_class,
+            &mut out,
+        );
+    }
+
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_paths(
+    star_var: &str,
+    current_var: &str,
+    current_class: &linkml_schemaview::classview::ClassView,
+    path_so_far: &[String],
+    star_map: &HashMap<String, StarBuilder>,
+    var_to_class: &HashMap<String, String>,
+    out: &mut HashMap<String, PathBinding>,
+) {
+    if path_so_far.len() >= MAX_PATH_DEPTH {
+        return;
+    }
+    let Some(builder) = star_map.get(current_var) else {
+        return;
+    };
+
+    let mut slots: Vec<(&String, &String)> = builder.object_variables.iter().collect();
+    slots.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (slot_name, object_var) in slots {
+        // A typed object variable is its own star, reached by a join edge.
+        if var_to_class.contains_key(object_var) {
+            continue;
+        }
+        let Some(slot) = current_class.slots().iter().find(|s| s.name == *slot_name) else {
+            continue;
+        };
+
+        let mut path = path_so_far.to_vec();
+        path.push(slot_name.clone());
+
+        match slot.get_range_class() {
+            // A nested structure: keep walking. The variable standing for the
+            // structure itself is deliberately not recorded — it serialises as
+            // a blank node, which no consumer can reproduce, so it is a step
+            // rather than a value.
+            Some(range_class) => {
+                if matches!(
+                    slot.determine_slot_inline_mode(),
+                    linkml_schemaview::slotview::SlotInlineMode::Inline
+                ) {
+                    walk_paths(
+                        star_var,
+                        object_var,
+                        &range_class,
+                        &path,
+                        star_map,
+                        var_to_class,
+                        out,
+                    );
+                }
+            }
+            // A scalar leaf. Depth one is already in Star::slot_variables;
+            // recording it again would give two answers to one question.
+            None => {
+                if path.len() > 1 {
+                    out.insert(
+                        object_var.clone(),
+                        PathBinding {
+                            star_var: star_var.to_owned(),
+                            slot_path: path,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// True when the query has an operator that consumes the *whole* solution
 /// sequence before LIMIT applies, which makes pushing LIMIT into the object
 /// fetch unsound.
@@ -1160,6 +1305,13 @@ types:
     base: int
 
 classes:
+  Coordinates:
+    class_uri: asset360:Coordinates
+    attributes:
+      longitude:
+        range: integer
+      latitude:
+        range: integer
   Signal:
     class_uri: asset360:Signal
     attributes:
@@ -1169,6 +1321,9 @@ classes:
         range: string
       length:
         range: integer
+      location:
+        range: Coordinates
+        inlined: true
       locatedOnTrack:
         range: Track
   BaliseGroup:
@@ -1280,6 +1435,72 @@ classes:
         let plan = sparql_scope("SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10", &sv).unwrap();
 
         assert_eq!(plan.sql_limit, Some(10));
+    }
+
+    #[test]
+    fn test_nested_structure_yields_a_path_binding() {
+        // ?lon lives inside ?s's JSON, two slots down. No star can describe it:
+        // ?loc has no rdf:type and is not an object of its own.
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:longitude ?lon }",
+            &sv,
+        )
+        .unwrap();
+
+        let binding = plan
+            .path_bindings
+            .get("lon")
+            .expect("?lon should resolve to a path");
+        assert_eq!(binding.star_var, "s");
+        assert_eq!(binding.slot_path, vec!["location", "longitude"]);
+
+        // The intermediate variable is traversable, not bindable: it stands for
+        // the nested structure, which serialises as a blank node.
+        assert!(!plan.path_bindings.contains_key("loc"));
+    }
+
+    #[test]
+    fn test_direct_slots_are_not_duplicated_as_paths() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
+            &sv,
+        )
+        .unwrap();
+
+        // Depth one belongs to Star::slot_variables; two answers to one
+        // question is how they drift apart.
+        assert!(plan.path_bindings.is_empty());
+        let star = find_star(&plan, "s");
+        assert_eq!(
+            star.slot_variables.get("name").map(String::as_str),
+            Some("name")
+        );
+    }
+
+    #[test]
+    fn test_reference_slots_are_not_walked_into() {
+        // `locatedOnTrack` holds another object's URI, so its value is a join
+        // key. Reading through it in JSONB would look for data that is not
+        // there.
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t asset360:hasName ?tn }",
+            &sv,
+        )
+        .unwrap();
+
+        assert!(
+            !plan.path_bindings.contains_key("tn"),
+            "a reference must not become a JSON path: {:?}",
+            plan.path_bindings
+        );
     }
 
     #[test]

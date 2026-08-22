@@ -26,7 +26,7 @@ use spargebra::{Query, SparqlParser};
 
 use linkml_schemaview::schemaview::SchemaView;
 
-use crate::sparql_scoper::{ScopeError, Star, sparql_scope};
+use crate::sparql_scoper::{PathBinding, ScopeError, Star, sparql_scope};
 use crate::sparql_terms::{TermDescriptor, term_descriptor};
 
 /// Verdict for one query.
@@ -439,7 +439,13 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     // Group keys first, so their binding indices are stable and low.
     let mut group_keys: Vec<usize> = Vec::new();
     for var in group_vars {
-        match binding_for(var.as_str(), star, schema_view, &mut bindings) {
+        match binding_for(
+            var.as_str(),
+            star,
+            &plan.path_bindings,
+            schema_view,
+            &mut bindings,
+        ) {
             Ok(idx) => group_keys.push(idx),
             Err(b) => return Ok(Pushdown::Blocked(b)),
         }
@@ -454,7 +460,14 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
             .find(|(inner, _)| *inner == internal_var.as_str())
             .map(|(_, alias)| *alias)
             .unwrap_or(internal_var.as_str());
-        match measure_for(aggregate, result_name, star, schema_view, &mut bindings) {
+        match measure_for(
+            aggregate,
+            result_name,
+            star,
+            &plan.path_bindings,
+            schema_view,
+            &mut bindings,
+        ) {
             Ok(spec) => measures.push(spec),
             Err(b) => return Ok(Pushdown::Blocked(b)),
         }
@@ -508,6 +521,7 @@ fn blocked(code: BlockedCode, detail: impl Into<String>, at: Option<String>) -> 
 fn binding_for(
     var_name: &str,
     star: &Star,
+    path_bindings: &std::collections::HashMap<String, PathBinding>,
     schema_view: &SchemaView,
     bindings: &mut Vec<BindingSpec>,
 ) -> Result<usize, Blocked> {
@@ -530,20 +544,26 @@ fn binding_for(
         return Ok(bindings.len() - 1);
     }
 
-    let slot = star
+    let direct = star
         .slot_variables
         .iter()
         .find(|(_slot, bound_var)| bound_var.as_str() == var_name)
-        .map(|(slot, _)| slot.clone())
-        .ok_or_else(|| {
-            Blocked::new(
-                BlockedCode::UnscopedBinding,
-                format!("?{var_name} is not bound to a slot of <{}>", star.class_uri),
-                Some(format!("?{var_name}")),
-            )
-        })?;
+        .map(|(slot, _)| vec![slot.clone()]);
 
-    let slot_path = vec![slot];
+    // Failing that, the variable may sit inside one of the star's nested
+    // structures — `?s :location ?l . ?l :longitude ?v` binds ?v two slots
+    // down. The scoper resolved those paths while walking the same triples.
+    let nested = path_bindings
+        .get(var_name)
+        .and_then(|binding| (binding.star_var == star.variable).then(|| binding.slot_path.clone()));
+
+    let slot_path = direct.or(nested).ok_or_else(|| {
+        Blocked::new(
+            BlockedCode::UnscopedBinding,
+            format!("?{var_name} is not bound to a slot of <{}>", star.class_uri),
+            Some(format!("?{var_name}")),
+        )
+    })?;
     // Unknown to the schema should be impossible here — the slot came from the
     // star decomposition, which resolved it against this very class — but a
     // descriptor is required to render the column, so refuse rather than guess.
@@ -572,10 +592,12 @@ fn binding_for(
     Ok(bindings.len() - 1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_for(
     aggregate: &AggregateExpression,
     result_var: &str,
     star: &Star,
+    path_bindings: &std::collections::HashMap<String, PathBinding>,
     schema_view: &SchemaView,
     bindings: &mut Vec<BindingSpec>,
 ) -> Result<MeasureSpec, Blocked> {
@@ -604,7 +626,7 @@ fn measure_for(
                     None,
                 ));
             };
-            let arg = binding_for(v.as_str(), star, schema_view, bindings)?;
+            let arg = binding_for(v.as_str(), star, path_bindings, schema_view, bindings)?;
 
             let func = match name {
                 AggregateFunction::Count => Measure::Count {
@@ -781,6 +803,33 @@ mod tests {
         assert!(spec.order_by[0].desc);
         assert_eq!(spec.order_by[1].key, OrderKey::Binding(0));
         assert!(!spec.order_by[1].desc);
+    }
+
+    #[test]
+    fn groups_by_a_value_inside_a_nested_structure() {
+        let spec = eligible(
+            "SELECT ?lon (COUNT(*) AS ?n) WHERE { \
+             ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:longitude ?lon } GROUP BY ?lon",
+        );
+
+        let key = &spec.bindings[spec.group_keys[0]];
+        assert_eq!(key.slot_path, vec!["location", "longitude"]);
+        // Two slots down, and still numeric — the descriptor followed the path.
+        assert!(key.descriptor.numeric);
+    }
+
+    #[test]
+    fn grouping_by_the_nested_structure_itself_is_refused() {
+        // ?loc stands for the structure, which serialises as a blank node: SQL
+        // cannot reproduce the label, and neither can a second oxigraph run.
+        assert_eq!(
+            blocked_code(
+                "SELECT ?loc (COUNT(*) AS ?n) WHERE { \
+                 ?s a asset360:Signal ; asset360:location ?loc } GROUP BY ?loc"
+            ),
+            BlockedCode::UnscopedBinding
+        );
     }
 
     #[test]

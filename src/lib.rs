@@ -1575,12 +1575,29 @@ impl PlanNode {
 pub struct QueryPlan {
     root: PlanNode,
     sql_limit: Option<usize>,
+    path_bindings: HashMap<String, (String, Vec<String>)>,
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl QueryPlan {
+    /// Variables reached by walking into a star's nested structures, as
+    /// ``{variable: (star_variable, [slot, ...])}``.
+    ///
+    /// ``?s :location ?l . ?l :longitude ?v`` binds ``?v`` two slots down from
+    /// ``?s``, which no star can describe — ``?l`` has no ``rdf:type`` and is
+    /// part of ``?s``'s JSON rather than an object of its own. Read the value
+    /// with ``object_data->'location'->>'longitude'``.
+    ///
+    /// Only scalar leaves appear. A variable standing for the nested structure
+    /// itself serialises as a blank node, which nothing can reproduce, so it is
+    /// traversable but never a value.
+    #[getter]
+    fn path_bindings(&self) -> HashMap<String, (String, Vec<String>)> {
+        self.path_bindings.clone()
+    }
+
     /// Root of the algebra tree.
     #[getter]
     fn root(&self) -> PlanNode {
@@ -2100,6 +2117,11 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
         Ok(plan) => Ok(QueryPlan {
             root: PlanNode { inner: plan.root },
             sql_limit: plan.sql_limit,
+            path_bindings: plan
+                .path_bindings
+                .into_iter()
+                .map(|(var, binding)| (var, (binding.star_var, binding.slot_path)))
+                .collect(),
         }),
         Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
             Err(pyo3::exceptions::PyValueError::new_err(
