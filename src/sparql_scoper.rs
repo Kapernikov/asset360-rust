@@ -226,6 +226,49 @@ pub enum FilterCondition {
     Eq(String),
     /// Set membership: `VALUES ?var { "a" "b" }` → `WHERE object_data->>'field' IN ('a', 'b')`
     In(Vec<String>),
+    /// An ordering comparison: `FILTER(?len > 10)`.
+    ///
+    /// The consumer must compare the way SPARQL does, which is not how text
+    /// compares: a numeric slot casts (so 9 < 10), and a string slot needs
+    /// codepoint collation. The slot's term descriptor says which, so this
+    /// carries only the operator and the value.
+    Cmp { op: CmpOp, value: String },
+}
+
+/// Ordering operators liftable from a `FILTER` into SQL.
+///
+/// Deliberately not `!=`: SPARQL's inequality is false for an *unbound*
+/// variable, where SQL's `<>` on NULL is unknown and would drop rows the
+/// query keeps. Equality is already covered by [`FilterCondition::Eq`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+impl CmpOp {
+    /// The SQL operator. Safe to inline: it comes from this closed set, never
+    /// from the request.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            Self::Gt => ">",
+            Self::Gte => ">=",
+            Self::Lt => "<",
+            Self::Lte => "<=",
+        }
+    }
+
+    /// Stable string form for the Python boundary.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Gt => "gt",
+            Self::Gte => "gte",
+            Self::Lt => "lt",
+            Self::Lte => "lte",
+        }
+    }
 }
 
 /// Errors from query planning.
@@ -455,11 +498,20 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         let mut inline_filters = builder.inline_filters.clone();
         if let Some(id_name) = identifier_slot_name.as_deref() {
             if let Some(conds) = inline_filters.remove(id_name) {
+                // Equality and set membership become an `asset360_uri` lookup
+                // against the indexed column. An ordering comparison cannot —
+                // there is no finite value list — so it stays a filter and the
+                // renderer targets the same column with the operator.
+                let mut kept: Vec<FilterCondition> = Vec::new();
                 for cond in conds {
                     match cond {
                         FilterCondition::Eq(v) => identifier_values.push(v),
                         FilterCondition::In(vs) => identifier_values.extend(vs),
+                        cmp @ FilterCondition::Cmp { .. } => kept.push(cmp),
                     }
+                }
+                if !kept.is_empty() {
+                    inline_filters.insert(id_name.to_owned(), kept);
                 }
             }
             required_fields.retain(|s| s != id_name);
@@ -615,6 +667,11 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
                         match cond {
                             FilterCondition::Eq(v) => star.identifier_values.push(v),
                             FilterCondition::In(vs) => star.identifier_values.extend(vs),
+                            // See the Phase-1 note: an ordering comparison has
+                            // no value list to hoist, so it stays a filter.
+                            cmp @ FilterCondition::Cmp { .. } => {
+                                star.filters.entry(slot.clone()).or_default().push(cmp);
+                            }
                         }
                     }
                 } else {
@@ -900,6 +957,39 @@ fn extract_equality_from_expr(
                     .entry(field)
                     .or_default()
                     .push(FilterCondition::Eq(value));
+            }
+        }
+        Expression::Greater(left, right)
+        | Expression::GreaterOrEqual(left, right)
+        | Expression::Less(left, right)
+        | Expression::LessOrEqual(left, right) => {
+            // Written either way round: `?len > 10` and `10 < ?len` are the
+            // same constraint, so a reversed match flips the operator.
+            let forward = match expr {
+                Expression::Greater(..) => CmpOp::Gt,
+                Expression::GreaterOrEqual(..) => CmpOp::Gte,
+                Expression::Less(..) => CmpOp::Lt,
+                _ => CmpOp::Lte,
+            };
+            let (op, found) = match match_var_literal(left, right, var_to_field) {
+                Some(found) => (forward, Some(found)),
+                None => (
+                    match forward {
+                        CmpOp::Gt => CmpOp::Lt,
+                        CmpOp::Gte => CmpOp::Lte,
+                        CmpOp::Lt => CmpOp::Gt,
+                        CmpOp::Lte => CmpOp::Gte,
+                    },
+                    match_var_literal(right, left, var_to_field),
+                ),
+            };
+            if let Some((star_var, field, value)) = found {
+                star_filters
+                    .entry(star_var)
+                    .or_default()
+                    .entry(field)
+                    .or_default()
+                    .push(FilterCondition::Cmp { op, value });
             }
         }
         Expression::And(left, right) => {
@@ -1190,6 +1280,69 @@ classes:
         let plan = sparql_scope("SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10", &sv).unwrap();
 
         assert_eq!(plan.sql_limit, Some(10));
+    }
+
+    #[test]
+    fn test_comparison_filters_are_pushed_down() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:length ?len . \
+                 FILTER(?len > 10) }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        let conds = star.filters.get("length").expect("length filter");
+        assert!(matches!(
+            &conds[0],
+            FilterCondition::Cmp {
+                op: CmpOp::Gt,
+                value
+            } if value == "10"
+        ));
+    }
+
+    #[test]
+    fn test_reversed_comparison_flips_the_operator() {
+        // `10 < ?len` constrains ?len the same way `?len > 10` does; written
+        // the other way round the operator has to flip, or the filter would
+        // exclude exactly the rows it should keep.
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . FILTER(10 < ?len) }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        let conds = star.filters.get("length").expect("length filter");
+        assert!(
+            matches!(&conds[0], FilterCondition::Cmp { op: CmpOp::Gt, value } if value == "10"),
+            "expected > 10, got {:?}",
+            conds[0]
+        );
+    }
+
+    #[test]
+    fn test_range_filters_combine() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . \
+             FILTER(?len >= 10 && ?len <= 20) }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "s");
+        let conds = star.filters.get("length").expect("length filter");
+        assert_eq!(conds.len(), 2, "both bounds should be pushed: {conds:?}");
     }
 
     /// LIMIT must NOT be pushed into the object fetch when an operator has to

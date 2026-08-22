@@ -1319,6 +1319,10 @@ impl FilterCondition {
                 operator: "in".to_owned(),
                 values: vs.clone(),
             },
+            crate::sparql_scoper::FilterCondition::Cmp { op, value } => Self {
+                operator: op.as_str().to_owned(),
+                values: vec![value.clone()],
+            },
         }
     }
 }
