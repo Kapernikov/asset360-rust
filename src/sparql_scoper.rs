@@ -1053,8 +1053,21 @@ prefixes:
     prefix_reference: https://data.infrabel.be/asset360/
   linkml:
     prefix_reference: https://w3id.org/linkml/
+  xsd:
+    prefix_reference: http://www.w3.org/2001/XMLSchema#
 default_prefix: asset360
 default_range: string
+
+# Declared locally rather than imported: the term descriptor resolves
+# numeric-ness from the datatype IRI a type carries, so a schema whose types
+# are unresolved would make every slot look non-numeric.
+types:
+  string:
+    uri: xsd:string
+    base: str
+  integer:
+    uri: xsd:integer
+    base: int
 
 classes:
   Signal:

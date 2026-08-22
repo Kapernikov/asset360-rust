@@ -27,20 +27,7 @@ use spargebra::{Query, SparqlParser};
 use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_scoper::{ScopeError, Star, sparql_scope};
-
-/// LinkML type names whose values are numbers. `SUM`/`AVG` are refused on
-/// anything else: SPARQL raises a type error where SQL would silently cast,
-/// and the two routes must not disagree.
-const NUMERIC_RANGES: &[&str] = &[
-    "integer",
-    "float",
-    "double",
-    "decimal",
-    "nonNegativeInteger",
-    "positiveInteger",
-    "negativeInteger",
-    "nonPositiveInteger",
-];
+use crate::sparql_terms::{TermDescriptor, term_descriptor};
 
 /// Verdict for one query.
 #[derive(Debug, Clone)]
@@ -181,14 +168,15 @@ pub struct BindingSpec {
     /// Pointer to the schema position, for the term descriptor. Deliberately
     /// not a copy of the rendering decision: that stays on the schema side.
     pub term_ref: TermRef,
-    /// Whether the declared range is numeric.
+    /// How this column's stored text becomes an RDF term, resolved from the
+    /// schema once per column.
     ///
-    /// Decided here rather than in the renderer because it is schema
-    /// knowledge, and the renderer needs it for two separate reasons: a
-    /// numeric column casts before `SUM`/`AVG`/`MIN`/`MAX`, while a text
-    /// column has to sort under `COLLATE "C"` to match SPARQL's codepoint
-    /// ordering rather than the database's locale collation.
-    pub numeric: bool,
+    /// Carried here rather than left to the renderer because it is schema
+    /// knowledge, and the renderer needs it twice over: to answer in the same
+    /// terms the oxigraph route would, and to know whether a column casts
+    /// (numeric) or compares under `COLLATE "C"` (text, matching SPARQL's
+    /// codepoint ordering rather than the database's locale collation).
+    pub descriptor: TermDescriptor,
 }
 
 /// Where a binding sits in the schema. The renderer asks the schema how to turn
@@ -537,8 +525,7 @@ fn binding_for(
                 class_uri: star.class_uri.clone(),
                 slot_path: Vec::new(),
             },
-            // An object's own IRI is never a number.
-            numeric: false,
+            descriptor: TermDescriptor::subject_iri(),
         });
         return Ok(bindings.len() - 1);
     }
@@ -556,16 +543,31 @@ fn binding_for(
             )
         })?;
 
-    let numeric = is_numeric_slot(&star.class_uri, &slot, schema_view);
+    let slot_path = vec![slot];
+    // Unknown to the schema should be impossible here — the slot came from the
+    // star decomposition, which resolved it against this very class — but a
+    // descriptor is required to render the column, so refuse rather than guess.
+    let descriptor = term_descriptor(schema_view, &star.class_uri, &slot_path).ok_or_else(|| {
+        Blocked::new(
+            BlockedCode::UnscopedBinding,
+            format!(
+                "?{var_name} resolves to {slot_path:?} on <{}>, which the schema cannot describe \
+                 as an RDF term",
+                star.class_uri
+            ),
+            Some(format!("?{var_name}")),
+        )
+    })?;
+
     bindings.push(BindingSpec {
         var: var_name.to_owned(),
         star_var: star.variable.clone(),
-        slot_path: vec![slot.clone()],
+        slot_path: slot_path.clone(),
         term_ref: TermRef {
             class_uri: star.class_uri.clone(),
-            slot_path: vec![slot],
+            slot_path,
         },
-        numeric,
+        descriptor,
     });
     Ok(bindings.len() - 1)
 }
@@ -610,7 +612,7 @@ fn measure_for(
                     distinct: *distinct,
                 },
                 AggregateFunction::Sum | AggregateFunction::Avg => {
-                    if !bindings[arg].numeric {
+                    if !bindings[arg].descriptor.numeric {
                         return Err(Blocked::new(
                             BlockedCode::NonNumericMeasure,
                             format!(
@@ -645,24 +647,6 @@ fn measure_for(
             Ok(MeasureSpec { var, func })
         }
     }
-}
-
-/// Whether a slot's declared range is numeric, so a cast is legal.
-///
-/// Decided from the schema, never from the stored values: publish
-/// range-validates everything that enters the system, so the declared range is
-/// the authority.
-fn is_numeric_slot(class_uri: &str, slot_name: &str, schema_view: &SchemaView) -> bool {
-    let Ok(Some(class_view)) = schema_view.get_class_by_uri(class_uri) else {
-        return false;
-    };
-    class_view
-        .slots()
-        .iter()
-        .find(|s| s.name == slot_name)
-        .and_then(|s| s.definition().range.clone())
-        .map(|range| NUMERIC_RANGES.contains(&range.as_str()))
-        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------

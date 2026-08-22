@@ -42,6 +42,7 @@ pub mod shacl_ast;
 pub mod sparql_executor;
 pub mod sparql_pushdown;
 pub mod sparql_scoper;
+pub mod sparql_terms;
 
 #[cfg(feature = "shacl-parser")]
 pub mod shacl_parser;
@@ -1668,21 +1669,62 @@ impl PushdownBinding {
         &self.inner.term_ref.class_uri
     }
 
-    /// ``True`` when the slot's declared range is numeric.
+    /// ``True`` when the slot's values are numbers.
     ///
     /// The renderer needs this twice over: a numeric column is cast before
     /// aggregation, while a text column must be compared and sorted under
     /// ``COLLATE "C"`` — SPARQL orders simple literals by Unicode codepoint,
     /// which the database's default collation does not.
+    ///
+    /// Resolved from the datatype the schema derives (so a custom type with
+    /// ``typeof: integer`` counts), not from the range's spelling.
     #[getter]
     fn numeric(&self) -> bool {
-        self.inner.numeric
+        self.inner.descriptor.numeric
+    }
+
+    /// How this column's stored text becomes an RDF term: ``"iri"``,
+    /// ``"literal"`` or ``"enum_iri"``.
+    ///
+    /// An unrecognised value must be rejected rather than guessed — it means
+    /// the analyser knows a term shape this serialiser does not, and guessing
+    /// would answer differently from the oxigraph route.
+    #[getter]
+    fn term_kind(&self) -> &'static str {
+        use crate::sparql_terms::TermKind;
+        match self.inner.descriptor.kind {
+            TermKind::Iri => "iri",
+            TermKind::Literal => "literal",
+            TermKind::EnumIri => "enum_iri",
+        }
+    }
+
+    /// Datatype IRI for a typed literal, or ``None`` for a plain one.
+    #[getter]
+    fn datatype(&self) -> Option<String> {
+        self.inner.descriptor.datatype.clone()
+    }
+
+    /// Language tag, mutually exclusive with ``datatype`` per RDF.
+    #[getter]
+    fn lang(&self) -> Option<String> {
+        self.inner.descriptor.lang.clone()
+    }
+
+    /// For ``term_kind == "enum_iri"``: stored value → IRI. A value absent
+    /// from this map has no ``meaning`` in the schema and stays a literal,
+    /// which is what the turtle writer does.
+    #[getter]
+    fn enum_map(&self) -> HashMap<String, String> {
+        self.inner.descriptor.enum_map.iter().cloned().collect()
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "PushdownBinding(var={:?}, slot_path={:?})",
-            self.inner.var, self.inner.slot_path
+            "PushdownBinding(var={:?}, slot_path={:?}, term_kind={:?})",
+            self.inner.var,
+            self.inner.slot_path,
+            self.term_kind()
         )
     }
 }
