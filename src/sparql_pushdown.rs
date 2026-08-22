@@ -162,9 +162,17 @@ pub struct BindingSpec {
     pub var: String,
     /// The star's variable, which maps to a table alias.
     pub star_var: String,
-    /// Path from the object root to the value. One element today; a path
-    /// through nested inline objects when traversal lands.
+    /// Path from the object root to the value: one slot per step.
     pub slot_path: Vec<String>,
+    /// Parallel to `slot_path`: whether each step holds a collection rather
+    /// than a single value.
+    ///
+    /// RDF gives one triple per element of a collection, so a query over a
+    /// multivalued slot has one solution per element — which a consumer must
+    /// reproduce by unnesting, or the counts come out as one-per-record. Kept
+    /// per step because any hop along a path may be a collection, and each one
+    /// multiplies the rows.
+    pub containers: Vec<Container>,
     /// Pointer to the schema position, for the term descriptor. Deliberately
     /// not a copy of the rendering decision: that stays on the schema side.
     pub term_ref: TermRef,
@@ -177,6 +185,41 @@ pub struct BindingSpec {
     /// (numeric) or compares under `COLLATE "C"` (text, matching SPARQL's
     /// codepoint ordering rather than the database's locale collation).
     pub descriptor: TermDescriptor,
+}
+
+/// How one step of a path is stored, mirroring the schema's own three-way
+/// distinction rather than inventing a fourth vocabulary
+/// (`SlotContainerMode::{SingleValue, List, Mapping}` upstream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    /// One value.
+    Single,
+    /// A JSON array: unnest its elements.
+    List,
+    /// A JSON object keyed by the range's identifier: unnest its values. The
+    /// turtle writer iterates the values too, so the keys are not part of the
+    /// graph.
+    Mapping,
+}
+
+impl Container {
+    /// Stable string form for the Python boundary.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::List => "list",
+            Self::Mapping => "mapping",
+        }
+    }
+
+    fn from_slot(slot: &linkml_schemaview::slotview::SlotView) -> Self {
+        use linkml_schemaview::slotview::SlotContainerMode;
+        match slot.determine_slot_container_mode() {
+            SlotContainerMode::SingleValue => Self::Single,
+            SlotContainerMode::List => Self::List,
+            SlotContainerMode::Mapping => Self::Mapping,
+        }
+    }
 }
 
 /// Where a binding sits in the schema. The renderer asks the schema how to turn
@@ -586,6 +629,7 @@ fn binding_for(
                 class_uri: star.class_uri.clone(),
                 slot_path: Vec::new(),
             },
+            containers: Vec::new(),
             descriptor: TermDescriptor::subject_iri(),
         });
         return Ok(bindings.len() - 1);
@@ -626,10 +670,12 @@ fn binding_for(
         )
     })?;
 
+    let containers = containers_along(schema_view, &star.class_uri, &slot_path);
     bindings.push(BindingSpec {
         var: var_name.to_owned(),
         star_var: star.variable.clone(),
         slot_path: slot_path.clone(),
+        containers,
         term_ref: TermRef {
             class_uri: star.class_uri.clone(),
             slot_path,
@@ -640,6 +686,44 @@ fn binding_for(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Resolve how each step of a path is stored, walking the same route the
+/// descriptor does.
+///
+/// A step that cannot be resolved is reported as `Single`: the descriptor
+/// resolution runs first and refuses anything the schema does not describe, so
+/// reaching this with an unknown slot is not possible — and assuming "single"
+/// would under-count rather than invent rows.
+fn containers_along(
+    schema_view: &SchemaView,
+    class_uri: &str,
+    slot_path: &[String],
+) -> Vec<Container> {
+    let mut out = Vec::with_capacity(slot_path.len());
+    let Ok(Some(mut class_view)) = schema_view.get_class_by_uri(class_uri) else {
+        return vec![Container::Single; slot_path.len()];
+    };
+
+    for (i, slot_name) in slot_path.iter().enumerate() {
+        let Some(slot) = class_view
+            .slots()
+            .iter()
+            .find(|s| s.name == *slot_name)
+            .cloned()
+        else {
+            out.extend(std::iter::repeat_n(Container::Single, slot_path.len() - i));
+            break;
+        };
+        out.push(Container::from_slot(&slot));
+
+        match slot.get_range_class() {
+            Some(next) => class_view = next,
+            None => break,
+        }
+    }
+
+    out
+}
+
 fn measure_for(
     aggregate: &AggregateExpression,
     result_var: &str,

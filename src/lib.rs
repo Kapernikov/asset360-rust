@@ -1690,6 +1690,24 @@ impl PushdownBinding {
         &self.inner.term_ref.class_uri
     }
 
+    /// How each step of ``slot_path`` is stored: ``"single"``, ``"list"`` or
+    /// ``"mapping"``, one entry per step.
+    ///
+    /// RDF gives one triple per element of a collection, so a query over a
+    /// multivalued slot has one solution per element. A consumer must unnest
+    /// those (``jsonb_array_elements`` for a list, ``jsonb_each`` for a
+    /// mapping, whose keys are not part of the graph) or the counts come out as
+    /// one per record. Any hop along a path may be a collection, and each one
+    /// multiplies the rows.
+    #[getter]
+    fn containers(&self) -> Vec<&'static str> {
+        self.inner
+            .containers
+            .iter()
+            .map(|container| container.as_str())
+            .collect()
+    }
+
     /// ``True`` when the slot's values are numbers.
     ///
     /// The renderer needs this twice over: a numeric column is cast before
