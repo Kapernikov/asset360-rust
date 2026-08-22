@@ -420,19 +420,46 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     let stars = plan.root.all_stars();
     let joins = plan.root.all_joins();
 
-    if stars.len() != 1 || !joins.is_empty() {
+    if stars.is_empty() {
+        return Ok(blocked(
+            BlockedCode::UnsupportedPattern,
+            "no class is scoped, so there is nothing to group over",
+            None,
+        ));
+    }
+
+    // Several classes are fine when join edges connect them: each edge becomes
+    // a SQL JOIN on `right.object_data->>slot = left.asset360_uri`. Without an
+    // edge the classes are independent, and the SQL would be a cross product —
+    // where oxigraph evaluates two unrelated patterns. Different questions, so
+    // refuse rather than answer the wrong one.
+    if stars.len() > 1 && joins.len() < stars.len() - 1 {
         return Ok(blocked(
             BlockedCode::UnsupportedPattern,
             format!(
-                "pushdown currently handles one class per question; this query has {} \
-                 scoped classes and {} joins",
+                "this question spans {} classes with only {} reference(s) between \
+                 them, so they are not all connected",
                 stars.len(),
                 joins.len()
             ),
             None,
         ));
     }
-    let star = stars[0];
+
+    // A left-joined star can contribute unbound rows, which changes what the
+    // aggregates count. Supported for the values *inside* a star, not yet for
+    // an optional star of its own.
+    if let Some(optional) = stars.iter().find(|s| s.is_optional) {
+        return Ok(blocked(
+            BlockedCode::UnsupportedPattern,
+            format!(
+                "?{} is introduced inside an OPTIONAL block; grouping across an \
+                 optional class is not supported yet",
+                optional.variable
+            ),
+            Some(format!("?{}", optional.variable)),
+        ));
+    }
 
     let mut bindings: Vec<BindingSpec> = Vec::new();
 
@@ -441,7 +468,7 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     for var in group_vars {
         match binding_for(
             var.as_str(),
-            star,
+            &stars,
             &plan.path_bindings,
             schema_view,
             &mut bindings,
@@ -463,7 +490,7 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         match measure_for(
             aggregate,
             result_name,
-            star,
+            &stars,
             &plan.path_bindings,
             schema_view,
             &mut bindings,
@@ -520,7 +547,7 @@ fn blocked(code: BlockedCode, detail: impl Into<String>, at: Option<String>) -> 
 /// the first mention.
 fn binding_for(
     var_name: &str,
-    star: &Star,
+    stars: &[&Star],
     path_bindings: &std::collections::HashMap<String, PathBinding>,
     schema_view: &SchemaView,
     bindings: &mut Vec<BindingSpec>,
@@ -528,6 +555,26 @@ fn binding_for(
     if let Some(i) = bindings.iter().position(|b| b.var == var_name) {
         return Ok(i);
     }
+
+    // Which star owns this variable: the one whose subject it is, or whose
+    // slot binds it, or whose nested structure it sits in.
+    let star = stars
+        .iter()
+        .copied()
+        .find(|s| {
+            s.variable == var_name
+                || s.slot_variables.values().any(|v| v == var_name)
+                || path_bindings
+                    .get(var_name)
+                    .is_some_and(|b| b.star_var == s.variable)
+        })
+        .ok_or_else(|| {
+            Blocked::new(
+                BlockedCode::UnscopedBinding,
+                format!("?{var_name} is not bound by any scoped class in this query"),
+                Some(format!("?{var_name}")),
+            )
+        })?;
 
     // The star's subject variable binds the object's own IRI.
     if star.variable == var_name {
@@ -596,7 +643,7 @@ fn binding_for(
 fn measure_for(
     aggregate: &AggregateExpression,
     result_var: &str,
-    star: &Star,
+    stars: &[&Star],
     path_bindings: &std::collections::HashMap<String, PathBinding>,
     schema_view: &SchemaView,
     bindings: &mut Vec<BindingSpec>,
@@ -626,7 +673,7 @@ fn measure_for(
                     None,
                 ));
             };
-            let arg = binding_for(v.as_str(), star, path_bindings, schema_view, bindings)?;
+            let arg = binding_for(v.as_str(), stars, path_bindings, schema_view, bindings)?;
 
             let func = match name {
                 AggregateFunction::Count => Measure::Count {
@@ -640,7 +687,7 @@ fn measure_for(
                             format!(
                                 "?{} is not a numeric slot of <{}>",
                                 v.as_str(),
-                                star.class_uri
+                                bindings[arg].term_ref.class_uri
                             ),
                             Some(format!("?{}", v.as_str())),
                         ));
@@ -857,12 +904,65 @@ mod tests {
     }
 
     #[test]
-    fn multi_class_questions_are_refused_for_now() {
+    fn groups_across_a_reference_between_classes() {
+        // "components per tunnel complex": two classes, connected by a
+        // reference, which becomes a SQL JOIN.
+        let spec = eligible(
+            "SELECT ?cn (COUNT(*) AS ?n) WHERE { \
+             ?c a asset360:TunnelComplex ; asset360:hasName ?cn . \
+             ?comp a asset360:CivilEngineeringAsset ; asset360:belongsToTunnelComplex ?c } \
+             GROUP BY ?cn",
+        );
+
+        let key = &spec.bindings[spec.group_keys[0]];
+        assert_eq!(key.var, "cn");
+        // The group key belongs to the complex, not to the component — a
+        // binding names its own star so the renderer reads the right alias.
+        assert_eq!(key.star_var, "c");
+        assert_eq!(key.slot_path, vec!["hasName"]);
+    }
+
+    #[test]
+    fn measures_can_come_from_the_other_class() {
+        let spec = eligible(
+            "SELECT ?cn (COUNT(?compName) AS ?n) WHERE { \
+             ?c a asset360:TunnelComplex ; asset360:hasName ?cn . \
+             ?comp a asset360:CivilEngineeringAsset ; asset360:belongsToTunnelComplex ?c ; \
+             asset360:hasName ?compName } \
+             GROUP BY ?cn",
+        );
+
+        let arg = match spec.measures[0].func {
+            Measure::Count { arg: Some(i), .. } => i,
+            ref other => panic!("expected COUNT(?compName), got {other:?}"),
+        };
+        assert_eq!(spec.bindings[arg].star_var, "comp");
+    }
+
+    #[test]
+    fn unconnected_classes_are_refused() {
+        // Without a reference between them the SQL would be a cross product,
+        // where oxigraph evaluates two independent patterns. Different
+        // questions, so answering either one would be wrong.
         assert_eq!(
             blocked_code(
                 "SELECT ?cn (COUNT(*) AS ?n) WHERE { \
                  ?c a asset360:TunnelComplex ; asset360:hasName ?cn . \
-                 ?comp a asset360:CivilEngineeringAsset ; asset360:belongsToTunnelComplex ?c } \
+                 ?sig a asset360:Signal } \
+                 GROUP BY ?cn"
+            ),
+            BlockedCode::UnsupportedPattern
+        );
+    }
+
+    #[test]
+    fn an_optional_class_is_refused() {
+        assert_eq!(
+            blocked_code(
+                "SELECT ?cn (COUNT(*) AS ?n) WHERE { \
+                 ?c a asset360:TunnelComplex ; asset360:hasName ?cn . \
+                 OPTIONAL { ?comp a asset360:CivilEngineeringAsset ; \
+                 asset360:belongsToTunnelComplex ?c } } \
                  GROUP BY ?cn"
             ),
             BlockedCode::UnsupportedPattern
