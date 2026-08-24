@@ -53,6 +53,27 @@ pub struct QueryPlan {
     /// nested structure itself, which serialises as a blank node — nothing a
     /// consumer can reproduce — so it is traversable but not bindable.
     pub path_bindings: HashMap<String, PathBinding>,
+
+    /// Whether this plan represents the query *completely*.
+    ///
+    /// Every extraction step here is deliberately lossy in the safe direction:
+    /// a constraint that cannot be expressed is dropped, the fetch widens, and
+    /// oxigraph re-applies the real query to what came back. That makes a
+    /// dropped constraint invisible — which is fine for a prefetch and fatal
+    /// for anything treating the plan as the answer, where the same loss is a
+    /// plausible wrong number with no error.
+    ///
+    /// `false` means something in the query is not in this plan: a `FILTER`
+    /// this cannot express, a triple whose subject is not a scoped class, a
+    /// sub-`SELECT`, a `FILTER` inside `OPTIONAL`. A consumer that needs an
+    /// exact plan — the aggregate pushdown — must refuse; a consumer that only
+    /// needs a superset may ignore it.
+    ///
+    /// Also gates `sql_limit`: a LIMIT is only pushable when the fetch it
+    /// bounds is the real row set. With a dropped `FILTER(REGEX(...))`, LIMIT
+    /// 10 fetches ten arbitrary rows and oxigraph filters them down to a
+    /// handful, where the query asked for ten matches.
+    pub exact: bool,
 }
 
 /// Where a nested variable's value lives, relative to a star.
@@ -708,7 +729,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     }
 
     let mut star_filters: HashMap<String, HashMap<String, Vec<FilterCondition>>> = HashMap::new();
-    collect_filter_conditions(pattern, &var_to_field, &mut star_filters);
+    let filters_complete = collect_filter_conditions(pattern, 0, &var_to_field, &mut star_filters);
     collect_values_filters(pattern, &var_to_field, &mut star_filters);
 
     for star in &mut stars {
@@ -745,13 +766,11 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // DISTINCT — see has_holistic_modifier).
     let has_optional = !stars.iter().all(|s| !s.is_optional)
         || joins.iter().any(|j| j.join_type == JoinType::Left);
-    let sql_limit =
-        if stars.len() == 1 && joins.is_empty() && !has_optional && !has_holistic_modifier(pattern)
-        {
-            extract_top_level_limit(pattern)
-        } else {
-            None
-        };
+    let sql_limit = if stars.len() == 1 && joins.is_empty() && !has_optional {
+        pushable_limit(pattern)
+    } else {
+        None
+    };
 
     // Phase 5: Wrap the result into a PlanNode tree. If the original
     // pattern has no OPTIONAL (all joins inner, no optional stars), emit
@@ -802,12 +821,38 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
 
     // Phase 6: paths into nested structures. Done after the stars exist so a
     // variable that *is* a star is never mistaken for a step inside one.
-    let path_bindings = collect_path_bindings(&star_map, &var_to_class, schema_view);
+    let (path_bindings, traversed) = collect_path_bindings(&star_map, &var_to_class, schema_view);
+
+    // Phase 7: is this plan the whole query?
+    //
+    // Each of these is a way the extraction above loses something. None of them
+    // matters for a prefetch — oxigraph re-applies the query — and every one of
+    // them is a wrong answer for a consumer treating the plan as exact.
+    let every_subject_scoped = triples_with_depth.iter().all(|(tp, _)| match &tp.subject {
+        TermPattern::Variable(v) => {
+            let name = v.as_str();
+            // Either the subject is a scoped class, or it is a step inside one
+            // (an inline structure reached by a path).
+            var_to_class.contains_key(name) || traversed.contains(name)
+        }
+        // A constant-IRI subject became a star of its own in Phase 1.
+        TermPattern::NamedNode(_) => true,
+        _ => false,
+    });
+
+    let exact = filters_complete && every_subject_scoped && !contains_subquery(pattern);
+
+    // A LIMIT may only be pushed into a fetch that returns the real row set.
+    // With a dropped FILTER the fetch is a superset, so ten rows off the top
+    // are ten arbitrary rows, and oxigraph then filters them down to fewer
+    // than the query asked for.
+    let sql_limit = if exact { sql_limit } else { None };
 
     Ok(QueryPlan {
         root,
         sql_limit,
         path_bindings,
+        exact,
     })
 }
 
@@ -974,22 +1019,53 @@ fn tag_triples_by_depth<'a>(
 }
 
 /// Collect FILTER equality conditions, now keyed by (star_variable, slot_name).
+/// Collect the FILTER conditions that can be pushed to SQL.
+///
+/// Returns `false` when anything was left behind, which the caller records as
+/// inexactness. Two ways that happens:
+///
+/// * an expression this cannot express — `!=`, `||`, `!`, `REGEX`, `BOUND`, a
+///   comparison between two variables;
+/// * a `FILTER` inside an `OPTIONAL`. Pushing one into the fetch drops rows the
+///   LEFT JOIN is supposed to preserve, which is why inline constants are
+///   depth-gated; this recursed into `LeftJoin` with no gate.
 fn collect_filter_conditions(
     pattern: &GraphPattern,
+    depth: usize,
     var_to_field: &HashMap<String, (String, String)>,
     star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
-) {
+) -> bool {
     match pattern {
         GraphPattern::Filter { expr, inner } => {
-            extract_equality_from_expr(expr, var_to_field, star_filters);
-            collect_filter_conditions(inner, var_to_field, star_filters);
+            let handled = if depth == 0 {
+                extract_equality_from_expr(expr, var_to_field, star_filters)
+            } else {
+                // Inside an OPTIONAL: leave it entirely to oxigraph.
+                false
+            };
+            handled & collect_filter_conditions(inner, depth, var_to_field, star_filters)
+        }
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            let l = collect_filter_conditions(left, depth, var_to_field, star_filters);
+            let r = collect_filter_conditions(right, depth + 1, var_to_field, star_filters);
+            // `OPTIONAL { ... FILTER(...) }` does not leave a Filter node:
+            // spargebra lifts the condition into the LeftJoin itself. It is not
+            // pushable — it decides whether the optional side *matched*, so
+            // applying it to the fetch would drop rows the LEFT JOIN exists to
+            // keep — and it is not represented in the plan either, so a
+            // consumer treating the plan as exact has to know.
+            l & r & expression.is_none()
         }
         GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
-            collect_filter_conditions(left, var_to_field, star_filters);
-            collect_filter_conditions(right, var_to_field, star_filters);
+            let l = collect_filter_conditions(left, depth, var_to_field, star_filters);
+            let r = collect_filter_conditions(right, depth, var_to_field, star_filters);
+            l & r
         }
         GraphPattern::Extend { inner, .. }
         | GraphPattern::OrderBy { inner, .. }
@@ -1000,17 +1076,22 @@ fn collect_filter_conditions(
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => {
-            collect_filter_conditions(inner, var_to_field, star_filters);
+            collect_filter_conditions(inner, depth, var_to_field, star_filters)
         }
-        _ => {}
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => true,
     }
 }
 
+/// Push what this expression says into `star_filters`.
+///
+/// Returns `false` when any part of it could not be expressed, so the caller
+/// knows the plan no longer describes the whole query. Silence here is what
+/// turned a dropped `REGEX` into ten arbitrary rows.
 fn extract_equality_from_expr(
     expr: &Expression,
     var_to_field: &HashMap<String, (String, String)>,
     star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
-) {
+) -> bool {
     match expr {
         Expression::Equal(left, right) => {
             if let Some((star_var, field, value)) = match_var_literal(left, right, var_to_field)
@@ -1022,6 +1103,11 @@ fn extract_equality_from_expr(
                     .entry(field)
                     .or_default()
                     .push(FilterCondition::Eq(value));
+                true
+            } else {
+                // A comparison between two variables, or against something
+                // that is not a literal.
+                false
             }
         }
         Expression::Greater(left, right)
@@ -1055,13 +1141,22 @@ fn extract_equality_from_expr(
                     .entry(field)
                     .or_default()
                     .push(FilterCondition::Cmp { op, value });
+                true
+            } else {
+                false
             }
         }
         Expression::And(left, right) => {
-            extract_equality_from_expr(left, var_to_field, star_filters);
-            extract_equality_from_expr(right, var_to_field, star_filters);
+            // Both halves must land: `A && B` with B dropped is a weaker
+            // filter, which over-fetches — safe for a prefetch, wrong for an
+            // exact plan, and the caller can only tell if it hears about it.
+            let l = extract_equality_from_expr(left, var_to_field, star_filters);
+            let r = extract_equality_from_expr(right, var_to_field, star_filters);
+            l & r
         }
-        _ => {}
+        // Everything else — `!=`, `||`, `!`, REGEX, BOUND, arithmetic — is left
+        // to oxigraph, and the plan is no longer a complete description.
+        _ => false,
     }
 }
 
@@ -1142,12 +1237,95 @@ fn collect_values_filters(
     }
 }
 
-/// Extract top-level LIMIT from the query pattern.
-fn extract_top_level_limit(pattern: &GraphPattern) -> Option<usize> {
+/// Whether the pattern contains a sub-`SELECT`.
+///
+/// A subquery has its own projection and its own modifiers — a `LIMIT 5` inside
+/// bounds what the outer query can see — and none of that reaches the star
+/// decomposition, which walks straight through to the triples. Reported as
+/// inexact rather than partially parsed: half-understanding a subquery is how a
+/// count over five rows becomes a count over all of them.
+fn contains_subquery(pattern: &GraphPattern) -> bool {
+    // The outermost Project is the query's own; anything deeper is a subquery.
+    fn walk(pattern: &GraphPattern, inside: bool) -> bool {
+        match pattern {
+            GraphPattern::Project { inner, .. } => inside || walk(inner, true),
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Graph { inner, .. }
+            | GraphPattern::Service { inner, .. } => walk(inner, inside),
+            GraphPattern::Join { left, right }
+            | GraphPattern::LeftJoin { left, right, .. }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Minus { left, right } => walk(left, inside) || walk(right, inside),
+            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
+                false
+            }
+        }
+    }
+    walk(pattern, false)
+}
+
+/// The LIMIT that may be pushed into the object fetch, if any.
+///
+/// One function decides, because the bug this replaced was two of them
+/// disagreeing: extraction walked `Slice`/`Project` while the eligibility check
+/// looked at stars and joins, so nothing owned the question "is this LIMIT safe
+/// to push?" and a `GROUP BY` slipped between them. Finding a limit and
+/// refusing to push it are the same decision, so they are one walk — there is
+/// no way to get a limit out of here without passing the check.
+///
+/// The operators that consume the whole sequence before LIMIT applies:
+///
+/// * `Group` — both `GROUP BY` and a bare aggregate, which spargebra models as
+///   a `Group` with no grouping variables. A pushed LIMIT would aggregate over
+///   an arbitrary subset and return a plausible, wrong number.
+/// * `OrderBy` — would sort an arbitrary subset rather than the top of the full
+///   ordering.
+/// * `Distinct` / `Reduced` — would deduplicate an arbitrary subset, returning
+///   fewer distinct values than exist. That is the shape a filter dropdown uses.
+fn pushable_limit(pattern: &GraphPattern) -> Option<usize> {
     match pattern {
-        GraphPattern::Slice { length, .. } => *length,
-        GraphPattern::Project { inner, .. } => extract_top_level_limit(inner),
-        _ => None,
+        // Holistic: nothing below may be pushed, whatever it says.
+        GraphPattern::Group { .. }
+        | GraphPattern::OrderBy { .. }
+        | GraphPattern::Distinct { .. }
+        | GraphPattern::Reduced { .. } => None,
+
+        // A limit, pushable only if nothing below must see every solution.
+        GraphPattern::Slice { inner, length, .. } => {
+            if is_holistic(inner) {
+                None
+            } else {
+                // An inner Slice wins: it applies first, so it bounds what this
+                // one can ever see.
+                match (pushable_limit(inner), *length) {
+                    (Some(inner_limit), Some(outer)) => Some(inner_limit.min(outer)),
+                    (Some(inner_limit), None) => Some(inner_limit),
+                    (None, outer) => outer,
+                }
+            }
+        }
+
+        // Transparent: keep looking underneath.
+        GraphPattern::Project { inner, .. }
+        | GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Service { inner, .. } => pushable_limit(inner),
+
+        // No limit here.
+        GraphPattern::Join { .. }
+        | GraphPattern::LeftJoin { .. }
+        | GraphPattern::Union { .. }
+        | GraphPattern::Minus { .. }
+        | GraphPattern::Bgp { .. }
+        | GraphPattern::Path { .. }
+        | GraphPattern::Values { .. } => None,
     }
 }
 
@@ -1160,8 +1338,11 @@ fn collect_path_bindings(
     star_map: &HashMap<String, StarBuilder>,
     var_to_class: &HashMap<String, String>,
     schema_view: &SchemaView,
-) -> HashMap<String, PathBinding> {
+) -> (HashMap<String, PathBinding>, HashSet<String>) {
     let mut out: HashMap<String, PathBinding> = HashMap::new();
+    // Every variable the walk passed through or landed on. Used to tell a
+    // legitimate step inside a star from a subject nothing accounts for.
+    let mut traversed: HashSet<String> = HashSet::new();
 
     // Deterministic order: two stars could in principle reach the same variable,
     // and which path wins must not depend on hash iteration order.
@@ -1180,10 +1361,11 @@ fn collect_path_bindings(
             star_map,
             var_to_class,
             &mut out,
+            &mut traversed,
         );
     }
 
-    out
+    (out, traversed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1195,6 +1377,7 @@ fn walk_paths(
     star_map: &HashMap<String, StarBuilder>,
     var_to_class: &HashMap<String, String>,
     out: &mut HashMap<String, PathBinding>,
+    traversed: &mut HashSet<String>,
 ) {
     if path_so_far.len() >= MAX_PATH_DEPTH {
         return;
@@ -1228,6 +1411,7 @@ fn walk_paths(
                     slot.determine_slot_inline_mode(),
                     linkml_schemaview::slotview::SlotInlineMode::Inline
                 ) {
+                    traversed.insert(object_var.clone());
                     walk_paths(
                         star_var,
                         object_var,
@@ -1236,12 +1420,14 @@ fn walk_paths(
                         star_map,
                         var_to_class,
                         out,
+                        traversed,
                     );
                 }
             }
             // A scalar leaf. Depth one is already in Star::slot_variables;
             // recording it again would give two answers to one question.
             None => {
+                traversed.insert(object_var.clone());
                 if path.len() > 1 {
                     out.insert(
                         object_var.clone(),
@@ -1256,18 +1442,11 @@ fn walk_paths(
     }
 }
 
-/// True when the query has an operator that consumes the *whole* solution
-/// sequence before LIMIT applies, which makes pushing LIMIT into the object
-/// fetch unsound.
+/// Whether any operator below this point must see every solution.
 ///
-/// `Group` covers both `GROUP BY` and bare aggregates (spargebra models
-/// `SELECT (COUNT(*) AS ?n)` as a `Group` with no grouping variables): a
-/// LIMIT applied to the fetch would aggregate over an arbitrary subset and
-/// return a plausible, wrong number with no error. `OrderBy` would sort an
-/// arbitrary subset instead of the top of the full ordering, and `Distinct` /
-/// `Reduced` would deduplicate one, returning fewer distinct values than
-/// exist — the shape a filter dropdown uses.
-fn has_holistic_modifier(pattern: &GraphPattern) -> bool {
+/// Only [`pushable_limit`] calls this, to tell "no limit found" apart from
+/// "found one that must not be pushed".
+fn is_holistic(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Group { .. }
         | GraphPattern::OrderBy { .. }
@@ -1278,13 +1457,11 @@ fn has_holistic_modifier(pattern: &GraphPattern) -> bool {
         | GraphPattern::Project { inner, .. }
         | GraphPattern::Slice { inner, .. }
         | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => has_holistic_modifier(inner),
+        | GraphPattern::Service { inner, .. } => is_holistic(inner),
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
-            has_holistic_modifier(left) || has_holistic_modifier(right)
-        }
+        | GraphPattern::Minus { left, right } => is_holistic(left) || is_holistic(right),
         // Left exhaustive on purpose: a new GraphPattern variant should be a
         // compile error here, not a silent "safe to push the LIMIT down".
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,

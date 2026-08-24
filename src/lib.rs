@@ -1604,6 +1604,7 @@ pub struct QueryPlan {
     root: PlanNode,
     sql_limit: Option<usize>,
     path_bindings: HashMap<String, (String, Vec<String>)>,
+    exact: bool,
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -1624,6 +1625,24 @@ impl QueryPlan {
     #[getter]
     fn path_bindings(&self) -> HashMap<String, (String, Vec<String>)> {
         self.path_bindings.clone()
+    }
+
+    /// Whether this plan describes the query *completely*.
+    ///
+    /// Extraction is deliberately lossy in the safe direction: a constraint
+    /// that cannot be expressed is dropped, the fetch widens, and oxigraph
+    /// re-applies the real query to what came back. ``False`` means something
+    /// was dropped — a ``FILTER`` this cannot express, a triple whose subject
+    /// is not a scoped class, a sub-``SELECT``, a ``FILTER`` inside
+    /// ``OPTIONAL``.
+    ///
+    /// A consumer that only needs a superset (fetch objects, let oxigraph
+    /// answer) may ignore this. A consumer that answers *from* the plan must
+    /// refuse when it is ``False``, or it answers a weaker question and reports
+    /// a plausible wrong number.
+    #[getter]
+    fn exact(&self) -> bool {
+        self.exact
     }
 
     /// Root of the algebra tree.
@@ -1983,6 +2002,17 @@ impl PushdownSolution {
         self.inner.offset
     }
 
+    /// The variables the query asks for, in ``SELECT`` order.
+    ///
+    /// A measure or binding absent from this list is machinery: a value grouped
+    /// by but not selected, or an aggregate that exists only to order by — the
+    /// latter has no ``AS`` name, so emitting it would produce a column named
+    /// after an internal identifier.
+    #[getter]
+    fn projected(&self) -> Vec<String> {
+        self.inner.projected.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PushdownSolution(bindings={}, group_keys={:?}, measures={})",
@@ -2168,6 +2198,7 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
                 .into_iter()
                 .map(|(var, binding)| (var, (binding.star_var, binding.slot_path)))
                 .collect(),
+            exact: plan.exact,
         }),
         Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
             Err(pyo3::exceptions::PyValueError::new_err(

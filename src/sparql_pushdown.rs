@@ -83,8 +83,16 @@ pub enum BlockedCode {
     /// other computed value.
     UnsupportedExpression,
     /// A pattern the star decomposition cannot express as one SQL query:
-    /// `UNION`, `MINUS`, property paths, subqueries, or several stars.
+    /// `UNION`, `MINUS`, property paths, subqueries, or unconnected classes.
     UnsupportedPattern,
+    /// The plan does not describe the whole query, so answering from it would
+    /// answer a *different* question — usually a weaker one.
+    ///
+    /// Distinct from `UnsupportedPattern` because the cause is not the shape of
+    /// the query but what the planner had to leave out of it: a `FILTER` it
+    /// cannot express, a triple whose subject is not a scoped class, a
+    /// sub-`SELECT`, a `FILTER` inside `OPTIONAL`.
+    IncompletePlan,
     /// `SUM`/`AVG` over a slot whose declared range is not numeric.
     NonNumericMeasure,
     /// A grouping or measure variable that is not bound to a slot of a scoped
@@ -100,6 +108,7 @@ impl BlockedCode {
             Self::UnsupportedAggregate => "unsupported_aggregate",
             Self::UnsupportedExpression => "unsupported_expression",
             Self::UnsupportedPattern => "unsupported_pattern",
+            Self::IncompletePlan => "incomplete_plan",
             Self::NonNumericMeasure => "non_numeric_measure",
             Self::UnscopedBinding => "unscoped_binding",
         }
@@ -122,6 +131,14 @@ impl BlockedCode {
                 "Group over one class at a time. Ask a separate question per \
                  branch instead of UNION/MINUS, and spell out each step of a \
                  path as its own triple pattern."
+            }
+            Self::IncompletePlan => {
+                "Something in this question cannot be turned into SQL, so it \
+                 cannot be aggregated in the database. Constrain values with \
+                 `=`, `IN`, or a `<`/`>` comparison rather than `!=`, `||`, \
+                 `REGEX` or `BOUND`; give every subject an `rdf:type`; keep \
+                 FILTERs outside OPTIONAL; and ask sub-queries as separate \
+                 questions."
             }
             Self::NonNumericMeasure => {
                 "SUM and AVG need a numeric slot. Use COUNT to count values, \
@@ -153,6 +170,14 @@ pub struct SolutionSpec {
     pub distinct: bool,
     pub limit: Option<usize>,
     pub offset: usize,
+    /// The variables the query asks for, in `SELECT` order.
+    ///
+    /// Not every binding or measure is projected. A variable may exist only to
+    /// be grouped by, and an aggregate written as `ORDER BY DESC(COUNT(*))` has
+    /// no `AS` name at all — spargebra invents an internal one, and emitting it
+    /// would hand the caller a column named after a hash. Anything absent from
+    /// this list is machinery, not an answer.
+    pub projected: Vec<String>,
 }
 
 /// One projected variable, resolved to where its value lives.
@@ -306,6 +331,8 @@ struct Peeled<'a> {
     /// does not reproduce.
     extends: Vec<(&'a Variable, &'a Expression)>,
     group: Option<GroupParts<'a>>,
+    /// Variables from the outermost `Project` — what the query asks for.
+    projection: Vec<String>,
 }
 
 /// First `BIND` found inside a pattern, if any.
@@ -348,15 +375,31 @@ fn peel<'a>(pattern: &'a GraphPattern, out: &mut Peeled<'a>) {
             start,
             length,
         } => {
-            out.offset = *start;
-            out.limit = *length;
+            // Compose rather than assign: `LIMIT 3` wrapped around a subquery's
+            // `LIMIT 10` returns three rows, and overwriting would return ten.
+            // Sub-queries are refused as inexact before this runs, so today the
+            // nesting cannot occur — the arithmetic is here so that stops being
+            // load-bearing.
+            out.offset += *start;
+            out.limit = match (out.limit, *length) {
+                (Some(outer), Some(inner_limit)) => Some(outer.min(inner_limit)),
+                (Some(outer), None) => Some(outer),
+                (None, inner_limit) => inner_limit,
+            };
             peel(inner, out);
         }
         GraphPattern::Distinct { inner } | GraphPattern::Reduced { inner } => {
             out.distinct = true;
             peel(inner, out);
         }
-        GraphPattern::Project { inner, .. } => peel(inner, out),
+        GraphPattern::Project { inner, variables } => {
+            // The outermost projection is the query's; a nested one belongs to
+            // a subquery, which is refused before this point.
+            if out.projection.is_empty() {
+                out.projection = variables.iter().map(|v| v.as_str().to_owned()).collect();
+            }
+            peel(inner, out)
+        }
         GraphPattern::OrderBy { inner, expression } => {
             out.order_by = expression;
             peel(inner, out);
@@ -411,6 +454,7 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         order_by: &[],
         extends: Vec::new(),
         group: None,
+        projection: Vec::new(),
     };
     peel(pattern, &mut peeled);
 
@@ -464,6 +508,25 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     // already resolves classes, slots and join edges. Passing the parsed query
     // keeps this to one parse per call.
     let plan = scope_parsed(&parsed, schema_view)?;
+
+    // The plan is built to decide what to *load*, and every extraction step is
+    // lossy in the safe direction: a constraint it cannot express is dropped,
+    // the fetch widens, and oxigraph re-applies the real query afterwards. Used
+    // as an exact plan, that same loss is a plausible wrong number with no
+    // error — a dropped `FILTER(REGEX(...))` counts every row, a triple whose
+    // subject was never scoped counts one per group.
+    //
+    // So the question to ask is not "did I recognise enough of this query" but
+    // "did the planner drop anything at all".
+    if !plan.exact {
+        return Ok(blocked(
+            BlockedCode::IncompletePlan,
+            "the query plan does not describe this whole question, so answering \
+             from it would answer a weaker one",
+            None,
+        ));
+    }
+
     let stars = plan.root.all_stars();
     let joins = plan.root.all_joins();
 
@@ -575,6 +638,26 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         order_by.push(OrderTerm { key, desc });
     }
 
+    // Everything the query asks for must be something this can answer;
+    // anything it can answer but was not asked for is machinery and stays out
+    // of the result.
+    let known: Vec<&str> = bindings
+        .iter()
+        .map(|b| b.var.as_str())
+        .chain(measures.iter().map(|m| m.var.as_str()))
+        .collect();
+    if let Some(missing) = peeled
+        .projection
+        .iter()
+        .find(|var| !known.contains(&var.as_str()))
+    {
+        return Ok(blocked(
+            BlockedCode::UnscopedBinding,
+            format!("?{missing} is projected but is neither grouped nor aggregated"),
+            Some(format!("?{missing}")),
+        ));
+    }
+
     Ok(Pushdown::Eligible(SolutionSpec {
         bindings,
         group_keys,
@@ -583,6 +666,7 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         distinct: peeled.distinct,
         limit: peeled.limit,
         offset: peeled.offset,
+        projected: peeled.projection,
     }))
 }
 
@@ -997,6 +1081,115 @@ mod tests {
             ),
             BlockedCode::UnscopedBinding
         );
+    }
+
+    /// Every one of these scoped fine and came back eligible, and every one
+    /// would have answered a *weaker* question than it was asked: the planner
+    /// drops what it cannot express, because for a prefetch that only means
+    /// over-fetching and oxigraph re-applies the query afterwards.
+    #[test]
+    fn a_plan_that_drops_part_of_the_query_is_refused() {
+        for (label, query) in [
+            // FILTER shapes the extractor does not handle. Dropped, the SQL
+            // counts every row of the class.
+            (
+                "!=",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                    asset360:name ?nm . FILTER(?nm != \"BX517\") }",
+            ),
+            (
+                "REGEX",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                       asset360:name ?nm . FILTER(REGEX(?nm, \"^BX\")) }",
+            ),
+            (
+                "||",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                    asset360:name ?nm . FILTER(?nm = \"a\" || ?nm = \"b\") }",
+            ),
+            (
+                "BOUND",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                       asset360:name ?nm . FILTER(BOUND(?nm)) }",
+            ),
+            // Half of a conjunction landing is still a weaker filter.
+            (
+                "partial &&",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                            asset360:name ?nm ; asset360:length ?l . \
+                            FILTER(?l > 5 && REGEX(?nm, \"^BX\")) }",
+            ),
+            // A FILTER inside OPTIONAL must not reach the fetch at all: it
+            // would drop the rows the LEFT JOIN exists to preserve.
+            (
+                "FILTER in OPTIONAL",
+                "SELECT (COUNT(*) AS ?n) WHERE { \
+                                    ?s a asset360:Signal . \
+                                    OPTIONAL { ?s asset360:length ?l . FILTER(?l > 5) } }",
+            ),
+            // A subject with no rdf:type has no star, so its triples vanish
+            // and the count collapses to one per group.
+            (
+                "untyped subject",
+                "SELECT ?t (COUNT(*) AS ?n) WHERE { \
+                                 ?sig asset360:locatedOnTrack ?t . \
+                                 ?t a asset360:Track } GROUP BY ?t",
+            ),
+            // A sub-SELECT's own LIMIT never reaches the plan.
+            (
+                "sub-SELECT",
+                "SELECT (COUNT(*) AS ?n) WHERE { \
+                            { SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 5 } }",
+            ),
+        ] {
+            assert_eq!(
+                blocked_code(query),
+                BlockedCode::IncompletePlan,
+                "should be refused as incomplete: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordering_only_aggregate_is_not_projected() {
+        // `ORDER BY DESC(COUNT(*))` creates an aggregate with no AS name;
+        // spargebra invents an internal one. Emitting it would hand the caller
+        // a column named after a hash.
+        let spec = eligible(
+            "SELECT ?name WHERE { ?s a asset360:Signal ; asset360:name ?name } \
+             GROUP BY ?name ORDER BY DESC(COUNT(*))",
+        );
+
+        assert_eq!(spec.projected, vec!["name".to_owned()]);
+        assert_eq!(
+            spec.measures.len(),
+            1,
+            "the aggregate still has to be computed"
+        );
+        assert!(
+            !spec.projected.contains(&spec.measures[0].var),
+            "an internal aggregate name must not be projected: {:?}",
+            spec.measures[0].var
+        );
+    }
+
+    #[test]
+    fn the_projection_is_captured_in_select_order() {
+        let spec = eligible(
+            "SELECT ?name (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?name } GROUP BY ?name",
+        );
+        assert_eq!(spec.projected, vec!["name".to_owned(), "n".to_owned()]);
+    }
+
+    #[test]
+    fn a_pushable_filter_still_works() {
+        // The completeness check must not refuse what it can express.
+        let spec = eligible(
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; asset360:length ?l . \
+             FILTER(?l > 5 && ?l <= 20) }",
+        );
+        assert_eq!(spec.measures.len(), 1);
     }
 
     #[test]
