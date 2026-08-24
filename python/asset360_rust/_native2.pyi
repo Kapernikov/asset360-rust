@@ -3805,6 +3805,22 @@ class PushdownVerdict:
         refusal into a repair, so it is meant to be shown verbatim.
         """
     @property
+    def plan(self) -> typing.Optional[QueryPlan]:
+        r"""
+        The plan the verdict was derived from, when ``kind == "eligible"``.
+        
+        A consumer needs **both**: the solution says what to project, group and
+        aggregate, and the plan says which rows — the classes, their filters and
+        the join edges. Reading only the solution silently drops every
+        constraint: ``FILTER(?l > 5)`` on a ``COUNT(*)`` yields a solution with
+        no bindings, and a bare aggregate's solution does not even name the
+        class.
+        
+        Use this rather than calling ``sparql_scope`` again — a second call
+        re-parses and could in principle disagree with the one behind the
+        verdict.
+        """
+    @property
     def solution(self) -> typing.Optional[PushdownSolution]:
         r"""
         The solution spec when ``kind == "eligible"``, else ``None``.

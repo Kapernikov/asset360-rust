@@ -2062,7 +2062,7 @@ impl PushdownVerdict {
         match &self.inner {
             Pushdown::NotApplicable => "not_applicable",
             Pushdown::Blocked(_) => "blocked",
-            Pushdown::Eligible(_) => "eligible",
+            Pushdown::Eligible { .. } => "eligible",
         }
     }
 
@@ -2108,13 +2108,51 @@ impl PushdownVerdict {
         }
     }
 
+    /// The plan the verdict was derived from, when ``kind == "eligible"``.
+    ///
+    /// A consumer needs **both**: the solution says what to project, group and
+    /// aggregate, and the plan says which rows — the classes, their filters and
+    /// the join edges. Reading only the solution silently drops every
+    /// constraint: ``FILTER(?l > 5)`` on a ``COUNT(*)`` yields a solution with
+    /// no bindings, and a bare aggregate's solution does not even name the
+    /// class.
+    ///
+    /// Use this rather than calling ``sparql_scope`` again — a second call
+    /// re-parses and could in principle disagree with the one behind the
+    /// verdict.
+    #[getter]
+    fn plan(&self) -> Option<QueryPlan> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Eligible { plan, .. } => Some(QueryPlan {
+                root: PlanNode {
+                    inner: plan.root.clone(),
+                },
+                sql_limit: plan.sql_limit,
+                path_bindings: plan
+                    .path_bindings
+                    .iter()
+                    .map(|(var, binding)| {
+                        (
+                            var.clone(),
+                            (binding.star_var.clone(), binding.slot_path.clone()),
+                        )
+                    })
+                    .collect(),
+                exact: plan.inexact.is_none(),
+                inexact_reason: plan.inexact.map(|cause| cause.as_str()),
+            }),
+            _ => None,
+        }
+    }
+
     /// The solution spec when ``kind == "eligible"``, else ``None``.
     #[getter]
     fn solution(&self) -> Option<PushdownSolution> {
         use crate::sparql_pushdown::Pushdown;
         match &self.inner {
-            Pushdown::Eligible(spec) => Some(PushdownSolution {
-                inner: spec.clone(),
+            Pushdown::Eligible { solution, .. } => Some(PushdownSolution {
+                inner: solution.clone(),
             }),
             _ => None,
         }

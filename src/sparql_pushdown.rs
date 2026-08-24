@@ -26,7 +26,7 @@ use spargebra::term::Variable;
 
 use linkml_schemaview::schemaview::SchemaView;
 
-use crate::sparql_scoper::{PathBinding, ScopeError, Star, parse_query, scope_parsed};
+use crate::sparql_scoper::{PathBinding, QueryPlan, ScopeError, Star, parse_query, scope_parsed};
 use crate::sparql_terms::{TermDescriptor, term_descriptor};
 
 /// Verdict for one query.
@@ -37,8 +37,23 @@ pub enum Pushdown {
     NotApplicable,
     /// Aggregate-shaped, but outside the supported subset.
     Blocked(Blocked),
-    /// Answerable in SQL.
-    Eligible(SolutionSpec),
+    /// Answerable in SQL — from the [`SolutionSpec`] **and** the [`QueryPlan`]
+    /// it was derived from, together.
+    ///
+    /// The spec says what to project, group and aggregate. Everything about
+    /// *which rows* — the classes, their filters, the join edges — lives in the
+    /// plan, and a consumer that reads only the spec silently drops every
+    /// constraint: `FILTER(?l > 5)` on a `COUNT(*)` produces a spec with no
+    /// bindings at all, and for a bare aggregate the spec does not even name
+    /// the class.
+    ///
+    /// So the plan travels with the verdict rather than being fetched again by
+    /// a second `sparql_scope` call, which would also re-parse and could in
+    /// principle disagree.
+    Eligible {
+        solution: SolutionSpec,
+        plan: QueryPlan,
+    },
 }
 
 /// A refusal, shaped so a caller can both branch on it and show it to whoever
@@ -557,21 +572,23 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         ));
     }
 
-    // Several classes are fine when join edges connect them: each edge becomes
-    // a SQL JOIN on `right.object_data->>slot = left.asset360_uri`. Without an
-    // edge the classes are independent, and the SQL would be a cross product —
-    // where oxigraph evaluates two unrelated patterns. Different questions, so
-    // refuse rather than answer the wrong one.
-    if stars.len() > 1 && joins.len() < stars.len() - 1 {
+    // Several classes are fine when join edges connect them all: each edge
+    // becomes a SQL JOIN on `right.object_data->>slot = left.asset360_uri`.
+    // A class with no path to the others is independent, and the SQL would be a
+    // cross product where oxigraph evaluates two unrelated patterns — different
+    // questions, so refuse rather than answer the wrong one.
+    //
+    // Counting edges is not enough: three classes with two edges *between the
+    // same two of them* leaves the third disconnected while the count looks
+    // right. So walk the graph.
+    if let Some(isolated) = disconnected_star(&stars, &joins) {
         return Ok(blocked(
             BlockedCode::UnsupportedPattern,
             format!(
-                "this question spans {} classes with only {} reference(s) between \
-                 them, so they are not all connected",
-                stars.len(),
-                joins.len()
+                "?{isolated} shares no reference with the other classes in this \
+                 question, so joining them would multiply unrelated rows"
             ),
-            None,
+            Some(format!("?{isolated}")),
         ));
     }
 
@@ -677,16 +694,48 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         ));
     }
 
-    Ok(Pushdown::Eligible(SolutionSpec {
-        bindings,
-        group_keys,
-        measures,
-        order_by,
-        distinct: peeled.distinct,
-        limit: peeled.limit,
-        offset: peeled.offset,
-        projected: peeled.projection,
-    }))
+    Ok(Pushdown::Eligible {
+        solution: SolutionSpec {
+            bindings,
+            group_keys,
+            measures,
+            order_by,
+            distinct: peeled.distinct,
+            limit: peeled.limit,
+            offset: peeled.offset,
+            projected: peeled.projection,
+        },
+        plan,
+    })
+}
+
+/// A star that no chain of join edges connects to the first one, if any.
+fn disconnected_star(stars: &[&Star], joins: &[&crate::sparql_scoper::JoinEdge]) -> Option<String> {
+    let first = stars.first()?;
+    let mut reached: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    reached.insert(first.variable.as_str());
+
+    // Edges are undirected for reachability: a join constrains both ends.
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for join in joins {
+            let left_in = reached.contains(join.left.as_str());
+            let right_in = reached.contains(join.right.as_str());
+            if left_in && !right_in {
+                reached.insert(join.right.as_str());
+                progress = true;
+            } else if right_in && !left_in {
+                reached.insert(join.left.as_str());
+                progress = true;
+            }
+        }
+    }
+
+    stars
+        .iter()
+        .find(|star| !reached.contains(star.variable.as_str()))
+        .map(|star| star.variable.clone())
 }
 
 fn blocked(code: BlockedCode, detail: impl Into<String>, at: Option<String>) -> Pushdown {
@@ -927,7 +976,16 @@ mod tests {
 
     fn eligible(query: &str) -> SolutionSpec {
         match analyse(query) {
-            Pushdown::Eligible(spec) => spec,
+            Pushdown::Eligible { solution, .. } => solution,
+            other => panic!("expected Eligible, got {other:?}"),
+        }
+    }
+
+    /// The plan that travels with an eligible verdict — where the filters,
+    /// classes and join edges live.
+    fn eligible_plan(query: &str) -> crate::sparql_scoper::QueryPlan {
+        match analyse(query) {
+            Pushdown::Eligible { plan, .. } => plan,
             other => panic!("expected Eligible, got {other:?}"),
         }
     }
@@ -958,7 +1016,10 @@ mod tests {
         // Both entry points must accept it, or they accept different languages.
         crate::sparql_scoper::sparql_scope(query, &sv).expect("scoper accepts it");
         let verdict = analyse_pushdown(query, &sv).expect("analyser accepts it");
-        assert!(matches!(verdict, Pushdown::Eligible(_)), "got {verdict:?}");
+        assert!(
+            matches!(verdict, Pushdown::Eligible { .. }),
+            "got {verdict:?}"
+        );
     }
 
     #[test]
@@ -1230,6 +1291,75 @@ mod tests {
              FILTER(?l > 5 && ?l <= 20) }",
         );
         assert_eq!(spec.measures.len(), 1);
+    }
+
+    /// An eligible verdict is not a description of the query on its own: the
+    /// constraints live in the plan. `FILTER(?l > 5)` on a `COUNT(*)` produces
+    /// a solution with no bindings at all, so a consumer reading only the
+    /// solution would count every row.
+    #[test]
+    fn the_plan_travels_with_an_eligible_verdict() {
+        let query = "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                     asset360:length ?l . FILTER(?l > 5) }";
+
+        let spec = eligible(query);
+        assert!(
+            spec.bindings.is_empty(),
+            "nothing is projected, so the filter cannot be in the solution"
+        );
+
+        let plan = eligible_plan(query);
+        let star = &plan.root.all_stars()[0];
+        assert_eq!(
+            star.class_uri, "https://data.infrabel.be/asset360/Signal",
+            "the class is only knowable from the plan"
+        );
+        assert!(
+            star.filters.contains_key("length"),
+            "the filter must reach the consumer through the plan: {:?}",
+            star.filters
+        );
+    }
+
+    #[test]
+    fn a_class_sharing_no_reference_is_refused() {
+        // Three classes, two edges — but both edges are between the same two, so
+        // the third is a cross product. Counting edges said this was fine.
+        assert_eq!(
+            blocked_code(
+                "SELECT ?cn (COUNT(*) AS ?n) WHERE { \
+                 ?c a asset360:TunnelComplex ; asset360:hasName ?cn . \
+                 ?comp a asset360:CivilEngineeringAsset ; \
+                 asset360:belongsToTunnelComplex ?c ; asset360:hasName ?compn . \
+                 ?sig a asset360:Signal } \
+                 GROUP BY ?cn"
+            ),
+            BlockedCode::UnsupportedPattern
+        );
+    }
+
+    #[test]
+    fn multivalued_and_mapping_containers_are_carried() {
+        // Container::List and ::Mapping had no test at all, so nothing said
+        // which unnest a consumer owes — and getting that wrong is a silent
+        // count error.
+        let spec = eligible(
+            "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?kind } GROUP BY ?kind",
+        );
+        let key = &spec.bindings[spec.group_keys[0]];
+        assert_eq!(key.containers, vec![Container::List]);
+
+        let spec = eligible(
+            "SELECT ?doc (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:documents ?d . ?d asset360:title ?doc } GROUP BY ?doc",
+        );
+        let key = &spec.bindings[spec.group_keys[0]];
+        assert_eq!(
+            key.containers,
+            vec![Container::Mapping, Container::Single],
+            "a mapping hop unnests with jsonb_each, and its keys are not in the graph"
+        );
     }
 
     #[test]

@@ -117,6 +117,15 @@ pub enum Inexact {
     UnboundValues,
     /// A sub-`SELECT`, which has its own projection and modifiers.
     Subquery,
+    /// A `GRAPH` block. The plan reads one relation — the default graph — so a
+    /// named-graph pattern would be answered from the wrong graph.
+    NamedGraph,
+    /// A `SERVICE` block. The data lives on another endpoint; answering it from
+    /// local SQL answers a different question entirely.
+    RemoteService,
+    /// One variable bound by two different slots, which is an equality between
+    /// them that the plan does not carry.
+    ImpliedEquality,
 }
 
 impl Inexact {
@@ -132,6 +141,9 @@ impl Inexact {
             Self::ConstantInOptional => "constant_in_optional",
             Self::UnboundValues => "unbound_values",
             Self::Subquery => "subquery",
+            Self::NamedGraph => "named_graph",
+            Self::RemoteService => "remote_service",
+            Self::ImpliedEquality => "implied_equality",
         }
     }
 
@@ -169,6 +181,19 @@ impl Inexact {
                 "a sub-SELECT has its own projection and limits, which this plan \
                  does not carry"
             }
+            Self::NamedGraph => {
+                "a GRAPH block names a graph, and the plan reads only the \
+                 default one"
+            }
+            Self::RemoteService => {
+                "a SERVICE block reads another endpoint, which local SQL cannot \
+                 answer"
+            }
+            Self::ImpliedEquality => {
+                "one variable is bound by two different slots, which requires \
+                 those two values to be equal — a constraint the plan does not \
+                 carry"
+            }
         }
     }
 
@@ -202,6 +227,15 @@ impl Inexact {
                  with VALUES."
             }
             Self::Subquery => "Ask the sub-query as a separate question.",
+            Self::NamedGraph => {
+                "Query the default graph: drop the GRAPH wrapper, or ask the \
+                 named graph through an endpoint that serves it."
+            }
+            Self::RemoteService => "Ask the remote endpoint directly.",
+            Self::ImpliedEquality => {
+                "Use a different variable for each slot, and compare them with \
+                 a FILTER if the equality is what you meant."
+            }
         }
     }
 }
@@ -909,7 +943,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     if let Some(cause) = collect_filter_conditions(pattern, 0, &var_to_field, &mut star_filters) {
         drop(cause);
     }
-    if let Some(cause) = collect_values_filters(pattern, &var_to_field, &mut star_filters) {
+    if let Some(cause) = collect_values_filters(pattern, 0, &var_to_field, &mut star_filters) {
         drop(cause);
     }
 
@@ -1009,8 +1043,34 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         drop(Inexact::UntypedSubject);
     }
 
+    // A variable bound by two slots is an equality between them —
+    // `?s :hasName ?v ; :asset360_uri ?v` says the name equals the id — and the
+    // plan carries the slots separately with no condition tying them. Which
+    // binding a consumer picked would then decide the answer, hash order and
+    // all.
+    let mut bound_once: HashSet<&String> = HashSet::new();
+    let mut bound_twice = false;
+    for builder in star_map.values() {
+        for object_var in builder.object_variables.values() {
+            if var_to_class.contains_key(object_var) {
+                // A typed object variable is a join edge, which the plan does
+                // carry.
+                continue;
+            }
+            if !bound_once.insert(object_var) {
+                bound_twice = true;
+            }
+        }
+    }
+    if bound_twice {
+        drop(Inexact::ImpliedEquality);
+    }
+
     if contains_subquery(pattern) {
         drop(Inexact::Subquery);
+    }
+    if let Some(cause) = contains_foreign_scope(pattern) {
+        drop(cause);
     }
 
     // Phase 7: the SQL LIMIT.
@@ -1342,6 +1402,38 @@ fn extract_equality_from_expr(
                 false
             }
         }
+        // `FILTER(?v IN ("a", "b"))` is the same constraint as
+        // `VALUES ?v { "a" "b" }`, which is already pushed. Refusing one while
+        // accepting the other made the supported subset depend on how the query
+        // happened to be written.
+        Expression::In(target, options) => {
+            let Expression::Variable(var) = target.as_ref() else {
+                return false;
+            };
+            let Some((star_var, field)) = var_to_field.get(var.as_str()) else {
+                return false;
+            };
+            let mut values = Vec::with_capacity(options.len());
+            for option in options {
+                match option {
+                    Expression::Literal(lit) => values.push(lit.value().to_owned()),
+                    Expression::NamedNode(nn) => values.push(nn.as_str().to_owned()),
+                    // A computed member would have to be evaluated first.
+                    _ => return false,
+                }
+            }
+            if values.is_empty() {
+                // `IN ()` is never true, which the plan has no way to say.
+                return false;
+            }
+            star_filters
+                .entry(star_var.clone())
+                .or_default()
+                .entry(field.clone())
+                .or_default()
+                .push(FilterCondition::In(values));
+            true
+        }
         Expression::And(left, right) => {
             // Both halves must land: `A && B` with B dropped is a weaker
             // filter, which over-fetches — safe for a prefetch, wrong for an
@@ -1376,10 +1468,15 @@ fn match_var_literal(
 /// Collect VALUES conditions, now keyed by (star_variable, slot_name).
 fn collect_values_filters(
     pattern: &GraphPattern,
+    depth: usize,
     var_to_field: &HashMap<String, (String, String)>,
     star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
 ) -> Option<Inexact> {
     match pattern {
+        // Inside an OPTIONAL a VALUES block narrows the optional side only.
+        // Pushing it into the fetch would drop rows the join preserves, exactly
+        // as a FILTER there would.
+        GraphPattern::Values { .. } if depth > 0 => Some(Inexact::FilterInOptional),
         GraphPattern::Values {
             variables,
             bindings,
@@ -1422,15 +1519,18 @@ fn collect_values_filters(
             }
             dropped
         }
+        GraphPattern::LeftJoin { left, right, .. } => {
+            collect_values_filters(left, depth, var_to_field, star_filters).or(
+                collect_values_filters(right, depth + 1, var_to_field, star_filters),
+            )
+        }
         GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => collect_values_filters(
-            left,
-            var_to_field,
-            star_filters,
-        )
-        .or(collect_values_filters(right, var_to_field, star_filters)),
+        | GraphPattern::Minus { left, right } => {
+            collect_values_filters(left, depth, var_to_field, star_filters).or(
+                collect_values_filters(right, depth, var_to_field, star_filters),
+            )
+        }
         GraphPattern::Filter { inner, .. }
         | GraphPattern::Extend { inner, .. }
         | GraphPattern::OrderBy { inner, .. }
@@ -1441,7 +1541,7 @@ fn collect_values_filters(
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => {
-            collect_values_filters(inner, var_to_field, star_filters)
+            collect_values_filters(inner, depth, var_to_field, star_filters)
         }
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } => None,
     }
@@ -1480,7 +1580,12 @@ fn contains_subquery(pattern: &GraphPattern) -> bool {
     walk(pattern, false)
 }
 
-/// The LIMIT that may be pushed into the object fetch, if any.
+/// How many rows the object fetch may be limited to, if it may be limited.
+///
+/// This is `OFFSET + LIMIT`, not `LIMIT`: the fetch has to cover the whole
+/// window the query asks for, because the engine applies the offset to what
+/// comes back. `LIMIT 10 OFFSET 20` needs thirty rows — fetching ten and then
+/// skipping twenty of them returns nothing.
 ///
 /// One function decides, because the bug this replaced was two of them
 /// disagreeing: extraction walked `Slice`/`Project` while the eligibility check
@@ -1507,7 +1612,11 @@ fn pushable_limit(pattern: &GraphPattern) -> Option<usize> {
         | GraphPattern::Reduced { .. } => None,
 
         // A limit, pushable only if nothing below must see every solution.
-        GraphPattern::Slice { inner, length, .. } => {
+        GraphPattern::Slice {
+            inner,
+            start,
+            length,
+        } => {
             if is_holistic(inner) || contains_slice(inner) {
                 // A nested Slice would need composing with this one, and the
                 // composition is not `min`: an inner LIMIT applies before an
@@ -1517,7 +1626,10 @@ fn pushable_limit(pattern: &GraphPattern) -> Option<usize> {
                 // did run, refuse to push anything.
                 None
             } else {
-                *length
+                // Cover the window: the rows skipped by OFFSET still have to
+                // be fetched, or the engine offsets into a short result and
+                // returns fewer rows than the query asked for — or none.
+                length.map(|length| length.saturating_add(*start))
             }
         }
 
@@ -1550,10 +1662,12 @@ fn collect_path_bindings(
     schema_view: &SchemaView,
 ) -> (HashMap<String, PathBinding>, HashSet<String>) {
     let mut out: HashMap<String, PathBinding> = HashMap::new();
-    // Variables the walk explained: every step it passed through and every leaf
-    // it landed on. Used only to clear a recorded drop — not to re-derive the
-    // check, which is what an after-the-fact reconstruction did before, missing
-    // four other drop sites in the process.
+    // Variables the walk explained *as steps*: the intermediate nodes it passed
+    // through. Scalar leaves are deliberately absent — a leaf holds a value, so
+    // a leaf variable used as a subject is a subject nothing accounts for, and
+    // clearing it would reinstate the hole this set exists to close.
+    //
+    // Used only to clear a recorded drop, never to re-derive the check.
     let mut traversed: HashSet<String> = HashSet::new();
 
     // Deterministic order: two stars could in principle reach the same variable,
@@ -1639,7 +1753,6 @@ fn walk_paths(
             // A scalar leaf. Depth one is already in Star::slot_variables;
             // recording it again would give two answers to one question.
             None => {
-                traversed.insert(object_var.clone());
                 if path.len() > 1 {
                     out.insert(
                         object_var.clone(),
@@ -1651,6 +1764,35 @@ fn walk_paths(
                 }
             }
         }
+    }
+}
+
+/// A `GRAPH` or `SERVICE` block anywhere in the pattern.
+///
+/// Both are walked transparently by everything else here, which is right for a
+/// prefetch — the triples inside still say which classes to load — and wrong
+/// for an exact plan: the plan reads the default graph of the local database,
+/// so a named-graph pattern is answered from the wrong graph and a remote
+/// pattern from the wrong endpoint.
+fn contains_foreign_scope(pattern: &GraphPattern) -> Option<Inexact> {
+    match pattern {
+        GraphPattern::Graph { .. } => Some(Inexact::NamedGraph),
+        GraphPattern::Service { .. } => Some(Inexact::RemoteService),
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Group { inner, .. } => contains_foreign_scope(inner),
+        GraphPattern::Join { left, right }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => {
+            contains_foreign_scope(left).or(contains_foreign_scope(right))
+        }
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => None,
     }
 }
 
@@ -1727,6 +1869,13 @@ default_prefix: asset360
 default_range: string
 
 classes:
+  Document:
+    class_uri: asset360:Document
+    attributes:
+      docId:
+        key: true
+      title:
+        range: string
   Coordinates:
     class_uri: asset360:Coordinates
     attributes:
@@ -1745,6 +1894,13 @@ classes:
         range: integer
       location:
         range: Coordinates
+        inlined: true
+      trafficKinds:
+        range: string
+        multivalued: true
+      documents:
+        range: Document
+        multivalued: true
         inlined: true
       locatedOnTrack:
         range: Track
@@ -2097,6 +2253,104 @@ classes:
                 "wrong cause recorded for: {query}"
             );
         }
+    }
+
+    /// Each of these was measured Eligible with a plan that did not describe
+    /// the query, and each answered a weaker question than it was asked.
+    #[test]
+    fn more_drop_sites_are_recorded() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for (expected, query) in [
+            // A GRAPH block names a graph; the plan reads the default one.
+            (
+                Inexact::NamedGraph,
+                "SELECT ?s WHERE { GRAPH <urn:g> { ?s a asset360:Signal } }",
+            ),
+            // A SERVICE block reads another endpoint entirely.
+            (
+                Inexact::RemoteService,
+                "SELECT ?s WHERE { SERVICE <urn:remote> { ?s a asset360:Signal } }",
+            ),
+            // One variable bound by two slots is an equality between them.
+            (
+                Inexact::ImpliedEquality,
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?v ; \
+                 asset360:length ?v }",
+            ),
+            // A VALUES inside OPTIONAL narrows the optional side only.
+            (
+                Inexact::FilterInOptional,
+                "SELECT ?s WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:name ?nm . VALUES ?nm { \"a\" } } }",
+            ),
+            // A scalar leaf used as a subject: a literal cannot be a subject,
+            // and the path walk must not clear it just because it is a leaf.
+            (
+                Inexact::UntypedSubject,
+                "SELECT ?x WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 ?nm asset360:name ?x }",
+            ),
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(plan.inexact, Some(expected), "wrong cause for: {query}");
+        }
+    }
+
+    /// A LIMIT bounds the fetch, so the fetch has to cover the whole window the
+    /// query asks for. `LIMIT 10 OFFSET 20` needs thirty rows: fetching ten and
+    /// then offsetting twenty of them returns nothing at all.
+    #[test]
+    fn offset_is_included_in_the_pushed_row_count() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for (query, expected) in [
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10",
+                Some(10),
+            ),
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10 OFFSET 20",
+                Some(30),
+            ),
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal } OFFSET 20",
+                // No LIMIT bounds nothing, however large the offset.
+                None,
+            ),
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(plan.sql_limit, expected, "for: {query}");
+        }
+    }
+
+    /// `FILTER(?v IN (...))` is the same constraint as `VALUES ?v { ... }`,
+    /// which was already pushed — accepting one and refusing the other made the
+    /// supported subset depend on how the query happened to be written.
+    #[test]
+    fn filter_in_is_pushed_like_values() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm IN (\"a\", \"b\")) }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+
+        assert_eq!(plan.inexact, None);
+        let star = find_star(&plan, "s");
+        let conds = star.filters.get("name").expect("name filter");
+        assert!(
+            matches!(&conds[0], FilterCondition::In(values) if values.len() == 2),
+            "expected an IN filter, got {:?}",
+            conds[0]
+        );
     }
 
     #[test]
