@@ -347,37 +347,20 @@ impl Inexact {
 /// an enum value that serialises as an IRI is not its stored code. Decided from
 /// the slot, because it is the stored form that settles it — not the form the
 /// query happened to write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PushForm {
-    /// An untagged literal. `numeric` carries whether the range is a number,
-    /// which is what makes `FILTER(?l > 5)` a comparison rather than a type
-    /// error.
-    Literal { numeric: bool },
+    /// A literal, with the datatype and language its values carry. `None`
+    /// datatype means a plain literal, whose datatype *is* `xsd:string`.
+    Literal {
+        datatype: Option<String>,
+        lang: Option<String>,
+    },
     /// A named node: comparable, against an IRI constant only.
     Iri,
-    /// Language-tagged, typed, or enum-valued — the stored text is not the
-    /// term, so no comparison against a query constant is the same question.
+    /// Enum-valued — the stored code is not the term it renders as, so no
+    /// comparison against a query constant is the same question.
     Tagged,
 }
-
-/// Datatypes a numeric column's constants may carry.
-///
-/// About the *query's* literal, not the slot's range — the range is upstream's
-/// question, answered by `RangeInfo` in `sparql_terms`.
-const XSD_NUMERIC_LITERALS: [&str; 12] = [
-    "http://www.w3.org/2001/XMLSchema#integer",
-    "http://www.w3.org/2001/XMLSchema#decimal",
-    "http://www.w3.org/2001/XMLSchema#double",
-    "http://www.w3.org/2001/XMLSchema#float",
-    "http://www.w3.org/2001/XMLSchema#long",
-    "http://www.w3.org/2001/XMLSchema#int",
-    "http://www.w3.org/2001/XMLSchema#short",
-    "http://www.w3.org/2001/XMLSchema#byte",
-    "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-    "http://www.w3.org/2001/XMLSchema#positiveInteger",
-    "http://www.w3.org/2001/XMLSchema#unsignedLong",
-    "http://www.w3.org/2001/XMLSchema#unsignedInt",
-];
 
 /// Value variables, each with the column it reads and how that column compares.
 type ValueColumns = HashMap<String, (String, String, PushForm)>;
@@ -743,8 +726,9 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // Subject variables whose class could not be resolved. Cleared below by
     // whichever of them the path walk explains.
     let mut unresolved_subjects: HashSet<String> = HashSet::new();
-    // Stars that did not survive, with the triples they had claimed.
-    let mut discarded_claims: Vec<DiscardedStar> = Vec::new();
+    // Stars that did not survive. Borrowed, not copied: `star_map` outlives the
+    // loop and every field this needs is already on the builder.
+    let mut discarded_claims: Vec<&StarBuilder> = Vec::new();
     // Named for what it does. This was `drop`, which shadowed `std::mem::drop`
     // for the rest of the function and read as if it destroyed the cause rather
     // than recording it.
@@ -975,31 +959,10 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 // builder claimed back to the working set unless the walk turns
                 // out to represent every one of them.
                 unresolved_subjects.insert(builder.variable.clone());
-                discarded_claims.push(DiscardedStar {
-                    claimed: builder.claimed.clone(),
-                    value_variables: builder.object_variables.values().cloned().collect(),
-                    // A constant on a nested step is a condition the path walk
-                    // has no way to carry: it records where a value lives, not
-                    // what it must equal.
-                    has_constants: !builder.inline_filters.is_empty(),
-                    has_type: builder.type_iri.is_some(),
-                });
+                discarded_claims.push(builder);
                 continue;
             }
         };
-        // The class the plan holds must be the class the query asked for. A
-        // subject can also be scoped by which slots it uses, and that fallback
-        // answers even when the stated `rdf:type` names something the schema
-        // does not have — so the type triple was claimed and then quietly not
-        // used, and the plan describes every instance of the class it guessed.
-        if builder
-            .type_iri
-            .as_ref()
-            .is_some_and(|stated| *stated != class_uri)
-        {
-            record_loss(Inexact::UnrepresentedTriple);
-        }
-
         let star_is_optional = builder.type_depth > 0;
         let mut required_fields: Vec<String> = Vec::new();
         let mut optional_fields: Vec<String> = Vec::new();
@@ -1289,18 +1252,25 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // is left describing nothing. Only a value the walk turned into a path
     // binding is actually carried.
     for discarded in &discarded_claims {
-        let represented = !discarded.has_constants
-            && !discarded.has_type
-            && discarded
-                .value_variables
-                .iter()
-                .all(|var| path_bindings.contains_key(var));
+        // A constant on a nested step is a condition no path can carry — a path
+        // records where a value lives, not what it must equal — and neither is
+        // an `rdf:type` on it.
+        let represented = discarded.inline_filters.is_empty()
+            && discarded.type_iri.is_none()
+            && discarded.object_variables.values().all(|var| {
+                // A leaf comes back as a path binding. An *intermediate* node
+                // deliberately does not — it serialises as a blank node, so the
+                // walk records it as a step and keeps going — and the paths that
+                // continue past it carry the hop that introduced it.
+                path_bindings.contains_key(var) || traversed.contains(var)
+            });
         if !represented {
+            // Both, deliberately. The `extend` keeps the working set meaning
+            // what it says — these triples are unclaimed again — and the cause
+            // is named here because `cause_for_unconsumed` reads a returned
+            // triple in isolation, where `?d :title ?ti` looks like a duplicate
+            // slot binding rather than the casualty of a discarded star.
             unconsumed.extend(discarded.claimed.iter().copied());
-            // Say why here. `cause_for_unconsumed` reads the triple to guess a
-            // cause, and a returned triple looks like whatever it is in
-            // isolation — `?d :title ?ti` reads as a duplicate slot binding,
-            // which is not what happened to it.
             record_loss(Inexact::UnrepresentedTriple);
         }
     }
@@ -1368,20 +1338,6 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// A star that was built and then discarded, and what it had claimed.
-struct DiscardedStar {
-    claimed: Vec<usize>,
-    /// Variables reading a value off this subject. Each has to come back as a
-    /// path binding, or the triple that introduced it is unrepresented.
-    value_variables: Vec<String>,
-    /// Whether a constant object was pushed against this subject.
-    has_constants: bool,
-    /// Whether an `rdf:type` was stated on it. A path binding says where a
-    /// value lives inside a structure; it cannot say that the structure has a
-    /// type, so the type triple is represented by nothing.
-    has_type: bool,
-}
 
 struct StarBuilder {
     variable: String,
@@ -1766,6 +1722,9 @@ fn match_var_literal(
     // wrote it that way.
     let value = match lit_expr {
         Expression::Literal(lit) if literal_pushable(lit, form) => lit.value().to_owned(),
+        // An IRI column compares against an IRI, the same way `IN` does — these
+        // two arms are one rule and drifted apart when only `IN` learned it.
+        Expression::NamedNode(nn) if *form == PushForm::Iri => nn.as_str().to_owned(),
         _ => return None,
     };
     Some((star_var.clone(), field.clone(), value))
@@ -1787,30 +1746,33 @@ fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &str) -> Push
     match descriptor.kind {
         TermKind::Iri => PushForm::Iri,
         TermKind::EnumIri => PushForm::Tagged,
-        TermKind::Literal if descriptor.lang.is_none() && descriptor.datatype.is_none() => {
-            PushForm::Literal {
-                numeric: descriptor.numeric,
-            }
-        }
-        TermKind::Literal => PushForm::Tagged,
+        TermKind::Literal => PushForm::Literal {
+            datatype: descriptor.datatype.clone(),
+            lang: descriptor.lang.clone(),
+        },
     }
 }
 
 /// Whether comparing this constant as text asks what the query asks.
 ///
-/// A language tag never survives the comparison: `"BX1"@en` is a different term
-/// from `"BX1"`, and pushing it as text matches a row the query excludes. A
-/// datatype survives only on a numeric column, where the comparison is
-/// numeric — which is what makes `FILTER(?l > 5)` work at all.
+/// Only when the constant is the *same RDF term* the column's values render as.
+/// The comparison is on stored text, and the text is the term only if the
+/// datatype and language agree: `"BX1"@en` is not `"BX1"`, and — depending on
+/// whether the schema resolves its `integer` type to an IRI — a length of three
+/// is either the plain literal `"3"` or `3`, and the other one matches nothing.
+///
+/// So this asks the column, never the operator. Whether an *ordering* is
+/// meaningful is a separate question, answered by `TermDescriptor::numeric`.
 fn literal_pushable(lit: &spargebra::term::Literal, form: &PushForm) -> bool {
-    let PushForm::Literal { numeric } = form else {
+    let PushForm::Literal { datatype, lang } = form else {
         return false;
     };
-    if lit.language().is_some() {
+    if lit.language() != lang.as_deref() {
         return false;
     }
-    let datatype = lit.datatype().as_str();
-    datatype == XSD_STRING_IRI || (*numeric && XSD_NUMERIC_LITERALS.contains(&datatype))
+    // A plain literal's datatype is `xsd:string`, so the column's `None` and a
+    // query literal with no explicit type are the same term.
+    lit.datatype().as_str() == datatype.as_deref().unwrap_or(XSD_STRING_IRI)
 }
 
 /// Collect VALUES conditions, now keyed by (star_variable, slot_name).
@@ -2303,8 +2265,23 @@ prefixes:
     prefix_reference: https://data.infrabel.be/asset360/
   linkml:
     prefix_reference: https://w3id.org/linkml/
+  xsd:
+    prefix_reference: http://www.w3.org/2001/XMLSchema#
 default_prefix: asset360
 default_range: string
+
+# Declared, as the real schema declares them: `tests/data/asset360.yaml`
+# imports `./types`, where `integer` resolves to `xsd:integer`. Without this the
+# fixture serialises a number as a plain literal, which is a different RDF term
+# and answers comparison questions differently — so a fixture without it tests a
+# configuration production does not run.
+types:
+  string:
+    uri: xsd:string
+    base: str
+  integer:
+    uri: xsd:integer
+    base: int
 
 classes:
   Document:
@@ -2321,6 +2298,14 @@ classes:
         range: integer
       latitude:
         range: integer
+      detail:
+        range: Detail
+        inlined: true
+  Detail:
+    class_uri: asset360:Detail
+    attributes:
+      value:
+        range: string
   Signal:
     class_uri: asset360:Signal
     attributes:
@@ -2867,6 +2852,117 @@ classes:
             assert!(!cause.instead().is_empty(), "{wire} has no repair");
             assert!(seen.insert(wire), "{wire} is used by two causes");
         }
+    }
+
+    /// A pushed condition compares stored text, so a constant is pushable only
+    /// when it is the same RDF term the column's values render as.
+    ///
+    /// Both directions matter, and which one is which depends on the schema: an
+    /// `integer` range that resolves to `xsd:integer` stores `3`, so `= 3` is
+    /// the question and `= "3"` matches nothing. Were the type left unresolved
+    /// the writer would emit a plain `"3"` and the two would swap — which is
+    /// why this asks the descriptor rather than assuming either.
+    #[test]
+    fn a_constant_is_pushed_only_as_the_column_s_own_term() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                      PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+
+        for (query, pushed) in [
+            // A typed integer column takes a number, not its text.
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?l . \
+                 FILTER(?l = 3) }",
+                true,
+            ),
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?l . \
+                 FILTER(?l = \"3\") }",
+                false,
+            ),
+            // A string column is the mirror image.
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm = \"BX\") }",
+                true,
+            ),
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm = 3) }",
+                false,
+            ),
+            // A tag is a different term whatever the column.
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm = \"BX\"@en) }",
+                false,
+            ),
+            // Same rule through VALUES and IN, not just `=`.
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?l . \
+                 VALUES ?l { 3 } }",
+                true,
+            ),
+            (
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?l . \
+                 FILTER(?l IN (3)) }",
+                true,
+            ),
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(
+                plan.inexact.is_none(),
+                pushed,
+                "wrong verdict for: {query} (got {:?})",
+                plan.inexact
+            );
+        }
+    }
+
+    /// `= <iri>` and `IN (<iri>)` are one rule, and they drifted: only `IN`
+    /// learned that a reference column compares against an IRI.
+    #[test]
+    fn an_iri_constant_is_pushed_by_equality_as_well_as_in() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             FILTER(?t = <https://data.infrabel.be/asset360/track/T1>) }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             FILTER(?t IN (<https://data.infrabel.be/asset360/track/T1>)) }",
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(plan.inexact, None, "should push: {query}");
+        }
+
+        // And the cross-term cases stay refused in both: a literal is not an
+        // IRI, whichever operator asks.
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             FILTER(?t = \"T1\") }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(?nm = <https://data.infrabel.be/asset360/track/T1>) }",
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert!(plan.inexact.is_some(), "should refuse: {query}");
+        }
+    }
+
+    /// A path deeper than two hops is still one path, and the plan carries the
+    /// whole chain. The intermediate node is a step rather than a value, so it
+    /// never becomes a path binding — which must not be read as "unrepresented".
+    #[test]
+    fn a_three_hop_nested_path_is_exact() {
+        let sv = test_schema_view();
+        let query = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                     SELECT ?v WHERE { ?s a asset360:Signal ; asset360:location ?c . \
+                     ?c asset360:detail ?d . ?d asset360:value ?v }";
+
+        let plan = sparql_scope(query, &sv).unwrap();
+        assert_eq!(plan.inexact, None, "a walked path is not a loss");
+        let binding = plan.path_bindings.get("v").expect("?v is a path binding");
+        assert_eq!(binding.slot_path, ["location", "detail", "value"]);
     }
 
     /// A LIMIT bounds the fetch, so the fetch has to cover the whole window the

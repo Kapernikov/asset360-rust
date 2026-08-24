@@ -716,34 +716,44 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     // mentions ?k counts one row per Signal. `BindingSpec::containers` is how a
     // consumer reproduces that multiplicity, and a variable with no binding has
     // no container and no instruction.
-    for star in &stars {
-        for (slot, var) in &star.slot_variables {
-            if bindings.iter().any(|b| b.var == *var) {
-                continue;
+    //
+    // Both ways in: a slot read directly off a star, and a hop inside a path.
+    let unbound_multivalued = stars
+        .iter()
+        .flat_map(|star| {
+            star.slot_variables
+                .iter()
+                .map(move |(slot, var)| (var, star.class_uri.as_str(), std::slice::from_ref(slot)))
+        })
+        .chain(plan.path_bindings.iter().filter_map(|(var, binding)| {
+            let star = stars.iter().find(|s| s.variable == binding.star_var)?;
+            Some((var, star.class_uri.as_str(), binding.slot_path.as_slice()))
+        }))
+        .find(|(var, class_uri, slot_path)| {
+            if bindings.iter().any(|b| b.var == **var) {
+                return false;
             }
-            let multivalued = crate::sparql_terms::resolve_column(
-                schema_view,
-                &star.class_uri,
-                std::slice::from_ref(slot),
-            )
-            .is_some_and(|(_, containers)| {
-                containers.iter().any(|mode| {
-                    *mode != linkml_schemaview::slotview::SlotContainerMode::SingleValue
-                })
-            });
-            if multivalued {
-                return Ok(blocked(
-                    BlockedCode::UnsupportedPattern,
-                    format!(
-                        "?{var} reads {slot}, which holds several values per \
-                         record, and the question neither groups by it nor \
-                         aggregates it — so each record stands for as many \
-                         solutions as it has values"
-                    ),
-                    Some(format!("?{var}")),
-                ));
-            }
-        }
+            // A step on the way to a value the plan *does* carry is not a loss:
+            // that value's `containers` describe every hop of its path,
+            // including this one. Only a multiplying read that nothing extends
+            // is unaccounted for.
+            let carried_by_a_value = bindings
+                .iter()
+                .any(|b| b.slot_path.len() > slot_path.len() && b.slot_path.starts_with(slot_path));
+            !carried_by_a_value && path_multiplies(schema_view, class_uri, slot_path)
+        });
+
+    if let Some((var, _, slot_path)) = unbound_multivalued {
+        return Ok(blocked(
+            BlockedCode::UnsupportedPattern,
+            format!(
+                "?{var} reads {}, which holds several values per record, and the \
+                 question neither groups by it nor aggregates it — so each \
+                 record stands for as many solutions as it has values",
+                slot_path.join(".")
+            ),
+            Some(format!("?{var}")),
+        ));
     }
 
     Ok(Pushdown::Eligible {
@@ -781,6 +791,37 @@ fn disconnected_star(stars: &[&Star], joins: &[&crate::sparql_scoper::JoinEdge])
         .iter()
         .find(|star| !reached.contains(star.variable.as_str()))
         .map(|star| star.variable.clone())
+}
+
+/// Whether any step of this path holds more than one value per record.
+///
+/// Asked of the slot rather than of its term descriptor: a multivalued *inlined*
+/// range has no describable term (it serialises as a blank node), so a
+/// descriptor-shaped question answers "no container" for `documents` — which
+/// reads as single-valued and is how this multiplicity stayed invisible.
+fn path_multiplies(schema_view: &SchemaView, class_uri: &str, slot_path: &[String]) -> bool {
+    use linkml_schemaview::identifier::Identifier;
+    use linkml_schemaview::slotview::SlotContainerMode;
+
+    let Ok(Some(mut class_view)) = schema_view.get_class_by_uri(class_uri) else {
+        return false;
+    };
+    for (i, slot_name) in slot_path.iter().enumerate() {
+        let Some(slot) = class_view.slot(&Identifier::Name(slot_name.clone())) else {
+            return false;
+        };
+        if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
+            return true;
+        }
+        if i + 1 == slot_path.len() {
+            return false;
+        }
+        match slot.get_range_class() {
+            Some(next) => class_view = next,
+            None => return false,
+        }
+    }
+    false
 }
 
 fn blocked(code: BlockedCode, detail: impl Into<String>, at: Option<String>) -> Pushdown {
@@ -1342,6 +1383,15 @@ mod tests {
              asset360:trafficKinds ?k }",
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm ; asset360:trafficKinds ?k } GROUP BY ?nm",
+            // A multivalued *inlined* range has no describable term, so asking
+            // its descriptor answered "single-valued" and this counted records
+            // where SPARQL counts documents.
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:documents ?d }",
+            // Same multiplicity one hop in: the leaf is describable, the hop
+            // that multiplies is not the leaf.
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:documents ?d . ?d asset360:title ?ti }",
         ] {
             assert_eq!(
                 blocked_code(query),
