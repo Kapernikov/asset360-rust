@@ -391,6 +391,9 @@ pub(crate) enum PushForm {
     Literal {
         datatype: Option<String>,
         lang: Option<String>,
+        /// Whether the range is a number. Not part of "is this the same term",
+        /// but it decides whether SPARQL compares the constant by *value*.
+        numeric: bool,
     },
     /// A named node: comparable, against an IRI constant only.
     Iri,
@@ -887,6 +890,20 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             let slot_name = slot_view.name.clone();
             let multivalued = slot_view.determine_slot_container_mode()
                 != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
+            // How this column's values render, so an inline constant is judged
+            // by the same rule as one in a FILTER or a VALUES. This arm used to
+            // ask only whether the *query* wrote a plain literal, which accepts
+            // `:length "3"` on a column storing `3` and refuses the `3` that
+            // matches — the inversion the FILTER route was fixed for.
+            let form = push_form_of_slot(schema_view, &slot_view);
+            // An identity slot is the object's identity rather than a stored
+            // value: the writer emits no triple for it, and a constant here is
+            // hoisted into `identifier_values` for an indexed `asset360_uri`
+            // lookup instead of a JSONB text compare. The term rule is about
+            // that compare, so it does not apply — and the identity may be
+            // written either as a literal or as an IRI.
+            let identity_slot = slot_view.definition().identifier.unwrap_or(false)
+                || slot_view.definition().key.unwrap_or(false);
             let current = builder
                 .slot_depth
                 .get(&slot_name)
@@ -932,7 +949,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                         // See the variable arm above: two reads of one
                         // multivalued slot, found in the other order.
                         record_loss(Inexact::ConstantAndVariableOnSlot);
-                    } else {
+                    } else if identity_slot || form == PushForm::Iri {
                         builder
                             .inline_filters
                             .entry(slot_name)
@@ -940,18 +957,19 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                             .push(FilterCondition::Eq(nn.as_str().to_owned()));
                         unconsumed.remove(&index);
                         builder.claimed.push(index);
+                    } else {
+                        // An IRI where the column stores a literal: the two are
+                        // different terms and oxigraph matches neither.
+                        record_loss(Inexact::TaggedConstant);
                     }
                 }
                 // Inline literal constant: `?s :foo "bar"`.
                 //
-                // Only a plain literal: the condition compares the stored text,
-                // so a tagged or typed literal would match on its value alone.
-                // `:name "BX1"@en` is not the same term as `"BX1"`, and pushing
-                // it as one matches rows the query excludes.
+                // Pushed only when the constant is the term this column's
+                // values render as — the same rule the FILTER and VALUES routes
+                // apply, from the same function.
                 TermPattern::Literal(lit) if *depth == 0 => {
-                    let plain =
-                        lit.language().is_none() && (lit.datatype().as_str() == XSD_STRING_IRI);
-                    if plain {
+                    if identity_slot || literal_pushable(lit, &form) {
                         if multivalued && builder.object_variables.contains_key(&slot_name) {
                             // See the variable arm above.
                             record_loss(Inexact::ConstantAndVariableOnSlot);
@@ -964,6 +982,8 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                             unconsumed.remove(&index);
                             builder.claimed.push(index);
                         }
+                    } else {
+                        record_loss(Inexact::TaggedConstant);
                     }
                 }
                 // A constant object inside an OPTIONAL: pushing it would
@@ -1852,7 +1872,6 @@ fn match_var_literal(
 /// Unresolvable means unrepresentable, which is `Tagged`: refusing to push is
 /// always safe, and this runs before the class has been fully validated.
 fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &str) -> PushForm {
-    use crate::sparql_terms::TermKind;
     let Some((descriptor, _)) = crate::sparql_terms::resolve_column(
         schema_view,
         class_uri,
@@ -1860,12 +1879,33 @@ fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &str) -> Push
     ) else {
         return PushForm::Tagged;
     };
+    push_form_of(&descriptor)
+}
+
+/// The same question asked of a slot the caller already holds.
+///
+/// Phase 1 has the `SlotView` but not yet the class, and it was left comparing
+/// datatypes by hand — a fourth copy of this rule, and the one that stayed
+/// wrong when the other three were fixed.
+fn push_form_of_slot(
+    schema_view: &SchemaView,
+    slot: &linkml_schemaview::slotview::SlotView,
+) -> PushForm {
+    match crate::sparql_terms::describe_slot(schema_view, slot) {
+        Some(descriptor) => push_form_of(&descriptor),
+        None => PushForm::Tagged,
+    }
+}
+
+fn push_form_of(descriptor: &crate::sparql_terms::TermDescriptor) -> PushForm {
+    use crate::sparql_terms::TermKind;
     match descriptor.kind {
         TermKind::Iri => PushForm::Iri,
         TermKind::EnumIri => PushForm::Tagged,
         TermKind::Literal => PushForm::Literal {
             datatype: descriptor.datatype.clone(),
             lang: descriptor.lang.clone(),
+            numeric: descriptor.numeric,
         },
     }
 }
@@ -1881,15 +1921,51 @@ fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &str) -> Push
 /// So this asks the column, never the operator. Whether an *ordering* is
 /// meaningful is a separate question, answered by `TermDescriptor::numeric`.
 fn literal_pushable(lit: &spargebra::term::Literal, form: &PushForm) -> bool {
-    let PushForm::Literal { datatype, lang } = form else {
+    let PushForm::Literal {
+        datatype,
+        lang,
+        numeric,
+    } = form
+    else {
         return false;
     };
-    if lit.language() != lang.as_deref() {
-        return false;
+
+    // Language first, and decisively. A language-tagged literal's datatype is
+    // `rdf:langString`, which never equals a column's, so comparing datatypes
+    // first refused every constant on a language-tagged column — including the
+    // one that was right.
+    match (lit.language(), lang.as_deref()) {
+        (Some(a), Some(b)) => return a == b,
+        (None, None) => {}
+        _ => return false,
     }
+
     // A plain literal's datatype is `xsd:string`, so the column's `None` and a
     // query literal with no explicit type are the same term.
-    lit.datatype().as_str() == datatype.as_deref().unwrap_or(XSD_STRING_IRI)
+    if lit.datatype().as_str() != datatype.as_deref().unwrap_or(XSD_STRING_IRI) {
+        return false;
+    }
+
+    // Same datatype is still not SPARQL `=`: on a number the query compares
+    // *values* and the pushed condition compares text, so `= "003"^^xsd:integer`
+    // selects a record that `object_data->>'length' = '003'` never finds. Push
+    // only the form the stored text is written in.
+    !numeric || is_canonical_number(lit.value())
+}
+
+/// Whether this is the way the number would be written back out.
+///
+/// Round-tripping is the test rather than a grammar: `003`, `+3` and `1.50` all
+/// name values the stored text does not spell that way, and comparing text
+/// against any of them silently matches nothing.
+fn is_canonical_number(lexical: &str) -> bool {
+    if let Ok(int) = lexical.parse::<i64>() {
+        return int.to_string() == lexical;
+    }
+    if let Ok(float) = lexical.parse::<f64>() {
+        return float.to_string() == lexical;
+    }
+    false
 }
 
 /// Collect VALUES conditions, now keyed by (star_variable, slot_name).
@@ -2474,6 +2550,12 @@ classes:
         identifier: true
       hasName:
         range: string
+      # Deliberately the same slot name Signal uses, so a check that matches a
+      # carried path by spelling alone is caught rather than trusted.
+      documents:
+        range: Document
+        multivalued: true
+        inlined: true
       belongsToLine:
         range: Line
   Line:

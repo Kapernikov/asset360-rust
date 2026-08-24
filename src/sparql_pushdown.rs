@@ -721,15 +721,25 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     let unbound_multivalued = stars
         .iter()
         .flat_map(|star| {
-            star.slot_variables
-                .iter()
-                .map(move |(slot, var)| (var, star.class_uri.as_str(), std::slice::from_ref(slot)))
+            star.slot_variables.iter().map(move |(slot, var)| {
+                (
+                    var,
+                    star.variable.as_str(),
+                    star.class_uri.as_str(),
+                    std::slice::from_ref(slot),
+                )
+            })
         })
         .chain(plan.path_bindings.iter().filter_map(|(var, binding)| {
             let star = stars.iter().find(|s| s.variable == binding.star_var)?;
-            Some((var, star.class_uri.as_str(), binding.slot_path.as_slice()))
+            Some((
+                var,
+                star.variable.as_str(),
+                star.class_uri.as_str(),
+                binding.slot_path.as_slice(),
+            ))
         }))
-        .find(|(var, class_uri, slot_path)| {
+        .find(|(var, star_var, class_uri, slot_path)| {
             if bindings.iter().any(|b| b.var == **var) {
                 return false;
             }
@@ -737,13 +747,20 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
             // that value's `containers` describe every hop of its path,
             // including this one. Only a multiplying read that nothing extends
             // is unaccounted for.
-            let carried_by_a_value = bindings
-                .iter()
-                .any(|b| b.slot_path.len() > slot_path.len() && b.slot_path.starts_with(slot_path));
+            //
+            // On the *same* star, though. Two classes can own slots of the same
+            // name — `Signal.documents` and `Track.documents` — and matching a
+            // path by spelling alone let a binding on one excuse an unaccounted
+            // multiplication on the other.
+            let carried_by_a_value = bindings.iter().any(|b| {
+                b.star_var == *star_var
+                    && b.slot_path.len() > slot_path.len()
+                    && b.slot_path.starts_with(slot_path)
+            });
             !carried_by_a_value && path_multiplies(schema_view, class_uri, slot_path)
         });
 
-    if let Some((var, _, slot_path)) = unbound_multivalued {
+    if let Some((var, _, _, slot_path)) = unbound_multivalued {
         return Ok(blocked(
             BlockedCode::UnsupportedPattern,
             format!(
@@ -1392,6 +1409,13 @@ mod tests {
             // that multiplies is not the leaf.
             "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:documents ?d . ?d asset360:title ?ti }",
+            // Two classes can own a slot of the same name. Matching the carried
+            // path by spelling alone let ?ti's binding on the Track star excuse
+            // ?d1's unaccounted multiplication on the Signal star.
+            "SELECT (COUNT(?ti) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:documents ?d1 ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:documents ?d2 . \
+             ?d2 asset360:title ?ti }",
         ] {
             assert_eq!(
                 blocked_code(query),
