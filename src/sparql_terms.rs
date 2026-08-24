@@ -34,6 +34,7 @@
 
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
+use linkml_schemaview::slotview::SlotContainerMode;
 
 /// What kind of RDF term a column's values become.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,22 +91,34 @@ pub fn term_descriptor(
     class_uri: &str,
     slot_path: &[String],
 ) -> Option<TermDescriptor> {
+    resolve_column(schema_view, class_uri, slot_path).map(|(descriptor, _)| descriptor)
+}
+
+/// Resolve a column: how to render its values, and how each step is stored.
+///
+/// One walk, because there is only one route. The containers come out of the
+/// same `SlotView`s the descriptor is derived from, so the two cannot disagree
+/// about a path — and no caller has to know that one must run before the other,
+/// which is what the previous pair of functions silently required.
+pub fn resolve_column(
+    schema_view: &SchemaView,
+    class_uri: &str,
+    slot_path: &[String],
+) -> Option<(TermDescriptor, Vec<SlotContainerMode>)> {
     if slot_path.is_empty() {
-        return Some(TermDescriptor::subject_iri());
+        return Some((TermDescriptor::subject_iri(), Vec::new()));
     }
 
     let mut class_view = schema_view.get_class_by_uri(class_uri).ok()??;
+    let mut containers = Vec::with_capacity(slot_path.len());
 
     for (i, slot_name) in slot_path.iter().enumerate() {
-        let slot = class_view
-            .slots()
-            .iter()
-            .find(|s| s.name == *slot_name)?
-            .clone();
+        // The class's own name index, rather than a scan of its slots.
+        let slot = class_view.slot(&Identifier::Name(slot_name.clone()))?;
+        containers.push(slot.determine_slot_container_mode());
 
-        let is_last = i + 1 == slot_path.len();
-        if is_last {
-            return describe_slot(schema_view, &slot);
+        if i + 1 == slot_path.len() {
+            return describe_slot(schema_view, &slot).map(|d| (d, containers));
         }
 
         // An intermediate step must be a class to walk into.

@@ -1604,8 +1604,27 @@ pub struct QueryPlan {
     root: PlanNode,
     sql_limit: Option<usize>,
     path_bindings: HashMap<String, (String, Vec<String>)>,
-    exact: bool,
     inexact_reason: Option<&'static str>,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+impl From<crate::sparql_scoper::QueryPlan> for QueryPlan {
+    /// One conversion for both entry points. ``sparql_scope`` and a pushdown
+    /// verdict's ``.plan`` were building this by hand, fifty lines apart, and
+    /// an exactness field set in one place and forgotten in the other is a plan
+    /// that claims to describe a query it does not.
+    fn from(plan: crate::sparql_scoper::QueryPlan) -> Self {
+        QueryPlan {
+            root: PlanNode { inner: plan.root },
+            sql_limit: plan.sql_limit,
+            path_bindings: plan
+                .path_bindings
+                .into_iter()
+                .map(|(var, binding)| (var, (binding.star_var, binding.slot_path)))
+                .collect(),
+            inexact_reason: plan.inexact.map(|cause| cause.as_str()),
+        }
+    }
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -1643,7 +1662,7 @@ impl QueryPlan {
     /// a plausible wrong number.
     #[getter]
     fn exact(&self) -> bool {
-        self.exact
+        self.inexact_reason.is_none()
     }
 
     /// Why the plan is not exact, or ``None`` when it is.
@@ -1715,9 +1734,10 @@ impl QueryPlan {
 
     fn __repr__(&self) -> String {
         format!(
-            "QueryPlan(root={:?}, limit={:?})",
+            "QueryPlan(root={:?}, limit={:?}, inexact_reason={:?})",
             self.root.kind(),
-            self.sql_limit
+            self.sql_limit,
+            self.inexact_reason
         )
     }
 }
@@ -1765,7 +1785,7 @@ impl PushdownBinding {
     /// position to ask for a term descriptor.
     #[getter]
     fn class_uri(&self) -> &str {
-        &self.inner.term_ref.class_uri
+        &self.inner.class_uri
     }
 
     /// How each step of ``slot_path`` is stored: ``"single"``, ``"list"`` or
@@ -2142,24 +2162,7 @@ impl PushdownVerdict {
     fn plan(&self) -> Option<QueryPlan> {
         use crate::sparql_pushdown::Pushdown;
         match &self.inner {
-            Pushdown::Eligible { plan, .. } => Some(QueryPlan {
-                root: PlanNode {
-                    inner: plan.root.clone(),
-                },
-                sql_limit: plan.sql_limit,
-                path_bindings: plan
-                    .path_bindings
-                    .iter()
-                    .map(|(var, binding)| {
-                        (
-                            var.clone(),
-                            (binding.star_var.clone(), binding.slot_path.clone()),
-                        )
-                    })
-                    .collect(),
-                exact: plan.inexact.is_none(),
-                inexact_reason: plan.inexact.map(|cause| cause.as_str()),
-            }),
+            Pushdown::Eligible { plan, .. } => Some(plan.clone().into()),
             _ => None,
         }
     }
@@ -2217,20 +2220,10 @@ fn py_sparql_pushdown(
 
     match crate::sparql_pushdown::analyse_pushdown(query, sv) {
         Ok(verdict) => Ok(PushdownVerdict { inner: verdict }),
-        Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
-            Err(pyo3::exceptions::PyValueError::new_err(
-                "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.",
-            ))
-        }
-        Err(crate::sparql_scoper::ScopeError::ParseError(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("SPARQL parse error: {msg}")),
-        ),
-        Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("Query is unscoped: {msg}")),
-        ),
-        Err(crate::sparql_scoper::ScopeError::UnsupportedConstruct(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("unsupported_construct: {msg}")),
-        ),
+        // ScopeError's Display produces exactly these strings, so there is one
+        // place to change when a variant is added — rather than two blocks
+        // fifty lines apart that stayed identical by luck.
+        Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e.to_string())),
     }
 }
 
@@ -2259,31 +2252,11 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
     let sv = sv_ref.as_rust();
 
     match crate::sparql_scoper::sparql_scope(query, sv) {
-        Ok(plan) => Ok(QueryPlan {
-            root: PlanNode { inner: plan.root },
-            sql_limit: plan.sql_limit,
-            path_bindings: plan
-                .path_bindings
-                .into_iter()
-                .map(|(var, binding)| (var, (binding.star_var, binding.slot_path)))
-                .collect(),
-            exact: plan.inexact.is_none(),
-            inexact_reason: plan.inexact.map(|cause| cause.as_str()),
-        }),
-        Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
-            Err(pyo3::exceptions::PyValueError::new_err(
-                "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.",
-            ))
-        }
-        Err(crate::sparql_scoper::ScopeError::ParseError(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("SPARQL parse error: {msg}")),
-        ),
-        Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("Query is unscoped: {msg}")),
-        ),
-        Err(crate::sparql_scoper::ScopeError::UnsupportedConstruct(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("unsupported_construct: {msg}")),
-        ),
+        Ok(plan) => Ok(plan.into()),
+        // ScopeError's Display produces exactly these strings, so there is one
+        // place to change when a variant is added — rather than two blocks
+        // fifty lines apart that stayed identical by luck.
+        Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e.to_string())),
     }
 }
 

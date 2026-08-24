@@ -27,7 +27,7 @@ use spargebra::term::Variable;
 use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_scoper::{PathBinding, QueryPlan, ScopeError, Star, parse_query, scope_parsed};
-use crate::sparql_terms::{TermDescriptor, term_descriptor};
+use crate::sparql_terms::{TermDescriptor, resolve_column};
 
 /// Verdict for one query.
 #[derive(Debug, Clone)]
@@ -216,9 +216,9 @@ pub struct BindingSpec {
     /// per step because any hop along a path may be a collection, and each one
     /// multiplies the rows.
     pub containers: Vec<Container>,
-    /// Pointer to the schema position, for the term descriptor. Deliberately
-    /// not a copy of the rendering decision: that stays on the schema side.
-    pub term_ref: TermRef,
+    /// Class IRI the slot path is resolved against — the schema position, not a
+    /// copy of the rendering decision, which lives in `descriptor`.
+    pub class_uri: String,
     /// How this column's stored text becomes an RDF term, resolved from the
     /// schema once per column.
     ///
@@ -255,22 +255,16 @@ impl Container {
         }
     }
 
-    fn from_slot(slot: &linkml_schemaview::slotview::SlotView) -> Self {
+    /// Map the schema's own three-way distinction to the string form the
+    /// Python boundary uses. Not a parallel vocabulary — a rendering of one.
+    fn from_mode(mode: &linkml_schemaview::slotview::SlotContainerMode) -> Self {
         use linkml_schemaview::slotview::SlotContainerMode;
-        match slot.determine_slot_container_mode() {
+        match mode {
             SlotContainerMode::SingleValue => Self::Single,
             SlotContainerMode::List => Self::List,
             SlotContainerMode::Mapping => Self::Mapping,
         }
     }
-}
-
-/// Where a binding sits in the schema. The renderer asks the schema how to turn
-/// a stored value into an RDF term; the plan only says which value.
-#[derive(Debug, Clone)]
-pub struct TermRef {
-    pub class_uri: String,
-    pub slot_path: Vec<String>,
 }
 
 /// One aggregate in the SELECT list.
@@ -777,17 +771,32 @@ fn binding_for(
         return Ok(i);
     }
 
-    // Which star owns this variable: the one whose subject it is, or whose
-    // slot binds it, or whose nested structure it sits in.
-    let star = stars
+    // Which star owns this variable, and where in it the value lives. One
+    // resolution: which route matched and where the value sits are the same
+    // question, and answering it twice is how the second refusal below became
+    // unreachable.
+    let (star, slot_path) = stars
         .iter()
         .copied()
-        .find(|s| {
-            s.variable == var_name
-                || s.slot_variables.values().any(|v| v == var_name)
-                || path_bindings
-                    .get(var_name)
-                    .is_some_and(|b| b.star_var == s.variable)
+        .find_map(|s| {
+            // The star's subject variable binds the object's own IRI, which is
+            // the empty path — resolve_column maps that to subject_iri().
+            if s.variable == var_name {
+                return Some((s, Vec::new()));
+            }
+            if let Some((slot, _)) = s
+                .slot_variables
+                .iter()
+                .find(|(_slot, bound_var)| bound_var.as_str() == var_name)
+            {
+                return Some((s, vec![slot.clone()]));
+            }
+            // Or inside one of the star's nested structures —
+            // `?s :location ?l . ?l :longitude ?v` binds ?v two slots down.
+            path_bindings
+                .get(var_name)
+                .filter(|b| b.star_var == s.variable)
+                .map(|b| (s, b.slot_path.clone()))
         })
         .ok_or_else(|| {
             Blocked::new(
@@ -797,65 +806,26 @@ fn binding_for(
             )
         })?;
 
-    // The star's subject variable binds the object's own IRI.
-    if star.variable == var_name {
-        bindings.push(BindingSpec {
-            var: var_name.to_owned(),
-            star_var: star.variable.clone(),
-            slot_path: Vec::new(),
-            term_ref: TermRef {
-                class_uri: star.class_uri.clone(),
-                slot_path: Vec::new(),
-            },
-            containers: Vec::new(),
-            descriptor: TermDescriptor::subject_iri(),
-        });
-        return Ok(bindings.len() - 1);
-    }
-
-    let direct = star
-        .slot_variables
-        .iter()
-        .find(|(_slot, bound_var)| bound_var.as_str() == var_name)
-        .map(|(slot, _)| vec![slot.clone()]);
-
-    // Failing that, the variable may sit inside one of the star's nested
-    // structures — `?s :location ?l . ?l :longitude ?v` binds ?v two slots
-    // down. The scoper resolved those paths while walking the same triples.
-    let nested = path_bindings
-        .get(var_name)
-        .filter(|binding| binding.star_var == star.variable);
-    if let Some(binding) = nested
+    // A required and an optional nested read look identical in the plan and
+    // have different answers: required excludes the records that lack the
+    // value, optional keeps them with the variable unbound. Until the plan can
+    // say which, refuse rather than pick one.
+    if let Some(binding) = path_bindings.get(var_name)
+        && binding.star_var == star.variable
         && binding.optional
     {
-        {
-            // A required and an optional nested read look identical in the plan
-            // and have different answers: required excludes the records that
-            // lack the value, optional keeps them with the variable unbound.
-            // Until the plan can say which, refuse rather than pick one.
-            return Err(Blocked::new(
-                BlockedCode::IncompletePlan,
-                format!(
-                    "?{var_name} is read inside an OPTIONAL through a nested \
-                     path, which the plan cannot tell apart from a required read"
-                ),
-                Some(format!("?{var_name}")),
-            ));
-        }
-    }
-    let nested = nested.map(|binding| binding.slot_path.clone());
-
-    let slot_path = direct.or(nested).ok_or_else(|| {
-        Blocked::new(
-            BlockedCode::UnscopedBinding,
-            format!("?{var_name} is not bound to a slot of <{}>", star.class_uri),
+        return Err(Blocked::new(
+            BlockedCode::IncompletePlan,
+            format!(
+                "?{var_name} is read inside an OPTIONAL through a nested path, \
+                 which the plan cannot tell apart from a required read"
+            ),
             Some(format!("?{var_name}")),
-        )
-    })?;
-    // Unknown to the schema should be impossible here — the slot came from the
-    // star decomposition, which resolved it against this very class — but a
-    // descriptor is required to render the column, so refuse rather than guess.
-    let descriptor = term_descriptor(schema_view, &star.class_uri, &slot_path).ok_or_else(|| {
+        ));
+    }
+
+    let (descriptor, container_modes) = resolve_column(schema_view, &star.class_uri, &slot_path)
+        .ok_or_else(|| {
         Blocked::new(
             BlockedCode::UnscopedBinding,
             format!(
@@ -867,58 +837,16 @@ fn binding_for(
         )
     })?;
 
-    let containers = containers_along(schema_view, &star.class_uri, &slot_path);
+    let containers: Vec<Container> = container_modes.iter().map(Container::from_mode).collect();
     bindings.push(BindingSpec {
         var: var_name.to_owned(),
         star_var: star.variable.clone(),
-        slot_path: slot_path.clone(),
+        slot_path,
         containers,
-        term_ref: TermRef {
-            class_uri: star.class_uri.clone(),
-            slot_path,
-        },
+        class_uri: star.class_uri.clone(),
         descriptor,
     });
     Ok(bindings.len() - 1)
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Resolve how each step of a path is stored, walking the same route the
-/// descriptor does.
-///
-/// A step that cannot be resolved is reported as `Single`: the descriptor
-/// resolution runs first and refuses anything the schema does not describe, so
-/// reaching this with an unknown slot is not possible — and assuming "single"
-/// would under-count rather than invent rows.
-fn containers_along(
-    schema_view: &SchemaView,
-    class_uri: &str,
-    slot_path: &[String],
-) -> Vec<Container> {
-    let mut out = Vec::with_capacity(slot_path.len());
-    let Ok(Some(mut class_view)) = schema_view.get_class_by_uri(class_uri) else {
-        return vec![Container::Single; slot_path.len()];
-    };
-
-    for (i, slot_name) in slot_path.iter().enumerate() {
-        let Some(slot) = class_view
-            .slots()
-            .iter()
-            .find(|s| s.name == *slot_name)
-            .cloned()
-        else {
-            out.extend(std::iter::repeat_n(Container::Single, slot_path.len() - i));
-            break;
-        };
-        out.push(Container::from_slot(&slot));
-
-        match slot.get_range_class() {
-            Some(next) => class_view = next,
-            None => break,
-        }
-    }
-
-    out
 }
 
 fn measure_for(
@@ -968,7 +896,7 @@ fn measure_for(
                             format!(
                                 "?{} is not a numeric slot of <{}>",
                                 v.as_str(),
-                                bindings[arg].term_ref.class_uri
+                                bindings[arg].class_uri
                             ),
                             Some(format!("?{}", v.as_str())),
                         ));
@@ -1105,10 +1033,7 @@ mod tests {
         let key = &spec.bindings[spec.group_keys[0]];
         assert_eq!(key.var, "name");
         assert_eq!(key.slot_path, vec!["name".to_owned()]);
-        assert_eq!(
-            key.term_ref.class_uri,
-            "https://data.infrabel.be/asset360/Signal"
-        );
+        assert_eq!(key.class_uri, "https://data.infrabel.be/asset360/Signal");
 
         assert_eq!(spec.measures.len(), 1);
         assert_eq!(spec.measures[0].var, "n");

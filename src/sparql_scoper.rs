@@ -19,6 +19,7 @@ use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use spargebra::{Query, SparqlParser};
 
+use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 
 // ---------------------------------------------------------------------------
@@ -1335,10 +1336,15 @@ fn resolve_star_class(
             .class_views()
             .map_err(|e| ScopeError::ParseError(e.to_string()))?;
         for cv in all_classes {
-            if used_slots
-                .iter()
-                .all(|slot| cv.slots().iter().any(|s| s.name == **slot))
-            {
+            // Existence only, so index the class's own names once rather than
+            // rescanning them per used slot — and never materialise a SlotView,
+            // which is what `slot()` would cost here for nothing. This runs
+            // over every class in the schema.
+            let matches = {
+                let names: HashSet<&str> = cv.slots().iter().map(|s| s.name.as_str()).collect();
+                used_slots.iter().all(|slot| names.contains(slot.as_str()))
+            };
+            if matches {
                 candidates.push(cv);
             }
         }
@@ -1419,11 +1425,10 @@ fn tag_triples_by_depth<'a>(
     }
 }
 
-/// Collect FILTER equality conditions, now keyed by (star_variable, slot_name).
 /// Collect the FILTER conditions that can be pushed to SQL.
 ///
-/// Returns `false` when anything was left behind, which the caller records as
-/// inexactness. Two ways that happens:
+/// Returns the cause when anything was left behind, which the caller records as
+/// the plan's inexactness. Two ways that happens:
 ///
 /// * an expression this cannot express — `!=`, `||`, `!`, `REGEX`, `BOUND`, a
 ///   comparison between two variables;
@@ -1787,7 +1792,7 @@ fn pushable_limit(pattern: &GraphPattern) -> Option<usize> {
             start,
             length,
         } => {
-            if is_holistic(inner) || contains_slice(inner) {
+            if blocks_limit_push(inner) {
                 // A nested Slice would need composing with this one, and the
                 // composition is not `min`: an inner LIMIT applies before an
                 // outer OFFSET, so the two interact. Nested slices only arise
@@ -1892,7 +1897,10 @@ fn walk_paths(
         if var_to_class.contains_key(object_var) {
             continue;
         }
-        let Some(slot) = current_class.slots().iter().find(|s| s.name == *slot_name) else {
+        // The class's own O(1) name index rather than a scan. It hands back an
+        // owned SlotView, which this did not need before — worth it for a wide
+        // class (TunnelComplex has 95 slots), a wash for a narrow one.
+        let Some(slot) = current_class.slot(&Identifier::Name(slot_name.clone())) else {
             continue;
         };
 
@@ -2007,47 +2015,38 @@ fn contains_foreign_scope(pattern: &GraphPattern) -> Option<Inexact> {
     }
 }
 
-/// Whether a `Slice` appears below this point.
-fn contains_slice(pattern: &GraphPattern) -> bool {
-    match pattern {
-        GraphPattern::Slice { .. } => true,
-        GraphPattern::Filter { inner, .. }
-        | GraphPattern::Extend { inner, .. }
-        | GraphPattern::OrderBy { inner, .. }
-        | GraphPattern::Project { inner, .. }
-        | GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::Group { inner, .. }
-        | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => contains_slice(inner),
-        GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => contains_slice(left) || contains_slice(right),
-        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
-    }
-}
-
-/// Whether any operator below this point must see every solution.
+/// Whether anything below this point stops a LIMIT from being pushed.
 ///
-/// Only [`pushable_limit`] calls this, to tell "no limit found" apart from
-/// "found one that must not be pushed".
-fn is_holistic(pattern: &GraphPattern) -> bool {
+/// Two reasons, and they are one question: an operator that must see every
+/// solution first (`GROUP BY`, a bare aggregate, `ORDER BY`,
+/// `DISTINCT`/`REDUCED`), or a second `Slice`, which would have to be
+/// *composed* with the outer one rather than applied independently — an inner
+/// LIMIT applies before an outer OFFSET, so `min` is not the composition.
+/// Nested slices only arise from sub-queries, which are refused as inexact, so
+/// rather than carry arithmetic that is unreachable and would be wrong if it
+/// ever ran, refuse to push anything.
+///
+/// Only [`pushable_limit`] calls this, from inside its own `Slice` arm, so "a
+/// `Slice` below this point" and "a `Slice` nested inside the one I am looking
+/// at" are the same condition.
+fn blocks_limit_push(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Group { .. }
         | GraphPattern::OrderBy { .. }
         | GraphPattern::Distinct { .. }
-        | GraphPattern::Reduced { .. } => true,
+        | GraphPattern::Reduced { .. }
+        | GraphPattern::Slice { .. } => true,
         GraphPattern::Filter { inner, .. }
         | GraphPattern::Extend { inner, .. }
         | GraphPattern::Project { inner, .. }
-        | GraphPattern::Slice { inner, .. }
         | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => is_holistic(inner),
+        | GraphPattern::Service { inner, .. } => blocks_limit_push(inner),
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => is_holistic(left) || is_holistic(right),
+        | GraphPattern::Minus { left, right } => {
+            blocks_limit_push(left) || blocks_limit_push(right)
+        }
         // Left exhaustive on purpose: a new GraphPattern variant should be a
         // compile error here, not a silent "safe to push the LIMIT down".
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
