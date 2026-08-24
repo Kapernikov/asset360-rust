@@ -156,12 +156,6 @@ pub enum Inexact {
     /// A `VALUES` row with `UNDEF` for a variable: that row places no
     /// constraint, so dropping it turns a union into an intersection.
     UndefInValues,
-    /// An `OPTIONAL` that relates two otherwise unrelated classes. Rendering it
-    /// as a join implies a relationship the query does not require.
-    OptionalJoin,
-    /// A nested path whose leaf sits inside an `OPTIONAL`. Indistinguishable in
-    /// the plan from a mandatory one, and the two have different answers.
-    OptionalPath,
 }
 
 impl Inexact {
@@ -185,8 +179,6 @@ impl Inexact {
             Self::RepeatedType => "repeated_type",
             Self::TaggedConstant => "tagged_constant",
             Self::UndefInValues => "undef_in_values",
-            Self::OptionalJoin => "optional_join",
-            Self::OptionalPath => "optional_path",
         }
     }
 
@@ -257,16 +249,6 @@ impl Inexact {
                 "a VALUES row uses UNDEF, which places no constraint at all — \
                  dropping it would turn a union into an intersection"
             }
-            Self::OptionalJoin => {
-                "an OPTIONAL relates two classes that the query does not \
-                 otherwise relate, so they are independent and the answer is \
-                 their cross product"
-            }
-            Self::OptionalPath => {
-                "a nested value is read inside an OPTIONAL, which the plan \
-                 cannot tell apart from a required one — and the two have \
-                 different answers"
-            }
         }
     }
 
@@ -324,15 +306,6 @@ impl Inexact {
             Self::UndefInValues => {
                 "Leave the row out instead of using UNDEF, or ask the \
                  unconstrained case as its own question."
-            }
-            Self::OptionalJoin => {
-                "Make the relationship required, or ask about each class \
-                 separately — an OPTIONAL between two classes does not relate \
-                 them."
-            }
-            Self::OptionalPath => {
-                "Read the nested value outside the OPTIONAL, or accept that \
-                 records without it are excluded and drop the OPTIONAL."
             }
         }
     }
@@ -575,17 +548,6 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
-    /// The SQL operator. Safe to inline: it comes from this closed set, never
-    /// from the request.
-    pub fn as_sql(&self) -> &'static str {
-        match self {
-            Self::Gt => ">",
-            Self::Gte => ">=",
-            Self::Lt => "<",
-            Self::Lte => "<=",
-        }
-    }
-
     /// Stable string form for the Python boundary.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -710,7 +672,10 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // Subject variables whose class could not be resolved. Cleared below by
     // whichever of them the path walk explains.
     let mut unresolved_subjects: HashSet<String> = HashSet::new();
-    let mut drop = |cause: Inexact| {
+    // Named for what it does. This was `drop`, which shadowed `std::mem::drop`
+    // for the rest of the function and read as if it destroyed the cause rather
+    // than recording it.
+    let mut record_loss = |cause: Inexact| {
         if inexact.is_none() {
             inexact = Some(cause);
         }
@@ -754,7 +719,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 (key, Some(iri))
             }
             _ => {
-                drop(Inexact::UnscopedSubject);
+                record_loss(Inexact::UnscopedSubject);
                 continue;
             }
         };
@@ -764,7 +729,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             _ => {
                 // `?s ?p ?o`: which slot this reads is unknown until the query
                 // runs, so the triple constrains nothing here.
-                drop(Inexact::VariablePredicate);
+                record_loss(Inexact::VariablePredicate);
                 continue;
             }
         };
@@ -865,7 +830,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 // oxigraph — and the plan no longer says everything the query
                 // does.
                 TermPattern::NamedNode(_) | TermPattern::Literal(_) => {
-                    drop(Inexact::ConstantInOptional);
+                    record_loss(Inexact::ConstantInOptional);
                 }
                 _ => {}
             }
@@ -873,7 +838,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             // A predicate that matches no slot: its constraint is invisible to
             // the plan, so a consumer reading the plan as exact would count
             // rows the query excludes.
-            drop(Inexact::UnknownPredicate);
+            record_loss(Inexact::UnknownPredicate);
         }
     }
 
@@ -1045,28 +1010,19 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // does. Compute reachability from mandatory stars and reject any
     // orphaned optional star.
     {
-        use std::collections::HashSet;
-        let mut reachable: HashSet<String> = stars
+        let edges: Vec<(&str, &str)> = joins
             .iter()
-            .filter(|s| !s.is_optional)
-            .map(|s| s.variable.clone())
+            .map(|j| (j.left.as_str(), j.right.as_str()))
             .collect();
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for j in &joins {
-                if reachable.contains(&j.left) && !reachable.contains(&j.right) {
-                    reachable.insert(j.right.clone());
-                    changed = true;
-                }
-                if reachable.contains(&j.right) && !reachable.contains(&j.left) {
-                    reachable.insert(j.left.clone());
-                    changed = true;
-                }
-            }
-        }
+        let reachable = stars_reachable_from(
+            stars
+                .iter()
+                .filter(|s| !s.is_optional)
+                .map(|s| s.variable.as_str()),
+            &edges,
+        );
         for s in &stars {
-            if s.is_optional && !reachable.contains(&s.variable) {
+            if s.is_optional && !reachable.contains(s.variable.as_str()) {
                 return Err(ScopeError::UnsupportedConstruct(format!(
                     "OPTIONAL block introduces ?{} which shares no variable with the mandatory pattern; \
                      disconnected OPTIONAL is not supported yet",
@@ -1096,10 +1052,10 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
 
     let mut star_filters: HashMap<String, HashMap<String, Vec<FilterCondition>>> = HashMap::new();
     if let Some(cause) = collect_filter_conditions(pattern, 0, &var_to_field, &mut star_filters) {
-        drop(cause);
+        record_loss(cause);
     }
     if let Some(cause) = collect_values_filters(pattern, 0, &var_to_field, &mut star_filters) {
-        drop(cause);
+        record_loss(cause);
     }
 
     for star in &mut stars {
@@ -1195,7 +1151,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         .iter()
         .any(|var| !traversed.contains(var))
     {
-        drop(Inexact::UntypedSubject);
+        record_loss(Inexact::UntypedSubject);
     }
 
     // Whatever no path claimed. This is what makes the property structural: a
@@ -1203,7 +1159,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // nobody thought of is reported rather than silent.
     if let Some(index) = unconsumed.iter().min() {
         let (tp, depth) = &triples_with_depth[*index];
-        drop(cause_for_unconsumed(tp, *depth, schema_view));
+        record_loss(cause_for_unconsumed(tp, *depth, schema_view));
     }
 
     // A variable bound by two slots is an equality between them —
@@ -1226,14 +1182,14 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         }
     }
     if bound_twice {
-        drop(Inexact::ImpliedEquality);
+        record_loss(Inexact::ImpliedEquality);
     }
 
     if contains_subquery(pattern) {
-        drop(Inexact::Subquery);
+        record_loss(Inexact::Subquery);
     }
     if let Some(cause) = contains_foreign_scope(pattern) {
-        drop(cause);
+        record_loss(cause);
     }
 
     // Phase 7: the SQL LIMIT.
@@ -1961,6 +1917,34 @@ fn walk_paths(
     }
 }
 
+/// The stars reachable from `seeds` by any chain of join edges.
+///
+/// Edges are undirected here: a join constrains both of its ends, so a star is
+/// related to the seeds whichever side of the edge it sits on. Shared by the
+/// two questions that need it — which OPTIONAL stars hang off the mandatory
+/// pattern, and whether every class in an aggregate is actually related — so
+/// the two cannot disagree about what "connected" means.
+pub(crate) fn stars_reachable_from<'a>(
+    seeds: impl IntoIterator<Item = &'a str>,
+    edges: &[(&'a str, &'a str)],
+) -> HashSet<&'a str> {
+    let mut reached: HashSet<&'a str> = seeds.into_iter().collect();
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for (left, right) in edges {
+            if reached.contains(left) && !reached.contains(right) {
+                reached.insert(right);
+                progress = true;
+            } else if reached.contains(right) && !reached.contains(left) {
+                reached.insert(left);
+                progress = true;
+            }
+        }
+    }
+    reached
+}
+
 /// Name the reason a triple went unrepresented, for the message only.
 ///
 /// The verdict does not depend on getting this right: the triple is already
@@ -2414,6 +2398,10 @@ classes:
     /// only pushable when the fetch returns the real row set, and an exact
     /// consumer must refuse. Each of these reported `exact` before, and each
     /// answered a weaker question than it was asked.
+    ///
+    /// One table on purpose: these are one question asked of every drop site,
+    /// and a new site belongs here as a row rather than as a fourth test with
+    /// the same body.
     #[test]
     fn dropping_part_of_the_query_is_recorded_at_the_drop_site() {
         let sv = test_schema_view();
@@ -2455,27 +2443,9 @@ classes:
                 Inexact::Subquery,
                 "SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 5 } }",
             ),
-        ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
-            assert_eq!(
-                plan.inexact,
-                Some(expected),
-                "wrong cause recorded for: {query}"
-            );
-        }
-    }
-
-    /// Each of these was measured Eligible with a plan that did not describe
-    /// the query, and each answered a weaker question than it was asked.
-    /// A triple nothing claimed makes the plan inexact by default, which is
-    /// what stops the *next* unenumerated drop site from being silent. Each of
-    /// these was measured Eligible with a wrong number.
-    #[test]
-    fn unclaimed_triples_make_the_plan_inexact() {
-        let sv = test_schema_view();
-        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
-
-        for (expected, query) in [
+            // A triple nothing claimed makes the plan inexact by default, which
+            // is what stops the *next* unenumerated drop site from being silent.
+            // Each of the following was measured Eligible with a wrong number.
             // One slot read through two variables pairs its values with each
             // other; the plan describes a single read.
             (
@@ -2506,18 +2476,6 @@ classes:
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  VALUES ?nm { \"BX1\" UNDEF } }",
             ),
-        ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
-            assert_eq!(plan.inexact, Some(expected), "wrong cause for: {query}");
-        }
-    }
-
-    #[test]
-    fn more_drop_sites_are_recorded() {
-        let sv = test_schema_view();
-        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
-
-        for (expected, query) in [
             // A GRAPH block names a graph; the plan reads the default one.
             (
                 Inexact::NamedGraph,
@@ -2547,9 +2505,60 @@ classes:
                 "SELECT ?x WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  ?nm asset360:name ?x }",
             ),
+            // A blank-node property list has no variable to scope, so nothing
+            // can claim its triples — and the same query written with a named
+            // intermediate variable is exact and eligible.
+            (
+                Inexact::UnscopedSubject,
+                "SELECT ?v WHERE { ?s a asset360:Signal ; \
+                 asset360:location [ asset360:longitude ?v ] }",
+            ),
         ] {
             let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
-            assert_eq!(plan.inexact, Some(expected), "wrong cause for: {query}");
+            assert_eq!(
+                plan.inexact,
+                Some(expected),
+                "wrong cause recorded for: {query}"
+            );
+        }
+    }
+
+    /// Every cause carries all three strings, and no two share a wire form.
+    ///
+    /// The array is the whole set on purpose: a variant added without a line
+    /// here fails to compile, which is the reminder to also add it to the
+    /// ``inexact_reason`` docstring on the Python side — that list is what a
+    /// consumer branches on, and two of these were once documented as possible
+    /// while being unconstructable.
+    #[test]
+    fn every_inexact_cause_is_fully_described() {
+        const ALL: [Inexact; 17] = [
+            Inexact::FilterExpression,
+            Inexact::FilterInOptional,
+            Inexact::VariablePredicate,
+            Inexact::UnknownPredicate,
+            Inexact::UnscopedSubject,
+            Inexact::UntypedSubject,
+            Inexact::ConstantInOptional,
+            Inexact::UnboundValues,
+            Inexact::Subquery,
+            Inexact::NamedGraph,
+            Inexact::RemoteService,
+            Inexact::ImpliedEquality,
+            Inexact::UnrepresentedTriple,
+            Inexact::DuplicateSlotBinding,
+            Inexact::RepeatedType,
+            Inexact::TaggedConstant,
+            Inexact::UndefInValues,
+        ];
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for cause in ALL {
+            let wire = cause.as_str();
+            assert!(!wire.is_empty(), "{cause:?} has no wire form");
+            assert!(!cause.detail().is_empty(), "{wire} has no detail");
+            assert!(!cause.instead().is_empty(), "{wire} has no repair");
+            assert!(seen.insert(wire), "{wire} is used by two causes");
         }
     }
 

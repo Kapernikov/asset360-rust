@@ -3819,6 +3819,12 @@ class PushdownVerdict:
         Use this rather than calling ``sparql_scope`` again — a second call
         re-parses and could in principle disagree with the one behind the
         verdict.
+        
+        One field does not carry over: this plan's :attr:`~QueryPlan.sql_limit`
+        is always ``None`` here, because an aggregate must see every solution
+        before it can be limited. The query's own ``LIMIT`` is
+        ``solution.limit``, which applies to the *grouped* rows — take it from
+        there, never from the plan.
         """
     @property
     def solution(self) -> typing.Optional[PushdownSolution]:
@@ -3837,10 +3843,10 @@ class QueryPlan:
     structure.
     """
     @property
-    def path_bindings(self) -> builtins.dict[builtins.str, tuple[builtins.str, builtins.list[builtins.str]]]:
+    def path_bindings(self) -> builtins.dict[builtins.str, tuple[builtins.str, builtins.list[builtins.str], builtins.bool]]:
         r"""
         Variables reached by walking into a star's nested structures, as
-        ``{variable: (star_variable, [slot, ...])}``.
+        ``{variable: (star_variable, [slot, ...], optional)}``.
         
         ``?s :location ?l . ?l :longitude ?v`` binds ``?v`` two slots down from
         ``?s``, which no star can describe — ``?l`` has no ``rdf:type`` and is
@@ -3850,6 +3856,13 @@ class QueryPlan:
         Only scalar leaves appear. A variable standing for the nested structure
         itself serialises as a blank node, which nothing can reproduce, so it is
         traversable but never a value.
+        
+        The third element is whether any hop of the path was introduced inside
+        an ``OPTIONAL``. It is load-bearing: a required and an optional nested
+        read follow the same slots and have different answers — required
+        excludes the records that lack the value, optional keeps them with the
+        variable unbound — so a consumer that renders both the same way answers
+        one of the two questions wrongly.
         """
     @property
     def exact(self) -> builtins.bool:
@@ -3878,8 +3891,7 @@ class QueryPlan:
         ``untyped_subject``, ``constant_in_optional``, ``unbound_values``,
         ``subquery``, ``named_graph``, ``remote_service``, ``implied_equality``,
         ``unrepresented_triple``, ``duplicate_slot_binding``, ``repeated_type``,
-        ``tagged_constant``, ``undef_in_values``, ``optional_join``,
-        ``optional_path``.
+        ``tagged_constant``, ``undef_in_values``.
         
         Treat an unrecognised value as inexact rather than ignoring it: the set
         grows as more ways of dropping part of a query are found, and a new one

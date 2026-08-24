@@ -726,27 +726,20 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
 }
 
 /// A star that no chain of join edges connects to the first one, if any.
+///
+/// The walk itself is [`crate::sparql_scoper::stars_reachable_from`], shared
+/// with the scoper's disconnected-OPTIONAL check so that "connected" means one
+/// thing in this crate.
 fn disconnected_star(stars: &[&Star], joins: &[&crate::sparql_scoper::JoinEdge]) -> Option<String> {
     let first = stars.first()?;
-    let mut reached: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    reached.insert(first.variable.as_str());
-
-    // Edges are undirected for reachability: a join constrains both ends.
-    let mut progress = true;
-    while progress {
-        progress = false;
-        for join in joins {
-            let left_in = reached.contains(join.left.as_str());
-            let right_in = reached.contains(join.right.as_str());
-            if left_in && !right_in {
-                reached.insert(join.right.as_str());
-                progress = true;
-            } else if right_in && !left_in {
-                reached.insert(join.left.as_str());
-                progress = true;
-            }
-        }
-    }
+    let edges: Vec<(&str, &str)> = joins
+        .iter()
+        .map(|join| (join.left.as_str(), join.right.as_str()))
+        .collect();
+    let reached = crate::sparql_scoper::stars_reachable_from(
+        std::iter::once(first.variable.as_str()),
+        &edges,
+    );
 
     stars
         .iter()

@@ -77,29 +77,21 @@ impl TermDescriptor {
     }
 }
 
-/// Resolve how the value at `slot_path` on `class_uri` renders as an RDF term.
+/// Resolve a column: how the value at `slot_path` on `class_uri` renders as an
+/// RDF term, and how each step of the path is stored.
 ///
 /// An empty `slot_path` describes the object's own identifier. Returns `None`
 /// when the class or a step of the path is unknown to the schema.
-///
-/// Pull-based on an explicit path on purpose: a schema may be cyclic (a class
-/// with a slot of its own range), so there is no finite enumeration of "every
-/// path from this class" to precompute. Each call resolves the path it is
-/// given, which is always finite because it comes from a query.
-pub fn term_descriptor(
-    schema_view: &SchemaView,
-    class_uri: &str,
-    slot_path: &[String],
-) -> Option<TermDescriptor> {
-    resolve_column(schema_view, class_uri, slot_path).map(|(descriptor, _)| descriptor)
-}
-
-/// Resolve a column: how to render its values, and how each step is stored.
 ///
 /// One walk, because there is only one route. The containers come out of the
 /// same `SlotView`s the descriptor is derived from, so the two cannot disagree
 /// about a path — and no caller has to know that one must run before the other,
 /// which is what the previous pair of functions silently required.
+///
+/// Pull-based on an explicit path on purpose: a schema may be cyclic (a class
+/// with a slot of its own range), so there is no finite enumeration of "every
+/// path from this class" to precompute. Each call resolves the path it is
+/// given, which is always finite because it comes from a query.
 pub fn resolve_column(
     schema_view: &SchemaView,
     class_uri: &str,
@@ -250,6 +242,16 @@ fn enum_meanings(
 
 #[cfg(test)]
 mod tests {
+    /// The descriptor half of [`resolve_column`], which is all these cases are
+    /// about. The container half has its own assertions in `sparql_pushdown`.
+    fn descriptor_of(
+        schema_view: &SchemaView,
+        class_uri: &str,
+        slot_path: &[String],
+    ) -> Option<TermDescriptor> {
+        resolve_column(schema_view, class_uri, slot_path).map(|(descriptor, _)| descriptor)
+    }
+
     use super::*;
     use linkml_meta::SchemaDefinition;
     use linkml_schemaview::schemaview::SchemaView;
@@ -348,7 +350,7 @@ classes:
     }
 
     fn describe(slot: &str) -> TermDescriptor {
-        term_descriptor(&schema(), SIGNAL, &[slot.to_owned()])
+        descriptor_of(&schema(), SIGNAL, &[slot.to_owned()])
             .unwrap_or_else(|| panic!("no descriptor for {slot}"))
     }
 
@@ -423,7 +425,7 @@ classes:
     fn a_reference_is_the_target_iri() {
         // A reference stores the target's URI, which is exactly the term
         // oxigraph binds — so "count per parent" is answerable.
-        let d = term_descriptor(&schema(), SIGNAL, &["locatedOnTrack".to_owned()])
+        let d = descriptor_of(&schema(), SIGNAL, &["locatedOnTrack".to_owned()])
             .expect("a reference is a renderable term");
         assert_eq!(d.kind, TermKind::Iri);
     }
@@ -433,19 +435,19 @@ classes:
         // Nested JSON serialises as a blank node whose label nothing can
         // reproduce, so there is nothing to render. Refusing here is what makes
         // the analyser reject `GROUP BY ?loc`.
-        assert!(term_descriptor(&schema(), SIGNAL, &["location".to_owned()]).is_none());
+        assert!(descriptor_of(&schema(), SIGNAL, &["location".to_owned()]).is_none());
     }
 
     #[test]
     fn subject_binding_is_an_iri() {
-        let d = term_descriptor(&schema(), SIGNAL, &[]).unwrap();
+        let d = descriptor_of(&schema(), SIGNAL, &[]).unwrap();
         assert_eq!(d.kind, TermKind::Iri);
         assert!(!d.numeric);
     }
 
     #[test]
     fn path_walks_into_an_inline_object() {
-        let d = term_descriptor(
+        let d = descriptor_of(
             &schema(),
             SIGNAL,
             &["location".to_owned(), "longitude".to_owned()],
@@ -456,11 +458,11 @@ classes:
 
     #[test]
     fn unknown_class_or_slot_yields_nothing() {
-        assert!(term_descriptor(&schema(), SIGNAL, &["nope".to_owned()]).is_none());
-        assert!(term_descriptor(&schema(), "urn:not:a:class", &["name".to_owned()]).is_none());
+        assert!(descriptor_of(&schema(), SIGNAL, &["nope".to_owned()]).is_none());
+        assert!(descriptor_of(&schema(), "urn:not:a:class", &["name".to_owned()]).is_none());
         // A scalar cannot be walked through.
         assert!(
-            term_descriptor(&schema(), SIGNAL, &["name".to_owned(), "deeper".to_owned()]).is_none()
+            descriptor_of(&schema(), SIGNAL, &["name".to_owned(), "deeper".to_owned()]).is_none()
         );
     }
 }
