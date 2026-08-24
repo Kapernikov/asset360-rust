@@ -1646,10 +1646,19 @@ impl QueryPlan {
         self.exact
     }
 
-    /// Why the plan is not exact, or ``None`` when it is: one of
-    /// ``filter_expression``, ``filter_in_optional``, ``variable_predicate``,
-    /// ``unknown_predicate``, ``unscoped_subject``, ``untyped_subject``,
-    /// ``constant_in_optional``, ``unbound_values``, ``subquery``.
+    /// Why the plan is not exact, or ``None`` when it is.
+    ///
+    /// One of: ``filter_expression``, ``filter_in_optional``,
+    /// ``variable_predicate``, ``unknown_predicate``, ``unscoped_subject``,
+    /// ``untyped_subject``, ``constant_in_optional``, ``unbound_values``,
+    /// ``subquery``, ``named_graph``, ``remote_service``, ``implied_equality``,
+    /// ``unrepresented_triple``, ``duplicate_slot_binding``, ``repeated_type``,
+    /// ``tagged_constant``, ``undef_in_values``, ``optional_join``,
+    /// ``optional_path``.
+    ///
+    /// Treat an unrecognised value as inexact rather than ignoring it: the set
+    /// grows as more ways of dropping part of a query are found, and a new one
+    /// means the plan describes less than the query.
     ///
     /// Recorded at the point the planner dropped something, so this names a
     /// real cause rather than an inference about what survived.
@@ -1688,8 +1697,17 @@ impl QueryPlan {
             .collect()
     }
 
-    /// SQL LIMIT — only for single-star, zero-join, zero-OPTIONAL
-    /// queries with a top-level SPARQL LIMIT.
+    /// How many rows the object fetch may be limited to — ``OFFSET + LIMIT``,
+    /// not ``LIMIT``.
+    ///
+    /// The fetch has to cover the whole window the query asks for, because the
+    /// engine applies the offset to whatever comes back: ``LIMIT 10 OFFSET 20``
+    /// needs thirty rows, and fetching ten and then skipping twenty of them
+    /// returns nothing.
+    ///
+    /// ``None`` means no limit may be pushed — several classes, a join, an
+    /// OPTIONAL, a modifier that must see every solution first, or a plan that
+    /// does not describe the whole query (see ``exact``).
     #[getter]
     fn sql_limit(&self) -> Option<usize> {
         self.sql_limit

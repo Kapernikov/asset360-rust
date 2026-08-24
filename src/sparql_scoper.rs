@@ -36,8 +36,17 @@ pub struct QueryPlan {
     /// Root of the algebra tree.
     pub root: PlanNode,
 
-    /// SQL LIMIT — only set for single-star, zero-join, zero-OPTIONAL
-    /// queries with a top-level SPARQL LIMIT.
+    /// How many rows the object fetch may be limited to — `OFFSET + LIMIT`,
+    /// not `LIMIT`.
+    ///
+    /// The fetch has to cover the whole window the query asks for, because the
+    /// engine applies the offset to whatever comes back: `LIMIT 10 OFFSET 20`
+    /// needs thirty rows, and fetching ten then skipping twenty returns
+    /// nothing.
+    ///
+    /// Only set for a single-class, zero-join, zero-OPTIONAL query whose plan
+    /// describes the whole question (see `inexact`) and whose modifiers let a
+    /// limit apply before them.
     pub sql_limit: Option<usize>,
 
     /// Variables reached by walking *into* a star's nested structures, as
@@ -126,6 +135,32 @@ pub enum Inexact {
     /// One variable bound by two different slots, which is an equality between
     /// them that the plan does not carry.
     ImpliedEquality,
+    /// A triple no part of the plan claimed.
+    ///
+    /// The catch-all, and the point of the working set: a triple is inexact by
+    /// default and only a path that fully represents it says otherwise. A cause
+    /// added later is a better message; this one means the plan is still
+    /// honest about not describing the query.
+    UnrepresentedTriple,
+    /// A slot read through two variables — `:kinds ?x ; :kinds ?y` — which is a
+    /// self-join over its values.
+    DuplicateSlotBinding,
+    /// A second, different `rdf:type` on one subject: an intersection of
+    /// classes, where the plan holds one.
+    RepeatedType,
+    /// A constant object carrying a language tag or a non-string datatype. The
+    /// pushed condition compares stored text, so it would match on the value
+    /// alone and accept rows the query excludes.
+    TaggedConstant,
+    /// A `VALUES` row with `UNDEF` for a variable: that row places no
+    /// constraint, so dropping it turns a union into an intersection.
+    UndefInValues,
+    /// An `OPTIONAL` that relates two otherwise unrelated classes. Rendering it
+    /// as a join implies a relationship the query does not require.
+    OptionalJoin,
+    /// A nested path whose leaf sits inside an `OPTIONAL`. Indistinguishable in
+    /// the plan from a mandatory one, and the two have different answers.
+    OptionalPath,
 }
 
 impl Inexact {
@@ -144,6 +179,13 @@ impl Inexact {
             Self::NamedGraph => "named_graph",
             Self::RemoteService => "remote_service",
             Self::ImpliedEquality => "implied_equality",
+            Self::UnrepresentedTriple => "unrepresented_triple",
+            Self::DuplicateSlotBinding => "duplicate_slot_binding",
+            Self::RepeatedType => "repeated_type",
+            Self::TaggedConstant => "tagged_constant",
+            Self::UndefInValues => "undef_in_values",
+            Self::OptionalJoin => "optional_join",
+            Self::OptionalPath => "optional_path",
         }
     }
 
@@ -194,6 +236,36 @@ impl Inexact {
                  those two values to be equal — a constraint the plan does not \
                  carry"
             }
+            Self::UnrepresentedTriple => {
+                "a triple pattern is not represented in the plan, so the plan \
+                 describes fewer constraints than the query"
+            }
+            Self::DuplicateSlotBinding => {
+                "one slot is read through two variables, which pairs its values \
+                 with each other — the plan describes a single read"
+            }
+            Self::RepeatedType => {
+                "a subject is given two different rdf:types, which is an \
+                 intersection of classes; the plan holds one class"
+            }
+            Self::TaggedConstant => {
+                "a constant object carries a language tag or datatype, and the \
+                 pushed condition compares stored text only"
+            }
+            Self::UndefInValues => {
+                "a VALUES row uses UNDEF, which places no constraint at all — \
+                 dropping it would turn a union into an intersection"
+            }
+            Self::OptionalJoin => {
+                "an OPTIONAL relates two classes that the query does not \
+                 otherwise relate, so they are independent and the answer is \
+                 their cross product"
+            }
+            Self::OptionalPath => {
+                "a nested value is read inside an OPTIONAL, which the plan \
+                 cannot tell apart from a required one — and the two have \
+                 different answers"
+            }
         }
     }
 
@@ -236,6 +308,31 @@ impl Inexact {
                 "Use a different variable for each slot, and compare them with \
                  a FILTER if the equality is what you meant."
             }
+            Self::UnrepresentedTriple | Self::DuplicateSlotBinding => {
+                "Ask about one value per slot; read a slot twice as two \
+                 questions if you need to pair its values."
+            }
+            Self::RepeatedType => {
+                "Give each subject one rdf:type. Two types means the \
+                 intersection, which is usually empty."
+            }
+            Self::TaggedConstant => {
+                "Compare with a FILTER, e.g. `FILTER(?name = \"BX1\"@en)`, or \
+                 drop the tag if the stored value is untagged."
+            }
+            Self::UndefInValues => {
+                "Leave the row out instead of using UNDEF, or ask the \
+                 unconstrained case as its own question."
+            }
+            Self::OptionalJoin => {
+                "Make the relationship required, or ask about each class \
+                 separately — an OPTIONAL between two classes does not relate \
+                 them."
+            }
+            Self::OptionalPath => {
+                "Read the nested value outside the OPTIONAL, or accept that \
+                 records without it are excluded and drop the OPTIONAL."
+            }
         }
     }
 }
@@ -248,7 +345,18 @@ pub struct PathBinding {
     /// Slots to follow from the object root. Always at least two — a
     /// single-slot binding is already in [`Star::slot_variables`].
     pub slot_path: Vec<String>,
+    /// Whether any hop of the path was introduced inside an `OPTIONAL`.
+    ///
+    /// A required and an optional nested read produce the same slots, and
+    /// different answers: required excludes the records that lack the value,
+    /// optional keeps them with the variable unbound. Without this the two are
+    /// byte-identical in the plan, so one of the two answers is necessarily
+    /// wrong.
+    pub optional: bool,
 }
+
+/// The datatype every plain literal carries in RDF 1.1.
+const XSD_STRING_IRI: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 /// How deep to follow nested structures.
 ///
@@ -615,7 +723,18 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // assigned on first encounter so the same IRI maps to the same star.
     let mut const_subject_keys: HashMap<String, String> = HashMap::new();
 
-    for (tp, depth) in &triples_with_depth {
+    // Every triple starts unconsumed, and only a path that *fully represents*
+    // it marks it consumed. Whatever is left over at the end makes the plan
+    // inexact, whether or not anyone thought to enumerate that case.
+    //
+    // Three rounds of review each closed the drop sites of the round before and
+    // found a new one: subjects, then predicates, then a repeated rdf:type and a
+    // slot bound twice. That is what auditing every `continue` by hand gets you.
+    // Inverting the default is the fix: a triple nobody claimed is a triple the
+    // plan does not describe.
+    let mut unconsumed: HashSet<usize> = (0..triples_with_depth.len()).collect();
+
+    for (index, (tp, depth)) in triples_with_depth.iter().enumerate() {
         // A triple subject is either a query variable or a constant IRI.
         // Constant-IRI subjects become identifier-scoped stars (keyed by a
         // synthetic variable name; the IRI itself is the identifier value).
@@ -662,11 +781,23 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             });
 
         if pred_iri == RDF_TYPE {
-            if let TermPattern::NamedNode(nn) = &tp.object
-                && *depth < builder.type_depth
-            {
-                builder.type_iri = Some(nn.as_str().to_owned());
-                builder.type_depth = *depth;
+            if let TermPattern::NamedNode(nn) = &tp.object {
+                if builder.type_iri.is_none() {
+                    builder.type_iri = Some(nn.as_str().to_owned());
+                    builder.type_depth = *depth;
+                    unconsumed.remove(&index);
+                } else if builder.type_iri.as_deref() == Some(nn.as_str()) {
+                    // The same type stated twice says nothing new.
+                    unconsumed.remove(&index);
+                } else if *depth < builder.type_depth {
+                    // A second, *different* rdf:type is an intersection —
+                    // `?s a :Signal ; a :Track` matches nothing unless one
+                    // subclasses the other — and a plan holding one class
+                    // counts every instance of it. Take the shallower one and
+                    // leave this triple unconsumed.
+                    builder.type_iri = Some(nn.as_str().to_owned());
+                    builder.type_depth = *depth;
+                }
             }
         } else if let Ok(Some(slot_view)) = schema_view.get_slot_by_uri(pred_iri) {
             // Handled below. The `else` after this branch is the drop site for
@@ -682,9 +813,21 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 .insert(slot_name.clone(), current.min(*depth));
             match &tp.object {
                 TermPattern::Variable(v) => {
-                    builder
-                        .object_variables
-                        .insert(slot_name, v.as_str().to_owned());
+                    // One slot bound to two variables — `:kinds ?x ; :kinds ?y`
+                    // — is a self-join over the slot's values, and the map holds
+                    // one variable per slot. Keep the first and leave this
+                    // triple unconsumed: overwriting silently described a
+                    // single read where the query has two. The mirror of the
+                    // one-variable-on-two-slots case, which is caught.
+                    match builder.object_variables.get(&slot_name) {
+                        Some(existing) if existing != v.as_str() => {}
+                        _ => {
+                            builder
+                                .object_variables
+                                .insert(slot_name, v.as_str().to_owned());
+                            unconsumed.remove(&index);
+                        }
+                    }
                 }
                 // Inline NamedNode constant: `?s :foo <uri>` →
                 // pushable equality filter `object_data->>'foo' = '<uri>'`.
@@ -696,14 +839,25 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                         .entry(slot_name)
                         .or_default()
                         .push(FilterCondition::Eq(nn.as_str().to_owned()));
+                    unconsumed.remove(&index);
                 }
                 // Inline literal constant: `?s :foo "bar"`.
+                //
+                // Only a plain literal: the condition compares the stored text,
+                // so a tagged or typed literal would match on its value alone.
+                // `:name "BX1"@en` is not the same term as `"BX1"`, and pushing
+                // it as one matches rows the query excludes.
                 TermPattern::Literal(lit) if *depth == 0 => {
-                    builder
-                        .inline_filters
-                        .entry(slot_name)
-                        .or_default()
-                        .push(FilterCondition::Eq(lit.value().to_owned()));
+                    let plain =
+                        lit.language().is_none() && (lit.datatype().as_str() == XSD_STRING_IRI);
+                    if plain {
+                        builder
+                            .inline_filters
+                            .entry(slot_name)
+                            .or_default()
+                            .push(FilterCondition::Eq(lit.value().to_owned()));
+                        unconsumed.remove(&index);
+                    }
                 }
                 // A constant object inside an OPTIONAL: pushing it would
                 // filter out rows the LEFT JOIN preserves, so it is left to
@@ -1041,6 +1195,14 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         .any(|var| !traversed.contains(var))
     {
         drop(Inexact::UntypedSubject);
+    }
+
+    // Whatever no path claimed. This is what makes the property structural: a
+    // triple is inexact until something says otherwise, so the next drop site
+    // nobody thought of is reported rather than silent.
+    if let Some(index) = unconsumed.iter().min() {
+        let (tp, depth) = &triples_with_depth[*index];
+        drop(cause_for_unconsumed(tp, *depth, schema_view));
     }
 
     // A variable bound by two slots is an equality between them —
@@ -1491,17 +1653,25 @@ fn collect_values_filters(
                 };
                 {
                     let mut values = Vec::new();
+                    let mut has_undef = false;
                     for row in bindings {
-                        if let Some(Some(term)) = row.get(i) {
-                            match term {
-                                spargebra::term::GroundTerm::NamedNode(nn) => {
-                                    values.push(nn.as_str().to_owned());
-                                }
-                                spargebra::term::GroundTerm::Literal(lit) => {
-                                    values.push(lit.value().to_owned());
-                                }
+                        match row.get(i) {
+                            Some(Some(spargebra::term::GroundTerm::NamedNode(nn))) => {
+                                values.push(nn.as_str().to_owned());
                             }
+                            Some(Some(spargebra::term::GroundTerm::Literal(lit))) => {
+                                values.push(lit.value().to_owned());
+                            }
+                            // UNDEF means *no constraint* for that row, so the
+                            // block as a whole constrains nothing. Skipping the
+                            // cell turned a union into an intersection:
+                            // `VALUES ?nm { "BX1" UNDEF }` became `= "BX1"`.
+                            _ => has_undef = true,
                         }
+                    }
+                    if has_undef {
+                        dropped = Some(Inexact::UndefInValues);
+                        continue;
                     }
                     if values.is_empty() {
                         // Nothing to constrain with, so the VALUES block says
@@ -1688,6 +1858,7 @@ fn collect_path_bindings(
             var_to_class,
             &mut out,
             &mut traversed,
+            false,
         );
     }
 
@@ -1704,6 +1875,7 @@ fn walk_paths(
     var_to_class: &HashMap<String, String>,
     out: &mut HashMap<String, PathBinding>,
     traversed: &mut HashSet<String>,
+    optional_so_far: bool,
 ) {
     if path_so_far.len() >= MAX_PATH_DEPTH {
         return;
@@ -1738,6 +1910,10 @@ fn walk_paths(
                     linkml_schemaview::slotview::SlotInlineMode::Inline
                 ) {
                     traversed.insert(object_var.clone());
+                    let hop_optional = builder
+                        .slot_depth
+                        .get(slot_name)
+                        .is_some_and(|depth| *depth > 0);
                     walk_paths(
                         star_var,
                         object_var,
@@ -1747,6 +1923,7 @@ fn walk_paths(
                         var_to_class,
                         out,
                         traversed,
+                        optional_so_far || hop_optional,
                     );
                 }
             }
@@ -1754,16 +1931,50 @@ fn walk_paths(
             // recording it again would give two answers to one question.
             None => {
                 if path.len() > 1 {
+                    // Optional anywhere along the path makes the read optional:
+                    // a missing hop leaves the leaf unbound just as a missing
+                    // leaf does.
+                    let optional = optional_so_far
+                        || builder
+                            .slot_depth
+                            .get(slot_name)
+                            .is_some_and(|depth| *depth > 0);
                     out.insert(
                         object_var.clone(),
                         PathBinding {
                             star_var: star_var.to_owned(),
                             slot_path: path,
+                            optional,
                         },
                     );
                 }
             }
         }
+    }
+}
+
+/// Name the reason a triple went unrepresented, for the message only.
+///
+/// The verdict does not depend on getting this right: the triple is already
+/// inexact by virtue of being unconsumed. This just turns "something was
+/// dropped" into something the author can act on.
+fn cause_for_unconsumed(tp: &TriplePattern, depth: usize, schema_view: &SchemaView) -> Inexact {
+    let NamedNodePattern::NamedNode(pred) = &tp.predicate else {
+        return Inexact::VariablePredicate;
+    };
+    if pred.as_str() == RDF_TYPE {
+        return Inexact::RepeatedType;
+    }
+    match schema_view.get_slot_by_uri(pred.as_str()) {
+        Ok(Some(_)) => match &tp.object {
+            TermPattern::Variable(_) => Inexact::DuplicateSlotBinding,
+            TermPattern::Literal(_) | TermPattern::NamedNode(_) if depth > 0 => {
+                Inexact::ConstantInOptional
+            }
+            TermPattern::Literal(_) => Inexact::TaggedConstant,
+            _ => Inexact::UnrepresentedTriple,
+        },
+        _ => Inexact::UnknownPredicate,
     }
 }
 
@@ -2257,6 +2468,51 @@ classes:
 
     /// Each of these was measured Eligible with a plan that did not describe
     /// the query, and each answered a weaker question than it was asked.
+    /// A triple nothing claimed makes the plan inexact by default, which is
+    /// what stops the *next* unenumerated drop site from being silent. Each of
+    /// these was measured Eligible with a wrong number.
+    #[test]
+    fn unclaimed_triples_make_the_plan_inexact() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for (expected, query) in [
+            // One slot read through two variables pairs its values with each
+            // other; the plan describes a single read.
+            (
+                Inexact::DuplicateSlotBinding,
+                "SELECT ?x ?y WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?x ; \
+                 asset360:trafficKinds ?y }",
+            ),
+            // Two rdf:types is an intersection, and the answer used to depend
+            // on which one came first in the query.
+            (
+                Inexact::RepeatedType,
+                "SELECT ?s WHERE { ?s a asset360:Signal ; a asset360:Track }",
+            ),
+            (
+                Inexact::RepeatedType,
+                "SELECT ?s WHERE { ?s a asset360:Track ; a asset360:Signal }",
+            ),
+            // A tagged literal is not the same term as its text, and the pushed
+            // condition compares text.
+            (
+                Inexact::TaggedConstant,
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX1\"@en }",
+            ),
+            // UNDEF means "no constraint", so dropping the cell turned a union
+            // into an intersection.
+            (
+                Inexact::UndefInValues,
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 VALUES ?nm { \"BX1\" UNDEF } }",
+            ),
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(plan.inexact, Some(expected), "wrong cause for: {query}");
+        }
+    }
+
     #[test]
     fn more_drop_sites_are_recorded() {
         let sv = test_schema_view();

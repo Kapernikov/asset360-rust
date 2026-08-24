@@ -592,6 +592,28 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         ));
     }
 
+    // An OPTIONAL *edge* between two mandatory classes does not relate them:
+    // `{ ?s a Signal . ?t a Track . OPTIONAL { ?s :locatedOnTrack ?t } }` asks
+    // for every Signal paired with every Track, and rendering the edge as a
+    // join answers a much smaller question. The star-level check below misses
+    // this because neither star is optional — only the edge is — and the edge
+    // also makes the two look connected.
+    if let Some(edge) = joins
+        .iter()
+        .find(|join| join.join_type == crate::sparql_scoper::JoinType::Left)
+    {
+        return Ok(blocked(
+            BlockedCode::UnsupportedPattern,
+            format!(
+                "the reference between ?{} and ?{} is inside an OPTIONAL, so the \
+                 two classes are not required to be related and the answer \
+                 pairs every one with every other",
+                edge.left, edge.right
+            ),
+            Some(format!("?{}", edge.right)),
+        ));
+    }
+
     // A left-joined star can contribute unbound rows, which changes what the
     // aggregates count. Supported for the values *inside* a star, not yet for
     // an optional star of its own.
@@ -802,7 +824,26 @@ fn binding_for(
     // down. The scoper resolved those paths while walking the same triples.
     let nested = path_bindings
         .get(var_name)
-        .and_then(|binding| (binding.star_var == star.variable).then(|| binding.slot_path.clone()));
+        .filter(|binding| binding.star_var == star.variable);
+    if let Some(binding) = nested
+        && binding.optional
+    {
+        {
+            // A required and an optional nested read look identical in the plan
+            // and have different answers: required excludes the records that
+            // lack the value, optional keeps them with the variable unbound.
+            // Until the plan can say which, refuse rather than pick one.
+            return Err(Blocked::new(
+                BlockedCode::IncompletePlan,
+                format!(
+                    "?{var_name} is read inside an OPTIONAL through a nested \
+                     path, which the plan cannot tell apart from a required read"
+                ),
+                Some(format!("?{var_name}")),
+            ));
+        }
+    }
+    let nested = nested.map(|binding| binding.slot_path.clone());
 
     let slot_path = direct.or(nested).ok_or_else(|| {
         Blocked::new(
@@ -1318,6 +1359,46 @@ mod tests {
             star.filters.contains_key("length"),
             "the filter must reach the consumer through the plan: {:?}",
             star.filters
+        );
+    }
+
+    /// An OPTIONAL between two mandatory classes does not relate them: the
+    /// answer pairs every one with every other. The star-level check missed
+    /// this because neither star is optional — only the edge — and the edge
+    /// also made them look connected.
+    #[test]
+    fn an_optional_reference_between_classes_is_refused() {
+        assert_eq!(
+            blocked_code(
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
+                 ?t a asset360:Track . OPTIONAL { ?s asset360:locatedOnTrack ?t } }"
+            ),
+            BlockedCode::UnsupportedPattern
+        );
+    }
+
+    /// A required and an optional nested read are the same slots and different
+    /// answers — required excludes the records that lack the value, optional
+    /// keeps them unbound — so the plan must not present them identically.
+    #[test]
+    fn an_optional_nested_path_is_refused_while_a_required_one_is_not() {
+        assert_eq!(
+            blocked_code(
+                "SELECT ?lon (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:location ?loc . ?loc asset360:longitude ?lon } } \
+                 GROUP BY ?lon"
+            ),
+            BlockedCode::IncompletePlan
+        );
+
+        // The required form still works, and is the shape reports use.
+        let spec = eligible(
+            "SELECT ?lon (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:location ?loc . ?loc asset360:longitude ?lon } GROUP BY ?lon",
+        );
+        assert_eq!(
+            spec.bindings[spec.group_keys[0]].slot_path,
+            vec!["location", "longitude"]
         );
     }
 
