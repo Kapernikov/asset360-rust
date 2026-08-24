@@ -95,13 +95,35 @@ pub struct QueryPlan {
     pub inexact: Option<Inexact>,
 }
 
-/// What the planner had to leave out of a plan.
+/// Declares [`Inexact`] together with the list of every one of its variants.
 ///
-/// One variant per drop site, so a refusal can say which one fired: a generic
-/// "something was dropped" forces a hint listing every possible rewrite, most
-/// of which do not apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Inexact {
+/// `as_str`, `detail` and `instead` are exhaustive matches, so the compiler
+/// already refuses a variant without them. What it does not refuse is a
+/// *hand-written* list falling behind — `const ALL: [Inexact; 19]` kept
+/// compiling when a twentieth cause arrived, and the test built on it went on
+/// passing while the cause was missing from it and from the Python contract.
+/// Generating the list from the same rows as the enum makes that
+/// unrepresentable.
+macro_rules! inexact_variants {
+    ($($(#[$meta:meta])* $variant:ident,)+) => {
+        /// What the planner had to leave out of a plan.
+        ///
+        /// One variant per drop site, so a refusal can say which one fired: a
+        /// generic "something was dropped" forces a hint listing every possible
+        /// rewrite, most of which do not apply.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Inexact {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl Inexact {
+            /// Every cause. Generated with the enum, so it cannot fall behind.
+            pub const ALL: &'static [Inexact] = &[$(Inexact::$variant,)+];
+        }
+    };
+}
+
+inexact_variants! {
     /// A `FILTER` expression that cannot be expressed as a pushable condition:
     /// `!=`, `||`, `!`, `REGEX`, `BOUND`, a comparison between two variables.
     FilterExpression,
@@ -997,7 +1019,19 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 continue;
             }
         };
-        let star_is_optional = builder.type_depth > 0;
+        // `type_depth` is the OPTIONAL depth of the `rdf:type` triple, and it
+        // starts at `usize::MAX` for a subject that has none. A constant-IRI
+        // subject usually has none — `<.../signal/A> :name ?nm` names the
+        // instance instead — and its class is inferred from the slots it uses,
+        // so reading the sentinel as a depth made every such star "optional"
+        // and got the query refused for a nonexistent OPTIONAL block. Where no
+        // type was stated, the star is as optional as the shallowest triple
+        // that mentions it.
+        let star_is_optional = if builder.type_iri.is_some() {
+            builder.type_depth > 0
+        } else {
+            builder.slot_depth.values().min().is_some_and(|d| *d > 0)
+        };
         let mut required_fields: Vec<String> = Vec::new();
         let mut optional_fields: Vec<String> = Vec::new();
         for (slot, depth) in &builder.slot_depth {
@@ -2898,37 +2932,13 @@ classes:
 
     /// Every cause carries all three strings, and no two share a wire form.
     ///
-    /// The array is the whole set on purpose: a variant added without a line
-    /// here fails to compile, which is the reminder to also add it to the
-    /// ``inexact_reason`` docstring on the Python side — that list is what a
-    /// consumer branches on, and two of these were once documented as possible
-    /// while being unconstructable.
+    /// Over [`Inexact::ALL`], which the enum declaration generates — an earlier
+    /// version of this test restated the list by hand, went stale, and passed
+    /// while a cause was missing from both it and the Python contract.
     #[test]
     fn every_inexact_cause_is_fully_described() {
-        const ALL: [Inexact; 19] = [
-            Inexact::FilterExpression,
-            Inexact::FilterInOptional,
-            Inexact::VariablePredicate,
-            Inexact::UnknownPredicate,
-            Inexact::UnscopedSubject,
-            Inexact::UntypedSubject,
-            Inexact::ConstantInOptional,
-            Inexact::UnboundValues,
-            Inexact::Subquery,
-            Inexact::NamedGraph,
-            Inexact::RemoteService,
-            Inexact::ImpliedEquality,
-            Inexact::UnrepresentedTriple,
-            Inexact::DuplicateSlotBinding,
-            Inexact::RepeatedType,
-            Inexact::TaggedConstant,
-            Inexact::UndefInValues,
-            Inexact::ValuesTuple,
-            Inexact::ConstantAndVariableOnSlot,
-        ];
-
         let mut seen: HashSet<&str> = HashSet::new();
-        for cause in ALL {
+        for cause in Inexact::ALL {
             let wire = cause.as_str();
             assert!(!wire.is_empty(), "{cause:?} has no wire form");
             assert!(!cause.detail().is_empty(), "{wire} has no detail");
@@ -3000,6 +3010,29 @@ classes:
                 plan.inexact
             );
         }
+    }
+
+    /// The plainest query there is: name one instance, ask for one of its
+    /// values. Its class is inferred from the slot, so no `rdf:type` triple
+    /// exists — and reading that absence as an OPTIONAL depth got the query
+    /// refused for a block it does not contain.
+    #[test]
+    fn a_constant_subject_without_a_type_is_not_optional() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?nm WHERE { <https://data.infrabel.be/asset360/signal/A> \
+             asset360:name ?nm }",
+            &sv,
+        )
+        .expect("an ordinary constant-subject query is not a disconnected OPTIONAL");
+
+        let star = &plan.root.all_stars()[0];
+        assert!(!star.is_optional, "nothing here is optional");
+        assert_eq!(
+            star.identifier_values,
+            ["https://data.infrabel.be/asset360/signal/A"]
+        );
     }
 
     /// A join edge claims the slot holds the other class's URI. An inlined slot

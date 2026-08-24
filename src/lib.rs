@@ -82,6 +82,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "sparql-endpoint")]
     {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_inexact_reasons, m)?)?;
         m.add_function(wrap_pyfunction!(py_sparql_pushdown, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
@@ -1694,13 +1695,10 @@ impl QueryPlan {
 
     /// Why the plan is not exact, or ``None`` when it is.
     ///
-    /// One of: ``filter_expression``, ``filter_in_optional``,
-    /// ``variable_predicate``, ``unknown_predicate``, ``unscoped_subject``,
-    /// ``untyped_subject``, ``constant_in_optional``, ``unbound_values``,
-    /// ``subquery``, ``named_graph``, ``remote_service``, ``implied_equality``,
-    /// ``unrepresented_triple``, ``duplicate_slot_binding``, ``repeated_type``,
-    /// ``tagged_constant``, ``undef_in_values``, ``values_tuple``,
-    /// ``constant_and_variable_on_slot``.
+    /// One of :func:`sparql_inexact_reasons`, which is served from the
+    /// planner's own set rather than restated here — restating it is how this
+    /// docstring came to advertise two causes that could not occur and, later,
+    /// to omit one that could.
     ///
     /// Treat an unrecognised value as inexact rather than ignoring it: the set
     /// grows as more ways of dropping part of a query are found, and a new one
@@ -2258,6 +2256,24 @@ fn py_sparql_pushdown(
         // fifty lines apart that stayed identical by luck.
         Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e.to_string())),
     }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Every value :attr:`QueryPlan.inexact_reason` can take, in the planner's own
+/// order.
+///
+/// Served rather than written down: a caller that wants to branch exhaustively
+/// can check its own table against this, and a cause added to the planner shows
+/// up here without anyone remembering to edit a docstring — which is how the
+/// docstring came to advertise two causes that could not occur and to omit one
+/// that could.
+fn sparql_inexact_reasons() -> Vec<&'static str> {
+    crate::sparql_scoper::Inexact::ALL
+        .iter()
+        .map(|cause| cause.as_str())
+        .collect()
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]

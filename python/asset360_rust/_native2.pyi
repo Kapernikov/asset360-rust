@@ -3886,13 +3886,10 @@ class QueryPlan:
         r"""
         Why the plan is not exact, or ``None`` when it is.
         
-        One of: ``filter_expression``, ``filter_in_optional``,
-        ``variable_predicate``, ``unknown_predicate``, ``unscoped_subject``,
-        ``untyped_subject``, ``constant_in_optional``, ``unbound_values``,
-        ``subquery``, ``named_graph``, ``remote_service``, ``implied_equality``,
-        ``unrepresented_triple``, ``duplicate_slot_binding``, ``repeated_type``,
-        ``tagged_constant``, ``undef_in_values``, ``values_tuple``,
-        ``constant_and_variable_on_slot``.
+        One of :func:`sparql_inexact_reasons`, which is served from the
+        planner's own set rather than restated here — restating it is how this
+        docstring came to advertise two causes that could not occur and, later,
+        to omit one that could.
         
         Treat an unrecognised value as inexact rather than ignoring it: the set
         grows as more ways of dropping part of a query are found, and a new one
@@ -6226,6 +6223,18 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
     Raises:
         RuntimeError: Conversion failure (with object URI), limit exceeded,
             or query execution error.
+    """
+
+def sparql_inexact_reasons() -> builtins.list[builtins.str]:
+    r"""
+    Every value :attr:`QueryPlan.inexact_reason` can take, in the planner's own
+    order.
+    
+    Served rather than written down: a caller that wants to branch exhaustively
+    can check its own table against this, and a cause added to the planner shows
+    up here without anyone remembering to edit a docstring — which is how the
+    docstring came to advertise two causes that could not occur and to omit one
+    that could.
     """
 
 def sparql_scope(query:builtins.str, schema_view:SchemaView) -> QueryPlan:
