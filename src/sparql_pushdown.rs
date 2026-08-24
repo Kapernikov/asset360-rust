@@ -52,6 +52,10 @@ pub struct Blocked {
     /// Where in the query, when it can be located: a variable, a predicate, or
     /// an operator name. `None` when the whole query shape is the problem.
     pub at: Option<String>,
+    /// A hint more specific than the code's own, when the cause is known more
+    /// precisely than the code. `IncompletePlan` covers nine distinct causes,
+    /// and a hint listing all nine rewrites is a hint for none of them.
+    instead: Option<&'static str>,
 }
 
 impl Blocked {
@@ -60,13 +64,14 @@ impl Blocked {
             code,
             detail: detail.into(),
             at,
+            instead: None,
         }
     }
 
-    /// A supported shape to use instead. Kept on the code rather than composed
-    /// per call site so the same refusal always suggests the same fix.
+    /// A supported shape to use instead — the cause's own hint where there is
+    /// one, else the code's.
     pub fn instead(&self) -> &'static str {
-        self.code.instead()
+        self.instead.unwrap_or_else(|| self.code.instead())
     }
 }
 
@@ -133,12 +138,10 @@ impl BlockedCode {
                  path as its own triple pattern."
             }
             Self::IncompletePlan => {
-                "Something in this question cannot be turned into SQL, so it \
-                 cannot be aggregated in the database. Constrain values with \
-                 `=`, `IN`, or a `<`/`>` comparison rather than `!=`, `||`, \
-                 `REGEX` or `BOUND`; give every subject an `rdf:type`; keep \
-                 FILTERs outside OPTIONAL; and ask sub-queries as separate \
-                 questions."
+                // Only reached if a cause somehow carries no hint of its own;
+                // `Inexact::instead()` is the real answer for this code.
+                "Part of this question cannot be turned into SQL, so it cannot \
+                 be aggregated in the database."
             }
             Self::NonNumericMeasure => {
                 "SUM and AVG need a numeric slot. Use COUNT to count values, \
@@ -333,6 +336,9 @@ struct Peeled<'a> {
     group: Option<GroupParts<'a>>,
     /// Variables from the outermost `Project` — what the query asks for.
     projection: Vec<String>,
+    /// Two Slices on one path, which would need composing rather than
+    /// overwriting.
+    nested_slice: bool,
 }
 
 /// First `BIND` found inside a pattern, if any.
@@ -375,17 +381,17 @@ fn peel<'a>(pattern: &'a GraphPattern, out: &mut Peeled<'a>) {
             start,
             length,
         } => {
-            // Compose rather than assign: `LIMIT 3` wrapped around a subquery's
-            // `LIMIT 10` returns three rows, and overwriting would return ten.
-            // Sub-queries are refused as inexact before this runs, so today the
-            // nesting cannot occur — the arithmetic is here so that stops being
-            // load-bearing.
-            out.offset += *start;
-            out.limit = match (out.limit, *length) {
-                (Some(outer), Some(inner_limit)) => Some(outer.min(inner_limit)),
-                (Some(outer), None) => Some(outer),
-                (None, inner_limit) => inner_limit,
-            };
+            // A second Slice would have to be *composed* with this one, and
+            // the composition is not obvious — an inner LIMIT applies before an
+            // outer OFFSET. Nested slices only come from sub-queries, which are
+            // refused as inexact before this runs, so rather than carry
+            // arithmetic that is unreachable and would be wrong if it ever ran,
+            // record the nesting and refuse.
+            if out.limit.is_some() || out.offset != 0 {
+                out.nested_slice = true;
+            }
+            out.offset = *start;
+            out.limit = *length;
             peel(inner, out);
         }
         GraphPattern::Distinct { inner } | GraphPattern::Reduced { inner } => {
@@ -455,6 +461,7 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         extends: Vec::new(),
         group: None,
         projection: Vec::new(),
+        nested_slice: false,
     };
     peel(pattern, &mut peeled);
 
@@ -466,6 +473,15 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     else {
         return Ok(Pushdown::NotApplicable);
     };
+
+    if peeled.nested_slice {
+        return Ok(blocked(
+            BlockedCode::UnsupportedPattern,
+            "the query has nested LIMIT/OFFSET clauses, which have to be \
+             composed rather than applied independently",
+            None,
+        ));
+    }
 
     if let Some(bound) = first_bind_variable(group_inner) {
         return Ok(blocked(
@@ -518,13 +534,16 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     //
     // So the question to ask is not "did I recognise enough of this query" but
     // "did the planner drop anything at all".
-    if !plan.exact {
-        return Ok(blocked(
-            BlockedCode::IncompletePlan,
-            "the query plan does not describe this whole question, so answering \
-             from it would answer a weaker one",
-            None,
-        ));
+    if let Some(cause) = plan.inexact {
+        // The cause travels with the refusal: it names what was dropped and the
+        // one rewrite that fixes it, rather than a list of every rewrite that
+        // might.
+        return Ok(Pushdown::Blocked(Blocked {
+            code: BlockedCode::IncompletePlan,
+            detail: cause.detail().to_owned(),
+            at: None,
+            instead: Some(cause.instead()),
+        }));
     }
 
     let stars = plan.root.all_stars();
@@ -1140,6 +1159,27 @@ mod tests {
                 "sub-SELECT",
                 "SELECT (COUNT(*) AS ?n) WHERE { \
                             { SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 5 } }",
+            ),
+            // Drop sites an after-the-fact check missed: it inspected triple
+            // subjects, and each of these loses a triple for another reason.
+            (
+                "unknown predicate",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
+                 ?s <urn:unknown> \"x\" }",
+            ),
+            (
+                "variable predicate",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . ?s ?p \"x\" }",
+            ),
+            (
+                "constant in OPTIONAL",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:name \"BX\" } }",
+            ),
+            (
+                "VALUES on unbound var",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
+                 VALUES ?zz { \"a\" } }",
             ),
         ] {
             assert_eq!(

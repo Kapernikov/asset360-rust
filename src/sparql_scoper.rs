@@ -54,7 +54,8 @@ pub struct QueryPlan {
     /// consumer can reproduce — so it is traversable but not bindable.
     pub path_bindings: HashMap<String, PathBinding>,
 
-    /// Whether this plan represents the query *completely*.
+    /// Why this plan is *not* a complete representation of the query, if it
+    /// isn't.
     ///
     /// Every extraction step here is deliberately lossy in the safe direction:
     /// a constraint that cannot be expressed is dropped, the fetch widens, and
@@ -73,7 +74,136 @@ pub struct QueryPlan {
     /// bounds is the real row set. With a dropped `FILTER(REGEX(...))`, LIMIT
     /// 10 fetches ten arbitrary rows and oxigraph filters them down to a
     /// handful, where the query asked for ten matches.
-    pub exact: bool,
+    ///
+    /// Recorded *where the loss happens* — at each point that drops part of the
+    /// query — rather than reconstructed afterwards from what survived. An
+    /// after-the-fact check can only look at what it knows to look for, and the
+    /// first version of it missed four drop sites: a variable predicate, a
+    /// predicate matching no slot, an inline constant inside `OPTIONAL`, and
+    /// `VALUES` on an unknown variable. Each produced a plan that claimed to be
+    /// exact while counting every row of the class.
+    pub inexact: Option<Inexact>,
+}
+
+/// What the planner had to leave out of a plan.
+///
+/// One variant per drop site, so a refusal can say which one fired: a generic
+/// "something was dropped" forces a hint listing every possible rewrite, most
+/// of which do not apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inexact {
+    /// A `FILTER` expression that cannot be expressed as a pushable condition:
+    /// `!=`, `||`, `!`, `REGEX`, `BOUND`, a comparison between two variables.
+    FilterExpression,
+    /// A `FILTER` inside an `OPTIONAL`, including the condition spargebra lifts
+    /// into the `LeftJoin` itself. Pushing one would drop the rows the join
+    /// exists to preserve.
+    FilterInOptional,
+    /// A triple whose predicate is a variable, so which slot it reads is not
+    /// known until the query runs.
+    VariablePredicate,
+    /// A triple whose predicate matches no slot in the schema, so its
+    /// constraint is invisible to the plan.
+    UnknownPredicate,
+    /// A subject that is neither a variable nor an IRI, so it cannot be a star.
+    UnscopedSubject,
+    /// A subject with no resolvable class: its triples are not represented at
+    /// all, and a count over the remaining stars is one per group.
+    UntypedSubject,
+    /// A constant object inside an `OPTIONAL`. Pushing it would filter out rows
+    /// the join preserves, so it is left to oxigraph.
+    ConstantInOptional,
+    /// A `VALUES` block over a variable the plan does not bind.
+    UnboundValues,
+    /// A sub-`SELECT`, which has its own projection and modifiers.
+    Subquery,
+}
+
+impl Inexact {
+    /// Stable string form, for an error payload or a lint code.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FilterExpression => "filter_expression",
+            Self::FilterInOptional => "filter_in_optional",
+            Self::VariablePredicate => "variable_predicate",
+            Self::UnknownPredicate => "unknown_predicate",
+            Self::UnscopedSubject => "unscoped_subject",
+            Self::UntypedSubject => "untyped_subject",
+            Self::ConstantInOptional => "constant_in_optional",
+            Self::UnboundValues => "unbound_values",
+            Self::Subquery => "subquery",
+        }
+    }
+
+    /// What was left out, in terms of the query.
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::FilterExpression => {
+                "a FILTER this cannot turn into a SQL condition was left for the \
+                 SPARQL engine, so the plan describes a weaker constraint than \
+                 the query"
+            }
+            Self::FilterInOptional => {
+                "a FILTER inside an OPTIONAL cannot be applied to the fetch \
+                 without dropping the rows the OPTIONAL preserves"
+            }
+            Self::VariablePredicate => {
+                "a triple has a variable predicate, so which slot it reads is \
+                 not known before the query runs"
+            }
+            Self::UnknownPredicate => {
+                "a triple uses a predicate that matches no slot in the schema, \
+                 so its constraint is not in the plan"
+            }
+            Self::UnscopedSubject => "a triple has a subject that cannot be scoped",
+            Self::UntypedSubject => {
+                "a subject has no resolvable rdf:type, so its triples are not \
+                 represented in the plan at all"
+            }
+            Self::ConstantInOptional => {
+                "a constant value inside an OPTIONAL cannot be applied to the \
+                 fetch without dropping rows the OPTIONAL preserves"
+            }
+            Self::UnboundValues => "a VALUES block constrains a variable the plan does not bind",
+            Self::Subquery => {
+                "a sub-SELECT has its own projection and limits, which this plan \
+                 does not carry"
+            }
+        }
+    }
+
+    /// The rewrite that makes the query expressible — one per cause, rather
+    /// than a list of four where three never apply.
+    pub fn instead(&self) -> &'static str {
+        match self {
+            Self::FilterExpression => {
+                "Constrain values with `=`, `IN`, or a `<` / `>` comparison \
+                 against a literal. `!=`, `||`, `!`, REGEX and BOUND cannot be \
+                 pushed to the database."
+            }
+            Self::FilterInOptional | Self::ConstantInOptional => {
+                "Move the condition out of the OPTIONAL block, or drop the \
+                 OPTIONAL if the value is required after all."
+            }
+            Self::VariablePredicate => {
+                "Name the predicate, e.g. `?s asset360:status ?v` rather than \
+                 `?s ?p ?v`."
+            }
+            Self::UnknownPredicate => {
+                "Use a predicate the schema defines; check the spelling and the \
+                 prefix."
+            }
+            Self::UnscopedSubject | Self::UntypedSubject => {
+                "Give every subject an rdf:type, e.g. `?s a asset360:Signal`, so \
+                 the class it belongs to is known."
+            }
+            Self::UnboundValues => {
+                "Bind the variable with a triple pattern before constraining it \
+                 with VALUES."
+            }
+            Self::Subquery => "Ask the sub-query as a separate question.",
+        }
+    }
 }
 
 /// Where a nested variable's value lives, relative to a star.
@@ -431,6 +561,18 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
     tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
 
+    // Anything dropped along the way is recorded here, at the point it is
+    // dropped. The first cause wins: one actionable reason beats a list.
+    let mut inexact: Option<Inexact> = None;
+    // Subject variables whose class could not be resolved. Cleared below by
+    // whichever of them the path walk explains.
+    let mut unresolved_subjects: HashSet<String> = HashSet::new();
+    let mut drop = |cause: Inexact| {
+        if inexact.is_none() {
+            inexact = Some(cause);
+        }
+    };
+
     // Phase 1: Build stars — group triples by subject variable,
     // tracking the minimum OPTIONAL depth at which each slot and each
     // star itself was introduced.
@@ -457,12 +599,20 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                     .clone();
                 (key, Some(iri))
             }
-            _ => continue,
+            _ => {
+                drop(Inexact::UnscopedSubject);
+                continue;
+            }
         };
 
         let pred_iri = match &tp.predicate {
             NamedNodePattern::NamedNode(nn) => nn.as_str(),
-            _ => continue,
+            _ => {
+                // `?s ?p ?o`: which slot this reads is unknown until the query
+                // runs, so the triple constrains nothing here.
+                drop(Inexact::VariablePredicate);
+                continue;
+            }
         };
 
         let builder = star_map
@@ -485,6 +635,8 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 builder.type_depth = *depth;
             }
         } else if let Ok(Some(slot_view)) = schema_view.get_slot_by_uri(pred_iri) {
+            // Handled below. The `else` after this branch is the drop site for
+            // a predicate the schema does not know.
             let slot_name = slot_view.name.clone();
             let current = builder
                 .slot_depth
@@ -519,8 +671,20 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                         .or_default()
                         .push(FilterCondition::Eq(lit.value().to_owned()));
                 }
+                // A constant object inside an OPTIONAL: pushing it would
+                // filter out rows the LEFT JOIN preserves, so it is left to
+                // oxigraph — and the plan no longer says everything the query
+                // does.
+                TermPattern::NamedNode(_) | TermPattern::Literal(_) => {
+                    drop(Inexact::ConstantInOptional);
+                }
                 _ => {}
             }
+        } else {
+            // A predicate that matches no slot: its constraint is invisible to
+            // the plan, so a consumer reading the plan as exact would count
+            // rows the query excludes.
+            drop(Inexact::UnknownPredicate);
         }
     }
 
@@ -542,7 +706,20 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         // whole query — never a silent drop that returns wrong data.
         let (class_uri, identifier_slot_name) = match resolve_star_class(builder, schema_view)? {
             Some(resolved) => resolved,
-            None => continue,
+            None => {
+                // A variable subject whose class cannot be resolved. Two very
+                // different things look like this, and only Phase 6 can tell
+                // them apart: a step inside another star's nested structure
+                // (`?s :location ?loc . ?loc :longitude ?v`), which the plan
+                // *does* represent as a path, and a subject nothing accounts
+                // for (`?sig :locatedOnTrack ?t` with ?sig untyped), whose
+                // triples vanish and leave a count of one per group.
+                //
+                // So record the name rather than the verdict, and let the path
+                // walk clear the ones it explains.
+                unresolved_subjects.insert(builder.variable.clone());
+                continue;
+            }
         };
         let star_is_optional = builder.type_depth > 0;
         let mut required_fields: Vec<String> = Vec::new();
@@ -729,8 +906,12 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     }
 
     let mut star_filters: HashMap<String, HashMap<String, Vec<FilterCondition>>> = HashMap::new();
-    let filters_complete = collect_filter_conditions(pattern, 0, &var_to_field, &mut star_filters);
-    collect_values_filters(pattern, &var_to_field, &mut star_filters);
+    if let Some(cause) = collect_filter_conditions(pattern, 0, &var_to_field, &mut star_filters) {
+        drop(cause);
+    }
+    if let Some(cause) = collect_values_filters(pattern, &var_to_field, &mut star_filters) {
+        drop(cause);
+    }
 
     for star in &mut stars {
         if let Some(extra) = star_filters.remove(&star.variable) {
@@ -759,19 +940,6 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         }
     }
 
-    // Phase 4: SQL LIMIT — only if the query has a single star, no
-    // joins, no OPTIONAL blocks (otherwise the LIMIT could slice
-    // off the wrong rows), and no operator that must see every solution
-    // before the LIMIT applies (GROUP BY / aggregate / ORDER BY /
-    // DISTINCT — see has_holistic_modifier).
-    let has_optional = !stars.iter().all(|s| !s.is_optional)
-        || joins.iter().any(|j| j.join_type == JoinType::Left);
-    let sql_limit = if stars.len() == 1 && joins.is_empty() && !has_optional {
-        pushable_limit(pattern)
-    } else {
-        None
-    };
-
     // Phase 5: Wrap the result into a PlanNode tree. If the original
     // pattern has no OPTIONAL (all joins inner, no optional stars), emit
     // a single `Bgp` node. If any OPTIONAL is present, split mandatory
@@ -779,6 +947,15 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // Nested OPTIONAL flattens to this two-level shape — all the
     // non-trivial semantics (all-or-nothing per block, sibling
     // independence) live in oxigraph, not in the plan tree.
+    // Facts about the shape, captured before the stars and joins move into the
+    // plan tree, and used by the LIMIT decision at the end.
+    let has_optional = !stars.iter().all(|s| !s.is_optional)
+        || joins.iter().any(|j| j.join_type == JoinType::Left);
+    // A LIMIT can only bound a fetch that returns one row per solution. With
+    // more than one star, or any join, a row is a combination and the top N
+    // rows are not the top N solutions.
+    let single_relation = stars.len() == 1 && joins.is_empty();
+
     let root = if has_optional {
         let mandatory_vars: HashSet<String> = stars
             .iter()
@@ -823,36 +1000,38 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // variable that *is* a star is never mistaken for a step inside one.
     let (path_bindings, traversed) = collect_path_bindings(&star_map, &var_to_class, schema_view);
 
-    // Phase 7: is this plan the whole query?
+    // A subject the path walk reached is a step inside a star, which the plan
+    // describes. Anything left is a subject nothing accounts for.
+    if unresolved_subjects
+        .iter()
+        .any(|var| !traversed.contains(var))
+    {
+        drop(Inexact::UntypedSubject);
+    }
+
+    if contains_subquery(pattern) {
+        drop(Inexact::Subquery);
+    }
+
+    // Phase 7: the SQL LIMIT.
     //
-    // Each of these is a way the extraction above loses something. None of them
-    // matters for a prefetch — oxigraph re-applies the query — and every one of
-    // them is a wrong answer for a consumer treating the plan as exact.
-    let every_subject_scoped = triples_with_depth.iter().all(|(tp, _)| match &tp.subject {
-        TermPattern::Variable(v) => {
-            let name = v.as_str();
-            // Either the subject is a scoped class, or it is a step inside one
-            // (an inline structure reached by a path).
-            var_to_class.contains_key(name) || traversed.contains(name)
-        }
-        // A constant-IRI subject became a star of its own in Phase 1.
-        TermPattern::NamedNode(_) => true,
-        _ => false,
-    });
-
-    let exact = filters_complete && every_subject_scoped && !contains_subquery(pattern);
-
-    // A LIMIT may only be pushed into a fetch that returns the real row set.
-    // With a dropped FILTER the fetch is a superset, so ten rows off the top
-    // are ten arbitrary rows, and oxigraph then filters them down to fewer
-    // than the query asked for.
-    let sql_limit = if exact { sql_limit } else { None };
+    // `pushable_limit` owns the modifier question — whether an operator must
+    // see every solution before the limit applies — and this owns the rest: a
+    // LIMIT bounds the *fetch*, so it is only sound when the fetch returns the
+    // real row set. With anything dropped, ten rows off the top are ten
+    // arbitrary rows and the engine filters them down to fewer than the query
+    // asked for. One assignment, so there is no second owner to disagree with.
+    let sql_limit = if inexact.is_none() && single_relation && !has_optional {
+        pushable_limit(pattern)
+    } else {
+        None
+    };
 
     Ok(QueryPlan {
         root,
         sql_limit,
         path_bindings,
-        exact,
+        inexact,
     })
 }
 
@@ -1034,16 +1213,25 @@ fn collect_filter_conditions(
     depth: usize,
     var_to_field: &HashMap<String, (String, String)>,
     star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
-) -> bool {
+) -> Option<Inexact> {
     match pattern {
         GraphPattern::Filter { expr, inner } => {
-            let handled = if depth == 0 {
-                extract_equality_from_expr(expr, var_to_field, star_filters)
+            let here = if depth == 0 {
+                if extract_equality_from_expr(expr, var_to_field, star_filters) {
+                    None
+                } else {
+                    Some(Inexact::FilterExpression)
+                }
             } else {
                 // Inside an OPTIONAL: leave it entirely to oxigraph.
-                false
+                Some(Inexact::FilterInOptional)
             };
-            handled & collect_filter_conditions(inner, depth, var_to_field, star_filters)
+            here.or(collect_filter_conditions(
+                inner,
+                depth,
+                var_to_field,
+                star_filters,
+            ))
         }
         GraphPattern::LeftJoin {
             left,
@@ -1058,14 +1246,15 @@ fn collect_filter_conditions(
             // applying it to the fetch would drop rows the LEFT JOIN exists to
             // keep — and it is not represented in the plan either, so a
             // consumer treating the plan as exact has to know.
-            l & r & expression.is_none()
+            let lifted = expression.as_ref().map(|_| Inexact::FilterInOptional);
+            l.or(r).or(lifted)
         }
         GraphPattern::Join { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
-            let l = collect_filter_conditions(left, depth, var_to_field, star_filters);
-            let r = collect_filter_conditions(right, depth, var_to_field, star_filters);
-            l & r
+            collect_filter_conditions(left, depth, var_to_field, star_filters).or(
+                collect_filter_conditions(right, depth, var_to_field, star_filters),
+            )
         }
         GraphPattern::Extend { inner, .. }
         | GraphPattern::OrderBy { inner, .. }
@@ -1078,7 +1267,7 @@ fn collect_filter_conditions(
         | GraphPattern::Service { inner, .. } => {
             collect_filter_conditions(inner, depth, var_to_field, star_filters)
         }
-        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => true,
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => None,
     }
 }
 
@@ -1116,11 +1305,18 @@ fn extract_equality_from_expr(
         | Expression::LessOrEqual(left, right) => {
             // Written either way round: `?len > 10` and `10 < ?len` are the
             // same constraint, so a reversed match flips the operator.
+            // Exhaustive over the four variants this arm matches. A catch-all
+            // was survivable while the plan was only a prefetch — a wrong
+            // operator merely widened the fetch — but the plan is now the
+            // answer, so a fifth comparison variant silently becoming `<=`
+            // would be a wrong number. `unreachable!` cannot fire: the outer
+            // pattern admits exactly these four.
             let forward = match expr {
                 Expression::Greater(..) => CmpOp::Gt,
                 Expression::GreaterOrEqual(..) => CmpOp::Gte,
                 Expression::Less(..) => CmpOp::Lt,
-                _ => CmpOp::Lte,
+                Expression::LessOrEqual(..) => CmpOp::Lte,
+                _ => unreachable!("outer match admits only the four comparisons"),
             };
             let (op, found) = match match_var_literal(left, right, var_to_field) {
                 Some(found) => (forward, Some(found)),
@@ -1182,14 +1378,21 @@ fn collect_values_filters(
     pattern: &GraphPattern,
     var_to_field: &HashMap<String, (String, String)>,
     star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
-) {
+) -> Option<Inexact> {
     match pattern {
         GraphPattern::Values {
             variables,
             bindings,
         } => {
+            let mut dropped = None;
             for (i, var) in variables.iter().enumerate() {
-                if let Some((star_var, field)) = var_to_field.get(var.as_str()) {
+                let Some((star_var, field)) = var_to_field.get(var.as_str()) else {
+                    // A VALUES over a variable no star binds constrains
+                    // something this plan does not describe.
+                    dropped = Some(Inexact::UnboundValues);
+                    continue;
+                };
+                {
                     let mut values = Vec::new();
                     for row in bindings {
                         if let Some(Some(term)) = row.get(i) {
@@ -1203,7 +1406,11 @@ fn collect_values_filters(
                             }
                         }
                     }
-                    if !values.is_empty() {
+                    if values.is_empty() {
+                        // Nothing to constrain with, so the VALUES block says
+                        // something the plan does not.
+                        dropped = Some(Inexact::UnboundValues);
+                    } else {
                         star_filters
                             .entry(star_var.clone())
                             .or_default()
@@ -1213,14 +1420,17 @@ fn collect_values_filters(
                     }
                 }
             }
+            dropped
         }
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
-            collect_values_filters(left, var_to_field, star_filters);
-            collect_values_filters(right, var_to_field, star_filters);
-        }
+        | GraphPattern::Minus { left, right } => collect_values_filters(
+            left,
+            var_to_field,
+            star_filters,
+        )
+        .or(collect_values_filters(right, var_to_field, star_filters)),
         GraphPattern::Filter { inner, .. }
         | GraphPattern::Extend { inner, .. }
         | GraphPattern::OrderBy { inner, .. }
@@ -1231,9 +1441,9 @@ fn collect_values_filters(
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => {
-            collect_values_filters(inner, var_to_field, star_filters);
+            collect_values_filters(inner, var_to_field, star_filters)
         }
-        _ => {}
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } => None,
     }
 }
 
@@ -1298,16 +1508,16 @@ fn pushable_limit(pattern: &GraphPattern) -> Option<usize> {
 
         // A limit, pushable only if nothing below must see every solution.
         GraphPattern::Slice { inner, length, .. } => {
-            if is_holistic(inner) {
+            if is_holistic(inner) || contains_slice(inner) {
+                // A nested Slice would need composing with this one, and the
+                // composition is not `min`: an inner LIMIT applies before an
+                // outer OFFSET, so the two interact. Nested slices only arise
+                // from sub-queries, which are refused as inexact — rather than
+                // carry unreachable arithmetic that would be wrong if it ever
+                // did run, refuse to push anything.
                 None
             } else {
-                // An inner Slice wins: it applies first, so it bounds what this
-                // one can ever see.
-                match (pushable_limit(inner), *length) {
-                    (Some(inner_limit), Some(outer)) => Some(inner_limit.min(outer)),
-                    (Some(inner_limit), None) => Some(inner_limit),
-                    (None, outer) => outer,
-                }
+                *length
             }
         }
 
@@ -1340,8 +1550,10 @@ fn collect_path_bindings(
     schema_view: &SchemaView,
 ) -> (HashMap<String, PathBinding>, HashSet<String>) {
     let mut out: HashMap<String, PathBinding> = HashMap::new();
-    // Every variable the walk passed through or landed on. Used to tell a
-    // legitimate step inside a star from a subject nothing accounts for.
+    // Variables the walk explained: every step it passed through and every leaf
+    // it landed on. Used only to clear a recorded drop — not to re-derive the
+    // check, which is what an after-the-fact reconstruction did before, missing
+    // four other drop sites in the process.
     let mut traversed: HashSet<String> = HashSet::new();
 
     // Deterministic order: two stars could in principle reach the same variable,
@@ -1439,6 +1651,27 @@ fn walk_paths(
                 }
             }
         }
+    }
+}
+
+/// Whether a `Slice` appears below this point.
+fn contains_slice(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Slice { .. } => true,
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Group { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Service { inner, .. } => contains_slice(inner),
+        GraphPattern::Join { left, right }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => contains_slice(left) || contains_slice(right),
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
     }
 }
 
@@ -1783,10 +2016,114 @@ classes:
                 "distinct",
                 "SELECT DISTINCT ?name WHERE { ?s a asset360:Signal ; asset360:name ?name } LIMIT 10",
             ),
+            // A LIMIT also bounds the *fetch*, so it is only sound when the
+            // fetch returns the real row set. These plans drop part of the
+            // query, so ten rows off the top are ten arbitrary rows and the
+            // engine then filters them down to fewer than the query asked for.
+            (
+                "dropped REGEX filter",
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(REGEX(?nm, \"^BX\")) } LIMIT 10",
+            ),
+            (
+                "dropped != filter",
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm != \"BX517\") } LIMIT 10",
+            ),
+            (
+                "unknown predicate",
+                "SELECT ?s WHERE { ?s a asset360:Signal . ?s <urn:unknown> \"x\" } LIMIT 10",
+            ),
+            (
+                "variable predicate",
+                "SELECT ?s WHERE { ?s a asset360:Signal . ?s ?p \"x\" } LIMIT 10",
+            ),
         ] {
             let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
             assert_eq!(plan.sql_limit, None, "sql_limit must be None for: {label}");
         }
+    }
+
+    /// Every point that drops part of the query must say so, because a LIMIT is
+    /// only pushable when the fetch returns the real row set, and an exact
+    /// consumer must refuse. Each of these reported `exact` before, and each
+    /// answered a weaker question than it was asked.
+    #[test]
+    fn dropping_part_of_the_query_is_recorded_at_the_drop_site() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for (expected, query) in [
+            (
+                Inexact::UnknownPredicate,
+                "SELECT ?s WHERE { ?s a asset360:Signal . ?s <urn:unknown> \"x\" }",
+            ),
+            (
+                Inexact::VariablePredicate,
+                "SELECT ?s WHERE { ?s a asset360:Signal . ?s ?p \"x\" }",
+            ),
+            (
+                Inexact::ConstantInOptional,
+                "SELECT ?s WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:name \"BX\" } }",
+            ),
+            (
+                Inexact::UnboundValues,
+                "SELECT ?s WHERE { ?s a asset360:Signal . VALUES ?zz { \"a\" } }",
+            ),
+            (
+                Inexact::UntypedSubject,
+                "SELECT ?t WHERE { ?sig asset360:locatedOnTrack ?t . ?t a asset360:Track }",
+            ),
+            (
+                Inexact::FilterExpression,
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(REGEX(?nm, \"^BX\")) }",
+            ),
+            (
+                Inexact::FilterInOptional,
+                "SELECT ?s WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:length ?l . FILTER(?l > 5) } }",
+            ),
+            (
+                Inexact::Subquery,
+                "SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 5 } }",
+            ),
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(
+                plan.inexact,
+                Some(expected),
+                "wrong cause recorded for: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_expressible_query_is_exact() {
+        // The check must not refuse what the plan does describe: a nested path
+        // is a legitimate untyped subject, and a pushable FILTER is no loss.
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . FILTER(?nm = \"BX\") }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?l . FILTER(?l > 5) }",
+            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:longitude ?lon }",
+            "SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10",
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(plan.inexact, None, "should be exact: {query}");
+        }
+
+        // And the LIMIT survives when nothing was dropped.
+        let plan = sparql_scope(
+            &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal }} LIMIT 10"),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.sql_limit, Some(10));
     }
 
     // ---- Two-type inner join ----

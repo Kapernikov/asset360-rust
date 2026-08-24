@@ -1605,6 +1605,7 @@ pub struct QueryPlan {
     sql_limit: Option<usize>,
     path_bindings: HashMap<String, (String, Vec<String>)>,
     exact: bool,
+    inexact_reason: Option<&'static str>,
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -1643,6 +1644,18 @@ impl QueryPlan {
     #[getter]
     fn exact(&self) -> bool {
         self.exact
+    }
+
+    /// Why the plan is not exact, or ``None`` when it is: one of
+    /// ``filter_expression``, ``filter_in_optional``, ``variable_predicate``,
+    /// ``unknown_predicate``, ``unscoped_subject``, ``untyped_subject``,
+    /// ``constant_in_optional``, ``unbound_values``, ``subquery``.
+    ///
+    /// Recorded at the point the planner dropped something, so this names a
+    /// real cause rather than an inference about what survived.
+    #[getter]
+    fn inexact_reason(&self) -> Option<&'static str> {
+        self.inexact_reason
     }
 
     /// Root of the algebra tree.
@@ -2198,7 +2211,8 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
                 .into_iter()
                 .map(|(var, binding)| (var, (binding.star_var, binding.slot_path)))
                 .collect(),
-            exact: plan.exact,
+            exact: plan.inexact.is_none(),
+            inexact_reason: plan.inexact.map(|cause| cause.as_str()),
         }),
         Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
             Err(pyo3::exceptions::PyValueError::new_err(
