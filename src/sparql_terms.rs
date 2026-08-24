@@ -122,7 +122,7 @@ pub fn resolve_column(
 
 /// Describe a slot's values, or `None` when they are not a term a consumer can
 /// reproduce.
-fn describe_slot(
+pub fn describe_slot(
     schema_view: &SchemaView,
     slot: &linkml_schemaview::slotview::SlotView,
 ) -> Option<TermDescriptor> {

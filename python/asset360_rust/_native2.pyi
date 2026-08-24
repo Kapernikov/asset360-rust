@@ -3891,7 +3891,8 @@ class QueryPlan:
         ``untyped_subject``, ``constant_in_optional``, ``unbound_values``,
         ``subquery``, ``named_graph``, ``remote_service``, ``implied_equality``,
         ``unrepresented_triple``, ``duplicate_slot_binding``, ``repeated_type``,
-        ``tagged_constant``, ``undef_in_values``.
+        ``tagged_constant``, ``undef_in_values``, ``values_tuple``,
+        ``constant_and_variable_on_slot``.
         
         Treat an unrecognised value as inexact rather than ignoring it: the set
         grows as more ways of dropping part of a query are found, and a new one

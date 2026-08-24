@@ -710,6 +710,42 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         ));
     }
 
+    // A multivalued slot read through a variable that nothing groups or
+    // aggregates still multiplies solutions: `?s a Signal ; :trafficKinds ?k`
+    // with `COUNT(*)` counts one solution *per kind*, while a plan that never
+    // mentions ?k counts one row per Signal. `BindingSpec::containers` is how a
+    // consumer reproduces that multiplicity, and a variable with no binding has
+    // no container and no instruction.
+    for star in &stars {
+        for (slot, var) in &star.slot_variables {
+            if bindings.iter().any(|b| b.var == *var) {
+                continue;
+            }
+            let multivalued = crate::sparql_terms::resolve_column(
+                schema_view,
+                &star.class_uri,
+                std::slice::from_ref(slot),
+            )
+            .is_some_and(|(_, containers)| {
+                containers.iter().any(|mode| {
+                    *mode != linkml_schemaview::slotview::SlotContainerMode::SingleValue
+                })
+            });
+            if multivalued {
+                return Ok(blocked(
+                    BlockedCode::UnsupportedPattern,
+                    format!(
+                        "?{var} reads {slot}, which holds several values per \
+                         record, and the question neither groups by it nor \
+                         aggregates it — so each record stands for as many \
+                         solutions as it has values"
+                    ),
+                    Some(format!("?{var}")),
+                ));
+            }
+        }
+    }
+
     Ok(Pushdown::Eligible {
         solution: SolutionSpec {
             bindings,
@@ -1293,6 +1329,34 @@ mod tests {
             ),
             BlockedCode::UnsupportedPattern
         );
+    }
+
+    /// A multivalued read nobody grouped or aggregated multiplies solutions,
+    /// and a plan that never mentions the variable counts records instead.
+    /// Measured against oxigraph: two Signals with two and three kinds answer
+    /// 5, while the plan describes 2.
+    #[test]
+    fn an_unaggregated_multivalued_read_is_refused() {
+        for query in [
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?k }",
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:trafficKinds ?k } GROUP BY ?nm",
+        ] {
+            assert_eq!(
+                blocked_code(query),
+                BlockedCode::UnsupportedPattern,
+                "should refuse: {query}"
+            );
+        }
+
+        // Grouping by it *is* answerable — the multiplicity is then the answer,
+        // and `containers` tells the consumer how to reproduce it.
+        let spec = eligible(
+            "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?k } GROUP BY ?k",
+        );
+        assert_eq!(spec.group_keys.len(), 1);
     }
 
     /// A required and an optional nested read are the same slots and different

@@ -156,6 +156,14 @@ pub enum Inexact {
     /// A `VALUES` row with `UNDEF` for a variable: that row places no
     /// constraint, so dropping it turns a union into an intersection.
     UndefInValues,
+    /// A `VALUES` block over several variables with more than one row. The rows
+    /// are *tuples* — `("BX1" 4) ("BX2" 3)` admits two combinations — and one
+    /// independent `IN` per column admits all four.
+    ValuesTuple,
+    /// A constant and a variable read of one multivalued slot
+    /// (`:kinds "p" ; :kinds ?x`): two independent reads of the same values,
+    /// which the plan collapses into one filtered read.
+    ConstantAndVariableOnSlot,
 }
 
 impl Inexact {
@@ -179,6 +187,8 @@ impl Inexact {
             Self::RepeatedType => "repeated_type",
             Self::TaggedConstant => "tagged_constant",
             Self::UndefInValues => "undef_in_values",
+            Self::ValuesTuple => "values_tuple",
+            Self::ConstantAndVariableOnSlot => "constant_and_variable_on_slot",
         }
     }
 
@@ -249,6 +259,16 @@ impl Inexact {
                 "a VALUES row uses UNDEF, which places no constraint at all — \
                  dropping it would turn a union into an intersection"
             }
+            Self::ValuesTuple => {
+                "a VALUES block pairs several variables per row, and the plan \
+                 can only say which values each column may take — which admits \
+                 combinations the query does not list"
+            }
+            Self::ConstantAndVariableOnSlot => {
+                "one multivalued slot is read both as a constant and through a \
+                 variable, which pairs its values with each other; the plan \
+                 describes a single filtered read"
+            }
         }
     }
 
@@ -307,9 +327,60 @@ impl Inexact {
                 "Leave the row out instead of using UNDEF, or ask the \
                  unconstrained case as its own question."
             }
+            Self::ValuesTuple => {
+                "Use one VALUES per variable if the columns are independent, \
+                 or ask each listed combination as its own question."
+            }
+            Self::ConstantAndVariableOnSlot => {
+                "Read the slot once — drop the constant and filter the \
+                 variable instead."
+            }
         }
     }
 }
+
+/// What RDF term one column's values become, as far as a *pushed comparison* is
+/// concerned.
+///
+/// A pushed condition compares the stored text. That is the same question
+/// SPARQL asks only when the term is the text: `"BX1"@en` is not `"BX1"`, and
+/// an enum value that serialises as an IRI is not its stored code. Decided from
+/// the slot, because it is the stored form that settles it — not the form the
+/// query happened to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushForm {
+    /// An untagged literal. `numeric` carries whether the range is a number,
+    /// which is what makes `FILTER(?l > 5)` a comparison rather than a type
+    /// error.
+    Literal { numeric: bool },
+    /// A named node: comparable, against an IRI constant only.
+    Iri,
+    /// Language-tagged, typed, or enum-valued — the stored text is not the
+    /// term, so no comparison against a query constant is the same question.
+    Tagged,
+}
+
+/// Datatypes a numeric column's constants may carry.
+///
+/// About the *query's* literal, not the slot's range — the range is upstream's
+/// question, answered by `RangeInfo` in `sparql_terms`.
+const XSD_NUMERIC_LITERALS: [&str; 12] = [
+    "http://www.w3.org/2001/XMLSchema#integer",
+    "http://www.w3.org/2001/XMLSchema#decimal",
+    "http://www.w3.org/2001/XMLSchema#double",
+    "http://www.w3.org/2001/XMLSchema#float",
+    "http://www.w3.org/2001/XMLSchema#long",
+    "http://www.w3.org/2001/XMLSchema#int",
+    "http://www.w3.org/2001/XMLSchema#short",
+    "http://www.w3.org/2001/XMLSchema#byte",
+    "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+    "http://www.w3.org/2001/XMLSchema#positiveInteger",
+    "http://www.w3.org/2001/XMLSchema#unsignedLong",
+    "http://www.w3.org/2001/XMLSchema#unsignedInt",
+];
+
+/// Value variables, each with the column it reads and how that column compares.
+type ValueColumns = HashMap<String, (String, String, PushForm)>;
 
 /// Where a nested variable's value lives, relative to a star.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -672,6 +743,8 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // Subject variables whose class could not be resolved. Cleared below by
     // whichever of them the path walk explains.
     let mut unresolved_subjects: HashSet<String> = HashSet::new();
+    // Stars that did not survive, with the triples they had claimed.
+    let mut discarded_claims: Vec<DiscardedStar> = Vec::new();
     // Named for what it does. This was `drop`, which shadowed `std::mem::drop`
     // for the rest of the function and read as if it destroyed the cause rather
     // than recording it.
@@ -744,6 +817,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 slot_depth: HashMap::new(),
                 object_variables: HashMap::new(),
                 inline_filters: HashMap::new(),
+                claimed: Vec::new(),
             });
 
         if pred_iri == RDF_TYPE {
@@ -752,9 +826,11 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                     builder.type_iri = Some(nn.as_str().to_owned());
                     builder.type_depth = *depth;
                     unconsumed.remove(&index);
+                    builder.claimed.push(index);
                 } else if builder.type_iri.as_deref() == Some(nn.as_str()) {
                     // The same type stated twice says nothing new.
                     unconsumed.remove(&index);
+                    builder.claimed.push(index);
                 } else if *depth < builder.type_depth {
                     // A second, *different* rdf:type is an intersection —
                     // `?s a :Signal ; a :Track` matches nothing unless one
@@ -769,6 +845,8 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             // Handled below. The `else` after this branch is the drop site for
             // a predicate the schema does not know.
             let slot_name = slot_view.name.clone();
+            let multivalued = slot_view.determine_slot_container_mode()
+                != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
             let current = builder
                 .slot_depth
                 .get(&slot_name)
@@ -787,11 +865,21 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                     // one-variable-on-two-slots case, which is caught.
                     match builder.object_variables.get(&slot_name) {
                         Some(existing) if existing != v.as_str() => {}
+                        // A constant already read this slot. On a multivalued
+                        // slot that is the same self-join in the other
+                        // direction: `:kinds "p" ; :kinds ?x` pairs the values
+                        // with each other, while the plan describes one
+                        // filtered read. Single-valued is different — the
+                        // constant just fixes what the variable binds.
+                        _ if multivalued && builder.inline_filters.contains_key(&slot_name) => {
+                            record_loss(Inexact::ConstantAndVariableOnSlot);
+                        }
                         _ => {
                             builder
                                 .object_variables
                                 .insert(slot_name, v.as_str().to_owned());
                             unconsumed.remove(&index);
+                            builder.claimed.push(index);
                         }
                     }
                 }
@@ -800,12 +888,19 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 // Only at depth 0 — inside an OPTIONAL we leave it to
                 // oxigraph to avoid breaking LEFT JOIN row preservation.
                 TermPattern::NamedNode(nn) if *depth == 0 => {
-                    builder
-                        .inline_filters
-                        .entry(slot_name)
-                        .or_default()
-                        .push(FilterCondition::Eq(nn.as_str().to_owned()));
-                    unconsumed.remove(&index);
+                    if multivalued && builder.object_variables.contains_key(&slot_name) {
+                        // See the variable arm above: two reads of one
+                        // multivalued slot, found in the other order.
+                        record_loss(Inexact::ConstantAndVariableOnSlot);
+                    } else {
+                        builder
+                            .inline_filters
+                            .entry(slot_name)
+                            .or_default()
+                            .push(FilterCondition::Eq(nn.as_str().to_owned()));
+                        unconsumed.remove(&index);
+                        builder.claimed.push(index);
+                    }
                 }
                 // Inline literal constant: `?s :foo "bar"`.
                 //
@@ -817,12 +912,18 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                     let plain =
                         lit.language().is_none() && (lit.datatype().as_str() == XSD_STRING_IRI);
                     if plain {
-                        builder
-                            .inline_filters
-                            .entry(slot_name)
-                            .or_default()
-                            .push(FilterCondition::Eq(lit.value().to_owned()));
-                        unconsumed.remove(&index);
+                        if multivalued && builder.object_variables.contains_key(&slot_name) {
+                            // See the variable arm above.
+                            record_loss(Inexact::ConstantAndVariableOnSlot);
+                        } else {
+                            builder
+                                .inline_filters
+                                .entry(slot_name)
+                                .or_default()
+                                .push(FilterCondition::Eq(lit.value().to_owned()));
+                            unconsumed.remove(&index);
+                            builder.claimed.push(index);
+                        }
                     }
                 }
                 // A constant object inside an OPTIONAL: pushing it would
@@ -870,11 +971,35 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 // triples vanish and leave a count of one per group.
                 //
                 // So record the name rather than the verdict, and let the path
-                // walk clear the ones it explains.
+                // walk clear the ones it explains — and hand the triples this
+                // builder claimed back to the working set unless the walk turns
+                // out to represent every one of them.
                 unresolved_subjects.insert(builder.variable.clone());
+                discarded_claims.push(DiscardedStar {
+                    claimed: builder.claimed.clone(),
+                    value_variables: builder.object_variables.values().cloned().collect(),
+                    // A constant on a nested step is a condition the path walk
+                    // has no way to carry: it records where a value lives, not
+                    // what it must equal.
+                    has_constants: !builder.inline_filters.is_empty(),
+                    has_type: builder.type_iri.is_some(),
+                });
                 continue;
             }
         };
+        // The class the plan holds must be the class the query asked for. A
+        // subject can also be scoped by which slots it uses, and that fallback
+        // answers even when the stated `rdf:type` names something the schema
+        // does not have — so the type triple was claimed and then quietly not
+        // used, and the plan describes every instance of the class it guessed.
+        if builder
+            .type_iri
+            .as_ref()
+            .is_some_and(|stated| *stated != class_uri)
+        {
+            record_loss(Inexact::UnrepresentedTriple);
+        }
+
         let star_is_optional = builder.type_depth > 0;
         let mut required_fields: Vec<String> = Vec::new();
         let mut optional_fields: Vec<String> = Vec::new();
@@ -1033,7 +1158,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     }
 
     // Phase 3: Collect filter conditions per star.
-    let mut var_to_field: HashMap<String, (String, String)> = HashMap::new();
+    let mut var_to_field: ValueColumns = HashMap::new();
     // Map: object_variable → (star_variable, slot_name)
     for builder in star_map.values() {
         if !var_to_class.contains_key(&builder.variable) {
@@ -1044,7 +1169,11 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 // obj_var is a value variable (not another star's subject)
                 var_to_field.insert(
                     obj_var.clone(),
-                    (builder.variable.clone(), slot_name.clone()),
+                    (
+                        builder.variable.clone(),
+                        slot_name.clone(),
+                        push_form(schema_view, &var_to_class[&builder.variable], slot_name),
+                    ),
                 );
             }
         }
@@ -1154,6 +1283,28 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         record_loss(Inexact::UntypedSubject);
     }
 
+    // Hand back what a discarded star had claimed. Reaching the subject is not
+    // the same as representing its triples: `?c :longitude ?lo ; :hasName ?x`
+    // is walked as far as ?lo, and `hasName` — a slot of some other class —
+    // is left describing nothing. Only a value the walk turned into a path
+    // binding is actually carried.
+    for discarded in &discarded_claims {
+        let represented = !discarded.has_constants
+            && !discarded.has_type
+            && discarded
+                .value_variables
+                .iter()
+                .all(|var| path_bindings.contains_key(var));
+        if !represented {
+            unconsumed.extend(discarded.claimed.iter().copied());
+            // Say why here. `cause_for_unconsumed` reads the triple to guess a
+            // cause, and a returned triple looks like whatever it is in
+            // isolation — `?d :title ?ti` reads as a duplicate slot binding,
+            // which is not what happened to it.
+            record_loss(Inexact::UnrepresentedTriple);
+        }
+    }
+
     // Whatever no path claimed. This is what makes the property structural: a
     // triple is inexact until something says otherwise, so the next drop site
     // nobody thought of is reported rather than silent.
@@ -1218,6 +1369,20 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// A star that was built and then discarded, and what it had claimed.
+struct DiscardedStar {
+    claimed: Vec<usize>,
+    /// Variables reading a value off this subject. Each has to come back as a
+    /// path binding, or the triple that introduced it is unrepresented.
+    value_variables: Vec<String>,
+    /// Whether a constant object was pushed against this subject.
+    has_constants: bool,
+    /// Whether an `rdf:type` was stated on it. A path binding says where a
+    /// value lives inside a structure; it cannot say that the structure has a
+    /// type, so the type triple is represented by nothing.
+    has_type: bool,
+}
+
 struct StarBuilder {
     variable: String,
     /// `Some(iri)` when the subject is a constant IRI rather than a query
@@ -1239,6 +1404,12 @@ struct StarBuilder {
     /// these filters can't be safely pushed to SQL without breaking
     /// LEFT JOIN semantics, so they're left for oxigraph to apply.
     inline_filters: HashMap<String, Vec<FilterCondition>>,
+    /// Triples this builder claimed to represent.
+    ///
+    /// A claim is only as good as the star it was made against: this one may
+    /// still be discarded, and its triples are then represented by nothing
+    /// unless the path walk picks them up. Kept so they can be handed back.
+    claimed: Vec<usize>,
 }
 
 /// Resolve the LinkML class (and identifier slot name) for one star.
@@ -1394,7 +1565,7 @@ fn tag_triples_by_depth<'a>(
 fn collect_filter_conditions(
     pattern: &GraphPattern,
     depth: usize,
-    var_to_field: &HashMap<String, (String, String)>,
+    var_to_field: &ValueColumns,
     star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
 ) -> Option<Inexact> {
     match pattern {
@@ -1461,7 +1632,7 @@ fn collect_filter_conditions(
 /// turned a dropped `REGEX` into ten arbitrary rows.
 fn extract_equality_from_expr(
     expr: &Expression,
-    var_to_field: &HashMap<String, (String, String)>,
+    var_to_field: &ValueColumns,
     star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
 ) -> bool {
     match expr {
@@ -1533,15 +1704,24 @@ fn extract_equality_from_expr(
             let Expression::Variable(var) = target.as_ref() else {
                 return false;
             };
-            let Some((star_var, field)) = var_to_field.get(var.as_str()) else {
+            let Some((star_var, field, form)) = var_to_field.get(var.as_str()) else {
                 return false;
             };
             let mut values = Vec::with_capacity(options.len());
             for option in options {
                 match option {
-                    Expression::Literal(lit) => values.push(lit.value().to_owned()),
-                    Expression::NamedNode(nn) => values.push(nn.as_str().to_owned()),
-                    // A computed member would have to be evaluated first.
+                    // Only when the stored term *is* its text, and the query
+                    // wrote that same plain term. `IN ("BX1"@en)` compared as
+                    // text matches a row oxigraph excludes.
+                    Expression::Literal(lit) if literal_pushable(lit, form) => {
+                        values.push(lit.value().to_owned())
+                    }
+                    Expression::NamedNode(nn) if *form == PushForm::Iri => {
+                        values.push(nn.as_str().to_owned())
+                    }
+                    // A computed member would have to be evaluated first, and a
+                    // constant whose term does not match the column's is not a
+                    // comparison this can make.
                     _ => return false,
                 }
             }
@@ -1574,25 +1754,70 @@ fn extract_equality_from_expr(
 fn match_var_literal(
     var_expr: &Expression,
     lit_expr: &Expression,
-    var_to_field: &HashMap<String, (String, String)>,
+    var_to_field: &ValueColumns,
 ) -> Option<(String, String, String)> {
     let var_name = match var_expr {
         Expression::Variable(v) => v.as_str(),
         _ => return None,
     };
-    let (star_var, field) = var_to_field.get(var_name)?;
+    let (star_var, field, form) = var_to_field.get(var_name)?;
+    // Same rule as the IN arm: the pushed condition compares text, so it is the
+    // query's question only when the column's term is its text and the query
+    // wrote it that way.
     let value = match lit_expr {
-        Expression::Literal(lit) => lit.value().to_owned(),
+        Expression::Literal(lit) if literal_pushable(lit, form) => lit.value().to_owned(),
         _ => return None,
     };
     Some((star_var.clone(), field.clone(), value))
+}
+
+/// How a column's values compare, from the same descriptor the renderer uses.
+///
+/// Unresolvable means unrepresentable, which is `Tagged`: refusing to push is
+/// always safe, and this runs before the class has been fully validated.
+fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &str) -> PushForm {
+    use crate::sparql_terms::TermKind;
+    let Some((descriptor, _)) = crate::sparql_terms::resolve_column(
+        schema_view,
+        class_uri,
+        std::slice::from_ref(&slot_name.to_owned()),
+    ) else {
+        return PushForm::Tagged;
+    };
+    match descriptor.kind {
+        TermKind::Iri => PushForm::Iri,
+        TermKind::EnumIri => PushForm::Tagged,
+        TermKind::Literal if descriptor.lang.is_none() && descriptor.datatype.is_none() => {
+            PushForm::Literal {
+                numeric: descriptor.numeric,
+            }
+        }
+        TermKind::Literal => PushForm::Tagged,
+    }
+}
+
+/// Whether comparing this constant as text asks what the query asks.
+///
+/// A language tag never survives the comparison: `"BX1"@en` is a different term
+/// from `"BX1"`, and pushing it as text matches a row the query excludes. A
+/// datatype survives only on a numeric column, where the comparison is
+/// numeric — which is what makes `FILTER(?l > 5)` work at all.
+fn literal_pushable(lit: &spargebra::term::Literal, form: &PushForm) -> bool {
+    let PushForm::Literal { numeric } = form else {
+        return false;
+    };
+    if lit.language().is_some() {
+        return false;
+    }
+    let datatype = lit.datatype().as_str();
+    datatype == XSD_STRING_IRI || (*numeric && XSD_NUMERIC_LITERALS.contains(&datatype))
 }
 
 /// Collect VALUES conditions, now keyed by (star_variable, slot_name).
 fn collect_values_filters(
     pattern: &GraphPattern,
     depth: usize,
-    var_to_field: &HashMap<String, (String, String)>,
+    var_to_field: &ValueColumns,
     star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
 ) -> Option<Inexact> {
     match pattern {
@@ -1604,9 +1829,16 @@ fn collect_values_filters(
             variables,
             bindings,
         } => {
+            // Rows are tuples. `VALUES (?nm ?l) { ("BX1" 4) ("BX2" 3) }` admits
+            // two pairs, and the plan can only say `nm IN (BX1,BX2)` and
+            // `l IN (4,3)` — which admits four. One column, or one row, is the
+            // same question either way.
+            if variables.len() > 1 && bindings.len() > 1 {
+                return Some(Inexact::ValuesTuple);
+            }
             let mut dropped = None;
             for (i, var) in variables.iter().enumerate() {
-                let Some((star_var, field)) = var_to_field.get(var.as_str()) else {
+                let Some((star_var, field, form)) = var_to_field.get(var.as_str()) else {
                     // A VALUES over a variable no star binds constrains
                     // something this plan does not describe.
                     dropped = Some(Inexact::UnboundValues);
@@ -1615,14 +1847,22 @@ fn collect_values_filters(
                 {
                     let mut values = Vec::new();
                     let mut has_undef = false;
+                    let mut mismatched = false;
                     for row in bindings {
                         match row.get(i) {
-                            Some(Some(spargebra::term::GroundTerm::NamedNode(nn))) => {
+                            Some(Some(spargebra::term::GroundTerm::NamedNode(nn)))
+                                if *form == PushForm::Iri =>
+                            {
                                 values.push(nn.as_str().to_owned());
                             }
-                            Some(Some(spargebra::term::GroundTerm::Literal(lit))) => {
+                            // As in a FILTER: text is the term only for a plain
+                            // literal on a plain-valued column.
+                            Some(Some(spargebra::term::GroundTerm::Literal(lit)))
+                                if literal_pushable(lit, form) =>
+                            {
                                 values.push(lit.value().to_owned());
                             }
+                            Some(Some(_)) => mismatched = true,
                             // UNDEF means *no constraint* for that row, so the
                             // block as a whole constrains nothing. Skipping the
                             // cell turned a union into an intersection:
@@ -1632,6 +1872,10 @@ fn collect_values_filters(
                     }
                     if has_undef {
                         dropped = Some(Inexact::UndefInValues);
+                        continue;
+                    }
+                    if mismatched {
+                        dropped = Some(Inexact::TaggedConstant);
                         continue;
                     }
                     if values.is_empty() {
@@ -2505,6 +2749,67 @@ classes:
                 "SELECT ?x WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  ?nm asset360:name ?x }",
             ),
+            // A VALUES over several variables lists tuples; one IN per column
+            // admits combinations the query does not.
+            (
+                Inexact::ValuesTuple,
+                "SELECT ?nm ?l WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+                 asset360:length ?l . VALUES (?nm ?l) { (\"BX1\" 4) (\"BX2\" 3) } }",
+            ),
+            // A tag does not survive a text comparison, in a FILTER or a
+            // VALUES any more than inline: `"BX1"@en` is not `"BX1"`.
+            (
+                Inexact::FilterExpression,
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm = \"BX1\"@en) }",
+            ),
+            (
+                Inexact::FilterExpression,
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm IN (\"BX1\"@en)) }",
+            ),
+            (
+                Inexact::TaggedConstant,
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 VALUES ?nm { \"BX1\"@en } }",
+            ),
+            // A multivalued slot read as a constant and through a variable is
+            // the same self-join as two variables, in the other direction.
+            (
+                Inexact::ConstantAndVariableOnSlot,
+                "SELECT ?x WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"p\" ; \
+                 asset360:trafficKinds ?x }",
+            ),
+            (
+                Inexact::ConstantAndVariableOnSlot,
+                "SELECT ?x WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?x ; \
+                 asset360:trafficKinds \"p\" }",
+            ),
+            // A claim is only as good as the star it was made against. Each of
+            // these built a star for the nested subject, claimed its triples,
+            // and then lost the star — leaving a constraint the plan does not
+            // carry, with `exact` still true.
+            (
+                // A constant on a nested step: the path walk records where a
+                // value lives, never what it must equal.
+                Inexact::UnrepresentedTriple,
+                "SELECT ?ti WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
+                 ?d asset360:title ?ti ; asset360:docId \"D1\" }",
+            ),
+            (
+                // A type the schema does not know, on the nested subject: the
+                // star cannot resolve, so nothing represents its triples.
+                Inexact::UnrepresentedTriple,
+                "SELECT ?lo WHERE { ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c a <https://example.org/NotAClass> ; asset360:longitude ?lo }",
+            ),
+            (
+                // A slot the schema knows but the *intermediate* class does not:
+                // claimed in Phase 1 against the schema, dropped by the walk.
+                Inexact::UnrepresentedTriple,
+                "SELECT ?lo WHERE { ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c asset360:longitude ?lo ; asset360:name ?x }",
+            ),
             // A blank-node property list has no variable to scope, so nothing
             // can claim its triples — and the same query written with a named
             // intermediate variable is exact and eligible.
@@ -2532,7 +2837,7 @@ classes:
     /// while being unconstructable.
     #[test]
     fn every_inexact_cause_is_fully_described() {
-        const ALL: [Inexact; 17] = [
+        const ALL: [Inexact; 19] = [
             Inexact::FilterExpression,
             Inexact::FilterInOptional,
             Inexact::VariablePredicate,
@@ -2550,6 +2855,8 @@ classes:
             Inexact::RepeatedType,
             Inexact::TaggedConstant,
             Inexact::UndefInValues,
+            Inexact::ValuesTuple,
+            Inexact::ConstantAndVariableOnSlot,
         ];
 
         let mut seen: HashSet<&str> = HashSet::new();
@@ -2630,6 +2937,17 @@ classes:
             "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
              ?loc asset360:longitude ?lon }",
             "SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10",
+            // A single-valued slot read as a constant and through a variable is
+            // one read: the constant fixes what the variable binds. Only the
+            // multivalued shape is a self-join.
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name \"BX\" ; \
+             asset360:name ?nm }",
+            // One column, several rows, and one row over several columns: both
+            // are the same question as the IN the plan carries.
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             VALUES ?nm { \"BX1\" \"BX2\" } }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:length ?l . VALUES (?nm ?l) { (\"BX1\" 4) } }",
         ] {
             let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
             assert_eq!(plan.inexact, None, "should be exact: {query}");
