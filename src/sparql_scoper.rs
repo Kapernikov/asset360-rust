@@ -584,6 +584,23 @@ pub struct Star {
     /// to a variable, or only required to exist.
     pub multivalued_fields: Vec<String>,
 
+    /// Which of this star's slots compare as numbers rather than as text.
+    ///
+    /// A [`FilterCondition::Cmp`] on one of these has to cast, because the
+    /// stored JSONB text does not order the way the number does: `'9' >= '10'`
+    /// is true as text and false as a number, and `'2001' > '9'` is false as
+    /// text. Getting it wrong is silent in both directions — the aggregate
+    /// route reports a group too many, and the prefetch route drops every row
+    /// and lets the engine aggregate nothing.
+    ///
+    /// A binding carries this on its own term descriptor, but a slot that only
+    /// appears in a `FILTER` has no binding, so a consumer holding only
+    /// `filters` cannot ask. Resolved through the same `resolve_column` the
+    /// descriptors come from, so the two cannot disagree about a column.
+    ///
+    /// Covers every slot mentioned on this star, like `multivalued_fields`.
+    pub numeric_fields: Vec<String>,
+
     /// Which SPARQL variable each slot binds to: `?s :hasName ?name`
     /// contributes `"name" -> "name"` (slot name → variable name).
     ///
@@ -1134,10 +1151,29 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             .collect();
         multivalued_fields.sort();
 
+        // Which of them compare as numbers. Asked through `resolve_column`
+        // rather than the schema directly, so a filter and a group key on the
+        // same slot cannot end up disagreeing about its type.
+        let mut numeric_fields: Vec<String> = builder
+            .slot_depth
+            .keys()
+            .filter(|slot_name| {
+                crate::sparql_terms::resolve_column(
+                    schema_view,
+                    &class_uri,
+                    std::slice::from_ref(*slot_name),
+                )
+                .is_some_and(|(descriptor, _)| descriptor.numeric)
+            })
+            .cloned()
+            .collect();
+        numeric_fields.sort();
+
         stars.push(Star {
             variable: builder.variable.clone(),
             class_uri,
             multivalued_fields,
+            numeric_fields,
             identifier_values,
             required_fields,
             optional_fields,
@@ -3211,6 +3247,30 @@ classes:
         assert!(
             !star.multivalued_fields.contains(&"name".to_owned()),
             "a single-valued slot is not an array"
+        );
+    }
+
+    /// A comparison on a numeric slot has to cast, and a consumer holding only
+    /// `filters` cannot tell which slot that is: the slot appears in no
+    /// binding, so no term descriptor reaches it. `'9' >= '10'` is true as text
+    /// and false as a number, which is a wrong answer in silence.
+    #[test]
+    fn a_star_says_which_of_its_fields_compare_as_numbers() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:length ?len ; \
+             asset360:name ?nm . FILTER(?len >= 10) }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = &plan.root.all_stars()[0];
+        assert!(star.filters.contains_key("length"), "the comparison pushed");
+        assert_eq!(star.numeric_fields, ["length"]);
+        assert!(
+            !star.numeric_fields.contains(&"name".to_owned()),
+            "a string slot compares by codepoint, not by value"
         );
     }
 

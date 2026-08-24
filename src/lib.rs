@@ -1435,6 +1435,24 @@ impl Star {
         self.inner.multivalued_fields.clone()
     }
 
+    /// Which of this star's slots compare as numbers rather than as text.
+    ///
+    /// A comparison in :attr:`filters` on one of these must cast — the stored
+    /// JSONB text does not order the way the number does. ``'9' >= '10'`` is
+    /// true as text and false as a number, and ``'2001' > '9'`` is false as
+    /// text, so ignoring this reports a group too many on the aggregate route
+    /// and drops every row on the prefetch route. Everything else compares
+    /// under ``COLLATE "C"``, which is the codepoint order SPARQL specifies.
+    ///
+    /// A projected column carries the same answer on its own term descriptor;
+    /// a slot that only appears in a ``FILTER`` has no binding to carry it,
+    /// which is what this is for. Both come from the same resolution, so they
+    /// cannot disagree.
+    #[getter]
+    fn numeric_fields(&self) -> Vec<String> {
+        self.inner.numeric_fields.clone()
+    }
+
     /// Value-level filter conditions per slot, pushable to SQL.
     ///
     /// A field listed in :attr:`multivalued_fields` needs a containment test
