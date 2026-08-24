@@ -18,15 +18,15 @@
 //! hint, because the boundary of the supported subset is meant to be learned
 //! from the errors rather than from a document.
 
+use spargebra::Query;
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
 use spargebra::term::Variable;
-use spargebra::{Query, SparqlParser};
 
 use linkml_schemaview::schemaview::SchemaView;
 
-use crate::sparql_scoper::{PathBinding, ScopeError, Star, sparql_scope};
+use crate::sparql_scoper::{PathBinding, ScopeError, Star, parse_query, scope_parsed};
 use crate::sparql_terms::{TermDescriptor, term_descriptor};
 
 /// Verdict for one query.
@@ -391,9 +391,12 @@ fn peel<'a>(pattern: &'a GraphPattern, out: &mut Peeled<'a>) {
 /// same errors [`sparql_scope`] reports. A query that parses but cannot be
 /// pushed down is a [`Pushdown::Blocked`] verdict, not an error.
 pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdown, ScopeError> {
-    let parsed = SparqlParser::new()
-        .parse_query(query)
-        .map_err(|e| ScopeError::ParseError(e.to_string()))?;
+    // Parse once, with the shared parser, and hand the result to the scoper.
+    // A parser of its own here would accept a different language: the shared
+    // one preloads prefixes a caller may leave implicit, so a query without
+    // `PREFIX asset360:` would scope fine and then fail to parse here — a
+    // syntax error on a query that works.
+    let parsed = parse_query(query)?;
     let pattern = match &parsed {
         Query::Select { pattern, .. } => pattern,
         // CONSTRUCT/DESCRIBE/ASK produce graphs or booleans, not solution
@@ -458,8 +461,9 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     }
 
     // Reuse the star decomposition rather than re-walking the triples: it
-    // already resolves classes, slots and join edges.
-    let plan = sparql_scope(query, schema_view)?;
+    // already resolves classes, slots and join edges. Passing the parsed query
+    // keeps this to one parse per call.
+    let plan = scope_parsed(&parsed, schema_view)?;
     let stars = plan.root.all_stars();
     let joins = plan.root.all_joins();
 
@@ -835,6 +839,38 @@ mod tests {
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
+    }
+
+    /// The endpoint's parser preloads `asset360:`, so a query may leave it
+    /// implicit — and every other test here prepends PREFIX, which is exactly
+    /// how a parser mismatch stays hidden. With a parser of its own, this
+    /// query scoped fine and then failed to parse in the analyser: a syntax
+    /// error on a query that works, surfacing as a 500.
+    #[test]
+    fn implicit_prefixes_parse_the_same_as_the_scoper() {
+        let sv = test_schema_view();
+        let query = "SELECT ?name (COUNT(*) AS ?n) WHERE { \
+                     ?s a asset360:Signal ; asset360:name ?name } GROUP BY ?name";
+
+        // Both entry points must accept it, or they accept different languages.
+        crate::sparql_scoper::sparql_scope(query, &sv).expect("scoper accepts it");
+        let verdict = analyse_pushdown(query, &sv).expect("analyser accepts it");
+        assert!(matches!(verdict, Pushdown::Eligible(_)), "got {verdict:?}");
+    }
+
+    #[test]
+    fn an_update_is_rejected_not_misread() {
+        // Shared parsing means the analyser reports an Update as an Update,
+        // rather than as a syntax error or (worse) a query with nothing to
+        // group.
+        let sv = test_schema_view();
+        let err = analyse_pushdown(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             INSERT DATA { <urn:a> a asset360:Signal }",
+            &sv,
+        )
+        .expect_err("an update must not be planned");
+        assert!(matches!(err, ScopeError::UpdateRejected), "got {err:?}");
     }
 
     #[test]

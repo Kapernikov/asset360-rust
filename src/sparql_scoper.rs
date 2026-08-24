@@ -354,12 +354,19 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 /// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
 /// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update.
 pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
-    // Reject SPARQL Update
-    if SparqlParser::new().parse_update(query_str).is_ok() {
-        return Err(ScopeError::UpdateRejected);
-    }
+    let query = parse_query(query_str)?;
+    scope_parsed(&query, schema_view)
+}
 
-    let parser = SparqlParser::new()
+/// The parser every entry point must use.
+///
+/// It preloads the prefixes a caller may leave implicit, which makes it part of
+/// the endpoint's contract rather than a convenience: a query that omits
+/// `PREFIX asset360:` parses here and nowhere else. Two entry points with two
+/// parsers would accept two different languages — one would scope a query the
+/// other rejects as a syntax error.
+pub fn sparql_parser() -> SparqlParser {
+    SparqlParser::new()
         .with_prefix("asset360", "https://data.infrabel.be/asset360/")
         .expect("hardcoded prefix")
         .with_prefix("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
@@ -367,13 +374,31 @@ pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPl
         .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#")
         .expect("hardcoded prefix")
         .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#")
-        .expect("hardcoded prefix");
+        .expect("hardcoded prefix")
+}
 
-    let query = parser
+/// Parse a query, rejecting SPARQL Update.
+pub fn parse_query(query_str: &str) -> Result<Query, ScopeError> {
+    // An Update parses as an Update and not as a Query, so this check has to
+    // precede the query parse to give the specific error rather than a syntax
+    // one.
+    if sparql_parser().parse_update(query_str).is_ok() {
+        return Err(ScopeError::UpdateRejected);
+    }
+
+    sparql_parser()
         .parse_query(query_str)
-        .map_err(|e| ScopeError::ParseError(e.to_string()))?;
+        .map_err(|e| ScopeError::ParseError(e.to_string()))
+}
 
-    let pattern = match &query {
+/// Plan an already-parsed query.
+///
+/// Separate from [`sparql_scope`] so a caller that needs the parsed algebra for
+/// its own analysis — the aggregate pushdown does — can parse once and share
+/// the result, instead of parsing the same string again with a parser that
+/// might not match.
+pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
+    let pattern = match query {
         Query::Select { pattern, .. } => pattern,
         Query::Construct { pattern, .. } => pattern,
         Query::Describe { pattern, .. } => pattern,
@@ -1288,21 +1313,8 @@ prefixes:
     prefix_reference: https://data.infrabel.be/asset360/
   linkml:
     prefix_reference: https://w3id.org/linkml/
-  xsd:
-    prefix_reference: http://www.w3.org/2001/XMLSchema#
 default_prefix: asset360
 default_range: string
-
-# Declared locally rather than imported: the term descriptor resolves
-# numeric-ness from the datatype IRI a type carries, so a schema whose types
-# are unresolved would make every slot look non-numeric.
-types:
-  string:
-    uri: xsd:string
-    base: str
-  integer:
-    uri: xsd:integer
-    base: int
 
 classes:
   Coordinates:

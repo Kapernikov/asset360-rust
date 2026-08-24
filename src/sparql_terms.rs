@@ -35,39 +35,6 @@
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 
-/// XSD datatypes whose values are numbers.
-///
-/// Checked against the datatype IRI the schema resolves, not against a LinkML
-/// type name. Tying it to the datatype is what keeps the two routes in step:
-/// the turtle writer decides typed-vs-plain from the same field, so a value
-/// this treats as a number is exactly one oxigraph sees as a numeric literal.
-///
-/// Known limitation, covered by a test: a type declared only as
-/// `typeof: integer`, with no `uri` of its own, currently resolves to no
-/// datatype at all — so it serialises as a plain literal *and* is treated as
-/// non-numeric here, meaning `SUM`/`AVG` over it are refused. That is
-/// conservative rather than wrong (a plain literal is not a number in SPARQL
-/// either, so summing one is a type error), and the fix belongs upstream in
-/// `determine_rdf_type_info`, where it would change the writer's output too.
-/// It does not arise in practice: asset360's schemas use the bundled LinkML
-/// types, which all carry a `uri`.
-const XSD_NUMERIC: &[&str] = &[
-    "http://www.w3.org/2001/XMLSchema#integer",
-    "http://www.w3.org/2001/XMLSchema#decimal",
-    "http://www.w3.org/2001/XMLSchema#float",
-    "http://www.w3.org/2001/XMLSchema#double",
-    "http://www.w3.org/2001/XMLSchema#int",
-    "http://www.w3.org/2001/XMLSchema#long",
-    "http://www.w3.org/2001/XMLSchema#short",
-    "http://www.w3.org/2001/XMLSchema#byte",
-    "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-    "http://www.w3.org/2001/XMLSchema#positiveInteger",
-    "http://www.w3.org/2001/XMLSchema#negativeInteger",
-    "http://www.w3.org/2001/XMLSchema#nonPositiveInteger",
-    "http://www.w3.org/2001/XMLSchema#unsignedInt",
-    "http://www.w3.org/2001/XMLSchema#unsignedLong",
-];
-
 /// What kind of RDF term a column's values become.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TermKind {
@@ -210,9 +177,19 @@ fn describe_slot(
         None
     };
 
-    let numeric = datatype
-        .as_deref()
-        .is_some_and(|dt| XSD_NUMERIC.contains(&dt));
+    // Numeric-ness comes from the schema's own resolution, not from a list of
+    // datatype IRIs kept here: `is_integer`/`is_floating_point` prefer the
+    // resolved IRI *and* fall back to the builtin LinkML type names, so they
+    // still work against a schema whose `linkml:types` is not loaded. A local
+    // list missed that fallback, which is why the scoper's test fixture had to
+    // declare its own `types:` block.
+    //
+    // Gap to close upstream: neither helper covers xsd:int / long / short /
+    // unsigned*, so a slot declared with one of those is treated as
+    // non-numeric here — conservative (SUM/AVG are refused, never miscast),
+    // and the fix is a `RangeInfo::is_numeric()` request rather than a second
+    // list.
+    let numeric = info.is_some_and(|ri| ri.is_integer() || ri.is_floating_point());
 
     Some(TermDescriptor {
         kind: TermKind::Literal,

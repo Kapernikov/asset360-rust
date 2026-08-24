@@ -1247,8 +1247,23 @@ impl PyConstraintSet {
 #[derive(Clone)]
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
 ///
-/// Each condition has an `operator` (`"eq"` or `"in"`) and one or more
-/// string `values`. The Django view translates these to ORM lookups.
+/// Each condition has an `operator` and one or more string `values`:
+///
+/// | operator | from | values |
+/// |---|---|---|
+/// | `"eq"` | `FILTER(?v = "x")`, `?s :slot "x"` | one |
+/// | `"in"` | `VALUES ?v { "a" "b" }` | one or more |
+/// | `"gt"` / `"gte"` / `"lt"` / `"lte"` | `FILTER(?v > 10)` and friends | one |
+///
+/// A comparison compares the way SPARQL does, not the way text does: a numeric
+/// slot casts (as text, `"9" > "10"`) and a string slot needs codepoint
+/// collation. The consumer decides from the slot's type, which is why the
+/// operator alone is carried here.
+///
+/// **Unknown operators must be refused, not ignored.** A newer planner can emit
+/// one this consumer does not know, and silently dropping it widens the fetch
+/// instead of narrowing it — which stays correct only while something else
+/// re-applies the filter.
 ///
 /// Python usage:
 ///
@@ -1259,6 +1274,10 @@ impl PyConstraintSet {
 ///             qs = qs.filter(**{f"object_data__{field}": cond.value})
 ///         elif cond.operator == "in":
 ///             qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+///         elif cond.operator in ("gt", "gte", "lt", "lte"):
+///             qs = qs.filter(**{f"object_data__{field}__{cond.operator}": cond.value})
+///         else:
+///             raise ValueError(f"unsupported filter operator: {cond.operator}")
 /// ```
 pub struct FilterCondition {
     operator: String,
@@ -1269,13 +1288,18 @@ pub struct FilterCondition {
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl FilterCondition {
-    /// The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
+    /// The filter operator: ``"eq"`` (equality), ``"in"`` (set membership), or
+    /// ``"gt"`` / ``"gte"`` / ``"lt"`` / ``"lte"`` (ordering comparison).
+    ///
+    /// ``"ne"`` is deliberately absent: SPARQL's inequality is false for an
+    /// unbound variable, where SQL's ``<>`` against NULL is unknown and would
+    /// drop rows the query keeps.
     #[getter]
     fn operator(&self) -> &str {
         &self.operator
     }
 
-    /// The filter value (for ``"eq"`` conditions).
+    /// The single filter value, for every operator except ``"in"``.
     ///
     /// Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
     /// an empty condition (should not happen in practice).
@@ -1289,20 +1313,24 @@ impl FilterCondition {
 
     /// All filter values as a list.
     ///
-    /// For ``"eq"``: single-element list. For ``"in"``: multiple values.
+    /// One element for every operator except ``"in"``, which may have several.
     #[getter]
     fn values(&self) -> Vec<String> {
         self.values.clone()
     }
 
     fn __repr__(&self) -> String {
-        if self.operator == "eq" {
-            format!(
-                "FilterCondition(eq={:?})",
-                self.values.first().unwrap_or(&String::new())
-            )
-        } else {
+        // Print the operator rather than branching on one known value and
+        // labelling everything else "in" — which is how a `gt` condition came
+        // out as `FilterCondition(in=["10"])`.
+        if self.operator == "in" {
             format!("FilterCondition(in={:?})", self.values)
+        } else {
+            format!(
+                "FilterCondition({}={:?})",
+                self.operator,
+                self.values.first().map_or("", String::as_str)
+            )
         }
     }
 }
