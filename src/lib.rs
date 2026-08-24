@@ -1419,7 +1419,25 @@ impl Star {
         self.inner.is_optional
     }
 
+    /// Which of this star's slots hold several values per record.
+    ///
+    /// Two things depend on it, and both give wrong answers if it is ignored.
+    /// A condition in :attr:`filters` on one of these fields is a test that the
+    /// array *contains* the value — in Postgres ``EXISTS (SELECT 1 FROM
+    /// jsonb_array_elements_text(object_data->'field') v WHERE v.value = ...)``
+    /// — and rendering it as ``object_data->>'field' = 'value'`` compares the
+    /// array's own text, which matches nothing. And a value read off one of
+    /// these multiplies solutions: a record with three values answers a SPARQL
+    /// question three times, so counting rows is not counting solutions.
+    #[getter]
+    fn multivalued_fields(&self) -> Vec<String> {
+        self.inner.multivalued_fields.clone()
+    }
+
     /// Value-level filter conditions per slot, pushable to SQL.
+    ///
+    /// A field listed in :attr:`multivalued_fields` needs a containment test
+    /// rather than an equality — see that attribute.
     #[getter]
     fn filters(&self) -> HashMap<String, Vec<FilterCondition>> {
         self.inner

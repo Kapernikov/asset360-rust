@@ -5061,9 +5061,26 @@ class Star:
         block — its ``WHERE`` conditions must be null-guarded by Python.
         """
     @property
+    def multivalued_fields(self) -> builtins.list[builtins.str]:
+        r"""
+        Which of this star's slots hold several values per record.
+        
+        Two things depend on it, and both give wrong answers if it is ignored.
+        A condition in :attr:`filters` on one of these fields is a test that the
+        array *contains* the value — in Postgres ``EXISTS (SELECT 1 FROM
+        jsonb_array_elements_text(object_data->'field') v WHERE v.value = ...)``
+        — and rendering it as ``object_data->>'field' = 'value'`` compares the
+        array's own text, which matches nothing. And a value read off one of
+        these multiplies solutions: a record with three values answers a SPARQL
+        question three times, so counting rows is not counting solutions.
+        """
+    @property
     def filters(self) -> builtins.dict[builtins.str, builtins.list[FilterCondition]]:
         r"""
         Value-level filter conditions per slot, pushable to SQL.
+        
+        A field listed in :attr:`multivalued_fields` needs a containment test
+        rather than an equality — see that attribute.
         """
     @property
     def slot_variables(self) -> builtins.dict[builtins.str, builtins.str]:

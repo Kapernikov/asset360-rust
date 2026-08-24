@@ -160,6 +160,10 @@ pub enum Inexact {
     /// are *tuples* — `("BX1" 4) ("BX2" 3)` admits two combinations — and one
     /// independent `IN` per column admits all four.
     ValuesTuple,
+    /// A nested structure given its own `rdf:type`, so it became a class of its
+    /// own. A join edge would claim the slot stores the other class's URI, and
+    /// an inlined slot stores the structure itself.
+    TypedNestedStructure,
     /// A constant and a variable read of one multivalued slot
     /// (`:kinds "p" ; :kinds ?x`): two independent reads of the same values,
     /// which the plan collapses into one filtered read.
@@ -187,6 +191,7 @@ impl Inexact {
             Self::RepeatedType => "repeated_type",
             Self::TaggedConstant => "tagged_constant",
             Self::UndefInValues => "undef_in_values",
+            Self::TypedNestedStructure => "typed_nested_structure",
             Self::ValuesTuple => "values_tuple",
             Self::ConstantAndVariableOnSlot => "constant_and_variable_on_slot",
         }
@@ -259,6 +264,11 @@ impl Inexact {
                 "a VALUES row uses UNDEF, which places no constraint at all — \
                  dropping it would turn a union into an intersection"
             }
+            Self::TypedNestedStructure => {
+                "a nested structure is given its own rdf:type, which makes it a \
+                 second class; the plan can only relate two classes by a \
+                 reference, and this slot stores the structure itself"
+            }
             Self::ValuesTuple => {
                 "a VALUES block pairs several variables per row, and the plan \
                  can only say which values each column may take — which admits \
@@ -326,6 +336,11 @@ impl Inexact {
             Self::UndefInValues => {
                 "Leave the row out instead of using UNDEF, or ask the \
                  unconstrained case as its own question."
+            }
+            Self::TypedNestedStructure => {
+                "Drop the rdf:type on the nested variable — the schema already \
+                 says what it is — and the same question is answered by reading \
+                 through it as a path."
             }
             Self::ValuesTuple => {
                 "Use one VALUES per variable if the columns are independent, \
@@ -523,7 +538,26 @@ pub struct Star {
     /// where `?var` is bound to a known slot in this star.
     ///
     /// Does NOT include the identifier slot — see `identifier_values`.
+    ///
+    /// A field listed in [`Self::multivalued_fields`] holds an array, and a
+    /// condition on it is a test that the array *contains* the value. Rendering
+    /// it as `object_data->>'field' = 'value'` compares the array's text and
+    /// matches nothing.
     pub filters: HashMap<String, Vec<FilterCondition>>,
+
+    /// Which of this star's slots hold several values per record.
+    ///
+    /// Load-bearing for two things, and wrong answers either way. A condition
+    /// in [`Self::filters`] on one of these is a containment test — in
+    /// Postgres, `EXISTS (SELECT 1 FROM
+    /// jsonb_array_elements_text(object_data->'field') v WHERE v.value = ...)`
+    /// rather than an equality. And a value read off one multiplies solutions:
+    /// a record with three values answers a SPARQL question three times, so a
+    /// row-per-record count is not a count of solutions.
+    ///
+    /// Covers every slot mentioned on this star, whether it is filtered, bound
+    /// to a variable, or only required to exist.
+    pub multivalued_fields: Vec<String>,
 
     /// Which SPARQL variable each slot binds to: `?s :hasName ?name`
     /// contributes `"name" -> "name"` (slot name → variable name).
@@ -1021,9 +1055,35 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             var_to_identifier_slot.insert(builder.variable.clone(), id_name);
         }
 
+        // Which of this star's slots hold arrays. Asked of the schema once here,
+        // because a consumer cannot tell from `filters` alone and getting it
+        // wrong silently drops every row.
+        let mut multivalued_fields: Vec<String> = builder
+            .slot_depth
+            .keys()
+            .filter(|slot_name| {
+                schema_view
+                    .get_class_by_uri(&class_uri)
+                    .ok()
+                    .flatten()
+                    .and_then(|cv| {
+                        cv.slot(&linkml_schemaview::identifier::Identifier::Name(
+                            (*slot_name).clone(),
+                        ))
+                    })
+                    .is_some_and(|slot| {
+                        slot.determine_slot_container_mode()
+                            != linkml_schemaview::slotview::SlotContainerMode::SingleValue
+                    })
+            })
+            .cloned()
+            .collect();
+        multivalued_fields.sort();
+
         stars.push(Star {
             variable: builder.variable.clone(),
             class_uri,
+            multivalued_fields,
             identifier_values,
             required_fields,
             optional_fields,
@@ -1074,6 +1134,29 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         sorted_slots.sort_by(|a, b| a.0.cmp(b.0));
         for (slot_name, obj_var) in sorted_slots {
             if var_to_class.contains_key(obj_var) {
+                // A join edge says "this slot holds the other class's URI".
+                // That is only true of a *reference*: an inlined slot holds the
+                // structure itself, so there is no column to compare and no
+                // row to join to. The same question without the nested
+                // `rdf:type` is a path, which the plan does carry — so refuse
+                // rather than invent an edge, and say that in the hint.
+                let stores_a_reference = schema_view
+                    .get_class_by_uri(&var_to_class[&builder.variable])
+                    .ok()
+                    .flatten()
+                    .and_then(|cv| {
+                        cv.slot(&linkml_schemaview::identifier::Identifier::Name(
+                            slot_name.clone(),
+                        ))
+                    })
+                    .is_some_and(|slot| {
+                        slot.determine_slot_inline_mode()
+                            == linkml_schemaview::slotview::SlotInlineMode::Reference
+                    });
+                if !stores_a_reference {
+                    record_loss(Inexact::TypedNestedStructure);
+                    continue;
+                }
                 let slot_d = *builder.slot_depth.get(slot_name).unwrap_or(&0);
                 let left_d = *star_depths.get(obj_var).unwrap_or(&0);
                 let right_d = *star_depths.get(&builder.variable).unwrap_or(&0);
@@ -2917,6 +3000,103 @@ classes:
                 plan.inexact
             );
         }
+    }
+
+    /// A join edge claims the slot holds the other class's URI. An inlined slot
+    /// holds the structure itself, so there is no such column — and the same
+    /// question without the nested `rdf:type` is a path the plan does carry.
+    ///
+    /// Ground truth from the writer: an inlined object *is* given an
+    /// `rdf:type` triple, so the typed form is a legal question answering
+    /// exactly what the untyped one answers — which is why the hint says to
+    /// drop the type rather than to change the question.
+    #[test]
+    fn an_inlined_structure_is_never_joined_as_a_reference() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        // Typed: refused, with a cause that names the fix.
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?lo WHERE {{ ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c a asset360:Coordinates ; asset360:longitude ?lo }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, Some(Inexact::TypedNestedStructure));
+        // The star for ?c is still built — Phase 1 makes one for any typed
+        // subject — but nothing joins to it, which is the part that was wrong.
+        // Unjoined it costs a fetch returning no rows (an inlined structure is
+        // not a record of its own), and the recorded loss is what stops
+        // anything answering from this plan.
+        assert!(
+            plan.root.all_joins().is_empty(),
+            "an inlined slot is not a foreign key"
+        );
+
+        // A wrong type on the nested variable is the same shape, not a
+        // different one — it used to emit the same bogus edge.
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?lo WHERE {{ ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c a asset360:Track ; asset360:longitude ?lo }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert!(
+            plan.inexact.is_some(),
+            "a wrong nested type is still a loss"
+        );
+
+        // Untyped: the path, exact.
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?lo WHERE {{ ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c asset360:longitude ?lo }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None);
+        assert!(plan.path_bindings.contains_key("lo"));
+
+        // A real reference still joins.
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?tn WHERE {{ ?s a asset360:Signal ; \
+                 asset360:locatedOnTrack ?t . ?t a asset360:Track ; asset360:hasName ?tn }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None);
+        assert_eq!(plan.root.all_joins().len(), 1, "a reference is a join");
+    }
+
+    /// A filter on a multivalued slot is a containment test, and a consumer
+    /// cannot tell from `filters` alone — so the star says which fields hold
+    /// arrays. `:trafficKinds "m"` matches a record whose array contains "m";
+    /// comparing the array's text matches nothing.
+    #[test]
+    fn a_star_says_which_of_its_fields_hold_arrays() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" ; \
+             asset360:name \"BX\" }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = &plan.root.all_stars()[0];
+        assert!(star.filters.contains_key("trafficKinds"));
+        assert_eq!(star.multivalued_fields, ["trafficKinds"]);
+        assert!(
+            !star.multivalued_fields.contains(&"name".to_owned()),
+            "a single-valued slot is not an array"
+        );
     }
 
     /// `= <iri>` and `IN (<iri>)` are one rule, and they drifted: only `IN`
