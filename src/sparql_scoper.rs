@@ -175,6 +175,12 @@ inexact_variants! {
     /// pushed condition compares stored text, so it would match on the value
     /// alone and accept rows the query excludes.
     TaggedConstant,
+    /// A constant on an enum column that no stored value renders as — the
+    /// literal spelling of a code that carries a `meaning`, or an IRI no code
+    /// maps to. The answer is *no records*, which an equality on stored text
+    /// cannot state: pushing the constant's own text would match the code that
+    /// renders as an IRI.
+    EnumConstantUnmatched,
     /// A `VALUES` row with `UNDEF` for a variable: that row places no
     /// constraint, so dropping it turns a union into an intersection.
     UndefInValues,
@@ -212,6 +218,7 @@ impl Inexact {
             Self::DuplicateSlotBinding => "duplicate_slot_binding",
             Self::RepeatedType => "repeated_type",
             Self::TaggedConstant => "tagged_constant",
+            Self::EnumConstantUnmatched => "enum_constant_unmatched",
             Self::UndefInValues => "undef_in_values",
             Self::TypedNestedStructure => "typed_nested_structure",
             Self::ValuesTuple => "values_tuple",
@@ -281,6 +288,10 @@ impl Inexact {
             Self::TaggedConstant => {
                 "a constant object carries a language tag or datatype, and the \
                  pushed condition compares stored text only"
+            }
+            Self::EnumConstantUnmatched => {
+                "a constant on an enum-valued slot is a term no stored value \
+                 renders as, so the question selects no records at all"
             }
             Self::UndefInValues => {
                 "a VALUES row uses UNDEF, which places no constraint at all — \
@@ -355,6 +366,11 @@ impl Inexact {
                 "Compare with a FILTER, e.g. `FILTER(?name = \"BX1\"@en)`, or \
                  drop the tag if the stored value is untagged."
             }
+            Self::EnumConstantUnmatched => {
+                "Group by the slot first to see the terms its values render \
+                 as: a permissible value with a `meaning` is that IRI, not its \
+                 code spelled as a literal."
+            }
             Self::UndefInValues => {
                 "Leave the row out instead of using UNDEF, or ask the \
                  unconstrained case as its own question."
@@ -397,9 +413,70 @@ pub(crate) enum PushForm {
     },
     /// A named node: comparable, against an IRI constant only.
     Iri,
-    /// Enum-valued — the stored code is not the term it renders as, so no
-    /// comparison against a query constant is the same question.
+    /// Enum-valued: the stored text is a permissible value, and the term it
+    /// renders as is that value's `meaning` IRI when it has one and the plain
+    /// literal otherwise. So a constant is not compared against the column —
+    /// it is translated *backwards*, from the term the query wrote to the code
+    /// the column stores. See [`enum_codes`].
+    ///
+    /// Carries `(code, meaning IRI)` for the values that have one. A partially
+    /// mapped enum is the normal case, not a corner: `signalType` stores `GSA`
+    /// with a meaning beside `KSS` without one, so one column answers a literal
+    /// constant and an IRI constant, each for different records.
+    Enum { meanings: Vec<(String, String)> },
+    /// A column whose term this cannot describe at all, so no comparison
+    /// against a query constant is the same question.
     Tagged,
+}
+
+/// Which stored codes a constant on an enum column selects.
+///
+/// `None` means the constant is not a term any stored value renders as, so the
+/// question has an answer — no records — that a pushed equality cannot state.
+/// The caller records that as a loss rather than inventing a condition:
+/// pushing the constant's own text would match the code that renders as an IRI
+/// and answer 12072 where SPARQL answers 0.
+///
+/// Empty is impossible by construction: a literal that matches nothing returns
+/// `None`, and a literal that is not a mapped code selects itself, which is
+/// also what a value outside the enum stores.
+fn enum_codes(meanings: &[(String, String)], term: &TermPattern) -> Option<Vec<String>> {
+    match term {
+        // An IRI constant selects every code whose meaning is that IRI. Two
+        // codes may share one, which is why this is a list.
+        TermPattern::NamedNode(nn) => {
+            let codes: Vec<String> = meanings
+                .iter()
+                .filter(|(_code, iri)| iri == nn.as_str())
+                .map(|(code, _iri)| code.clone())
+                .collect();
+            (!codes.is_empty()).then_some(codes)
+        }
+        TermPattern::Literal(lit) => {
+            // An enum value renders either as its meaning IRI or as a plain
+            // literal, never as a typed or tagged one.
+            if lit.language().is_some() || lit.datatype().as_str() != XSD_STRING_IRI {
+                return None;
+            }
+            // A code that has a meaning renders as that IRI, so the plain
+            // literal spelling of it is a term no record carries.
+            if meanings.iter().any(|(code, _iri)| code == lit.value()) {
+                return None;
+            }
+            // Otherwise the stored text is the term: an unmapped permissible
+            // value, or a value the data holds that the enum does not declare.
+            Some(vec![lit.value().to_owned()])
+        }
+        _ => None,
+    }
+}
+
+/// One condition from the codes an enum constant selects.
+fn enum_condition(codes: Vec<String>) -> FilterCondition {
+    match <[String; 1]>::try_from(codes) {
+        Ok([only]) => FilterCondition::Eq(only),
+        Err(several) => FilterCondition::In(several),
+    }
 }
 
 /// Value variables, each with the column it reads and how that column compares.
@@ -649,7 +726,7 @@ pub enum JoinType {
 }
 
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterCondition {
     /// Equality: `FILTER(?var = "value")` → `WHERE object_data->>'field' = 'value'`
     Eq(String),
@@ -974,6 +1051,21 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                             .push(FilterCondition::Eq(nn.as_str().to_owned()));
                         unconsumed.remove(&index);
                         builder.claimed.push(index);
+                    } else if let PushForm::Enum { meanings } = &form {
+                        // An enum column stores a code, not the IRI it renders
+                        // as, so the constant is translated backwards.
+                        match enum_codes(meanings, &tp.object) {
+                            Some(codes) => {
+                                builder
+                                    .inline_filters
+                                    .entry(slot_name)
+                                    .or_default()
+                                    .push(enum_condition(codes));
+                                unconsumed.remove(&index);
+                                builder.claimed.push(index);
+                            }
+                            None => record_loss(Inexact::EnumConstantUnmatched),
+                        }
                     } else {
                         // An IRI where the column stores a literal: the two are
                         // different terms and oxigraph matches neither.
@@ -986,7 +1078,30 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 // values render as — the same rule the FILTER and VALUES routes
                 // apply, from the same function.
                 TermPattern::Literal(lit) if *depth == 0 => {
-                    if identity_slot || literal_pushable(lit, &form) {
+                    if let PushForm::Enum { meanings } = &form
+                        && !identity_slot
+                    {
+                        // Same rule as the IRI arm above: a literal selects the
+                        // codes that render as it, which is the code itself
+                        // only when it carries no `meaning`.
+                        match enum_codes(meanings, &tp.object) {
+                            Some(codes) => {
+                                if multivalued && builder.object_variables.contains_key(&slot_name)
+                                {
+                                    record_loss(Inexact::ConstantAndVariableOnSlot);
+                                } else {
+                                    builder
+                                        .inline_filters
+                                        .entry(slot_name)
+                                        .or_default()
+                                        .push(enum_condition(codes));
+                                    unconsumed.remove(&index);
+                                    builder.claimed.push(index);
+                                }
+                            }
+                            None => record_loss(Inexact::EnumConstantUnmatched),
+                        }
+                    } else if identity_slot || literal_pushable(lit, &form) {
                         if multivalued && builder.object_variables.contains_key(&slot_name) {
                             // See the variable arm above.
                             record_loss(Inexact::ConstantAndVariableOnSlot);
@@ -1766,15 +1881,15 @@ fn extract_equality_from_expr(
 ) -> bool {
     match expr {
         Expression::Equal(left, right) => {
-            if let Some((star_var, field, value)) = match_var_literal(left, right, var_to_field)
-                .or_else(|| match_var_literal(right, left, var_to_field))
+            if let Some((star_var, field, texts)) = match_var_constant(left, right, var_to_field)
+                .or_else(|| match_var_constant(right, left, var_to_field))
             {
                 star_filters
                     .entry(star_var)
                     .or_default()
                     .entry(field)
                     .or_default()
-                    .push(FilterCondition::Eq(value));
+                    .push(enum_condition(texts));
                 true
             } else {
                 // A comparison between two variables, or against something
@@ -1838,20 +1953,14 @@ fn extract_equality_from_expr(
             };
             let mut values = Vec::with_capacity(options.len());
             for option in options {
-                match option {
-                    // Only when the stored term *is* its text, and the query
-                    // wrote that same plain term. `IN ("BX1"@en)` compared as
-                    // text matches a row oxigraph excludes.
-                    Expression::Literal(lit) if literal_pushable(lit, form) => {
-                        values.push(lit.value().to_owned())
-                    }
-                    Expression::NamedNode(nn) if *form == PushForm::Iri => {
-                        values.push(nn.as_str().to_owned())
-                    }
-                    // A computed member would have to be evaluated first, and a
-                    // constant whose term does not match the column's is not a
-                    // comparison this can make.
-                    _ => return false,
+                // Only when the stored term *is* its text, and the query wrote
+                // that same plain term: `IN ("BX1"@en)` compared as text
+                // matches a row oxigraph excludes. A computed member would have
+                // to be evaluated first. An enum member translates backwards
+                // through its meanings, and may select more than one code.
+                match constant_texts(option, form) {
+                    Some(texts) => values.extend(texts),
+                    None => return false,
                 }
             }
             if values.is_empty() {
@@ -1878,6 +1987,45 @@ fn extract_equality_from_expr(
         // to oxigraph, and the plan is no longer a complete description.
         _ => false,
     }
+}
+
+/// The stored texts a constant selects on a column, or `None` when no
+/// comparison on stored text asks what the query asks.
+///
+/// One rule behind `=`, `IN` and an inline constant. They were three copies
+/// once, and the copies drifted: only `IN` learned that a reference column
+/// compares against an IRI. An enum translates *backwards* through its
+/// meanings; every other column compares the term against itself.
+fn constant_texts(expr: &Expression, form: &PushForm) -> Option<Vec<String>> {
+    if let PushForm::Enum { meanings } = form {
+        let term = match expr {
+            Expression::Literal(lit) => TermPattern::Literal(lit.clone()),
+            Expression::NamedNode(nn) => TermPattern::NamedNode(nn.clone()),
+            _ => return None,
+        };
+        return enum_codes(meanings, &term);
+    }
+    match expr {
+        Expression::Literal(lit) if literal_pushable(lit, form) => {
+            Some(vec![lit.value().to_owned()])
+        }
+        Expression::NamedNode(nn) if *form == PushForm::Iri => Some(vec![nn.as_str().to_owned()]),
+        _ => None,
+    }
+}
+
+/// A variable compared for equality against a constant, as the codes it selects.
+fn match_var_constant(
+    var_expr: &Expression,
+    const_expr: &Expression,
+    var_to_field: &ValueColumns,
+) -> Option<(String, String, Vec<String>)> {
+    let Expression::Variable(v) = var_expr else {
+        return None;
+    };
+    let (star_var, field, form) = var_to_field.get(v.as_str())?;
+    let texts = constant_texts(const_expr, form)?;
+    Some((star_var.clone(), field.clone(), texts))
 }
 
 fn match_var_literal(
@@ -1937,7 +2085,9 @@ fn push_form_of(descriptor: &crate::sparql_terms::TermDescriptor) -> PushForm {
     use crate::sparql_terms::TermKind;
     match descriptor.kind {
         TermKind::Iri => PushForm::Iri,
-        TermKind::EnumIri => PushForm::Tagged,
+        TermKind::EnumIri => PushForm::Enum {
+            meanings: descriptor.enum_map.clone(),
+        },
         TermKind::Literal => PushForm::Literal {
             datatype: descriptor.datatype.clone(),
             lang: descriptor.lang.clone(),
@@ -2496,6 +2646,8 @@ prefixes:
     prefix_reference: https://w3id.org/linkml/
   xsd:
     prefix_reference: http://www.w3.org/2001/XMLSchema#
+  eul:
+    prefix_reference: http://ontorail.org/src/Eulynx/
 default_prefix: asset360
 default_range: string
 
@@ -2511,6 +2663,17 @@ types:
   integer:
     uri: xsd:integer
     base: int
+
+# Partially mapped, as the real `signalType` is: `GSA` carries a `meaning` and
+# renders as that IRI, while `KSS` has none and renders as the plain literal
+# it stores. One enum answers both halves of the rule.
+enums:
+  SignalKind:
+    permissible_values:
+      GSA:
+        meaning: eul:GSA
+      KSS: {}
+      REP_H_D: {}
 
 classes:
   Document:
@@ -2550,6 +2713,8 @@ classes:
       trafficKinds:
         range: string
         multivalued: true
+      kind:
+        range: SignalKind
       documents:
         range: Document
         multivalued: true
@@ -3248,6 +3413,97 @@ classes:
             !star.multivalued_fields.contains(&"name".to_owned()),
             "a single-valued slot is not an array"
         );
+    }
+
+    /// An enum column stores a code, not the term it renders as. All three
+    /// shapes of that, on one partially mapped enum: `GSA` carries a meaning
+    /// and renders as an IRI, `KSS` carries none and renders as itself.
+    #[test]
+    fn an_enum_constant_is_translated_back_to_the_stored_code() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        // An IRI constant selects the code whose meaning it is.
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; \
+                 asset360:kind <http://ontorail.org/src/Eulynx/GSA> }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None, "an IRI constant on an enum is pushable");
+        assert_eq!(
+            plan.root.all_stars()[0].filters["kind"],
+            vec![FilterCondition::Eq("GSA".to_owned())],
+            "the pushed condition names the stored code, not the IRI"
+        );
+
+        // A literal constant selects itself, when the value has no meaning.
+        let plan = sparql_scope(
+            &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"KSS\" }}"),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None);
+        assert_eq!(
+            plan.root.all_stars()[0].filters["kind"],
+            vec![FilterCondition::Eq("KSS".to_owned())]
+        );
+
+        // The literal spelling of a mapped code is a term nothing renders as.
+        // Pushing it would answer with every GSA record where SPARQL answers
+        // with none.
+        let plan = sparql_scope(
+            &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"GSA\" }}"),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, Some(Inexact::EnumConstantUnmatched));
+        assert!(
+            !plan.root.all_stars()[0].filters.contains_key("kind"),
+            "nothing is pushed for a constant no record renders as"
+        );
+    }
+
+    /// The same rule through `FILTER(?k = ...)` and `IN` -- the two routes that
+    /// drifted from the inline one before.
+    #[test]
+    fn an_enum_constant_is_translated_in_a_filter_too() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for (query, expected) in [
+            (
+                format!(
+                    "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
+                     FILTER(?k = <http://ontorail.org/src/Eulynx/GSA>) }}"
+                ),
+                FilterCondition::Eq("GSA".to_owned()),
+            ),
+            (
+                format!(
+                    "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
+                     FILTER(?k = \"KSS\") }}"
+                ),
+                FilterCondition::Eq("KSS".to_owned()),
+            ),
+            (
+                format!(
+                    "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
+                     FILTER(?k IN (<http://ontorail.org/src/Eulynx/GSA>, \"KSS\")) }}"
+                ),
+                FilterCondition::In(vec!["GSA".to_owned(), "KSS".to_owned()]),
+            ),
+        ] {
+            let plan = sparql_scope(&query, &sv).unwrap();
+            assert_eq!(plan.inexact, None, "not pushed: {query}");
+            assert_eq!(
+                plan.root.all_stars()[0].filters["kind"],
+                vec![expected],
+                "wrong condition for: {query}"
+            );
+        }
     }
 
     /// A comparison on a numeric slot has to cast, and a consumer holding only
