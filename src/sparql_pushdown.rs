@@ -113,6 +113,13 @@ pub enum BlockedCode {
     /// cannot express, a triple whose subject is not a scoped class, a
     /// sub-`SELECT`, a `FILTER` inside `OPTIONAL`.
     IncompletePlan,
+    /// `HAVING`: a condition on the grouped rows.
+    ///
+    /// Its own code because its rewrite is its own: every other unsupported
+    /// pattern is a shape to be written differently, and this one is a feature
+    /// SQL has and this does not translate yet. Sending the generic pattern
+    /// hint told an author to avoid UNION in a query with no UNION in it.
+    UnsupportedHaving,
     /// `SUM`/`AVG` over a slot whose declared range is not numeric.
     NonNumericMeasure,
     /// A grouping or measure variable that is not bound to a slot of a scoped
@@ -128,6 +135,7 @@ impl BlockedCode {
             Self::UnsupportedAggregate => "unsupported_aggregate",
             Self::UnsupportedExpression => "unsupported_expression",
             Self::UnsupportedPattern => "unsupported_pattern",
+            Self::UnsupportedHaving => "unsupported_having",
             Self::IncompletePlan => "incomplete_plan",
             Self::NonNumericMeasure => "non_numeric_measure",
             Self::UnscopedBinding => "unscoped_binding",
@@ -157,6 +165,10 @@ impl BlockedCode {
                 // `Inexact::instead()` is the real answer for this code.
                 "Part of this question cannot be turned into SQL, so it cannot \
                  be aggregated in the database."
+            }
+            Self::UnsupportedHaving => {
+                "Ask for the groups without HAVING and drop the ones you do \
+                 not want from the result — the counts are already there."
             }
             Self::NonNumericMeasure => {
                 "SUM and AVG need a numeric slot. Use COUNT to count values, \
@@ -343,6 +355,9 @@ struct Peeled<'a> {
     /// does not reproduce.
     extends: Vec<(&'a Variable, &'a Expression)>,
     group: Option<GroupParts<'a>>,
+    /// Whether a `FILTER` sits *above* the grouping -- which is what `HAVING`
+    /// is. Peeling stops at the `Group`, so any filter reached here is one.
+    having: bool,
     /// Variables from the outermost `Project` — what the query asks for.
     projection: Vec<String>,
     /// Two Slices on one path, which would need composing rather than
@@ -427,6 +442,13 @@ fn peel<'a>(pattern: &'a GraphPattern, out: &mut Peeled<'a>) {
             out.extends.push((variable, expression));
             peel(inner, out);
         }
+        GraphPattern::Filter { inner, .. } => {
+            // A `FILTER` in the WHERE clause lives inside the group's own
+            // inner pattern, which this never descends into. One out here
+            // constrains the grouped rows, and that is a HAVING.
+            out.having = true;
+            peel(inner, out);
+        }
         GraphPattern::Group {
             variables,
             aggregates,
@@ -469,6 +491,7 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
         order_by: &[],
         extends: Vec::new(),
         group: None,
+        having: false,
         projection: Vec::new(),
         nested_slice: false,
     };
@@ -482,6 +505,20 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     else {
         return Ok(Pushdown::NotApplicable);
     };
+
+    if peeled.having {
+        // Reported rather than ignored. Left as `NotApplicable` -- which is
+        // what a query with no aggregate at all returns -- a HAVING fell
+        // through to the engine, and on any class worth grouping the engine
+        // cannot answer: 30 seconds, then a triple limit, about a query the
+        // planner could have named. A SQL `HAVING` would express it, and that
+        // is a feature rather than a rewrite; until then, say so.
+        return Ok(blocked(
+            BlockedCode::UnsupportedHaving,
+            "HAVING filters the grouped rows, which this does not translate yet",
+            None,
+        ));
+    }
 
     if peeled.nested_slice {
         return Ok(blocked(
@@ -1615,5 +1652,35 @@ mod tests {
             }
         ));
         assert!(spec.bindings[0].slot_path.is_empty());
+    }
+    /// A `HAVING` used to read as "no aggregate here": `peel` never handled a
+    /// `Filter`, so the `Group` beneath it was never found. The query then
+    /// went to the engine, which on a real class spends thirty seconds before
+    /// reporting a triple limit -- for a shape the planner can name up front.
+    #[test]
+    fn having_is_refused_rather_than_unrecognised() {
+        let sv = crate::sparql_scoper::tests::test_schema_view();
+        let verdict = analyse_pushdown(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?n } GROUP BY ?n HAVING (COUNT(*) > 1)",
+            &sv,
+        )
+        .unwrap();
+
+        match verdict {
+            Pushdown::Blocked(blocked) => {
+                assert_eq!(blocked.code, BlockedCode::UnsupportedHaving);
+                assert!(blocked.detail.contains("HAVING"), "{}", blocked.detail);
+                // Its own hint: the generic pattern advice told an author to
+                // avoid UNION in a query that contains none.
+                assert!(
+                    blocked.instead().contains("HAVING"),
+                    "the hint must be about HAVING, got: {}",
+                    blocked.instead()
+                );
+            }
+            other => panic!("expected a refusal naming HAVING, got {other:?}"),
+        }
     }
 }
