@@ -480,7 +480,15 @@ fn enum_condition(codes: Vec<String>) -> FilterCondition {
 }
 
 /// Value variables, each with the column it reads and how that column compares.
-type ValueColumns = HashMap<String, (String, String, PushForm)>;
+type ValueColumns = HashMap<String, (String, Vec<String>, PushForm)>;
+
+/// Filter conditions per star, keyed by the path they read.
+///
+/// A path of one slot is a column of the record itself; a longer one reads
+/// inside its JSON. Keyed by path rather than by slot name because
+/// `maintenanceUnit.zoneName` and a top-level `zoneName` are different columns
+/// that a flat key would merge.
+type StarFilters = HashMap<String, HashMap<Vec<String>, Vec<FilterCondition>>>;
 
 /// Where a nested variable's value lives, relative to a star.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,6 +669,14 @@ pub struct Star {
     /// to a variable, or only required to exist.
     pub multivalued_fields: Vec<String>,
 
+    /// Conditions on values inside this record's JSON, one entry per path.
+    ///
+    /// Separate from [`Self::filters`] because the two render differently: a
+    /// filter names a column, a path filter walks into it. A consumer that
+    /// renders only `filters` answers a weaker question than the query asked,
+    /// so this is not optional to read.
+    pub path_filters: Vec<PathFilter>,
+
     /// Which of this star's slots compare as numbers rather than as text.
     ///
     /// A [`FilterCondition::Cmp`] on one of these has to cast, because the
@@ -723,6 +739,34 @@ pub enum JoinType {
     /// SQL LEFT JOIN — left side always present, right may be NULL.
     /// Future: used for SPARQL OPTIONAL patterns.
     Left,
+}
+
+/// A condition on a value *inside* a record's JSON, rather than on a column of
+/// the record itself.
+///
+/// `?s :maintenanceUnit ?m . ?m :zoneName "Charleroi"` constrains a value two
+/// slots down, which no key of [`Star::filters`] can name. Rendered by walking
+/// the path: `object_data->'maintenanceUnit'->>'zoneName' = 'Charleroi'`.
+///
+/// Only single-valued hops appear here, and only outside `OPTIONAL`. A
+/// multivalued hop would make the condition a containment test over the
+/// elements, and an optional one would drop the rows a `LEFT JOIN` exists to
+/// keep -- both are left to the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathFilter {
+    /// Slots from the record's root to the value, e.g.
+    /// `["maintenanceUnit", "zoneName"]`. Always at least two long: one slot is
+    /// a column, and lives in [`Star::filters`].
+    pub slot_path: Vec<String>,
+    /// What the value must satisfy. Same vocabulary as a column's conditions.
+    pub conditions: Vec<FilterCondition>,
+    /// Whether this value compares as a number rather than as text.
+    ///
+    /// `Star::numeric_fields` cannot answer it: that lists the record's own
+    /// slots, and this value is inside one of them. Without it a comparison on
+    /// a nested number compares text, where `'9' >= '10'` is true -- the same
+    /// wrong answer that `numeric_fields` was added to prevent one level up.
+    pub numeric: bool,
 }
 
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
@@ -1289,6 +1333,8 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             class_uri,
             multivalued_fields,
             numeric_fields,
+            // Filled in Phase 3, once the paths into this record are known.
+            path_filters: Vec::new(),
             identifier_values,
             required_fields,
             optional_fields,
@@ -1408,6 +1454,14 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         }
     }
 
+    // Paths into nested structures. Done after the stars exist, so a variable
+    // that *is* a star is never mistaken for a step inside one -- and before
+    // the filters, so a condition on a nested value has a path to be attached
+    // to. Reading `?m :zoneName ?z . FILTER(?z = "Charleroi")` without the
+    // paths is how that filter used to be dropped.
+    let (path_bindings, traversed, nested_constants) =
+        collect_path_bindings(&star_map, &var_to_class, schema_view);
+
     // Phase 3: Collect filter conditions per star.
     let mut var_to_field: ValueColumns = HashMap::new();
     // Map: object_variable → (star_variable, slot_name)
@@ -1422,7 +1476,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                     obj_var.clone(),
                     (
                         builder.variable.clone(),
-                        slot_name.clone(),
+                        vec![slot_name.clone()],
                         push_form(schema_view, &var_to_class[&builder.variable], slot_name),
                     ),
                 );
@@ -1430,7 +1484,52 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         }
     }
 
-    let mut star_filters: HashMap<String, HashMap<String, Vec<FilterCondition>>> = HashMap::new();
+    // Which paths compare as numbers, for the conditions materialised below.
+    let mut numeric_paths: HashMap<Vec<String>, bool> = HashMap::new();
+
+    // A value inside a nested structure is filterable too, on the path that
+    // reaches it. `?m :zoneName ?z . FILTER(?z = "Charleroi")` used to be
+    // dropped for want of a key that could name it.
+    for (var, binding) in &path_bindings {
+        if binding.optional || var_to_field.contains_key(var) {
+            continue;
+        }
+        let Some((form, numeric)) = path_push_form(schema_view, &var_to_class, binding) else {
+            continue;
+        };
+        numeric_paths.insert(binding.slot_path.clone(), numeric);
+        var_to_field.insert(
+            var.clone(),
+            (binding.star_var.clone(), binding.slot_path.clone(), form),
+        );
+    }
+
+    // The same value written as a constant on the step instead of through a
+    // FILTER: `?c :longitude 4`. Phase 1 already applied the column's term rule
+    // when it recorded these -- it reads the form from the slot, which is the
+    // same slot this path ends on -- so what is left to check is the path
+    // itself.
+    let mut carried_constants: HashSet<String> = HashSet::new();
+    let mut star_filters: StarFilters = HashMap::new();
+    for constant in &nested_constants {
+        let binding = PathBinding {
+            star_var: constant.star_var.clone(),
+            slot_path: constant.slot_path.clone(),
+            optional: false,
+        };
+        let Some((_form, numeric)) = path_push_form(schema_view, &var_to_class, &binding) else {
+            continue;
+        };
+        numeric_paths.insert(constant.slot_path.clone(), numeric);
+        star_filters
+            .entry(constant.star_var.clone())
+            .or_default()
+            .entry(constant.slot_path.clone())
+            .or_default()
+            .extend(constant.conditions.iter().cloned());
+        carried_constants.insert(constant.nested_var.clone());
+    }
+
     if let Some(cause) = collect_filter_conditions(pattern, 0, &var_to_field, &mut star_filters) {
         record_loss(cause);
     }
@@ -1445,7 +1544,21 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
             // Identifier-slot filters get hoisted into identifier_values
             // instead of star.filters — they pushdown against the indexed
             // `asset360_uri` column, not JSONB.
-            for (slot, conds) in extra {
+            for (path, conds) in extra {
+                // A path of several slots reads inside the JSON, which no
+                // column key can name.
+                let slot = match <[String; 1]>::try_from(path) {
+                    Ok([slot]) => slot,
+                    Err(slot_path) => {
+                        let numeric = numeric_paths.get(&slot_path).copied().unwrap_or(false);
+                        star.path_filters.push(PathFilter {
+                            slot_path,
+                            conditions: conds,
+                            numeric,
+                        });
+                        continue;
+                    }
+                };
                 if Some(&slot) == id_slot.as_ref() {
                     for cond in conds {
                         match cond {
@@ -1521,10 +1634,6 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         PlanNode::Bgp { stars, joins }
     };
 
-    // Phase 6: paths into nested structures. Done after the stars exist so a
-    // variable that *is* a star is never mistaken for a step inside one.
-    let (path_bindings, traversed) = collect_path_bindings(&star_map, &var_to_class, schema_view);
-
     // A subject the path walk reached is a step inside a star, which the plan
     // describes. Anything left is a subject nothing accounts for.
     if unresolved_subjects
@@ -1540,10 +1649,11 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // is left describing nothing. Only a value the walk turned into a path
     // binding is actually carried.
     for discarded in &discarded_claims {
-        // A constant on a nested step is a condition no path can carry — a path
-        // records where a value lives, not what it must equal — and neither is
-        // an `rdf:type` on it.
-        let represented = discarded.inline_filters.is_empty()
+        // A constant on a nested step is carried when a path filter took it,
+        // which is what `carried_constants` records. An `rdf:type` on such a
+        // step never is.
+        let represented = (discarded.inline_filters.is_empty()
+            || carried_constants.contains(&discarded.variable))
             && discarded.type_iri.is_none()
             && discarded.object_variables.values().all(|var| {
                 // A leaf comes back as a path binding. An *intermediate* node
@@ -1810,7 +1920,7 @@ fn collect_filter_conditions(
     pattern: &GraphPattern,
     depth: usize,
     var_to_field: &ValueColumns,
-    star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
+    star_filters: &mut StarFilters,
 ) -> Option<Inexact> {
     match pattern {
         GraphPattern::Filter { expr, inner } => {
@@ -1877,7 +1987,7 @@ fn collect_filter_conditions(
 fn extract_equality_from_expr(
     expr: &Expression,
     var_to_field: &ValueColumns,
-    star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
+    star_filters: &mut StarFilters,
 ) -> bool {
     match expr {
         Expression::Equal(left, right) => {
@@ -1948,7 +2058,7 @@ fn extract_equality_from_expr(
             let Expression::Variable(var) = target.as_ref() else {
                 return false;
             };
-            let Some((star_var, field, form)) = var_to_field.get(var.as_str()) else {
+            let Some((star_var, path, form)) = var_to_field.get(var.as_str()) else {
                 return false;
             };
             let mut values = Vec::with_capacity(options.len());
@@ -1970,7 +2080,7 @@ fn extract_equality_from_expr(
             star_filters
                 .entry(star_var.clone())
                 .or_default()
-                .entry(field.clone())
+                .entry(path.clone())
                 .or_default()
                 .push(FilterCondition::In(values));
             true
@@ -1987,6 +2097,28 @@ fn extract_equality_from_expr(
         // to oxigraph, and the plan is no longer a complete description.
         _ => false,
     }
+}
+
+/// How a value at the end of a path compares, or `None` when it cannot be
+/// filtered there at all.
+///
+/// Two refusals, both silent if skipped. Every hop has to be single-valued, or
+/// the condition is a containment test over the elements rather than an
+/// equality. And the path has to resolve: a slot the schema cannot describe has
+/// no term rule, and without one there is no way to know whether comparing
+/// stored text asks what the query asks.
+fn path_push_form(
+    schema_view: &SchemaView,
+    var_to_class: &HashMap<String, String>,
+    binding: &PathBinding,
+) -> Option<(PushForm, bool)> {
+    let class_uri = var_to_class.get(&binding.star_var)?;
+    let (descriptor, containers) =
+        crate::sparql_terms::resolve_column(schema_view, class_uri, &binding.slot_path)?;
+    containers
+        .iter()
+        .all(|mode| *mode == linkml_schemaview::slotview::SlotContainerMode::SingleValue)
+        .then(|| (push_form_of(&descriptor), descriptor.numeric))
 }
 
 /// The stored texts a constant selects on a column, or `None` when no
@@ -2019,25 +2151,25 @@ fn match_var_constant(
     var_expr: &Expression,
     const_expr: &Expression,
     var_to_field: &ValueColumns,
-) -> Option<(String, String, Vec<String>)> {
+) -> Option<(String, Vec<String>, Vec<String>)> {
     let Expression::Variable(v) = var_expr else {
         return None;
     };
-    let (star_var, field, form) = var_to_field.get(v.as_str())?;
+    let (star_var, path, form) = var_to_field.get(v.as_str())?;
     let texts = constant_texts(const_expr, form)?;
-    Some((star_var.clone(), field.clone(), texts))
+    Some((star_var.clone(), path.clone(), texts))
 }
 
 fn match_var_literal(
     var_expr: &Expression,
     lit_expr: &Expression,
     var_to_field: &ValueColumns,
-) -> Option<(String, String, String)> {
+) -> Option<(String, Vec<String>, String)> {
     let var_name = match var_expr {
         Expression::Variable(v) => v.as_str(),
         _ => return None,
     };
-    let (star_var, field, form) = var_to_field.get(var_name)?;
+    let (star_var, path, form) = var_to_field.get(var_name)?;
     // Same rule as the IN arm: the pushed condition compares text, so it is the
     // query's question only when the column's term is its text and the query
     // wrote it that way.
@@ -2048,7 +2180,7 @@ fn match_var_literal(
         Expression::NamedNode(nn) if *form == PushForm::Iri => nn.as_str().to_owned(),
         _ => return None,
     };
-    Some((star_var.clone(), field.clone(), value))
+    Some((star_var.clone(), path.clone(), value))
 }
 
 /// How a column's values compare, from the same descriptor the renderer uses.
@@ -2159,7 +2291,7 @@ fn collect_values_filters(
     pattern: &GraphPattern,
     depth: usize,
     var_to_field: &ValueColumns,
-    star_filters: &mut HashMap<String, HashMap<String, Vec<FilterCondition>>>,
+    star_filters: &mut StarFilters,
 ) -> Option<Inexact> {
     match pattern {
         // Inside an OPTIONAL a VALUES block narrows the optional side only.
@@ -2372,11 +2504,29 @@ fn pushable_limit(pattern: &GraphPattern) -> Option<usize> {
 /// Only slots that are *inlined* are followed. A reference slot holds another
 /// object's URI, so its value is a join key, not a place to read through: the
 /// nested data simply is not there to walk.
+/// A constant found on a nested step, before the schema has vetted it.
+///
+/// `?c :longitude 4` inside `?s :location ?c` says what a value two slots down
+/// must equal. The walk finds it; whether it can be *pushed* is a question for
+/// the schema, answered in one place with the same rule the FILTER route uses.
+struct NestedConstant {
+    star_var: String,
+    /// The variable standing for the nested structure, so the caller can tell
+    /// which discarded star this accounts for.
+    nested_var: String,
+    slot_path: Vec<String>,
+    conditions: Vec<FilterCondition>,
+}
+
 fn collect_path_bindings(
     star_map: &HashMap<String, StarBuilder>,
     var_to_class: &HashMap<String, String>,
     schema_view: &SchemaView,
-) -> (HashMap<String, PathBinding>, HashSet<String>) {
+) -> (
+    HashMap<String, PathBinding>,
+    HashSet<String>,
+    Vec<NestedConstant>,
+) {
     let mut out: HashMap<String, PathBinding> = HashMap::new();
     // Variables the walk explained *as steps*: the intermediate nodes it passed
     // through. Scalar leaves are deliberately absent — a leaf holds a value, so
@@ -2385,6 +2535,7 @@ fn collect_path_bindings(
     //
     // Used only to clear a recorded drop, never to re-derive the check.
     let mut traversed: HashSet<String> = HashSet::new();
+    let mut constants: Vec<NestedConstant> = Vec::new();
 
     // Deterministic order: two stars could in principle reach the same variable,
     // and which path wins must not depend on hash iteration order.
@@ -2404,11 +2555,12 @@ fn collect_path_bindings(
             var_to_class,
             &mut out,
             &mut traversed,
+            &mut constants,
             false,
         );
     }
 
-    (out, traversed)
+    (out, traversed, constants)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2421,6 +2573,7 @@ fn walk_paths(
     var_to_class: &HashMap<String, String>,
     out: &mut HashMap<String, PathBinding>,
     traversed: &mut HashSet<String>,
+    constants: &mut Vec<NestedConstant>,
     optional_so_far: bool,
 ) {
     if path_so_far.len() >= MAX_PATH_DEPTH {
@@ -2429,6 +2582,26 @@ fn walk_paths(
     let Some(builder) = star_map.get(current_var) else {
         return;
     };
+
+    // Constants written on this step: `?c :longitude 4`. Only inside a nested
+    // structure -- at the root the same conditions are columns of the record,
+    // seeded in Phase 1 -- and never through an OPTIONAL, where pushing a
+    // condition drops the rows the LEFT JOIN exists to keep.
+    if !path_so_far.is_empty() && !optional_so_far {
+        let mut slots: Vec<(&String, &Vec<FilterCondition>)> =
+            builder.inline_filters.iter().collect();
+        slots.sort_by(|a, b| a.0.cmp(b.0));
+        for (slot_name, conditions) in slots {
+            let mut slot_path = path_so_far.to_vec();
+            slot_path.push(slot_name.clone());
+            constants.push(NestedConstant {
+                star_var: star_var.to_owned(),
+                nested_var: current_var.to_owned(),
+                slot_path,
+                conditions: conditions.clone(),
+            });
+        }
+    }
 
     let mut slots: Vec<(&String, &String)> = builder.object_variables.iter().collect();
     slots.sort_by(|a, b| a.0.cmp(b.0));
@@ -2472,6 +2645,7 @@ fn walk_paths(
                         var_to_class,
                         out,
                         traversed,
+                        constants,
                         optional_so_far || hop_optional,
                     );
                 }
@@ -3412,6 +3586,62 @@ classes:
         assert!(
             !star.multivalued_fields.contains(&"name".to_owned()),
             "a single-valued slot is not an array"
+        );
+    }
+
+    /// A condition on a value inside a nested structure. `?m :zoneName ?z .
+    /// FILTER(?z = "X")` reads two slots down, which no column key can name --
+    /// and dropping it counted every record where the query counts some.
+    #[test]
+    fn a_filter_on_a_nested_value_is_pushed_as_a_path() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+                 asset360:location ?c . ?c asset360:longitude ?lo . FILTER(?lo = 4) }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None, "a nested FILTER is pushable");
+        let star = &plan.root.all_stars()[0];
+        assert_eq!(
+            star.path_filters,
+            vec![PathFilter {
+                slot_path: vec!["location".to_owned(), "longitude".to_owned()],
+                conditions: vec![FilterCondition::Eq("4".to_owned())],
+                numeric: true,
+            }],
+            "the condition names the path, not a column"
+        );
+        assert!(
+            star.filters.is_empty(),
+            "a nested value is not a column of the record"
+        );
+    }
+
+    /// The same value written as a constant on the nested step rather than
+    /// through a FILTER. One question, so one answer.
+    #[test]
+    fn a_constant_on_a_nested_step_is_pushed_as_a_path() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:location ?c . ?c asset360:longitude 4 }",
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None, "a nested constant is pushable");
+        assert_eq!(
+            plan.root.all_stars()[0].path_filters,
+            vec![PathFilter {
+                slot_path: vec!["location".to_owned(), "longitude".to_owned()],
+                conditions: vec![FilterCondition::Eq("4".to_owned())],
+                numeric: true,
+            }]
         );
     }
 

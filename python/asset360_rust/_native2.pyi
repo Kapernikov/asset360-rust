@@ -5094,7 +5094,31 @@ class Star:
         Value-level filter conditions per slot, pushable to SQL.
         
         A field listed in :attr:`multivalued_fields` needs a containment test
-        rather than an equality — see that attribute.
+        rather than an equality — see that attribute. Conditions on values
+        *inside* the JSON are in :attr:`path_filters`, which has to be rendered
+        as well.
+        """
+    @property
+    def path_filters(self) -> builtins.list[tuple[builtins.list[builtins.str], builtins.list[FilterCondition], builtins.bool]]:
+        r"""
+        Conditions on values *inside* this record's JSON, as
+        ``[(slot_path, [FilterCondition, ...], numeric), ...]``.
+        
+        ``numeric`` says the value compares as a number, which
+        :attr:`numeric_fields` cannot answer for it -- that lists the record's
+        own slots, and this value is inside one of them.
+        
+        ``?s :maintenanceUnit ?m . ?m :zoneName "Charleroi"`` constrains a value
+        two slots down, which no key of :attr:`filters` can name. Render by
+        walking the path — ``object_data->'maintenanceUnit'->>'zoneName' =
+        'Charleroi'`` — with the last step as ``->>`` and every earlier one as
+        ``->``.
+        
+        **Not optional to read.** A consumer that renders only :attr:`filters`
+        asks a weaker question than the query did, and on an aggregate route
+        that is a larger number reported without a warning. Every path here is
+        single-valued at every hop and outside any ``OPTIONAL``; anything else
+        stays with the engine.
         """
     @property
     def slot_variables(self) -> builtins.dict[builtins.str, builtins.str]:
