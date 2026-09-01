@@ -785,6 +785,26 @@ pub enum FilterCondition {
     Cmp { op: CmpOp, value: String },
 }
 
+impl std::fmt::Display for FilterCondition {
+    /// As the condition reads in SQL, which is how a reader of a plan checks
+    /// it: `= 'KSS'`, `IN ('a', 'b')`, `>= '10'`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eq(value) => write!(f, "= '{value}'"),
+            Self::In(values) => write!(
+                f,
+                "IN ({})",
+                values
+                    .iter()
+                    .map(|value| format!("'{value}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Cmp { op, value } => write!(f, "{} '{value}'", op.as_sql()),
+        }
+    }
+}
+
 /// Ordering operators liftable from a `FILTER` into SQL.
 ///
 /// Deliberately not `!=`: SPARQL's inequality is false for an *unbound*
@@ -799,6 +819,16 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
+    /// The SQL spelling, for a plan a human reads.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            Self::Gt => ">",
+            Self::Gte => ">=",
+            Self::Lt => "<",
+            Self::Lte => "<=",
+        }
+    }
+
     /// Stable string form for the Python boundary.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -848,7 +878,7 @@ impl std::fmt::Display for ScopeError {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// Analyse a SPARQL query and produce a [`QueryPlan`].
 ///
@@ -1860,7 +1890,7 @@ fn resolve_star_class(
 ///
 /// Along the way, unsupported constructs (`UNION`, `MINUS`, property
 /// paths) are rejected with [`ScopeError::UnsupportedConstruct`].
-fn tag_triples_by_depth<'a>(
+pub(crate) fn tag_triples_by_depth<'a>(
     pattern: &'a GraphPattern,
     depth: usize,
     out: &mut Vec<(&'a TriplePattern, usize)>,

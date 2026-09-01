@@ -328,6 +328,37 @@ pub enum OrderKey {
     Measure(usize),
 }
 
+impl Measure {
+    /// `count(*)`, `count(distinct #2)`, `sum(#0)` -- the argument as the
+    /// binding index it is, since the plan prints the bindings beside it.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Count { arg: None, .. } => "count(*)".to_owned(),
+            Self::Count {
+                arg: Some(arg),
+                distinct,
+            } => {
+                let distinct = if *distinct { "distinct " } else { "" };
+                format!("count({distinct}#{arg})")
+            }
+            Self::Sum { arg } => format!("sum(#{arg})"),
+            Self::Avg { arg } => format!("avg(#{arg})"),
+            Self::Min { arg } => format!("min(#{arg})"),
+            Self::Max { arg } => format!("max(#{arg})"),
+        }
+    }
+}
+
+impl std::fmt::Display for OrderTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = match self.key {
+            OrderKey::Binding(index) => format!("binding #{index}"),
+            OrderKey::Measure(index) => format!("measure #{index}"),
+        };
+        write!(f, "{key} {}", if self.desc { "desc" } else { "asc" })
+    }
+}
+
 /// The `Group` node's three interesting parts: grouping variables, the
 /// aggregates and the variable each binds, and the pattern being grouped.
 struct GroupParts<'a> {

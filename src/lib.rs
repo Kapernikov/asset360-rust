@@ -40,6 +40,7 @@ pub mod shacl_ast;
 
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
+pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_scoper;
 pub mod sparql_terms;

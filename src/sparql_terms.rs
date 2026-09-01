@@ -65,6 +65,29 @@ pub struct TermDescriptor {
 }
 
 impl TermDescriptor {
+    /// The shape, short enough to sit at the end of a plan line.
+    ///
+    /// This is where wrong answers come from -- whether a value compares as a
+    /// number or as text, whether an enum renders as its code or as an IRI --
+    /// and none of it is visible in the query, so a plan that omitted it would
+    /// hide the thing a reader most needs.
+    pub fn shape(&self) -> String {
+        let base = match self.kind {
+            TermKind::Iri => "iri".to_owned(),
+            TermKind::EnumIri => format!("enum→iri ({} mapped)", self.enum_map.len()),
+            TermKind::Literal => match (&self.datatype, &self.lang) {
+                (_, Some(lang)) => format!("literal@{lang}"),
+                (Some(datatype), None) => short_iri(datatype),
+                (None, None) => "literal".to_owned(),
+            },
+        };
+        if self.numeric {
+            format!("{base}, numeric")
+        } else {
+            base
+        }
+    }
+
     /// An object's own identifier: always a named node, never a number.
     pub fn subject_iri() -> Self {
         Self {
@@ -239,6 +262,15 @@ fn enum_meanings(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// `http://www.w3.org/2001/XMLSchema#integer` → `xsd:integer`, for plan output.
+fn short_iri(iri: &str) -> String {
+    match iri.rsplit_once(['#', '/']) {
+        Some((namespace, local)) if namespace.contains("XMLSchema") => format!("xsd:{local}"),
+        Some((_, local)) => local.to_owned(),
+        None => iri.to_owned(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
