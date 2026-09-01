@@ -37,6 +37,14 @@ pub struct QueryPlan {
     /// Root of the algebra tree.
     pub root: PlanNode,
 
+    /// Indices into the query's depth-tagged triples that no part of this plan
+    /// represents.
+    ///
+    /// The working set, kept rather than collapsed. `inexact` says *a* triple
+    /// was dropped and names one cause; this says *which* triples, which is
+    /// what a plan needs in order to hand them to another pass instead of
+    /// refusing the whole query.
+    pub unconsumed: Vec<usize>,
     /// How many rows the object fetch may be limited to — `OFFSET + LIMIT`,
     /// not `LIMIT`.
     ///
@@ -1755,8 +1763,12 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
         None
     };
 
+    let mut unconsumed_indices: Vec<usize> = unconsumed.into_iter().collect();
+    unconsumed_indices.sort_unstable();
+
     Ok(QueryPlan {
         root,
+        unconsumed: unconsumed_indices,
         sql_limit,
         path_bindings,
         inexact,

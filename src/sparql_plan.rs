@@ -15,8 +15,11 @@
 //! [`Obligation`]s each one discharges. Two rules make it trustworthy:
 //!
 //! * **The ledger balances.** Every obligation of the query appears exactly
-//!   once, in a pass or in [`ExecutionPlan::residual`]. `residual.is_empty()`
-//!   is what "the plan describes the whole query" used to mean as a flag.
+//!   once, in a pass or in [`ExecutionPlan::residual`]. A non-empty residual
+//!   is an obligation with no pass at all -- a planner bug, or a consumer that
+//!   has no engine to fall back on. What the old `exact` flag actually asked
+//!   is [`ExecutionPlan::sql_only`]: are all the passes SQL, so the question
+//!   is answered without materialising anything.
 //! * **The executor fails closed.** It refuses a `contract` it does not know
 //!   and a pass kind it cannot name, rather than running the part it
 //!   understands. A forgotten field then costs an error instead of a plausible
@@ -30,6 +33,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use spargebra::Query;
+
+use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_scoper::{Inexact, ScopeError};
 
@@ -168,12 +173,24 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
-    /// Whether the passes answer the whole question.
+    /// Whether every obligation has a pass to enforce it.
     ///
-    /// This is the exactness rule that used to be a flag beside the plan,
-    /// derived instead of asserted.
-    pub fn is_exact(&self) -> bool {
+    /// False means the plan answers a *different* question than the one asked,
+    /// and the caller must refuse rather than run it.
+    pub fn is_accounted(&self) -> bool {
         self.residual.is_empty()
+    }
+
+    /// Whether SQL answers the whole question, with no engine pass.
+    ///
+    /// The question the old `exact` flag was really being asked -- "can this be
+    /// answered without materialising objects" -- and the one an SQL-only
+    /// consumer (a stored minibi question, which has no fallback) must ask
+    /// before running a plan.
+    pub fn sql_only(&self) -> bool {
+        self.passes
+            .iter()
+            .all(|pass| matches!(pass.kind, PassKind::Sql(_)))
     }
 
     /// Every obligation appears exactly once, in a pass or in the residual.
@@ -245,12 +262,19 @@ impl fmt::Display for LedgerError {
 /// the ledger can be checked by eye.
 impl fmt::Display for ExecutionPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let exactness = if self.is_exact() {
-            "exact".to_owned()
+        // Three states, and the difference matters to a reader. A plan whose
+        // passes are all SQL answers without materialising anything. A plan
+        // with an engine pass still answers, more slowly. A plan with a
+        // residual answers *nothing* -- some obligation has no pass at all,
+        // which is a planner bug or a consumer that refuses the engine.
+        let state = if !self.residual.is_empty() {
+            format!("UNACCOUNTED — {} obligation(s)", self.residual.len())
+        } else if self.sql_only() {
+            "all in SQL".to_owned()
         } else {
-            format!("INEXACT — {} obligation(s) unclaimed", self.residual.len())
+            "SQL narrows, engine finishes".to_owned()
         };
-        writeln!(f, "ExecutionPlan (contract {}, {exactness})", self.contract)?;
+        writeln!(f, "ExecutionPlan (contract {}, {state})", self.contract)?;
 
         for pass in &self.passes {
             match &pass.kind {
@@ -602,6 +626,123 @@ pub fn unclaimed(
         .collect()
 }
 
+/// Plan a query: one parse, one scope, one analysis, one artifact.
+///
+/// The entry point the executor should use. `sparql_scope` and
+/// `sparql_pushdown` remain for callers that predate this and each re-parse;
+/// they answer questions this artifact already contains.
+///
+/// Two shapes come out today, and adding a capability changes which shape is
+/// emitted rather than adding a branch to the executor:
+///
+/// * one `Sql` pass, when the SQL leaf can answer the whole question;
+/// * an `Sql` scan feeding an `Engine` pass, when it cannot -- the scan still
+///   narrows the rows, and the engine applies what is left.
+pub fn plan_query(query_str: &str, schema_view: &SchemaView) -> Result<ExecutionPlan, ScopeError> {
+    let parsed = crate::sparql_scoper::parse_query(query_str)?;
+    let obligations = obligations_of(&parsed)?;
+    let scoped = crate::sparql_scoper::scope_parsed(&parsed, schema_view)?;
+    let verdict =
+        crate::sparql_pushdown::analyse_pushdown_scoped(query_str, schema_view, Some(&scoped))?;
+
+    // How many of the leading obligations are triples: `obligations_of` emits
+    // them first, in the order `tag_triples_by_depth` produced, which is the
+    // order the scoper's `unconsumed` indexes. Same source, same order -- the
+    // one coupling here, asserted below rather than assumed.
+    let triple_count = obligations
+        .iter()
+        .filter(|obligation| {
+            matches!(
+                obligation,
+                Obligation::Type { .. } | Obligation::Triple { .. }
+            )
+        })
+        .count();
+    debug_assert!(
+        obligations
+            .iter()
+            .take(triple_count)
+            .all(|o| matches!(o, Obligation::Type { .. } | Obligation::Triple { .. })),
+        "obligations_of must emit every triple before any modifier"
+    );
+
+    let emits = emitted_variables(&verdict, &scoped);
+
+    if let crate::sparql_pushdown::Pushdown::Eligible { solution, plan } = verdict {
+        // The analyser refuses anything the plan does not fully describe, so an
+        // eligible verdict *is* the statement that SQL discharges everything.
+        return Ok(ExecutionPlan {
+            contract: PLAN_CONTRACT,
+            passes: vec![Pass {
+                id: 0,
+                inputs: Vec::new(),
+                discharges: all_ids(&obligations),
+                emits,
+                kind: PassKind::Sql(Box::new(SqlPass {
+                    plan,
+                    solution: Some(solution),
+                })),
+            }],
+            residual: Vec::new(),
+            obligations,
+        });
+    }
+
+    // Otherwise SQL claims exactly the triples the scoper represented, and the
+    // engine takes the rest. Claiming more would be the old mistake in a new
+    // shape: a pass that says it enforced something it did not.
+    let unconsumed: BTreeSet<usize> = scoped.unconsumed.iter().copied().collect();
+    let sql_claims: Vec<ObligationId> = (0..triple_count)
+        .filter(|index| !unconsumed.contains(index))
+        .collect();
+    let engine_claims: Vec<ObligationId> = (0..obligations.len())
+        .filter(|id| !sql_claims.contains(id))
+        .collect();
+
+    let causes = scoped.inexact.into_iter().collect();
+    Ok(ExecutionPlan {
+        contract: PLAN_CONTRACT,
+        passes: vec![
+            Pass {
+                id: 0,
+                inputs: Vec::new(),
+                discharges: sql_claims,
+                emits: Vec::new(),
+                kind: PassKind::Sql(Box::new(SqlPass {
+                    plan: scoped,
+                    solution: None,
+                })),
+            },
+            Pass {
+                id: 1,
+                inputs: vec![0],
+                discharges: engine_claims,
+                emits,
+                kind: PassKind::Engine(EnginePass { causes }),
+            },
+        ],
+        residual: Vec::new(),
+        obligations,
+    })
+}
+
+/// The variables the plan's last pass binds.
+fn emitted_variables(
+    verdict: &crate::sparql_pushdown::Pushdown,
+    _scoped: &crate::sparql_scoper::QueryPlan,
+) -> Vec<String> {
+    match verdict {
+        crate::sparql_pushdown::Pushdown::Eligible { solution, .. } => solution
+            .projected
+            .iter()
+            .map(|var| format!("?{var}"))
+            .collect(),
+        // Without a solution the projection is the engine's business, and
+        // guessing at it here would put a second answer in the plan.
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +787,102 @@ mod tests {
         assert_eq!(obligations, again);
     }
 
+    /// A question the SQL leaf can answer whole: one pass, nothing left over.
+    #[test]
+    fn a_pushable_question_plans_as_one_sql_pass() {
+        let sv = test_schema_view();
+        let plan = plan_query(
+            &format!(
+                "{PREFIX}SELECT ?kind (COUNT(*) AS ?n) WHERE {{ \
+                 ?s a asset360:Signal ; asset360:kind ?kind }} GROUP BY ?kind"
+            ),
+            &sv,
+        )
+        .unwrap();
+
+        plan.ledger_balances().unwrap();
+        assert_eq!(plan.passes.len(), 1, "{plan}");
+        assert!(matches!(plan.passes[0].kind, PassKind::Sql(_)), "{plan}");
+        assert_eq!(
+            plan.passes[0].discharges.len(),
+            plan.obligations.len(),
+            "one pass answering the question claims all of it:\n{plan}"
+        );
+        assert!(plan.sql_only(), "{plan}");
+    }
+
+    /// A question it cannot: the scan still narrows, and what is left is the
+    /// engine's -- named, in the plan, rather than inferred by the caller.
+    #[test]
+    fn an_unpushable_filter_plans_as_a_scan_plus_an_engine_pass() {
+        let sv = test_schema_view();
+        let plan = plan_query(
+            &format!(
+                "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ \
+                 ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(REGEX(?nm, \"^BX\")) }} GROUP BY ?nm"
+            ),
+            &sv,
+        )
+        .unwrap();
+
+        plan.ledger_balances().unwrap();
+        assert_eq!(plan.passes.len(), 2, "{plan}");
+        assert!(matches!(plan.passes[0].kind, PassKind::Sql(_)), "{plan}");
+        let PassKind::Engine(engine) = &plan.passes[1].kind else {
+            panic!("second pass must be the engine:\n{plan}");
+        };
+        assert!(
+            !engine.causes.is_empty(),
+            "the engine pass says why it exists:\n{plan}"
+        );
+        assert!(!plan.sql_only(), "{plan}");
+
+        // The scan still claims the triples it represented -- the point of a
+        // residual rather than a refusal.
+        assert!(
+            !plan.passes[0].discharges.is_empty(),
+            "the scan narrows even when the engine finishes:\n{plan}"
+        );
+        // ...and the aggregate is not among them: SQL did not group here.
+        let sql_claims = &plan.passes[0].discharges;
+        assert!(
+            !sql_claims.iter().any(|id| matches!(
+                plan.obligations[*id],
+                Obligation::Aggregate { .. } | Obligation::Group { .. }
+            )),
+            "a scan-only pass must not claim the grouping:\n{plan}"
+        );
+
+        println!("{plan}");
+    }
+
+    /// Every plan balances, over the whole corpus of shapes this planner
+    /// accepts. The invariant is only worth stating if it is checked on real
+    /// plans and not just on hand-built ones.
+    #[test]
+    fn every_planned_query_balances_its_ledger() {
+        let sv = test_schema_view();
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Signal }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal }",
+            "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:kind ?kind } GROUP BY ?kind ORDER BY DESC(?n) LIMIT 3",
+            "SELECT (SUM(?len) AS ?total) WHERE { ?s a asset360:Signal ; \
+             asset360:length ?len . FILTER(?len >= 10) }",
+            "SELECT ?lo WHERE { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?lo }",
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm . FILTER(?nm != \"BX\") } GROUP BY ?nm",
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn }",
+        ] {
+            let plan = plan_query(&format!("{PREFIX}{query}"), &sv).unwrap();
+            plan.ledger_balances()
+                .unwrap_or_else(|err| panic!("{err} for {query}\n{plan}"));
+        }
+    }
+
     /// The invariant, stated as a test rather than as prose: every obligation
     /// is claimed exactly once, by a pass or by the residual.
     #[test]
@@ -670,7 +907,10 @@ mod tests {
             residual: vec![1],
         };
         assert!(balanced.ledger_balances().is_ok());
-        assert!(!balanced.is_exact(), "a non-empty residual is not exact");
+        assert!(
+            !balanced.is_accounted(),
+            "an obligation with no pass is not accounted for"
+        );
 
         // The failure this catches: a pass silently not claiming something.
         let leaky = ExecutionPlan {
@@ -727,7 +967,7 @@ mod tests {
                 "obligation o{id} is missing from:\n{printed}"
             );
         }
-        assert!(printed.contains("exact"), "{printed}");
+        assert!(printed.contains("all in SQL"), "{printed}");
         assert!(printed.contains("pass 0  SQL"), "{printed}");
         assert!(printed.contains("scan"), "{printed}");
         assert!(printed.contains("residual  (empty)"), "{printed}");

@@ -31,6 +31,11 @@ use crate::sparql_terms::{TermDescriptor, resolve_column};
 
 /// Verdict for one query.
 #[derive(Debug, Clone)]
+// The eligible variant carries a whole star decomposition, so it dwarfs the
+// other two. Boxing it would ripple through every match in the PyO3 layer for
+// a type this MR is in the middle of replacing: `plan_query` returns an
+// `ExecutionPlan` and this enum becomes internal to it.
+#[allow(clippy::large_enum_variant)]
 pub enum Pushdown {
     /// Not a grouping/aggregating query at all — nothing to push down, and
     /// nothing wrong with it. Keeps the existing route.
@@ -502,6 +507,15 @@ fn peel<'a>(pattern: &'a GraphPattern, out: &mut Peeled<'a>) {
 /// same errors [`sparql_scope`] reports. A query that parses but cannot be
 /// pushed down is a [`Pushdown::Blocked`] verdict, not an error.
 pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdown, ScopeError> {
+    analyse_pushdown_scoped(query, schema_view, None)
+}
+
+/// As [`analyse_pushdown`], with a star decomposition the caller already has.
+pub fn analyse_pushdown_scoped(
+    query: &str,
+    schema_view: &SchemaView,
+    scoped: Option<&crate::sparql_scoper::QueryPlan>,
+) -> Result<Pushdown, ScopeError> {
     // Parse once, with the shared parser, and hand the result to the scoper.
     // A parser of its own here would accept a different language: the shared
     // one preloads prefixes a caller may leave implicit, so a query without
@@ -598,9 +612,14 @@ pub fn analyse_pushdown(query: &str, schema_view: &SchemaView) -> Result<Pushdow
     }
 
     // Reuse the star decomposition rather than re-walking the triples: it
-    // already resolves classes, slots and join edges. Passing the parsed query
-    // keeps this to one parse per call.
-    let plan = scope_parsed(&parsed, schema_view)?;
+    // already resolves classes, slots and join edges. Taken as an argument so
+    // one caller can scope once and analyse once -- two entry points that each
+    // parsed and scoped meant every request did the work twice, and left two
+    // results that could in principle disagree.
+    let plan = match scoped {
+        Some(plan) => plan.clone(),
+        None => scope_parsed(&parsed, schema_view)?,
+    };
 
     // The plan is built to decide what to *load*, and every extraction step is
     // lossy in the safe direction: a constraint it cannot express is dropped,
