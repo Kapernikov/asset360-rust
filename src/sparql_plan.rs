@@ -167,6 +167,15 @@ pub struct ExecutionPlan {
     pub contract: u32,
     pub obligations: Vec<Obligation>,
     pub passes: Vec<Pass>,
+    /// Why an aggregate could not be answered in SQL, when that is what
+    /// happened.
+    ///
+    /// The engine pass records *causes* — enough to explain a slow answer.
+    /// This is the other audience: an aggregate the engine may not be able to
+    /// answer at all, where the caller has to tell whoever wrote the query
+    /// which construct blocked it and what shape to use instead. Keeping it on
+    /// the artifact is what lets one call replace the two that each re-parsed.
+    pub blocked: Option<crate::sparql_pushdown::Blocked>,
     /// Obligations no pass discharges. Empty means the passes together answer
     /// exactly the question asked.
     pub residual: Vec<ObligationId>,
@@ -326,6 +335,19 @@ impl fmt::Display for ExecutionPlan {
                     writeln!(f, "      o{id}  {obligation}")?;
                 }
             }
+        }
+
+        // A refusal is not a failure of the plan — the engine pass still
+        // answers — but it is the reason SQL could not, and the thing to show
+        // whoever wrote the query.
+        if let Some(refusal) = &self.blocked {
+            writeln!(f, "  not pushable")?;
+            writeln!(f, "      code      {}", refusal.code.as_str())?;
+            writeln!(f, "      because   {}", refusal.detail)?;
+            if let Some(at) = &refusal.at {
+                writeln!(f, "      at        {at}")?;
+            }
+            writeln!(f, "      instead   {}", refusal.instead())?;
         }
 
         writeln!(f, "\nobligations")?;
@@ -667,6 +689,12 @@ pub fn plan_query(query_str: &str, schema_view: &SchemaView) -> Result<Execution
     );
 
     let emits = emitted_variables(&verdict, &scoped);
+    // Taken before the verdict is consumed below. Only a refusal carries one:
+    // a query that never asked for an aggregate has nothing to be told.
+    let blocked = match &verdict {
+        crate::sparql_pushdown::Pushdown::Blocked(refusal) => Some(refusal.clone()),
+        _ => None,
+    };
 
     if let crate::sparql_pushdown::Pushdown::Eligible { solution, plan } = verdict {
         // The analyser refuses anything the plan does not fully describe, so an
@@ -685,6 +713,7 @@ pub fn plan_query(query_str: &str, schema_view: &SchemaView) -> Result<Execution
             }],
             residual: Vec::new(),
             obligations,
+            blocked: None,
         });
     }
 
@@ -723,6 +752,7 @@ pub fn plan_query(query_str: &str, schema_view: &SchemaView) -> Result<Execution
         ],
         residual: Vec::new(),
         obligations,
+        blocked,
     })
 }
 
@@ -752,6 +782,54 @@ mod tests {
 
     /// The obligations are what the query asks for, one entry each, in a stable
     /// order -- a plan string is only reviewable if the same query prints the
+    /// A refusal travels on the artifact, so one call gives the caller both
+    /// the route to take *and* what to tell whoever wrote the query. Before
+    /// this it took a second call that re-parsed to recover the code and the
+    /// hint.
+    #[test]
+    fn a_refused_aggregate_carries_its_reason() {
+        let sv = test_schema_view();
+        let plan = plan_query(
+            &format!(
+                "{PREFIX}SELECT (GROUP_CONCAT(?name) AS ?names) \
+                 WHERE {{ ?s a asset360:Signal ; asset360:name ?name }}"
+            ),
+            &sv,
+        )
+        .expect("a refused aggregate still plans — the engine answers it");
+
+        let refusal = plan
+            .blocked
+            .as_ref()
+            .expect("GROUP_CONCAT is outside the subset, so a reason is owed");
+        assert_eq!(refusal.code.as_str(), "unsupported_aggregate");
+        assert!(!refusal.instead().is_empty(), "a refusal owes a rewrite");
+
+        // Still a usable plan: the engine pass answers, so the endpoint is not
+        // obliged to refuse the request.
+        assert!(plan.is_accounted(), "{plan}");
+        assert!(!plan.sql_only(), "{plan}");
+
+        let printed = plan.to_string();
+        assert!(printed.contains("not pushable"), "{printed}");
+        assert!(printed.contains("unsupported_aggregate"), "{printed}");
+        assert!(printed.contains("instead"), "{printed}");
+    }
+
+    /// A query that never asked for an aggregate is owed no explanation.
+    #[test]
+    fn an_ordinary_query_carries_no_refusal() {
+        let sv = test_schema_view();
+        let plan = plan_query(
+            &format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal }}"),
+            &sv,
+        )
+        .unwrap();
+
+        assert!(plan.blocked.is_none(), "{plan}");
+        assert!(!plan.to_string().contains("not pushable"));
+    }
+
     /// same ids every time.
     #[test]
     fn a_query_enumerates_its_obligations() {
@@ -905,6 +983,7 @@ mod tests {
                 kind: PassKind::Engine(EnginePass { causes: Vec::new() }),
             }],
             residual: vec![1],
+            blocked: None,
         };
         assert!(balanced.ledger_balances().is_ok());
         assert!(
@@ -957,6 +1036,7 @@ mod tests {
                 })),
             }],
             residual: Vec::new(),
+            blocked: None,
         };
         plan.ledger_balances().unwrap();
 

@@ -95,6 +95,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PushdownVerdict>()?;
         m.add_class::<ExecutionPlan>()?;
         m.add_class::<PlanPass>()?;
+        m.add_class::<PushdownRefusal>()?;
         m.add_class::<PushdownSolution>()?;
         m.add_class::<PushdownBinding>()?;
         m.add_class::<PushdownMeasure>()?;
@@ -2280,6 +2281,50 @@ impl PushdownVerdict {
 #[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
+/// Why an aggregate could not be pushed into SQL, in terms its author can act
+/// on.
+pub struct PushdownRefusal {
+    inner: crate::sparql_pushdown::Blocked,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownRefusal {
+    /// Stable code from a closed set. Branch on this, never on ``detail``.
+    #[getter]
+    fn code(&self) -> &'static str {
+        self.inner.code.as_str()
+    }
+
+    /// What blocked, in terms of the query and the data model.
+    #[getter]
+    fn detail(&self) -> String {
+        self.inner.detail.clone()
+    }
+
+    /// Where in the query, when it can be located — a variable or a pattern.
+    #[getter]
+    fn at(&self) -> Option<String> {
+        self.inner.at.clone()
+    }
+
+    /// A supported shape to use instead. Meant to be shown verbatim: it is
+    /// what turns a rejection into a repair.
+    #[getter]
+    fn instead(&self) -> &'static str {
+        self.inner.instead()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PushdownRefusal(code={:?})", self.code())
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
 /// One step of an execution plan.
 pub struct PlanPass {
     inner: crate::sparql_plan::Pass,
@@ -2440,9 +2485,25 @@ impl ExecutionPlan {
             .collect()
     }
 
-    /// The whole ledger, as text: state, passes with what each discharges, and
-    /// the residual. Meant for a human — an explain output, a log line, or a
-    /// test failure that has to say *why* a plan was refused.
+    /// Why an aggregate could not be answered in SQL, or ``None`` when that
+    /// did not arise — either SQL answered it, or the query never asked for
+    /// one.
+    ///
+    /// Distinct from a pass's ``causes``, which explain a *slower* answer.
+    /// This is what to tell whoever wrote the query: a stable ``code``, the
+    /// ``detail``, optionally ``at`` (the variable or pattern), and
+    /// ``instead`` — the shape that would work.
+    #[getter]
+    fn blocked(&self) -> Option<PushdownRefusal> {
+        self.inner
+            .blocked
+            .clone()
+            .map(|inner| PushdownRefusal { inner })
+    }
+
+    /// The whole ledger, as text: state, passes with what each discharges, the
+    /// residual, and any refusal. Meant for a human — an explain output, a log
+    /// line, or a test failure that has to say *why* a plan was refused.
     fn __str__(&self) -> String {
         self.inner.to_string()
     }
