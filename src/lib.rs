@@ -2450,6 +2450,22 @@ impl PlanOp {
         }
     }
 
+    /// For ``"join"``: the SPARQL variables the two sides bind, left first.
+    /// A renderer needs them to reach the right table aliases; the input
+    /// indices alone would have to be walked down to their scans.
+    #[getter]
+    fn join_stars(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join {
+                left_star,
+                right_star,
+                ..
+            } => vec![left_star.clone(), right_star.clone()],
+            _ => Vec::new(),
+        }
+    }
+
     /// For ``"join"``: ``"inner"`` or ``"left"``.
     #[getter]
     fn join_kind(&self) -> Option<&'static str> {

@@ -110,6 +110,14 @@ pub enum Op {
     Join {
         left: OpId,
         right: OpId,
+        /// The stars the two sides bind.
+        ///
+        /// Named as well as pointed at: an input may be a filter or another
+        /// join, so recovering which star a side belongs to would mean walking
+        /// down to its scan, and a renderer needs the variable to reach the
+        /// right table alias.
+        left_star: String,
+        right_star: String,
         /// Slot on the right whose value is the left row's `asset360_uri`.
         right_slot: String,
         kind: JoinType,
@@ -298,6 +306,8 @@ pub fn lower_sql_pass(
             op: Op::Join {
                 left,
                 right,
+                left_star: join.left.clone(),
+                right_star: join.right.clone(),
                 right_slot: join.right_slot.clone(),
                 kind: join.join_type,
             },
@@ -394,6 +404,24 @@ pub fn lower_sql_pass(
         // claims are the triples the scoper represented.
         if let Some(last) = nodes.last_mut() {
             last.discharges = discharges.to_vec();
+        }
+
+        // The fetch bound, when the scoper found one safe to apply. It is a
+        // *narrowing* and claims nothing: the engine still applies the query's
+        // own LIMIT and OFFSET, and this only spares the fetch from reading
+        // rows no answer could use. Represented as an operator so the fetch
+        // pass is fully described by its nodes -- otherwise a consumer reading
+        // only operators would fetch unbounded where the scoper said it need
+        // not.
+        if let Some(limit) = plan.sql_limit {
+            nodes.push(OpNode {
+                op: Op::Slice {
+                    input,
+                    limit: Some(limit),
+                    offset: 0,
+                },
+                discharges: Vec::new(),
+            });
         }
     }
 
