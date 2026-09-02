@@ -134,24 +134,19 @@ pub enum PassKind {
     Engine(EnginePass),
 }
 
-/// The SQL leaf.
+/// The SQL leaf: the pass the database executes, as operators.
 ///
-/// Holds the star decomposition the scoper already produces, and the aggregate
-/// spec when the pass groups. Splitting those two apart is not worth a new
-/// representation: the renderer reads both today and they describe one scan.
+/// It carried two other representations of itself until every consumer read
+/// the nodes -- the star decomposition and, when it grouped, the whole
+/// solution spec. Both were shaped for rendering, which is why a rewrite had
+/// nothing local to edit, and keeping three descriptions of one pass is how a
+/// consumer comes to read the stale one.
+///
+/// Scan, filter, join, unnest, group, sort, distinct, slice, project. Each
+/// node carries the obligations it discharges, so a rewrite is checkable
+/// against the ledger.
 #[derive(Debug, Clone)]
 pub struct SqlPass {
-    pub plan: crate::sparql_scoper::QueryPlan,
-    pub solution: Option<crate::sparql_pushdown::SolutionSpec>,
-    /// The same pass as operators: scan, filter, join, unnest, group, sort,
-    /// slice, project.
-    ///
-    /// `plan` and `solution` are shaped for rendering and are what the SQL
-    /// builder reads today. This is the shape a *rewrite* needs — a filter
-    /// pushed from the engine is one node moved and one claim moved, checkable
-    /// against the ledger, rather than surgery on two structures at once.
-    /// Lowered from the two above, so it says nothing they do not; the renderer
-    /// migrates onto it next, and they go.
     pub ops: crate::sparql_ops::OpTree,
 }
 
@@ -308,11 +303,15 @@ impl fmt::Display for ExecutionPlan {
             match &pass.kind {
                 PassKind::Sql(sql) => {
                     let classes: Vec<&str> = sql
-                        .plan
-                        .root
-                        .all_stars()
+                        .ops
+                        .nodes
                         .iter()
-                        .map(|star| star.class_uri.as_str())
+                        .filter_map(|node| match &node.op {
+                            crate::sparql_ops::Op::Scan { class_uri, .. } => {
+                                Some(class_uri.as_str())
+                            }
+                            _ => None,
+                        })
                         .collect();
                     writeln!(
                         f,
@@ -392,86 +391,113 @@ fn ids(ids: &[ObligationId]) -> String {
         .join(" ")
 }
 
+/// Print an SQL pass, operator by operator.
+///
+/// Reads the nodes rather than the two structures it used to, so the printout
+/// is the tree that runs: a rewrite shows up here, and a node this does not
+/// name is a node nobody renders.
 fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
-    for star in sql.plan.root.all_stars() {
-        writeln!(
-            f,
-            "      scan      {}  as ?{}",
-            shorten(&star.class_uri),
-            star.variable
-        )?;
-        if !star.identifier_values.is_empty() {
-            writeln!(f, "      identity  {}", star.identifier_values.join(", "))?;
-        }
-        let mut fields: Vec<&String> = star.filters.keys().collect();
-        fields.sort();
-        for field in fields {
-            for condition in &star.filters[field] {
-                writeln!(f, "      filter    {field} {condition}")?;
-            }
-        }
-        for path_filter in &star.path_filters {
-            for condition in &path_filter.conditions {
+    use crate::sparql_ops::{Enforcement, Op};
+
+    for node in &sql.ops.nodes {
+        match &node.op {
+            Op::Scan {
+                star_var,
+                class_uri,
+                identifier_values,
+                is_optional,
+                ..
+            } => {
                 writeln!(
                     f,
-                    "      filter    {} {condition}{}",
-                    path_filter.slot_path.join("."),
-                    if path_filter.numeric {
-                        "   numeric"
-                    } else {
-                        ""
-                    }
+                    "      scan      {}  as ?{star_var}{}",
+                    shorten(class_uri),
+                    if *is_optional { "   optional" } else { "" }
                 )?;
+                if !identifier_values.is_empty() {
+                    writeln!(f, "      identity  {}", identifier_values.join(", "))?;
+                }
             }
-        }
-        for field in &star.multivalued_fields {
-            writeln!(f, "      unnest    {field}")?;
-        }
-    }
-
-    let Some(solution) = &sql.solution else {
-        return Ok(());
-    };
-    let bindings = &solution.bindings;
-    for key in &solution.group_keys {
-        if let Some(binding) = bindings.get(*key) {
-            writeln!(
+            Op::Filter {
+                slot_path,
+                condition,
+                enforcement,
+                numeric,
+                ..
+            } => writeln!(
                 f,
-                "      group     ?{} ← {}   {}",
-                binding.var,
-                if binding.slot_path.is_empty() {
-                    "<identity>".to_owned()
-                } else {
-                    binding.slot_path.join(".")
-                },
-                binding.descriptor.shape()
-            )?;
+                "      filter    {} {condition}{}{}",
+                slot_path.join("."),
+                if *numeric { "   numeric" } else { "" },
+                // Says whether removing this node would change the answer or
+                // only the speed -- the question a rewrite has to ask.
+                match enforcement {
+                    Enforcement::Enforces => "",
+                    Enforcement::Narrows => "   narrows",
+                }
+            )?,
+            Op::Unnest { slot_path, .. } => writeln!(f, "      unnest    {}", slot_path.join("."))?,
+            Op::Join {
+                left_star,
+                right_star,
+                right_slot,
+                kind,
+                ..
+            } => writeln!(
+                f,
+                "      join      ?{right_star}.{right_slot} = ?{left_star}{}",
+                match kind {
+                    crate::sparql_scoper::JoinType::Inner => "",
+                    crate::sparql_scoper::JoinType::Left => "   left",
+                }
+            )?,
+            Op::Group {
+                bindings,
+                keys,
+                measures,
+                ..
+            } => {
+                for key in keys {
+                    if let Some(binding) = bindings.get(*key) {
+                        writeln!(
+                            f,
+                            "      group     ?{} ← {}   {}",
+                            binding.var,
+                            if binding.slot_path.is_empty() {
+                                "<identity>".to_owned()
+                            } else {
+                                binding.slot_path.join(".")
+                            },
+                            binding.descriptor.shape()
+                        )?;
+                    }
+                }
+                for measure in measures {
+                    writeln!(
+                        f,
+                        "      aggregate ?{} ← {}",
+                        measure.var,
+                        measure.func.render()
+                    )?;
+                }
+            }
+            Op::Sort { terms, .. } => {
+                for term in terms {
+                    writeln!(f, "      order     {term}")?;
+                }
+            }
+            Op::Distinct { .. } => writeln!(f, "      distinct")?,
+            Op::Slice { limit, offset, .. } => writeln!(
+                f,
+                "      limit     {} offset {offset}",
+                limit
+                    .map(|limit| limit.to_string())
+                    .unwrap_or_else(|| "-".to_owned())
+            )?,
+            // The projection is the pass's emitted variables, already printed
+            // on the pass line.
+            Op::Project { .. } => {}
         }
-    }
-    for measure in &solution.measures {
-        writeln!(
-            f,
-            "      aggregate ?{} ← {}",
-            measure.var,
-            measure.func.render()
-        )?;
-    }
-    for order in &solution.order_by {
-        writeln!(f, "      order     {order}")?;
-    }
-    if solution.distinct {
-        writeln!(f, "      distinct")?;
-    }
-    if solution.limit.is_some() || solution.offset > 0 {
-        writeln!(
-            f,
-            "      limit     {} offset {}",
-            solution
-                .limit
-                .map(|limit| limit.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            solution.offset
-        )?;
     }
     Ok(())
 }
@@ -727,11 +753,7 @@ pub fn plan_query(query_str: &str, schema_view: &SchemaView) -> Result<Execution
                 inputs: Vec::new(),
                 discharges,
                 emits,
-                kind: PassKind::Sql(Box::new(SqlPass {
-                    plan,
-                    solution: Some(solution),
-                    ops,
-                })),
+                kind: PassKind::Sql(Box::new(SqlPass { ops })),
             }],
             residual: Vec::new(),
             obligations,
@@ -761,8 +783,6 @@ pub fn plan_query(query_str: &str, schema_view: &SchemaView) -> Result<Execution
                 emits: Vec::new(),
                 kind: PassKind::Sql(Box::new(SqlPass {
                     ops: crate::sparql_ops::lower_sql_pass(&scoped, None, &sql_claims, false),
-                    plan: scoped,
-                    solution: None,
                 })),
             },
             Pass {
@@ -1060,8 +1080,6 @@ mod tests {
                         &all_ids(&obligations),
                         true,
                     ),
-                    plan: scoped,
-                    solution: None,
                 })),
             }],
             residual: Vec::new(),

@@ -2670,21 +2670,12 @@ impl PlanPass {
         self.inner.discharges.clone()
     }
 
-    /// For ``kind == "sql"``: the star decomposition to fetch with.
-    #[getter]
-    fn plan(&self) -> Option<QueryPlan> {
-        match &self.inner.kind {
-            crate::sparql_plan::PassKind::Sql(sql) => Some(QueryPlan::from(sql.plan.clone())),
-            crate::sparql_plan::PassKind::Engine(_) => None,
-        }
-    }
-
     /// For ``kind == "sql"``: the pass as operators, in an order a renderer can
     /// walk front to back — every operator's inputs come before it.
     ///
-    /// This is the shape to render from, and the shape a rewrite edits.
-    /// ``plan`` and ``solution`` are the older rendering-shaped views of the
-    /// same pass and will go once nothing reads them.
+    /// The only description of the pass. It carried a star decomposition and a
+    /// solution spec as well until every consumer read the nodes; three
+    /// descriptions of one pass is how a reader comes to use the stale one.
     #[getter]
     fn ops(&self) -> Vec<PlanOp> {
         match &self.inner.kind {
@@ -2697,18 +2688,6 @@ impl PlanPass {
                 })
                 .collect(),
             crate::sparql_plan::PassKind::Engine(_) => Vec::new(),
-        }
-    }
-
-    /// For ``kind == "sql"`` when the pass groups: what to select and
-    /// aggregate. ``None`` means the pass is a plain scan.
-    #[getter]
-    fn solution(&self) -> Option<PushdownSolution> {
-        match &self.inner.kind {
-            crate::sparql_plan::PassKind::Sql(sql) => {
-                sql.solution.clone().map(|inner| PushdownSolution { inner })
-            }
-            crate::sparql_plan::PassKind::Engine(_) => None,
         }
     }
 
