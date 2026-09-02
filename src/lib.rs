@@ -85,6 +85,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_inexact_reasons, m)?)?;
         m.add_function(wrap_pyfunction!(py_sparql_pushdown, m)?)?;
+        m.add_function(wrap_pyfunction!(py_plan_query, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
@@ -92,6 +93,8 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<JoinEdge>()?;
         m.add_class::<FilterCondition>()?;
         m.add_class::<PushdownVerdict>()?;
+        m.add_class::<ExecutionPlan>()?;
+        m.add_class::<PlanPass>()?;
         m.add_class::<PushdownSolution>()?;
         m.add_class::<PushdownBinding>()?;
         m.add_class::<PushdownMeasure>()?;
@@ -2271,6 +2274,226 @@ impl PushdownVerdict {
             None => format!("PushdownVerdict(kind={:?})", self.kind()),
         }
     }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One step of an execution plan.
+pub struct PlanPass {
+    inner: crate::sparql_plan::Pass,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PlanPass {
+    #[getter]
+    fn id(&self) -> usize {
+        self.inner.id
+    }
+
+    /// ``"sql"`` or ``"engine"``.
+    ///
+    /// Closed set: a consumer meeting a kind it does not know must refuse the
+    /// plan rather than skip the pass, which would answer a different question
+    /// than the one asked.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.inner.kind {
+            crate::sparql_plan::PassKind::Sql(_) => "sql",
+            crate::sparql_plan::PassKind::Engine(_) => "engine",
+        }
+    }
+
+    /// Ids of the passes whose solutions this one consumes.
+    #[getter]
+    fn inputs(&self) -> Vec<usize> {
+        self.inner.inputs.clone()
+    }
+
+    /// Variables this pass binds.
+    #[getter]
+    fn emits(&self) -> Vec<String> {
+        self.inner.emits.clone()
+    }
+
+    /// Ids of the obligations this pass enforces.
+    #[getter]
+    fn discharges(&self) -> Vec<usize> {
+        self.inner.discharges.clone()
+    }
+
+    /// For ``kind == "sql"``: the star decomposition to fetch with.
+    #[getter]
+    fn plan(&self) -> Option<QueryPlan> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Sql(sql) => Some(QueryPlan::from(sql.plan.clone())),
+            crate::sparql_plan::PassKind::Engine(_) => None,
+        }
+    }
+
+    /// For ``kind == "sql"`` when the pass groups: what to select and
+    /// aggregate. ``None`` means the pass is a plain scan.
+    #[getter]
+    fn solution(&self) -> Option<PushdownSolution> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Sql(sql) => {
+                sql.solution.clone().map(|inner| PushdownSolution { inner })
+            }
+            crate::sparql_plan::PassKind::Engine(_) => None,
+        }
+    }
+
+    /// For ``kind == "engine"``: why the engine is needed, as stable cause
+    /// codes. Useful in a log line or an explain output — the reader wants to
+    /// know what stopped SQL from answering alone.
+    #[getter]
+    fn causes(&self) -> Vec<String> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(engine) => engine
+                .causes
+                .iter()
+                .map(|cause| cause.as_str().to_owned())
+                .collect(),
+            crate::sparql_plan::PassKind::Sql(_) => Vec::new(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PlanPass(id={}, kind={:?})", self.inner.id, self.kind())
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// What answering a query takes: the obligations it imposes, the passes that
+/// discharge them, and anything left over.
+///
+/// One artifact from one parse. ``sparql_scope`` and ``sparql_pushdown``
+/// each re-parse and answer a question this already contains.
+pub struct ExecutionPlan {
+    inner: crate::sparql_plan::ExecutionPlan,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl ExecutionPlan {
+    /// Version of the plan shape. A consumer built against an older contract
+    /// must refuse rather than interpret fields it may not understand.
+    #[getter]
+    fn contract(&self) -> u32 {
+        self.inner.contract
+    }
+
+    /// Whether every obligation has a pass to enforce it.
+    ///
+    /// ``False`` means the plan answers a *different* question than the one
+    /// asked, so the caller must refuse to run it.
+    #[getter]
+    fn is_accounted(&self) -> bool {
+        self.inner.is_accounted()
+    }
+
+    /// Whether SQL answers the whole question, with no engine pass — what a
+    /// consumer with no fallback (a stored question) has to ask.
+    #[getter]
+    fn sql_only(&self) -> bool {
+        self.inner.sql_only()
+    }
+
+    #[getter]
+    fn passes(&self) -> Vec<PlanPass> {
+        self.inner
+            .passes
+            .iter()
+            .map(|pass| PlanPass {
+                inner: pass.clone(),
+            })
+            .collect()
+    }
+
+    /// Every obligation the query imposes, rendered for reading.
+    #[getter]
+    fn obligations(&self) -> Vec<String> {
+        self.inner
+            .obligations
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// The obligations no pass discharges, rendered for reading. Empty when
+    /// the plan answers exactly the question asked; anything here belongs in
+    /// the refusal message.
+    #[getter]
+    fn residual(&self) -> Vec<String> {
+        self.inner
+            .residual
+            .iter()
+            .filter_map(|id| self.inner.obligations.get(*id))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// The whole ledger, as text: state, passes with what each discharges, and
+    /// the residual. Meant for a human — an explain output, a log line, or a
+    /// test failure that has to say *why* a plan was refused.
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ExecutionPlan(contract={}, passes={}, accounted={}, sql_only={})",
+            self.inner.contract,
+            self.inner.passes.len(),
+            self.inner.is_accounted(),
+            self.inner.sql_only()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "plan_query")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Plan a SPARQL query: one parse, one scope, one analysis, one artifact.
+///
+/// The entry point an executor should use. :func:`sparql_scope` and
+/// :func:`sparql_pushdown` remain for callers that predate it, and each
+/// re-parses the query to answer a question this artifact already contains.
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_view: The LinkML schema.
+///
+/// Returns:
+///     ExecutionPlan. Check ``is_accounted`` before running it — a plan with a
+///     residual answers a different question than the one asked. ``print()``
+///     it to read the ledger.
+///
+/// Raises:
+///     ValueError: the query does not parse, is an update, or cannot be
+///         scoped at all.
+fn py_plan_query(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<ExecutionPlan> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    crate::sparql_plan::plan_query(query, sv)
+        .map(|inner| ExecutionPlan { inner })
+        // ScopeError's Display carries the wording the other entry points use,
+        // so the same failure reads the same however it was reached.
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
