@@ -97,6 +97,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<ExecutionPlan>()?;
         m.add_class::<PlanPass>()?;
         m.add_class::<PushdownRefusal>()?;
+        m.add_class::<PlanOp>()?;
         m.add_class::<PushdownSolution>()?;
         m.add_class::<PushdownBinding>()?;
         m.add_class::<PushdownMeasure>()?;
@@ -2282,6 +2283,265 @@ impl PushdownVerdict {
 #[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
+/// One operator of a database pass: a scan, a filter, a join, an unnest, a
+/// grouping, a sort, a distinct, a slice, or a projection.
+///
+/// Read ``kind`` first and refuse a value you do not know: skipping an operator
+/// you cannot render answers a different question, which is the failure the
+/// whole plan is shaped to prevent. The accessors for other kinds return
+/// ``None`` or an empty list, so a renderer branches on ``kind`` and reads only
+/// what belongs to it.
+pub struct PlanOp {
+    inner: crate::sparql_ops::OpNode,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PlanOp {
+    /// ``"scan"``, ``"unnest"``, ``"filter"``, ``"join"``, ``"group"``,
+    /// ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.inner.op.kind()
+    }
+
+    /// Indices of the operators this one consumes. Always lower than this
+    /// operator's own index, so a renderer can walk the list in order.
+    #[getter]
+    fn inputs(&self) -> Vec<usize> {
+        self.inner.op.inputs()
+    }
+
+    /// Obligations this operator discharges. An operator that only narrows
+    /// claims nothing — see ``enforcement``.
+    #[getter]
+    fn discharges(&self) -> Vec<usize> {
+        self.inner.discharges.clone()
+    }
+
+    /// The star this operator works on, for the kinds that name one: scan,
+    /// unnest, filter.
+    #[getter]
+    fn star_var(&self) -> Option<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { star_var, .. }
+            | Op::Unnest { star_var, .. }
+            | Op::Filter { star_var, .. } => Some(star_var.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``"scan"``: the class IRI to match against ``asset_type``.
+    #[getter]
+    fn class_uri(&self) -> Option<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { class_uri, .. } => Some(class_uri.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``"scan"``: values bound against the class's identifier slot, to be
+    /// compared against the indexed ``asset360_uri`` column rather than the
+    /// JSONB payload.
+    #[getter]
+    fn identifier_values(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan {
+                identifier_values, ..
+            } => identifier_values.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"scan"``: slots that must be present (``object_data ? 'slot'``).
+    #[getter]
+    fn required_slots(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { required_slots, .. } => required_slots.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"scan"``: slots that may be absent, so no existence check.
+    #[getter]
+    fn optional_slots(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { optional_slots, .. } => optional_slots.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"filter"`` and ``"unnest"``: the path from the record root to the
+    /// value. One element is a column; more walks into a nested structure.
+    #[getter]
+    fn slot_path(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { slot_path, .. } | Op::Unnest { slot_path, .. } => slot_path.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"filter"``: what the value must satisfy.
+    #[getter]
+    fn condition(&self) -> Option<FilterCondition> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { condition, .. } => Some(FilterCondition::from_rust(condition)),
+            _ => None,
+        }
+    }
+
+    /// For ``"filter"``: ``"enforces"`` when this operator decides the
+    /// obligation, ``"narrows"`` when it only reduces rows and a later pass
+    /// decides.
+    ///
+    /// A renderer may drop a ``"narrows"`` filter and still be correct — only
+    /// slower. Dropping an ``"enforces"`` one answers a different question.
+    #[getter]
+    fn enforcement(&self) -> Option<&'static str> {
+        use crate::sparql_ops::{Enforcement, Op};
+        match &self.inner.op {
+            Op::Filter { enforcement, .. } => Some(match enforcement {
+                Enforcement::Enforces => "enforces",
+                Enforcement::Narrows => "narrows",
+            }),
+            _ => None,
+        }
+    }
+
+    /// For ``"join"``: the slot on the right input whose value is the left
+    /// row's ``asset360_uri``.
+    #[getter]
+    fn right_slot(&self) -> Option<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join { right_slot, .. } => Some(right_slot.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``"join"``: ``"inner"`` or ``"left"``.
+    #[getter]
+    fn join_kind(&self) -> Option<&'static str> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join { kind, .. } => Some(match kind {
+                crate::sparql_scoper::JoinType::Inner => "inner",
+                crate::sparql_scoper::JoinType::Left => "left",
+            }),
+            _ => None,
+        }
+    }
+
+    /// For ``"group"``: one entry per projected value, addressed by position.
+    #[getter]
+    fn bindings(&self) -> Vec<PushdownBinding> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Group { bindings, .. } => bindings
+                .iter()
+                .map(|inner| PushdownBinding {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"group"``: indices into ``bindings`` that form the ``GROUP BY``.
+    /// Empty means one row over the whole input, which is what SPARQL returns
+    /// for a bare aggregate.
+    #[getter]
+    fn keys(&self) -> Vec<usize> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Group { keys, .. } => keys.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"group"``: the aggregates.
+    #[getter]
+    fn measures(&self) -> Vec<PushdownMeasure> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Group { measures, .. } => measures
+                .iter()
+                .map(|inner| PushdownMeasure {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"sort"``: the ordering terms, outermost first.
+    #[getter]
+    fn terms(&self) -> Vec<PushdownOrder> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Sort { terms, .. } => terms
+                .iter()
+                .map(|inner| PushdownOrder {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"slice"``: the row limit, or ``None`` for an offset with no limit.
+    #[getter]
+    fn limit(&self) -> Option<usize> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Slice { limit, .. } => *limit,
+            _ => None,
+        }
+    }
+
+    /// For ``"slice"``: rows to skip.
+    #[getter]
+    fn offset(&self) -> usize {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Slice { offset, .. } => *offset,
+            _ => 0,
+        }
+    }
+
+    /// For ``"project"``: the variables the query asked for, in ``SELECT``
+    /// order. Anything absent is machinery — a variable that exists only to be
+    /// grouped by, or an aggregate the parser named internally.
+    #[getter]
+    fn vars(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Project { vars, .. } => vars.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PlanOp(kind={:?}, inputs={:?})",
+            self.kind(),
+            self.inner.op.inputs()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
 /// Why an aggregate could not be pushed into SQL, in terms its author can act
 /// on.
 pub struct PushdownRefusal {
@@ -2377,6 +2637,27 @@ impl PlanPass {
         match &self.inner.kind {
             crate::sparql_plan::PassKind::Sql(sql) => Some(QueryPlan::from(sql.plan.clone())),
             crate::sparql_plan::PassKind::Engine(_) => None,
+        }
+    }
+
+    /// For ``kind == "sql"``: the pass as operators, in an order a renderer can
+    /// walk front to back — every operator's inputs come before it.
+    ///
+    /// This is the shape to render from, and the shape a rewrite edits.
+    /// ``plan`` and ``solution`` are the older rendering-shaped views of the
+    /// same pass and will go once nothing reads them.
+    #[getter]
+    fn ops(&self) -> Vec<PlanOp> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Sql(sql) => sql
+                .ops
+                .nodes
+                .iter()
+                .map(|inner| PlanOp {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            crate::sparql_plan::PassKind::Engine(_) => Vec::new(),
         }
     }
 
