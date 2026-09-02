@@ -75,6 +75,13 @@ pub enum Op {
         required_slots: Vec<String>,
         /// Slots that may be absent, so no existence check.
         optional_slots: Vec<String>,
+        /// Whether the star itself appears only inside `OPTIONAL`.
+        ///
+        /// Decides both the join type above it and whether its own conditions
+        /// have to tolerate a row the join did not match. A renderer that
+        /// misses it turns an optional block into a required one, which drops
+        /// rows the query keeps.
+        is_optional: bool,
     },
     /// One row per element of a multivalued slot, so row count matches
     /// solution count. Without it a record with three values counts once.
@@ -90,6 +97,14 @@ pub enum Op {
         slot_path: Vec<String>,
         condition: FilterCondition,
         enforcement: Enforcement,
+        /// Whether the value compares as a number rather than as text.
+        ///
+        /// Carried per node because it cannot be recovered from the path: the
+        /// same slot name on two classes may differ, and a value inside a
+        /// structure is not in the record's own slot list. Comparing a number
+        /// as text is the `'9' >= '10'` answer the scoper tracks numeric-ness
+        /// to prevent.
+        numeric: bool,
     },
     /// A reference between two stars: the right side holds the foreign key.
     Join {
@@ -220,6 +235,7 @@ pub fn lower_sql_pass(
                 identifier_values: star.identifier_values.clone(),
                 required_slots: star.required_fields.clone(),
                 optional_slots: star.optional_fields.clone(),
+                is_optional: star.is_optional,
             },
             discharges: Vec::new(),
         });
@@ -229,6 +245,7 @@ pub fn lower_sql_pass(
         // Both are comparisons on one star; the difference is only the depth of
         // the path, which the node carries.
         for (slot, conditions) in &star.filters {
+            let numeric = star.numeric_fields.iter().any(|field| field == slot);
             for condition in conditions {
                 let input = root_by_star[&star.variable];
                 nodes.push(OpNode {
@@ -238,6 +255,7 @@ pub fn lower_sql_pass(
                         slot_path: vec![slot.clone()],
                         condition: condition.clone(),
                         enforcement,
+                        numeric,
                     },
                     discharges: Vec::new(),
                 });
@@ -254,6 +272,7 @@ pub fn lower_sql_pass(
                         slot_path: path_filter.slot_path.clone(),
                         condition: condition.clone(),
                         enforcement,
+                        numeric: path_filter.numeric,
                     },
                     discharges: Vec::new(),
                 });
@@ -561,6 +580,66 @@ mod tests {
             ops.nodes
         );
         assert_eq!(ops.root().map(|node| node.op.kind()), Some("project"));
+    }
+
+    /// Lowering must carry the two facts a renderer cannot recover from the
+    /// node's shape, because dropping either is a wrong answer rather than an
+    /// error: whether a comparison is numeric (text comparison makes
+    /// `'9' >= '10'` true) and whether a star is optional (a required render
+    /// of an optional block drops rows the query keeps).
+    #[test]
+    fn lowering_carries_numeric_and_optional() {
+        let (_claims, ops) = sql_passes(
+            "SELECT ?s ?len WHERE { ?s a asset360:Signal ; asset360:length ?len . \
+             FILTER(?len >= 10) }",
+        )
+        .into_iter()
+        .next()
+        .expect("one SQL pass");
+
+        let numeric_filters: Vec<bool> = ops
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Filter { numeric, .. } => Some(*numeric),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            numeric_filters.iter().any(|numeric| *numeric),
+            "a comparison on an integer slot compares as a number, got {numeric_filters:?}"
+        );
+
+        // An optional star is marked, so the renderer knows the join above it
+        // is a LEFT JOIN and its own conditions have to be null-tolerant.
+        let (_claims, ops) = sql_passes(
+            "SELECT ?sig ?bg WHERE { ?sig a asset360:Signal . \
+             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?sig } }",
+        )
+        .into_iter()
+        .next()
+        .expect("one SQL pass");
+
+        let optionality: Vec<(String, bool)> = ops
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Scan {
+                    star_var,
+                    is_optional,
+                    ..
+                } => Some((star_var.clone(), *is_optional)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            optionality.iter().any(|(_, optional)| *optional),
+            "the OPTIONAL block's star is optional, got {optionality:?}"
+        );
+        assert!(
+            optionality.iter().any(|(_, optional)| !*optional),
+            "the mandatory star is not, got {optionality:?}"
+        );
     }
 
     /// A join lowers to a join node over two scans, which is what makes join

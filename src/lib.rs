@@ -2377,6 +2377,29 @@ impl PlanOp {
         }
     }
 
+    /// For ``"scan"``: whether the star appears only inside ``OPTIONAL``, so
+    /// its conditions must tolerate a row the join did not match. Rendering it
+    /// as required drops rows the query keeps.
+    #[getter]
+    fn is_optional(&self) -> bool {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { is_optional, .. } => *is_optional,
+            _ => false,
+        }
+    }
+
+    /// For ``"filter"``: whether the value compares as a number rather than as
+    /// text. Comparing a number as text makes ``'9' >= '10'`` true.
+    #[getter]
+    fn numeric(&self) -> bool {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { numeric, .. } => *numeric,
+            _ => false,
+        }
+    }
+
     /// For ``"filter"`` and ``"unnest"``: the path from the record root to the
     /// value. One element is a column; more walks into a nested structure.
     #[getter]
