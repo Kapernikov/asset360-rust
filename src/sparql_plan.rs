@@ -12,7 +12,16 @@
 //! be under-read will be.
 //!
 //! So an [`ExecutionPlan`] describes an ordered set of [`Pass`]es and the
-//! [`Obligation`]s each one discharges. Two rules make it trustworthy:
+//! [`Obligation`]s each one discharges.
+//!
+//! **The vocabulary, once:** an *obligation* is one thing the query demands --
+//! a triple pattern, a filter, the grouping, an aggregate, the ordering, the
+//! limit. To *discharge* one is for a pass to take care of it. The *residual*
+//! is whatever no pass took care of, which means the plan answers a different
+//! question than the one asked. `o0`, `o1`, ... are just their positions in
+//! the list, so a pass can point at them without repeating the text.
+//!
+//! Two rules make it trustworthy:
 //!
 //! * **The ledger balances.** Every obligation of the query appears exactly
 //!   once, in a pass or in [`ExecutionPlan::residual`]. A non-empty residual
@@ -134,6 +143,16 @@ pub enum PassKind {
 pub struct SqlPass {
     pub plan: crate::sparql_scoper::QueryPlan,
     pub solution: Option<crate::sparql_pushdown::SolutionSpec>,
+    /// The same pass as operators: scan, filter, join, unnest, group, sort,
+    /// slice, project.
+    ///
+    /// `plan` and `solution` are shaped for rendering and are what the SQL
+    /// builder reads today. This is the shape a *rewrite* needs — a filter
+    /// pushed from the engine is one node moved and one claim moved, checkable
+    /// against the ledger, rather than surgery on two structures at once.
+    /// Lowered from the two above, so it says nothing they do not; the renderer
+    /// migrates onto it next, and they go.
+    pub ops: crate::sparql_ops::OpTree,
 }
 
 /// The engine leg: what the SQL passes could not answer.
@@ -699,16 +718,19 @@ pub fn plan_query(query_str: &str, schema_view: &SchemaView) -> Result<Execution
     if let crate::sparql_pushdown::Pushdown::Eligible { solution, plan } = verdict {
         // The analyser refuses anything the plan does not fully describe, so an
         // eligible verdict *is* the statement that SQL discharges everything.
+        let discharges = all_ids(&obligations);
+        let ops = crate::sparql_ops::lower_sql_pass(&plan, Some(&solution), &discharges, true);
         return Ok(ExecutionPlan {
             contract: PLAN_CONTRACT,
             passes: vec![Pass {
                 id: 0,
                 inputs: Vec::new(),
-                discharges: all_ids(&obligations),
+                discharges,
                 emits,
                 kind: PassKind::Sql(Box::new(SqlPass {
                     plan,
                     solution: Some(solution),
+                    ops,
                 })),
             }],
             residual: Vec::new(),
@@ -735,9 +757,10 @@ pub fn plan_query(query_str: &str, schema_view: &SchemaView) -> Result<Execution
             Pass {
                 id: 0,
                 inputs: Vec::new(),
-                discharges: sql_claims,
+                discharges: sql_claims.clone(),
                 emits: Vec::new(),
                 kind: PassKind::Sql(Box::new(SqlPass {
+                    ops: crate::sparql_ops::lower_sql_pass(&scoped, None, &sql_claims, false),
                     plan: scoped,
                     solution: None,
                 })),
@@ -1031,6 +1054,12 @@ mod tests {
                 discharges: all_ids(&obligations),
                 emits: vec!["?kind".to_owned(), "?n".to_owned()],
                 kind: PassKind::Sql(Box::new(SqlPass {
+                    ops: crate::sparql_ops::lower_sql_pass(
+                        &scoped,
+                        None,
+                        &all_ids(&obligations),
+                        true,
+                    ),
                     plan: scoped,
                     solution: None,
                 })),
