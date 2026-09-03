@@ -46,6 +46,23 @@ pub trait Rule {
 /// error, but it is a bug, and the debug assertion in [`refine`] says so.
 pub const MAX_ROUNDS: usize = 64;
 
+/// A rule left the plan violating an invariant.
+///
+/// Carries the log as well as the defect, because the driver checks the result
+/// rather than each step in a release build: the rules that fired are the
+/// suspects, and without them a reader has a broken plan and no shortlist.
+#[derive(Debug, Clone)]
+pub struct RuleFailure {
+    pub defect: crate::sparql_refine::PlanDefect,
+    pub log: RefineLog,
+}
+
+impl std::fmt::Display for RuleFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "after applying {:?}: {}", self.log.applied, self.defect)
+    }
+}
+
 /// What the driver did, in order.
 #[derive(Debug, Clone, Default)]
 pub struct RefineLog {
@@ -61,13 +78,20 @@ pub struct RefineLog {
 
 /// Apply the rules in order until nothing changes.
 ///
-/// The invariants are re-checked after every single application, behind a
-/// debug assertion: a bad rule then fails at the rule rather than in a result.
-/// It is an assertion and not an error because a rule breaking an invariant is
-/// a programming mistake, and there is no sensible recovery -- the plan has
-/// already been edited, and silently rolling back would hide the rule that
-/// needs fixing.
-pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> RefineLog {
+/// Checked twice over, and the two checks answer different questions:
+///
+/// * **after every single application, behind a debug assertion.** This is the
+///   one that says *which rule*, and it is the reason to check per application
+///   at all. An assertion rather than an error because a rule breaking an
+///   invariant is a programming mistake with no sensible recovery -- the plan
+///   is already edited, and rolling back silently would hide the rule that
+///   needs fixing.
+/// * **the result, in every build.** A caller must never receive a plan a rule
+///   broke. "Nothing executes these plans yet" is true today and is exactly
+///   the assumption that stops being true once a renderer reads them, by which
+///   point a release-only gap would be invisible. Linear in the plan, so the
+///   cost is not a reason to skip it.
+pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFailure> {
     let mut log = RefineLog::default();
     for _ in 0..MAX_ROUNDS {
         log.rounds += 1;
@@ -86,16 +110,22 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> RefineLog {
         }
         if !changed {
             log.reached_fixpoint = true;
-            return log;
+            break;
         }
     }
+    // Not reaching a fixpoint leaves a *correct* plan -- every plan in the
+    // chain is one, just less refined -- so it is not an error to return. It
+    // is still a bug in the rule set, which is what the assertion says.
     debug_assert!(
-        false,
+        log.reached_fixpoint,
         "rule set did not reach a fixpoint in {MAX_ROUNDS} rounds; \
          the last rules to fire were {:?}",
         log.applied.iter().rev().take(8).collect::<Vec<_>>()
     );
-    log
+    match plan.check() {
+        Ok(()) => Ok(log),
+        Err(defect) => Err(RuleFailure { defect, log }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +454,7 @@ mod tests {
         assert_eq!(plan.find("match").len(), 3, "{plan}");
         assert_eq!(plan.find("join").len(), 2, "{plan}");
 
-        let log = refine(&mut plan, &[&rule]);
+        let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
         assert_eq!(log.applied, vec!["fold_matches_into_scan"], "{plan}");
         assert!(log.reached_fixpoint, "{plan}");
 
@@ -478,7 +508,8 @@ mod tests {
         ] {
             let naive = plan_of(query);
             let mut refined = naive.clone();
-            refine(&mut refined, &[&rule]);
+            refine(&mut refined, &[&rule])
+                .unwrap_or_else(|failure| panic!("{failure} for {query}"));
 
             assert_eq!(
                 refined.obligations, naive.obligations,
@@ -521,7 +552,7 @@ mod tests {
             "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm ; asset360:trafficKinds ?kind } GROUP BY ?kind",
         );
-        refine(&mut plan, &[&rule]);
+        refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
 
         // Which folded slots fan out, asked of the schema directly.
         let class = schema
@@ -584,7 +615,7 @@ mod tests {
             "SELECT ?a ?b WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?a ; \
              asset360:trafficKinds ?b }",
         );
-        refine(&mut plan, &[&rule]);
+        refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
 
         assert_eq!(scan_slots(&plan), Vec::new(), "{plan}");
         assert_eq!(
@@ -606,7 +637,7 @@ mod tests {
             "SELECT ?s ?nm ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL { ?s asset360:name ?nm } }",
         );
-        refine(&mut plan, &[&rule]);
+        refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
 
         assert_eq!(
             scan_slots(&plan),
@@ -632,7 +663,7 @@ mod tests {
             "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
              ?t a asset360:Track ; asset360:hasName ?tn }",
         );
-        let log = refine(&mut plan, &[&rule]);
+        let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
 
         assert_eq!(log.applied.len(), 2, "one application per star:\n{plan}");
         assert_eq!(plan.find("scan").len(), 2, "{plan}");
@@ -651,7 +682,7 @@ mod tests {
         let schema = test_schema_view();
         let rule = FoldMatchesIntoScan::new(&schema);
         let mut plan = plan_of("SELECT ?s WHERE { ?s a asset360:Signal ; a asset360:Track }");
-        let log = refine(&mut plan, &[&rule]);
+        let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
 
         assert!(log.applied.is_empty(), "{plan}");
         assert_eq!(plan.find("match").len(), 2, "{plan}");
@@ -664,7 +695,7 @@ mod tests {
         let schema = test_schema_view();
         let rule = FoldMatchesIntoScan::new(&schema);
         let mut plan = plan_of("SELECT ?s WHERE { ?s a asset360:NoSuchClass ; asset360:name ?nm }");
-        let log = refine(&mut plan, &[&rule]);
+        let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
 
         assert!(log.applied.is_empty(), "{plan}");
         assert!(plan.find("scan").is_empty(), "{plan}");
@@ -681,7 +712,7 @@ mod tests {
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" ; \
              asset360:kind ?k }",
         );
-        refine(&mut plan, &[&rule]);
+        refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
 
         assert_eq!(
             scan_slots(&plan),
@@ -739,15 +770,45 @@ mod tests {
             "SELECT ?nm ?tn WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
              asset360:locatedOnTrack ?t . ?t a asset360:Track ; asset360:hasName ?tn }",
         );
-        let first = refine(&mut plan, &[&rule]);
+        let first = refine(&mut plan, &[&rule]).unwrap();
         assert!(first.reached_fixpoint);
         assert!(!first.applied.is_empty());
         let before = plan.to_string();
 
-        let second = refine(&mut plan, &[&rule]);
+        let second = refine(&mut plan, &[&rule]).unwrap();
         assert!(second.applied.is_empty(), "{plan}");
         assert_eq!(second.rounds, 1, "one round to see there is nothing to do");
         assert_eq!(before, plan.to_string(), "a fixpoint is a fixpoint");
+    }
+
+    /// The driver refuses to hand back a plan a rule broke, in every build and
+    /// not only under a debug assertion.
+    ///
+    /// The rule here edits the plan and reports no change, which is the one
+    /// shape the per-application check cannot see -- it only looks after a
+    /// rule that said it did something -- and is a plausible bug: a rule that
+    /// returns `false` on a path where it already moved a node would otherwise
+    /// hand back a plan whose ledger is short one claim.
+    #[test]
+    fn a_rule_that_breaks_a_plan_is_not_handed_back() {
+        struct DropsAClaimQuietly;
+        impl Rule for DropsAClaimQuietly {
+            fn name(&self) -> &'static str {
+                "drops_a_claim_quietly"
+            }
+            fn apply(&self, plan: &mut Plan) -> bool {
+                plan.nodes[0].discharges.clear();
+                false
+            }
+        }
+
+        let mut plan = plan_of("SELECT ?s WHERE { ?s a asset360:Signal }");
+        let failure = refine(&mut plan, &[&DropsAClaimQuietly])
+            .expect_err("an unbalanced ledger must not be returned as a plan");
+        assert!(
+            matches!(failure.defect, crate::sparql_refine::PlanDefect::Ledger(_)),
+            "{failure}"
+        );
     }
 
     /// Rules apply in the order they are given, and an empty rule set is a
@@ -757,7 +818,7 @@ mod tests {
     fn no_rules_is_a_fixpoint() {
         let mut plan = plan_of("SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }");
         let before = plan.to_string();
-        let log = refine(&mut plan, &[]);
+        let log = refine(&mut plan, &[]).unwrap();
         assert!(log.reached_fixpoint);
         assert!(log.applied.is_empty());
         assert_eq!(before, plan.to_string());
