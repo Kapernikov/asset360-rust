@@ -1205,7 +1205,7 @@ fn scanned_column(
     plan: &crate::sparql_refine::Plan,
     var: &str,
 ) -> Option<(String, String, Vec<String>)> {
-    use crate::sparql_refine::{Executor, PlanOp as RefinedOp, SlotPresence};
+    use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
     plan.nodes.iter().find_map(|node| {
         let RefinedOp::Scan {
             star_var,
@@ -1218,11 +1218,13 @@ fn scanned_column(
         if node.executor != Executor::Sql {
             return None;
         }
+        // Either presence: a group key may be a value the record need not
+        // have. That is the missing-value bucket -- the column reads `NULL`
+        // and the bucket is a group like any other -- and the existence check
+        // is what `presence` decides, which the scan carries separately.
         slots
             .iter()
-            .find(|slot| {
-                slot.var.as_deref() == Some(var) && slot.presence == SlotPresence::Required
-            })
+            .find(|slot| slot.var.as_deref() == Some(var))
             .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
     })
 }
