@@ -64,7 +64,7 @@ use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
     CompareOp, Executor, Expr, Measure, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot,
     SlotPresence, SlotReading, SortTerm, inner_join_groups, is_type_pattern, object_variable,
-    predicate_iri, scan_with_fanout, subject_variable, type_class_iri,
+    predicate_iri, scan_with_fanout, subject_iri, subject_variable, type_class_iri,
 };
 
 /// One rewrite.
@@ -217,6 +217,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
     fn foldable_slots(
         &self,
         plan: &Plan,
+        keys: &HashMap<String, String>,
         star: &str,
         class_uri: &str,
         group: &[usize],
@@ -233,7 +234,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
             let PlanOp::Match { pattern } = &node.op else {
                 continue;
             };
-            if subject_variable(pattern) != Some(star) || is_type_pattern(pattern) {
+            if subject_star(keys, pattern).as_deref() != Some(star) || is_type_pattern(pattern) {
                 continue;
             }
             let (Some(predicate), Some(var)) = (predicate_iri(pattern), object_variable(pattern))
@@ -282,6 +283,47 @@ impl<'s> FoldMatchesIntoScan<'s> {
     }
 }
 
+/// The synthetic star name each constant-IRI subject in this plan gets, keyed
+/// by IRI.
+///
+/// Numbered in node order, which is the query's own triple order, because
+/// today's scoper numbers them in that order too and the gate compares the two
+/// plans by the *names* of the stars they scan. Reproducing the convention is
+/// therefore not cosmetic: a different name is a different plan as far as the
+/// comparator is concerned. If the two orders ever disagree the comparator
+/// reports different stars and the query falls back, which is the safe
+/// direction.
+fn const_subject_stars(plan: &Plan) -> HashMap<String, String> {
+    let mut keys: HashMap<String, String> = HashMap::new();
+    for node in &plan.nodes {
+        let PlanOp::Match { pattern } = &node.op else {
+            continue;
+        };
+        let Some(iri) = subject_iri(pattern) else {
+            continue;
+        };
+        let next = keys.len();
+        keys.entry(iri.to_owned())
+            .or_insert_with(|| format!("_const_subject_{next}"));
+    }
+    keys
+}
+
+/// The star a triple pattern's subject names: its variable, or the synthetic
+/// name its constant IRI was given.
+///
+/// One function so the two questions a rule asks about a subject -- "which
+/// star is this" and "does this triple belong to that star" -- cannot answer
+/// differently for a constant than for a variable. That they used to is the
+/// whole of why `<uri> a :Class ; :slot ?v` scanned the class instead of the
+/// record.
+fn subject_star(keys: &HashMap<String, String>, pattern: &TriplePattern) -> Option<String> {
+    if let Some(var) = subject_variable(pattern) {
+        return Some(var.to_owned());
+    }
+    keys.get(subject_iri(pattern)?).cloned()
+}
+
 impl Rule for FoldMatchesIntoScan<'_> {
     fn name(&self) -> &'static str {
         "fold_matches_into_scan"
@@ -289,6 +331,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
 
     fn apply(&self, plan: &mut Plan) -> bool {
         let groups = inner_join_groups(plan);
+        let keys = const_subject_stars(plan);
         for (type_node, node) in plan.nodes.iter().enumerate() {
             if node.executor != Executor::Engine {
                 continue;
@@ -296,11 +339,22 @@ impl Rule for FoldMatchesIntoScan<'_> {
             let PlanOp::Match { pattern } = &node.op else {
                 continue;
             };
+            // A constant subject is a star of one record: the query named the
+            // identity, so the scan carries it as an identifier value and the
+            // statement reads one row against the indexed column. Without
+            // this the plan scanned the whole class and left the narrowing to
+            // the engine -- correct, and the wrong statement.
+            let identifier_values: Vec<String> = subject_iri(pattern)
+                .map(|iri| vec![iri.to_owned()])
+                .into_iter()
+                .flatten()
+                .collect();
             let (Some(star), Some(class_uri)) =
-                (subject_variable(pattern), type_class_iri(pattern))
+                (subject_star(&keys, pattern), type_class_iri(pattern))
             else {
                 continue;
             };
+            let star = star.as_str();
             // An intersection of classes, or a type read into a variable
             // alongside a constant one: a scan of one class is not either of
             // those questions.
@@ -309,7 +363,8 @@ impl Rule for FoldMatchesIntoScan<'_> {
                 .iter()
                 .filter(|other| match &other.op {
                     PlanOp::Match { pattern } => {
-                        is_type_pattern(pattern) && subject_variable(pattern) == Some(star)
+                        is_type_pattern(pattern)
+                            && subject_star(&keys, pattern).as_deref() == Some(star)
                     }
                     _ => false,
                 })
@@ -330,8 +385,9 @@ impl Rule for FoldMatchesIntoScan<'_> {
             }
             let star = star.to_owned();
             let class_uri = class_uri.to_owned();
-            let slots = self.foldable_slots(plan, &star, &class_uri, &groups, groups[type_node]);
-            fold(plan, type_node, &star, &class_uri, slots);
+            let slots =
+                self.foldable_slots(plan, &keys, &star, &class_uri, &groups, groups[type_node]);
+            fold(plan, type_node, &star, &class_uri, identifier_values, slots);
             return true;
         }
         false
@@ -349,6 +405,7 @@ fn fold(
     type_node: NodeId,
     star: &str,
     class_uri: &str,
+    identifier_values: Vec<String>,
     slots: Vec<(NodeId, ScanSlot)>,
 ) {
     let mut folded: Vec<NodeId> = slots.iter().map(|(id, _)| *id).collect();
@@ -378,6 +435,7 @@ fn fold(
                 star,
                 class_uri,
                 scan_slots.clone(),
+                identifier_values.clone(),
                 nodes.len(),
                 claims.clone(),
             );
@@ -1598,6 +1656,135 @@ impl<'s> FoldIdentityConstant<'s> {
     }
 }
 
+/// The identity constraint a node states on a *star variable*, when it states
+/// one this rule can fold: the IRIs a record's own name is allowed to be.
+///
+/// Three spellings of one question reach here, and the point of resolving them
+/// in one place is that they are the same question:
+///
+/// * `?s asset360:id "<uri>"` -- a triple on the identifier slot, handled by
+///   the other arm because it has a slot address.
+/// * `VALUES ?s { <uri> }`
+/// * `FILTER(?s = <uri>)`
+///
+/// A star variable is bound to the record's own IRI, which is the identifier
+/// column -- so these fold into [`PlanOp::Scan::identifier_values`] and the
+/// statement reads one row against the index. Without the fold both spellings
+/// scan the whole class and let the engine narrow: a correct answer from a
+/// statement nobody would write, and a trap for anyone reading the
+/// configurations to learn how to name one asset.
+///
+/// **Only IRIs.** `FILTER(?s = "https://…")` compares a record's identity
+/// against a *literal*, and in SPARQL an IRI is never equal to a literal, so
+/// the query has no solutions -- while a statement comparing that text against
+/// `asset360_uri` would find the row. That is the one way this fold could
+/// answer a question the query did not ask, so a non-IRI declines.
+fn identity_terms(condition: &Expr) -> Option<(String, Vec<String>)> {
+    let iri_of = |expr: &Expr| -> Option<String> {
+        match expr {
+            Expr::Literal(Term::NamedNode(node)) => Some(node.as_str().to_owned()),
+            _ => None,
+        }
+    };
+    match condition {
+        Expr::Compare {
+            op: CompareOp::Eq,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Var(var), other) | (other, Expr::Var(var)) => {
+                Some((var.clone(), vec![iri_of(other)?]))
+            }
+            _ => None,
+        },
+        Expr::In { value, candidates } => {
+            let Expr::Var(var) = value.as_ref() else {
+                return None;
+            };
+            let mut out = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                out.push(iri_of(candidate)?);
+            }
+            (!out.is_empty()).then_some((var.clone(), out))
+        }
+        _ => None,
+    }
+}
+
+/// The single `Sql` scan of a star below `node`, when there is exactly one and
+/// it has no identity yet.
+fn sole_scan_of_star(plan: &Plan, node: NodeId, star: &str) -> Option<NodeId> {
+    let mut found = None;
+    for (id, scanned) in plan.nodes.iter().enumerate() {
+        let PlanOp::Scan {
+            star_var,
+            identifier_values,
+            ..
+        } = &scanned.op
+        else {
+            continue;
+        };
+        if scanned.executor != Executor::Sql || star_var != star || !plan.feeds(id, node) {
+            continue;
+        }
+        if !identifier_values.is_empty() {
+            // A second identity is an intersection, and two of them is either
+            // nothing or the same row: not a question this states by appending
+            // to a list that renders as `IN`.
+            return None;
+        }
+        if found.replace(id).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+/// Whether a node's rows reach every answer: no left join above it keeps rows
+/// it did not match, no union offers an alternative to it, no minus subtracts
+/// through it.
+///
+/// The condition an identity fold needs, and not
+/// [`mandatorily_feeds`] to the root, which stops at the first modifier and
+/// would answer `false` for every plan with a projection. What matters is not
+/// that the path is joins all the way up but that nothing on it makes this
+/// node's constraint conditional.
+fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
+    !plan.nodes.iter().any(|other| match &other.op {
+        // The preserved side keeps rows the optional side did not match, so a
+        // constraint inside the optional side decides whether the *value*
+        // binds -- not whether the row survives.
+        PlanOp::LeftJoin { right, .. } => plan.feeds(node, *right),
+        // Either branch of a union is an alternative, so narrowing one is not
+        // narrowing the answer.
+        PlanOp::Union { left, right } => plan.feeds(node, *left) || plan.feeds(node, *right),
+        // Narrowing what is subtracted *widens* the answer.
+        PlanOp::Minus { right, .. } => plan.feeds(node, *right),
+        _ => false,
+    })
+}
+
+/// Drop nodes whose work another node has taken over, reparenting each one's
+/// consumers onto its input.
+fn remove_nodes(plan: &mut Plan, removed: &[NodeId]) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if removed.contains(&old) {
+            remap[old] = remap[node.op.inputs()[0]];
+            continue;
+        }
+        nodes.push(node.clone());
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
 impl Rule for FoldIdentityConstant<'_> {
     fn name(&self) -> &'static str {
         "fold_identity_constant"
@@ -1679,6 +1866,102 @@ impl Rule for FoldIdentityConstant<'_> {
             plan.nodes[site.scan].discharges.sort_unstable();
 
             collapse_leaf_into(plan, id, consumer, other);
+            return true;
+        }
+
+        // The same fold, from a constraint written on the star variable
+        // itself. Separate loop rather than a second shape in the one above,
+        // because what it collapses differs -- a `VALUES` takes its join with
+        // it, a `FILTER` is unary -- while what it *decides* is shared.
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            // The constraint has to hold of every answer. Inside an
+            // `OPTIONAL` it does not: folding it into the scan would delete
+            // the rows the left join exists to keep.
+            if !applies_to_every_answer(plan, id) {
+                continue;
+            }
+            // `join` is the join a `VALUES` was applied by, which goes with
+            // it; a `FILTER` is unary and has none.
+            let (star, values, join, below) = match &plan.nodes[id].op {
+                PlanOp::Filter { input, condition } => {
+                    let Some((star, values)) = identity_terms(condition) else {
+                        continue;
+                    };
+                    (star, values, None, *input)
+                }
+                PlanOp::Values { variables, rows } => {
+                    let [variable] = variables.as_slice() else {
+                        continue;
+                    };
+                    let var = variable.as_str().to_owned();
+                    let mut values = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let [Some(GroundTerm::NamedNode(node))] = row.as_slice() else {
+                            values.clear();
+                            break;
+                        };
+                        values.push(node.as_str().to_owned());
+                    }
+                    if values.is_empty() {
+                        continue;
+                    }
+                    // A bag, not a set: `VALUES` with a repeated row
+                    // duplicates solutions, and an `IN` does not.
+                    if (1..values.len()).any(|i| values[..i].contains(&values[i])) {
+                        continue;
+                    }
+                    // The join that applies it, which goes with it.
+                    let above = consumers(plan, id);
+                    let [consumer] = above.as_slice() else {
+                        continue;
+                    };
+                    let PlanOp::Join {
+                        left, right, on, ..
+                    } = &plan.nodes[*consumer].op
+                    else {
+                        continue;
+                    };
+                    if on.as_slice() != [var.clone()] {
+                        continue;
+                    }
+                    let other = if *left == id { *right } else { *left };
+                    (var, values, Some((*consumer, other)), other)
+                }
+                _ => continue,
+            };
+
+            // A star variable names a record's identity, which
+            // `Visible::identity_of` resolves and `slot_of` deliberately does
+            // not: there is no slot address to compare against, and that is
+            // why a *filter* on it cannot be pushed as a condition. It can be
+            // pushed as an identity.
+            let visible = Visible::mandatorily_below(plan, below);
+            if visible.identity_of(&star).is_none() {
+                continue;
+            }
+            let Some(scan) = sole_scan_of_star(plan, below, &star) else {
+                continue;
+            };
+
+            if let PlanOp::Scan {
+                identifier_values, ..
+            } = &mut plan.nodes[scan].op
+            {
+                identifier_values.extend(values);
+            }
+            let mut claims = plan.nodes[id].discharges.clone();
+            if let Some((join, _)) = join {
+                claims.extend(plan.nodes[join].discharges.iter().copied());
+            }
+            plan.nodes[scan].discharges.extend(claims);
+            plan.nodes[scan].discharges.sort_unstable();
+            match join {
+                Some((join, other)) => collapse_leaf_into(plan, id, join, other),
+                None => remove_nodes(plan, &[id]),
+            }
             return true;
         }
         false
@@ -5136,6 +5419,112 @@ mod tests {
             "triple    ?s asset360:trafficKinds ?k",
         ),
     ];
+
+    /// Four spellings of "this one asset, by identifier", and one plan.
+    ///
+    /// The four are what the form configurations actually contain or are being
+    /// asked to move to, so the planner has to read all of them as one row
+    /// against the indexed identifier column rather than as a class scan the
+    /// engine narrows afterwards. The second is the *canonical* one and was
+    /// the one refinement did not handle -- which mattered more than the
+    /// others, because it is the spelling to migrate towards.
+    ///
+    /// A class scan plus an engine filter is not a wrong answer, which is why
+    /// only a test like this finds it: correct, and the wrong statement.
+    #[test]
+    fn every_spelling_of_one_asset_scans_one_row() {
+        let schema = test_schema_view();
+        let uri = "https://data.infrabel.be/asset360/sig-1";
+        for (query, spelling) in [
+            (
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+                 asset360:asset360_uri \"https://data.infrabel.be/asset360/sig-1\" }",
+                "the identifier slot, which is what the configurations send today",
+            ),
+            (
+                "SELECT ?nm WHERE { <https://data.infrabel.be/asset360/sig-1> \
+                 a asset360:Signal ; asset360:name ?nm }",
+                "a constant subject, which is canonical",
+            ),
+            (
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 VALUES ?s { <https://data.infrabel.be/asset360/sig-1> } }",
+                "a VALUES over the subject",
+            ),
+            (
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?s = <https://data.infrabel.be/asset360/sig-1>) }",
+                "an equality filter on the subject",
+            ),
+        ] {
+            let plan = refined(query, &schema, false);
+            let scans = plan.find("scan");
+            let [scan] = scans.as_slice() else {
+                panic!("{spelling}: one scan, not {}\n{plan}", scans.len());
+            };
+            let PlanOp::Scan {
+                identifier_values, ..
+            } = &plan.nodes[*scan].op
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                identifier_values,
+                &vec![uri.to_owned()],
+                "{spelling}: the identity is the scan's:\n{plan}"
+            );
+            // And nothing is left holding it: a constraint the scan applies
+            // and a node above re-applies would be the same row test twice.
+            assert!(
+                plan.find("filter").is_empty() && plan.find("values").is_empty(),
+                "{spelling}: the constraint moved rather than being copied:\n{plan}"
+            );
+        }
+    }
+
+    /// What an identity fold on the star variable declines, and why each
+    /// refusal is a wrong answer prevented rather than a shape not reached.
+    #[test]
+    fn what_the_identity_fold_declines_on_a_star_variable() {
+        let schema = test_schema_view();
+        let folded = |query: &str| -> bool {
+            let plan = refined(query, &schema, false);
+            plan.find("scan").iter().any(|id| {
+                matches!(&plan.nodes[*id].op, PlanOp::Scan { identifier_values, .. }
+                    if !identifier_values.is_empty())
+            })
+        };
+
+        // A *literal* compared against a record's identity. In SPARQL an IRI
+        // is never equal to a literal, so the query has no solutions -- while
+        // a statement comparing that text against `asset360_uri` would find
+        // the row. The one way this fold could answer a question the query did
+        // not ask.
+        assert!(
+            !folded(
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm .                  FILTER(?s = \"https://data.infrabel.be/asset360/sig-1\") }"
+            ),
+            "a literal is not an IRI"
+        );
+
+        // Inside an `OPTIONAL`: the constraint decides whether the optional
+        // side matched, and folding it into the scan would delete the rows the
+        // left join exists to keep.
+        assert!(
+            !folded(
+                "SELECT ?nm ?tn WHERE { ?s a asset360:Signal ; asset360:name ?nm ;                  asset360:locatedOnTrack ?t . OPTIONAL { ?t a asset360:Track ;                  asset360:hasName ?tn .                  FILTER(?t = <https://data.infrabel.be/asset360/trk-1>) } }"
+            ),
+            "an identity inside an OPTIONAL is conditional"
+        );
+
+        // An inequality is not a set of identities.
+        assert!(
+            !folded(
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm .                  FILTER(?s != <https://data.infrabel.be/asset360/sig-1>) }"
+            ),
+            "an inequality on identity"
+        );
+    }
 
     /// The first collapsing rule: the grouping and the projection above it are
     /// SQL's, the alias the query wrote is on the measure, and the plan is

@@ -1214,6 +1214,11 @@ pub fn scan_with_fanout(
     star_var: &str,
     class_uri: &str,
     slots: Vec<ScanSlot>,
+    // `identifier_values`: the record's identity, when the query named it
+    // rather than a variable. A constant subject scans one row, against the
+    // indexed identifier column. Empty for a variable subject, whose identity
+    // a rule folds later if the query constrains it.
+    identifier_values: Vec<String>,
     at: NodeId,
     discharges: Vec<ObligationId>,
 ) -> Vec<Node> {
@@ -1230,8 +1235,7 @@ pub fn scan_with_fanout(
             star_var: star_var.to_owned(),
             class_uri: class_uri.to_owned(),
             slots,
-            // Identity is folded by its own rule, once there is one to fold.
-            identifier_values: Vec::new(),
+            identifier_values,
         },
         discharges,
     )];
@@ -2526,6 +2530,20 @@ pub fn subject_variable(pattern: &TriplePattern) -> Option<&str> {
     }
 }
 
+/// The IRI a triple pattern's subject names, when the query named a record
+/// rather than a variable.
+///
+/// `<uri> a asset360:Signal ; asset360:name ?nm` is the canonical way to ask
+/// about one asset, and it is the spelling the form configurations should be
+/// moving *to* -- so a planner that reads it as "every Signal, narrowed later"
+/// is a planner nobody should migrate onto.
+pub fn subject_iri(pattern: &TriplePattern) -> Option<&str> {
+    match &pattern.subject {
+        TermPattern::NamedNode(node) => Some(node.as_str()),
+        _ => None,
+    }
+}
+
 /// The variable a triple pattern's object binds, when it is one.
 pub fn object_variable(pattern: &TriplePattern) -> Option<&str> {
     match &pattern.object {
@@ -2956,6 +2974,7 @@ mod tests {
             "s",
             "https://data.infrabel.be/asset360/TunnelComplex",
             slots,
+            Vec::new(),
             0,
             vec![0],
         );

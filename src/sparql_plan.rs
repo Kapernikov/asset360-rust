@@ -1594,6 +1594,50 @@ mod tests {
         }
     }
 
+    /// Every spelling of an identity restriction still declines to answer an
+    /// aggregate alone, including the several-identifier one.
+    ///
+    /// The standing constraint as the identity surface widened, and the reason
+    /// it is a constraint rather than a preference: the writer emits no triple
+    /// for an identifier, so the engine's answer to such a query is empty --
+    /// and an aggregate is the one case where the engine's answer is the
+    /// answer. Falling back leaves these queries with today's planner, which
+    /// serves them, so the refusal costs nothing and prevents an empty result.
+    #[test]
+    fn no_spelling_of_an_identity_answers_an_aggregate_alone() {
+        let sv = test_schema_view();
+        for (query, spelling) in [
+            (
+                "SELECT (COUNT(*) AS ?n) WHERE { \
+                 <https://data.infrabel.be/asset360/sig-1> a asset360:Signal ; \
+                 asset360:name ?nm }",
+                "a constant subject",
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm . VALUES ?s { \
+                 <https://data.infrabel.be/asset360/sig-1> \
+                 <https://data.infrabel.be/asset360/sig-2> } }",
+                "two identifiers, which render as an IN",
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm . \
+                 FILTER(?s = <https://data.infrabel.be/asset360/sig-1>) }",
+                "an equality filter",
+            ),
+        ] {
+            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let reason = plan.refinement.reason().unwrap_or_else(|| {
+                panic!("{spelling} answered an aggregate: {:?}", plan.refinement)
+            });
+            assert!(
+                reason.contains("identifier restriction"),
+                "{spelling}: {reason}"
+            );
+        }
+    }
+
     /// Path B is not a second chance. A query today's planner *can* answer
     /// goes through the comparator and nowhere else, so a refined plan the
     /// comparator calls worse falls back rather than being re-admitted on its
