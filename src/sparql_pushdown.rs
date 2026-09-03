@@ -1066,35 +1066,7 @@ fn having_term(
     // renders as. Wrong here would select no groups rather than the wrong ones,
     // which is a wrong answer and not a narrowing -- there is no engine leg to
     // re-apply anything on this route.
-    let (value, numeric) = match form {
-        // A count is an integer whatever it counted; a sum or an average over a
-        // numeric range is a number. Both compare by *value*, so any numeric
-        // literal is the same question -- unlike a stored-text comparison,
-        // where the lexical form has to match.
-        MeasureForm::Number => match numeric_value(literal) {
-            Some(value) => (value, true),
-            None => {
-                return Err(unsupported(format!(
-                    "HAVING compares an aggregate against {literal}, which is not a \
-                     number"
-                )));
-            }
-        },
-        // `MIN`/`MAX` hand back one of the column's own values, so the column's
-        // term rule decides, exactly as it would for a `FILTER` on that slot.
-        MeasureForm::Column(index) => {
-            let binding = &bindings[index];
-            let form = crate::sparql_scoper::push_form_of_descriptor(&binding.descriptor);
-            if !crate::sparql_scoper::literal_pushable(literal, &form) {
-                return Err(unsupported(format!(
-                    "HAVING compares ?{} against {literal}, which is not the term \
-                     that column's values render as",
-                    binding.var
-                )));
-            }
-            (literal.value().to_owned(), binding.descriptor.numeric)
-        }
-    };
+    let (value, numeric) = having_constant(&form, bindings, literal).map_err(unsupported)?;
 
     let condition = match op {
         Some(op) => FilterCondition::Cmp { op, value },
@@ -1107,15 +1079,62 @@ fn having_term(
     })
 }
 
+/// The constant a `HAVING` compares against, and whether the comparison is
+/// numeric -- or why the constant is not one SQL may compare against that
+/// column.
+///
+/// Term fidelity, and the same rule as everywhere else: a comparison asks the
+/// query's question only when the constant is the term the value renders as.
+/// Wrong here would select no groups rather than the wrong ones, which is a
+/// wrong answer and not a narrowing -- there is no engine leg to re-apply
+/// anything past a grouping, on either route.
+///
+/// Shared with the refined pipeline's lowering, which reaches the same
+/// `HavingTerm` from a different syntax. One judgement, two callers: two
+/// derivations of "is this constant faithful" is how two planners come to
+/// disagree about an answer.
+pub(crate) fn having_constant(
+    form: &MeasureForm,
+    bindings: &[BindingSpec],
+    literal: &spargebra::term::Literal,
+) -> Result<(String, bool), String> {
+    match form {
+        // A count is an integer whatever it counted; a sum or an average over a
+        // numeric range is a number. Both compare by *value*, so any numeric
+        // literal is the same question -- unlike a stored-text comparison,
+        // where the lexical form has to match.
+        MeasureForm::Number => match numeric_value(literal) {
+            Some(value) => Ok((value, true)),
+            None => Err(format!(
+                "HAVING compares an aggregate against {literal}, which is not a number"
+            )),
+        },
+        // `MIN`/`MAX` hand back one of the column's own values, so the column's
+        // term rule decides, exactly as it would for a `FILTER` on that slot.
+        MeasureForm::Column(index) => {
+            let binding = &bindings[*index];
+            let form = crate::sparql_scoper::push_form_of_descriptor(&binding.descriptor);
+            if !crate::sparql_scoper::literal_pushable(literal, &form) {
+                return Err(format!(
+                    "HAVING compares ?{} against {literal}, which is not the term \
+                     that column's values render as",
+                    binding.var
+                ));
+            }
+            Ok((literal.value().to_owned(), binding.descriptor.numeric))
+        }
+    }
+}
+
 /// What an aggregate's result compares as.
-enum MeasureForm {
+pub(crate) enum MeasureForm {
     /// A number in its own right: a count, a sum, an average.
     Number,
     /// One of a column's own values, so that column's term rule applies.
     Column(usize),
 }
 
-fn measure_form(func: &Measure) -> MeasureForm {
+pub(crate) fn measure_form(func: &Measure) -> MeasureForm {
     match func {
         Measure::Count { .. } | Measure::Sum { .. } | Measure::Avg { .. } => MeasureForm::Number,
         Measure::Min { arg } | Measure::Max { arg } => MeasureForm::Column(*arg),

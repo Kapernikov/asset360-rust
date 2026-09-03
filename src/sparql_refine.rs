@@ -206,6 +206,41 @@ pub enum CompareOp {
 }
 
 impl CompareOp {
+    /// The condition SQL renders for this comparison against `value`, when
+    /// there is one.
+    ///
+    /// The one mapping from SPARQL's comparison vocabulary to the renderer's,
+    /// shared by [`Expr::to_sql`] and by the `HAVING` lowering. `!=` has no
+    /// mapping, and that is not an oversight: SPARQL's inequality is false for
+    /// an unbound variable where SQL's `<>` on NULL is unknown, and the two
+    /// disagree about exactly the rows an `OPTIONAL` keeps and the groups whose
+    /// aggregate is unbound.
+    pub fn as_condition(&self, value: String) -> Option<FilterCondition> {
+        use crate::sparql_scoper::CmpOp;
+        let op = match self {
+            Self::Eq => return Some(FilterCondition::Eq(value)),
+            Self::Lt => CmpOp::Lt,
+            Self::Lte => CmpOp::Lte,
+            Self::Gt => CmpOp::Gt,
+            Self::Gte => CmpOp::Gte,
+            Self::Ne => return None,
+        };
+        Some(FilterCondition::Cmp { op, value })
+    }
+
+    /// The same comparison written the other way round: `3 < ?n` asks what
+    /// `?n > 3` asks, so a flipped spelling is not a different question.
+    pub fn flipped(&self) -> Self {
+        match self {
+            Self::Eq => Self::Eq,
+            Self::Ne => Self::Ne,
+            Self::Lt => Self::Gt,
+            Self::Lte => Self::Gte,
+            Self::Gt => Self::Lt,
+            Self::Gte => Self::Lte,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Eq => "=",
@@ -321,6 +356,34 @@ impl Expr {
     /// that renders and leaving the rest above -- changes who *claims* the
     /// filter obligation, and that is a rule's decision to make and to record,
     /// not a rendering detail.
+    /// The same expression with one variable renamed.
+    ///
+    /// For a rule that folds a rename into the node that produces the value:
+    /// the alias disappears, so every reference to the old name has to become
+    /// a reference to the new one or it names nothing.
+    pub fn rename_var(&self, from: &str, to: &str) -> Self {
+        match self {
+            Self::Var(var) if var == from => Self::Var(to.to_owned()),
+            Self::And(parts) => {
+                Self::And(parts.iter().map(|part| part.rename_var(from, to)).collect())
+            }
+            Self::Or(parts) => {
+                Self::Or(parts.iter().map(|part| part.rename_var(from, to)).collect())
+            }
+            Self::Not(inner) => Self::Not(Box::new(inner.rename_var(from, to))),
+            Self::Compare { op, left, right } => Self::Compare {
+                op: *op,
+                left: Box::new(left.rename_var(from, to)),
+                right: Box::new(right.rename_var(from, to)),
+            },
+            Self::In { value, candidates } => Self::In {
+                value: Box::new(value.rename_var(from, to)),
+                candidates: candidates.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     pub(crate) fn sql_shape_unchecked(&self) -> Option<Vec<SqlCondition>> {
         match self {
             Self::And(parts) => {
@@ -332,29 +395,7 @@ impl Expr {
             }
             Self::Compare { op, left, right } => {
                 let (slot, value) = slot_and_value(left, right)?;
-                let condition = match op {
-                    CompareOp::Eq => FilterCondition::Eq(value),
-                    CompareOp::Lt => FilterCondition::Cmp {
-                        op: crate::sparql_scoper::CmpOp::Lt,
-                        value,
-                    },
-                    CompareOp::Lte => FilterCondition::Cmp {
-                        op: crate::sparql_scoper::CmpOp::Lte,
-                        value,
-                    },
-                    CompareOp::Gt => FilterCondition::Cmp {
-                        op: crate::sparql_scoper::CmpOp::Gt,
-                        value,
-                    },
-                    CompareOp::Gte => FilterCondition::Cmp {
-                        op: crate::sparql_scoper::CmpOp::Gte,
-                        value,
-                    },
-                    // Not an oversight: SPARQL's `!=` is false for an unbound
-                    // variable, SQL's `<>` on NULL is unknown, and the two
-                    // disagree about exactly the rows an OPTIONAL keeps.
-                    CompareOp::Ne => return None,
-                };
+                let condition = op.as_condition(value)?;
                 let Self::Slot {
                     star_var,
                     slot_path,
@@ -891,6 +932,16 @@ pub enum PlanOp {
         input: NodeId,
         keys: Vec<String>,
         measures: Vec<Measure>,
+        /// Conditions on the grouped rows: SPARQL's `HAVING`, as SQL's.
+        ///
+        /// Empty until the grouping rule pushes the filters above the grouping
+        /// into it, which it may do only because SQL says the same thing with
+        /// a `HAVING` clause -- a filter over aggregates is not an operator
+        /// above a grouping in SQL, it is part of it. Each condition names a
+        /// key or a measure; which column that is, and whether the constant it
+        /// compares against is one SQL may compare against that column, is the
+        /// lowering's question.
+        having: Vec<Expr>,
     },
     Sort {
         input: NodeId,
@@ -1808,8 +1859,13 @@ impl PlanOp {
             }
             PlanOp::Filter { condition, .. } => condition.to_string(),
             PlanOp::Bind { var, expr, .. } => format!("?{var} ← {expr}"),
-            PlanOp::Group { keys, measures, .. } => format!(
-                "keys=[{}] measures=[{}]",
+            PlanOp::Group {
+                keys,
+                measures,
+                having,
+                ..
+            } => format!(
+                "keys=[{}] measures=[{}]{}",
                 keys.iter()
                     .map(|key| format!("?{key}"))
                     .collect::<Vec<_>>()
@@ -1818,7 +1874,19 @@ impl PlanOp {
                     .iter()
                     .map(|measure| format!("?{} ← {}", measure.var, measure.aggregate))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                if having.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " having=[{}]",
+                        having
+                            .iter()
+                            .map(|condition| condition.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" && ")
+                    )
+                }
             ),
             PlanOp::Sort { terms, .. } => terms
                 .iter()
@@ -2259,6 +2327,7 @@ impl Builder<'_> {
                         input,
                         keys,
                         measures,
+                        having: Vec::new(),
                     },
                     claims,
                     vars,

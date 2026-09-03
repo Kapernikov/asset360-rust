@@ -667,7 +667,7 @@ pub fn lower_refined(
     schema: &linkml_schemaview::schemaview::SchemaView,
     fetch_bound: Option<usize>,
 ) -> Result<OpTree, LoweringRefusal> {
-    use crate::sparql_refine::{Executor, PlanOp as RefinedOp, SlotPresence};
+    use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp, SlotPresence};
 
     let sql: Vec<usize> = (0..plan.nodes.len())
         .filter(|id| plan.nodes[*id].executor == Executor::Sql)
@@ -815,6 +815,11 @@ pub fn lower_refined(
 
     let mut nodes: Vec<OpNode> = Vec::with_capacity(sql.len());
     let mut remap: std::collections::HashMap<usize, OpId> = std::collections::HashMap::new();
+    // The columns a grouping produced, for the modifiers above it. An
+    // `ORDER BY` term names one of them, and only a grouping can say which
+    // index that is -- the refined plan names variables, and the renderer
+    // needs positions.
+    let mut grouped: Option<GroupedColumns> = None;
 
     for id in sql {
         let node = &plan.nodes[id];
@@ -1023,25 +1028,41 @@ pub fn lower_refined(
                     discharges: node.discharges.clone(),
                 });
             }
-            RefinedOp::Group { keys, measures, .. } => {
+            RefinedOp::Group {
+                keys,
+                measures,
+                having,
+                ..
+            } => {
                 let input = remap[&node.op.inputs()[0]];
                 // One binding per group key, resolved against the schema by
                 // the same function the single-pass planner uses -- the
                 // renderer needs the term descriptor and the containers, and
                 // deriving them here a second way is how two planners come to
                 // disagree about a column.
-                let mut bindings = Vec::with_capacity(keys.len());
+                //
+                // Keys first, so their indices are stable and low: the same
+                // order the single-pass planner builds, which is what lets the
+                // comparator compare two `HAVING` clauses term by term.
+                let mut bindings: Vec<crate::sparql_pushdown::BindingSpec> =
+                    Vec::with_capacity(keys.len());
                 for key in keys {
-                    let Some((star_var, class_uri, path)) = scanned_column(plan, key) else {
-                        return Err(LoweringRefusal::Unrenderable { node: id });
-                    };
-                    let Some(spec) = crate::sparql_pushdown::binding_spec(
-                        schema, &star_var, &class_uri, key, path,
-                    ) else {
-                        return Err(LoweringRefusal::Unrenderable { node: id });
-                    };
-                    bindings.push(spec);
+                    bind_column(plan, schema, key, &mut bindings)
+                        .ok_or(LoweringRefusal::Unrenderable { node: id })?;
                 }
+
+                // Then the measures, whose arguments are bindings too. Built
+                // before the fan-outs for the same reason: an index the
+                // comparator prints must not depend on how many arrays the
+                // statement had to unnest.
+                let mut lowered = Vec::with_capacity(measures.len());
+                for measure in measures {
+                    lowered.push(
+                        lower_measure(plan, schema, measure, &mut bindings)
+                            .ok_or(LoweringRefusal::Unrenderable { node: id })?,
+                    );
+                }
+
                 // Every fan-out below the grouping, as a binding.
                 //
                 // The two vocabularies say the same thing differently: the
@@ -1073,9 +1094,9 @@ pub fn lower_refined(
                         .iter()
                         .any(|spec| spec.star_var == *star_var && spec.slot_path == *slot_path)
                     {
-                        // Already a key: the element the grouping keys on is
-                        // the same element the fan-out produces, and one
-                        // LATERAL is one fan-out.
+                        // Already a key or a measure's argument: the element
+                        // the grouping reads is the same element the fan-out
+                        // produces, and one LATERAL is one fan-out.
                         continue;
                     }
                     let Some(class_uri) = classes.get(star_var) else {
@@ -1093,37 +1114,82 @@ pub fn lower_refined(
                     bindings.push(spec);
                 }
 
-                let mut lowered = Vec::with_capacity(measures.len());
-                for measure in measures {
-                    // `COUNT(*)` only, which is what the rule pushes. Anything
-                    // else reaching here is a rule ahead of this lowering, and
-                    // a refusal is how it finds out.
-                    if !matches!(
-                        measure.aggregate,
-                        spargebra::algebra::AggregateExpression::CountSolutions { distinct: false }
-                    ) {
-                        return Err(LoweringRefusal::Unrenderable { node: id });
-                    }
-                    lowered.push(MeasureSpec {
-                        var: measure.var.clone(),
-                        func: crate::sparql_pushdown::Measure::Count {
-                            arg: None,
-                            distinct: false,
-                        },
-                    });
+                let group_keys: Vec<usize> = (0..keys.len()).collect();
+                let mut terms = Vec::with_capacity(having.len());
+                for condition in having {
+                    terms.push(
+                        lower_having(condition, &bindings, &lowered, &group_keys)
+                            .ok_or(LoweringRefusal::Unrenderable { node: id })?,
+                    );
                 }
+
+                grouped = Some(GroupedColumns {
+                    bindings: bindings.clone(),
+                    measures: lowered.clone(),
+                });
                 nodes.push(OpNode {
                     op: Op::Group {
                         input,
                         // The keys are the first bindings, in the order the
-                        // query grouped by; anything after them is a fan-out
-                        // the statement needs and the answer does not name.
-                        keys: (0..keys.len()).collect(),
+                        // query grouped by; anything after them is a measure's
+                        // argument or a fan-out the statement needs and the
+                        // answer does not name.
+                        keys: group_keys,
                         bindings,
                         measures: lowered,
-                        // No rule pushes a condition on grouped rows into a
-                        // refined plan; the single-pass planner renders those.
-                        having: Vec::new(),
+                        having: terms,
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Sort { terms, .. } => {
+                let input = remap[&node.op.inputs()[0]];
+                // An ordering is only renderable over a grouped result: it
+                // sorts columns of one, and the renderer places a term inside
+                // or outside the grouping by which kind of column it names.
+                // Below a grouping an ordering is the engine's -- the rows SQL
+                // hands back there are a fetch, not an answer.
+                let Some(columns) = &grouped else {
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                };
+                let mut lowered = Vec::with_capacity(terms.len());
+                for term in terms {
+                    let RefinedExpr::Var(name) = &term.expr else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    let Some(key) = columns.key_of(name) else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    lowered.push(crate::sparql_pushdown::OrderTerm {
+                        key,
+                        desc: term.desc,
+                    });
+                }
+                nodes.push(OpNode {
+                    op: Op::Sort {
+                        input,
+                        terms: lowered,
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Distinct { .. } | RefinedOp::Reduced { .. } => {
+                let input = remap[&node.op.inputs()[0]];
+                // `REDUCED` permits duplicate elimination without requiring
+                // it, so answering a `DISTINCT` satisfies it -- and this
+                // renderer has no third behaviour to offer.
+                nodes.push(OpNode {
+                    op: Op::Distinct { input },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Slice { limit, offset, .. } => {
+                let input = remap[&node.op.inputs()[0]];
+                nodes.push(OpNode {
+                    op: Op::Slice {
+                        input,
+                        limit: *limit,
+                        offset: *offset,
                     },
                     discharges: node.discharges.clone(),
                 });
@@ -1363,33 +1429,235 @@ fn missing_from(wanted: &[String], have: &[String]) -> Option<String> {
 /// Deliberately narrow: a variable bound to an element of an array, or read
 /// without being required, is not a column a grouping can key on, and the
 /// rules decline those before the lowering sees them.
+/// The columns of a grouped result: its bindings and its measures, in the
+/// order the statement will list them.
+///
+/// Held while lowering the nodes above a grouping, because an `ORDER BY` term
+/// or a `HAVING` names a variable and the renderer needs an index into one of
+/// these two lists. The refined plan states the same fact structurally -- the
+/// grouping is below -- and this is where that becomes a position.
+struct GroupedColumns {
+    bindings: Vec<crate::sparql_pushdown::BindingSpec>,
+    measures: Vec<crate::sparql_pushdown::MeasureSpec>,
+}
+
+impl GroupedColumns {
+    /// Which column of the grouped result a variable names.
+    ///
+    /// Measures first: an aggregate aliased to a name that also happens to be
+    /// a binding's is the aggregate, which is what SPARQL's scoping says --
+    /// the projected `?n` of `(COUNT(*) AS ?n)` is the count.
+    fn key_of(&self, var: &str) -> Option<crate::sparql_pushdown::OrderKey> {
+        if let Some(index) = self.measures.iter().position(|m| m.var == var) {
+            return Some(crate::sparql_pushdown::OrderKey::Measure(index));
+        }
+        self.bindings
+            .iter()
+            .position(|b| b.var == var)
+            .map(crate::sparql_pushdown::OrderKey::Binding)
+    }
+}
+
+/// Add a binding for the column a variable reads, or return the index of the
+/// one already there.
+///
+/// Deduplicated by address rather than by name: a group key and an aggregate's
+/// argument that read the same slot of the same record are one column, and two
+/// bindings for it would make the renderer build two LATERALs over one array.
+fn bind_column(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    var: &str,
+    bindings: &mut Vec<crate::sparql_pushdown::BindingSpec>,
+) -> Option<usize> {
+    let (star_var, class_uri, path) = scanned_column(plan, var)?;
+    if let Some(index) = bindings
+        .iter()
+        .position(|spec| spec.star_var == star_var && spec.slot_path == path)
+    {
+        return Some(index);
+    }
+    let spec = crate::sparql_pushdown::binding_spec(schema, &star_var, &class_uri, var, path)?;
+    bindings.push(spec);
+    Some(bindings.len() - 1)
+}
+
+/// One aggregate, with its argument bound as a column.
+///
+/// The vocabulary check is the rule's -- it declined everything this cannot
+/// render -- so a shape reaching here that this refuses is a rule ahead of the
+/// lowering, and the refusal is how it finds out.
+fn lower_measure(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    measure: &crate::sparql_refine::Measure,
+    bindings: &mut Vec<crate::sparql_pushdown::BindingSpec>,
+) -> Option<crate::sparql_pushdown::MeasureSpec> {
+    use crate::sparql_pushdown::Measure as Func;
+    use spargebra::algebra::{AggregateExpression, AggregateFunction};
+
+    let var = measure.var.clone();
+    match &measure.aggregate {
+        AggregateExpression::CountSolutions { distinct: false } => {
+            Some(crate::sparql_pushdown::MeasureSpec {
+                var,
+                func: Func::Count {
+                    arg: None,
+                    distinct: false,
+                },
+            })
+        }
+        // `COUNT(DISTINCT *)` counts distinct *solutions*, which `count(*)`
+        // does not; the rule declines it rather than let the renderer's
+        // approximation stand.
+        AggregateExpression::CountSolutions { distinct: true } => None,
+        AggregateExpression::FunctionCall {
+            name,
+            expr,
+            distinct,
+        } => {
+            let crate::sparql_refine::Expr::Var(arg_var) = crate::sparql_refine::Expr::from(expr)
+            else {
+                return None;
+            };
+            let arg = bind_column(plan, schema, &arg_var, bindings)?;
+            let func = match name {
+                AggregateFunction::Count => Func::Count {
+                    arg: Some(arg),
+                    distinct: *distinct,
+                },
+                // Checked here as well as in the rule, and deliberately: the
+                // descriptor is what the renderer casts on, so the fact that
+                // decides a cast and the fact that decides the push are the
+                // same fact.
+                AggregateFunction::Sum if bindings[arg].descriptor.numeric => Func::Sum { arg },
+                AggregateFunction::Avg if bindings[arg].descriptor.numeric => Func::Avg { arg },
+                AggregateFunction::Min => Func::Min { arg },
+                AggregateFunction::Max => Func::Max { arg },
+                _ => return None,
+            };
+            Some(crate::sparql_pushdown::MeasureSpec { var, func })
+        }
+    }
+}
+
+/// One `HAVING` conjunct as the renderer's term, or `None` when it is not a
+/// comparison of one column of the grouped result against a faithful
+/// constant.
+///
+/// The constant's fidelity is [`crate::sparql_pushdown::having_constant`],
+/// which the single-pass planner asks too: a `HAVING` on this route and a
+/// `HAVING` on that one are held to one notion of what SQL may compare.
+fn lower_having(
+    condition: &crate::sparql_refine::Expr,
+    bindings: &[crate::sparql_pushdown::BindingSpec],
+    measures: &[crate::sparql_pushdown::MeasureSpec],
+    group_keys: &[usize],
+) -> Option<crate::sparql_pushdown::HavingTerm> {
+    use crate::sparql_pushdown::{MeasureForm, OrderKey};
+    use crate::sparql_refine::Expr as RefinedExpr;
+
+    let crate::sparql_refine::Expr::Compare { op, left, right } = condition else {
+        return None;
+    };
+    // One side names a column, the other is a constant -- and a flipped
+    // spelling is the same question, so the operator flips with it. `!=` is
+    // absent for the reason a pushed `FILTER` leaves it out: SPARQL's
+    // inequality is false where SQL's `<>` is unknown, and they disagree about
+    // exactly the group whose aggregate is unbound.
+    let (name, term, op) = match (left.as_ref(), right.as_ref()) {
+        (RefinedExpr::Var(name), RefinedExpr::Literal(term)) => (name, term, *op),
+        (RefinedExpr::Literal(term), RefinedExpr::Var(name)) => (name, term, op.flipped()),
+        _ => return None,
+    };
+    // A literal, and not an IRI: the fidelity rule below is written for a
+    // literal's lexical form, and an aggregate compared against an IRI is a
+    // question this cannot ask.
+    let spargebra::term::Term::Literal(literal) = term else {
+        return None;
+    };
+
+    let (key, form) = if let Some(index) = measures.iter().position(|m| &m.var == name) {
+        (
+            OrderKey::Measure(index),
+            crate::sparql_pushdown::measure_form(&measures[index].func),
+        )
+    } else if let Some(index) = group_keys
+        .iter()
+        .copied()
+        .find(|index| &bindings[*index].var == name)
+    {
+        (OrderKey::Binding(index), MeasureForm::Column(index))
+    } else {
+        // Bound but neither grouped nor aggregated: a grouped row has no
+        // single value for it, and SPARQL agrees -- outside a grouping the
+        // variable is not in scope.
+        return None;
+    };
+
+    let (value, numeric) =
+        crate::sparql_pushdown::having_constant(&form, bindings, literal).ok()?;
+    // Through the same mapping a pushed `FILTER` uses, so a `HAVING` and a
+    // `WHERE` cannot come to mean different things by the same operator.
+    let condition = op.as_condition(value)?;
+    Some(crate::sparql_pushdown::HavingTerm {
+        key,
+        condition,
+        numeric,
+    })
+}
+
 fn scanned_column(
     plan: &crate::sparql_refine::Plan,
     var: &str,
 ) -> Option<(String, String, Vec<String>)> {
     use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
-    plan.nodes.iter().find_map(|node| {
-        let RefinedOp::Scan {
-            star_var,
-            class_uri,
-            slots,
-            ..
-        } = &node.op
-        else {
-            return None;
-        };
-        if node.executor != Executor::Sql {
-            return None;
-        }
-        // Either presence: a group key may be a value the record need not
-        // have. That is the missing-value bucket -- the column reads `NULL`
-        // and the bucket is a group like any other -- and the existence check
-        // is what `presence` decides, which the scan carries separately.
-        slots
-            .iter()
-            .find(|slot| slot.var.as_deref() == Some(var))
-            .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
-    })
+    plan.nodes
+        .iter()
+        .find_map(|node| {
+            let RefinedOp::Scan {
+                star_var,
+                class_uri,
+                slots,
+                ..
+            } = &node.op
+            else {
+                return None;
+            };
+            if node.executor != Executor::Sql {
+                return None;
+            }
+            // Either presence: a group key may be a value the record need not
+            // have. That is the missing-value bucket -- the column reads `NULL`
+            // and the bucket is a group like any other -- and the existence check
+            // is what `presence` decides, which the scan carries separately.
+            slots
+                .iter()
+                .find(|slot| slot.var.as_deref() == Some(var))
+                .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
+        })
+        // Or the record's own identity. `GROUP BY ?t` over a scanned star groups
+        // by its URI, which the renderer reads from the identifier column at the
+        // empty path -- a column of the row rather than a value in its payload.
+        //
+        // Slots first, and that order is the resolution the rule used: a variable
+        // that is both some star's identity and another star's slot value is a
+        // value join, which `Visible` reports as ambiguous and the rule declines
+        // before reaching here.
+        .or_else(|| {
+            plan.nodes.iter().find_map(|node| {
+                let RefinedOp::Scan {
+                    star_var,
+                    class_uri,
+                    ..
+                } = &node.op
+                else {
+                    return None;
+                };
+                (node.executor == Executor::Sql && star_var == var)
+                    .then(|| (star_var.clone(), class_uri.clone(), Vec::new()))
+            })
+        })
 }
 
 /// The scan node for a star, in a tree being built.

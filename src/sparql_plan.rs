@@ -1533,6 +1533,67 @@ mod tests {
         println!("{plan}");
     }
 
+    /// The collapsing surface, end to end: the rule pushes it, the lowering
+    /// renders it, and the gate admits it.
+    ///
+    /// The rule-level test asserts the plan is all `Sql`; this asserts the
+    /// three stages agree, which is the property that ships. They caught
+    /// different failures -- a rename the rule folded into a measure left an
+    /// `ORDER BY` naming spargebra's internal variable, which the plan called
+    /// pushed and the lowering could not render.
+    #[test]
+    fn the_collapsing_surface_reaches_sql() {
+        let sv = test_schema_view();
+        for query in [
+            // Measures, over a column and over its distinct values.
+            "SELECT ?nm (COUNT(?len) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm",
+            "SELECT ?nm (COUNT(DISTINCT ?len) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm",
+            "SELECT ?nm (MIN(?len) AS ?lo) (MAX(?len) AS ?hi) WHERE { \
+             ?s a asset360:Signal ; asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm",
+            "SELECT ?nm (SUM(?len) AS ?t) (AVG(?len) AS ?a) WHERE { \
+             ?s a asset360:Signal ; asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm",
+            // Key arity: none, and several.
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal }",
+            "SELECT ?nm ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:kind ?k } GROUP BY ?nm ?k",
+            // The modifiers above.
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n) LIMIT 3",
+            "SELECT DISTINCT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm",
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(COUNT(*))",
+            // A key that is one element of an array, and a key that is a
+            // record's own identity.
+            "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?k } GROUP BY ?k",
+            "SELECT ?t (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:locatedOnTrack ?t . ?t a asset360:Track } GROUP BY ?t",
+            // And a condition on the grouped rows.
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm HAVING (COUNT(*) > 1)",
+        ] {
+            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            assert!(
+                matches!(
+                    plan.refinement,
+                    Refinement::Used(_) | Refinement::UsedAlone(_)
+                ),
+                "{query}: {:?}",
+                plan.refinement
+            );
+            assert!(plan.blocked.is_none(), "{query}: {:?}", plan.blocked);
+            // Answered in SQL: no operator was handed back to an engine that
+            // cannot recompute an aggregate.
+            assert!(
+                plan.sql_only(),
+                "{query} is a collapse, so it is whole or it is nothing"
+            );
+        }
+    }
+
     /// Path B is not a second chance. A query today's planner *can* answer
     /// goes through the comparator and nowhere else, so a refined plan the
     /// comparator calls worse falls back rather than being re-admitted on its
@@ -1544,12 +1605,13 @@ mod tests {
     #[test]
     fn a_plan_the_comparator_refuses_is_not_admitted_by_the_other_path() {
         let sv = test_schema_view();
-        // An aggregate with an ordering above it: today answers it whole, and
-        // the grouping rule declines the shape, so the refined statement would
-        // hand the grouping back.
+        // `COUNT(DISTINCT *)`: today answers it, and the grouping rule
+        // declines it, so the refined statement would hand the grouping back.
+        // (Today renders it as `count(*)`, which counts solutions rather than
+        // distinct ones -- the difference this rule refuses to reproduce.)
         let query = format!(
-            "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
-             asset360:name ?nm }} GROUP BY ?nm ORDER BY DESC(?n)"
+            "{PREFIX}SELECT (COUNT(DISTINCT *) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?nm }}"
         );
         let today = plan_query(&query, &sv).expect("should plan");
         assert!(today.blocked.is_none(), "today answers this one");
@@ -1718,13 +1780,13 @@ mod tests {
         let sv = test_schema_view();
         for (query, expected) in [
             (
-                // An aggregate with more collapsing work above it: the
-                // grouping rule declines the whole shape rather than pushing
-                // the grouping and leaving the ordering to an engine that
-                // cannot do it, so the refined statement would hand the
-                // grouping back -- the regression the gate exists to refuse.
-                "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n)",
+                // An aggregate the grouping rule declines: `COUNT(DISTINCT *)`
+                // counts distinct solutions, which `count(*)` does not, so the
+                // refined statement would hand the grouping back -- the
+                // regression the gate exists to refuse. Today answers it, by
+                // rendering the distinct away.
+                "SELECT (COUNT(DISTINCT *) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm }",
                 "leaves 'group",
             ),
             (
