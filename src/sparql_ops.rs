@@ -587,6 +587,12 @@ pub enum LoweringRefusal {
     /// optional and this lowering would call it mandatory, which wraps its
     /// conditions the wrong way.
     OptionalScan { node: usize },
+    /// A row cap on the fetch tighter than the query's own `LIMIT` + `OFFSET`.
+    ///
+    /// The bound claims nothing, so no ledger notices it, and it is the one
+    /// narrowing that can drop an answer: the engine cannot find a solution in
+    /// a row the fetch did not return.
+    FetchBoundTooTight { bound: usize, demanded: usize },
     /// A node claiming an obligation the work it renders does not discharge.
     ///
     /// Today this catches one shape: a scan claiming to scope a subject to a
@@ -654,6 +660,12 @@ impl fmt::Display for LoweringRefusal {
                 "n{node} rests on an identifier restriction, which narrows a fetch \
                  but cannot answer alone: the writer emits no triple for an \
                  identifier, so the engine's answer to such a query is empty"
+            ),
+            Self::FetchBoundTooTight { bound, demanded } => write!(
+                f,
+                "the fetch is capped at {bound} rows and the query asks for \
+                 {demanded}, so an answer could be in a row the statement never \
+                 returns"
             ),
             Self::ClaimWithoutTheWork { node, claim } => write!(
                 f,
@@ -1296,33 +1308,95 @@ pub fn lower_refined(
             star_var,
             class_uri,
             identifier_values,
+            slots,
             ..
         } = &plan.nodes[id].op
         else {
             continue;
         };
         for claim in &plan.nodes[id].discharges {
-            let Some(crate::sparql_plan::Obligation::Type { subject, class_iri }) =
-                plan.obligations.get(*claim)
-            else {
-                continue;
-            };
-            // The obligation writes its subject as the query did: `?s` for a
-            // variable, `<uri>` for a record the query named -- and a named
-            // record's star is the synthetic one, so the identity is what
-            // matches, not the name.
-            let scopes_the_subject = match subject.strip_prefix('?') {
-                Some(variable) => variable == star_var,
-                None => identifier_values
-                    .iter()
-                    .any(|value| subject.trim_matches(['<', '>']) == value),
-            };
-            if !scopes_the_subject || class_iri != class_uri {
-                return Err(LoweringRefusal::ClaimWithoutTheWork {
+            let wrong = |claim: &crate::sparql_plan::Obligation| {
+                Err(LoweringRefusal::ClaimWithoutTheWork {
                     node: id,
-                    claim: plan.obligations[*claim].to_string(),
-                });
+                    claim: claim.to_string(),
+                })
+            };
+            match plan.obligations.get(*claim) {
+                Some(claim @ crate::sparql_plan::Obligation::Type { subject, class_iri }) => {
+                    // The obligation writes its subject as the query did: `?s`
+                    // for a variable, `<uri>` for a record the query named --
+                    // and a named record's star is the synthetic one, so the
+                    // identity is what matches, not the name.
+                    let scopes_the_subject = match subject.strip_prefix('?') {
+                        Some(variable) => variable == star_var,
+                        None => identifier_values
+                            .iter()
+                            .any(|value| subject.trim_matches(['<', '>']) == value),
+                    };
+                    if !scopes_the_subject || class_iri != class_uri {
+                        return wrong(claim);
+                    }
+                }
+                // **A scan claiming a read must make it.** The asymmetry:
+                // reading *more* than the query asked is a wider fetch and
+                // costs only time, while claiming a read the statement does
+                // not make means nobody makes it -- the engine was told this
+                // node answered it.
+                //
+                // Any position in any path: a nested read is claimed by the
+                // scan that folded it, and the predicate is then one hop of a
+                // longer address. The identifier is the exception the identity
+                // fold makes -- it becomes a value against the indexed column
+                // rather than a slot of the payload.
+                Some(claim @ crate::sparql_plan::Obligation::Triple { predicate, .. }) => {
+                    let slot = predicate
+                        .trim_matches(['<', '>'])
+                        .rsplit(['/', '#'])
+                        .next()
+                        .unwrap_or_default();
+                    let read = slots
+                        .iter()
+                        .any(|scanned| scanned.path.iter().any(|hop| hop == slot));
+                    let is_the_identity = identifier_slot_of(schema, class_uri)
+                        .is_some_and(|identifier| identifier == slot)
+                        && !identifier_values.is_empty();
+                    if !read && !is_the_identity {
+                        return wrong(claim);
+                    }
+                }
+                _ => continue,
             }
+        }
+    }
+
+    // **A fetch bound must not be tighter than the query's own limit.** The
+    // other asymmetry, and the one with a wrong answer on the tight side: a
+    // looser bound costs a few rows of fetch, while a tighter one drops
+    // answers the engine would have found. It claims nothing, so no ledger
+    // notices.
+    //
+    // Promoted from the comparator clause that compared two bounds. The
+    // single-plan form is better than the comparison it replaces: it holds
+    // against the *query*, which is the thing that decides how many rows an
+    // answer can need, rather than against whatever the other planner
+    // happened to compute.
+    if let Some(bound) = fetch_bound {
+        let demanded = plan.obligations.iter().find_map(|obligation| {
+            match obligation {
+                crate::sparql_plan::Obligation::Slice { limit, offset } => {
+                    // No limit at all: every row may be needed, so no bound is
+                    // safe -- but the bound came from the scoper, which is the
+                    // analysis that owns that question, so this only checks
+                    // the arithmetic it did.
+                    limit.map(|limit| limit + offset)
+                }
+                _ => None,
+            }
+        });
+        if let Some(demanded) = demanded
+            && bound < demanded
+        {
+            return Err(LoweringRefusal::FetchBoundTooTight { bound, demanded });
         }
     }
 
@@ -2615,6 +2689,56 @@ mod tests {
             .expect_err("a scan must scan the class it claims to scope");
         assert!(
             matches!(refusal, LoweringRefusal::ClaimWithoutTheWork { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// **The asymmetries, as invariants on one plan.** Narrower is fine;
+    /// missing is not.
+    ///
+    /// The comparator's clause list was the accumulated definition of *worse*,
+    /// and each clause promoted here keeps the half of it that survives the
+    /// deletion. "Different is suspicious" does not survive — there will be
+    /// nothing to differ from — so what is kept is the direction: reading more
+    /// rows than the query needs costs time, and reading fewer than it needs
+    /// costs an answer.
+    #[test]
+    fn narrower_is_fine_and_missing_is_not() {
+        use crate::sparql_refine::PlanOp as RefinedOp;
+
+        let sv = test_schema_view();
+
+        // A read the scan claims and does not make. The claim is what makes it
+        // wrong: the engine was told this node answered it, so nobody does.
+        let mut plan = refined_plan(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            &sv,
+        );
+        let scan = plan.find("scan")[0];
+        if let RefinedOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+            slots.clear();
+        }
+        let refusal =
+            lower_refined(&plan, &sv, None).expect_err("a scan must make the reads it claims");
+        assert!(
+            matches!(refusal, LoweringRefusal::ClaimWithoutTheWork { .. }),
+            "{refusal}"
+        );
+
+        // A fetch bound tighter than the query's own limit. It claims nothing,
+        // so no ledger notices, and the engine cannot find a solution in a row
+        // the fetch never returned.
+        let plan = refined_plan(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
+             LIMIT 10 OFFSET 5",
+            &sv,
+        );
+        lower_refined(&plan, &sv, Some(15)).expect("exactly enough rows lowers");
+        lower_refined(&plan, &sv, Some(50)).expect("more than enough lowers too");
+        let refusal =
+            lower_refined(&plan, &sv, Some(14)).expect_err("one row short must not lower");
+        assert!(
+            matches!(refusal, LoweringRefusal::FetchBoundTooTight { .. }),
             "{refusal}"
         );
     }
