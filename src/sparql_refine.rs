@@ -356,6 +356,40 @@ impl Expr {
     /// that renders and leaving the rest above -- changes who *claims* the
     /// filter obligation, and that is a rule's decision to make and to record,
     /// not a rendering detail.
+    /// The same expression with one variable replaced by an expression.
+    ///
+    /// For the rule that sinks a condition on a group key below the grouping:
+    /// the key is a variable in the query's vocabulary and a column in SQL's,
+    /// and this is the substitution between them.
+    pub fn substitute_var(&self, from: &str, to: &Expr) -> Self {
+        match self {
+            Self::Var(var) if var == from => to.clone(),
+            Self::And(parts) => Self::And(
+                parts
+                    .iter()
+                    .map(|part| part.substitute_var(from, to))
+                    .collect(),
+            ),
+            Self::Or(parts) => Self::Or(
+                parts
+                    .iter()
+                    .map(|part| part.substitute_var(from, to))
+                    .collect(),
+            ),
+            Self::Not(inner) => Self::Not(Box::new(inner.substitute_var(from, to))),
+            Self::Compare { op, left, right } => Self::Compare {
+                op: *op,
+                left: Box::new(left.substitute_var(from, to)),
+                right: Box::new(right.substitute_var(from, to)),
+            },
+            Self::In { value, candidates } => Self::In {
+                value: Box::new(value.substitute_var(from, to)),
+                candidates: candidates.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// The same expression with one variable renamed.
     ///
     /// For a rule that folds a rename into the node that produces the value:

@@ -355,21 +355,31 @@ impl Rule for FoldMatchesIntoScan<'_> {
                 continue;
             };
             let star = star.as_str();
-            // An intersection of classes, or a type read into a variable
-            // alongside a constant one: a scan of one class is not either of
-            // those questions.
-            let types_on_star = plan
+            // An intersection of classes is not a scan of one class:
+            // `?s a :Signal ; a :Track` matches nothing unless one subclasses
+            // the other, and a statement holding one of them counts every
+            // instance of it.
+            //
+            // A type read into a *variable* alongside the constant one is a
+            // different matter, and folding is right there: `?s a ?t . ?s a
+            // :CivilEngineeringAsset` wants every asset of that class, which
+            // is exactly what the scan fetches, and the engine binds `?t` from
+            // the instance's own types. The triple stays unclaimed, so it is
+            // the engine's -- and the grouping above it declines, because `?t`
+            // is not a column any scan binds. That is today's plan for this
+            // query, arrived at by the rules.
+            let classes_on_star = plan
                 .nodes
                 .iter()
                 .filter(|other| match &other.op {
                     PlanOp::Match { pattern } => {
-                        is_type_pattern(pattern)
+                        type_class_iri(pattern).is_some()
                             && subject_star(&keys, pattern).as_deref() == Some(star)
                     }
                     _ => false,
                 })
                 .count();
-            if types_on_star != 1 {
+            if classes_on_star != 1 {
                 continue;
             }
             if self
@@ -1038,6 +1048,69 @@ fn drop_optional_pair(plan: &mut Plan, leftjoin: NodeId, matched: NodeId, left: 
     for node in &mut nodes {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+/// One `HAVING` conjunct as a condition on a column, when the variable it
+/// names is a group key an `Sql` scan below binds.
+///
+/// `None` for a conjunct over a measure -- there is no row to test it against
+/// until the rows are grouped -- and for a key with no column address, which
+/// is a record's identity: SQL can compare against the identifier column, but
+/// no [`Expr::Slot`] names it, so that one stays a `HAVING`.
+fn sinkable(visible: &Visible, condition: &Expr) -> Option<Expr> {
+    let name = having_names(condition)?;
+    let binding = visible.slot_of(&name)?;
+    Some(condition.substitute_var(
+        &name,
+        &Expr::Slot {
+            star_var: binding.star_var.clone(),
+            slot_path: binding.path.clone(),
+            reading: binding.reading,
+        },
+    ))
+}
+
+/// Insert filters immediately below a node, in order, each reading the one
+/// before it.
+fn insert_filters_below(plan: &mut Plan, target: NodeId, filters: Vec<(Vec<ObligationId>, Expr)>) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() + filters.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == target {
+            let mut input = remap[node.op.inputs()[0]].expect("inputs precede their node");
+            for (claims, condition) in &filters {
+                nodes.push(Node::sql(
+                    PlanOp::Filter {
+                        input,
+                        condition: condition.clone(),
+                    },
+                    claims.clone(),
+                ));
+                input = nodes.len() - 1;
+            }
+            let mut op = node.op.clone();
+            op.map_inputs(|_| input);
+            nodes.push(Node {
+                op,
+                executor: node.executor,
+                output: node.output,
+                discharges: node.discharges.clone(),
+            });
+            remap[old] = Some(nodes.len() - 1);
+            continue;
+        }
+        let mut op = node.op.clone();
+        op.map_inputs(|input| remap[input].expect("inputs precede their node"));
+        nodes.push(Node {
+            op,
+            executor: node.executor,
+            output: node.output,
+            discharges: node.discharges.clone(),
+        });
+        remap[old] = Some(nodes.len() - 1);
     }
     plan.nodes = nodes;
     refresh_join_variables(plan);
@@ -3046,24 +3119,52 @@ fn push_grouping(plan: &mut Plan, group: NodeId, tail: GroupingTail) {
             }
         }
     }
-    let conditions: Vec<Expr> = tail
-        .having
-        .iter()
-        .map(|(_, condition)| renamed(condition))
-        .collect();
+    // A condition on a *group key* is a condition on the column the key
+    // reads, and it belongs below the grouping rather than after it: SQL says
+    // the same thing either way, but a `WHERE` narrows before the grouping
+    // does its work and a `HAVING` after. Today's planner extracts these, so
+    // sinking them is also what keeps the two statements comparable -- a
+    // condition the comparator finds in one plan and not the other is a
+    // difference whether or not it changes the answer.
+    //
+    // A condition on a measure cannot sink: there is no row to test it
+    // against until the rows are grouped. That one stays a `HAVING`.
+    let input = plan.nodes[group].op.inputs()[0];
+    let visible = Visible::below(plan, input);
+    let mut sinks: Vec<(Vec<ObligationId>, Expr)> = Vec::new();
+    let mut conditions: Vec<Expr> = Vec::new();
+    for (node, condition) in &tail.having {
+        let condition = renamed(condition);
+        match sinkable(&visible, &condition) {
+            Some(sunk) => sinks.push((plan.nodes[*node].discharges.clone(), sunk)),
+            None => conditions.push(condition),
+        }
+    }
     if let PlanOp::Group { having, .. } = &mut plan.nodes[group].op {
         *having = conditions;
     }
 
-    let mut claims: Vec<ObligationId> = Vec::new();
+    let sunk_claims: Vec<ObligationId> = sinks
+        .iter()
+        .flat_map(|(claims, _)| claims.iter().copied())
+        .collect();
     let removed: Vec<NodeId> = tail
         .aliases
         .iter()
         .map(|(node, _, _)| *node)
         .chain(tail.having.iter().map(|(node, _)| *node))
         .collect();
+    // The grouping takes the claims of the nodes that disappear into it --
+    // except the ones that go to a filter it sinks, which carries its own.
+    let mut claims: Vec<ObligationId> = Vec::new();
     for node in &removed {
-        claims.extend(plan.nodes[*node].discharges.iter().copied());
+        claims.extend(
+            plan.nodes[*node]
+                .discharges
+                .iter()
+                .copied()
+                .filter(|claim| !sunk_claims.contains(claim)),
+        );
     }
     plan.nodes[group].discharges.extend(claims);
     plan.nodes[group].discharges.sort_unstable();
@@ -3092,6 +3193,15 @@ fn push_grouping(plan: &mut Plan, group: NodeId, tail: GroupingTail) {
     }
     plan.nodes = nodes;
     refresh_join_variables(plan);
+    // Below the grouping, which is now wherever the renumbering put it.
+    if !sinks.is_empty() {
+        let group = plan
+            .nodes
+            .iter()
+            .position(|node| matches!(node.op, PlanOp::Group { .. }))
+            .expect("the grouping this rule just pushed");
+        insert_filters_below(plan, group, sinks);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5419,6 +5529,122 @@ mod tests {
             "triple    ?s asset360:trafficKinds ?k",
         ),
     ];
+
+    /// A condition on a group key sinks below the grouping; one on a measure
+    /// stays a `HAVING`.
+    ///
+    /// Both halves are the same reasoning read in two directions. A key is a
+    /// column of every row, so the condition can be a `WHERE` -- and should
+    /// be, because it narrows before the grouping does its work. A measure has
+    /// no value until the rows are grouped, so it cannot.
+    ///
+    /// It is also what keeps the two statements comparable: today's planner
+    /// extracts these, and a condition the comparator finds in one plan and
+    /// not the other is a difference whether or not it changes the answer.
+    #[test]
+    fn a_condition_on_a_group_key_sinks_below_the_grouping() {
+        let schema = test_schema_view();
+
+        let plan = refined(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm HAVING (?nm > \"S\")",
+            &schema,
+            false,
+        );
+        let filters = plan.find("filter");
+        let [filter] = filters.as_slice() else {
+            panic!("the condition is a filter now:\n{plan}");
+        };
+        let group = plan.find("group")[0];
+        assert!(*filter < group, "and it is below the grouping:\n{plan}");
+        assert_eq!(
+            plan.nodes[*filter].op.describe(),
+            "(?s.name > \"S\")",
+            "as a condition on the column the key reads:\n{plan}"
+        );
+        assert!(
+            plan.nodes[group].op.describe().contains("measures"),
+            "{plan}"
+        );
+        assert!(
+            !plan.nodes[group].op.describe().contains("having"),
+            "nothing is left for the HAVING:\n{plan}"
+        );
+
+        // Both at once: the key sinks, the measure stays.
+        let plan = refined(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm HAVING (?nm > \"S\" && COUNT(*) > 1)",
+            &schema,
+            false,
+        );
+        assert_eq!(plan.find("filter").len(), 1, "{plan}");
+        let group = plan.find("group")[0];
+        assert!(
+            plan.nodes[group].op.describe().contains("having=[(?n >"),
+            "the measure's condition is the grouping's:\n{plan}"
+        );
+
+        // And on a multivalued key, where the column is one element: the
+        // filter has to be above the fan-out, and read the element the
+        // fan-out bound rather than the record's array.
+        let plan = refined(
+            "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?k } GROUP BY ?k HAVING (?k > \"F\")",
+            &schema,
+            false,
+        );
+        let filter = plan.find("filter")[0];
+        let unnest = plan.find("unnest")[0];
+        assert!(unnest < filter, "above the fan-out:\n{plan}");
+        assert_eq!(
+            plan.nodes[filter].op.describe(),
+            "(?s.trafficKinds[each] > \"F\")",
+            "reading the element, not the array:\n{plan}"
+        );
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "{plan}"
+        );
+    }
+
+    /// A type read into a variable beside a constant one still scans the
+    /// class.
+    ///
+    /// `?s a ?t . ?s a :CivilEngineeringAsset` (the subclass roll-up) wants
+    /// every asset of that class, which is what the scan fetches; the engine
+    /// binds `?t` from the instance's own types. An *intersection* of two
+    /// constant classes is a different question and still declines -- a
+    /// statement holding one of them counts every instance of it.
+    #[test]
+    fn a_variable_type_beside_a_constant_one_still_scans_the_class() {
+        let schema = test_schema_view();
+
+        let plan = refined(
+            "SELECT ?t (COUNT(*) AS ?c) WHERE { ?s a ?t . ?s a asset360:Signal } \
+             GROUP BY ?t",
+            &schema,
+            false,
+        );
+        let scans = plan.find("scan");
+        assert_eq!(scans.len(), 1, "the class is scanned:\n{plan}");
+        assert_eq!(plan.nodes[scans[0]].executor, Executor::Sql, "{plan}");
+        // And the grouping is not pushed: `?t` is not a column any scan binds,
+        // so this is a fetch the engine groups -- which is today's plan for
+        // this query.
+        let group = plan.find("group")[0];
+        assert_eq!(plan.nodes[group].executor, Executor::Engine, "{plan}");
+
+        let plan = refined(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; a asset360:Track }",
+            &schema,
+            false,
+        );
+        assert!(
+            plan.find("scan").is_empty(),
+            "an intersection of classes is not a scan of one:\n{plan}"
+        );
+    }
 
     /// Four spellings of "this one asset, by identifier", and one plan.
     ///
