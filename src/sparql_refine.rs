@@ -1053,6 +1053,20 @@ pub enum PlanOp {
         /// the unnest restoring a slot's fan-out is the one binding that
         /// slot's variable.
         var: String,
+        /// Whether the row survives a collection with no elements.
+        ///
+        /// [`SlotPresence::Required`] is a `CROSS JOIN LATERAL`: a record with
+        /// an empty array supplies no rows, which is what a required read
+        /// means. [`SlotPresence::Optional`] is a `LEFT JOIN LATERAL`: the
+        /// record answers once with the variable unbound, which is what an
+        /// `OPTIONAL` over a collection means -- and getting it wrong is a
+        /// smaller count with nothing to say a record was dropped.
+        ///
+        /// Stated on the fan-out as well as on the slot it fans out, for the
+        /// reason `reading` and `optional_side` are stated on a filter: a fact
+        /// a renderer has to fetch from another node is a fact it can forget
+        /// to fetch. The lowering refuses a plan where the two disagree.
+        presence: SlotPresence,
     },
     /// Solutions to triples.
     Construct {
@@ -1256,13 +1270,19 @@ pub fn scan_with_fanout(
     at: NodeId,
     discharges: Vec<ObligationId>,
 ) -> Vec<Node> {
-    // A *delivered* slot exposes no binding above the scan, so nothing counts
-    // its values and there is no multiplicity to restore. Fanning one out
-    // would multiply rows for a read nobody reads.
-    let fanning: Vec<(Vec<String>, String)> = slots
+    // A slot that *binds* a variable owes a fan-out, whatever its presence: a
+    // consumer counting solutions counts one per element. A delivered slot
+    // exposes no binding above the scan, so nothing counts its values and
+    // there is no multiplicity to restore -- fanning one out would multiply
+    // rows for a read nobody reads.
+    let fanning: Vec<(Vec<String>, String, SlotPresence)> = slots
         .iter()
-        .filter(|slot| slot.multivalued && slot.presence == SlotPresence::Required)
-        .filter_map(|slot| slot.var.clone().map(|var| (slot.path.clone(), var)))
+        .filter(|slot| slot.multivalued)
+        .filter_map(|slot| {
+            slot.var
+                .clone()
+                .map(|var| (slot.path.clone(), var, slot.presence))
+        })
         .collect();
     let mut out = vec![Node::sql(
         PlanOp::Scan {
@@ -1273,7 +1293,7 @@ pub fn scan_with_fanout(
         },
         discharges,
     )];
-    for (path, var) in fanning {
+    for (path, var, presence) in fanning {
         let input = at + out.len() - 1;
         out.push(Node::sql(
             PlanOp::Unnest {
@@ -1281,6 +1301,7 @@ pub fn scan_with_fanout(
                 star_var: star_var.to_owned(),
                 slot_path: path,
                 var,
+                presence,
             },
             Vec::new(),
         ));
@@ -1536,9 +1557,9 @@ impl Plan {
                 continue;
             };
             // Any read that *binds* a multivalued slot owes a fan-out,
-            // whatever its presence. An optional one would need the fan-out
-            // inside the optional side, which no rule builds -- so the shape
-            // is refused here rather than mis-rendered.
+            // whatever its presence. An optional one needs the fan-out inside
+            // the optional side, which is a `LEFT JOIN LATERAL` -- the
+            // presence on the [`PlanOp::Unnest`] is what says so.
             for slot in slots
                 .iter()
                 .filter(|slot| slot.multivalued && slot.var.is_some())

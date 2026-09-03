@@ -1849,18 +1849,20 @@ mod tests {
                 // regression the gate exists to refuse. Today answers it, by
                 // rendering the distinct away.
                 "SELECT (COUNT(DISTINCT *) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm }",
+             asset360:name ?nm }",
                 "leaves 'group",
             ),
             (
-                // A multivalued read inside an `OPTIONAL`, grouped.
-                // `AbsorbOptionalRead` declines it -- the fan-out would have
-                // to live inside the optional side, and an `Unnest` has no
-                // way to say that -- so the read stays a match and the
-                // grouping above it cannot push.
-                "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
-                 OPTIONAL { ?s asset360:trafficKinds ?k } } GROUP BY ?k",
-                "leaves 'group",
+                // An aggregate over a record the query named. Today answers it
+                // from the statement; the rules refuse to, because the writer
+                // emits no triple for an identifier and the engine's answer to
+                // such a query is empty -- so a statement that answered alone
+                // would be inventing one. Deliberately left as a fallback: the
+                // spelling is the user's decision to make, not the planner's.
+                "SELECT (COUNT(*) AS ?n) WHERE { \
+             <https://data.infrabel.be/asset360/sig-1> a asset360:Signal ; \
+             asset360:name ?nm }",
+                "identifier restriction",
             ),
         ] {
             let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");

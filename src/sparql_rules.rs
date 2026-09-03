@@ -1005,22 +1005,47 @@ impl Rule for AbsorbOptionalRead<'_> {
             let Some(delivered) = slots.iter().position(|slot| slot.path == path) else {
                 continue;
             };
-            if slots[delivered].multivalued || slots[delivered].var.is_some() {
+            if slots[delivered].var.is_some() {
                 continue;
             }
+            let multivalued = slots[delivered].multivalued;
 
             // Bind it. From here the column is the read: a value where there
             // is one, `NULL` where there is not.
             if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
-                slots[delivered].var = Some(var);
+                slots[delivered].var = Some(var.clone());
                 slots[delivered].presence = SlotPresence::Optional;
             }
+
             let mut claims = plan.nodes[right].discharges.clone();
             claims.extend(plan.nodes[id].discharges.iter().copied());
             plan.nodes[scan].discharges.extend(claims);
             plan.nodes[scan].discharges.sort_unstable();
 
             drop_optional_pair(plan, id, right, left);
+
+            // A collection read this way owes a fan-out, and an *optional*
+            // one: the record with no elements answers once with the variable
+            // unbound, which is a `LEFT JOIN LATERAL`. Without the fan-out a
+            // consumer counting solutions counts one per record; with a
+            // required one it drops the record entirely -- a smaller count
+            // with nothing to say it happened.
+            //
+            // After the drop, and the scan located again: dropping the pair
+            // renumbers the plan, and an insertion at a stale index is how a
+            // rewrite reparents a node onto the wrong input.
+            if multivalued {
+                let scan = plan
+                    .nodes
+                    .iter()
+                    .position(|node| {
+                        matches!(&node.op, PlanOp::Scan { star_var, slots, .. }
+                            if star_var == &star
+                                && slots.iter().any(|slot| slot.path == path))
+                    })
+                    .expect("the scan this rule just bound");
+                insert_unnest_above(plan, scan, &star, path, var);
+            }
             return true;
         }
         false
@@ -1071,6 +1096,46 @@ fn sinkable(visible: &Visible, condition: &Expr) -> Option<Expr> {
             reading: binding.reading,
         },
     ))
+}
+
+/// Insert an optional fan-out immediately above a scan.
+///
+/// Immediately above, because that is the earliest position: every consumer of
+/// the variable the fan-out binds comes later, and an unnest that sits above a
+/// grouping would count records where the query counts solutions
+/// ([`Plan::fanout_restored`] checks exactly that).
+fn insert_unnest_above(plan: &mut Plan, scan: NodeId, star: &str, path: Vec<String>, var: String) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() + 1);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        let mut op = node.op.clone();
+        op.map_inputs(|input| remap[input].expect("inputs precede their node"));
+        nodes.push(Node {
+            op,
+            executor: node.executor,
+            output: node.output,
+            discharges: node.discharges.clone(),
+        });
+        remap[old] = Some(nodes.len() - 1);
+        if old == scan {
+            let input = nodes.len() - 1;
+            nodes.push(Node::sql(
+                PlanOp::Unnest {
+                    input,
+                    star_var: star.to_owned(),
+                    slot_path: path.clone(),
+                    var: var.clone(),
+                    presence: SlotPresence::Optional,
+                },
+                Vec::new(),
+            ));
+            // Consumers of the scan read the fan-out instead: the rows they
+            // want are one per element, not one per record.
+            remap[old] = Some(nodes.len() - 1);
+        }
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
 }
 
 /// Insert filters immediately below a node, in order, each reading the one
@@ -4369,7 +4434,7 @@ mod tests {
     /// and the fifth invariant refuses that shape rather than trusting a rule
     /// to decline it, since any *bound* multivalued read owes an unnest.
     #[test]
-    fn a_delivered_array_does_not_fan_out() {
+    fn an_optional_array_is_absorbed_and_fans_out_optionally() {
         let schema = test_schema_view();
         let plan = refined(
             "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
@@ -4378,11 +4443,33 @@ mod tests {
             false,
         );
 
+        // The read is the scan's, bound to the variable, and optional.
         assert!(
-            scan_slots(&plan).contains(&("trafficKinds".to_owned(), String::new(), true)),
+            scan_slots(&plan).contains(&("trafficKinds".to_owned(), "k".to_owned(), true)),
             "{plan}"
         );
-        assert!(plan.find("unnest").is_empty(), "{plan}");
+        let PlanOp::Scan { slots, .. } = &plan.nodes[plan.find("scan")[0]].op else {
+            unreachable!()
+        };
+        let slot = slots
+            .iter()
+            .find(|slot| slot.path == ["trafficKinds".to_owned()])
+            .expect("the absorbed slot");
+        assert_eq!(slot.presence, SlotPresence::Optional, "{plan}");
+
+        // And the fan-out is optional too, which is the whole difficulty: a
+        // record with no kinds answers once with `?k` unbound, so the lateral
+        // has to be a `LEFT JOIN` -- a `CROSS JOIN` drops the record and the
+        // count comes out smaller with nothing to say it happened.
+        let unnests = plan.find("unnest");
+        let [unnest] = unnests.as_slice() else {
+            panic!("one fan-out, for the one collection read:\n{plan}");
+        };
+        let PlanOp::Unnest { presence, var, .. } = &plan.nodes[*unnest].op else {
+            unreachable!()
+        };
+        assert_eq!(*presence, SlotPresence::Optional, "{plan}");
+        assert_eq!(var, "k", "{plan}");
         plan.check()
             .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
         println!("{plan}");
@@ -5676,25 +5763,22 @@ mod tests {
     /// right about a column nothing binds, and the way to settle it was to
     /// make the node answer rather than to keep arguing about the ledger.
     ///
-    /// What remains is the two shapes absorption declines: a condition lifted
-    /// into the left join (which decides whether the *value* binds, not
-    /// whether the row survives) and a multivalued optional read (whose
-    /// fan-out would have to live inside the optional side). Both keep the
-    /// `match`, and the `match` keeps the claim.
-    const KNOWN_GAPS: &[(&str, &str)] = &[
-        (
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-             OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
-            "triple    ?s asset360:name ?nm",
-        ),
-        (
-            // The same gap, listed per query rather than folded in: a list of
-            // queries is what says whether the gap is one thing or several.
-            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-             OPTIONAL { ?s asset360:trafficKinds ?k } }",
-            "triple    ?s asset360:trafficKinds ?k",
-        ),
-    ];
+    /// **One entry left.** The multivalued optional read is absorbed now: the
+    /// fan-out it needed lives inside the optional side, which is a `LEFT JOIN
+    /// LATERAL`, and [`SlotPresence`] on the [`PlanOp::Unnest`] is what says
+    /// so.
+    ///
+    /// What remains is the one shape absorption declines: an optional read
+    /// with a condition lifted into the left join. The condition decides
+    /// whether the *value* binds rather than whether the row survives, so the
+    /// read stays a `match` -- and the `match` keeps the claim. `PushLeftJoin`
+    /// pushes the join anyway, without the condition, so the statement is
+    /// today's; the claim is the only difference left.
+    const KNOWN_GAPS: &[(&str, &str)] = &[(
+        "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+         OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
+        "triple    ?s asset360:name ?nm",
+    )];
 
     /// A condition on a group key sinks below the grouping; one on a measure
     /// stays a `HAVING`.
@@ -6852,6 +6936,7 @@ mod tests {
                         star_var: "s".to_owned(),
                         slot_path: vec!["name".to_owned()],
                         var: "nm".to_owned(),
+                        presence: SlotPresence::Required,
                     },
                     Vec::new(),
                 );
