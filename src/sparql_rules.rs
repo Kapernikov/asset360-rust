@@ -1,6 +1,14 @@
-//! Rules, a fixpoint driver, and tier one: fold matches into a scan, turn a
-//! constant object into a filter, push a comparison filter, push a reference
-//! join.
+//! Rules, a fixpoint driver, and tier one: fold matches into a scan, fold a
+//! nested read into a path, turn a constant object into a filter, turn a
+//! `VALUES` over a bound variable into one, push a comparison filter, push a
+//! reference join.
+//!
+//! Together they are at capability parity with the planner that serves
+//! queries today -- `the_refined_plan_claims_everything_todays_sql_pass_claims`
+//! holds them to it, over both what a plan *claims* and what conditions it
+//! pushes, with the two remaining gaps named in `KNOWN_GAPS` and beside
+//! [`Visible`]. That parity is the gate on executing these plans: switching
+//! onto a planner that pushed less would regress answers or lose pushdown.
 //!
 //! A rule is a function on a plan: match a shape, edit nodes, move claims.
 //! Applied to fixpoint in a fixed order, with every invariant re-checked after
@@ -24,8 +32,9 @@
 //! *superset* of the answer, and a constant compared against a column whose
 //! values never spell it that way selects nothing at all. The engine then
 //! re-runs the query over no instances and reports no answer. See
-//! [`constant_is_the_columns_term`], which asks the same question of a
-//! constant that the star decomposition does.
+//! [`Expr::to_sql`], the only way to obtain a condition, which asks the same
+//! question of a constant that the star decomposition does -- and which is why
+//! it takes a schema.
 //!
 //! One requirement runs through the rules and is not in 28d: **the order a
 //! query wrote its filters in must not decide the plan.** Obligations are per
