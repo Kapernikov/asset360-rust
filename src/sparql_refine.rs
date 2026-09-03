@@ -63,7 +63,7 @@
 //! [`Plan::fanout_restored`] catches the missing unnest that would otherwise
 //! only show up as a count of 1 where the answer was 3.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::fmt;
 
 use spargebra::Query;
@@ -382,39 +382,6 @@ impl Expr {
             | Self::Slot { .. }
             | Self::Function { .. }
             | Self::Opaque(_) => None,
-        }
-    }
-
-    /// Every variable this expression reads, for a rule that needs to know
-    /// what a filter depends on.
-    pub fn variables(&self) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        self.collect_variables(&mut out);
-        out
-    }
-
-    fn collect_variables(&self, out: &mut BTreeSet<String>) {
-        match self {
-            Self::Var(name) => {
-                out.insert(name.clone());
-            }
-            Self::Literal(_) | Self::Slot { .. } | Self::Opaque(_) => {}
-            Self::Compare { left, right, .. } => {
-                left.collect_variables(out);
-                right.collect_variables(out);
-            }
-            Self::In { value, candidates } => {
-                value.collect_variables(out);
-                for candidate in candidates {
-                    candidate.collect_variables(out);
-                }
-            }
-            Self::And(parts) | Self::Or(parts) | Self::Function { args: parts, .. } => {
-                for part in parts {
-                    part.collect_variables(out);
-                }
-            }
-            Self::Not(inner) => inner.collect_variables(out),
         }
     }
 }
@@ -1045,10 +1012,6 @@ impl Plan {
         self.nodes.last()
     }
 
-    pub fn root_id(&self) -> Option<NodeId> {
-        self.nodes.len().checked_sub(1)
-    }
-
     /// All five invariants, in the order a reader of 28d expects them.
     ///
     /// Cheap -- linear in the plan -- which is what makes checking after every
@@ -1112,10 +1075,6 @@ impl Plan {
             }
         }
         Ok(())
-    }
-
-    pub fn is_well_formed(&self) -> bool {
-        self.well_formed().is_ok()
     }
 
     /// **Invariant 3.** No `Sql` node above an `Engine` node.
@@ -1217,12 +1176,6 @@ impl Plan {
             .filter(|(_, node)| node.op.kind() == kind)
             .map(|(id, _)| id)
             .collect()
-    }
-
-    /// Whether SQL answers the whole question, with nothing left for the
-    /// engine.
-    pub fn sql_only(&self) -> bool {
-        !self.nodes.is_empty() && self.nodes.iter().all(|node| node.executor == Executor::Sql)
     }
 }
 
@@ -1940,21 +1893,6 @@ pub fn is_type_pattern(pattern: &TriplePattern) -> bool {
     predicate_iri(pattern) == Some(crate::sparql_scoper::RDF_TYPE)
 }
 
-/// Nodes reachable from `from` by following inputs, `from` included.
-pub fn descendants(plan: &Plan, from: NodeId) -> HashSet<NodeId> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![from];
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Some(node) = plan.nodes.get(id) {
-            stack.extend(node.op.inputs());
-        }
-    }
-    seen
-}
-
 /// Which nodes are connected to which by plain joins only.
 ///
 /// A rule that folds matches together has to know they are joined
@@ -1988,17 +1926,6 @@ pub fn inner_join_groups(plan: &Plan) -> Vec<usize> {
     }
     (0..plan.nodes.len())
         .map(|id| root_of(&mut group, id))
-        .collect()
-}
-
-/// A map from node id to the obligations it discharges, for a rule that moves
-/// claims between nodes.
-pub fn claims_of(plan: &Plan) -> HashMap<NodeId, Vec<ObligationId>> {
-    plan.nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| !node.discharges.is_empty())
-        .map(|(id, node)| (id, node.discharges.clone()))
         .collect()
 }
 

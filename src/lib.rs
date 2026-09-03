@@ -44,6 +44,7 @@ pub mod sparql_ops;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;
+pub mod sparql_rules;
 pub mod sparql_scoper;
 pub mod sparql_terms;
 
