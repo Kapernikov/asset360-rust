@@ -578,8 +578,10 @@ pub enum LoweringRefusal {
     /// not a row test: as a `WHERE` it deletes the row the join exists to
     /// keep, quietly and with a smaller answer.
     ///
-    /// `PushLeftJoin` declines the shape, and this is the second lock -- the
-    /// rule that forgets is the one this catches.
+    /// `PushLeftJoin` pushes the join and gives the condition up to the
+    /// residual, so no plan the rules build reaches here with one. This is the
+    /// second lock: the rule that starts carrying a condition it cannot apply
+    /// is the one this catches.
     PushedOptional { node: usize },
     /// A scan on the optional side of a left join. Same reason: the star is
     /// optional and this lowering would call it mandatory, which wraps its
@@ -2620,18 +2622,28 @@ mod tests {
             &sv,
         );
         let leftjoin = plan.find("leftjoin")[0];
+        // The rules push this join *without* the condition, which the engine
+        // then re-applies. Put the condition back, as a rule that had not
+        // thought about it would.
+        let condition = crate::sparql_refine::Expr::Compare {
+            op: crate::sparql_refine::CompareOp::Gt,
+            left: Box::new(crate::sparql_refine::Expr::Var("tn".to_owned())),
+            right: Box::new(crate::sparql_refine::Expr::Literal(
+                spargebra::term::Literal::new_simple_literal("A").into(),
+            )),
+        };
+        if let crate::sparql_refine::PlanOp::LeftJoin {
+            condition: slot, ..
+        } = &mut plan.nodes[leftjoin].op
+        {
+            *slot = Some(condition);
+        }
         assert_eq!(
             plan.nodes[leftjoin].executor,
-            crate::sparql_refine::Executor::Engine,
-            "the rule declines a lifted condition:\n{plan}"
+            crate::sparql_refine::Executor::Sql,
+            "the join itself is pushed:\n{plan}"
         );
 
-        // Push it anyway, as a rule that had not thought about the condition
-        // would.
-        plan.nodes[leftjoin].executor = crate::sparql_refine::Executor::Sql;
-        for input in plan.nodes[leftjoin].op.inputs() {
-            plan.nodes[input].executor = crate::sparql_refine::Executor::Sql;
-        }
         let refusal = lower_refined(&plan, &sv, None)
             .expect_err("a lifted condition must not be rendered as a WHERE");
         assert!(

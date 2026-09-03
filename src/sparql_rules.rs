@@ -2683,9 +2683,7 @@ impl Rule for PushLeftJoin<'_> {
             else {
                 continue;
             };
-            if condition.is_some() {
-                continue;
-            }
+            let lifted = condition.is_some();
             let (left, right) = (*left, *right);
             if plan.nodes[left].executor != Executor::Sql
                 || plan.nodes[right].executor != Executor::Sql
@@ -2706,8 +2704,38 @@ impl Rule for PushLeftJoin<'_> {
                 continue;
             };
             plan.nodes[id].executor = Executor::Sql;
-            if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
+            if let PlanOp::LeftJoin {
+                reference,
+                condition,
+                ..
+            } = &mut plan.nodes[id].op
+            {
                 *reference = Some(edge);
+                // A lifted condition stays with the engine, and the plan says
+                // so by giving it up rather than by carrying it unrendered.
+                //
+                // The condition decides whether the optional side *matched*,
+                // which is a conditional binding and not a row test: as a
+                // `WHERE` it deletes the row the join exists to keep, and this
+                // renderer has no `ON` clause to put it in. So the join goes
+                // to SQL without it and the obligation goes to the residual --
+                // the engine re-runs the whole query, and a left join that
+                // matches too generously still fetches a superset of the
+                // records the answer needs. Which is today's statement for
+                // this query, exactly: a join, two scans, and no condition.
+                //
+                // What is *not* sound is answering from this statement, and
+                // that is already refused elsewhere: an unclaimed obligation
+                // means `admit_alone` declines, so the rows can only ever be a
+                // fetch.
+                if lifted {
+                    *condition = None;
+                }
+            }
+            if lifted {
+                let claims = std::mem::take(&mut plan.nodes[id].discharges);
+                plan.residual.extend(claims);
+                plan.residual.sort_unstable();
             }
             return true;
         }
@@ -6123,19 +6151,6 @@ mod tests {
                 .any(|id| plan.nodes[*id].executor == Executor::Sql)
         };
 
-        // A lifted condition decides whether the optional side *matched*: a
-        // signal whose track is named "A" is still an answer, with the name
-        // unbound. As a `WHERE` that row is deleted -- an inner join wearing a
-        // left join's clothes.
-        assert!(
-            !pushed(
-                "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-                 OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
-                 FILTER(?tn > \"A\") } }"
-            ),
-            "a lifted condition"
-        );
-
         // No reference between the two sides: the optional block is unrelated,
         // and joining unrelated row sets multiplies them.
         assert!(
@@ -6146,6 +6161,61 @@ mod tests {
             ),
             "no reference edge"
         );
+    }
+
+    /// A lifted condition goes to the engine, and the join still pushes.
+    ///
+    /// The condition decides whether the optional side *matched*, which is a
+    /// conditional binding and not a row test: as a `WHERE` it deletes the row
+    /// the join exists to keep, and this renderer has no `ON` clause to put it
+    /// in. So the plan gives the condition up -- to the residual, where an
+    /// obligation nobody claims is the engine's -- and keeps the join, which
+    /// is a left join that matches too generously and therefore fetches a
+    /// superset of the records the answer needs. That is today's statement for
+    /// this query, exactly.
+    ///
+    /// Giving it up rather than carrying it unrendered is the load-bearing
+    /// part: a plan that held a condition it does not apply would have to be
+    /// read carefully to be understood, and the ledger would say the work was
+    /// accounted for.
+    #[test]
+    fn a_lifted_condition_goes_to_the_engine_and_the_join_still_pushes() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
+             FILTER(?tn > \"A\") } }",
+            &schema,
+            false,
+        );
+        let leftjoin = plan.find("leftjoin")[0];
+        assert_eq!(plan.nodes[leftjoin].executor, Executor::Sql, "{plan}");
+        let PlanOp::LeftJoin { condition, .. } = &plan.nodes[leftjoin].op else {
+            unreachable!()
+        };
+        assert!(
+            condition.is_none(),
+            "the plan does not carry a condition it will not apply:\n{plan}"
+        );
+        assert!(
+            plan.nodes[leftjoin].discharges.is_empty(),
+            "and it claims nothing for it:\n{plan}"
+        );
+        assert_eq!(
+            plan.residual.len(),
+            1,
+            "the condition is unaccounted for, which is what the residual is \
+             for:\n{plan}"
+        );
+        assert!(
+            plan.obligations[plan.residual[0]]
+                .to_string()
+                .contains("(?tn > \"A\")"),
+            "{plan}"
+        );
+        // And the invariants hold, including the ledger: an obligation in the
+        // residual is claimed once, there.
+        plan.check().expect("the plan is well formed");
     }
 
     /// A condition inside the `OPTIONAL` is marked as belonging to the

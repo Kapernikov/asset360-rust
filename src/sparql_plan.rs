@@ -1853,14 +1853,14 @@ mod tests {
                 "leaves 'group",
             ),
             (
-                // An `OPTIONAL` whose condition is lifted into the left join.
-                // `PushLeftJoin` declines it -- the condition decides whether
-                // the optional side matched, not whether the row survives --
-                // so the frontier is two islands and not a statement.
-                "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-                 OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
-                 FILTER(?tn > \"A\") } }",
-                "not lowerable",
+                // A multivalued read inside an `OPTIONAL`, grouped.
+                // `AbsorbOptionalRead` declines it -- the fan-out would have
+                // to live inside the optional side, and an `Unnest` has no
+                // way to say that -- so the read stays a match and the
+                // grouping above it cannot push.
+                "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:trafficKinds ?k } } GROUP BY ?k",
+                "leaves 'group",
             ),
         ] {
             let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
