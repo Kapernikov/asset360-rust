@@ -46,7 +46,7 @@ use spargebra::term::{Term, TermPattern, TriplePattern};
 
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
-    CompareOp, Executor, Expr, Node, NodeId, Plan, PlanOp, ScanSlot, SlotReading,
+    CompareOp, Executor, Expr, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot, SlotReading,
     inner_join_groups, is_type_pattern, object_variable, predicate_iri, scan_with_fanout,
     subject_variable, type_class_iri,
 };
@@ -725,7 +725,10 @@ impl Rule for ConstantObjectBecomesFilter<'_> {
             let [consumer] = above.as_slice() else {
                 continue;
             };
-            let PlanOp::Join { left, right, on } = &plan.nodes[*consumer].op else {
+            let PlanOp::Join {
+                left, right, on, ..
+            } = &plan.nodes[*consumer].op
+            else {
                 continue;
             };
             if on.as_slice() != [star.clone()] {
@@ -1098,12 +1101,12 @@ fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
 /// exactly that pair, so the rule reads the join's variable and asks which
 /// side is which.
 ///
-/// The direction is not recorded on the node, and that is deliberate: `on`
-/// plus the two scans determine it, which is the derivation this rule performs
-/// and any consumer can repeat. Recording it would be a change to the
-/// representation, and the fact worth recording is the one an invariant could
-/// then check -- which this one is not, since a wrong direction is a wrong
-/// answer no invariant of a plan can see.
+/// The direction is recorded on the node as a [`ReferenceEdge`], so a consumer
+/// does not repeat the derivation this rule performed -- a derivation performed
+/// twice is where a renderer comes to disagree with the plan it renders. What
+/// an invariant can then check is *agreement* with the scans below
+/// ([`Plan::reference_joins_agree`]); that a slot really is a foreign key is
+/// this rule's question, asked of the schema.
 ///
 /// Preconditions, each with the wrong answer it prevents:
 ///
@@ -1135,25 +1138,32 @@ impl<'s> PushReferenceJoin<'s> {
         Self { schema }
     }
 
-    /// Whether a scan feeding `holder` binds `joined` to a single-valued
-    /// reference slot of its own class -- the foreign key side of the edge.
-    fn holds_the_foreign_key(&self, plan: &Plan, holder: NodeId, joined: &str) -> bool {
+    /// The star and slot on the foreign-key side of the edge: a scan feeding
+    /// `holder` that binds `joined` to a single-valued reference slot of its
+    /// own class.
+    fn foreign_key_on(
+        &self,
+        plan: &Plan,
+        holder: NodeId,
+        joined: &str,
+    ) -> Option<(String, String)> {
         plan.nodes
             .iter()
             .enumerate()
-            .any(|(id, node)| match &node.op {
+            .find_map(|(id, node)| match &node.op {
                 PlanOp::Scan {
-                    class_uri, slots, ..
-                } => {
-                    node.executor == Executor::Sql
-                        && plan.feeds(id, holder)
-                        && slots.iter().any(|slot| {
-                            slot.var == joined
-                                && !slot.multivalued
-                                && self.stores_a_reference(class_uri, &slot.slot)
-                        })
-                }
-                _ => false,
+                    star_var,
+                    class_uri,
+                    slots,
+                } if node.executor == Executor::Sql && plan.feeds(id, holder) => slots
+                    .iter()
+                    .find(|slot| {
+                        slot.var == joined
+                            && !slot.multivalued
+                            && self.stores_a_reference(class_uri, &slot.slot)
+                    })
+                    .map(|slot| (star_var.clone(), slot.slot.clone())),
+                _ => None,
             })
     }
 
@@ -1185,7 +1195,10 @@ impl Rule for PushReferenceJoin<'_> {
             // A left join is a different operator, and no rule pushes one: the
             // preserved side keeps rows the optional side did not match, which
             // is not what an inner join on the foreign key returns.
-            let PlanOp::Join { left, right, on } = &plan.nodes[id].op else {
+            let PlanOp::Join {
+                left, right, on, ..
+            } = &plan.nodes[id].op
+            else {
                 continue;
             };
             let (left, right) = (*left, *right);
@@ -1216,10 +1229,20 @@ impl Rule for PushReferenceJoin<'_> {
                 continue;
             };
             let holder = if referenced == left { right } else { left };
-            if !self.holds_the_foreign_key(plan, holder, &joined) {
+            let Some((holder_star, slot)) = self.foreign_key_on(plan, holder, &joined) else {
                 continue;
-            }
+            };
             plan.nodes[id].executor = Executor::Sql;
+            // Recorded, not left to be re-derived: see [`ReferenceEdge`]. The
+            // agreement invariant reads it back against these same scans, so a
+            // rule that recorded the direction backwards fails at the rule.
+            if let PlanOp::Join { reference, .. } = &mut plan.nodes[id].op {
+                *reference = Some(ReferenceEdge {
+                    referenced: joined,
+                    holder: holder_star,
+                    slot,
+                });
+            }
             return true;
         }
         false
@@ -1685,6 +1708,127 @@ mod tests {
             "the projection is still the engine's:\n{plan}"
         );
         println!("{plan}");
+    }
+
+    /// The pushed join records which side holds the foreign key, in the
+    /// vocabulary `JoinEdge` uses, so a consumer does not repeat the
+    /// derivation the rule already performed.
+    #[test]
+    fn a_pushed_join_records_the_reference_it_joins_on() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushReferenceJoin::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        let join = plan.find("join")[0];
+        let PlanOp::Join {
+            reference: Some(edge),
+            ..
+        } = &plan.nodes[join].op
+        else {
+            panic!("a pushed join carries its edge:\n{plan}");
+        };
+        assert_eq!(edge.referenced, "t", "{plan}");
+        assert_eq!(edge.holder, "s", "{plan}");
+        assert_eq!(edge.slot, "locatedOnTrack", "{plan}");
+        // And it is in the printout, because a reader checking a plan should
+        // not have to reconstruct the direction either.
+        assert!(
+            plan.nodes[join]
+                .op
+                .describe()
+                .contains("via ?s.locatedOnTrack"),
+            "{plan}"
+        );
+
+        // A join no rule pushed records nothing: a natural join on a shared
+        // variable is not necessarily a reference.
+        let mut value_join = plan_of(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             ?t a asset360:Track ; asset360:hasName ?nm }",
+        );
+        refine(
+            &mut value_join,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushReferenceJoin::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+        assert!(
+            matches!(
+                &value_join.nodes[value_join.find("join")[0]].op,
+                PlanOp::Join {
+                    reference: None,
+                    ..
+                }
+            ),
+            "{value_join}"
+        );
+    }
+
+    /// The sixth invariant. A recorded direction cannot be checked against the
+    /// *schema* by a plan -- whether a slot is a foreign key is the rule's
+    /// question -- but it can be checked against the scans the join joins, and
+    /// a wrong direction is otherwise a wrong join in a plan every other
+    /// invariant passes.
+    #[test]
+    fn a_reference_edge_that_disagrees_with_the_scans_is_a_defect() {
+        /// Turns the edge around: `?t` holds no `locatedOnTrack`, so the
+        /// recorded holder is not the scan that bound the joined variable.
+        struct ReversesTheEdge;
+        impl Rule for ReversesTheEdge {
+            fn name(&self) -> &'static str {
+                "reverses_the_edge"
+            }
+            fn apply(&self, plan: &mut Plan) -> bool {
+                for node in &mut plan.nodes {
+                    if let PlanOp::Join {
+                        reference: Some(edge),
+                        ..
+                    } = &mut node.op
+                    {
+                        std::mem::swap(&mut edge.referenced, &mut edge.holder);
+                    }
+                }
+                // Reports no change, so the driver's result check is what has
+                // to catch it.
+                false
+            }
+        }
+
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushReferenceJoin::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        let failure = refine(&mut plan, &[&ReversesTheEdge])
+            .expect_err("a reversed edge must not be handed back");
+        assert!(
+            matches!(
+                failure.defect,
+                crate::sparql_refine::PlanDefect::MisrecordedJoin { .. }
+            ),
+            "{failure}"
+        );
     }
 
     /// A left join is a different operator and no rule pushes one, even with

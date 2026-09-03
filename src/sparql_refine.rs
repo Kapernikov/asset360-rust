@@ -762,6 +762,30 @@ pub struct ScanSlot {
     pub multivalued: bool,
 }
 
+/// The reference a pushed join joins on, recorded rather than re-derived.
+///
+/// The same edge as [`crate::sparql_scoper::JoinEdge`], whose `left` is the
+/// referenced star, `right` the star holding the foreign key and `right_slot`
+/// the slot holding it -- named here for what each is, because "left" and
+/// "right" also name the sides of the plan node and the two need not line up.
+///
+/// A rule could leave this out: `on` plus the scans below determine it, which
+/// is the derivation the rule performs. Recording it means a consumer does not
+/// repeat that derivation -- and a derivation performed twice is where a
+/// renderer comes to disagree with the plan it is rendering. It also gives
+/// [`Plan::reference_joins_agree`] something to check, so a rule that records
+/// the wrong direction fails at the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceEdge {
+    /// The star whose records are referenced: its identifier is the value the
+    /// foreign key holds.
+    pub referenced: String,
+    /// The star holding the foreign key.
+    pub holder: String,
+    /// The slot on `holder` whose value is `referenced`'s identifier.
+    pub slot: String,
+}
+
 /// One step of a plan.
 ///
 /// Inputs are node indices, so the tree is a flat vector and a rewrite is an
@@ -797,6 +821,13 @@ pub enum PlanOp {
         left: NodeId,
         right: NodeId,
         on: Vec<String>,
+        /// The reference edge this join joins on, once a rule has pushed it.
+        ///
+        /// `None` in a naive plan and on any join no rule pushed: a natural
+        /// join on a shared variable is not necessarily a reference, and
+        /// recording one that is not is what
+        /// [`Plan::reference_joins_agree`] refuses.
+        reference: Option<ReferenceEdge>,
     },
     /// `OPTIONAL`, as an operator rather than a plan-level node.
     LeftJoin {
@@ -1164,6 +1195,12 @@ pub enum PlanDefect {
     StrayFanout {
         unnest: NodeId,
     },
+    /// A join whose recorded [`ReferenceEdge`] is not what the scans below it
+    /// say. Not one of 28d's, and the invariant that exists because the plan
+    /// now records the direction rather than leaving it to be re-derived.
+    MisrecordedJoin {
+        join: NodeId,
+    },
 }
 
 impl fmt::Display for PlanDefect {
@@ -1193,6 +1230,10 @@ impl fmt::Display for PlanDefect {
                 "n{scan} folded the multivalued slot '{slot}' without the unnest \
                  that binds its variable, so a record with several values counts once"
             ),
+            Self::MisrecordedJoin { join } => write!(
+                f,
+                "n{join} records a reference edge the scans below it do not support"
+            ),
             Self::StrayFanout { unnest } => write!(
                 f,
                 "n{unnest} fans out a slot no scan below it read as multivalued, \
@@ -1208,7 +1249,9 @@ impl Plan {
         self.nodes.last()
     }
 
-    /// All five invariants, in the order a reader of 28d expects them.
+    /// All six invariants, in the order a reader of 28d expects them: its four,
+    /// the fan-out one stage 1 added, and the join-agreement one stage 2 added
+    /// with [`ReferenceEdge`].
     ///
     /// Cheap -- linear in the plan -- which is what makes checking after every
     /// single rule application affordable, and the difference between a rule
@@ -1218,7 +1261,8 @@ impl Plan {
         self.well_formed()?;
         self.frontier_is_a_cut()?;
         self.root_matches_form()?;
-        self.fanout_restored()
+        self.fanout_restored()?;
+        self.reference_joins_agree()
     }
 
     /// **Invariant 1.** Every obligation appears exactly once, in a node or in
@@ -1393,6 +1437,56 @@ impl Plan {
         Ok(())
     }
 
+    /// **Invariant 6.** A recorded reference edge says what the scans below
+    /// say.
+    ///
+    /// The direction is a fact about the schema, so no invariant can tell that
+    /// a *slot* is really a foreign key -- that is the pushing rule's job,
+    /// asked of the same `SlotInlineMode::Reference` the star decomposition
+    /// uses. What is checkable, and what would otherwise be a wrong join in a
+    /// plan every invariant passed, is *agreement*: the referenced star is
+    /// scanned on one side, the holder on the other, the recorded slot is the
+    /// one that scan bound to the joined variable, and the join is on that
+    /// variable and nothing else.
+    pub fn reference_joins_agree(&self) -> Result<(), PlanDefect> {
+        for (id, node) in self.nodes.iter().enumerate() {
+            let PlanOp::Join {
+                left,
+                right,
+                on,
+                reference: Some(edge),
+            } = &node.op
+            else {
+                continue;
+            };
+            let scanned_on = |side: NodeId, star: &str| -> Option<&Vec<ScanSlot>> {
+                self.nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(scan, below)| match &below.op {
+                        PlanOp::Scan {
+                            star_var, slots, ..
+                        } if star_var == star && self.feeds(scan, side) => Some(slots),
+                        _ => None,
+                    })
+            };
+            let holds_the_key = |side: NodeId| {
+                scanned_on(side, &edge.holder).is_some_and(|slots| {
+                    slots
+                        .iter()
+                        .any(|slot| slot.slot == edge.slot && slot.var == edge.referenced)
+                })
+            };
+            let agrees = on.as_slice() == [edge.referenced.clone()]
+                && ((scanned_on(*left, &edge.referenced).is_some() && holds_the_key(*right))
+                    || (scanned_on(*right, &edge.referenced).is_some() && holds_the_key(*left)));
+            if !agrees {
+                return Err(PlanDefect::MisrecordedJoin { join: id });
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `lower`'s rows reach `upper`, following inputs.
     pub fn feeds(&self, lower: NodeId, upper: NodeId) -> bool {
         if lower == upper {
@@ -1495,12 +1589,21 @@ impl PlanOp {
                     .join(" "),
                 rows.len()
             ),
-            PlanOp::Join { left, right, on } => format!(
-                "n{left}, n{right}  on {}",
+            PlanOp::Join {
+                left,
+                right,
+                on,
+                reference,
+            } => format!(
+                "n{left}, n{right}  on {}{}",
                 on.iter()
                     .map(|var| format!("?{var}"))
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join(" "),
+                match reference {
+                    Some(edge) => format!("  via ?{}.{}", edge.holder, edge.slot),
+                    None => String::new(),
+                }
             ),
             PlanOp::LeftJoin {
                 left,
@@ -2108,7 +2211,16 @@ impl Builder<'_> {
             .cloned()
             .collect();
         let vars: BTreeSet<String> = self.vars[left].union(&self.vars[right]).cloned().collect();
-        self.push(PlanOp::Join { left, right, on }, Vec::new(), vars)
+        self.push(
+            PlanOp::Join {
+                left,
+                right,
+                on,
+                reference: None,
+            },
+            Vec::new(),
+            vars,
+        )
     }
 }
 
