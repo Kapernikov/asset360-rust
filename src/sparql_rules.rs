@@ -46,9 +46,9 @@ use spargebra::term::{Term, TermPattern, TriplePattern};
 
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
-    CompareOp, Executor, Expr, Node, NodeId, Plan, PlanOp, ScanSlot, inner_join_groups,
-    is_type_pattern, object_variable, predicate_iri, scan_with_fanout, subject_variable,
-    type_class_iri,
+    CompareOp, Executor, Expr, Node, NodeId, Plan, PlanOp, ScanSlot, SlotReading,
+    inner_join_groups, is_type_pattern, object_variable, predicate_iri, scan_with_fanout,
+    subject_variable, type_class_iri,
 };
 
 /// One rewrite.
@@ -471,13 +471,16 @@ fn joined_in(nodes: &[Node], lower: NodeId, upper: NodeId) -> bool {
 // What an `Sql` scan makes visible
 // ---------------------------------------------------------------------------
 
-/// One variable an `Sql` [`PlanOp::Scan`] binds to a slot of its record.
+/// One variable an `Sql` [`PlanOp::Scan`] binds to a slot of its record, and
+/// which value at that address the variable stands for.
 struct SlotBinding {
     star_var: String,
     slot: String,
-    /// Whether the slot holds an array. Carried because a condition on one is
-    /// not a condition on a column -- see [`PushComparisonFilter`].
-    multivalued: bool,
+    /// [`SlotReading::Column`] for a single-valued slot, and
+    /// [`SlotReading::BoundElement`] for a multivalued one whose
+    /// [`PlanOp::Unnest`] is below the node being asked -- the variable then
+    /// stands for one element, which is what SPARQL bound it to.
+    reading: SlotReading,
 }
 
 /// The variables the `Sql` scans feeding a node have bound, and what to.
@@ -524,10 +527,26 @@ impl Visible {
             // resolving `?s` through some other star's slot of the same name.
             slots.insert(star_var.clone(), None);
             for slot in scan_slots {
+                // A multivalued slot's variable is one *element*, and it is
+                // the unnest below that bound it. Without the unnest under
+                // this node the element has no name here -- the fan-out has
+                // not happened yet -- so the variable resolves to nothing
+                // rather than to the array, which would select records where
+                // the query selects rows.
+                let reading = if slot.multivalued {
+                    if unnest_below(plan, base, star_var, &slot.slot, &slot.var) {
+                        SlotReading::BoundElement
+                    } else {
+                        slots.insert(slot.var.clone(), None);
+                        continue;
+                    }
+                } else {
+                    SlotReading::Column
+                };
                 let binding = SlotBinding {
                     star_var: star_var.clone(),
                     slot: slot.slot.clone(),
-                    multivalued: slot.multivalued,
+                    reading,
                 };
                 match slots.entry(slot.var.clone()) {
                     Entry::Vacant(entry) => {
@@ -545,13 +564,27 @@ impl Visible {
         }
     }
 
-    /// The slot a variable reads, when exactly one single-valued slot does.
+    /// The slot a variable reads, when exactly one does.
     fn slot_of(&self, var: &str) -> Option<&SlotBinding> {
         match self.slots.get(var) {
-            Some(Some(binding)) if !binding.multivalued => Some(binding),
+            Some(Some(binding)) => Some(binding),
             _ => None,
         }
     }
+}
+
+/// Whether the unnest that bound `var` to an element of `star.slot` is at or
+/// below `node`.
+fn unnest_below(plan: &Plan, node: NodeId, star: &str, slot: &str, var: &str) -> bool {
+    plan.nodes.iter().enumerate().any(|(id, above)| {
+        matches!(
+            &above.op,
+            PlanOp::Unnest { star_var, slot_path, var: bound, .. }
+                if star_var == star
+                    && slot_path.as_slice() == std::slice::from_ref(&slot.to_owned())
+                    && bound == var
+        ) && plan.feeds(id, node)
+    })
 }
 
 /// Every node that reads `id`.
@@ -596,10 +629,12 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
 ///   `?s` unbound against a match that binds it *keeps* the row, so a scan
 ///   reached through the optional side of a left join is not a row set this
 ///   constraint can be moved onto.
-/// * **The slot is single-valued.** `:trafficKinds "m"` asks whether the array
-///   *contains* the value, which is not what a condition naming the column
-///   says. See [`PushComparisonFilter`] for why that ambiguity is declined
-///   rather than guessed.
+/// * **A multivalued slot is a containment test, not a column.**
+///   `:trafficKinds "m"` asks whether the record carries that triple at all,
+///   which matches a record once however many values it holds -- so the
+///   condition is [`SlotReading::AnyElement`] and the rewrite is still
+///   cardinality-preserving. Rendering it as an equality on the column would
+///   compare the array's text and match nothing.
 /// * **The constant is the term the column's values render as.** See
 ///   [`constant_is_the_columns_term`]. Without it this rule would be the one
 ///   that turns "no record renders as `eul:GSA`" into "no rows", which is a
@@ -629,14 +664,24 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
         let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
         let on_class = class.slot(&Identifier::Name(slot.name.clone()))?;
-        if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue {
-            return None;
-        }
+        // A constant object on a multivalued slot is a containment test, and
+        // *not* a fan-out: `?s :trafficKinds "m"` binds nothing, so a record
+        // whose array carries the value answers the query once however many
+        // values it holds. That is what makes replacing the match with a
+        // filter cardinality-preserving here, and it is the reading the star
+        // decomposition's renderer already performs.
+        let reading = if on_class.determine_slot_container_mode() == SlotContainerMode::SingleValue
+        {
+            SlotReading::Column
+        } else {
+            SlotReading::AnyElement
+        };
         let condition = Expr::Compare {
             op: CompareOp::Eq,
             left: Box::new(Expr::Slot {
                 star_var: star.to_owned(),
                 slot_path: vec![slot.name.clone()],
+                reading,
             }),
             right: Box::new(Expr::Literal(term.clone())),
         };
@@ -800,18 +845,16 @@ fn replace_match_with_filter(
 ///
 /// Preconditions, each with the wrong answer it prevents:
 ///
-/// * **Every variable resolves to exactly one single-valued slot of a scan
-///   that feeds the landing site.** A variable two stars bind is a value join,
-///   and naming either column answers a different question. A variable bound
-///   by a *multivalued* slot is worse than ambiguous: the same
-///   `(star, slot_path)` address means the array below its [`PlanOp::Unnest`]
-///   and one element above it, so a condition carrying that address means one
-///   thing to a renderer reading it as a column and another to one reading it
-///   after the fan-out -- a containment test and an equality, which select
-///   different rows. That ambiguity is a missing fact in the representation
-///   (nothing names the *element*), and 28d's own lesson is that a rule facing
-///   one should not paper over it: this declines until an unnest binds the
-///   element.
+/// * **Every variable resolves to exactly one slot of a scan that feeds the
+///   landing site.** A variable two stars bind is a value join, and naming
+///   either column answers a different question. A variable bound by a
+///   *multivalued* slot resolves to [`SlotReading::BoundElement`] -- the
+///   element its [`PlanOp::Unnest`] bound -- and only when that unnest is
+///   below the landing site; before the fan-out the element has no name, and
+///   naming the array instead would select records where the query selects
+///   rows. This declined altogether until the unnest carried the variable it
+///   binds, which is 28d's lesson twice over: the rule could not be written
+///   safely because the representation was missing a fact.
 /// * **The constant is the term the column's values render as.** See
 ///   [`constant_is_the_columns_term`]: the pushed-conditions-only-narrow
 ///   argument fails for a constant no stored value spells.
@@ -1015,6 +1058,7 @@ fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
             Expr::Slot {
                 star_var: binding.star_var.clone(),
                 slot_path: vec![binding.slot.clone()],
+                reading: binding.reading,
             }
         }
         Expr::Literal(term) => Expr::Literal(term.clone()),
@@ -1903,28 +1947,6 @@ mod tests {
         println!("{plan}");
     }
 
-    /// A constant on a multivalued slot asks whether the array contains the
-    /// value, which is not what a condition naming the column says -- and the
-    /// scan's own fold declines it too, so the match stays whole.
-    #[test]
-    fn a_constant_on_a_multivalued_slot_stays_a_match() {
-        let schema = test_schema_view();
-        let mut plan =
-            plan_of("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }");
-        refine(
-            &mut plan,
-            &[
-                &FoldMatchesIntoScan::new(&schema),
-                &ConstantObjectBecomesFilter::new(&schema),
-                &PushComparisonFilter::new(&schema),
-            ],
-        )
-        .expect("every invariant holds");
-
-        assert_eq!(plan.find("match").len(), 1, "{plan}");
-        assert!(plan.find("filter").is_empty(), "{plan}");
-    }
-
     /// The same term test the filter rule applies, at the point the constant
     /// enters the plan: an enum column stores `GSA` and its values render as
     /// `eul:GSA`, so neither spelling is a condition on the column.
@@ -2180,14 +2202,16 @@ mod tests {
         assert_eq!(plan.nodes[filter].executor, Executor::Engine, "{plan}");
     }
 
-    /// A variable bound by a multivalued slot is not a column. The same
-    /// `(star, slot_path)` address means the array below its unnest and one
-    /// element above it, and a condition carrying it would be a containment
-    /// test to one reader and an equality to another -- different rows. The
-    /// missing fact is a name for the element, which is a change to the
-    /// representation and not to this rule.
+    /// A variable bound by a multivalued slot stands for one *element* -- the
+    /// one the unnest below bound -- so the condition is on the element and
+    /// selects rows, which is what SPARQL means: one solution per matching
+    /// value, not every value of a matching record.
+    ///
+    /// This declined until the plan could say which of the three values at
+    /// `(?s, [trafficKinds])` a condition meant. The unnest now names the
+    /// variable it binds, so `[each]` has something to refer to.
     #[test]
-    fn a_comparison_on_a_multivalued_slot_is_not_pushed() {
+    fn a_comparison_on_a_multivalued_slot_is_pushed_as_the_element() {
         let schema = test_schema_view();
         let mut plan = plan_of(
             "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
@@ -2202,16 +2226,90 @@ mod tests {
         )
         .expect("every invariant holds");
 
+        let filter = plan.find("filter")[0];
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
         assert_eq!(
-            plan.nodes[plan.find("filter")[0]].executor,
-            Executor::Engine,
+            plan.nodes[filter].op.describe(),
+            "(?s.trafficKinds[each] = \"m\")",
+            "the condition is on the element, not on the array:\n{plan}"
+        );
+        // ...and the element it names is the one the unnest below bound.
+        let unnest = plan.find("unnest")[0];
+        assert_eq!(
+            plan.nodes[unnest].op.describe(),
+            "?s.trafficKinds → ?k",
             "{plan}"
         );
+        assert!(plan.feeds(unnest, filter), "{plan}");
+        println!("{plan}");
+    }
+
+    /// A constant object on a multivalued slot is the other reading: it binds
+    /// nothing, so a record whose array carries the value answers once however
+    /// many values it holds. That is a containment test -- what the star
+    /// decomposition's renderer already performs -- and there is no unnest,
+    /// because there is no fan-out to restore.
+    #[test]
+    fn a_constant_on_a_multivalued_slot_is_pushed_as_containment() {
+        let schema = test_schema_view();
+        let mut plan =
+            plan_of("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }");
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &ConstantObjectBecomesFilter::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert!(plan.find("match").is_empty(), "{plan}");
+        let filter = plan.find("filter")[0];
         assert_eq!(
-            plan.nodes[plan.find("scan")[0]].executor,
-            Executor::Sql,
-            "the scan still folds it; only the condition on it declines:\n{plan}"
+            plan.nodes[filter].op.describe(),
+            "(?s.trafficKinds[any] = \"m\")",
+            "{plan}"
         );
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        assert!(
+            plan.find("unnest").is_empty(),
+            "a constant read does not fan out, so nothing has to restore it:\n{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// Both readings of one slot in one query, which is the case that shows
+    /// they are different questions rather than two spellings of one.
+    ///
+    /// `:trafficKinds "m" ; :trafficKinds ?k` asks for records carrying "m",
+    /// once per value of `?k`. So the constant is a containment test on the
+    /// record and the variable is an element the unnest bound -- and the star
+    /// decomposition refuses this shape outright
+    /// (`Inexact::ConstantAndVariableOnSlot`) because one `Star` cannot say
+    /// both about one slot.
+    #[test]
+    fn one_multivalued_slot_can_carry_both_readings() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" ; \
+             asset360:trafficKinds ?k }",
+        );
+        let rules = tier_one_rules(&schema);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        refine(&mut plan, &borrowed).expect("every invariant holds");
+
+        assert_eq!(plan.find("unnest").len(), 1, "{plan}");
+        assert_eq!(
+            plan.find("filter")
+                .into_iter()
+                .map(|id| plan.nodes[id].op.describe())
+                .collect::<Vec<_>>(),
+            vec!["(?s.trafficKinds[any] = \"m\")".to_owned()],
+            "{plan}"
+        );
+        assert!(plan.find("match").is_empty(), "{plan}");
+        println!("{plan}");
     }
 
     /// A pushed condition compares stored text, so it asks the query's
@@ -2552,7 +2650,7 @@ mod tests {
         );
         assert_eq!(
             by_kind("unnest"),
-            vec![("?s.trafficKinds".to_owned(), Executor::Sql)],
+            vec![("?s.trafficKinds → ?kind".to_owned(), Executor::Sql)],
             "the fan-out the fold owed, still in SQL:\n{plan}"
         );
         assert_eq!(
@@ -2634,6 +2732,91 @@ mod tests {
         );
         assert_eq!(plan.nodes[group].executor, Executor::Engine, "{plan}");
         println!("{plan}");
+    }
+
+    /// The fifth invariant now reads the unnest's *variable*, because a
+    /// condition above it addresses the element through that name. Two rules
+    /// that a plan could previously pass with, and cannot now.
+    #[test]
+    fn an_unnest_that_binds_the_wrong_name_is_a_defect() {
+        /// Fans out the right slot under a name nothing bound. Before the
+        /// unnest carried a variable this plan passed every invariant, and a
+        /// `[each]` condition above it named an element no scan had read.
+        struct RenamesTheElement;
+        impl Rule for RenamesTheElement {
+            fn name(&self) -> &'static str {
+                "renames_the_element"
+            }
+            fn apply(&self, plan: &mut Plan) -> bool {
+                for node in &mut plan.nodes {
+                    if let PlanOp::Unnest { var, .. } = &mut node.op {
+                        *var = "other".to_owned();
+                        break;
+                    }
+                }
+                // Reports no change, so the driver's *result* check is what
+                // has to catch it -- the same shape as
+                // `a_rule_that_breaks_a_plan_is_not_handed_back`, and the
+                // reason the failure is a returned error rather than a panic.
+                false
+            }
+        }
+
+        /// Fans out a slot no scan folded as multivalued -- rows multiplied by
+        /// an array no row set has.
+        struct InventsAFanout;
+        impl Rule for InventsAFanout {
+            fn name(&self) -> &'static str {
+                "invents_a_fanout"
+            }
+            fn apply(&self, plan: &mut Plan) -> bool {
+                let below = plan.nodes.len() - 2;
+                let stray = Node::sql(
+                    PlanOp::Unnest {
+                        input: below,
+                        star_var: "s".to_owned(),
+                        slot_path: vec!["name".to_owned()],
+                        var: "nm".to_owned(),
+                    },
+                    Vec::new(),
+                );
+                plan.nodes.insert(below + 1, stray);
+                for node in plan.nodes.iter_mut().skip(below + 2) {
+                    node.op
+                        .map_inputs(|input| if input > below { input + 1 } else { input });
+                }
+                // Reports no change, for the reason above.
+                false
+            }
+        }
+
+        let schema = test_schema_view();
+        let query = "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+                     asset360:trafficKinds ?k }";
+
+        let mut renamed = plan_of(query);
+        refine(&mut renamed, &[&FoldMatchesIntoScan::new(&schema)]).unwrap();
+        let failure = refine(&mut renamed, &[&RenamesTheElement])
+            .expect_err("an unnest under the wrong name must not be handed back");
+        assert!(
+            matches!(
+                failure.defect,
+                crate::sparql_refine::PlanDefect::LostFanout { .. }
+            ),
+            "{failure}"
+        );
+
+        let mut invented = plan_of(query);
+        refine(&mut invented, &[&FoldMatchesIntoScan::new(&schema)]).unwrap();
+        let failure = refine(&mut invented, &[&InventsAFanout])
+            .expect_err("a fan-out nothing folded must not be handed back");
+        assert!(
+            matches!(
+                failure.defect,
+                crate::sparql_refine::PlanDefect::StrayFanout { .. }
+            ),
+            "{failure}"
+        );
     }
 
     /// Rules apply in the order they are given, and an empty rule set is a

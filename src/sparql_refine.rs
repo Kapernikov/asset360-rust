@@ -238,6 +238,10 @@ pub enum Expr {
     Slot {
         star_var: String,
         slot_path: Vec<String>,
+        /// Which of the three values at that address this is. See
+        /// [`SlotReading`]; without it the address is ambiguous on any
+        /// multivalued slot.
+        reading: SlotReading,
     },
     Compare {
         op: CompareOp,
@@ -272,6 +276,48 @@ pub enum Expr {
     Opaque(String),
 }
 
+/// How to read the value a `(star, slot_path)` address names.
+///
+/// The fact 28d's `Slot` was missing, and the reason a rule could not push a
+/// condition on a multivalued slot at all: one address means three different
+/// things, and they select different rows.
+///
+/// The lesson is stage 1's, with a second instance. `ScanSlot` carries
+/// `multivalued` because a plan whose scan slots are bare names cannot see a
+/// cardinality error; an address with no reading cannot see this one. A
+/// consumer handed `(?s, [trafficKinds], = 'm')` and nothing else has to guess
+/// between an equality that matches no array, a containment test over the
+/// array, and a comparison against one unnested element -- and two of those
+/// answer a different question than the query asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotReading {
+    /// The column's own value: `object_data->>'name'`. Only correct for a
+    /// single-valued slot -- on an array it compares the array's text and
+    /// matches nothing.
+    Column,
+    /// Some element of the array the column holds. `?s :trafficKinds "m"` asks
+    /// whether the record carries that triple at all, which is a containment
+    /// test -- `EXISTS (SELECT 1 FROM jsonb_array_elements_text(...))`, what
+    /// the star decomposition's `multivalued_fields` tells its renderer to do
+    /// -- and matches a record once however many values it holds.
+    AnyElement,
+    /// The element a [`PlanOp::Unnest`] below bound to a variable. One row per
+    /// value, so a condition on it selects *rows* rather than records, which
+    /// is what SPARQL means by `?s :trafficKinds ?k . FILTER(?k = "m")`: one
+    /// solution per matching value, not every value of a matching record.
+    BoundElement,
+}
+
+impl fmt::Display for SlotReading {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Column => Ok(()),
+            Self::AnyElement => f.write_str("[any]"),
+            Self::BoundElement => f.write_str("[each]"),
+        }
+    }
+}
+
 /// A comparison SQL can express, in the vocabulary the renderer already
 /// speaks.
 ///
@@ -285,6 +331,10 @@ pub struct SqlCondition {
     pub star_var: String,
     pub slot_path: Vec<String>,
     pub condition: FilterCondition,
+    /// Which value at that address the condition holds of. A renderer that
+    /// ignores this renders a containment test as an equality on an array,
+    /// which matches nothing.
+    pub reading: SlotReading,
 }
 
 impl Expr {
@@ -349,6 +399,7 @@ impl Expr {
                 let Self::Slot {
                     star_var,
                     slot_path,
+                    reading,
                 } = slot
                 else {
                     return None;
@@ -357,12 +408,14 @@ impl Expr {
                     star_var: star_var.clone(),
                     slot_path: slot_path.clone(),
                     condition,
+                    reading: *reading,
                 }])
             }
             Self::In { value, candidates } => {
                 let Self::Slot {
                     star_var,
                     slot_path,
+                    reading,
                 } = value.as_ref()
                 else {
                     return None;
@@ -378,6 +431,7 @@ impl Expr {
                     star_var: star_var.clone(),
                     slot_path: slot_path.clone(),
                     condition: FilterCondition::In(values),
+                    reading: *reading,
                 }])
             }
             // A disjunction is not a conjunction of conditions, and a
@@ -443,6 +497,7 @@ impl Expr {
                     Self::Slot {
                         star_var,
                         slot_path,
+                        ..
                     },
                     Self::Literal(term),
                 )
@@ -451,6 +506,7 @@ impl Expr {
                     Self::Slot {
                         star_var,
                         slot_path,
+                        ..
                     },
                 ) => comparable(star_var, slot_path, term),
                 _ => true,
@@ -459,6 +515,7 @@ impl Expr {
                 Self::Slot {
                     star_var,
                     slot_path,
+                    ..
                 } => candidates.iter().all(|candidate| match candidate {
                     Self::Literal(term) => comparable(star_var, slot_path, term),
                     _ => true,
@@ -535,7 +592,8 @@ impl fmt::Display for Expr {
             Self::Slot {
                 star_var,
                 slot_path,
-            } => write!(f, "?{star_var}.{}", slot_path.join(".")),
+                reading,
+            } => write!(f, "?{star_var}.{}{reading}", slot_path.join(".")),
             Self::Compare { op, left, right } => {
                 write!(f, "({left} {} {right})", op.as_str())
             }
@@ -828,6 +886,16 @@ pub enum PlanOp {
         input: NodeId,
         star_var: String,
         slot_path: Vec<String>,
+        /// The variable this element binds -- the one the folded `match` read
+        /// the slot into.
+        ///
+        /// Without it, a condition above the unnest can only name the array,
+        /// and `(?s, [trafficKinds])` then means the column to one reader and
+        /// an element to another. With it, [`SlotReading::BoundElement`] has
+        /// something to refer to and [`Plan::fanout_restored`] can check that
+        /// the unnest restoring a slot's fan-out is the one binding that
+        /// slot's variable.
+        var: String,
     },
     /// Solutions to triples.
     Construct {
@@ -1009,10 +1077,10 @@ pub fn scan_with_fanout(
     at: NodeId,
     discharges: Vec<ObligationId>,
 ) -> Vec<Node> {
-    let fanning: Vec<String> = slots
+    let fanning: Vec<(String, String)> = slots
         .iter()
         .filter(|slot| slot.multivalued)
-        .map(|slot| slot.slot.clone())
+        .map(|slot| (slot.slot.clone(), slot.var.clone()))
         .collect();
     let mut out = vec![Node::sql(
         PlanOp::Scan {
@@ -1022,13 +1090,14 @@ pub fn scan_with_fanout(
         },
         discharges,
     )];
-    for slot in fanning {
+    for (slot, var) in fanning {
         let input = at + out.len() - 1;
         out.push(Node::sql(
             PlanOp::Unnest {
                 input,
                 star_var: star_var.to_owned(),
                 slot_path: vec![slot],
+                var,
             },
             Vec::new(),
         ));
@@ -1089,6 +1158,12 @@ pub enum PlanDefect {
         scan: NodeId,
         slot: String,
     },
+    /// An `Unnest` for a slot no scan below it folded as multivalued -- the
+    /// converse of `LostFanout`, and checkable only because the unnest names
+    /// the variable it binds. See [`Plan::fanout_restored`].
+    StrayFanout {
+        unnest: NodeId,
+    },
 }
 
 impl fmt::Display for PlanDefect {
@@ -1115,8 +1190,13 @@ impl fmt::Display for PlanDefect {
             ),
             Self::LostFanout { scan, slot } => write!(
                 f,
-                "n{scan} folded the multivalued slot '{slot}' without its unnest, \
-                 so a record with several values counts once"
+                "n{scan} folded the multivalued slot '{slot}' without the unnest \
+                 that binds its variable, so a record with several values counts once"
+            ),
+            Self::StrayFanout { unnest } => write!(
+                f,
+                "n{unnest} fans out a slot no scan below it read as multivalued, \
+                 so it multiplies rows nothing asked for"
             ),
         }
     }
@@ -1254,9 +1334,18 @@ impl Plan {
                         PlanOp::Unnest {
                             star_var: unnest_star,
                             slot_path,
+                            var,
                             ..
                         } if unnest_star == star_var
                             && slot_path.as_slice() == std::slice::from_ref(&slot.slot)
+                            // The variable too, and not only the path. A
+                            // condition above the unnest addresses the element
+                            // *through* the name it bound
+                            // ([`SlotReading::BoundElement`]), so an unnest
+                            // that fans out the right slot under the wrong
+                            // name leaves that condition naming an element
+                            // nothing bound.
+                            && var == &slot.var
                     ) && self.feeds(scan_id, id)
                 });
                 if !restored {
@@ -1265,6 +1354,40 @@ impl Plan {
                         slot: slot.slot.clone(),
                     });
                 }
+            }
+        }
+
+        // The converse, which the invariant needs now that a reading refers to
+        // an unnest: an unnest nothing folded multiplies rows by an array no
+        // row set has, and a `BoundElement` condition above it would name an
+        // element of a slot the scan never read.
+        for (id, node) in self.nodes.iter().enumerate() {
+            let PlanOp::Unnest {
+                star_var,
+                slot_path,
+                var,
+                ..
+            } = &node.op
+            else {
+                continue;
+            };
+            let folded = self.nodes.iter().enumerate().any(|(scan_id, below)| {
+                matches!(
+                    &below.op,
+                    PlanOp::Scan {
+                        star_var: scan_star,
+                        slots,
+                        ..
+                    } if scan_star == star_var
+                        && slots.iter().any(|slot| {
+                            slot.multivalued
+                                && slot_path.as_slice() == std::slice::from_ref(&slot.slot)
+                                && &slot.var == var
+                        })
+                ) && self.feeds(scan_id, id)
+            });
+            if !folded {
+                return Err(PlanDefect::StrayFanout { unnest: id });
             }
         }
         Ok(())
@@ -1446,8 +1569,9 @@ impl PlanOp {
             PlanOp::Unnest {
                 star_var,
                 slot_path,
+                var,
                 ..
-            } => format!("?{star_var}.{}", slot_path.join(".")),
+            } => format!("?{star_var}.{} → ?{var}", slot_path.join(".")),
             PlanOp::Construct { template, .. } => format!("{} triple(s)", template.len()),
         }
     }
@@ -2469,6 +2593,7 @@ mod tests {
         let slot = Expr::Slot {
             star_var: "s".to_owned(),
             slot_path: vec!["hasName".to_owned()],
+            reading: SlotReading::Column,
         };
         let value = Expr::Literal(Literal::new_simple_literal("A").into());
 
@@ -2486,6 +2611,7 @@ mod tests {
                     op: crate::sparql_scoper::CmpOp::Gt,
                     value: "A".to_owned(),
                 },
+                reading: SlotReading::Column,
             }])
         );
 
@@ -2541,6 +2667,7 @@ mod tests {
             value: Box::new(Expr::Slot {
                 star_var: "s".to_owned(),
                 slot_path: vec!["hasName".to_owned()],
+                reading: SlotReading::Column,
             }),
             candidates: vec![
                 Expr::Literal(Literal::new_simple_literal("A").into()),
@@ -2553,6 +2680,7 @@ mod tests {
                 star_var: "s".to_owned(),
                 slot_path: vec!["hasName".to_owned()],
                 condition: FilterCondition::In(vec!["A".to_owned(), "B".to_owned()]),
+                reading: SlotReading::Column,
             }])
         );
         // ...and the public entry agrees, because these constants are the
@@ -2581,6 +2709,7 @@ mod tests {
             left: Box::new(Expr::Slot {
                 star_var: "s".to_owned(),
                 slot_path: vec![slot.to_owned()],
+                reading: SlotReading::Column,
             }),
             right: Box::new(Expr::Literal(term)),
         };
