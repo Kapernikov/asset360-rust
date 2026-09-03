@@ -2888,11 +2888,19 @@ impl ExecutionPlan {
             .collect()
     }
 
-    /// Where these operators came from: ``"not_attempted"``, ``"used"`` or
-    /// ``"fallback"``.
+    /// Where these operators came from: ``"not_attempted"``, ``"used"``,
+    /// ``"used_alone"`` or ``"fallback"``.
     ///
     /// ``"not_attempted"`` for a plan from :func:`plan_query`, which does not
-    /// refine. The other two only come from :func:`plan_query_refined`.
+    /// refine. The rest only come from :func:`plan_query_refined`.
+    ///
+    /// ``"used"`` and ``"used_alone"`` are different risks and read
+    /// differently on purpose. ``"used"`` is a *substitution*: the single-pass
+    /// planner had a plan, and the refined statement was shown to read no more
+    /// rows and leave no more work to the engine. ``"used_alone"`` is a
+    /// *capability*: that planner refuses the query outright, so nothing was
+    /// compared — the plan was admitted because it answers the whole question
+    /// in SQL by construction, and ``refinement_note`` says what was refused.
     #[getter]
     fn refinement(&self) -> &'static str {
         self.inner.refinement.as_str()

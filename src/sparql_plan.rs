@@ -922,6 +922,13 @@ pub enum Refinement {
     /// today it is an `OPTIONAL` read, where the refined plan declines to
     /// claim optionality a narrowing scan does not render.
     Used(Option<String>),
+    /// The refined plan answers a question the single-pass planner refuses
+    /// outright, and was admitted on its own soundness rather than by
+    /// comparison. The string says what today's planner refused and why.
+    ///
+    /// A different risk from a substitution, so it reads differently in a log:
+    /// nothing was compared, because there was nothing to compare against.
+    UsedAlone(String),
     /// The refined plan was built and not used, for this reason.
     Fallback(String),
 }
@@ -931,6 +938,7 @@ impl Refinement {
         match self {
             Self::NotAttempted => "not_attempted",
             Self::Used(_) => "used",
+            Self::UsedAlone(_) => "used_alone",
             Self::Fallback(_) => "fallback",
         }
     }
@@ -943,10 +951,12 @@ impl Refinement {
         }
     }
 
-    /// What the refined plan claims differently, when it was used anyway.
+    /// What the refined plan claims differently, when it was used anyway --
+    /// or, for [`Refinement::UsedAlone`], what today's planner refused.
     pub fn note(&self) -> Option<&str> {
         match self {
             Self::Used(note) => note.as_deref(),
+            Self::UsedAlone(refusal) => Some(refusal),
             _ => None,
         }
     }
@@ -1017,7 +1027,22 @@ pub fn plan_query_refined(
             return Ok(plan);
         }
     };
-    // The gate.
+
+    // Which admission path, decided by whether there is a plan to compare
+    // against at all -- and the two are *exclusive* rather than ordered.
+    //
+    // Path B is not a second chance for a plan path A refused. If the
+    // comparator says a substitution is worse, that is a regression, and
+    // trying a different argument for the same plan would convert it into a
+    // capability claim. So a query today's planner can answer goes through the
+    // comparator and nowhere else, and only a query it refuses outright
+    // reaches the other path.
+    let refused = plan.blocked.clone();
+    if let Some(refusal) = refused {
+        return Ok(admit_alone(plan, refined, refusal));
+    }
+
+    // Path A: the gate.
     if let Err(reason) = refined.is_no_worse_than(&today_ops) {
         plan.refinement = Refinement::Fallback(reason);
         return Ok(plan);
@@ -1078,6 +1103,85 @@ pub fn plan_query_refined(
     };
     plan.refinement = Refinement::Used(note);
     Ok(plan)
+}
+
+/// Admit a refined plan for a question the single-pass planner refuses.
+///
+/// **Path B.** There is no plan to be no worse than, so admission rests on the
+/// refined plan's own soundness -- and that is a *stronger* condition than the
+/// comparator's, not a weaker one. The comparator says "this substitution
+/// loses nothing"; this says "this statement answers the whole question by
+/// construction":
+///
+/// * every node runs in SQL, so the statement *is* the query rather than a
+///   fetch for an engine that finishes it. (The frontier being a cut is an
+///   invariant, checked at every rule application, so an all-`Sql` plan has no
+///   engine node hiding beneath one.)
+/// * every obligation is discharged by those nodes, so the residual is empty
+///   and the ledger balances.
+/// * every invariant holds, `fanout_restored` in its strengthened form
+///   included -- which is what makes a count over a fanned-out read a count of
+///   solutions rather than of records.
+///
+/// Anything less falls back, and the reason says which condition failed.
+///
+/// The evidence is elsewhere and it is not an argument: **every shape admitted
+/// this way carries an oracle test against the engine leg**, which materialises
+/// instances and re-runs the whole query, so it answers shapes the SQL route
+/// refuses. A comparator cannot judge these plans; the engine can.
+fn admit_alone(
+    mut plan: ExecutionPlan,
+    refined: crate::sparql_ops::OpTree,
+    refusal: crate::sparql_pushdown::Blocked,
+) -> ExecutionPlan {
+    let claimed: BTreeSet<ObligationId> = refined.claims().into_iter().collect();
+    let unclaimed: Vec<String> = (0..plan.obligations.len())
+        .filter(|id| !claimed.contains(id))
+        .map(|id| plan.obligations[id].to_string())
+        .collect();
+    if !unclaimed.is_empty() {
+        plan.refinement = Refinement::Fallback(format!(
+            "the single-pass planner refuses this query ({}), and the refined plan \
+             does not answer it alone either: {}",
+            refusal.code.as_str(),
+            unclaimed.join("; ")
+        ));
+        return plan;
+    }
+
+    // One pass, and the refusal goes with it: an artifact that says an
+    // aggregate is blocked while serving it from SQL would mislead every
+    // reader of it, including the routing code that asks whether this plan
+    // answers alone.
+    plan.passes = vec![Pass {
+        id: 0,
+        inputs: Vec::new(),
+        discharges: claimed.iter().copied().collect(),
+        emits: emitted_from(&refined),
+        kind: PassKind::Sql(Box::new(SqlPass { ops: refined })),
+    }];
+    plan.residual = Vec::new();
+    plan.refinement = Refinement::UsedAlone(format!(
+        "the single-pass planner refuses this query ({}: {}), and the refined \
+         plan answers it in SQL alone",
+        refusal.code.as_str(),
+        refusal.detail
+    ));
+    plan.blocked = None;
+    plan
+}
+
+/// The variables a lowered statement binds, from its projection.
+fn emitted_from(ops: &crate::sparql_ops::OpTree) -> Vec<String> {
+    ops.nodes
+        .iter()
+        .find_map(|node| match &node.op {
+            crate::sparql_ops::Op::Project { vars, .. } => {
+                Some(vars.iter().map(|var| format!("?{var}")).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// The refined plan's operators, or why there are none.
@@ -1351,6 +1455,136 @@ mod tests {
                 .is_no_worse_than(&ops(&today))
                 .unwrap_or_else(|reason| panic!("{query}: {reason}"));
         }
+    }
+
+    /// **Path B.** A query the single-pass planner refuses outright, answered
+    /// in SQL alone.
+    ///
+    /// `?k` is read and never grouped or aggregated, so today's planner
+    /// refuses: a multivalued read with no binding "has no container and no
+    /// instruction", and counting one row per record would answer a different
+    /// question. The refined plan has the instruction -- an `Unnest` below the
+    /// grouping -- so it counts one row per value, which is one per solution.
+    ///
+    /// The first query this architecture serves that the endpoint could not
+    /// answer before.
+    #[test]
+    fn a_query_todays_planner_refuses_can_be_answered_alone() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:trafficKinds ?k }} GROUP BY ?nm"
+        );
+
+        // Today: refused, with a reason.
+        let today = plan_query(&query, &sv).expect("should plan");
+        assert!(today.blocked.is_some(), "{today}");
+        assert!(!today.sql_only(), "today fetches and lets the engine group");
+
+        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let note = match &plan.refinement {
+            Refinement::UsedAlone(note) => note.clone(),
+            other => panic!("expected admission on its own soundness, got {other:?}"),
+        };
+        assert!(note.contains("refuses this query"), "{note}");
+
+        // What admission rests on, asserted rather than assumed.
+        assert!(plan.sql_only(), "the statement is the query:\n{plan}");
+        assert!(plan.is_accounted(), "{plan}");
+        plan.ledger_balances().unwrap();
+        assert!(
+            plan.blocked.is_none(),
+            "an artifact must not say an aggregate is blocked while serving it"
+        );
+
+        // And the fan-out reached the statement, which is the whole difference
+        // between counting solutions and counting records.
+        let ops = plan
+            .passes
+            .iter()
+            .find_map(|pass| match &pass.kind {
+                PassKind::Sql(sql) => Some(sql.ops.clone()),
+                PassKind::Engine(_) => None,
+            })
+            .expect("one pass, and it is SQL");
+        assert_eq!(ops.find("group").len(), 1, "{plan}");
+        let crate::sparql_ops::Op::Group { bindings, keys, .. } =
+            &ops.nodes[ops.find("group")[0]].op
+        else {
+            panic!("{plan}");
+        };
+        assert_eq!(keys, &vec![0], "the name is the only key");
+        assert_eq!(
+            bindings.len(),
+            2,
+            "the fan-out is a binding too: {bindings:?}"
+        );
+        assert!(
+            bindings[1]
+                .containers
+                .iter()
+                .any(|container| *container != crate::sparql_pushdown::Container::Single),
+            "the second binding is the collection the renderer unnests: {bindings:?}"
+        );
+        println!("{plan}");
+    }
+
+    /// Path B is not a second chance. A query today's planner *can* answer
+    /// goes through the comparator and nowhere else, so a refined plan the
+    /// comparator calls worse falls back rather than being re-admitted on its
+    /// own soundness.
+    ///
+    /// Structural rather than conventional: the two paths are chosen by
+    /// whether the artifact carries a refusal, so there is no ordering to get
+    /// wrong.
+    #[test]
+    fn a_plan_the_comparator_refuses_is_not_admitted_by_the_other_path() {
+        let sv = test_schema_view();
+        // An aggregate with an ordering above it: today answers it whole, and
+        // the grouping rule declines the shape, so the refined statement would
+        // hand the grouping back.
+        let query = format!(
+            "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?nm }} GROUP BY ?nm ORDER BY DESC(?n)"
+        );
+        let today = plan_query(&query, &sv).expect("should plan");
+        assert!(today.blocked.is_none(), "today answers this one");
+
+        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        assert!(
+            matches!(plan.refinement, Refinement::Fallback(_)),
+            "a substitution the comparator refuses must not become a capability \
+             claim: {:?}",
+            plan.refinement
+        );
+        assert!(
+            plan.refinement.reason().unwrap().contains("leaves 'group"),
+            "{:?}",
+            plan.refinement
+        );
+    }
+
+    /// And path B refuses a plan that does not answer alone, which is most of
+    /// them: a refused aggregate whose refined plan is still a fetch stays a
+    /// fetch, with the reason naming both halves.
+    #[test]
+    fn path_b_refuses_a_plan_that_does_not_answer_alone() {
+        let sv = test_schema_view();
+        // `GROUP_CONCAT` is outside the pushable set, so today refuses -- and
+        // no rule pushes that grouping either.
+        let query = format!(
+            "{PREFIX}SELECT (GROUP_CONCAT(?nm) AS ?names) WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?nm }}"
+        );
+        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let reason = match &plan.refinement {
+            Refinement::Fallback(reason) => reason.clone(),
+            other => panic!("expected a fallback, got {other:?}"),
+        };
+        assert!(reason.contains("refuses this query"), "{reason}");
+        assert!(reason.contains("does not answer it alone"), "{reason}");
+        // The refusal stays on the artifact, because it is still true.
+        assert!(plan.blocked.is_some(), "{plan}");
     }
 
     /// A pushed grouping answers alone: SQL claims every obligation, there is

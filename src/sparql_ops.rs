@@ -882,6 +882,57 @@ pub fn lower_refined(
                     };
                     bindings.push(spec);
                 }
+                // Every fan-out below the grouping, as a binding.
+                //
+                // The two vocabularies say the same thing differently: the
+                // refined plan states a fan-out as an `Unnest` node, and the
+                // renderer states it as a binding whose path holds a
+                // collection -- which is what it builds the LATERAL from. A
+                // fanned-out read that is nobody's group key therefore has to
+                // arrive here as a binding anyway, or the statement counts
+                // records where the query counts solutions.
+                //
+                // That is the whole of what the single-pass planner refuses as
+                // `unbound_multivalued`: "a variable with no binding has no
+                // container and no instruction". Here it has both.
+                for unnest in plan.nodes.iter().enumerate().filter_map(|(fanout, node)| {
+                    match &node.op {
+                        RefinedOp::Unnest {
+                            star_var,
+                            slot_path,
+                            var,
+                            ..
+                        // Below *this* grouping. A fan-out elsewhere in the
+                        // plan multiplies rows this statement never reads.
+                        } if plan.feeds(fanout, id) => Some((star_var, slot_path, var)),
+                        _ => None,
+                    }
+                }) {
+                    let (star_var, slot_path, var) = unnest;
+                    if bindings
+                        .iter()
+                        .any(|spec| spec.star_var == *star_var && spec.slot_path == *slot_path)
+                    {
+                        // Already a key: the element the grouping keys on is
+                        // the same element the fan-out produces, and one
+                        // LATERAL is one fan-out.
+                        continue;
+                    }
+                    let Some(class_uri) = classes.get(star_var) else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    let Some(spec) = crate::sparql_pushdown::binding_spec(
+                        schema,
+                        star_var,
+                        class_uri,
+                        var,
+                        slot_path.clone(),
+                    ) else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    bindings.push(spec);
+                }
+
                 let mut lowered = Vec::with_capacity(measures.len());
                 for measure in measures {
                     // `COUNT(*)` only, which is what the rule pushes. Anything
@@ -904,7 +955,10 @@ pub fn lower_refined(
                 nodes.push(OpNode {
                     op: Op::Group {
                         input,
-                        keys: (0..bindings.len()).collect(),
+                        // The keys are the first bindings, in the order the
+                        // query grouped by; anything after them is a fan-out
+                        // the statement needs and the answer does not name.
+                        keys: (0..keys.len()).collect(),
                         bindings,
                         measures: lowered,
                         // No rule pushes a condition on grouped rows into a
@@ -1167,9 +1221,7 @@ fn scanned_column(
         slots
             .iter()
             .find(|slot| {
-                slot.var.as_deref() == Some(var)
-                    && !slot.multivalued
-                    && slot.presence == SlotPresence::Required
+                slot.var.as_deref() == Some(var) && slot.presence == SlotPresence::Required
             })
             .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
     })

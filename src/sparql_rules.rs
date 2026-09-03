@@ -1923,11 +1923,11 @@ impl Rule for PushReferenceJoin<'_> {
 ///   would group rows a filter has not seen. The frontier-is-a-cut invariant
 ///   says the same thing after the fact; the rule declines before it, so a
 ///   plan the driver would refuse is never built.
-/// * **One group key, single-valued, bound by a scan below.** A multivalued
-///   key is the next shape, not this one: its groups are elements, and the
-///   fetch narrowing and the group test come apart (as they do for a
-///   `HAVING`). One key, so the rule cannot quietly serve a shape whose
-///   ordering of keys the renderer decides.
+/// * **One group key, bound by a scan below as a column or as an unnested
+///   element.** Grouping on a multivalued slot groups its *values*, which the
+///   fan-out below has already turned into solutions -- so the key is the
+///   element, never the array. One key, so the rule cannot quietly serve a
+///   shape whose ordering of keys the renderer decides.
 /// * **Exactly `COUNT(*)`.** `COUNT(?v)` must not count solutions where `?v`
 ///   is unbound, and `COUNT(DISTINCT ?v)` counts values rather than
 ///   solutions; both are real shapes with their own reasoning, and neither is
@@ -1985,14 +1985,28 @@ impl Rule for PushScalarCountGrouping<'_> {
                 continue;
             }
 
-            // The key has to be a column an `Sql` scan below binds, and a
-            // scalar one: `Visible` answers both, and returns nothing for a
-            // variable bound to an element of an array.
+            // The key has to be a value an `Sql` scan below binds, and
+            // `Visible` answers both which one and how to read it.
+            //
+            // Two readings are keys. A `Column` is the scalar case. A
+            // `BoundElement` is one element of an array, and grouping on it is
+            // what SPARQL means by grouping on a multivalued slot: the fan-out
+            // below has already turned each value into its own solution, so
+            // the groups are values and the count is one per solution. That
+            // the unnest is below is not assumed -- `Visible` only reports
+            // `BoundElement` when it is, and the fifth invariant refuses a
+            // plan where it drifts above the grouping.
+            //
+            // `AnyElement` is not a key: it is a test over a record's array,
+            // and there is no single value to group by.
             let visible = Visible::below(plan, input);
             let Some(binding) = visible.slot_of(key) else {
                 continue;
             };
-            if binding.reading != SlotReading::Column {
+            if !matches!(
+                binding.reading,
+                SlotReading::Column | SlotReading::BoundElement
+            ) {
                 continue;
             }
             // Resolvable as a column, or the lowering could not render it.
@@ -4267,6 +4281,38 @@ mod tests {
         println!("{plan}");
     }
 
+    /// Grouping on a multivalued slot groups its *values*, and the count is
+    /// one per solution -- which is one per value, not one per record.
+    ///
+    /// The fan-out below has already turned each value into its own row, so
+    /// the key is the element the unnest bound. Reading the array instead
+    /// would make one group per record's whole list, which is a different
+    /// question with the same shape.
+    #[test]
+    fn a_multivalued_key_groups_its_elements() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?k } GROUP BY ?k",
+            &schema,
+            false,
+        );
+
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "{plan}"
+        );
+        assert_eq!(plan.find("unnest").len(), 1, "{plan}");
+        // The fan-out is below the grouping, which is what makes the count one
+        // per value -- and what the fifth invariant now refuses to let drift.
+        let unnest = plan.find("unnest")[0];
+        let group = plan.find("group")[0];
+        assert!(plan.feeds(unnest, group), "{plan}");
+        plan.check()
+            .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+        println!("{plan}");
+    }
+
     /// Every shape this rule declines, and the wrong answer each would be.
     ///
     /// The list is long on purpose: a collapsing rule takes the answer rather
@@ -4291,16 +4337,6 @@ mod tests {
                  asset360:name ?nm . FILTER(REGEX(?nm, \"^A\")) } GROUP BY ?nm"
             ),
             "a grouping over an engine filter"
-        );
-
-        // A multivalued key groups *elements*, where the fetch narrowing and
-        // the group test come apart. The next shape, not this one.
-        assert!(
-            !grouped(
-                "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:trafficKinds ?k } GROUP BY ?k"
-            ),
-            "a multivalued key"
         );
 
         // `COUNT(?v)` must not count solutions where `?v` is unbound, and
