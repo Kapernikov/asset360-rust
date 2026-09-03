@@ -1058,7 +1058,12 @@ pub fn plan_query_refined(
     // reaches the other path.
     let refused = plan.blocked.clone();
     if let Some(refusal) = refused {
-        return Ok(admit_alone(plan, refined, refusal));
+        let because = format!(
+            "the single-pass planner refuses this query ({}: {})",
+            refusal.code.as_str(),
+            refusal.detail
+        );
+        return Ok(admit_alone(plan, refined, &because));
     }
 
     // Path A: the gate.
@@ -1087,6 +1092,68 @@ pub fn plan_query_refined(
         )
     });
 
+    Ok(substitute(plan, refined, note))
+}
+
+/// Admission with the comparator removed — what the gate becomes once the
+/// single-pass planner is gone.
+///
+/// **A rehearsal, and it exists to be run against the frozen inventory while
+/// the old planner is still here to contradict it.** After the deletion every
+/// query asks one question — does this plan answer the whole query in SQL, on
+/// its own terms — and a plan that does not gets its statement used as a
+/// *fetch*, with the engine finishing, which is what happens today whenever
+/// the aggregate route refuses. There is no third outcome and nothing to
+/// compare against, so a plan that would be wrongly admitted alone has
+/// nothing standing between it and an answer. Finding those now is the whole
+/// point.
+///
+/// It still calls [`plan_query`] for the artifact around the statement — the
+/// obligation list, the passes, the fetch bound — so this is the *admission*
+/// rehearsed, not the deletion. Owning those three things is the second half
+/// of the work.
+pub fn plan_query_refined_alone(
+    query_str: &str,
+    schema_view: &SchemaView,
+) -> Result<ExecutionPlan, ScopeError> {
+    let mut plan = plan_query(query_str, schema_view)?;
+    let fetch_bound = plan
+        .passes
+        .iter()
+        .find_map(|pass| match &pass.kind {
+            PassKind::Sql(sql) => Some(crate::sparql_ops::fetch_bound_of(&sql.ops)),
+            PassKind::Engine(_) => None,
+        })
+        .flatten();
+
+    let refined = match refined_ops(query_str, schema_view, fetch_bound) {
+        Ok(refined) => refined,
+        Err(reason) => {
+            plan.refinement = Refinement::Fallback(reason);
+            return Ok(plan);
+        }
+    };
+
+    // The one question, asked by the same predicate the gated path asks.
+    if answers_alone(&plan, &refined).is_ok() {
+        return Ok(admit_alone(plan, refined, "there is no comparator"));
+    }
+    // Not the whole query, so the statement is a fetch and the engine
+    // finishes — the substitution, with no gate in front of it.
+    Ok(substitute(plan, refined, None))
+}
+
+/// Put the refined statement in place of today's, and rebalance the ledger.
+///
+/// Shared by the gated path and by the rehearsal that has no gate: the
+/// substitution is the same edit either way, and the difference is only
+/// whether anything compared first.
+fn substitute(
+    mut plan: ExecutionPlan,
+    refined: crate::sparql_ops::OpTree,
+    note: Option<String>,
+) -> ExecutionPlan {
+    let claimed: BTreeSet<ObligationId> = refined.claims().into_iter().collect();
     // The ledger has to balance against the *new* division of labour: what SQL
     // now claims, the engine no longer does. Recomputing it rather than
     // trusting the two to agree is what keeps "exactly once" true across the
@@ -1121,7 +1188,7 @@ pub fn plan_query_refined(
         engine_claims
     };
     plan.refinement = Refinement::Used(note);
-    Ok(plan)
+    plan
 }
 
 /// Admit a refined plan for a question the single-pass planner refuses.
@@ -1148,25 +1215,65 @@ pub fn plan_query_refined(
 /// this way carries an oracle test against the engine leg**, which materialises
 /// instances and re-runs the whole query, so it answers shapes the SQL route
 /// refuses. A comparator cannot judge these plans; the engine can.
-fn admit_alone(
-    mut plan: ExecutionPlan,
-    refined: crate::sparql_ops::OpTree,
-    refusal: crate::sparql_pushdown::Blocked,
-) -> ExecutionPlan {
+/// Whether a statement answers the whole query on its own, or why not.
+///
+/// Two conditions, and the second was latent until the comparator was
+/// rehearsed away:
+///
+/// * **it claims every obligation.** Anything unclaimed is work nobody does.
+/// * **it can emit the answer.** Claiming every obligation is not the same
+///   thing: the serialiser reads a *solution* — columns with the term
+///   descriptor that says how each becomes an RDF term — and only a grouping
+///   node carries those, because only a query with a solution layer has them.
+///   A fetch's rows are records, which oxigraph turns into triples and answers
+///   from.
+///
+/// A plain `SELECT ?s ?nm WHERE { … FILTER(…) }` claims its type, its triple
+/// and its filter, so the first condition alone admitted it — and the artifact
+/// then said SQL answers a query whose columns no renderer could name. Path A
+/// took every non-blocked query first, so nothing reached the second
+/// condition to find out it was missing. The deletion removes path A, which is
+/// exactly why [`plan_query_refined_alone`] exists before it.
+fn answers_alone(plan: &ExecutionPlan, refined: &crate::sparql_ops::OpTree) -> Result<(), String> {
     let claimed: BTreeSet<ObligationId> = refined.claims().into_iter().collect();
     let unclaimed: Vec<String> = (0..plan.obligations.len())
         .filter(|id| !claimed.contains(id))
         .map(|id| plan.obligations[id].to_string())
         .collect();
     if !unclaimed.is_empty() {
-        plan.refinement = Refinement::Fallback(format!(
-            "the single-pass planner refuses this query ({}), and the refined plan \
-             does not answer it alone either: {}",
-            refusal.code.as_str(),
+        return Err(format!(
+            "the refined plan does not answer it alone either: {}",
             unclaimed.join("; ")
         ));
+    }
+    if !refined
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, crate::sparql_ops::Op::Group { .. }))
+    {
+        return Err(
+            "the refined statement fetches rows rather than emitting solutions, so it \
+             cannot answer alone"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn admit_alone(
+    mut plan: ExecutionPlan,
+    refined: crate::sparql_ops::OpTree,
+    // Why nobody is comparing: today's refusal, or the fact that the
+    // comparator is gone. The admission question is the same either way --
+    // does this plan answer the whole query in SQL -- and only the sentence in
+    // the artifact differs.
+    because: &str,
+) -> ExecutionPlan {
+    if let Err(why) = answers_alone(&plan, &refined) {
+        plan.refinement = Refinement::Fallback(format!("{because}, and {why}"));
         return plan;
     }
+    let claimed: BTreeSet<ObligationId> = refined.claims().into_iter().collect();
 
     // One pass, and the refusal goes with it: an artifact that says an
     // aggregate is blocked while serving it from SQL would mislead every
@@ -1181,10 +1288,7 @@ fn admit_alone(
     }];
     plan.residual = Vec::new();
     plan.refinement = Refinement::UsedAlone(format!(
-        "the single-pass planner refuses this query ({}: {}), and the refined \
-         plan answers it in SQL alone",
-        refusal.code.as_str(),
-        refusal.detail
+        "{because}, and the refined plan answers it in SQL alone"
     ));
     plan.blocked = None;
     plan
@@ -1655,6 +1759,70 @@ mod tests {
                 "{spelling}: {reason}"
             );
         }
+    }
+
+    /// The rehearsal: admission with the comparator removed asks one question,
+    /// and answers it the same way for a query today's planner serves as for
+    /// one it refuses.
+    ///
+    /// Three outcomes and no fourth. A statement that claims the whole query
+    /// answers alone; one that claims part of it is a fetch the engine
+    /// finishes; a plan that does not lower at all leaves today's statement in
+    /// place, which is the one thing the deletion will have to replace.
+    #[test]
+    fn admission_without_the_comparator_has_three_outcomes() {
+        let sv = test_schema_view();
+
+        // Answers alone: everything the query asks for is in the statement.
+        let plan = plan_query_refined_alone(
+            &format!(
+                "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+                 asset360:name ?nm }} GROUP BY ?nm"
+            ),
+            &sv,
+        )
+        .expect("should plan");
+        assert!(
+            matches!(plan.refinement, Refinement::UsedAlone(_)),
+            "{:?}",
+            plan.refinement
+        );
+        assert!(plan.sql_only(), "{plan}");
+
+        // A fetch: the statement narrows and the engine answers. Today's gate
+        // calls this `used` too, so the deletion changes nothing here -- which
+        // is the reassuring half of the rehearsal.
+        let plan = plan_query_refined_alone(
+            &format!(
+                "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; \
+                 asset360:name ?nm . FILTER(?nm > \"A\") }}"
+            ),
+            &sv,
+        )
+        .expect("should plan");
+        assert!(
+            matches!(plan.refinement, Refinement::Used(_)),
+            "{:?}",
+            plan.refinement
+        );
+        assert!(!plan.sql_only(), "the engine still answers it:\n{plan}");
+
+        // And a plan with an engine node in it is *not* admitted alone, which
+        // is the failure this rehearsal exists to catch: with no comparator,
+        // nothing else stands between such a plan and an answer.
+        let plan = plan_query_refined_alone(
+            &format!(
+                "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+                 asset360:name ?nm . FILTER(REGEX(?nm, \"^A\")) }} GROUP BY ?nm"
+            ),
+            &sv,
+        )
+        .expect("should plan");
+        assert!(
+            !plan.sql_only(),
+            "a regex the statement cannot apply must not be answered from \
+             it:\n{plan}"
+        );
     }
 
     /// Path B is not a second chance. A query today's planner *can* answer

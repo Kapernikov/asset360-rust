@@ -91,6 +91,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_plan_query, m)?)?;
         m.add_function(wrap_pyfunction!(py_plan_query_refined, m)?)?;
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
+        m.add_function(wrap_pyfunction!(py_plan_query_refined_alone, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
@@ -3090,6 +3091,45 @@ fn py_plan_query_refined(
     let sv = sv_ref.as_rust();
 
     crate::sparql_plan::plan_query_refined(query, sv)
+        .map(|inner| ExecutionPlan { inner })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "plan_query_refined_alone")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Plan a query with the comparator removed — admission as it will be once the
+/// single-pass planner is deleted.
+///
+/// **A rehearsal, not a route.** The endpoint uses
+/// :func:`plan_query_refined`; this exists so the inventory can run the whole
+/// corpus through the post-deletion question while the planner it replaces is
+/// still here to contradict the answer. Every query asks one thing — does this
+/// plan answer the whole query in SQL — and a plan that does not has its
+/// statement used as a fetch with the engine finishing.
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_view: The LinkML schema.
+///
+/// Returns:
+///     ExecutionPlan, with ``refinement`` of ``"used_alone"`` (SQL answers
+///     it), ``"used"`` (SQL fetches, the engine finishes) or ``"fallback"``
+///     (no refined statement at all).
+///
+/// Raises:
+///     ValueError: the query does not parse or cannot be scoped.
+fn py_plan_query_refined_alone(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<ExecutionPlan> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    crate::sparql_plan::plan_query_refined_alone(query, sv)
         .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
