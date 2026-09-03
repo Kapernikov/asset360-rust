@@ -1,4 +1,6 @@
-//! Rules, a fixpoint driver, and the first rule: fold matches into a scan.
+//! Rules, a fixpoint driver, and tier one: fold matches into a scan, turn a
+//! constant object into a filter, push a comparison filter, push a reference
+//! join.
 //!
 //! A rule is a function on a plan: match a shape, edit nodes, move claims.
 //! Applied to fixpoint in a fixed order, with every invariant re-checked after
@@ -16,6 +18,22 @@
 //! narrowing cannot change an answer. The rules that would move a *collapsing*
 //! operator -- group, distinct, slice, sort -- are not here, and they are the
 //! ones that need a residual evaluator.
+//!
+//! That argument has one hole, and the tier-one rules are stricter than 28d
+//! because of it: a condition SQL applies is a narrowing only if it selects a
+//! *superset* of the answer, and a constant compared against a column whose
+//! values never spell it that way selects nothing at all. The engine then
+//! re-runs the query over no instances and reports no answer. See
+//! [`constant_is_the_columns_term`], which asks the same question of a
+//! constant that the star decomposition does.
+//!
+//! One requirement runs through the rules and is not in 28d: **the order a
+//! query wrote its filters in must not decide the plan.** Obligations are per
+//! top-level conjunct and the naive builder chains one `Filter` node per
+//! conjunct, so a pushable conjunct can end up above an unpushable one, where
+//! the frontier-is-a-cut invariant forbids pushing it. Filters commute, so
+//! [`PushComparisonFilter`] sinks the pushable one below -- see
+//! [`landing_site`] for the argument and the cases that stop it.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -1247,6 +1265,35 @@ impl Rule for PushReferenceJoin<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The tier-one rule set
+// ---------------------------------------------------------------------------
+
+/// Every tier-one rule, in the order 28d lists them: scope a type, turn a
+/// constant object into a filter, push a comparison, push a reference join.
+///
+/// Tier one is the set that needs nothing new from the executor. The engine
+/// leg re-runs the whole query, so a node below the first row-collapsing
+/// operator only ever narrows what SQL hands over -- provided the condition it
+/// applies is the query's own, which is the one place these rules are stricter
+/// than that argument (see [`constant_is_the_columns_term`]).
+///
+/// The order is a preference and not a requirement: each rule is monotone --
+/// the fold and the constant rewrite remove a `match`, the other two turn an
+/// `Engine` node `Sql`, and none of them ever does the reverse -- so the
+/// driver reaches the same fixpoint from any order, and
+/// `the_rule_order_does_not_decide_the_fixpoint` holds it to that. What the
+/// order buys is rounds: a filter cannot push before the scan below it exists,
+/// so running the fold first reaches the fixpoint in fewer passes.
+pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
+    vec![
+        Box::new(FoldMatchesIntoScan::new(schema)),
+        Box::new(ConstantObjectBecomesFilter::new(schema)),
+        Box::new(PushComparisonFilter::new(schema)),
+        Box::new(PushReferenceJoin::new(schema)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2402,6 +2449,273 @@ mod tests {
                 "every pushed conjunct is below the one that did not push:\n{plan}"
             );
         }
+        println!("{plan}");
+    }
+
+    /// The queries the tier-one rules are asked about as a set, rather than
+    /// one shape per rule. Every cross-rule test below runs all of them.
+    const CORPUS: &[&str] = &[
+        "SELECT ?s WHERE { ?s a asset360:Signal }",
+        "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+         FILTER(?nm > \"A\") }",
+        // The worked example of 28d, on the fixture's classes.
+        "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+         asset360:name ?nm ; asset360:trafficKinds ?kind . FILTER(?nm > \"A\") \
+         FILTER(REGEX(?nm, \"^A\")) } GROUP BY ?kind ORDER BY DESC(?n) LIMIT 10",
+        // ...and the same query with its filters the other way round.
+        "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+         asset360:name ?nm ; asset360:trafficKinds ?kind . \
+         FILTER(REGEX(?nm, \"^A\")) FILTER(?nm > \"A\") } GROUP BY ?kind \
+         ORDER BY DESC(?n) LIMIT 10",
+        "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" ; \
+         asset360:length 3 }",
+        "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+         ?t a asset360:Track ; asset360:hasName ?tn }",
+        "SELECT ?tn ?ln WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+         ?t a asset360:Track ; asset360:hasName ?tn ; asset360:belongsToLine ?l . \
+         ?l a asset360:Line ; asset360:hasName ?ln . FILTER(?tn > \"A\") }",
+        "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+         OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
+        "SELECT ?d WHERE { ?s a asset360:Signal ; asset360:length ?len . \
+         BIND(?len * 2 AS ?d) FILTER(?d > 3) }",
+        "SELECT DISTINCT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+         FILTER(?k = \"m\") }",
+        "SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal ; \
+         asset360:name ?nm } LIMIT 3 } }",
+        "SELECT ?s WHERE { VALUES ?s { \"a\" \"b\" } }",
+        "ASK WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }",
+        "CONSTRUCT { ?s asset360:name ?nm } WHERE { ?s a asset360:Signal ; \
+         asset360:name ?nm . FILTER(?nm > \"A\") }",
+        "DESCRIBE ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . \
+         FILTER(?len >= 10) }",
+    ];
+
+    /// The whole rule set, applied to fixpoint in a given order.
+    ///
+    /// Takes a plan rather than a query because two *parses* of one query are
+    /// not the same plan: spargebra names the internal variable of
+    /// `(COUNT(*) AS ?n)` freshly each time, so comparing two plans built from
+    /// two parses compares those names as well.
+    fn refine_naive(naive: &Plan, schema: &SchemaView, reverse: bool) -> Plan {
+        let mut rules = tier_one_rules(schema);
+        if reverse {
+            rules.reverse();
+        }
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let mut plan = naive.clone();
+        refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}"));
+        plan
+    }
+
+    fn refined(query: &str, schema: &SchemaView, reverse: bool) -> Plan {
+        refine_naive(&plan_of(query), schema, reverse)
+    }
+
+    /// A rule chain is only testable if its result does not depend on the
+    /// order the rules were listed in. Every tier-one rule is monotone -- two
+    /// of them remove a `match`, two turn an `Engine` node `Sql`, none does
+    /// the reverse -- so the fixpoint is the same and only the number of
+    /// rounds differs.
+    #[test]
+    fn the_rule_order_does_not_decide_the_fixpoint() {
+        let schema = test_schema_view();
+        for query in CORPUS {
+            let naive = plan_of(query);
+            let forwards = refine_naive(&naive, &schema, false);
+            let backwards = refine_naive(&naive, &schema, true);
+            assert_eq!(
+                forwards.to_string(),
+                backwards.to_string(),
+                "the rule order decided the plan for {query}"
+            );
+        }
+    }
+
+    /// Refinement edits nodes, never the question. Stated as the obligation
+    /// list being untouched and every one of them still claimed exactly once,
+    /// because a rule could balance a ledger it had rewritten.
+    #[test]
+    fn refinement_never_changes_the_obligations() {
+        let schema = test_schema_view();
+        for query in CORPUS {
+            let naive = plan_of(query);
+            let refined = refined(query, &schema, false);
+
+            assert_eq!(refined.obligations, naive.obligations, "{query}");
+            assert_eq!(
+                refined.obligations.len(),
+                naive.obligations.len(),
+                "{query}"
+            );
+            assert_eq!(refined.residual, naive.residual, "{query}");
+            let claims = |plan: &Plan| {
+                let mut ids: Vec<ObligationId> = plan
+                    .nodes
+                    .iter()
+                    .flat_map(|node| node.discharges.iter().copied())
+                    .collect();
+                ids.sort_unstable();
+                ids
+            };
+            assert_eq!(
+                claims(&refined),
+                claims(&naive),
+                "the same obligations, claimed once each: {query}\n{refined}"
+            );
+            refined
+                .check()
+                .unwrap_or_else(|defect| panic!("{defect} for {query}\n{refined}"));
+        }
+    }
+
+    /// Every invariant after every single application, over the whole rule set
+    /// -- not only behind the driver's debug assertion, and not only for one
+    /// rule at a time. A rule that breaks something has to fail at the rule.
+    #[test]
+    fn every_invariant_holds_after_every_application_of_every_rule() {
+        let schema = test_schema_view();
+        let rules = tier_one_rules(&schema);
+        for query in CORPUS {
+            let mut plan = plan_of(query);
+            plan.check()
+                .unwrap_or_else(|defect| panic!("naive: {defect} for {query}\n{plan}"));
+            let mut applications = 0;
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for rule in &rules {
+                    if rule.apply(&mut plan) {
+                        changed = true;
+                        applications += 1;
+                        plan.check().unwrap_or_else(|defect| {
+                            panic!(
+                                "{}, application {applications}: {defect} for {query}\n{plan}",
+                                rule.name()
+                            )
+                        });
+                        assert!(applications < 32, "no fixpoint for {query}\n{plan}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The worked example of 28d, and the shape the document draws: the scan
+    /// and its unnest and the comparison in SQL, the regex and everything
+    /// above it with the engine.
+    ///
+    /// The grouping is the case worth understanding. It is refused not by a
+    /// verdict about the query but by the frontier-is-a-cut invariant -- it
+    /// sits above an engine filter, and SQL cannot group rows the regex has
+    /// not filtered yet -- and the plan names the node that blocked it.
+    #[test]
+    fn the_worked_example_ends_in_the_shape_28d_draws() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:trafficKinds ?kind . FILTER(?nm > \"A\") \
+             FILTER(REGEX(?nm, \"^A\")) } GROUP BY ?kind ORDER BY DESC(?n) LIMIT 10",
+            &schema,
+            false,
+        );
+
+        let by_kind = |kind: &str| -> Vec<(String, Executor)> {
+            plan.find(kind)
+                .into_iter()
+                .map(|id| (plan.nodes[id].op.describe(), plan.nodes[id].executor))
+                .collect()
+        };
+        assert_eq!(
+            by_kind("scan"),
+            vec![(
+                "asset360:Signal as ?s, requires [name→?nm, trafficKinds→?kind[]]".to_owned(),
+                Executor::Sql
+            )],
+            "{plan}"
+        );
+        assert_eq!(
+            by_kind("unnest"),
+            vec![("?s.trafficKinds".to_owned(), Executor::Sql)],
+            "the fan-out the fold owed, still in SQL:\n{plan}"
+        );
+        assert_eq!(
+            by_kind("filter"),
+            vec![
+                ("(?s.name > \"A\")".to_owned(), Executor::Sql),
+                ("REGEX(?nm, \"^A\")".to_owned(), Executor::Engine),
+            ],
+            "{plan}"
+        );
+        for kind in ["group", "sort", "slice", "bind", "project"] {
+            assert!(
+                by_kind(kind)
+                    .iter()
+                    .all(|(_, executor)| *executor == Executor::Engine),
+                "{kind} is above the regex, so it is the engine's:\n{plan}"
+            );
+        }
+        // The node that blocked the grouping, named: the group's input is the
+        // regex, and it runs in the engine.
+        let group = plan.find("group")[0];
+        let below = plan.nodes[group].op.inputs();
+        let [input] = below.as_slice() else {
+            panic!("a grouping has one input:\n{plan}");
+        };
+        assert_eq!(plan.nodes[*input].op.kind(), "filter", "{plan}");
+        assert_eq!(plan.nodes[*input].executor, Executor::Engine, "{plan}");
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert!(plan.find("join").is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// Three stars, two reference joins and a comparison, all pushed: the
+    /// rules compose into one SQL statement without anything having been
+    /// decided for the query as a whole.
+    #[test]
+    fn a_chain_of_reference_joins_pushes_whole() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?tn ?ln WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn ; asset360:belongsToLine ?l . \
+             ?l a asset360:Line ; asset360:hasName ?ln . FILTER(?tn > \"A\") }",
+            &schema,
+            false,
+        );
+
+        assert_eq!(plan.find("scan").len(), 3, "{plan}");
+        assert_eq!(plan.find("join").len(), 2, "{plan}");
+        assert!(
+            plan.nodes[..plan.nodes.len() - 1]
+                .iter()
+                .all(|node| node.executor == Executor::Sql),
+            "everything below the projection is one statement:\n{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// Where 28d says refinement wins: drop the regex and the frontier moves
+    /// up to the grouping's input, so everything below the first collapsing
+    /// operator is one SQL statement. The grouping itself is tier two and
+    /// stays with the engine -- no rule here moves a collapsing operator.
+    #[test]
+    fn without_the_regex_the_frontier_reaches_the_grouping() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:trafficKinds ?kind . FILTER(?nm > \"A\") } \
+             GROUP BY ?kind ORDER BY DESC(?n) LIMIT 10",
+            &schema,
+            false,
+        );
+
+        let group = plan.find("group")[0];
+        assert!(
+            plan.nodes[..group]
+                .iter()
+                .all(|node| node.executor == Executor::Sql),
+            "everything below the grouping is SQL's:\n{plan}"
+        );
+        assert_eq!(plan.nodes[group].executor, Executor::Engine, "{plan}");
         println!("{plan}");
     }
 
