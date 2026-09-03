@@ -873,9 +873,27 @@ pub fn lower_refined(
             RefinedOp::Unnest {
                 star_var,
                 slot_path,
+                presence,
                 ..
             } => {
                 let input = remap[&node.op.inputs()[0]];
+                // The fan-out and the slot it fans out must agree about
+                // whether a record with no elements survives. The renderer
+                // reads that from the *scan* -- an optional slot gets a `LEFT
+                // JOIN LATERAL`, a required one a `CROSS JOIN` -- so a plan
+                // whose unnest says one thing and whose slot says the other
+                // renders as whichever the scan said, silently. One of the two
+                // is then a lie, and there is no way to tell which.
+                let agrees = plan.nodes.iter().any(|below| {
+                    matches!(&below.op, RefinedOp::Scan { star_var: scan_star, slots, .. }
+                    if scan_star == star_var
+                        && slots.iter().any(|slot| {
+                            &slot.path == slot_path && slot.presence == *presence
+                        }))
+                });
+                if !agrees {
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                }
                 if enforcement == Enforcement::Narrows {
                     // A fan-out makes row count equal *solution* count, which
                     // only a pass that counts needs. This one hands rows to an
@@ -2407,6 +2425,38 @@ mod tests {
         .expect_err("an identity restriction must not answer alone");
         assert!(
             matches!(refusal, LoweringRefusal::IdentityIsNotATriple { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// A fan-out that disagrees with the slot it fans out does not lower.
+    ///
+    /// The renderer decides `LEFT` versus `CROSS JOIN LATERAL` from the
+    /// *scan*, so a plan whose unnest says optional and whose slot says
+    /// required renders as required, silently, and one of the two statements
+    /// is a lie with no way to tell which. Refusing is how the plan stays
+    /// readable as a description of what will run.
+    #[test]
+    fn a_fanout_that_disagrees_with_its_slot_does_not_lower() {
+        use crate::sparql_refine::{PlanOp as RefinedOp, SlotPresence};
+
+        let sv = test_schema_view();
+        let mut plan = refined_plan(
+            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             OPTIONAL { ?s asset360:trafficKinds ?k } }",
+            &sv,
+        );
+        // As built, the two agree and it lowers.
+        lower_refined(&plan, &sv, None).expect("an optional collection read lowers");
+
+        let unnest = plan.find("unnest")[0];
+        if let RefinedOp::Unnest { presence, .. } = &mut plan.nodes[unnest].op {
+            *presence = SlotPresence::Required;
+        }
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a fan-out that contradicts its slot must not render");
+        assert!(
+            matches!(refusal, LoweringRefusal::Unrenderable { .. }),
             "{refusal}"
         );
     }
