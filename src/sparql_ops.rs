@@ -585,6 +585,27 @@ pub enum LoweringRefusal {
     /// optional and this lowering would call it mandatory, which wraps its
     /// conditions the wrong way.
     OptionalScan { node: usize },
+    /// A statement that reads a whole class while the query fixes the
+    /// record's identity.
+    ///
+    /// **A comparator clause, promoted.** It was found by comparing against
+    /// the single-pass planner -- "?ce disagrees about identifier values: []
+    /// against [X]" -- on the query every form field in the product runs. It
+    /// needs no second plan to state: a `match` on the identifier slot with a
+    /// constant object, still unfolded above a scan of the same star, *is* the
+    /// difference between reading one record and reading the class.
+    IdentityUnfolded { node: usize },
+    /// A statement that would answer *alone* while resting on an identifier
+    /// restriction.
+    ///
+    /// The identifier is the subject IRI and the writer emits no triple for
+    /// it, so `?ce :id "X"` matches nothing in the graph: the engine's answer
+    /// to such a query is *empty*. A restriction on the identity column is
+    /// therefore a narrowing of a fetch and never an answer -- today's
+    /// aggregate route counts the record and reports one where the engine
+    /// reports none, which is the wrong answer this refusal exists to avoid
+    /// repeating.
+    IdentityIsNotATriple { node: usize },
 }
 
 impl fmt::Display for LoweringRefusal {
@@ -605,6 +626,17 @@ impl fmt::Display for LoweringRefusal {
                 f,
                 "n{node} pushes a left join whose lifted condition would have to \
                  be a conditional binding rather than a row test"
+            ),
+            Self::IdentityUnfolded { node } => write!(
+                f,
+                "n{node} reads a whole class while the query fixes the record's \
+                 identity, so the statement is wider than the question"
+            ),
+            Self::IdentityIsNotATriple { node } => write!(
+                f,
+                "n{node} rests on an identifier restriction, which narrows a fetch \
+                 but cannot answer alone: the writer emits no triple for an \
+                 identifier, so the engine's answer to such a query is empty"
             ),
             Self::OptionalScan { node } => write!(
                 f,
@@ -705,6 +737,42 @@ pub fn lower_refined(
         .flat_map(|right| (0..plan.nodes.len()).filter(move |id| plan.feeds(*id, right)))
         .collect();
 
+    // A statement must not read a whole class while the query names one
+    // record. This is the comparator clause that caught the identity blindness,
+    // stated on one plan: an unfolded identifier constant above a scan of the
+    // same star is the difference, and it is visible without anything to
+    // compare against.
+    for &id in &sql {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            identifier_values,
+            ..
+        } = &plan.nodes[id].op
+        else {
+            continue;
+        };
+        if !identifier_values.is_empty() {
+            continue;
+        }
+        let Some(identifier) = identifier_slot_of(schema, class_uri) else {
+            continue;
+        };
+        let unfolded = plan.nodes.iter().any(|node| {
+            let RefinedOp::Match { pattern } = &node.op else {
+                return false;
+            };
+            crate::sparql_refine::subject_variable(pattern) == Some(star_var.as_str())
+                && crate::sparql_refine::predicate_iri(pattern)
+                    .and_then(|iri| schema.get_slot_by_uri(iri).ok().flatten())
+                    .is_some_and(|slot| slot.name == identifier)
+                && !matches!(pattern.object, spargebra::term::TermPattern::Variable(_))
+        });
+        if unfolded {
+            return Err(LoweringRefusal::IdentityUnfolded { node: id });
+        }
+    }
+
     // A pass that answers the query enforces its filters; one that feeds the
     // engine only narrows. The refined plan says which by whether anything
     // above the frontier is left.
@@ -713,6 +781,22 @@ pub fn lower_refined(
     } else {
         Enforcement::Narrows
     };
+
+    // An identifier restriction narrows a fetch and cannot answer alone. The
+    // engine's answer to `?ce :id "X"` is *empty* -- the writer emits no
+    // triple for an identifier, because it is the subject IRI -- so a
+    // statement that both restricts the identity and answers on its own
+    // reports a record the query has no solution for. Today's aggregate route
+    // does exactly that (one where the engine says none); this is where the
+    // refined planner declines to.
+    if enforcement == Enforcement::Enforces
+        && let Some(id) = sql.iter().copied().find(|id| {
+            matches!(&plan.nodes[*id].op,
+                RefinedOp::Scan { identifier_values, .. } if !identifier_values.is_empty())
+        })
+    {
+        return Err(LoweringRefusal::IdentityIsNotATriple { node: id });
+    }
 
     // Which class each star was scanned as, for the conditions and for the
     // identifier hoist.
@@ -739,6 +823,7 @@ pub fn lower_refined(
                 star_var,
                 class_uri,
                 slots,
+                identifier_values,
             } => {
                 // Only a slot of the record itself is an existence check.
                 // A value further in is reached by walking into the column,
@@ -756,9 +841,10 @@ pub fn lower_refined(
                     op: Op::Scan {
                         star_var: star_var.clone(),
                         class_uri: class_uri.clone(),
-                        // Filled by the filters below: a constraint on the
-                        // identifier slot belongs against the indexed column.
-                        identifier_values: Vec::new(),
+                        // What the query fixed the identity to, plus anything
+                        // the filters below hoist here: both belong against
+                        // the indexed column rather than the JSONB payload.
+                        identifier_values: identifier_values.clone(),
                         required_slots: column_slots(SlotPresence::Required)
                             .into_iter()
                             // The identifier's existence check is structurally
@@ -1287,6 +1373,7 @@ fn scanned_column(
             star_var,
             class_uri,
             slots,
+            ..
         } = &node.op
         else {
             return None;
@@ -1919,6 +2006,112 @@ mod tests {
         .expect_err("two islands must not lower");
         assert!(
             matches!(refusal, LoweringRefusal::SeveralIslands { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// **The wrong answer this refusal exists to prevent.** A statement that
+    /// restricts the identity and answers *alone* reports a record the query
+    /// has no solution for.
+    ///
+    /// The writer emits no triple for an identifier -- it is the subject IRI
+    /// -- so `?s :id "u"` matches nothing in the graph and the engine's answer
+    /// is empty. Today's aggregate route counts the record and reports one;
+    /// the refined planner declines to render such a statement at all, which
+    /// is why the grouping falls back to that route rather than repeating its
+    /// number from a second place.
+    #[test]
+    fn an_identity_restriction_cannot_answer_alone() {
+        let sv = test_schema_view();
+        // A fetch: identity narrows, the engine decides, and this is the whole
+        // point of the fold.
+        let fetch = lowered(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
+             asset360:name ?nm }",
+            &sv,
+        )
+        .expect("a narrowing fetch lowers");
+        let Op::Scan {
+            identifier_values, ..
+        } = &fetch.nodes[0].op
+        else {
+            panic!("the first node is the scan");
+        };
+        assert_eq!(identifier_values, &vec!["u-1".to_owned()]);
+
+        // A grouping over the same restriction would answer alone, so it does
+        // not lower.
+        let refusal = lowered(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:asset360_uri \"u-1\" ; asset360:name ?nm } GROUP BY ?nm",
+            &sv,
+        )
+        .expect_err("an identity restriction must not answer alone");
+        assert!(
+            matches!(refusal, LoweringRefusal::IdentityIsNotATriple { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// **A comparator clause, promoted to a check on one plan.** A statement
+    /// that reads a whole class while the query fixes the identity is refused,
+    /// whether or not there is a second planner to compare against.
+    ///
+    /// This is the shape the comparator caught -- "?ce disagrees about
+    /// identifier values: [] against [X]" -- on the query every named source
+    /// in the product runs. Stating it here is what keeps the knowledge after
+    /// the comparator goes.
+    #[test]
+    fn a_statement_may_not_read_a_class_the_query_narrows_to_one_record() {
+        let sv = test_schema_view();
+        let mut plan = refined_plan(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
+             asset360:name ?nm }",
+            &sv,
+        );
+        // As the rules leave it, identity is folded and it lowers.
+        lower_refined(&plan, &sv, None).expect("folded identity lowers");
+
+        // Unfold it, as a planner blind to identity would leave it: the
+        // constant back as a `match`, the scan reading the class.
+        let scan = plan.find("scan")[0];
+        if let crate::sparql_refine::PlanOp::Scan {
+            identifier_values, ..
+        } = &mut plan.nodes[scan].op
+        {
+            identifier_values.clear();
+        }
+        let pattern = spargebra::term::TriplePattern {
+            subject: spargebra::term::TermPattern::Variable(
+                spargebra::term::Variable::new_unchecked("s"),
+            ),
+            predicate: spargebra::term::NamedNodePattern::NamedNode(
+                spargebra::term::NamedNode::new_unchecked(
+                    "https://data.infrabel.be/asset360/asset360_uri",
+                ),
+            ),
+            object: spargebra::term::TermPattern::Literal(
+                spargebra::term::Literal::new_simple_literal("u-1"),
+            ),
+        };
+        plan.nodes.insert(
+            scan + 1,
+            crate::sparql_refine::Node::engine(
+                crate::sparql_refine::PlanOp::Match {
+                    pattern: Box::new(pattern),
+                },
+                Vec::new(),
+            ),
+        );
+        for node in plan.nodes.iter_mut().skip(scan + 2) {
+            node.op
+                .map_inputs(|input| if input > scan { input + 1 } else { input });
+        }
+
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a class scan where the query names one record must not render");
+        assert!(
+            matches!(refusal, LoweringRefusal::IdentityUnfolded { .. }),
             "{refusal}"
         );
     }

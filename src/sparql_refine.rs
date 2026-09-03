@@ -530,6 +530,14 @@ fn slot_and_value<'e>(left: &'e Expr, right: &'e Expr) -> Option<(&'e Expr, Stri
     }
 }
 
+/// The stored text of a term, for a caller outside this module.
+///
+/// Used by the identity fold, where a literal and an IRI carrying the same URI
+/// are the same question -- see `FoldIdentityConstant`.
+pub fn lexical_of(term: &Term) -> String {
+    lexical(term)
+}
+
 /// The stored text of a term: a literal's lexical form, an IRI's string.
 ///
 /// The SQL side compares against JSONB text, so the datatype and the language
@@ -930,6 +938,19 @@ pub enum PlanOp {
         star_var: String,
         class_uri: String,
         slots: Vec<ScanSlot>,
+        /// Values the query fixed the record's *identity* to.
+        ///
+        /// Not a slot and not a JSONB path: the identifier is the record's own
+        /// URI, which lives in an indexed column, and today's star
+        /// decomposition carries it apart from `filters` for exactly that
+        /// reason. A scan with one of these reads one record; a scan without
+        /// reads the class.
+        ///
+        /// The writer emits *no triple* for the identifier -- it is the
+        /// subject IRI -- so a constant here narrows the fetch and is never an
+        /// answer on its own. `LoweringRefusal::IdentityIsNotATriple` is what
+        /// keeps that true.
+        identifier_values: Vec<String>,
     },
     /// One row per element of a multivalued slot, so row count matches
     /// solution count. Without it a record with three values counts once.
@@ -1158,6 +1179,8 @@ pub fn scan_with_fanout(
             star_var: star_var.to_owned(),
             class_uri: class_uri.to_owned(),
             slots,
+            // Identity is folded by its own rule, once there is one to fold.
+            identifier_values: Vec::new(),
         },
         discharges,
     )];
@@ -1822,9 +1845,15 @@ impl PlanOp {
                 star_var,
                 class_uri,
                 slots,
+                identifier_values,
             } => format!(
-                "{} as ?{star_var}, requires [{}]",
+                "{} as ?{star_var}{}, requires [{}]",
                 shorten(class_uri),
+                if identifier_values.is_empty() {
+                    String::new()
+                } else {
+                    format!(" is {}", identifier_values.join(", "))
+                },
                 slots
                     .iter()
                     .map(|slot| format!(
@@ -2813,6 +2842,7 @@ mod tests {
             PlanOp::Scan {
                 star_var: "s".to_owned(),
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
+                identifier_values: Vec::new(),
                 slots: vec![ScanSlot {
                     path: vec!["trafficKinds".to_owned()],
                     var: Some("kind".to_owned()),
