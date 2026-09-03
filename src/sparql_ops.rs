@@ -587,6 +587,21 @@ pub enum LoweringRefusal {
     /// optional and this lowering would call it mandatory, which wraps its
     /// conditions the wrong way.
     OptionalScan { node: usize },
+    /// A node claiming an obligation the work it renders does not discharge.
+    ///
+    /// Today this catches one shape: a scan claiming to scope a subject to a
+    /// class while scanning another. The clause is stated generally because
+    /// the *category* is what matters -- a ledger that balances says every
+    /// obligation is claimed once, and says nothing about whether the claimant
+    /// does the work.
+    ClaimWithoutTheWork { node: usize, claim: String },
+    /// A condition on a slot that holds several values, rendered as a
+    /// comparison against the column.
+    ///
+    /// The one defect this pipeline shipped, as a refusal: the array's text is
+    /// compared against the constant and nothing matches, so the query answers
+    /// empty while every ledger balances.
+    ConditionReadsACollection { node: usize, slot: String },
     /// A statement that reads a whole class while the query fixes the
     /// record's identity.
     ///
@@ -639,6 +654,16 @@ impl fmt::Display for LoweringRefusal {
                 "n{node} rests on an identifier restriction, which narrows a fetch \
                  but cannot answer alone: the writer emits no triple for an \
                  identifier, so the engine's answer to such a query is empty"
+            ),
+            Self::ClaimWithoutTheWork { node, claim } => write!(
+                f,
+                "n{node} claims '{claim}' and renders nothing that discharges it"
+            ),
+            Self::ConditionReadsACollection { node, slot } => write!(
+                f,
+                "n{node} compares '{slot}' as a column, and that slot holds \
+                 several values -- the comparison would be against the array's \
+                 text and would match nothing"
             ),
             Self::OptionalScan { node } => write!(
                 f,
@@ -823,7 +848,7 @@ pub fn lower_refined(
     // needs positions.
     let mut grouped: Option<GroupedColumns> = None;
 
-    for id in sql {
+    for id in sql.iter().copied() {
         let node = &plan.nodes[id];
         match &node.op {
             RefinedOp::Scan {
@@ -1261,7 +1286,118 @@ pub fn lower_refined(
         });
     }
 
-    Ok(OpTree { nodes })
+    // The other half of the same clause, asked of the plan because that is
+    // where the claims are attributed to nodes: a scan claiming to scope a
+    // subject to a class must be scanning that class. The comparator needed a
+    // second plan to say "?s is scanned as X rather than Y"; this needs none
+    // to say "this scan claims to scope ?s to Y and scans X".
+    for &id in &sql {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            identifier_values,
+            ..
+        } = &plan.nodes[id].op
+        else {
+            continue;
+        };
+        for claim in &plan.nodes[id].discharges {
+            let Some(crate::sparql_plan::Obligation::Type { subject, class_iri }) =
+                plan.obligations.get(*claim)
+            else {
+                continue;
+            };
+            // The obligation writes its subject as the query did: `?s` for a
+            // variable, `<uri>` for a record the query named -- and a named
+            // record's star is the synthetic one, so the identity is what
+            // matches, not the name.
+            let scopes_the_subject = match subject.strip_prefix('?') {
+                Some(variable) => variable == star_var,
+                None => identifier_values
+                    .iter()
+                    .any(|value| subject.trim_matches(['<', '>']) == value),
+            };
+            if !scopes_the_subject || class_iri != class_uri {
+                return Err(LoweringRefusal::ClaimWithoutTheWork {
+                    node: id,
+                    claim: plan.obligations[*claim].to_string(),
+                });
+            }
+        }
+    }
+
+    let tree = OpTree { nodes };
+    claims_are_backed_by_rendered_work(&tree, schema)?;
+    Ok(tree)
+}
+
+/// **A comparator clause, promoted: claims backed by rendered work.**
+///
+/// A node that claims an obligation must render something that discharges it.
+/// Nothing checked that, and the one defect this pipeline shipped is exactly
+/// its violation: a filter claimed `?k = "m"` on a multivalued slot and
+/// rendered `object_data->>'trafficKinds' = 'm'`, which compares the array's
+/// text and matches nothing. The claim ledger balanced, the frontier was a
+/// cut, the comparator's *claims* agreed -- and the answer was empty.
+///
+/// Two clauses, both about a claim and the work behind it:
+///
+/// * **a condition on a collection must not read it as a column.** Whether a
+///   path holds several values is the schema's answer, asked here with the
+///   same function the single-pass planner asks (`path_multiplies`), so the
+///   two cannot disagree about a column. A `Column` reading of a multivalued
+///   path is the shipped bug, stated as a refusal.
+/// * **a scan claiming a `Type` obligation must scan that class.** The other
+///   half of a comparator clause, which needed a second plan to say
+///   "?s is scanned as X rather than Y" and needs none to say "this scan
+///   claims to scope ?s to Y and scans X".
+///
+/// It runs on the lowered tree rather than on the refined plan because the
+/// tree is what executes: a plan can be as truthful as it likes about work its
+/// lowering then renders differently.
+fn claims_are_backed_by_rendered_work(
+    tree: &OpTree,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+) -> Result<(), LoweringRefusal> {
+    let class_of_star: std::collections::HashMap<&str, &str> = tree
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Scan {
+                star_var,
+                class_uri,
+                ..
+            } => Some((star_var.as_str(), class_uri.as_str())),
+            _ => None,
+        })
+        .collect();
+
+    for (id, node) in tree.nodes.iter().enumerate() {
+        match &node.op {
+            Op::Filter {
+                star_var,
+                slot_path,
+                reading,
+                ..
+            } => {
+                let Some(class_uri) = class_of_star.get(star_var.as_str()) else {
+                    // A condition on a star this statement does not scan has
+                    // no column at all.
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                };
+                if *reading == SlotReading::Column
+                    && crate::sparql_pushdown::path_multiplies(schema, class_uri, slot_path)
+                {
+                    return Err(LoweringRefusal::ConditionReadsACollection {
+                        node: id,
+                        slot: slot_path.join("."),
+                    });
+                }
+            }
+            _ => continue,
+        }
+    }
+    Ok(())
 }
 
 /// The row cap a lowered pass carries, when it is the fetch bound.
@@ -2425,6 +2561,60 @@ mod tests {
         .expect_err("an identity restriction must not answer alone");
         assert!(
             matches!(refusal, LoweringRefusal::IdentityIsNotATriple { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// **The promoted clause: claims backed by rendered work.**
+    ///
+    /// Both halves, each sabotaged on a plan the rules actually built, because
+    /// a check nobody has broken deliberately is a check nobody knows the
+    /// strength of.
+    ///
+    /// The first half is the one defect this pipeline shipped: a condition on
+    /// a multivalued slot rendered as a comparison against the column, which
+    /// compares the array's text and matches nothing. Every ledger balanced
+    /// and the comparator's claims agreed; the answer was empty.
+    #[test]
+    fn a_claim_needs_the_work_behind_it() {
+        use crate::sparql_refine::{PlanOp as RefinedOp, SlotReading as Reading};
+
+        let sv = test_schema_view();
+
+        // A containment test on a collection, which the rules render as an
+        // element test.
+        let mut plan = refined_plan(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }",
+            &sv,
+        );
+        lower_refined(&plan, &sv, None).expect("as built, it lowers");
+        let filter = plan.find("filter")[0];
+        if let RefinedOp::Filter { condition, .. } = &mut plan.nodes[filter].op
+            && let crate::sparql_refine::Expr::Compare { left, .. } = condition
+            && let crate::sparql_refine::Expr::Slot { reading, .. } = left.as_mut()
+        {
+            *reading = Reading::Column;
+        }
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a column reading of a collection must not render");
+        assert!(
+            matches!(refusal, LoweringRefusal::ConditionReadsACollection { .. }),
+            "{refusal}"
+        );
+
+        // And a scan claiming to scope a subject to a class it does not scan.
+        let mut plan = refined_plan(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            &sv,
+        );
+        let scan = plan.find("scan")[0];
+        if let RefinedOp::Scan { class_uri, .. } = &mut plan.nodes[scan].op {
+            *class_uri = "https://data.infrabel.be/asset360/Track".to_owned();
+        }
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a scan must scan the class it claims to scope");
+        assert!(
+            matches!(refusal, LoweringRefusal::ClaimWithoutTheWork { .. }),
             "{refusal}"
         );
     }

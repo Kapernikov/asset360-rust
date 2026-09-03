@@ -1203,7 +1203,11 @@ fn disconnected_star(stars: &[&Star], joins: &[&crate::sparql_scoper::JoinEdge])
 /// range has no describable term (it serialises as a blank node), so a
 /// descriptor-shaped question answers "no container" for `documents` — which
 /// reads as single-valued and is how this multiplicity stayed invisible.
-fn path_multiplies(schema_view: &SchemaView, class_uri: &str, slot_path: &[String]) -> bool {
+pub(crate) fn path_multiplies(
+    schema_view: &SchemaView,
+    class_uri: &str,
+    slot_path: &[String],
+) -> bool {
     use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::slotview::SlotContainerMode;
 
