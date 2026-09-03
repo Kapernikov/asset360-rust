@@ -40,7 +40,13 @@ pub mod shacl_ast;
 
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
+pub mod sparql_ops;
+pub mod sparql_plan;
+pub mod sparql_pushdown;
+pub mod sparql_refine;
+pub mod sparql_rules;
 pub mod sparql_scoper;
+pub mod sparql_terms;
 
 #[cfg(feature = "shacl-parser")]
 pub mod shacl_parser;
@@ -80,12 +86,24 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "sparql-endpoint")]
     {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_inexact_reasons, m)?)?;
+        m.add_function(wrap_pyfunction!(py_sparql_pushdown, m)?)?;
+        m.add_function(wrap_pyfunction!(py_plan_query, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
         m.add_class::<Star>()?;
         m.add_class::<JoinEdge>()?;
         m.add_class::<FilterCondition>()?;
+        m.add_class::<PushdownVerdict>()?;
+        m.add_class::<ExecutionPlan>()?;
+        m.add_class::<PlanPass>()?;
+        m.add_class::<PushdownRefusal>()?;
+        m.add_class::<PlanOp>()?;
+        m.add_class::<PushdownSolution>()?;
+        m.add_class::<PushdownBinding>()?;
+        m.add_class::<PushdownMeasure>()?;
+        m.add_class::<PushdownOrder>()?;
     }
     Ok(())
 }
@@ -1239,8 +1257,23 @@ impl PyConstraintSet {
 #[derive(Clone)]
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
 ///
-/// Each condition has an `operator` (`"eq"` or `"in"`) and one or more
-/// string `values`. The Django view translates these to ORM lookups.
+/// Each condition has an `operator` and one or more string `values`:
+///
+/// | operator | from | values |
+/// |---|---|---|
+/// | `"eq"` | `FILTER(?v = "x")`, `?s :slot "x"` | one |
+/// | `"in"` | `VALUES ?v { "a" "b" }` | one or more |
+/// | `"gt"` / `"gte"` / `"lt"` / `"lte"` | `FILTER(?v > 10)` and friends | one |
+///
+/// A comparison compares the way SPARQL does, not the way text does: a numeric
+/// slot casts (as text, `"9" > "10"`) and a string slot needs codepoint
+/// collation. The consumer decides from the slot's type, which is why the
+/// operator alone is carried here.
+///
+/// **Unknown operators must be refused, not ignored.** A newer planner can emit
+/// one this consumer does not know, and silently dropping it widens the fetch
+/// instead of narrowing it — which stays correct only while something else
+/// re-applies the filter.
 ///
 /// Python usage:
 ///
@@ -1251,6 +1284,10 @@ impl PyConstraintSet {
 ///             qs = qs.filter(**{f"object_data__{field}": cond.value})
 ///         elif cond.operator == "in":
 ///             qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+///         elif cond.operator in ("gt", "gte", "lt", "lte"):
+///             qs = qs.filter(**{f"object_data__{field}__{cond.operator}": cond.value})
+///         else:
+///             raise ValueError(f"unsupported filter operator: {cond.operator}")
 /// ```
 pub struct FilterCondition {
     operator: String,
@@ -1261,13 +1298,18 @@ pub struct FilterCondition {
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl FilterCondition {
-    /// The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
+    /// The filter operator: ``"eq"`` (equality), ``"in"`` (set membership), or
+    /// ``"gt"`` / ``"gte"`` / ``"lt"`` / ``"lte"`` (ordering comparison).
+    ///
+    /// ``"ne"`` is deliberately absent: SPARQL's inequality is false for an
+    /// unbound variable, where SQL's ``<>`` against NULL is unknown and would
+    /// drop rows the query keeps.
     #[getter]
     fn operator(&self) -> &str {
         &self.operator
     }
 
-    /// The filter value (for ``"eq"`` conditions).
+    /// The single filter value, for every operator except ``"in"``.
     ///
     /// Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
     /// an empty condition (should not happen in practice).
@@ -1281,20 +1323,24 @@ impl FilterCondition {
 
     /// All filter values as a list.
     ///
-    /// For ``"eq"``: single-element list. For ``"in"``: multiple values.
+    /// One element for every operator except ``"in"``, which may have several.
     #[getter]
     fn values(&self) -> Vec<String> {
         self.values.clone()
     }
 
     fn __repr__(&self) -> String {
-        if self.operator == "eq" {
-            format!(
-                "FilterCondition(eq={:?})",
-                self.values.first().unwrap_or(&String::new())
-            )
-        } else {
+        // Print the operator rather than branching on one known value and
+        // labelling everything else "in" — which is how a `gt` condition came
+        // out as `FilterCondition(in=["10"])`.
+        if self.operator == "in" {
             format!("FilterCondition(in={:?})", self.values)
+        } else {
+            format!(
+                "FilterCondition({}={:?})",
+                self.operator,
+                self.values.first().map_or("", String::as_str)
+            )
         }
     }
 }
@@ -1310,6 +1356,10 @@ impl FilterCondition {
             crate::sparql_scoper::FilterCondition::In(vs) => Self {
                 operator: "in".to_owned(),
                 values: vs.clone(),
+            },
+            crate::sparql_scoper::FilterCondition::Cmp { op, value } => Self {
+                operator: op.as_str().to_owned(),
+                values: vec![value.clone()],
             },
         }
     }
@@ -1379,7 +1429,45 @@ impl Star {
         self.inner.is_optional
     }
 
+    /// Which of this star's slots hold several values per record.
+    ///
+    /// Two things depend on it, and both give wrong answers if it is ignored.
+    /// A condition in :attr:`filters` on one of these fields is a test that the
+    /// array *contains* the value — in Postgres ``EXISTS (SELECT 1 FROM
+    /// jsonb_array_elements_text(object_data->'field') v WHERE v.value = ...)``
+    /// — and rendering it as ``object_data->>'field' = 'value'`` compares the
+    /// array's own text, which matches nothing. And a value read off one of
+    /// these multiplies solutions: a record with three values answers a SPARQL
+    /// question three times, so counting rows is not counting solutions.
+    #[getter]
+    fn multivalued_fields(&self) -> Vec<String> {
+        self.inner.multivalued_fields.clone()
+    }
+
+    /// Which of this star's slots compare as numbers rather than as text.
+    ///
+    /// A comparison in :attr:`filters` on one of these must cast — the stored
+    /// JSONB text does not order the way the number does. ``'9' >= '10'`` is
+    /// true as text and false as a number, and ``'2001' > '9'`` is false as
+    /// text, so ignoring this reports a group too many on the aggregate route
+    /// and drops every row on the prefetch route. Everything else compares
+    /// under ``COLLATE "C"``, which is the codepoint order SPARQL specifies.
+    ///
+    /// A projected column carries the same answer on its own term descriptor;
+    /// a slot that only appears in a ``FILTER`` has no binding to carry it,
+    /// which is what this is for. Both come from the same resolution, so they
+    /// cannot disagree.
+    #[getter]
+    fn numeric_fields(&self) -> Vec<String> {
+        self.inner.numeric_fields.clone()
+    }
+
     /// Value-level filter conditions per slot, pushable to SQL.
+    ///
+    /// A field listed in :attr:`multivalued_fields` needs a containment test
+    /// rather than an equality — see that attribute. Conditions on values
+    /// *inside* the JSON are in :attr:`path_filters`, which has to be rendered
+    /// as well.
     #[getter]
     fn filters(&self) -> HashMap<String, Vec<FilterCondition>> {
         self.inner
@@ -1390,6 +1478,51 @@ impl Star {
                 (field.clone(), py_conds)
             })
             .collect()
+    }
+
+    /// Conditions on values *inside* this record's JSON, as
+    /// ``[(slot_path, [FilterCondition, ...], numeric), ...]``.
+    ///
+    /// ``numeric`` says the value compares as a number, which
+    /// :attr:`numeric_fields` cannot answer for it -- that lists the record's
+    /// own slots, and this value is inside one of them.
+    ///
+    /// ``?s :maintenanceUnit ?m . ?m :zoneName "Charleroi"`` constrains a value
+    /// two slots down, which no key of :attr:`filters` can name. Render by
+    /// walking the path — ``object_data->'maintenanceUnit'->>'zoneName' =
+    /// 'Charleroi'`` — with the last step as ``->>`` and every earlier one as
+    /// ``->``.
+    ///
+    /// **Not optional to read.** A consumer that renders only :attr:`filters`
+    /// asks a weaker question than the query did, and on an aggregate route
+    /// that is a larger number reported without a warning. Every path here is
+    /// single-valued at every hop and outside any ``OPTIONAL``; anything else
+    /// stays with the engine.
+    #[getter]
+    fn path_filters(&self) -> Vec<(Vec<String>, Vec<FilterCondition>, bool)> {
+        self.inner
+            .path_filters
+            .iter()
+            .map(|filter| {
+                let conditions = filter
+                    .conditions
+                    .iter()
+                    .map(FilterCondition::from_rust)
+                    .collect();
+                (filter.slot_path.clone(), conditions, filter.numeric)
+            })
+            .collect()
+    }
+
+    /// Which SPARQL variable each slot binds to, as ``{slot: variable}``.
+    ///
+    /// Answers "where does ``?name`` come from" without re-parsing the
+    /// query: the star decomposition already worked it out to find join
+    /// edges. Only object *variables* appear — a constant object is a
+    /// filter, not a binding.
+    #[getter]
+    fn slot_variables(&self) -> HashMap<String, String> {
+        self.inner.slot_variables.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -1552,12 +1685,95 @@ impl PlanNode {
 pub struct QueryPlan {
     root: PlanNode,
     sql_limit: Option<usize>,
+    path_bindings: HashMap<String, (String, Vec<String>, bool)>,
+    inexact_reason: Option<&'static str>,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+impl From<crate::sparql_scoper::QueryPlan> for QueryPlan {
+    /// One conversion for both entry points. ``sparql_scope`` and a pushdown
+    /// verdict's ``.plan`` were building this by hand, fifty lines apart, and
+    /// an exactness field set in one place and forgotten in the other is a plan
+    /// that claims to describe a query it does not.
+    fn from(plan: crate::sparql_scoper::QueryPlan) -> Self {
+        QueryPlan {
+            root: PlanNode { inner: plan.root },
+            sql_limit: plan.sql_limit,
+            path_bindings: plan
+                .path_bindings
+                .into_iter()
+                .map(|(var, binding)| {
+                    (var, (binding.star_var, binding.slot_path, binding.optional))
+                })
+                .collect(),
+            inexact_reason: plan.inexact.map(|cause| cause.as_str()),
+        }
+    }
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl QueryPlan {
+    /// Variables reached by walking into a star's nested structures, as
+    /// ``{variable: (star_variable, [slot, ...], optional)}``.
+    ///
+    /// ``?s :location ?l . ?l :longitude ?v`` binds ``?v`` two slots down from
+    /// ``?s``, which no star can describe — ``?l`` has no ``rdf:type`` and is
+    /// part of ``?s``'s JSON rather than an object of its own. Read the value
+    /// with ``object_data->'location'->>'longitude'``.
+    ///
+    /// Only scalar leaves appear. A variable standing for the nested structure
+    /// itself serialises as a blank node, which nothing can reproduce, so it is
+    /// traversable but never a value.
+    ///
+    /// The third element is whether any hop of the path was introduced inside
+    /// an ``OPTIONAL``. It is load-bearing: a required and an optional nested
+    /// read follow the same slots and have different answers — required
+    /// excludes the records that lack the value, optional keeps them with the
+    /// variable unbound — so a consumer that renders both the same way answers
+    /// one of the two questions wrongly.
+    #[getter]
+    fn path_bindings(&self) -> HashMap<String, (String, Vec<String>, bool)> {
+        self.path_bindings.clone()
+    }
+
+    /// Whether this plan describes the query *completely*.
+    ///
+    /// Extraction is deliberately lossy in the safe direction: a constraint
+    /// that cannot be expressed is dropped, the fetch widens, and oxigraph
+    /// re-applies the real query to what came back. ``False`` means something
+    /// was dropped — a ``FILTER`` this cannot express, a triple whose subject
+    /// is not a scoped class, a sub-``SELECT``, a ``FILTER`` inside
+    /// ``OPTIONAL``.
+    ///
+    /// A consumer that only needs a superset (fetch objects, let oxigraph
+    /// answer) may ignore this. A consumer that answers *from* the plan must
+    /// refuse when it is ``False``, or it answers a weaker question and reports
+    /// a plausible wrong number.
+    #[getter]
+    fn exact(&self) -> bool {
+        self.inexact_reason.is_none()
+    }
+
+    /// Why the plan is not exact, or ``None`` when it is.
+    ///
+    /// One of :func:`sparql_inexact_reasons`, which is served from the
+    /// planner's own set rather than restated here — restating it is how this
+    /// docstring came to advertise two causes that could not occur and, later,
+    /// to omit one that could.
+    ///
+    /// Treat an unrecognised value as inexact rather than ignoring it: the set
+    /// grows as more ways of dropping part of a query are found, and a new one
+    /// means the plan describes less than the query.
+    ///
+    /// Recorded at the point the planner dropped something, so this names a
+    /// real cause rather than an inference about what survived.
+    #[getter]
+    fn inexact_reason(&self) -> Option<&'static str> {
+        self.inexact_reason
+    }
+
     /// Root of the algebra tree.
     #[getter]
     fn root(&self) -> PlanNode {
@@ -1588,8 +1804,17 @@ impl QueryPlan {
             .collect()
     }
 
-    /// SQL LIMIT — only for single-star, zero-join, zero-OPTIONAL
-    /// queries with a top-level SPARQL LIMIT.
+    /// How many rows the object fetch may be limited to — ``OFFSET + LIMIT``,
+    /// not ``LIMIT``.
+    ///
+    /// The fetch has to cover the whole window the query asks for, because the
+    /// engine applies the offset to whatever comes back: ``LIMIT 10 OFFSET 20``
+    /// needs thirty rows, and fetching ten and then skipping twenty of them
+    /// returns nothing.
+    ///
+    /// ``None`` means no limit may be pushed — several classes, a join, an
+    /// OPTIONAL, a modifier that must see every solution first, or a plan that
+    /// does not describe the whole query (see ``exact``).
     #[getter]
     fn sql_limit(&self) -> Option<usize> {
         self.sql_limit
@@ -1597,11 +1822,1099 @@ impl QueryPlan {
 
     fn __repr__(&self) -> String {
         format!(
-            "QueryPlan(root={:?}, limit={:?})",
+            "QueryPlan(root={:?}, limit={:?}, inexact_reason={:?})",
             self.root.kind(),
-            self.sql_limit
+            self.sql_limit,
+            self.inexact_reason
         )
     }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One projected value in a pushdown solution: which slot of which star it
+/// reads, and where that sits in the schema.
+///
+/// Result columns are addressed by *position* in
+/// :attr:`PushdownSolution.bindings`, never by SPARQL variable name — those
+/// come from the request, and unquoted SQL identifiers case-fold and truncate
+/// at 63 bytes, so two distinct variables could silently collide into one
+/// column. ``var`` is for labelling the response only.
+pub struct PushdownBinding {
+    inner: crate::sparql_pushdown::BindingSpec,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownBinding {
+    /// SPARQL variable name (without ``?``) — the result column label.
+    #[getter]
+    fn var(&self) -> &str {
+        &self.inner.var
+    }
+
+    /// The star's variable, which the SQL builder maps to a table alias.
+    #[getter]
+    fn star_var(&self) -> &str {
+        &self.inner.star_var
+    }
+
+    /// Slot path from the object root to the value. Empty means the object's
+    /// own IRI (the indexed ``asset360_uri`` column, not JSONB).
+    #[getter]
+    fn slot_path(&self) -> Vec<String> {
+        self.inner.slot_path.clone()
+    }
+
+    /// Class IRI this binding's slot path is resolved against — the schema
+    /// position to ask for a term descriptor.
+    #[getter]
+    fn class_uri(&self) -> &str {
+        &self.inner.class_uri
+    }
+
+    /// How each step of ``slot_path`` is stored: ``"single"``, ``"list"`` or
+    /// ``"mapping"``, one entry per step.
+    ///
+    /// RDF gives one triple per element of a collection, so a query over a
+    /// multivalued slot has one solution per element. A consumer must unnest
+    /// those (``jsonb_array_elements`` for a list, ``jsonb_each`` for a
+    /// mapping, whose keys are not part of the graph) or the counts come out as
+    /// one per record. Any hop along a path may be a collection, and each one
+    /// multiplies the rows.
+    #[getter]
+    fn containers(&self) -> Vec<&'static str> {
+        self.inner
+            .containers
+            .iter()
+            .map(|container| container.as_str())
+            .collect()
+    }
+
+    /// ``True`` when the slot's values are numbers.
+    ///
+    /// The renderer needs this twice over: a numeric column is cast before
+    /// aggregation, while a text column must be compared and sorted under
+    /// ``COLLATE "C"`` — SPARQL orders simple literals by Unicode codepoint,
+    /// which the database's default collation does not.
+    ///
+    /// Resolved from the datatype the schema derives (so a custom type with
+    /// ``typeof: integer`` counts), not from the range's spelling.
+    #[getter]
+    fn numeric(&self) -> bool {
+        self.inner.descriptor.numeric
+    }
+
+    /// How this column's stored text becomes an RDF term: ``"iri"``,
+    /// ``"literal"`` or ``"enum_iri"``.
+    ///
+    /// An unrecognised value must be rejected rather than guessed — it means
+    /// the analyser knows a term shape this serialiser does not, and guessing
+    /// would answer differently from the oxigraph route.
+    #[getter]
+    fn term_kind(&self) -> &'static str {
+        use crate::sparql_terms::TermKind;
+        match self.inner.descriptor.kind {
+            TermKind::Iri => "iri",
+            TermKind::Literal => "literal",
+            TermKind::EnumIri => "enum_iri",
+        }
+    }
+
+    /// Datatype IRI for a typed literal, or ``None`` for a plain one.
+    #[getter]
+    fn datatype(&self) -> Option<String> {
+        self.inner.descriptor.datatype.clone()
+    }
+
+    /// Language tag, mutually exclusive with ``datatype`` per RDF.
+    #[getter]
+    fn lang(&self) -> Option<String> {
+        self.inner.descriptor.lang.clone()
+    }
+
+    /// For ``term_kind == "enum_iri"``: stored value → IRI. A value absent
+    /// from this map has no ``meaning`` in the schema and stays a literal,
+    /// which is what the turtle writer does.
+    #[getter]
+    fn enum_map(&self) -> HashMap<String, String> {
+        self.inner.descriptor.enum_map.iter().cloned().collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownBinding(var={:?}, slot_path={:?}, term_kind={:?})",
+            self.inner.var,
+            self.inner.slot_path,
+            self.term_kind()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One aggregate in the SELECT list.
+pub struct PushdownMeasure {
+    inner: crate::sparql_pushdown::MeasureSpec,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownMeasure {
+    /// The result variable (the ``AS`` name), used to label the column.
+    #[getter]
+    fn var(&self) -> &str {
+        &self.inner.var
+    }
+
+    /// One of ``"count"``, ``"sum"``, ``"avg"``, ``"min"``, ``"max"``.
+    /// Unknown values MUST be rejected rather than guessed: a new aggregate
+    /// appearing here means the Rust side supports something this Python
+    /// does not yet render.
+    #[getter]
+    fn func(&self) -> &str {
+        use crate::sparql_pushdown::Measure;
+        match self.inner.func {
+            Measure::Count { .. } => "count",
+            Measure::Sum { .. } => "sum",
+            Measure::Avg { .. } => "avg",
+            Measure::Min { .. } => "min",
+            Measure::Max { .. } => "max",
+        }
+    }
+
+    /// Index into ``bindings`` of the aggregated value, or ``None`` for
+    /// ``COUNT(*)`` — which counts solutions and has no argument.
+    #[getter]
+    fn arg(&self) -> Option<usize> {
+        use crate::sparql_pushdown::Measure;
+        match self.inner.func {
+            Measure::Count { arg, .. } => arg,
+            Measure::Sum { arg }
+            | Measure::Avg { arg }
+            | Measure::Min { arg }
+            | Measure::Max { arg } => Some(arg),
+        }
+    }
+
+    /// ``True`` for ``COUNT(DISTINCT ...)``. Always ``False`` for the other
+    /// functions, where SPARQL has no DISTINCT form this subset accepts.
+    #[getter]
+    fn distinct(&self) -> bool {
+        use crate::sparql_pushdown::Measure;
+        matches!(self.inner.func, Measure::Count { distinct: true, .. })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownMeasure(var={:?}, func={:?})",
+            self.inner.var,
+            self.func()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One ``ORDER BY`` term.
+///
+/// ``kind`` says whether it sorts on a projected value or on an aggregate
+/// result, which decides whether the SQL builder can place it inside the
+/// binding subquery or must apply it outside the grouping.
+pub struct PushdownOrder {
+    inner: crate::sparql_pushdown::OrderTerm,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownOrder {
+    /// ``"binding"`` or ``"measure"``.
+    #[getter]
+    fn kind(&self) -> &str {
+        use crate::sparql_pushdown::OrderKey;
+        match self.inner.key {
+            OrderKey::Binding(_) => "binding",
+            OrderKey::Measure(_) => "measure",
+        }
+    }
+
+    /// Index into ``bindings`` or ``measures``, per ``kind``.
+    #[getter]
+    fn index(&self) -> usize {
+        use crate::sparql_pushdown::OrderKey;
+        match self.inner.key {
+            OrderKey::Binding(i) | OrderKey::Measure(i) => i,
+        }
+    }
+
+    /// ``True`` for ``DESC``.
+    ///
+    /// Note for the renderer: SPARQL sorts unbound *before* every bound value
+    /// ascending, where Postgres defaults to NULLS LAST for ASC — so the
+    /// generated SQL must say ``NULLS FIRST`` / ``NULLS LAST`` explicitly.
+    #[getter]
+    fn desc(&self) -> bool {
+        self.inner.desc
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownOrder(kind={:?}, index={}, desc={})",
+            self.kind(),
+            self.index(),
+            self.inner.desc
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// What SQL must produce for an eligible query: one row per solution, then
+/// grouping on top.
+pub struct PushdownSolution {
+    inner: crate::sparql_pushdown::SolutionSpec,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownSolution {
+    #[getter]
+    fn bindings(&self) -> Vec<PushdownBinding> {
+        self.inner
+            .bindings
+            .iter()
+            .map(|b| PushdownBinding { inner: b.clone() })
+            .collect()
+    }
+
+    /// Indices into ``bindings`` forming the ``GROUP BY``. Empty is legal and
+    /// means one row over the whole input — SPARQL returns exactly one
+    /// solution for a bare aggregate, where a SQL ``GROUP BY`` over no rows
+    /// would return none, so the renderer must omit ``GROUP BY`` entirely.
+    #[getter]
+    fn group_keys(&self) -> Vec<usize> {
+        self.inner.group_keys.clone()
+    }
+
+    #[getter]
+    fn measures(&self) -> Vec<PushdownMeasure> {
+        self.inner
+            .measures
+            .iter()
+            .map(|m| PushdownMeasure { inner: m.clone() })
+            .collect()
+    }
+
+    #[getter]
+    fn order_by(&self) -> Vec<PushdownOrder> {
+        self.inner
+            .order_by
+            .iter()
+            .map(|o| PushdownOrder { inner: o.clone() })
+            .collect()
+    }
+
+    #[getter]
+    fn distinct(&self) -> bool {
+        self.inner.distinct
+    }
+
+    #[getter]
+    fn limit(&self) -> Option<usize> {
+        self.inner.limit
+    }
+
+    #[getter]
+    fn offset(&self) -> usize {
+        self.inner.offset
+    }
+
+    /// The variables the query asks for, in ``SELECT`` order.
+    ///
+    /// A measure or binding absent from this list is machinery: a value grouped
+    /// by but not selected, or an aggregate that exists only to order by — the
+    /// latter has no ``AS`` name, so emitting it would produce a column named
+    /// after an internal identifier.
+    #[getter]
+    fn projected(&self) -> Vec<String> {
+        self.inner.projected.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownSolution(bindings={}, group_keys={:?}, measures={})",
+            self.inner.bindings.len(),
+            self.inner.group_keys,
+            self.inner.measures.len()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// Verdict on whether a query's grouping and aggregation can be answered in
+/// SQL.
+///
+/// Three-way on purpose. ``"not_applicable"`` (not an aggregate at all) and
+/// ``"blocked"`` (an aggregate outside the supported subset) must not collapse
+/// into one falsy value: the first keeps the existing route silently, the
+/// second is reportable to whoever wrote the query.
+pub struct PushdownVerdict {
+    inner: crate::sparql_pushdown::Pushdown,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownVerdict {
+    /// ``"not_applicable"``, ``"blocked"`` or ``"eligible"``.
+    #[getter]
+    fn kind(&self) -> &str {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::NotApplicable => "not_applicable",
+            Pushdown::Blocked(_) => "blocked",
+            Pushdown::Eligible { .. } => "eligible",
+        }
+    }
+
+    /// Stable machine-readable refusal code, or ``None`` when not blocked.
+    /// Branch on this, never on ``detail``.
+    #[getter]
+    fn code(&self) -> Option<&'static str> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Blocked(b) => Some(b.code.as_str()),
+            _ => None,
+        }
+    }
+
+    /// What blocked, in terms of the query and the data model.
+    #[getter]
+    fn detail(&self) -> Option<String> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Blocked(b) => Some(b.detail.clone()),
+            _ => None,
+        }
+    }
+
+    /// Where in the query, when locatable — a variable or an operator.
+    #[getter]
+    fn at(&self) -> Option<String> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Blocked(b) => b.at.clone(),
+            _ => None,
+        }
+    }
+
+    /// A supported shape to use instead. This is the field that turns a
+    /// refusal into a repair, so it is meant to be shown verbatim.
+    #[getter]
+    fn instead(&self) -> Option<&'static str> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Blocked(b) => Some(b.instead()),
+            _ => None,
+        }
+    }
+
+    /// The plan the verdict was derived from, when ``kind == "eligible"``.
+    ///
+    /// A consumer needs **both**: the solution says what to project, group and
+    /// aggregate, and the plan says which rows — the classes, their filters and
+    /// the join edges. Reading only the solution silently drops every
+    /// constraint: ``FILTER(?l > 5)`` on a ``COUNT(*)`` yields a solution with
+    /// no bindings, and a bare aggregate's solution does not even name the
+    /// class.
+    ///
+    /// Use this rather than calling ``sparql_scope`` again — a second call
+    /// re-parses and could in principle disagree with the one behind the
+    /// verdict.
+    ///
+    /// One field does not carry over: this plan's :attr:`~QueryPlan.sql_limit`
+    /// is always ``None`` here, because an aggregate must see every solution
+    /// before it can be limited. The query's own ``LIMIT`` is
+    /// ``solution.limit``, which applies to the *grouped* rows — take it from
+    /// there, never from the plan.
+    #[getter]
+    fn plan(&self) -> Option<QueryPlan> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Eligible { plan, .. } => Some(plan.clone().into()),
+            _ => None,
+        }
+    }
+
+    /// The solution spec when ``kind == "eligible"``, else ``None``.
+    #[getter]
+    fn solution(&self) -> Option<PushdownSolution> {
+        use crate::sparql_pushdown::Pushdown;
+        match &self.inner {
+            Pushdown::Eligible { solution, .. } => Some(PushdownSolution {
+                inner: solution.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match self.code() {
+            Some(code) => format!("PushdownVerdict(kind={:?}, code={:?})", self.kind(), code),
+            None => format!("PushdownVerdict(kind={:?})", self.kind()),
+        }
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One operator of a database pass: a scan, a filter, a join, an unnest, a
+/// grouping, a sort, a distinct, a slice, or a projection.
+///
+/// Read ``kind`` first and refuse a value you do not know: skipping an operator
+/// you cannot render answers a different question, which is the failure the
+/// whole plan is shaped to prevent. The accessors for other kinds return
+/// ``None`` or an empty list, so a renderer branches on ``kind`` and reads only
+/// what belongs to it.
+pub struct PlanOp {
+    inner: crate::sparql_ops::OpNode,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PlanOp {
+    /// ``"scan"``, ``"unnest"``, ``"filter"``, ``"join"``, ``"group"``,
+    /// ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.inner.op.kind()
+    }
+
+    /// Indices of the operators this one consumes. Always lower than this
+    /// operator's own index, so a renderer can walk the list in order.
+    #[getter]
+    fn inputs(&self) -> Vec<usize> {
+        self.inner.op.inputs()
+    }
+
+    /// Obligations this operator discharges. An operator that only narrows
+    /// claims nothing — see ``enforcement``.
+    #[getter]
+    fn discharges(&self) -> Vec<usize> {
+        self.inner.discharges.clone()
+    }
+
+    /// The star this operator works on, for the kinds that name one: scan,
+    /// unnest, filter.
+    #[getter]
+    fn star_var(&self) -> Option<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { star_var, .. }
+            | Op::Unnest { star_var, .. }
+            | Op::Filter { star_var, .. } => Some(star_var.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``"scan"``: the class IRI to match against ``asset_type``.
+    #[getter]
+    fn class_uri(&self) -> Option<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { class_uri, .. } => Some(class_uri.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``"scan"``: values bound against the class's identifier slot, to be
+    /// compared against the indexed ``asset360_uri`` column rather than the
+    /// JSONB payload.
+    #[getter]
+    fn identifier_values(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan {
+                identifier_values, ..
+            } => identifier_values.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"scan"``: slots that must be present (``object_data ? 'slot'``).
+    #[getter]
+    fn required_slots(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { required_slots, .. } => required_slots.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"scan"``: slots that may be absent, so no existence check.
+    #[getter]
+    fn optional_slots(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { optional_slots, .. } => optional_slots.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"scan"``: whether the star appears only inside ``OPTIONAL``, so
+    /// its conditions must tolerate a row the join did not match. Rendering it
+    /// as required drops rows the query keeps.
+    #[getter]
+    fn is_optional(&self) -> bool {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { is_optional, .. } => *is_optional,
+            _ => false,
+        }
+    }
+
+    /// For ``"filter"``: whether the value compares as a number rather than as
+    /// text. Comparing a number as text makes ``'9' >= '10'`` true.
+    #[getter]
+    fn numeric(&self) -> bool {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { numeric, .. } => *numeric,
+            _ => false,
+        }
+    }
+
+    /// For ``"filter"`` and ``"unnest"``: the path from the record root to the
+    /// value. One element is a column; more walks into a nested structure.
+    #[getter]
+    fn slot_path(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { slot_path, .. } | Op::Unnest { slot_path, .. } => slot_path.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"filter"``: what the value must satisfy.
+    #[getter]
+    fn condition(&self) -> Option<FilterCondition> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { condition, .. } => Some(FilterCondition::from_rust(condition)),
+            _ => None,
+        }
+    }
+
+    /// For ``"filter"``: ``"enforces"`` when this operator decides the
+    /// obligation, ``"narrows"`` when it only reduces rows and a later pass
+    /// decides.
+    ///
+    /// A renderer may drop a ``"narrows"`` filter and still be correct — only
+    /// slower. Dropping an ``"enforces"`` one answers a different question.
+    #[getter]
+    fn enforcement(&self) -> Option<&'static str> {
+        use crate::sparql_ops::{Enforcement, Op};
+        match &self.inner.op {
+            Op::Filter { enforcement, .. } => Some(match enforcement {
+                Enforcement::Enforces => "enforces",
+                Enforcement::Narrows => "narrows",
+            }),
+            _ => None,
+        }
+    }
+
+    /// For ``"join"``: the slot on the right input whose value is the left
+    /// row's ``asset360_uri``.
+    #[getter]
+    fn right_slot(&self) -> Option<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join { right_slot, .. } => Some(right_slot.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``"join"``: the SPARQL variables the two sides bind, left first.
+    /// A renderer needs them to reach the right table aliases; the input
+    /// indices alone would have to be walked down to their scans.
+    #[getter]
+    fn join_stars(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join {
+                left_star,
+                right_star,
+                ..
+            } => vec![left_star.clone(), right_star.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"join"``: ``"inner"`` or ``"left"``.
+    #[getter]
+    fn join_kind(&self) -> Option<&'static str> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join { kind, .. } => Some(match kind {
+                crate::sparql_scoper::JoinType::Inner => "inner",
+                crate::sparql_scoper::JoinType::Left => "left",
+            }),
+            _ => None,
+        }
+    }
+
+    /// For ``"group"``: one entry per projected value, addressed by position.
+    #[getter]
+    fn bindings(&self) -> Vec<PushdownBinding> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Group { bindings, .. } => bindings
+                .iter()
+                .map(|inner| PushdownBinding {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"group"``: indices into ``bindings`` that form the ``GROUP BY``.
+    /// Empty means one row over the whole input, which is what SPARQL returns
+    /// for a bare aggregate.
+    #[getter]
+    fn keys(&self) -> Vec<usize> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Group { keys, .. } => keys.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"group"``: the aggregates.
+    #[getter]
+    fn measures(&self) -> Vec<PushdownMeasure> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Group { measures, .. } => measures
+                .iter()
+                .map(|inner| PushdownMeasure {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"sort"``: the ordering terms, outermost first.
+    #[getter]
+    fn terms(&self) -> Vec<PushdownOrder> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Sort { terms, .. } => terms
+                .iter()
+                .map(|inner| PushdownOrder {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"slice"``: the row limit, or ``None`` for an offset with no limit.
+    #[getter]
+    fn limit(&self) -> Option<usize> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Slice { limit, .. } => *limit,
+            _ => None,
+        }
+    }
+
+    /// For ``"slice"``: rows to skip.
+    #[getter]
+    fn offset(&self) -> usize {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Slice { offset, .. } => *offset,
+            _ => 0,
+        }
+    }
+
+    /// For ``"project"``: the variables the query asked for, in ``SELECT``
+    /// order. Anything absent is machinery — a variable that exists only to be
+    /// grouped by, or an aggregate the parser named internally.
+    #[getter]
+    fn vars(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Project { vars, .. } => vars.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PlanOp(kind={:?}, inputs={:?})",
+            self.kind(),
+            self.inner.op.inputs()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// Why an aggregate could not be pushed into SQL, in terms its author can act
+/// on.
+pub struct PushdownRefusal {
+    inner: crate::sparql_pushdown::Blocked,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownRefusal {
+    /// Stable code from a closed set. Branch on this, never on ``detail``.
+    #[getter]
+    fn code(&self) -> &'static str {
+        self.inner.code.as_str()
+    }
+
+    /// What blocked, in terms of the query and the data model.
+    #[getter]
+    fn detail(&self) -> String {
+        self.inner.detail.clone()
+    }
+
+    /// Where in the query, when it can be located — a variable or a pattern.
+    #[getter]
+    fn at(&self) -> Option<String> {
+        self.inner.at.clone()
+    }
+
+    /// A supported shape to use instead. Meant to be shown verbatim: it is
+    /// what turns a rejection into a repair.
+    #[getter]
+    fn instead(&self) -> &'static str {
+        self.inner.instead()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PushdownRefusal(code={:?})", self.code())
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// One step of an execution plan.
+pub struct PlanPass {
+    inner: crate::sparql_plan::Pass,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PlanPass {
+    #[getter]
+    fn id(&self) -> usize {
+        self.inner.id
+    }
+
+    /// ``"sql"`` or ``"engine"``.
+    ///
+    /// Closed set: a consumer meeting a kind it does not know must refuse the
+    /// plan rather than skip the pass, which would answer a different question
+    /// than the one asked.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.inner.kind {
+            crate::sparql_plan::PassKind::Sql(_) => "sql",
+            crate::sparql_plan::PassKind::Engine(_) => "engine",
+        }
+    }
+
+    /// Ids of the passes whose solutions this one consumes.
+    #[getter]
+    fn inputs(&self) -> Vec<usize> {
+        self.inner.inputs.clone()
+    }
+
+    /// Variables this pass binds.
+    #[getter]
+    fn emits(&self) -> Vec<String> {
+        self.inner.emits.clone()
+    }
+
+    /// Ids of the obligations this pass enforces.
+    #[getter]
+    fn discharges(&self) -> Vec<usize> {
+        self.inner.discharges.clone()
+    }
+
+    /// For ``kind == "sql"``: the pass as operators, in an order a renderer can
+    /// walk front to back — every operator's inputs come before it.
+    ///
+    /// The only description of the pass. It carried a star decomposition and a
+    /// solution spec as well until every consumer read the nodes; three
+    /// descriptions of one pass is how a reader comes to use the stale one.
+    #[getter]
+    fn ops(&self) -> Vec<PlanOp> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Sql(sql) => sql
+                .ops
+                .nodes
+                .iter()
+                .map(|inner| PlanOp {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            crate::sparql_plan::PassKind::Engine(_) => Vec::new(),
+        }
+    }
+
+    /// For ``kind == "engine"``: why the engine is needed, as stable cause
+    /// codes. Useful in a log line or an explain output — the reader wants to
+    /// know what stopped SQL from answering alone.
+    #[getter]
+    fn causes(&self) -> Vec<String> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(engine) => engine
+                .causes
+                .iter()
+                .map(|cause| cause.as_str().to_owned())
+                .collect(),
+            crate::sparql_plan::PassKind::Sql(_) => Vec::new(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PlanPass(id={}, kind={:?})", self.inner.id, self.kind())
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
+/// What answering a query takes: the obligations it imposes, the passes that
+/// discharge them, and anything left over.
+///
+/// One artifact from one parse. ``sparql_scope`` and ``sparql_pushdown``
+/// each re-parse and answer a question this already contains.
+pub struct ExecutionPlan {
+    inner: crate::sparql_plan::ExecutionPlan,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl ExecutionPlan {
+    /// Version of the plan shape. A consumer built against an older contract
+    /// must refuse rather than interpret fields it may not understand.
+    #[getter]
+    fn contract(&self) -> u32 {
+        self.inner.contract
+    }
+
+    /// Whether every obligation has a pass to enforce it.
+    ///
+    /// ``False`` means the plan answers a *different* question than the one
+    /// asked, so the caller must refuse to run it.
+    #[getter]
+    fn is_accounted(&self) -> bool {
+        self.inner.is_accounted()
+    }
+
+    /// Whether SQL answers the whole question, with no engine pass — what a
+    /// consumer with no fallback (a stored question) has to ask.
+    #[getter]
+    fn sql_only(&self) -> bool {
+        self.inner.sql_only()
+    }
+
+    #[getter]
+    fn passes(&self) -> Vec<PlanPass> {
+        self.inner
+            .passes
+            .iter()
+            .map(|pass| PlanPass {
+                inner: pass.clone(),
+            })
+            .collect()
+    }
+
+    /// Every obligation the query imposes, rendered for reading.
+    #[getter]
+    fn obligations(&self) -> Vec<String> {
+        self.inner
+            .obligations
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// The obligations no pass discharges, rendered for reading. Empty when
+    /// the plan answers exactly the question asked; anything here belongs in
+    /// the refusal message.
+    #[getter]
+    fn residual(&self) -> Vec<String> {
+        self.inner
+            .residual
+            .iter()
+            .filter_map(|id| self.inner.obligations.get(*id))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Why an aggregate could not be answered in SQL, or ``None`` when that
+    /// did not arise — either SQL answered it, or the query never asked for
+    /// one.
+    ///
+    /// Distinct from a pass's ``causes``, which explain a *slower* answer.
+    /// This is what to tell whoever wrote the query: a stable ``code``, the
+    /// ``detail``, optionally ``at`` (the variable or pattern), and
+    /// ``instead`` — the shape that would work.
+    #[getter]
+    fn blocked(&self) -> Option<PushdownRefusal> {
+        self.inner
+            .blocked
+            .clone()
+            .map(|inner| PushdownRefusal { inner })
+    }
+
+    /// The whole ledger, as text: state, passes with what each discharges, the
+    /// residual, and any refusal. Meant for a human — an explain output, a log
+    /// line, or a test failure that has to say *why* a plan was refused.
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ExecutionPlan(contract={}, passes={}, accounted={}, sql_only={})",
+            self.inner.contract,
+            self.inner.passes.len(),
+            self.inner.is_accounted(),
+            self.inner.sql_only()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "plan_query")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Plan a SPARQL query: one parse, one scope, one analysis, one artifact.
+///
+/// The entry point an executor should use. :func:`sparql_scope` and
+/// :func:`sparql_pushdown` remain for callers that predate it, and each
+/// re-parses the query to answer a question this artifact already contains.
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_view: The LinkML schema.
+///
+/// Returns:
+///     ExecutionPlan. Check ``is_accounted`` before running it — a plan with a
+///     residual answers a different question than the one asked. ``print()``
+///     it to read the ledger.
+///
+/// Raises:
+///     ValueError: the query does not parse, is an update, or cannot be
+///         scoped at all.
+fn py_plan_query(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<ExecutionPlan> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    crate::sparql_plan::plan_query(query, sv)
+        .map(|inner| ExecutionPlan { inner })
+        // ScopeError's Display carries the wording the other entry points use,
+        // so the same failure reads the same however it was reached.
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "sparql_pushdown")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Classify a SPARQL query for aggregate pushdown.
+///
+/// Unlike :func:`sparql_scope`, which decides what to *load* for oxigraph to
+/// query, this decides whether the query's grouping and aggregation can be
+/// answered by SQL without loading anything — the only shape that works for an
+/// aggregate, which by definition touches every object of its class.
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_view: The LinkML schema, for resolving slots and ranges.
+///
+/// Returns:
+///     PushdownVerdict — inspect ``.kind`` first.
+///
+/// Raises:
+///     ValueError: the query does not parse or cannot be scoped at all. A
+///         query that parses but cannot be pushed down is a ``"blocked"``
+///         verdict, not an exception.
+fn py_sparql_pushdown(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<PushdownVerdict> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    match crate::sparql_pushdown::analyse_pushdown(query, sv) {
+        Ok(verdict) => Ok(PushdownVerdict { inner: verdict }),
+        // ScopeError's Display produces exactly these strings, so there is one
+        // place to change when a variant is added — rather than two blocks
+        // fifty lines apart that stayed identical by luck.
+        Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e.to_string())),
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Every value :attr:`QueryPlan.inexact_reason` can take, in the planner's own
+/// order.
+///
+/// Served rather than written down: a caller that wants to branch exhaustively
+/// can check its own table against this, and a cause added to the planner shows
+/// up here without anyone remembering to edit a docstring — which is how the
+/// docstring came to advertise two causes that could not occur and to omit one
+/// that could.
+fn sparql_inexact_reasons() -> Vec<&'static str> {
+    crate::sparql_scoper::Inexact::ALL
+        .iter()
+        .map(|cause| cause.as_str())
+        .collect()
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -1629,24 +2942,11 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
     let sv = sv_ref.as_rust();
 
     match crate::sparql_scoper::sparql_scope(query, sv) {
-        Ok(plan) => Ok(QueryPlan {
-            root: PlanNode { inner: plan.root },
-            sql_limit: plan.sql_limit,
-        }),
-        Err(crate::sparql_scoper::ScopeError::UpdateRejected) => {
-            Err(pyo3::exceptions::PyValueError::new_err(
-                "SPARQL Update (INSERT/DELETE) is not supported. This endpoint is read-only.",
-            ))
-        }
-        Err(crate::sparql_scoper::ScopeError::ParseError(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("SPARQL parse error: {msg}")),
-        ),
-        Err(crate::sparql_scoper::ScopeError::Unscoped(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("Query is unscoped: {msg}")),
-        ),
-        Err(crate::sparql_scoper::ScopeError::UnsupportedConstruct(msg)) => Err(
-            pyo3::exceptions::PyValueError::new_err(format!("unsupported_construct: {msg}")),
-        ),
+        Ok(plan) => Ok(plan.into()),
+        // ScopeError's Display produces exactly these strings, so there is one
+        // place to change when a variant is added — rather than two blocks
+        // fifty lines apart that stayed identical by luck.
+        Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e.to_string())),
     }
 }
 

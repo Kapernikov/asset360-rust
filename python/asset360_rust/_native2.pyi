@@ -2688,8 +2688,23 @@ class FilterCondition:
     r"""
     A filter condition extracted from the SPARQL query, pushable to SQL.
     
-    Each condition has an `operator` (`"eq"` or `"in"`) and one or more
-    string `values`. The Django view translates these to ORM lookups.
+    Each condition has an `operator` and one or more string `values`:
+    
+    | operator | from | values |
+    |---|---|---|
+    | `"eq"` | `FILTER(?v = "x")`, `?s :slot "x"` | one |
+    | `"in"` | `VALUES ?v { "a" "b" }` | one or more |
+    | `"gt"` / `"gte"` / `"lt"` / `"lte"` | `FILTER(?v > 10)` and friends | one |
+    
+    A comparison compares the way SPARQL does, not the way text does: a numeric
+    slot casts (as text, `"9" > "10"`) and a string slot needs codepoint
+    collation. The consumer decides from the slot's type, which is why the
+    operator alone is carried here.
+    
+    **Unknown operators must be refused, not ignored.** A newer planner can emit
+    one this consumer does not know, and silently dropping it widens the fetch
+    instead of narrowing it — which stays correct only while something else
+    re-applies the filter.
     
     Python usage:
     
@@ -2700,17 +2715,26 @@ class FilterCondition:
                 qs = qs.filter(**{f"object_data__{field}": cond.value})
             elif cond.operator == "in":
                 qs = qs.filter(**{f"object_data__{field}__in": cond.values})
+            elif cond.operator in ("gt", "gte", "lt", "lte"):
+                qs = qs.filter(**{f"object_data__{field}__{cond.operator}": cond.value})
+            else:
+                raise ValueError(f"unsupported filter operator: {cond.operator}")
     ```
     """
     @property
     def operator(self) -> builtins.str:
         r"""
-        The filter operator: ``"eq"`` (equality) or ``"in"`` (set membership).
+        The filter operator: ``"eq"`` (equality), ``"in"`` (set membership), or
+        ``"gt"`` / ``"gte"`` / ``"lt"`` / ``"lte"`` (ordering comparison).
+        
+        ``"ne"`` is deliberately absent: SPARQL's inequality is false for an
+        unbound variable, where SQL's ``<>`` against NULL is unknown and would
+        drop rows the query keeps.
         """
     @property
     def value(self) -> builtins.str:
         r"""
-        The filter value (for ``"eq"`` conditions).
+        The single filter value, for every operator except ``"in"``.
         
         Shorthand for ``self.values[0]``. Raises ``IndexError`` if called on
         an empty condition (should not happen in practice).
@@ -2720,7 +2744,7 @@ class FilterCondition:
         r"""
         All filter values as a list.
         
-        For ``"eq"``: single-element list. For ``"in"``: multiple values.
+        One element for every operator except ``"in"``, which may have several.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -3558,6 +3582,257 @@ class Prefix:
     def prefix_reference(self, value: builtins.str) -> None: ...
     def __new__(cls, prefix_prefix:builtins.str, prefix_reference:builtins.str) -> Prefix: ...
 
+class PushdownBinding:
+    r"""
+    One projected value in a pushdown solution: which slot of which star it
+    reads, and where that sits in the schema.
+    
+    Result columns are addressed by *position* in
+    :attr:`PushdownSolution.bindings`, never by SPARQL variable name — those
+    come from the request, and unquoted SQL identifiers case-fold and truncate
+    at 63 bytes, so two distinct variables could silently collide into one
+    column. ``var`` is for labelling the response only.
+    """
+    @property
+    def var(self) -> builtins.str:
+        r"""
+        SPARQL variable name (without ``?``) — the result column label.
+        """
+    @property
+    def star_var(self) -> builtins.str:
+        r"""
+        The star's variable, which the SQL builder maps to a table alias.
+        """
+    @property
+    def slot_path(self) -> builtins.list[builtins.str]:
+        r"""
+        Slot path from the object root to the value. Empty means the object's
+        own IRI (the indexed ``asset360_uri`` column, not JSONB).
+        """
+    @property
+    def class_uri(self) -> builtins.str:
+        r"""
+        Class IRI this binding's slot path is resolved against — the schema
+        position to ask for a term descriptor.
+        """
+    @property
+    def containers(self) -> builtins.list[builtins.str]:
+        r"""
+        How each step of ``slot_path`` is stored: ``"single"``, ``"list"`` or
+        ``"mapping"``, one entry per step.
+        
+        RDF gives one triple per element of a collection, so a query over a
+        multivalued slot has one solution per element. A consumer must unnest
+        those (``jsonb_array_elements`` for a list, ``jsonb_each`` for a
+        mapping, whose keys are not part of the graph) or the counts come out as
+        one per record. Any hop along a path may be a collection, and each one
+        multiplies the rows.
+        """
+    @property
+    def numeric(self) -> builtins.bool:
+        r"""
+        ``True`` when the slot's values are numbers.
+        
+        The renderer needs this twice over: a numeric column is cast before
+        aggregation, while a text column must be compared and sorted under
+        ``COLLATE "C"`` — SPARQL orders simple literals by Unicode codepoint,
+        which the database's default collation does not.
+        
+        Resolved from the datatype the schema derives (so a custom type with
+        ``typeof: integer`` counts), not from the range's spelling.
+        """
+    @property
+    def term_kind(self) -> builtins.str:
+        r"""
+        How this column's stored text becomes an RDF term: ``"iri"``,
+        ``"literal"`` or ``"enum_iri"``.
+        
+        An unrecognised value must be rejected rather than guessed — it means
+        the analyser knows a term shape this serialiser does not, and guessing
+        would answer differently from the oxigraph route.
+        """
+    @property
+    def datatype(self) -> typing.Optional[builtins.str]:
+        r"""
+        Datatype IRI for a typed literal, or ``None`` for a plain one.
+        """
+    @property
+    def lang(self) -> typing.Optional[builtins.str]:
+        r"""
+        Language tag, mutually exclusive with ``datatype`` per RDF.
+        """
+    @property
+    def enum_map(self) -> builtins.dict[builtins.str, builtins.str]:
+        r"""
+        For ``term_kind == "enum_iri"``: stored value → IRI. A value absent
+        from this map has no ``meaning`` in the schema and stays a literal,
+        which is what the turtle writer does.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+class PushdownMeasure:
+    r"""
+    One aggregate in the SELECT list.
+    """
+    @property
+    def var(self) -> builtins.str:
+        r"""
+        The result variable (the ``AS`` name), used to label the column.
+        """
+    @property
+    def func(self) -> builtins.str:
+        r"""
+        One of ``"count"``, ``"sum"``, ``"avg"``, ``"min"``, ``"max"``.
+        Unknown values MUST be rejected rather than guessed: a new aggregate
+        appearing here means the Rust side supports something this Python
+        does not yet render.
+        """
+    @property
+    def arg(self) -> typing.Optional[builtins.int]:
+        r"""
+        Index into ``bindings`` of the aggregated value, or ``None`` for
+        ``COUNT(*)`` — which counts solutions and has no argument.
+        """
+    @property
+    def distinct(self) -> builtins.bool:
+        r"""
+        ``True`` for ``COUNT(DISTINCT ...)``. Always ``False`` for the other
+        functions, where SPARQL has no DISTINCT form this subset accepts.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+class PushdownOrder:
+    r"""
+    One ``ORDER BY`` term.
+    
+    ``kind`` says whether it sorts on a projected value or on an aggregate
+    result, which decides whether the SQL builder can place it inside the
+    binding subquery or must apply it outside the grouping.
+    """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        ``"binding"`` or ``"measure"``.
+        """
+    @property
+    def index(self) -> builtins.int:
+        r"""
+        Index into ``bindings`` or ``measures``, per ``kind``.
+        """
+    @property
+    def desc(self) -> builtins.bool:
+        r"""
+        ``True`` for ``DESC``.
+        
+        Note for the renderer: SPARQL sorts unbound *before* every bound value
+        ascending, where Postgres defaults to NULLS LAST for ASC — so the
+        generated SQL must say ``NULLS FIRST`` / ``NULLS LAST`` explicitly.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+class PushdownSolution:
+    r"""
+    What SQL must produce for an eligible query: one row per solution, then
+    grouping on top.
+    """
+    @property
+    def bindings(self) -> builtins.list[PushdownBinding]: ...
+    @property
+    def group_keys(self) -> builtins.list[builtins.int]:
+        r"""
+        Indices into ``bindings`` forming the ``GROUP BY``. Empty is legal and
+        means one row over the whole input — SPARQL returns exactly one
+        solution for a bare aggregate, where a SQL ``GROUP BY`` over no rows
+        would return none, so the renderer must omit ``GROUP BY`` entirely.
+        """
+    @property
+    def measures(self) -> builtins.list[PushdownMeasure]: ...
+    @property
+    def order_by(self) -> builtins.list[PushdownOrder]: ...
+    @property
+    def distinct(self) -> builtins.bool: ...
+    @property
+    def limit(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def offset(self) -> builtins.int: ...
+    @property
+    def projected(self) -> builtins.list[builtins.str]:
+        r"""
+        The variables the query asks for, in ``SELECT`` order.
+        
+        A measure or binding absent from this list is machinery: a value grouped
+        by but not selected, or an aggregate that exists only to order by — the
+        latter has no ``AS`` name, so emitting it would produce a column named
+        after an internal identifier.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+class PushdownVerdict:
+    r"""
+    Verdict on whether a query's grouping and aggregation can be answered in
+    SQL.
+    
+    Three-way on purpose. ``"not_applicable"`` (not an aggregate at all) and
+    ``"blocked"`` (an aggregate outside the supported subset) must not collapse
+    into one falsy value: the first keeps the existing route silently, the
+    second is reportable to whoever wrote the query.
+    """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        ``"not_applicable"``, ``"blocked"`` or ``"eligible"``.
+        """
+    @property
+    def code(self) -> typing.Optional[builtins.str]:
+        r"""
+        Stable machine-readable refusal code, or ``None`` when not blocked.
+        Branch on this, never on ``detail``.
+        """
+    @property
+    def detail(self) -> typing.Optional[builtins.str]:
+        r"""
+        What blocked, in terms of the query and the data model.
+        """
+    @property
+    def at(self) -> typing.Optional[builtins.str]:
+        r"""
+        Where in the query, when locatable — a variable or an operator.
+        """
+    @property
+    def instead(self) -> typing.Optional[builtins.str]:
+        r"""
+        A supported shape to use instead. This is the field that turns a
+        refusal into a repair, so it is meant to be shown verbatim.
+        """
+    @property
+    def plan(self) -> typing.Optional[QueryPlan]:
+        r"""
+        The plan the verdict was derived from, when ``kind == "eligible"``.
+        
+        A consumer needs **both**: the solution says what to project, group and
+        aggregate, and the plan says which rows — the classes, their filters and
+        the join edges. Reading only the solution silently drops every
+        constraint: ``FILTER(?l > 5)`` on a ``COUNT(*)`` yields a solution with
+        no bindings, and a bare aggregate's solution does not even name the
+        class.
+        
+        Use this rather than calling ``sparql_scope`` again — a second call
+        re-parses and could in principle disagree with the one behind the
+        verdict.
+        
+        One field does not carry over: this plan's :attr:`~QueryPlan.sql_limit`
+        is always ``None`` here, because an aggregate must see every solution
+        before it can be limited. The query's own ``LIMIT`` is
+        ``solution.limit``, which applies to the *grouped* rows — take it from
+        there, never from the plan.
+        """
+    @property
+    def solution(self) -> typing.Optional[PushdownSolution]:
+        r"""
+        The solution spec when ``kind == "eligible"``, else ``None``.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class QueryPlan:
     r"""
     Structured plan for fetching data from PostgreSQL.
@@ -3567,6 +3842,62 @@ class QueryPlan:
     stars / joins pre-order for call-sites that don't need the tree
     structure.
     """
+    @property
+    def path_bindings(self) -> builtins.dict[builtins.str, tuple[builtins.str, builtins.list[builtins.str], builtins.bool]]:
+        r"""
+        Variables reached by walking into a star's nested structures, as
+        ``{variable: (star_variable, [slot, ...], optional)}``.
+        
+        ``?s :location ?l . ?l :longitude ?v`` binds ``?v`` two slots down from
+        ``?s``, which no star can describe — ``?l`` has no ``rdf:type`` and is
+        part of ``?s``'s JSON rather than an object of its own. Read the value
+        with ``object_data->'location'->>'longitude'``.
+        
+        Only scalar leaves appear. A variable standing for the nested structure
+        itself serialises as a blank node, which nothing can reproduce, so it is
+        traversable but never a value.
+        
+        The third element is whether any hop of the path was introduced inside
+        an ``OPTIONAL``. It is load-bearing: a required and an optional nested
+        read follow the same slots and have different answers — required
+        excludes the records that lack the value, optional keeps them with the
+        variable unbound — so a consumer that renders both the same way answers
+        one of the two questions wrongly.
+        """
+    @property
+    def exact(self) -> builtins.bool:
+        r"""
+        Whether this plan describes the query *completely*.
+        
+        Extraction is deliberately lossy in the safe direction: a constraint
+        that cannot be expressed is dropped, the fetch widens, and oxigraph
+        re-applies the real query to what came back. ``False`` means something
+        was dropped — a ``FILTER`` this cannot express, a triple whose subject
+        is not a scoped class, a sub-``SELECT``, a ``FILTER`` inside
+        ``OPTIONAL``.
+        
+        A consumer that only needs a superset (fetch objects, let oxigraph
+        answer) may ignore this. A consumer that answers *from* the plan must
+        refuse when it is ``False``, or it answers a weaker question and reports
+        a plausible wrong number.
+        """
+    @property
+    def inexact_reason(self) -> typing.Optional[builtins.str]:
+        r"""
+        Why the plan is not exact, or ``None`` when it is.
+        
+        One of :func:`sparql_inexact_reasons`, which is served from the
+        planner's own set rather than restated here — restating it is how this
+        docstring came to advertise two causes that could not occur and, later,
+        to omit one that could.
+        
+        Treat an unrecognised value as inexact rather than ignoring it: the set
+        grows as more ways of dropping part of a query are found, and a new one
+        means the plan describes less than the query.
+        
+        Recorded at the point the planner dropped something, so this names a
+        real cause rather than an inference about what survived.
+        """
     @property
     def root(self) -> PlanNode:
         r"""
@@ -3587,8 +3918,17 @@ class QueryPlan:
     @property
     def sql_limit(self) -> typing.Optional[builtins.int]:
         r"""
-        SQL LIMIT — only for single-star, zero-join, zero-OPTIONAL
-        queries with a top-level SPARQL LIMIT.
+        How many rows the object fetch may be limited to — ``OFFSET + LIMIT``,
+        not ``LIMIT``.
+        
+        The fetch has to cover the whole window the query asks for, because the
+        engine applies the offset to whatever comes back: ``LIMIT 10 OFFSET 20``
+        needs thirty rows, and fetching ten and then skipping twenty of them
+        returns nothing.
+        
+        ``None`` means no limit may be pushed — several classes, a join, an
+        OPTIONAL, a modifier that must see every solution first, or a plan that
+        does not describe the whole query (see ``exact``).
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -4718,9 +5058,77 @@ class Star:
         block — its ``WHERE`` conditions must be null-guarded by Python.
         """
     @property
+    def multivalued_fields(self) -> builtins.list[builtins.str]:
+        r"""
+        Which of this star's slots hold several values per record.
+        
+        Two things depend on it, and both give wrong answers if it is ignored.
+        A condition in :attr:`filters` on one of these fields is a test that the
+        array *contains* the value — in Postgres ``EXISTS (SELECT 1 FROM
+        jsonb_array_elements_text(object_data->'field') v WHERE v.value = ...)``
+        — and rendering it as ``object_data->>'field' = 'value'`` compares the
+        array's own text, which matches nothing. And a value read off one of
+        these multiplies solutions: a record with three values answers a SPARQL
+        question three times, so counting rows is not counting solutions.
+        """
+    @property
+    def numeric_fields(self) -> builtins.list[builtins.str]:
+        r"""
+        Which of this star's slots compare as numbers rather than as text.
+        
+        A comparison in :attr:`filters` on one of these must cast — the stored
+        JSONB text does not order the way the number does. ``'9' >= '10'`` is
+        true as text and false as a number, and ``'2001' > '9'`` is false as
+        text, so ignoring this reports a group too many on the aggregate route
+        and drops every row on the prefetch route. Everything else compares
+        under ``COLLATE "C"``, which is the codepoint order SPARQL specifies.
+        
+        A projected column carries the same answer on its own term descriptor;
+        a slot that only appears in a ``FILTER`` has no binding to carry it,
+        which is what this is for. Both come from the same resolution, so they
+        cannot disagree.
+        """
+    @property
     def filters(self) -> builtins.dict[builtins.str, builtins.list[FilterCondition]]:
         r"""
         Value-level filter conditions per slot, pushable to SQL.
+        
+        A field listed in :attr:`multivalued_fields` needs a containment test
+        rather than an equality — see that attribute. Conditions on values
+        *inside* the JSON are in :attr:`path_filters`, which has to be rendered
+        as well.
+        """
+    @property
+    def path_filters(self) -> builtins.list[tuple[builtins.list[builtins.str], builtins.list[FilterCondition], builtins.bool]]:
+        r"""
+        Conditions on values *inside* this record's JSON, as
+        ``[(slot_path, [FilterCondition, ...], numeric), ...]``.
+        
+        ``numeric`` says the value compares as a number, which
+        :attr:`numeric_fields` cannot answer for it -- that lists the record's
+        own slots, and this value is inside one of them.
+        
+        ``?s :maintenanceUnit ?m . ?m :zoneName "Charleroi"`` constrains a value
+        two slots down, which no key of :attr:`filters` can name. Render by
+        walking the path — ``object_data->'maintenanceUnit'->>'zoneName' =
+        'Charleroi'`` — with the last step as ``->>`` and every earlier one as
+        ``->``.
+        
+        **Not optional to read.** A consumer that renders only :attr:`filters`
+        asks a weaker question than the query did, and on an aggregate route
+        that is a larger number reported without a warning. Every path here is
+        single-valued at every hop and outside any ``OPTIONAL``; anything else
+        stays with the engine.
+        """
+    @property
+    def slot_variables(self) -> builtins.dict[builtins.str, builtins.str]:
+        r"""
+        Which SPARQL variable each slot binds to, as ``{slot: variable}``.
+        
+        Answers "where does ``?name`` come from" without re-parsing the
+        query: the star decomposition already worked it out to find join
+        edges. Only object *variables* appear — a constant object is a
+        filter, not a binding.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -5811,6 +6219,28 @@ def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
+def py_sparql_pushdown(query:builtins.str, schema_view:SchemaView) -> PushdownVerdict:
+    r"""
+    Classify a SPARQL query for aggregate pushdown.
+    
+    Unlike :func:`sparql_scope`, which decides what to *load* for oxigraph to
+    query, this decides whether the query's grouping and aggregation can be
+    answered by SQL without loading anything — the only shape that works for an
+    aggregate, which by definition touches every object of its class.
+    
+    Args:
+        query: SPARQL query string.
+        schema_view: The LinkML schema, for resolving slots and ranges.
+    
+    Returns:
+        PushdownVerdict — inspect ``.kind`` first.
+    
+    Raises:
+        ValueError: the query does not parse or cannot be scoped at all. A
+            query that parses but cannot be pushed down is a ``"blocked"``
+            verdict, not an exception.
+    """
+
 def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
@@ -5834,6 +6264,18 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
     Raises:
         RuntimeError: Conversion failure (with object URI), limit exceeded,
             or query execution error.
+    """
+
+def sparql_inexact_reasons() -> builtins.list[builtins.str]:
+    r"""
+    Every value :attr:`QueryPlan.inexact_reason` can take, in the planner's own
+    order.
+    
+    Served rather than written down: a caller that wants to branch exhaustively
+    can check its own table against this, and a cause added to the planner shows
+    up here without anyone remembering to edit a docstring — which is how the
+    docstring came to advertise two causes that could not occur and to omit one
+    that could.
     """
 
 def sparql_scope(query:builtins.str, schema_view:SchemaView) -> QueryPlan:

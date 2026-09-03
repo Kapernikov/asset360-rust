@@ -478,3 +478,256 @@ classes:
         assert!(result.contains("Signal"), "Should contain type");
     }
 }
+
+/// A differential oracle over the *documented* rendering of a pushed filter.
+///
+/// Six bugs in this area shared one shape: a rule applied at three call sites
+/// out of four, or to one operator and not its twin, so the plan claimed to
+/// describe a query whose answer it changed. Each was found by hand and fixed by
+/// hand. This sweeps the grid instead — every column kind against every way of
+/// writing a constant — and asks the only question that matters: when the plan
+/// says it is exact, does rendering its filter the way the docs say produce the
+/// answer oxigraph produces?
+///
+/// It deliberately does not care *which* refusal an inexact plan gives. A
+/// refusal is always safe; claiming exactness and being wrong is not.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod pushed_filters_match_sparql {
+    use crate::sparql_scoper::{FilterCondition, sparql_scope};
+    use linkml_runtime::{LinkMLInstance, load_json_str};
+    use linkml_schemaview::identifier::Identifier;
+    use linkml_schemaview::schemaview::SchemaView;
+
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                          PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+
+    /// One column per kind the term rule distinguishes, plus the text each
+    /// stores — which is what `object_data->>'slot'` would yield.
+    const STORED: [(&str, &[&str]); 5] = [
+        ("name", &["BX1"]),
+        ("length", &["3"]),
+        ("description", &["hello"]),
+        ("seeAlso", &["https://data.infrabel.be/asset360/track/T1"]),
+        ("trafficKinds", &["m", "p"]),
+    ];
+
+    fn schema() -> SchemaView {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+        let yaml = r#"
+id: https://data.infrabel.be/asset360
+name: asset360
+prefixes:
+  asset360:
+    prefix_reference: https://data.infrabel.be/asset360/
+  linkml:
+    prefix_reference: https://w3id.org/linkml/
+  xsd:
+    prefix_reference: http://www.w3.org/2001/XMLSchema#
+default_prefix: asset360
+default_range: string
+types:
+  string:
+    uri: xsd:string
+    base: str
+  integer:
+    uri: xsd:integer
+    base: int
+  uriorcurie:
+    uri: xsd:anyURI
+    base: URIorCURIE
+classes:
+  Signal:
+    class_uri: asset360:Signal
+    attributes:
+      asset360_uri:
+        identifier: true
+      name:
+        range: string
+      length:
+        range: integer
+      description:
+        range: string
+        in_language: en
+      seeAlso:
+        range: uriorcurie
+      trafficKinds:
+        range: string
+        multivalued: true
+"#;
+        let schema: SchemaDefinition = p2e::deserialize(yml::Deserializer::from_str(yaml)).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        sv
+    }
+
+    fn instance(sv: &SchemaView) -> LinkMLInstance {
+        let conv = sv.converter();
+        let cv = sv
+            .get_class(&Identifier::new("Signal"), &conv)
+            .unwrap()
+            .unwrap();
+        load_json_str(
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/A",
+                "name": "BX1", "length": 3, "description": "hello",
+                "seeAlso": "https://data.infrabel.be/asset360/track/T1",
+                "trafficKinds": ["m", "p"]}"#,
+            sv,
+            &cv,
+            &conv,
+        )
+        .unwrap()
+        .into_instance_tolerate_errors()
+        .unwrap()
+    }
+
+    /// Does SPARQL itself match, over the real serialisation?
+    fn sparql_matches(sv: &SchemaView, inst: &LinkMLInstance, triple: &str) -> bool {
+        let refs = vec![inst];
+        let json = super::sparql_execute(
+            &format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; {triple} }}"),
+            &refs,
+            sv,
+            "json",
+            super::ExecuteLimits::default(),
+        )
+        .expect("query executes");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        !parsed["results"]["bindings"].as_array().unwrap().is_empty()
+    }
+
+    /// Does the plan's own documented rendering match?
+    ///
+    /// `object_data->>'field' = 'value'` for a single-valued column, and the
+    /// containment test `multivalued_fields` prescribes for an array one.
+    fn rendering_matches(
+        conditions: &[FilterCondition],
+        stored: &[&str],
+        multivalued: bool,
+    ) -> bool {
+        conditions.iter().all(|condition| match condition {
+            FilterCondition::Eq(v) => {
+                if multivalued {
+                    stored.contains(&v.as_str())
+                } else {
+                    stored.first() == Some(&v.as_str())
+                }
+            }
+            FilterCondition::In(vs) => stored.iter().any(|s| vs.iter().any(|v| v == s)),
+            // Text ordering, which is what the documented SQL does.
+            FilterCondition::Cmp { op, value } => {
+                stored.first().is_some_and(|s| match op.as_str() {
+                    ">" => *s > value.as_str(),
+                    ">=" => *s >= value.as_str(),
+                    "<" => *s < value.as_str(),
+                    _ => *s <= value.as_str(),
+                })
+            }
+        })
+    }
+
+    #[test]
+    fn every_pushed_constant_answers_what_sparql_answers() {
+        let sv = schema();
+        let inst = instance(&sv);
+
+        // Every column kind against every way of writing a constant: matching
+        // and non-matching, canonical and not, tagged and bare, IRI and literal.
+        let constants = [
+            "\"BX1\"",
+            "\"hello\"",
+            "\"hello\"@en",
+            "\"hello\"@fr",
+            "\"m\"",
+            "\"3\"",
+            "3",
+            "\"003\"^^xsd:integer",
+            "\"+3\"^^xsd:integer",
+            "\"3\"^^xsd:string",
+            "\"BX1\"@en",
+            "<https://data.infrabel.be/asset360/track/T1>",
+            "\"https://data.infrabel.be/asset360/track/T1\"",
+        ];
+
+        let mut checked = 0;
+        for (slot, stored) in STORED {
+            for constant in constants {
+                let triple = format!("asset360:{slot} {constant}");
+                let query =
+                    format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; {triple} }}");
+                let plan = sparql_scope(&query, &sv).expect("scopes");
+
+                // An inexact plan has already said it does not describe the
+                // query; nothing is claimed and nothing is owed.
+                if plan.inexact.is_some() {
+                    continue;
+                }
+
+                let star = &plan.root.all_stars()[0];
+                let multivalued = star.multivalued_fields.iter().any(|f| f == slot);
+                let rendered = match star.filters.get(slot) {
+                    Some(conditions) => rendering_matches(conditions, stored, multivalued),
+                    // Nothing pushed: the fetch is wider and oxigraph decides.
+                    None => continue,
+                };
+
+                checked += 1;
+                assert_eq!(
+                    rendered,
+                    sparql_matches(&sv, &inst, &triple),
+                    "exact plan disagrees with SPARQL for `{triple}`: rendering \
+                     said {rendered}"
+                );
+            }
+        }
+
+        // Guard the guard: a grid that silently stopped exercising anything
+        // would pass forever.
+        assert!(
+            checked >= 8,
+            "only {checked} constants were actually pushed"
+        );
+    }
+
+    /// The other half, and the half a "refusals are always safe" oracle cannot
+    /// see: a constant written *as the column stores it* must actually push.
+    ///
+    /// Refusing everything is safe and useless, and this is how the language
+    /// check in `literal_pushable` came to be dead — every constant on a
+    /// language-tagged column was refused, including the only one that was
+    /// right, and no wrong-answer test could notice.
+    #[test]
+    fn a_constant_in_the_column_s_own_form_is_pushed() {
+        let sv = schema();
+        let inst = instance(&sv);
+
+        for (slot, constant) in [
+            ("name", "\"BX1\""),
+            ("length", "3"),
+            ("description", "\"hello\"@en"),
+            ("seeAlso", "<https://data.infrabel.be/asset360/track/T1>"),
+            ("trafficKinds", "\"m\""),
+        ] {
+            let triple = format!("asset360:{slot} {constant}");
+            assert!(
+                sparql_matches(&sv, &inst, &triple),
+                "the fixture must actually match, or the case proves nothing: {triple}"
+            );
+
+            let plan = sparql_scope(
+                &format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; {triple} }}"),
+                &sv,
+            )
+            .expect("scopes");
+            assert_eq!(
+                plan.inexact, None,
+                "the column's own form must be pushable: {triple}"
+            );
+            assert!(
+                plan.root.all_stars()[0].filters.contains_key(slot),
+                "exact, but nothing pushed for {triple}"
+            );
+        }
+    }
+}
