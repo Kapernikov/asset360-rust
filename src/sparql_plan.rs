@@ -994,6 +994,25 @@ impl Refinement {
 /// The refined plan also has to be *lowerable*: its frontier must be one
 /// island, since a pass is one statement. See
 /// [`crate::sparql_ops::LoweringRefusal`].
+/// The refined plan for a query, as text.
+///
+/// For diagnostics only, and it exists because a fallback hides its own
+/// evidence: the artifact `plan_query_refined` returns carries today's
+/// operators, so the plan the gate rejected is gone by the time anyone reads
+/// the reason. This is that plan.
+pub fn refined_plan_text(
+    query: &str,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+) -> Result<String, String> {
+    let naive = crate::sparql_refine::naive_plan_of(query).map_err(|e| e.to_string())?;
+    let rules = crate::sparql_rules::tier_one_rules(schema);
+    let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+        rules.iter().map(|rule| rule.as_ref()).collect();
+    let mut plan = naive;
+    crate::sparql_rules::refine(&mut plan, &borrowed).map_err(|failure| failure.to_string())?;
+    Ok(plan.to_string())
+}
+
 pub fn plan_query_refined(
     query_str: &str,
     schema_view: &SchemaView,

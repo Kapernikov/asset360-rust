@@ -90,6 +90,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_sparql_pushdown, m)?)?;
         m.add_function(wrap_pyfunction!(py_plan_query, m)?)?;
         m.add_function(wrap_pyfunction!(py_plan_query_refined, m)?)?;
+        m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
@@ -3060,11 +3061,12 @@ fn py_plan_query(
 /// came from, and ``refinement`` says: ``"used"`` or ``"fallback"``, with
 /// ``refinement_reason`` naming what stopped it.
 ///
-/// The gate compares *claims*: the refined operators are used only when the
-/// obligations they discharge are a superset of what the single-pass planner's
-/// SQL pass discharges. That makes a regression impossible by construction —
-/// SQL claiming more cannot lose rows the answer needs, while SQL claiming
-/// less means work moved back to the engine.
+/// The gate compares the *row source*: the refined operators are used only
+/// when the statement they lower to is no wider a fetch and applies no less
+/// than the single-pass planner's — scanned classes, identifier restrictions,
+/// existence checks, conditions, joins, fan-outs, collapsing work. The claim
+/// ledger is reported beside it rather than gating on it, because a plan can
+/// claim more while rendering less.
 ///
 /// Args:
 ///     query: SPARQL query string.
@@ -3090,6 +3092,39 @@ fn py_plan_query_refined(
     crate::sparql_plan::plan_query_refined(query, sv)
         .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "refined_plan_text")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// The refined plan for a query, as the text the Rust tests print.
+///
+/// Diagnostics, and the one thing the `ExecutionPlan` artifact cannot show: on
+/// a fallback the artifact carries *today's* operators, so the plan that was
+/// rejected leaves no trace beyond `refinement_reason`. Reading a table of
+/// fallbacks without it means guessing which rule declined -- which cost a
+/// round of guessing once.
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_view: The LinkML schema.
+///
+/// Returns:
+///     str: the plan, one line per node, with the obligation ledger.
+///
+/// Raises:
+///     ValueError: the query does not parse or cannot be represented.
+fn py_refined_plan_text(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<String> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+    crate::sparql_plan::refined_plan_text(query, sv)
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]

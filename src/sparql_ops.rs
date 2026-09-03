@@ -1381,6 +1381,14 @@ fn collapsing_of(tree: &OpTree) -> Vec<String> {
                 "group having=[{}]",
                 having
                     .iter()
+                    // Only the terms over *aggregates*. A condition on a group
+                    // key is a condition on a column of every row -- it can be
+                    // a `WHERE`, and the refined pipeline sinks it into one --
+                    // so a plan that states it there has not handed anything
+                    // back. The condition clause above is what checks it is
+                    // still applied; counting it here as well would make
+                    // sinking it look like losing it.
+                    .filter(|term| matches!(term.key, crate::sparql_pushdown::OrderKey::Measure(_)))
                     .map(|term| format!(
                         "{}{} {} numeric={}",
                         match term.key {
@@ -1410,6 +1418,24 @@ fn collapsing_of(tree: &OpTree) -> Vec<String> {
 
 /// The first element of `wanted` that `have` does not cover, counting
 /// duplicates.
+/// Whether a containment test is answered by a condition on the bound element
+/// of the same slot.
+///
+/// Both are rendered strings, and comparing them as strings is the point: this
+/// is the one place where two *different* conditions may stand for the same
+/// narrowing, so the substitution is written out rather than left to whoever
+/// reads the diff.
+fn subsumed_by_an_element_condition(missing: &str, have: &[String]) -> bool {
+    let Some(wanted) = missing.split_once(" reading=[any] ") else {
+        return false;
+    };
+    have.iter().any(|condition| {
+        condition
+            .split_once(" reading=[each] ")
+            .is_some_and(|mine| mine == wanted)
+    })
+}
+
 fn missing_from(wanted: &[String], have: &[String]) -> Option<String> {
     let mut left: Vec<&String> = have.iter().collect();
     for item in wanted {
@@ -1874,7 +1900,21 @@ impl OpTree {
         }
 
         if let Some(missing) = missing_from(&conditions_of(today), &conditions_of(self)) {
-            return Err(format!("the refined plan does not apply {missing}"));
+            // One exception, and it is a subsumption rather than an excuse: a
+            // containment test over a record's array (`[any]`) asks whether
+            // *some* element satisfies the condition, and a condition on the
+            // element a fan-out bound (`[each]`) holds of the element in the
+            // row. Every row the second keeps comes from a record the first
+            // would keep, so the refined row source is a subset -- while the
+            // strings differ, because the reading does.
+            //
+            // Today's planner applies both, on the same query: it narrows the
+            // fetch with the containment test and then states the exact
+            // condition again as a `HAVING` over the group key. The refined
+            // plan states it once, on the element.
+            if !subsumed_by_an_element_condition(&missing, &conditions_of(self)) {
+                return Err(format!("the refined plan does not apply {missing}"));
+            }
         }
         if joins_of(self) != joins_of(today) {
             return Err(format!(
@@ -2367,6 +2407,133 @@ mod tests {
             matches!(refusal, LoweringRefusal::IdentityIsNotATriple { .. }),
             "{refusal}"
         );
+    }
+
+    /// The two ways the comparator now reads a *different* statement as no
+    /// worse, each written out because both look like a loss to a string
+    /// comparison.
+    ///
+    /// This is the clause pair that decides whether a `HAVING` over a group
+    /// key can be sunk at all. Today's planner applies such a condition
+    /// twice -- as a fetch narrowing and again as a `HAVING` -- and the
+    /// refined pipeline applies it once, on the rows. Without these the gate
+    /// called that a regression.
+    #[test]
+    fn the_gate_reads_a_sunk_condition_as_applied() {
+        use crate::sparql_pushdown::{HavingTerm, OrderKey};
+        use crate::sparql_scoper::FilterCondition;
+
+        let condition = |reading: SlotReading| OpNode {
+            op: Op::Filter {
+                input: 0,
+                star_var: "s".to_owned(),
+                slot_path: vec!["trafficKinds".to_owned()],
+                condition: FilterCondition::Cmp {
+                    op: crate::sparql_scoper::CmpOp::Gt,
+                    value: "F".to_owned(),
+                },
+                enforcement: Enforcement::Enforces,
+                optional_side: false,
+                reading,
+                numeric: false,
+            },
+            discharges: Vec::new(),
+        };
+        let scan = OpNode {
+            op: Op::Scan {
+                star_var: "s".to_owned(),
+                class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
+                identifier_values: Vec::new(),
+                required_slots: vec!["trafficKinds".to_owned()],
+                optional_slots: Vec::new(),
+                is_optional: false,
+            },
+            discharges: Vec::new(),
+        };
+        let grouping = |having: Vec<HavingTerm>| OpNode {
+            op: Op::Group {
+                input: 2,
+                bindings: Vec::new(),
+                keys: Vec::new(),
+                measures: Vec::new(),
+                having,
+            },
+            discharges: vec![0],
+        };
+        let key_term = HavingTerm {
+            key: OrderKey::Binding(0),
+            condition: FilterCondition::Cmp {
+                op: crate::sparql_scoper::CmpOp::Gt,
+                value: "F".to_owned(),
+            },
+            numeric: false,
+        };
+
+        // Today: a containment test on the record's array, and the exact
+        // condition again as a `HAVING` over the key.
+        let today = OpTree {
+            nodes: vec![
+                scan.clone(),
+                condition(SlotReading::AnyElement),
+                OpNode {
+                    op: Op::Unnest {
+                        input: 1,
+                        star_var: "s".to_owned(),
+                        slot_path: vec!["trafficKinds".to_owned()],
+                    },
+                    discharges: Vec::new(),
+                },
+                grouping(vec![key_term.clone()]),
+            ],
+        };
+        // The refined plan: one condition, on the element the fan-out bound.
+        let refined = OpTree {
+            nodes: vec![
+                scan.clone(),
+                condition(SlotReading::BoundElement),
+                OpNode {
+                    op: Op::Unnest {
+                        input: 1,
+                        star_var: "s".to_owned(),
+                        slot_path: vec!["trafficKinds".to_owned()],
+                    },
+                    discharges: Vec::new(),
+                },
+                grouping(Vec::new()),
+            ],
+        };
+        refined
+            .is_no_worse_than(&today)
+            .expect("a condition on the bound element subsumes the containment test");
+
+        // And neither substitution is a hole: a plan that applies *no*
+        // condition is still worse.
+        let neither = OpTree {
+            nodes: vec![
+                scan,
+                OpNode {
+                    op: Op::Unnest {
+                        input: 0,
+                        star_var: "s".to_owned(),
+                        slot_path: vec!["trafficKinds".to_owned()],
+                    },
+                    discharges: Vec::new(),
+                },
+                OpNode {
+                    op: Op::Group {
+                        input: 1,
+                        bindings: Vec::new(),
+                        keys: Vec::new(),
+                        measures: Vec::new(),
+                        having: Vec::new(),
+                    },
+                    discharges: vec![0],
+                },
+            ],
+        };
+        neither
+            .is_no_worse_than(&today)
+            .expect_err("dropping the condition altogether is worse");
     }
 
     /// **A comparator clause, promoted to a check on one plan.** A statement

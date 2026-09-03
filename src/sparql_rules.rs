@@ -5646,6 +5646,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn probe2() {
+        let schema = test_schema_view();
+        for q in [
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; asset360:name ?n } GROUP BY ?n HAVING (?n > \"S\")",
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; asset360:name ?n } GROUP BY ?n HAVING (COUNT(*) >= 1 && ?n > \"S\")",
+        ] {
+            let plan = refined(q, &schema, false);
+            println!("--- {q}\n{plan}");
+        }
+    }
+
     /// Four spellings of "this one asset, by identifier", and one plan.
     ///
     /// The four are what the form configurations actually contain or are being
