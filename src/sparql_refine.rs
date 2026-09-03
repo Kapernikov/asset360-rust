@@ -725,6 +725,35 @@ pub struct ScanSlot {
     /// Whether the slot holds an array, so one record answers the query once
     /// per value.
     pub multivalued: bool,
+    pub presence: SlotPresence,
+}
+
+/// Whether a scan *requires* the value it reads, or only delivers it.
+///
+/// The distinction 28d did not have, and the reason the ledger and the plan
+/// can disagree about an `OPTIONAL`. Today's star decomposition carries it as
+/// `required_fields` versus `optional_fields`, and it decides one thing in the
+/// SQL: whether an `object_data ? 'slot'` existence check is emitted.
+///
+/// It also decides what a scan may *claim*. A required read enforces the
+/// triple: a record without the value is not a row. A delivered read enforces
+/// nothing -- it hands a column to whoever decides the optionality, and while
+/// that is the engine re-running the query, the scan is a narrowing and
+/// claiming the triple would be a node saying it did something it did not.
+/// Once a node renders the optional semantics *in SQL* -- the left join, the
+/// null-tolerant conditions, the missing-value bucket -- the claim is honest
+/// and belongs to that node. So the claim is not a property of the read; it
+/// belongs to whoever renders the optionality, which is what the frontier
+/// says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotPresence {
+    /// `object_data ? 'slot'`: a record without the value is not a row, and
+    /// the scan enforces the triple.
+    Required,
+    /// Fetched with no existence check. Exposes no binding to any SQL node
+    /// above -- a condition on a value that may be absent would drop the rows
+    /// the left join exists to keep -- and claims nothing.
+    Delivered,
 }
 
 /// The reference a pushed join joins on, recorded rather than re-derived.
@@ -1073,9 +1102,12 @@ pub fn scan_with_fanout(
     at: NodeId,
     discharges: Vec<ObligationId>,
 ) -> Vec<Node> {
+    // A *delivered* slot exposes no binding above the scan, so nothing counts
+    // its values and there is no multiplicity to restore. Fanning one out
+    // would multiply rows for a read nobody reads.
     let fanning: Vec<(Vec<String>, String)> = slots
         .iter()
-        .filter(|slot| slot.multivalued)
+        .filter(|slot| slot.multivalued && slot.presence == SlotPresence::Required)
         .map(|slot| (slot.path.clone(), slot.var.clone()))
         .collect();
     let mut out = vec![Node::sql(
@@ -1336,7 +1368,10 @@ impl Plan {
             else {
                 continue;
             };
-            for slot in slots.iter().filter(|slot| slot.multivalued) {
+            for slot in slots
+                .iter()
+                .filter(|slot| slot.multivalued && slot.presence == SlotPresence::Required)
+            {
                 let restored = self.nodes.iter().enumerate().any(|(id, above)| {
                     matches!(
                         &above.op,
@@ -1389,7 +1424,10 @@ impl Plan {
                         ..
                     } if scan_star == star_var
                         && slots.iter().any(|slot| {
-                            slot.multivalued && slot_path == &slot.path && &slot.var == var
+                            slot.multivalued
+                                && slot.presence == SlotPresence::Required
+                                && slot_path == &slot.path
+                                && &slot.var == var
                         })
                 ) && self.feeds(scan_id, id)
             });
@@ -1444,6 +1482,9 @@ impl Plan {
                         .any(|slot| {
                             slot.path.as_slice() == [edge.slot.clone()]
                                 && slot.var == edge.referenced
+                                // A delivered read is not a binding, so it
+                                // cannot be the key a join reads.
+                                && slot.presence == SlotPresence::Required
                         })
                 })
             };
@@ -1631,10 +1672,15 @@ impl PlanOp {
                 slots
                     .iter()
                     .map(|slot| format!(
-                        "{}→?{}{}",
+                        "{}→?{}{}{}",
                         slot.path.join("."),
                         slot.var,
-                        if slot.multivalued { "[]" } else { "" }
+                        if slot.multivalued { "[]" } else { "" },
+                        if slot.presence == SlotPresence::Delivered {
+                            "?"
+                        } else {
+                            ""
+                        }
                     ))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -2611,6 +2657,7 @@ mod tests {
                     path: vec!["trafficKinds".to_owned()],
                     var: "kind".to_owned(),
                     multivalued: true,
+                    presence: SlotPresence::Required,
                 }],
             },
             vec![0],
@@ -2637,11 +2684,13 @@ mod tests {
                 path: vec!["hasName".to_owned()],
                 var: "nm".to_owned(),
                 multivalued: false,
+                presence: SlotPresence::Required,
             },
             ScanSlot {
                 path: vec!["trafficKinds".to_owned()],
                 var: "kind".to_owned(),
                 multivalued: true,
+                presence: SlotPresence::Required,
             },
         ];
         let nodes = scan_with_fanout(

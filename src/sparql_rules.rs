@@ -55,9 +55,9 @@ use spargebra::term::{GroundTerm, Term, TermPattern, TriplePattern};
 
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
-    CompareOp, Executor, Expr, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot, SlotReading,
-    inner_join_groups, is_type_pattern, object_variable, predicate_iri, scan_with_fanout,
-    subject_variable, type_class_iri,
+    CompareOp, Executor, Expr, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot, SlotPresence,
+    SlotReading, inner_join_groups, is_type_pattern, object_variable, predicate_iri,
+    scan_with_fanout, subject_variable, type_class_iri,
 };
 
 /// One rewrite.
@@ -249,6 +249,9 @@ impl<'s> FoldMatchesIntoScan<'s> {
                     var: var.to_owned(),
                     multivalued: on_class.determine_slot_container_mode()
                         != SlotContainerMode::SingleValue,
+                    // A read the query wrote outside an `OPTIONAL` requires
+                    // the value: a record without it is not an answer.
+                    presence: SlotPresence::Required,
                 },
             ));
         }
@@ -560,6 +563,16 @@ impl Visible {
             // (`?s :asset360_uri "u"`) does push, through the slot.
             slots.insert(star_var.clone(), None);
             for slot in scan_slots {
+                // A delivered read is not a binding this side exposes: its
+                // value may be absent, and a condition on it would drop the
+                // rows the left join above exists to keep. Entered as
+                // ambiguous rather than skipped, so a rule declines the
+                // variable instead of resolving it through another star's
+                // slot of the same name.
+                if slot.presence == SlotPresence::Delivered {
+                    slots.insert(slot.var.clone(), None);
+                    continue;
+                }
                 // A multivalued slot's variable is one *element*, and it is
                 // the unnest below that bound it. Without the unnest under
                 // this node the element has no name here -- the fan-out has
@@ -631,6 +644,126 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
         .filter(|(_, node)| node.op.inputs().contains(&id))
         .map(|(consumer, _)| consumer)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Deliver an optional read
+// ---------------------------------------------------------------------------
+
+/// A read inside an `OPTIONAL` on a star an `Sql` scan already scans becomes a
+/// *delivered* slot of that scan. The `match` stays where it is.
+///
+/// The one rule that adds to a scan without taking anything away, and the
+/// reason is the whole point of [`SlotPresence`]. The SQL leg has to hand the
+/// column over -- the engine cannot bind `?nm` from a record it was not given
+/// -- while nothing about the optionality is decided in SQL: no existence
+/// check, no condition, no claim. Today's star decomposition says exactly this
+/// with `optional_fields`, and lowering a scan without the slot would emit a
+/// statement that agrees only by accident (the prefetch selects whole
+/// records).
+///
+/// It claims nothing, which is the correction this rule exists to make
+/// precise. A delivered read enforces no triple; the `match` above keeps that
+/// obligation and the engine's left join decides it. When a later stage
+/// renders the optional semantics in SQL, the claim becomes honest and belongs
+/// to whichever node renders it -- not to this scan.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **The match is on the optional side of a `LeftJoin` whose preserved side
+///   takes every row from the scan.** Anything else is either the fold rule's
+///   job (a mandatory read) or a row set this scan does not feed.
+/// * **The scan does not read the slot already.** Otherwise the rule would add
+///   a slot per round and never reach a fixpoint. A slot the query reads both
+///   mandatorily and optionally stays *required*, which is the stronger of the
+///   two and what the mandatory read already established.
+pub struct DeliverOptionalRead<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> DeliverOptionalRead<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for DeliverOptionalRead<'_> {
+    fn name(&self) -> &'static str {
+        "deliver_optional_read"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+                continue;
+            };
+            if is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(star), Some(predicate), Some(var)) = (
+                subject_variable(pattern),
+                predicate_iri(pattern),
+                object_variable(pattern),
+            ) else {
+                continue;
+            };
+            let (star, predicate, var) = (star.to_owned(), predicate.to_owned(), var.to_owned());
+
+            // The optional shape: this match is inside the optional side of a
+            // left join whose preserved side is fed by the scan.
+            let Some((scan, class_uri)) = plan.nodes.iter().enumerate().find_map(|(scan, node)| {
+                let PlanOp::Scan {
+                    star_var,
+                    class_uri,
+                    slots,
+                } = &node.op
+                else {
+                    return None;
+                };
+                if node.executor != Executor::Sql || star_var != &star {
+                    return None;
+                }
+                if slots.iter().any(|slot| slot.var == var) {
+                    return None;
+                }
+                let optional = plan.nodes.iter().any(|above| {
+                    matches!(&above.op, PlanOp::LeftJoin { left, right, .. }
+                        if plan.feeds(id, *right) && mandatorily_feeds(plan, scan, *left))
+                });
+                optional.then(|| (scan, class_uri.clone()))
+            }) else {
+                continue;
+            };
+
+            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
+                continue;
+            };
+            let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
+                continue;
+            };
+            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+                continue;
+            };
+            let delivered = ScanSlot {
+                path: vec![slot.name.clone()],
+                var,
+                multivalued: on_class.determine_slot_container_mode()
+                    != SlotContainerMode::SingleValue,
+                presence: SlotPresence::Delivered,
+            };
+            if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+                if slots.contains(&delivered) {
+                    continue;
+                }
+                slots.push(delivered);
+            }
+            return true;
+        }
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -849,6 +982,7 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
                     path,
                     var,
                     multivalued: false,
+                    presence: SlotPresence::Required,
                 },
             );
             return true;
@@ -1572,6 +1706,7 @@ impl<'s> PushReferenceJoin<'s> {
                     .iter()
                     .find(|slot| {
                         slot.var == joined
+                            && slot.presence == SlotPresence::Required
                             && !slot.multivalued
                             // A foreign key is a column of the record. A
                             // reference inside an inlined structure is not
@@ -1672,9 +1807,9 @@ impl Rule for PushReferenceJoin<'_> {
 // ---------------------------------------------------------------------------
 
 /// Every tier-one rule, in the order 28d lists them: scope a type, fold a
-/// nested read into a path, turn a constant object into a filter, turn a
-/// `VALUES` over a bound variable into one, push a comparison, push a
-/// reference join.
+/// nested read into a path, deliver an optional read, turn a constant object
+/// into a filter, turn a `VALUES` over a bound variable into one, push a
+/// comparison, push a reference join.
 ///
 /// Tier one is the set that needs nothing new from the executor. The engine
 /// leg re-runs the whole query, so a node below the first row-collapsing
@@ -1683,8 +1818,9 @@ impl Rule for PushReferenceJoin<'_> {
 /// than that argument (see [`constant_is_the_columns_term`]).
 ///
 /// The order is a preference and not a requirement: each rule is monotone --
-/// three of them remove a `match`, two turn an `Engine` node `Sql`, and none
-/// of them ever does the reverse -- so the
+/// three of them remove a `match`, two turn an `Engine` node `Sql`, one adds a
+/// delivered slot to a scan, and none of them ever does the reverse -- so
+/// the
 /// driver reaches the same fixpoint from any order, and
 /// `the_rule_order_does_not_decide_the_fixpoint` holds it to that. What the
 /// order buys is rounds: a filter cannot push before the scan below it exists,
@@ -1693,6 +1829,7 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
     vec![
         Box::new(FoldMatchesIntoScan::new(schema)),
         Box::new(FoldNestedMatchIntoPath::new(schema)),
+        Box::new(DeliverOptionalRead::new(schema)),
         Box::new(ConstantObjectBecomesFilter::new(schema)),
         Box::new(ValuesBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
@@ -2452,6 +2589,133 @@ mod tests {
             );
             assert!(plan.find("filter").is_empty(), "{why}: {query}\n{plan}");
         }
+    }
+
+    /// The SQL leg has to hand over the column an `OPTIONAL` reads -- the
+    /// engine cannot bind `?nm` from a record it was not given -- while
+    /// nothing about the optionality is decided in SQL. So the scan delivers
+    /// the slot, requires nothing of it, and claims nothing: the `match` keeps
+    /// the triple and the left join above decides it.
+    #[test]
+    fn an_optional_read_is_delivered_but_not_required() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } }",
+            &schema,
+            false,
+        );
+
+        assert_eq!(
+            scan_slots(&plan),
+            vec![
+                ("kind".to_owned(), "k".to_owned(), false),
+                ("name".to_owned(), "nm".to_owned(), false),
+            ],
+            "{plan}"
+        );
+        let scan = plan.find("scan")[0];
+        let PlanOp::Scan { slots, .. } = &plan.nodes[scan].op else {
+            panic!("{plan}");
+        };
+        assert_eq!(slots[0].presence, SlotPresence::Required, "{plan}");
+        assert_eq!(slots[1].presence, SlotPresence::Delivered, "{plan}");
+        assert!(
+            plan.nodes[scan].op.describe().contains("name→?nm?"),
+            "a reader of the plan can see which read is only delivered:\n{plan}"
+        );
+
+        // The match stays, and keeps the claim: a delivered read enforces no
+        // triple, so the scan claiming it would be a node saying it did
+        // something it did not.
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
+        let matched = plan.find("match")[0];
+        assert_eq!(
+            plan.nodes[matched]
+                .discharges
+                .iter()
+                .map(|id| plan.obligations[*id].to_string())
+                .collect::<Vec<_>>(),
+            vec!["triple    ?s asset360:name ?nm"],
+            "{plan}"
+        );
+        assert_eq!(plan.nodes[matched].executor, Executor::Engine, "{plan}");
+        println!("{plan}");
+    }
+
+    /// A delivered read is not a binding the SQL side exposes, and three rules
+    /// have to agree about that or the plan answers a different question.
+    #[test]
+    fn nothing_reads_through_a_delivered_slot() {
+        let schema = test_schema_view();
+
+        // A filter on an optionally-read value stays with the engine: the
+        // value may be absent, and a condition on it drops exactly the rows
+        // the left join exists to keep.
+        let filtered = refined(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } FILTER(?nm > \"A\") }",
+            &schema,
+            false,
+        );
+        assert_eq!(
+            filtered.nodes[filtered.find("filter")[0]].executor,
+            Executor::Engine,
+            "{filtered}"
+        );
+
+        // A reference read optionally is not a foreign key a join may use.
+        let joined = refined(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
+             asset360:hasName ?tn } }",
+            &schema,
+            false,
+        );
+        assert!(
+            joined
+                .find("join")
+                .iter()
+                .all(|id| joined.nodes[*id].executor == Executor::Engine),
+            "{joined}"
+        );
+
+        // And a nested read is not walked into through one.
+        let nested = refined(
+            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:location ?loc . ?loc asset360:longitude ?lon } }",
+            &schema,
+            false,
+        );
+        assert!(
+            !scan_slots(&nested)
+                .iter()
+                .any(|(path, _, _)| path.contains('.')),
+            "{nested}"
+        );
+    }
+
+    /// A multivalued slot read only optionally owes no unnest: nothing above
+    /// the scan reads its values, so there is no multiplicity to restore --
+    /// and fanning it out would multiply rows for a read nobody reads.
+    #[test]
+    fn a_delivered_array_does_not_fan_out() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             OPTIONAL { ?s asset360:trafficKinds ?k } }",
+            &schema,
+            false,
+        );
+
+        assert!(
+            scan_slots(&plan).contains(&("trafficKinds".to_owned(), "k".to_owned(), true)),
+            "{plan}"
+        );
+        assert!(plan.find("unnest").is_empty(), "{plan}");
+        plan.check()
+            .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+        println!("{plan}");
     }
 
     /// A nested read becomes a path on the scan, and a filter on it pushes.
@@ -3308,6 +3572,8 @@ mod tests {
          ?l a asset360:Line ; asset360:hasName ?ln . FILTER(?tn > \"A\") }",
         "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
          OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
+        "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+         OPTIONAL { ?s asset360:trafficKinds ?k } }",
         "SELECT ?d WHERE { ?s a asset360:Signal ; asset360:length ?len . \
          BIND(?len * 2 AS ?d) FILTER(?d > 3) }",
         "SELECT DISTINCT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
@@ -3566,21 +3832,32 @@ mod tests {
     /// A read inside an `OPTIONAL` reaches today's star as an
     /// `optional_fields` entry: the prefetch delivers the column without a
     /// `WHERE object_data ? 'name'`, and the pass claims the triple because
-    /// the data reaches oxigraph. The refined plan claims an obligation when a
-    /// node *takes care of* it, and a fetch that requires nothing does not
-    /// enforce a triple -- so the `match` stays with the engine, which re-runs
-    /// the query anyway and gets the same answer from the same rows.
+    /// the data reaches oxigraph. The refined plan *delivers the same column*
+    /// -- [`DeliverOptionalRead`] puts it on the scan as
+    /// [`SlotPresence::Delivered`], so the two statements agree -- and does
+    /// not claim it: a fetch that requires nothing enforces no triple, and the
+    /// `match` above keeps the obligation for the engine's left join to
+    /// decide. So the difference is in the ledger and not in the SQL.
     ///
     /// I would argue against closing this by claiming it: `plan_query`'s own
     /// comment refuses to let a pass "say it enforced something it did not",
     /// and an optional read is exactly that. Stage 3 has to pick a meaning; if
     /// it wants today's, a scan needs a slot that is fetched without being
     /// required, which is a representation change and not a rule.
-    const KNOWN_GAPS: &[(&str, &str)] = &[(
-        "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-         OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
-        "triple    ?s asset360:name ?nm",
-    )];
+    const KNOWN_GAPS: &[(&str, &str)] = &[
+        (
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
+            "triple    ?s asset360:name ?nm",
+        ),
+        (
+            // The same gap, listed per query rather than folded in: a list of
+            // queries is what says whether the gap is one thing or several.
+            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             OPTIONAL { ?s asset360:trafficKinds ?k } }",
+            "triple    ?s asset360:trafficKinds ?k",
+        ),
+    ];
 
     /// A rule chain is only testable if its result does not depend on the
     /// order the rules were listed in. Every tier-one rule is monotone -- two
