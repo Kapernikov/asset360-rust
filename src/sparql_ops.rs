@@ -727,7 +727,7 @@ pub fn lower_refined(
                             // the same reason.
                             .filter(|slot| Some(slot.as_str()) != identifier.as_deref())
                             .collect(),
-                        optional_slots: column_slots(SlotPresence::Delivered),
+                        optional_slots: column_slots(SlotPresence::Optional),
                         // Mandatory, and checked rather than assumed:
                         // `LoweringRefusal::OptionalScan` above refuses a scan
                         // the query only optionally wants, and
@@ -1840,13 +1840,15 @@ mod tests {
     fn a_scan_the_query_only_optionally_wants_does_not_lower() {
         let sv = test_schema_view();
         let mut plan = refined_plan(
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-             OPTIONAL { ?s asset360:name ?nm } }",
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
             &sv,
         );
-        // As it stands, this lowers: the optional read is a delivered slot on
-        // a mandatory scan.
-        lower_refined(&plan, &sv, None).expect("should lower as it is");
+        // A second star inside the `OPTIONAL`, which is a real left join and
+        // not an absorbed read -- so there is a `leftjoin` node to push, which
+        // is what this test needs. (A same-star optional read no longer leaves
+        // one: `AbsorbOptionalRead` turns it into a nullable column.)
+        assert_eq!(plan.find("leftjoin").len(), 1, "{plan}");
 
         // Push the left join, as a tier-two rule eventually will.
         let leftjoin = plan.find("leftjoin")[0];

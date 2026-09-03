@@ -740,32 +740,40 @@ pub struct ScanSlot {
     pub presence: SlotPresence,
 }
 
-/// Whether a scan *requires* the value it reads, or only delivers it.
+/// Whether a scan *requires* the value it reads, or only allows it.
 ///
 /// The distinction 28d did not have, and the reason the ledger and the plan
-/// can disagree about an `OPTIONAL`. Today's star decomposition carries it as
-/// `required_fields` versus `optional_fields`, and it decides one thing in the
-/// SQL: whether an `object_data ? 'slot'` existence check is emitted.
+/// could disagree about an `OPTIONAL`. Today's star decomposition carries it
+/// as `required_fields` versus `optional_fields`, and it decides one thing in
+/// the SQL: whether an `object_data ? 'slot'` existence check is emitted.
 ///
-/// It also decides what a scan may *claim*. A required read enforces the
-/// triple: a record without the value is not a row. A delivered read enforces
-/// nothing -- it hands a column to whoever decides the optionality, and while
-/// that is the engine re-running the query, the scan is a narrowing and
-/// claiming the triple would be a node saying it did something it did not.
-/// Once a node renders the optional semantics *in SQL* -- the left join, the
-/// null-tolerant conditions, the missing-value bucket -- the claim is honest
-/// and belongs to that node. So the claim is not a property of the read; it
-/// belongs to whoever renders the optionality, which is what the frontier
-/// says.
+/// **Orthogonal to whether the read binds a variable**, which is
+/// [`ScanSlot::var`]. The two facts together are the whole of what a scan does
+/// with a value, and keeping them apart is what let the optional read stop
+/// being a special case:
+///
+/// | presence | `var` | what it is |
+/// |---|---|---|
+/// | `Required` | `Some` | a mandatory read: no value, no row |
+/// | `Required` | `None` | the existence half of `?s :name "BX"` |
+/// | `Optional` | `None` | delivered for the engine's benefit, read by nothing in SQL |
+/// | `Optional` | `Some` | an *absorbed* optional read: a nullable column the SQL side binds |
+///
+/// The last row is what makes a missing-value bucket possible, and it is also
+/// what makes the claim honest. A column delivered but bound by nothing does
+/// not produce the solution an `OPTIONAL` asks for -- the engine does, and a
+/// scan claiming it would be a node saying it did something it did not. A
+/// nullable column the SQL side *binds* produces exactly those solutions: the
+/// value where there is one, and no binding where there is not. So the claim
+/// follows the binding rather than the existence check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotPresence {
-    /// `object_data ? 'slot'`: a record without the value is not a row, and
-    /// the scan enforces the triple.
+    /// `object_data ? 'slot'` (and not JSON `null`): a record without a value
+    /// is not a row.
     Required,
-    /// Fetched with no existence check. Exposes no binding to any SQL node
-    /// above -- a condition on a value that may be absent would drop the rows
-    /// the left join exists to keep -- and claims nothing.
-    Delivered,
+    /// No existence check, so a record without a value is still a row and the
+    /// column reads as `NULL` there.
+    Optional,
 }
 
 /// The reference a pushed join joins on, recorded rather than re-derived.
@@ -1409,9 +1417,14 @@ impl Plan {
             else {
                 continue;
             };
-            for slot in slots.iter().filter(|slot| {
-                slot.multivalued && slot.presence == SlotPresence::Required && slot.var.is_some()
-            }) {
+            // Any read that *binds* a multivalued slot owes a fan-out,
+            // whatever its presence. An optional one would need the fan-out
+            // inside the optional side, which no rule builds -- so the shape
+            // is refused here rather than mis-rendered.
+            for slot in slots
+                .iter()
+                .filter(|slot| slot.multivalued && slot.var.is_some())
+            {
                 let restored = self.nodes.iter().enumerate().find_map(|(id, above)| {
                     let matches = matches!(
                         &above.op,
@@ -1480,7 +1493,6 @@ impl Plan {
                     } if scan_star == star_var
                         && slots.iter().any(|slot| {
                             slot.multivalued
-                                && slot.presence == SlotPresence::Required
                                 && slot_path == &slot.path
                                 && slot.var.as_ref() == Some(var)
                         })
@@ -1798,7 +1810,7 @@ impl PlanOp {
                             None => String::new(),
                         },
                         if slot.multivalued { "[]" } else { "" },
-                        if slot.presence == SlotPresence::Delivered {
+                        if slot.presence == SlotPresence::Optional {
                             "?"
                         } else {
                             ""

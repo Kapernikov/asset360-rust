@@ -1644,18 +1644,21 @@ mod tests {
         println!("{plan}");
     }
 
-    /// The case the gate was corrected for: an `OPTIONAL` read is refined,
-    /// and the claim difference is *reported* rather than vetoed.
+    /// The case the gate was corrected for, and the gap it was corrected
+    /// around is now closed at the source.
     ///
-    /// Both statements deliver the same column -- the scan carries it as a
-    /// delivered slot -- so no work moved and no row set widened. The ledgers
-    /// differ because the refined plan declines to let a narrowing scan claim
-    /// optionality it does not render, and comparing ledgers rejected the more
-    /// truthful plan for a difference that costs nothing. The missing-value
-    /// bucket is exactly this shape, so rejecting it cost the report the whole
-    /// feature exists for.
+    /// The gate used to compare claim ledgers, and rejected this shape because
+    /// the refined plan declined to let a narrowing scan claim optionality it
+    /// did not render. Comparing the row source instead admitted it *with* a
+    /// reported difference. Now there is no difference to report: the optional
+    /// read is absorbed into the scan as a bound nullable column, so the scan
+    /// renders the optional semantics and the claim is its own.
+    ///
+    /// Three rounds, three positions, and only the last one is stable: the
+    /// claim follows whoever answers, and the way to make a claim honest is to
+    /// make the node answer rather than to argue about the ledger.
     #[test]
-    fn an_optional_read_is_refined_and_its_ledger_difference_reported() {
+    fn an_optional_read_no_longer_costs_a_ledger_difference() {
         let sv = test_schema_view();
         let query = format!(
             "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
@@ -1663,20 +1666,16 @@ mod tests {
         );
         let plan = plan_query_refined(&query, &sv).expect("should plan");
 
-        let note = match &plan.refinement {
-            Refinement::Used(Some(note)) => note.clone(),
-            other => panic!("expected a refined plan with a note, got {other:?}"),
-        };
-        assert!(
-            note.contains("does not claim") && note.contains("asset360:name"),
-            "{note}"
+        assert_eq!(
+            plan.refinement,
+            Refinement::Used(None),
+            "the ledgers agree now: {:?}",
+            plan.refinement
         );
-
-        // The ledger stays honest: the engine claims what SQL does not, every
-        // obligation exactly once, nothing unaccounted for. Nothing was
-        // adjusted to buy the route.
         plan.ledger_balances().unwrap();
         assert!(plan.is_accounted(), "{plan}");
+
+        // The optional triple is SQL's, because the scan answers it.
         let sql_claims: Vec<String> = plan
             .passes
             .iter()
@@ -1685,14 +1684,14 @@ mod tests {
             .map(|id| plan.obligations[*id].to_string())
             .collect();
         assert!(
-            !sql_claims
+            sql_claims
                 .iter()
                 .any(|claim| claim.contains("asset360:name")),
-            "a fetch that requires nothing must not claim the triple: {sql_claims:?}"
+            "{sql_claims:?}"
         );
 
-        // And the column is delivered, which is why the statement is the same
-        // one today's planner renders.
+        // And the statement is still today's, which is what the comparator
+        // checked before there was anything else to check.
         let today = plan_query(&query, &sv).expect("should plan");
         let ops = |plan: &ExecutionPlan| -> crate::sparql_ops::OpTree {
             plan.passes

@@ -598,19 +598,13 @@ impl Visible {
             // written on the identifier slot itself
             // (`?s :asset360_uri "u"`) does push, through the slot.
             slots.insert(star_var.clone(), None);
+            // A slot that binds no variable is invisible here without a
+            // special case: there is no name to resolve. That covers the read
+            // an `OPTIONAL` delivers for the engine's benefit, which no SQL
+            // node above may read -- and it stops covering it the moment a
+            // rule *absorbs* that read and gives it a variable, which is
+            // exactly when reading it becomes correct.
             for slot in scan_slots {
-                // A delivered read is not a binding this side exposes: its
-                // value may be absent, and a condition on it would drop the
-                // rows the left join above exists to keep. Entered as
-                // ambiguous rather than skipped, so a rule declines the
-                // variable instead of resolving it through another star's
-                // slot of the same name.
-                if slot.presence == SlotPresence::Delivered {
-                    if let Some(var) = slot.var.clone() {
-                        slots.insert(var, None);
-                    }
-                    continue;
-                }
                 // A multivalued slot's variable is one *element*, and it is
                 // the unnest below that bound it. Without the unnest under
                 // this node the element has no name here -- the fan-out has
@@ -795,10 +789,16 @@ impl Rule for DeliverOptionalRead<'_> {
             };
             let delivered = ScanSlot {
                 path: vec![slot.name.clone()],
-                var: Some(var),
+                // Bound by nothing here. The `match` above is what binds the
+                // variable, and the engine's left join decides it; this slot
+                // exists so the column reaches the engine at all. Binding it
+                // would make it readable by SQL nodes that must not read it --
+                // and, if it were multivalued, would owe a fan-out inside the
+                // optional side that no rule builds.
+                var: None,
                 multivalued: on_class.determine_slot_container_mode()
                     != SlotContainerMode::SingleValue,
-                presence: SlotPresence::Delivered,
+                presence: SlotPresence::Optional,
             };
             if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
                 if slots.contains(&delivered) {
@@ -810,6 +810,156 @@ impl Rule for DeliverOptionalRead<'_> {
         }
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// Absorb an optional read
+// ---------------------------------------------------------------------------
+
+/// `OPTIONAL { ?s :name ?nm }` over a star the scan below already reads
+/// becomes a *bound* nullable column, and the left join disappears.
+///
+/// The rule that makes a missing-value bucket possible. [`DeliverOptionalRead`]
+/// puts the column on the scan so the engine can bind it; this one gives it
+/// the variable, so the SQL side can. The difference is the whole of what an
+/// `OPTIONAL` over one star means: a record with the value answers with it, a
+/// record without answers with the variable unbound — which is a `NULL`
+/// column, and a group of its own.
+///
+/// **It is also where the claim becomes honest.** A column delivered and bound
+/// by nothing does not produce the solution an `OPTIONAL` asks for; the engine
+/// does. A nullable column the SQL side binds produces exactly those
+/// solutions, so the scan takes the triple's obligation with it — which is the
+/// conditional claim [`SlotPresence`] describes, arriving at the condition
+/// that makes it true.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **No lifted condition on the left join.** `OPTIONAL { ?s :name ?nm .
+///   FILTER(?nm > "A") }` decides whether the *value* binds, not whether the
+///   row survives: a record whose name is `"A"` stays, with `?nm` unbound.
+///   Rendering that needs a conditional binding expression -- a `CASE` around
+///   the column -- which this does not build. As a `WHERE` it would delete the
+///   row, which is the single most common way a left-join translation is
+///   wrong, and it fails quietly with a smaller answer.
+/// * **The optional side is exactly one `match` on the same star.** Anything
+///   else is a second row set, which is a real left join and a different rule.
+/// * **A single-valued slot.** A multivalued optional read fans out *inside*
+///   the optional side; the fan-out would have to be part of the join rather
+///   than above the scan, and the fifth invariant refuses the shape this rule
+///   would otherwise build.
+/// * **The scan runs in SQL and takes every row of the preserved side.**
+pub struct AbsorbOptionalRead<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> AbsorbOptionalRead<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for AbsorbOptionalRead<'_> {
+    fn name(&self) -> &'static str {
+        "absorb_optional_read"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            let PlanOp::LeftJoin {
+                left,
+                right,
+                condition,
+            } = &plan.nodes[id].op
+            else {
+                continue;
+            };
+            if condition.is_some() {
+                continue;
+            }
+            let (left, right) = (*left, *right);
+
+            // The optional side: one match, reading one slot of one star.
+            let PlanOp::Match { pattern } = &plan.nodes[right].op else {
+                continue;
+            };
+            if plan.nodes[right].executor != Executor::Engine || is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(star), Some(predicate), Some(var)) = (
+                subject_variable(pattern),
+                predicate_iri(pattern),
+                object_variable(pattern),
+            ) else {
+                continue;
+            };
+            let (star, predicate, var) = (star.to_owned(), predicate.to_owned(), var.to_owned());
+            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
+                continue;
+            };
+            let path = vec![slot.name.clone()];
+
+            // The preserved side: a scan of that same star, in SQL, whose rows
+            // all reach the join.
+            let Some(scan) = plan.nodes.iter().enumerate().position(|(scan, node)| {
+                matches!(&node.op, PlanOp::Scan { star_var, .. } if star_var == &star)
+                    && node.executor == Executor::Sql
+                    && mandatorily_feeds(plan, scan, left)
+            }) else {
+                continue;
+            };
+            let PlanOp::Scan { slots, .. } = &plan.nodes[scan].op else {
+                continue;
+            };
+            let Some(delivered) = slots.iter().position(|slot| slot.path == path) else {
+                continue;
+            };
+            if slots[delivered].multivalued || slots[delivered].var.is_some() {
+                continue;
+            }
+
+            // Bind it. From here the column is the read: a value where there
+            // is one, `NULL` where there is not.
+            if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+                slots[delivered].var = Some(var);
+                slots[delivered].presence = SlotPresence::Optional;
+            }
+            let mut claims = plan.nodes[right].discharges.clone();
+            claims.extend(plan.nodes[id].discharges.iter().copied());
+            plan.nodes[scan].discharges.extend(claims);
+            plan.nodes[scan].discharges.sort_unstable();
+
+            drop_optional_pair(plan, id, right, left);
+            return true;
+        }
+        false
+    }
+}
+
+/// Remove the left join and the match it made optional, leaving the preserved
+/// side in their place.
+fn drop_optional_pair(plan: &mut Plan, leftjoin: NodeId, matched: NodeId, left: NodeId) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() - 2);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == matched {
+            continue;
+        }
+        if old == leftjoin {
+            // Everything that read the left join reads the preserved side:
+            // the optional value is a column of it now.
+            remap[old] = remap[left];
+            continue;
+        }
+        nodes.push(node.clone());
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
 }
 
 // ---------------------------------------------------------------------------
@@ -2160,6 +2310,7 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
         Box::new(FoldMatchesIntoScan::new(schema)),
         Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(DeliverOptionalRead::new(schema)),
+        Box::new(AbsorbOptionalRead::new(schema)),
         Box::new(ConstantObjectBecomesFilter::new(schema)),
         Box::new(ValuesBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
@@ -2965,13 +3116,23 @@ mod tests {
         }
     }
 
-    /// The SQL leg has to hand over the column an `OPTIONAL` reads -- the
-    /// engine cannot bind `?nm` from a record it was not given -- while
-    /// nothing about the optionality is decided in SQL. So the scan delivers
-    /// the slot, requires nothing of it, and claims nothing: the `match` keeps
-    /// the triple and the left join above decides it.
+    /// An `OPTIONAL` read of a scanned star becomes a bound nullable column,
+    /// and the left join disappears.
+    ///
+    /// Two rules in sequence, and the pair is the point.
+    /// [`DeliverOptionalRead`] puts the column on the scan with no existence
+    /// check and *no variable*, so the engine can bind it and no SQL node can.
+    /// [`AbsorbOptionalRead`] gives it the variable, which is the moment the
+    /// SQL side starts producing the solution the `OPTIONAL` asks for: the
+    /// value where there is one, `NULL` where there is not.
+    ///
+    /// And that is where the claim becomes honest. The scan takes the triple's
+    /// obligation because it now answers it -- the conditional claim
+    /// [`SlotPresence`] describes, arriving at the condition that makes it
+    /// true. Before this the `match` kept the claim, and the two planners
+    /// disagreed about the ledger for every `OPTIONAL` read.
     #[test]
-    fn an_optional_read_is_delivered_but_not_required() {
+    fn an_optional_read_becomes_a_bound_nullable_column() {
         let schema = test_schema_view();
         let plan = refined(
             "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
@@ -2980,52 +3141,90 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            scan_slots(&plan),
-            vec![
-                ("kind".to_owned(), "k".to_owned(), false),
-                ("name".to_owned(), "nm".to_owned(), false),
-            ],
-            "{plan}"
-        );
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert!(plan.find("leftjoin").is_empty(), "{plan}");
         let scan = plan.find("scan")[0];
         let PlanOp::Scan { slots, .. } = &plan.nodes[scan].op else {
             panic!("{plan}");
         };
-        assert_eq!(slots[0].presence, SlotPresence::Required, "{plan}");
-        assert_eq!(slots[1].presence, SlotPresence::Delivered, "{plan}");
-        assert!(
-            plan.nodes[scan].op.describe().contains("name→?nm?"),
-            "a reader of the plan can see which read is only delivered:\n{plan}"
+        let [required, optional] = slots.as_slice() else {
+            panic!("two reads: {slots:?}");
+        };
+        assert_eq!(required.presence, SlotPresence::Required, "{plan}");
+        assert_eq!(optional.presence, SlotPresence::Optional, "{plan}");
+        assert_eq!(
+            optional.var.as_deref(),
+            Some("nm"),
+            "absorbed, so the SQL side binds it:\n{plan}"
         );
 
-        // The match stays, and keeps the claim: a delivered read enforces no
-        // triple, so the scan claiming it would be a node saying it did
-        // something it did not.
-        assert_eq!(plan.find("match").len(), 1, "{plan}");
-        let matched = plan.find("match")[0];
+        // The scan claims the optional triple, because it is what answers it.
         assert_eq!(
-            plan.nodes[matched]
+            plan.nodes[scan]
                 .discharges
                 .iter()
                 .map(|id| plan.obligations[*id].to_string())
                 .collect::<Vec<_>>(),
-            vec!["triple    ?s asset360:name ?nm"],
+            vec![
+                "type      ?s a asset360:Signal".to_owned(),
+                "triple    ?s asset360:kind ?k".to_owned(),
+                "triple    ?s asset360:name ?nm".to_owned(),
+            ],
             "{plan}"
         );
-        assert_eq!(plan.nodes[matched].executor, Executor::Engine, "{plan}");
+        plan.check()
+            .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
         println!("{plan}");
     }
 
-    /// A delivered read is not a binding the SQL side exposes, and three rules
-    /// have to agree about that or the plan answers a different question.
+    /// A lifted condition is not absorbed, and this is the placement error the
+    /// rule exists to refuse.
+    ///
+    /// `OPTIONAL { ?s :name ?nm . FILTER(?nm > "A") }` decides whether the
+    /// *value* binds, not whether the row survives: a signal named "A" is
+    /// still an answer, with `?nm` unbound. Rendering the condition as a
+    /// `WHERE` would delete that row -- turning the left join into an inner
+    /// one, quietly, with a smaller answer and no error.
     #[test]
-    fn nothing_reads_through_a_delivered_slot() {
+    fn a_condition_inside_the_optional_is_not_absorbed() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
+            &schema,
+            false,
+        );
+
+        assert_eq!(plan.find("leftjoin").len(), 1, "{plan}");
+        assert_eq!(
+            plan.nodes[plan.find("leftjoin")[0]].executor,
+            Executor::Engine,
+            "{plan}"
+        );
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
+        // The column is still delivered, so the engine has what it needs.
+        assert!(
+            scan_slots(&plan).contains(&("name".to_owned(), String::new(), false)),
+            "{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// What an absorbed optional read may and may not be read by.
+    ///
+    /// A *filter* may: every condition this pushes is false or unknown against
+    /// `NULL` -- `=`, `IN` and the four orderings alike -- and SPARQL says the
+    /// same, since a comparison with an unbound variable is an error and an
+    /// error does not select the solution. The filter node sits above the
+    /// former left join, which is exactly where the query wrote it.
+    ///
+    /// A *join* may not: a foreign key that may be absent is not a key, and an
+    /// inner join on it would drop the row the `OPTIONAL` keeps. Nor may a
+    /// nested walk go through one, for the same reason one hop further down.
+    #[test]
+    fn what_may_read_an_absorbed_optional_column() {
         let schema = test_schema_view();
 
-        // A filter on an optionally-read value stays with the engine: the
-        // value may be absent, and a condition on it drops exactly the rows
-        // the left join exists to keep.
         let filtered = refined(
             "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL { ?s asset360:name ?nm } FILTER(?nm > \"A\") }",
@@ -3034,7 +3233,7 @@ mod tests {
         );
         assert_eq!(
             filtered.nodes[filtered.find("filter")[0]].executor,
-            Executor::Engine,
+            Executor::Sql,
             "{filtered}"
         );
 
@@ -3069,9 +3268,10 @@ mod tests {
         );
     }
 
-    /// A multivalued slot read only optionally owes no unnest: nothing above
-    /// the scan reads its values, so there is no multiplicity to restore --
-    /// and fanning it out would multiply rows for a read nobody reads.
+    /// A multivalued optional read stays delivered and unbound: absorbing it
+    /// would owe a fan-out *inside* the optional side, which no rule builds --
+    /// and the fifth invariant refuses that shape rather than trusting a rule
+    /// to decline it, since any *bound* multivalued read owes an unnest.
     #[test]
     fn a_delivered_array_does_not_fan_out() {
         let schema = test_schema_view();
@@ -3083,7 +3283,7 @@ mod tests {
         );
 
         assert!(
-            scan_slots(&plan).contains(&("trafficKinds".to_owned(), "k".to_owned(), true)),
+            scan_slots(&plan).contains(&("trafficKinds".to_owned(), String::new(), true)),
             "{plan}"
         );
         assert!(plan.find("unnest").is_empty(), "{plan}");
@@ -4206,20 +4406,23 @@ mod tests {
     /// disagreement about what claiming a triple *means*.
     ///
     /// A read inside an `OPTIONAL` reaches today's star as an
-    /// `optional_fields` entry: the prefetch delivers the column without a
-    /// `WHERE object_data ? 'name'`, and the pass claims the triple because
-    /// the data reaches oxigraph. The refined plan *delivers the same column*
-    /// -- [`DeliverOptionalRead`] puts it on the scan as
-    /// [`SlotPresence::Delivered`], so the two statements agree -- and does
-    /// not claim it: a fetch that requires nothing enforces no triple, and the
-    /// `match` above keeps the obligation for the engine's left join to
-    /// decide. So the difference is in the ledger and not in the SQL.
+    /// `optional_fields` entry: the prefetch delivers the column without an
+    /// existence check, and the pass claims the triple because the data
+    /// reaches oxigraph. The refined plan delivers the same column and does
+    /// not claim it, so the difference is in the ledger and not in the SQL.
     ///
-    /// I would argue against closing this by claiming it: `plan_query`'s own
-    /// comment refuses to let a pass "say it enforced something it did not",
-    /// and an optional read is exactly that. Stage 3 has to pick a meaning; if
-    /// it wants today's, a scan needs a slot that is fetched without being
-    /// required, which is a representation change and not a rule.
+    /// **Two entries left, where there used to be one for every optional
+    /// read.** [`AbsorbOptionalRead`] closes the general case by giving the
+    /// delivered column its variable, at which point the scan answers the read
+    /// and the claim is its own -- the argument for keeping it unclaimed was
+    /// right about a column nothing binds, and the way to settle it was to
+    /// make the node answer rather than to keep arguing about the ledger.
+    ///
+    /// What remains is the two shapes absorption declines: a condition lifted
+    /// into the left join (which decides whether the *value* binds, not
+    /// whether the row survives) and a multivalued optional read (whose
+    /// fan-out would have to live inside the optional side). Both keep the
+    /// `match`, and the `match` keeps the claim.
     const KNOWN_GAPS: &[(&str, &str)] = &[
         (
             "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
