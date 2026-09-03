@@ -74,6 +74,7 @@ use spargebra::algebra::{
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, Term, TermPattern, TriplePattern, Variable};
 
+pub use crate::sparql_ops::SlotReading;
 use crate::sparql_plan::{LedgerError, Obligation, ObligationId, obligation_of_triple, shorten};
 use crate::sparql_scoper::{FilterCondition, PushForm, ScopeError, literal_pushable};
 
@@ -274,48 +275,6 @@ pub enum Expr {
     /// to reason about it, and "there is an EXISTS here, and no rule pushes
     /// it" is the whole of that reasoning today.
     Opaque(String),
-}
-
-/// How to read the value a `(star, slot_path)` address names.
-///
-/// The fact 28d's `Slot` was missing, and the reason a rule could not push a
-/// condition on a multivalued slot at all: one address means three different
-/// things, and they select different rows.
-///
-/// The lesson is stage 1's, with a second instance. `ScanSlot` carries
-/// `multivalued` because a plan whose scan slots are bare names cannot see a
-/// cardinality error; an address with no reading cannot see this one. A
-/// consumer handed `(?s, [trafficKinds], = 'm')` and nothing else has to guess
-/// between an equality that matches no array, a containment test over the
-/// array, and a comparison against one unnested element -- and two of those
-/// answer a different question than the query asked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotReading {
-    /// The column's own value: `object_data->>'name'`. Only correct for a
-    /// single-valued slot -- on an array it compares the array's text and
-    /// matches nothing.
-    Column,
-    /// Some element of the array the column holds. `?s :trafficKinds "m"` asks
-    /// whether the record carries that triple at all, which is a containment
-    /// test -- `EXISTS (SELECT 1 FROM jsonb_array_elements_text(...))`, what
-    /// the star decomposition's `multivalued_fields` tells its renderer to do
-    /// -- and matches a record once however many values it holds.
-    AnyElement,
-    /// The element a [`PlanOp::Unnest`] below bound to a variable. One row per
-    /// value, so a condition on it selects *rows* rather than records, which
-    /// is what SPARQL means by `?s :trafficKinds ?k . FILTER(?k = "m")`: one
-    /// solution per matching value, not every value of a matching record.
-    BoundElement,
-}
-
-impl fmt::Display for SlotReading {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Column => Ok(()),
-            Self::AnyElement => f.write_str("[any]"),
-            Self::BoundElement => f.write_str("[each]"),
-        }
-    }
 }
 
 /// A comparison SQL can express, in the vocabulary the renderer already
@@ -761,11 +720,60 @@ pub struct SortTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanSlot {
     pub path: Vec<String>,
-    /// The variable the folded `match` bound to this slot's value.
-    pub var: String,
+    /// The variable the folded `match` bound to this slot's value, when the
+    /// read binds one.
+    ///
+    /// `None` for a read that constrains the value without naming it: `?s
+    /// :name "BX517"` asserts that the slot exists *and* what it holds, and
+    /// the existence half is a slot the scan reads while the value half is a
+    /// condition above it. Today's star says the same thing by listing the
+    /// name in `required_fields` with no entry in `slot_variables`.
+    ///
+    /// A slot with no variable binds nothing, so nothing above the scan can
+    /// read it: no condition resolves through it, no join keys on it, and a
+    /// multivalued one owes no unnest -- there is no binding whose
+    /// multiplicity could be lost.
+    pub var: Option<String>,
     /// Whether the slot holds an array, so one record answers the query once
     /// per value.
     pub multivalued: bool,
+    pub presence: SlotPresence,
+}
+
+/// Whether a scan *requires* the value it reads, or only allows it.
+///
+/// The distinction 28d did not have, and the reason the ledger and the plan
+/// could disagree about an `OPTIONAL`. Today's star decomposition carries it
+/// as `required_fields` versus `optional_fields`, and it decides one thing in
+/// the SQL: whether an `object_data ? 'slot'` existence check is emitted.
+///
+/// **Orthogonal to whether the read binds a variable**, which is
+/// [`ScanSlot::var`]. The two facts together are the whole of what a scan does
+/// with a value, and keeping them apart is what let the optional read stop
+/// being a special case:
+///
+/// | presence | `var` | what it is |
+/// |---|---|---|
+/// | `Required` | `Some` | a mandatory read: no value, no row |
+/// | `Required` | `None` | the existence half of `?s :name "BX"` |
+/// | `Optional` | `None` | delivered for the engine's benefit, read by nothing in SQL |
+/// | `Optional` | `Some` | an *absorbed* optional read: a nullable column the SQL side binds |
+///
+/// The last row is what makes a missing-value bucket possible, and it is also
+/// what makes the claim honest. A column delivered but bound by nothing does
+/// not produce the solution an `OPTIONAL` asks for -- the engine does, and a
+/// scan claiming it would be a node saying it did something it did not. A
+/// nullable column the SQL side *binds* produces exactly those solutions: the
+/// value where there is one, and no binding where there is not. So the claim
+/// follows the binding rather than the existence check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotPresence {
+    /// `object_data ? 'slot'` (and not JSON `null`): a record without a value
+    /// is not a row.
+    Required,
+    /// No existence check, so a record without a value is still a row and the
+    /// column reads as `NULL` there.
+    Optional,
 }
 
 /// The reference a pushed join joins on, recorded rather than re-derived.
@@ -839,6 +847,12 @@ pub enum PlanOp {
     LeftJoin {
         left: NodeId,
         right: NodeId,
+        /// The reference edge this join joins on, once a rule has pushed it.
+        ///
+        /// Same field and same reason as [`PlanOp::Join`]'s: the direction is
+        /// recorded rather than re-derived, and
+        /// [`Plan::reference_joins_agree`] checks it against the scans.
+        reference: Option<ReferenceEdge>,
         /// The condition spargebra lifts out of `OPTIONAL { ... FILTER(x) }`.
         ///
         /// Claimed by this node, per conjunct: nothing pushes it (it decides
@@ -1047,6 +1061,23 @@ impl PlanOp {
         }
     }
 
+    /// Whether this operator's result depends on how many rows it is given.
+    ///
+    /// The question the fifth invariant asks of a fan-out: a `COUNT` counts
+    /// rows, a `DISTINCT` removes duplicate ones, a `SLICE` takes the first
+    /// few. Restoring multiplicity *after* one of these has already read the
+    /// rows is a wrong answer -- a count of records where the query counts
+    /// solutions -- so the unnest has to be below them.
+    ///
+    /// A `Sort` is not here: it reorders rows without changing how many there
+    /// are, so a fan-out on either side of one produces the same multiset.
+    pub fn collapses_rows(&self) -> bool {
+        matches!(
+            self,
+            Self::Group { .. } | Self::Distinct { .. } | Self::Reduced { .. } | Self::Slice { .. }
+        )
+    }
+
     /// What this operator produces, which is a property of the operator and
     /// not a choice, so a node's [`Node::output`] cannot disagree with its op.
     pub fn output_kind(&self) -> OutputKind {
@@ -1114,10 +1145,13 @@ pub fn scan_with_fanout(
     at: NodeId,
     discharges: Vec<ObligationId>,
 ) -> Vec<Node> {
+    // A *delivered* slot exposes no binding above the scan, so nothing counts
+    // its values and there is no multiplicity to restore. Fanning one out
+    // would multiply rows for a read nobody reads.
     let fanning: Vec<(Vec<String>, String)> = slots
         .iter()
-        .filter(|slot| slot.multivalued)
-        .map(|slot| (slot.path.clone(), slot.var.clone()))
+        .filter(|slot| slot.multivalued && slot.presence == SlotPresence::Required)
+        .filter_map(|slot| slot.var.clone().map(|var| (slot.path.clone(), var)))
         .collect();
     let mut out = vec![Node::sql(
         PlanOp::Scan {
@@ -1201,6 +1235,13 @@ pub enum PlanDefect {
     StrayFanout {
         unnest: NodeId,
     },
+    /// A fan-out that happens after something already read the rows: a
+    /// `COUNT`, a `DISTINCT` or a `SLICE` between the scan and its `Unnest`.
+    /// The multiplicity is restored, and too late to be counted.
+    FanoutAfterCollapse {
+        unnest: NodeId,
+        collapse: NodeId,
+    },
     /// A join whose recorded [`ReferenceEdge`] is not what the scans below it
     /// say. Not one of 28d's, and the invariant that exists because the plan
     /// now records the direction rather than leaving it to be re-derived.
@@ -1239,6 +1280,11 @@ impl fmt::Display for PlanDefect {
             Self::MisrecordedJoin { join } => write!(
                 f,
                 "n{join} records a reference edge the scans below it do not support"
+            ),
+            Self::FanoutAfterCollapse { unnest, collapse } => write!(
+                f,
+                "n{collapse} reads rows the fan-out at n{unnest} has not produced yet, \
+                 so it counts records where the query counts solutions"
             ),
             Self::StrayFanout { unnest } => write!(
                 f,
@@ -1377,9 +1423,16 @@ impl Plan {
             else {
                 continue;
             };
-            for slot in slots.iter().filter(|slot| slot.multivalued) {
-                let restored = self.nodes.iter().enumerate().any(|(id, above)| {
-                    matches!(
+            // Any read that *binds* a multivalued slot owes a fan-out,
+            // whatever its presence. An optional one would need the fan-out
+            // inside the optional side, which no rule builds -- so the shape
+            // is refused here rather than mis-rendered.
+            for slot in slots
+                .iter()
+                .filter(|slot| slot.multivalued && slot.var.is_some())
+            {
+                let restored = self.nodes.iter().enumerate().find_map(|(id, above)| {
+                    let matches = matches!(
                         &above.op,
                         PlanOp::Unnest {
                             star_var: unnest_star,
@@ -1395,14 +1448,29 @@ impl Plan {
                             // that fans out the right slot under the wrong
                             // name leaves that condition naming an element
                             // nothing bound.
-                            && var == &slot.var
-                    ) && self.feeds(scan_id, id)
+                            && Some(var) == slot.var.as_ref()
+                    ) && self.feeds(scan_id, id);
+                    matches.then_some(id)
                 });
-                if !restored {
+                let Some(unnest) = restored else {
                     return Err(PlanDefect::LostFanout {
                         scan: scan_id,
                         slot: slot.path.join("."),
                     });
+                };
+                // Restored, and restored *in time*. A fan-out below a scan
+                // says nothing about where it sits relative to a `COUNT`: an
+                // unnest above the grouping would count records where the
+                // query counts solutions, and every other check would pass.
+                //
+                // Stated only once a plan could group. Written for stage 1 it
+                // would have been unfalsifiable -- nothing collapsed rows --
+                // and this is the shape the invariant was always meant to
+                // catch.
+                if let Some(collapse) = self.nodes.iter().enumerate().position(|(id, node)| {
+                    node.op.collapses_rows() && self.feeds(scan_id, id) && !self.feeds(unnest, id)
+                }) {
+                    return Err(PlanDefect::FanoutAfterCollapse { unnest, collapse });
                 }
             }
         }
@@ -1430,7 +1498,9 @@ impl Plan {
                         ..
                     } if scan_star == star_var
                         && slots.iter().any(|slot| {
-                            slot.multivalued && slot_path == &slot.path && &slot.var == var
+                            slot.multivalued
+                                && slot_path == &slot.path
+                                && slot.var.as_ref() == Some(var)
                         })
                 ) && self.feeds(scan_id, id)
             });
@@ -1454,14 +1524,23 @@ impl Plan {
     /// variable and nothing else.
     pub fn reference_joins_agree(&self) -> Result<(), PlanDefect> {
         for (id, node) in self.nodes.iter().enumerate() {
-            let PlanOp::Join {
-                left,
-                right,
-                on,
-                reference: Some(edge),
-            } = &node.op
-            else {
-                continue;
+            // Both join kinds: a left join records the same edge, and a
+            // reversed one is the same wrong answer with the rows the
+            // `OPTIONAL` keeps thrown in.
+            let (left, right, on, edge) = match &node.op {
+                PlanOp::Join {
+                    left,
+                    right,
+                    on,
+                    reference: Some(edge),
+                } => (left, right, Some(on), edge),
+                PlanOp::LeftJoin {
+                    left,
+                    right,
+                    reference: Some(edge),
+                    ..
+                } => (left, right, None, edge),
+                _ => continue,
             };
             let scanned_on = |side: NodeId, star: &str| -> Option<&Vec<ScanSlot>> {
                 self.nodes
@@ -1484,11 +1563,17 @@ impl Plan {
                         // edge this vocabulary can express.
                         .any(|slot| {
                             slot.path.as_slice() == [edge.slot.clone()]
-                                && slot.var == edge.referenced
+                                && slot.var.as_deref() == Some(edge.referenced.as_str())
+                                // A delivered read is not a binding, so it
+                                // cannot be the key a join reads.
+                                && slot.presence == SlotPresence::Required
                         })
                 })
             };
-            let agrees = on.as_slice() == [edge.referenced.clone()]
+            // A left join has no `on`: the variables the two sides share are
+            // the query's business, and what the renderer needs is the edge.
+            let joins_on_the_edge = on.is_none_or(|on| on.as_slice() == [edge.referenced.clone()]);
+            let agrees = joins_on_the_edge
                 && ((scanned_on(*left, &edge.referenced).is_some() && holds_the_key(*right))
                     || (scanned_on(*right, &edge.referenced).is_some() && holds_the_key(*left)));
             if !agrees {
@@ -1496,6 +1581,70 @@ impl Plan {
             }
         }
         Ok(())
+    }
+
+    /// The variables a node's solutions bind.
+    ///
+    /// Derived from the nodes rather than remembered from the query, because a
+    /// rule changes it: folding a match into a scan moves a binding from one
+    /// node to another, and collapsing a join removes the node that recorded
+    /// which variables the two sides shared. See
+    /// [`crate::sparql_rules::refresh_join_variables`].
+    pub fn variables_of(&self, node: NodeId) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let Some(node) = self.nodes.get(node) else {
+            return out;
+        };
+        match &node.op {
+            PlanOp::Scan {
+                star_var, slots, ..
+            } => {
+                out.insert(star_var.clone());
+                // A delivered read binds nothing *here*: the `match` that
+                // stayed above is what binds it, and counting it twice would
+                // put an optional variable in a mandatory join's `on`.
+                out.extend(
+                    slots
+                        .iter()
+                        .filter(|slot| slot.presence == SlotPresence::Required)
+                        .filter_map(|slot| slot.var.clone()),
+                );
+            }
+            PlanOp::Match { pattern } => {
+                add_term_var(&pattern.subject, &mut out);
+                if let NamedNodePattern::Variable(variable) = &pattern.predicate {
+                    out.insert(variable.as_str().to_owned());
+                }
+                add_term_var(&pattern.object, &mut out);
+            }
+            PlanOp::Path {
+                subject, object, ..
+            } => {
+                add_term_var(subject, &mut out);
+                add_term_var(object, &mut out);
+            }
+            PlanOp::Values { variables, .. } => {
+                out.extend(variables.iter().map(|v| v.as_str().to_owned()));
+            }
+            PlanOp::Group { keys, measures, .. } => {
+                out.extend(keys.iter().cloned());
+                out.extend(measures.iter().map(|measure| measure.var.clone()));
+            }
+            PlanOp::Project { vars, .. }
+            | PlanOp::SubSelect { vars, .. }
+            | PlanOp::Describe { vars, .. } => out.extend(vars.iter().cloned()),
+            PlanOp::Bind { input, var, .. } => {
+                out.extend(self.variables_of(*input));
+                out.insert(var.clone());
+            }
+            PlanOp::Minus { left, .. } => out.extend(self.variables_of(*left)),
+            other => {
+                for input in other.inputs() {
+                    out.extend(self.variables_of(input));
+                }
+            }
+        }
+        out
     }
 
     /// Whether `lower`'s rows reach `upper`, following inputs.
@@ -1619,11 +1768,18 @@ impl PlanOp {
             PlanOp::LeftJoin {
                 left,
                 right,
+                reference,
                 condition,
-            } => match condition {
-                Some(condition) => format!("n{left}, n{right}  if {condition}"),
-                None => format!("n{left}, n{right}"),
-            },
+            } => {
+                let edge = match reference {
+                    Some(edge) => format!("  via ?{}.{}", edge.holder, edge.slot),
+                    None => String::new(),
+                };
+                match condition {
+                    Some(condition) => format!("n{left}, n{right}{edge}  if {condition}"),
+                    None => format!("n{left}, n{right}{edge}"),
+                }
+            }
             PlanOp::Union { left, right } | PlanOp::Minus { left, right } => {
                 format!("n{left}, n{right}")
             }
@@ -1672,10 +1828,18 @@ impl PlanOp {
                 slots
                     .iter()
                     .map(|slot| format!(
-                        "{}→?{}{}",
+                        "{}{}{}{}",
                         slot.path.join("."),
-                        slot.var,
-                        if slot.multivalued { "[]" } else { "" }
+                        match &slot.var {
+                            Some(var) => format!("→?{var}"),
+                            None => String::new(),
+                        },
+                        if slot.multivalued { "[]" } else { "" },
+                        if slot.presence == SlotPresence::Optional {
+                            "?"
+                        } else {
+                            ""
+                        }
                     ))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -1961,6 +2125,7 @@ impl Builder<'_> {
                     PlanOp::LeftJoin {
                         left,
                         right,
+                        reference: None,
                         condition,
                     },
                     claims,
@@ -2650,8 +2815,9 @@ mod tests {
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
                 slots: vec![ScanSlot {
                     path: vec!["trafficKinds".to_owned()],
-                    var: "kind".to_owned(),
+                    var: Some("kind".to_owned()),
                     multivalued: true,
+                    presence: SlotPresence::Required,
                 }],
             },
             vec![0],
@@ -2676,13 +2842,15 @@ mod tests {
         let slots = vec![
             ScanSlot {
                 path: vec!["hasName".to_owned()],
-                var: "nm".to_owned(),
+                var: Some("nm".to_owned()),
                 multivalued: false,
+                presence: SlotPresence::Required,
             },
             ScanSlot {
                 path: vec!["trafficKinds".to_owned()],
-                var: "kind".to_owned(),
+                var: Some("kind".to_owned()),
                 multivalued: true,
+                presence: SlotPresence::Required,
             },
         ];
         let nodes = scan_with_fanout(

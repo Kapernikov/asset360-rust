@@ -89,6 +89,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sparql_inexact_reasons, m)?)?;
         m.add_function(wrap_pyfunction!(py_sparql_pushdown, m)?)?;
         m.add_function(wrap_pyfunction!(py_plan_query, m)?)?;
+        m.add_function(wrap_pyfunction!(py_plan_query_refined, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
@@ -104,6 +105,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PushdownBinding>()?;
         m.add_class::<PushdownMeasure>()?;
         m.add_class::<PushdownOrder>()?;
+        m.add_class::<PushdownHaving>()?;
     }
     Ok(())
 }
@@ -2024,6 +2026,74 @@ impl PushdownMeasure {
 #[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
+/// One ``HAVING`` comparison: a column of the grouped result against a
+/// constant.
+///
+/// ``kind`` and ``index`` address that column exactly as ``PushdownOrder``
+/// does — so a term over an aggregate names the *same* measure the projection
+/// computes, and the renderer emits one expression for both rather than
+/// deriving the aggregate twice.
+///
+/// The terms are a conjunction: every one must hold.
+pub struct PushdownHaving {
+    inner: crate::sparql_pushdown::HavingTerm,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownHaving {
+    /// ``"binding"`` for a group key, ``"measure"`` for an aggregate.
+    #[getter]
+    fn kind(&self) -> &str {
+        use crate::sparql_pushdown::OrderKey;
+        match self.inner.key {
+            OrderKey::Binding(_) => "binding",
+            OrderKey::Measure(_) => "measure",
+        }
+    }
+
+    /// Index into ``bindings`` or ``measures``, per ``kind``.
+    #[getter]
+    fn index(&self) -> usize {
+        use crate::sparql_pushdown::OrderKey;
+        match self.inner.key {
+            OrderKey::Binding(i) | OrderKey::Measure(i) => i,
+        }
+    }
+
+    /// What the value must satisfy — the same vocabulary a pushed ``FILTER``
+    /// uses, so a ``HAVING`` and a ``WHERE`` are rendered by one notion of
+    /// what SQL can compare.
+    #[getter]
+    fn condition(&self) -> FilterCondition {
+        FilterCondition::from_rust(&self.inner.condition)
+    }
+
+    /// Whether the comparison is numeric rather than textual.
+    ///
+    /// A property of the *result*, not of any column: a count is an integer
+    /// whatever it counted, while ``MIN``/``MAX`` carry the term of the column
+    /// they read. Ignoring it compares a count as text, where ``'9' > '10'``.
+    #[getter]
+    fn numeric(&self) -> bool {
+        self.inner.numeric
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownHaving(kind={:?}, index={}, numeric={})",
+            self.kind(),
+            self.index(),
+            self.numeric()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
 /// One ``ORDER BY`` term.
 ///
 /// ``kind`` says whether it sorts on a projected value or on an aggregate
@@ -2114,6 +2184,19 @@ impl PushdownSolution {
             .measures
             .iter()
             .map(|m| PushdownMeasure { inner: m.clone() })
+            .collect()
+    }
+
+    /// Conditions on the grouped rows — SQL ``HAVING``. A conjunction: every
+    /// term must hold. Empty when the query has none.
+    #[getter]
+    fn having(&self) -> Vec<PushdownHaving> {
+        self.inner
+            .having
+            .iter()
+            .map(|term| PushdownHaving {
+                inner: term.clone(),
+            })
             .collect()
     }
 
@@ -2441,6 +2524,49 @@ impl PlanOp {
         }
     }
 
+    /// For ``"filter"``: which value at ``slot_path`` the condition holds of
+    /// — ``"column"``, ``"any_element"`` or ``"bound_element"``.
+    ///
+    /// A renderer that ignores this renders a containment test as an equality
+    /// on an array, which compares the array's text and matches nothing.
+    ///
+    /// * ``"column"`` — the column's own value: ``object_data->>'slot'``.
+    /// * ``"any_element"`` — the array *contains* a value satisfying the
+    ///   condition: ``EXISTS (SELECT 1 FROM
+    ///   jsonb_array_elements_text(object_data->'slot') …)``. Matches a record
+    ///   once however many values it holds.
+    /// * ``"bound_element"`` — the element an ``unnest`` below bound, so the
+    ///   condition selects rows rather than records.
+    #[getter]
+    fn reading(&self) -> Option<&'static str> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { reading, .. } => Some(reading.as_str()),
+            _ => None,
+        }
+    }
+
+    /// For ``"filter"``: whether the condition is on the *optional* side of a
+    /// left join, so it must not eliminate an unmatched row.
+    ///
+    /// The single most common way a left-join translation is wrong: in a plain
+    /// ``WHERE`` such a condition turns the left join into an inner one,
+    /// silently, with a plausible smaller answer and no error. It belongs in
+    /// the ``ON`` clause — or, as this renderer states the same thing, in a
+    /// ``WHERE`` wrapped ``(… OR alias.asset360_uri IS NULL)``.
+    ///
+    /// Derivable from ``is_optional`` on the star's scan, and stated here for
+    /// the reason ``numeric`` and ``reading`` are: a fact the renderer has to
+    /// fetch from somewhere else is a fact it can forget to fetch.
+    #[getter]
+    fn optional_side(&self) -> bool {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { optional_side, .. } => *optional_side,
+            _ => false,
+        }
+    }
+
     /// For ``"join"``: the slot on the right input whose value is the left
     /// row's ``asset360_uri``.
     #[getter]
@@ -2516,6 +2642,25 @@ impl PlanOp {
             Op::Group { measures, .. } => measures
                 .iter()
                 .map(|inner| PushdownMeasure {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"group"``: the conditions on the grouped rows — SQL ``HAVING``.
+    ///
+    /// On the grouping operator rather than as one of its own, because SQL has
+    /// no operator there: a ``HAVING`` is a clause of the grouping, and its
+    /// terms index that grouping's measures.
+    #[getter]
+    fn having(&self) -> Vec<PushdownHaving> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Group { having, .. } => having
+                .iter()
+                .map(|inner| PushdownHaving {
                     inner: inner.clone(),
                 })
                 .collect(),
@@ -2764,6 +2909,50 @@ impl ExecutionPlan {
             .collect()
     }
 
+    /// Where these operators came from: ``"not_attempted"``, ``"used"``,
+    /// ``"used_alone"`` or ``"fallback"``.
+    ///
+    /// ``"not_attempted"`` for a plan from :func:`plan_query`, which does not
+    /// refine. The rest only come from :func:`plan_query_refined`.
+    ///
+    /// ``"used"`` and ``"used_alone"`` are different risks and read
+    /// differently on purpose. ``"used"`` is a *substitution*: the single-pass
+    /// planner had a plan, and the refined statement was shown to read no more
+    /// rows and leave no more work to the engine. ``"used_alone"`` is a
+    /// *capability*: that planner refuses the query outright, so nothing was
+    /// compared — the plan was admitted because it answers the whole question
+    /// in SQL by construction, and ``refinement_note`` says what was refused.
+    #[getter]
+    fn refinement(&self) -> &'static str {
+        self.inner.refinement.as_str()
+    }
+
+    /// Why the refinement pipeline's plan was not used, or ``None``.
+    ///
+    /// Worth logging with the query: it names the shape the rules do not
+    /// cover yet, and it is the signal that says when a gap has actually
+    /// closed rather than letting us assume it.
+    #[getter]
+    fn refinement_reason(&self) -> Option<String> {
+        self.inner.refinement.reason().map(ToOwned::to_owned)
+    }
+
+    /// A claim difference the gate allowed, or ``None``.
+    ///
+    /// Set when the refined plan *was* used and its ledger still differs from
+    /// the single-pass planner's: the two statements read the same rows and do
+    /// the same work, while an obligation SQL applies stays claimed by the
+    /// engine. The gate compares the row source, not the ledger, because the
+    /// two coincide for every rule that pushes work and come apart only where
+    /// a narrowing scan declines to claim semantics it does not render.
+    ///
+    /// Worth logging too: this is the tier-two backlog, observed rather than
+    /// assumed.
+    #[getter]
+    fn refinement_note(&self) -> Option<String> {
+        self.inner.refinement.note().map(ToOwned::to_owned)
+    }
+
     /// Every obligation the query imposes, rendered for reading.
     #[getter]
     fn obligations(&self) -> Vec<String> {
@@ -2856,6 +3045,50 @@ fn py_plan_query(
         .map(|inner| ExecutionPlan { inner })
         // ScopeError's Display carries the wording the other entry points use,
         // so the same failure reads the same however it was reached.
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "plan_query_refined")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Plan a SPARQL query through the refinement pipeline, falling back to
+/// :func:`plan_query` unless the refined plan claims at least as much.
+///
+/// Same artifact, same shape, same guarantees — a caller reads ``passes`` and
+/// their operators exactly as before. The difference is where the operators
+/// came from, and ``refinement`` says: ``"used"`` or ``"fallback"``, with
+/// ``refinement_reason`` naming what stopped it.
+///
+/// The gate compares *claims*: the refined operators are used only when the
+/// obligations they discharge are a superset of what the single-pass planner's
+/// SQL pass discharges. That makes a regression impossible by construction —
+/// SQL claiming more cannot lose rows the answer needs, while SQL claiming
+/// less means work moved back to the engine.
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_view: The LinkML schema.
+///
+/// Returns:
+///     ExecutionPlan. Log ``refinement_reason`` when it is not ``None``: a
+///     fallback nobody can see is a fallback that becomes permanent.
+///
+/// Raises:
+///     ValueError: the query does not parse, is an update, or cannot be
+///         scoped at all — the same failures as :func:`plan_query`, because
+///         the fallback plan is that function's.
+fn py_plan_query_refined(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<ExecutionPlan> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    crate::sparql_plan::plan_query_refined(query, sv)
+        .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 

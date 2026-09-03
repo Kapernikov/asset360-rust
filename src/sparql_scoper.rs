@@ -827,6 +827,20 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
+    /// The same demand with the sides swapped: `3 < COUNT(*)` is
+    /// `COUNT(*) > 3`.
+    ///
+    /// A comparison the query wrote the other way round is the same question,
+    /// and refusing it would refuse a spelling.
+    pub fn flipped(self) -> Self {
+        match self {
+            Self::Gt => Self::Lt,
+            Self::Gte => Self::Lte,
+            Self::Lt => Self::Gt,
+            Self::Lte => Self::Gte,
+        }
+    }
+
     /// The SQL spelling, for a plan a human reads.
     pub fn as_sql(&self) -> &'static str {
         match self {
@@ -1966,7 +1980,29 @@ fn collect_filter_conditions(
 ) -> Option<Inexact> {
     match pattern {
         GraphPattern::Filter { expr, inner } => {
-            let here = if depth == 0 {
+            let here = if contains_group(inner) {
+                // A condition on the *grouped* rows -- a `HAVING`. Not a row
+                // filter, so failing to express it is not a loss of the kind
+                // `inexact` reports: it cannot be applied to the fetch at all,
+                // and the aggregate route renders it as a SQL `HAVING` or
+                // refuses the aggregate by name. Recording a loss here made
+                // every `HAVING` query an incomplete plan, which is what
+                // blocked the feature before it was written.
+                //
+                // Extraction is still attempted, and only succeeds for a
+                // condition on a group *key*: that value is per-row, so
+                // narrowing the fetch by it is sound -- and it is what the
+                // fetch route has always done with these queries, so the row
+                // set does not change. A `HAVING` over an aggregate has no
+                // column to extract and quietly extracts nothing.
+                //
+                // It is a narrowing and not the whole demand: on a multivalued
+                // key, keeping records with *some* element past the bound still
+                // leaves the record's other elements as groups, which only the
+                // `HAVING` removes.
+                extract_equality_from_expr(expr, var_to_field, star_filters);
+                None
+            } else if depth == 0 {
                 if extract_equality_from_expr(expr, var_to_field, star_filters) {
                     None
                 } else {
@@ -2018,6 +2054,32 @@ fn collect_filter_conditions(
             collect_filter_conditions(inner, depth, var_to_field, star_filters)
         }
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => None,
+    }
+}
+
+/// Whether this pattern groups, anywhere below.
+///
+/// What makes a `FILTER` a `HAVING`: its own subtree holds the grouping. A
+/// `FILTER` in the `WHERE` clause sits *inside* the group's inner pattern, so
+/// its subtree has none. Local and exact, which is why the walk needs no flag
+/// threaded through it.
+fn contains_group(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Group { .. } => true,
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Service { inner, .. } => contains_group(inner),
+        GraphPattern::Join { left, right }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => contains_group(left) || contains_group(right),
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
     }
 }
 
@@ -2237,6 +2299,23 @@ pub(crate) fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &s
     )
 }
 
+/// Whether the value at this path compares as a number rather than as text.
+///
+/// The fact a `SqlCondition` deliberately does not carry: it names a slot, and
+/// how that slot's values compare is the renderer's to resolve -- from the
+/// same `resolve_column` `Star::numeric_fields` comes from, so a lowered
+/// condition and a scoped one cannot disagree about a column.
+pub(crate) fn numeric_at_path(
+    schema_view: &SchemaView,
+    class_uri: &str,
+    slot_path: &[String],
+) -> bool {
+    matches!(
+        push_form_of_path(schema_view, class_uri, slot_path),
+        PushForm::Literal { numeric: true, .. }
+    )
+}
+
 /// The same question about a value further inside the record.
 ///
 /// `resolve_column` walks a path already -- that is how a `PathFilter` learns
@@ -2270,6 +2349,18 @@ fn push_form_of_slot(
         Some(descriptor) => push_form_of(&descriptor),
         None => PushForm::Tagged,
     }
+}
+
+/// The push form of a column a caller already has the descriptor for.
+///
+/// Same question as [`push_form`], asked where the schema walk has already
+/// happened -- an aggregate's argument carries its descriptor on the binding,
+/// so a `HAVING` over `MIN(?name)` can ask the column's term rule without
+/// resolving the path a second time.
+pub(crate) fn push_form_of_descriptor(
+    descriptor: &crate::sparql_terms::TermDescriptor,
+) -> PushForm {
+    push_form_of(descriptor)
 }
 
 fn push_form_of(descriptor: &crate::sparql_terms::TermDescriptor) -> PushForm {
