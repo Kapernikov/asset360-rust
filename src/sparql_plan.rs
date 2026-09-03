@@ -914,7 +914,14 @@ pub enum Refinement {
     /// The plan came from the single-pass planner; nothing was refined.
     NotAttempted,
     /// The refined plan's operators are this plan's operators.
-    Used,
+    ///
+    /// The note, when there is one, is a *ledger* difference the gate
+    /// deliberately did not veto: the two statements read the same rows and do
+    /// the same work, while the obligations SQL claims are not the same. That
+    /// is the tier-two backlog, made observable rather than argued about --
+    /// today it is an `OPTIONAL` read, where the refined plan declines to
+    /// claim optionality a narrowing scan does not render.
+    Used(Option<String>),
     /// The refined plan was built and not used, for this reason.
     Fallback(String),
 }
@@ -923,7 +930,7 @@ impl Refinement {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NotAttempted => "not_attempted",
-            Self::Used => "used",
+            Self::Used(_) => "used",
             Self::Fallback(_) => "fallback",
         }
     }
@@ -935,24 +942,44 @@ impl Refinement {
             _ => None,
         }
     }
+
+    /// What the refined plan claims differently, when it was used anyway.
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            Self::Used(note) => note.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Plan a query, preferring the refinement pipeline, and fall back to
-/// [`plan_query`] unless the refined plan claims at least as much.
+/// [`plan_query`] unless the refined plan's row source is no worse.
 ///
 /// The gate is the whole point: **a regression is impossible by construction
 /// rather than by argument.** Both planners run, and the refined operators are
-/// used only when the obligations its `Sql` nodes claim are a superset of what
-/// today's SQL pass claims. Anything less -- a rule that stopped firing, a
-/// shape tier one does not cover, an aggregate today pushes whole -- keeps
-/// today's plan, and the artifact says why so the caller can log it.
+/// used only when [`crate::sparql_ops::OpTree::is_no_worse_than`] can show the
+/// lowered statement fetches no more rows and leaves no more work to the
+/// engine. Anything it cannot show -- a rule that stopped firing, a shape tier
+/// one does not cover, an aggregate today pushes whole -- keeps today's plan,
+/// and the artifact says why so the caller can log it.
 ///
-/// Claims and not answers, because a claim is what the ledger can compare
-/// mechanically. It is a sound gate in one direction only, and that is the
-/// direction that matters: SQL claiming more cannot lose rows the answer needs
-/// (every rule is a narrowing below the first collapsing operator, and the
-/// engine re-runs the query), while SQL claiming *less* means work moved back
-/// to the engine, which is the regression this refuses to let happen quietly.
+/// **The comparand was wrong at first, and the correction is the interesting
+/// part.** The gate compared the *claim ledgers*: SQL had to claim a superset
+/// of what today's SQL pass claimed. For every tier-one rule that coincides
+/// with "does more work reach the engine" -- a rule that pushes work claims
+/// what it pushed -- so the difference did not show until an `OPTIONAL` read.
+/// There both statements deliver the same column, the SQL is identical, no
+/// work moved, and the ledgers differ only because a narrowing scan declines
+/// to claim optionality it does not render. Comparing claims rejected the
+/// *more truthful* plan for a difference that costs nothing, and the missing
+/// value bucket 28c calls D11 -- the report the whole feature exists for --
+/// was the case it rejected. So the row source decides and the ledger is
+/// reported: [`Refinement::note`] carries a claim difference the gate allowed,
+/// which is the tier-two backlog made observable.
+///
+/// Nothing is adjusted to buy a route. The substituted passes carry the
+/// refined plan's own claims, so an obligation SQL applies without claiming
+/// stays the engine's and the ledger still balances.
 ///
 /// The refined plan also has to be *lowerable*: its frontier must be one
 /// island, since a pass is one statement. See
@@ -968,17 +995,20 @@ pub fn plan_query_refined(
         .filter(|pass| matches!(pass.kind, PassKind::Sql(_)))
         .flat_map(|pass| pass.discharges.iter().copied())
         .collect();
+    let Some(today_ops) = plan.passes.iter().find_map(|pass| match &pass.kind {
+        PassKind::Sql(sql) => Some(sql.ops.clone()),
+        PassKind::Engine(_) => None,
+    }) else {
+        // Every plan the planner emits has an SQL pass, even one the engine
+        // finishes. Without one there is nothing to compare against, and a
+        // comparison against nothing is not a gate.
+        plan.refinement = Refinement::Fallback("the plan has no SQL pass".to_owned());
+        return Ok(plan);
+    };
 
     // What the fetch may skip, decided by the analysis that owns that
     // question. See `lower_refined`.
-    let fetch_bound = plan
-        .passes
-        .iter()
-        .find_map(|pass| match &pass.kind {
-            PassKind::Sql(sql) => Some(&sql.ops),
-            PassKind::Engine(_) => None,
-        })
-        .and_then(crate::sparql_ops::fetch_bound_of);
+    let fetch_bound = crate::sparql_ops::fetch_bound_of(&today_ops);
 
     let refined = match refined_ops(query_str, schema_view, fetch_bound) {
         Ok(refined) => refined,
@@ -987,9 +1017,17 @@ pub fn plan_query_refined(
             return Ok(plan);
         }
     };
-    let claimed: BTreeSet<ObligationId> = refined.claims().into_iter().collect();
+    // The gate.
+    if let Err(reason) = refined.is_no_worse_than(&today_ops) {
+        plan.refinement = Refinement::Fallback(reason);
+        return Ok(plan);
+    }
 
-    let missing: Vec<String> = today
+    // Reported, not vetoed: an obligation today's SQL pass claims and the
+    // refined plan does not, while both statements read the same rows and do
+    // the same work. See the note on [`Refinement::Used`].
+    let claimed: BTreeSet<ObligationId> = refined.claims().into_iter().collect();
+    let unclaimed: Vec<String> = today
         .difference(&claimed)
         .map(|id| {
             plan.obligations
@@ -998,13 +1036,12 @@ pub fn plan_query_refined(
                 .unwrap_or_else(|| format!("o{id}"))
         })
         .collect();
-    if !missing.is_empty() {
-        plan.refinement = Refinement::Fallback(format!(
-            "the refined plan does not claim {}",
-            missing.join("; ")
-        ));
-        return Ok(plan);
-    }
+    let note = (!unclaimed.is_empty()).then(|| {
+        format!(
+            "the row sources agree while SQL applies but does not claim {}",
+            unclaimed.join("; ")
+        )
+    });
 
     // The ledger has to balance against the *new* division of labour: what SQL
     // now claims, the engine no longer does. Recomputing it rather than
@@ -1039,7 +1076,7 @@ pub fn plan_query_refined(
     } else {
         engine_claims
     };
-    plan.refinement = Refinement::Used;
+    plan.refinement = Refinement::Used(note);
     Ok(plan)
 }
 
@@ -1285,9 +1322,8 @@ mod tests {
              VALUES ?nm { \"a\" \"b\" } }",
         ] {
             let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
-            assert_eq!(
-                plan.refinement,
-                Refinement::Used,
+            assert!(
+                matches!(plan.refinement, Refinement::Used(_)),
                 "{query}: {:?}",
                 plan.refinement.reason()
             );
@@ -1295,20 +1331,86 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{error} for {query}\n{plan}"));
             assert!(plan.is_accounted(), "{query}\n{plan}");
 
-            // What the gate promises: never less than today.
+            // What the gate promises, stated in the quantity it compares:
+            // the lowered statement reads no more rows and does no less work.
             let today = plan_query(&format!("{PREFIX}{query}"), &sv).expect("should plan");
-            let claimed = |plan: &ExecutionPlan| -> BTreeSet<ObligationId> {
+            let ops = |plan: &ExecutionPlan| -> crate::sparql_ops::OpTree {
                 plan.passes
                     .iter()
-                    .filter(|pass| matches!(pass.kind, PassKind::Sql(_)))
-                    .flat_map(|pass| pass.discharges.iter().copied())
-                    .collect()
+                    .find_map(|pass| match &pass.kind {
+                        PassKind::Sql(sql) => Some(sql.ops.clone()),
+                        PassKind::Engine(_) => None,
+                    })
+                    .expect("every plan has an SQL pass")
             };
-            assert!(
-                claimed(&today).is_subset(&claimed(&plan)),
-                "the gate let through a plan that claims less: {query}"
-            );
+            ops(&plan)
+                .is_no_worse_than(&ops(&today))
+                .unwrap_or_else(|reason| panic!("{query}: {reason}"));
         }
+    }
+
+    /// The case the gate was corrected for: an `OPTIONAL` read is refined,
+    /// and the claim difference is *reported* rather than vetoed.
+    ///
+    /// Both statements deliver the same column -- the scan carries it as a
+    /// delivered slot -- so no work moved and no row set widened. The ledgers
+    /// differ because the refined plan declines to let a narrowing scan claim
+    /// optionality it does not render, and comparing ledgers rejected the more
+    /// truthful plan for a difference that costs nothing. The missing-value
+    /// bucket is exactly this shape, so rejecting it cost the report the whole
+    /// feature exists for.
+    #[test]
+    fn an_optional_read_is_refined_and_its_ledger_difference_reported() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL {{ ?s asset360:name ?nm }} }}"
+        );
+        let plan = plan_query_refined(&query, &sv).expect("should plan");
+
+        let note = match &plan.refinement {
+            Refinement::Used(Some(note)) => note.clone(),
+            other => panic!("expected a refined plan with a note, got {other:?}"),
+        };
+        assert!(
+            note.contains("does not claim") && note.contains("asset360:name"),
+            "{note}"
+        );
+
+        // The ledger stays honest: the engine claims what SQL does not, every
+        // obligation exactly once, nothing unaccounted for. Nothing was
+        // adjusted to buy the route.
+        plan.ledger_balances().unwrap();
+        assert!(plan.is_accounted(), "{plan}");
+        let sql_claims: Vec<String> = plan
+            .passes
+            .iter()
+            .filter(|pass| matches!(pass.kind, PassKind::Sql(_)))
+            .flat_map(|pass| pass.discharges.iter())
+            .map(|id| plan.obligations[*id].to_string())
+            .collect();
+        assert!(
+            !sql_claims
+                .iter()
+                .any(|claim| claim.contains("asset360:name")),
+            "a fetch that requires nothing must not claim the triple: {sql_claims:?}"
+        );
+
+        // And the column is delivered, which is why the statement is the same
+        // one today's planner renders.
+        let today = plan_query(&query, &sv).expect("should plan");
+        let ops = |plan: &ExecutionPlan| -> crate::sparql_ops::OpTree {
+            plan.passes
+                .iter()
+                .find_map(|pass| match &pass.kind {
+                    PassKind::Sql(sql) => Some(sql.ops.clone()),
+                    PassKind::Engine(_) => None,
+                })
+                .expect("every plan has an SQL pass")
+        };
+        ops(&plan)
+            .is_no_worse_than(&ops(&today))
+            .unwrap_or_else(|reason| panic!("{reason}"));
     }
 
     /// And in the other direction: a shape tier one cannot serve keeps today's
@@ -1318,12 +1420,13 @@ mod tests {
         let sv = test_schema_view();
         for (query, expected) in [
             (
-                // An aggregate today pushes whole: the eligible pass claims
-                // the grouping, the aggregate, the ordering and the slice, and
-                // no tier-one rule moves a collapsing operator.
+                // An aggregate today pushes whole, and no tier-one rule moves
+                // a collapsing operator -- so the refined statement would hand
+                // the grouping back to the engine, which is the regression the
+                // gate exists to refuse.
                 "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
                  asset360:name ?nm } GROUP BY ?nm",
-                "does not claim",
+                "leaves 'group' to the engine",
             ),
             (
                 // An `OPTIONAL` over a second star: two islands, so the
@@ -1331,23 +1434,6 @@ mod tests {
                 "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
                  OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
                 "not lowerable",
-            ),
-            (
-                // An optional *read* of the star's own slot, and the one gap
-                // that is a disagreement about the ledger rather than about
-                // pushdown. Both statements deliver the same column -- the
-                // scan carries it as `SlotPresence::Delivered` -- and today's
-                // pass claims the triple while the refined plan leaves it to
-                // the engine's left join, on the ground that a fetch which
-                // requires nothing enforces nothing. The gate compares claims,
-                // so the more truthful plan is the one that falls back.
-                //
-                // Conservative and safe, and it costs every `OPTIONAL` read
-                // the refined route until either the claim's meaning is
-                // settled or a rule renders the optional semantics in SQL.
-                "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-                 OPTIONAL { ?s asset360:name ?nm } }",
-                "does not claim",
             ),
         ] {
             let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
@@ -1376,7 +1462,11 @@ mod tests {
         );
         let today = plan_query(&query, &sv).expect("should plan");
         let refined = plan_query_refined(&query, &sv).expect("should plan");
-        assert_eq!(refined.refinement, Refinement::Used);
+        assert!(
+            matches!(refined.refinement, Refinement::Used(_)),
+            "{:?}",
+            refined.refinement
+        );
         assert_eq!(refined.obligations, today.obligations, "same question");
 
         let sql_claims = |plan: &ExecutionPlan| -> Vec<String> {
@@ -1436,7 +1526,10 @@ mod tests {
         assert_eq!(bound_of(&today), Some(1), "{today}");
 
         let refined = plan_query_refined(&query, &sv).expect("should plan");
-        assert_eq!(refined.refinement, Refinement::Used, "{refined}");
+        assert!(
+            matches!(refined.refinement, Refinement::Used(_)),
+            "{refined}"
+        );
         assert_eq!(bound_of(&refined), Some(1), "{refined}");
 
         // And it still claims nothing, which is what makes reading it safe.

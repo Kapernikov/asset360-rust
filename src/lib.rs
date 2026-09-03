@@ -2807,6 +2807,22 @@ impl ExecutionPlan {
         self.inner.refinement.reason().map(ToOwned::to_owned)
     }
 
+    /// A claim difference the gate allowed, or ``None``.
+    ///
+    /// Set when the refined plan *was* used and its ledger still differs from
+    /// the single-pass planner's: the two statements read the same rows and do
+    /// the same work, while an obligation SQL applies stays claimed by the
+    /// engine. The gate compares the row source, not the ledger, because the
+    /// two coincide for every rule that pushes work and come apart only where
+    /// a narrowing scan declines to claim semantics it does not render.
+    ///
+    /// Worth logging too: this is the tier-two backlog, observed rather than
+    /// assumed.
+    #[getter]
+    fn refinement_note(&self) -> Option<String> {
+        self.inner.refinement.note().map(ToOwned::to_owned)
+    }
+
     /// Every obligation the query imposes, rendered for reading.
     #[getter]
     fn obligations(&self) -> Vec<String> {

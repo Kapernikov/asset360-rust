@@ -31,6 +31,7 @@
 //! only be inferred by comparing two structures. [`Enforcement`] states it, so
 //! a rule can ask a node directly whether removing it would change the answer.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::sparql_plan::ObligationId;
@@ -855,6 +856,145 @@ pub fn fetch_bound_of(tree: &OpTree) -> Option<usize> {
     })
 }
 
+/// A scan's facts, for a comparison that does not depend on node order.
+struct ScanFacts {
+    class_uri: String,
+    identifier_values: Vec<String>,
+    required_slots: Vec<String>,
+    is_optional: bool,
+}
+
+fn scans_by_star(tree: &OpTree) -> BTreeMap<String, ScanFacts> {
+    tree.nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Scan {
+                star_var,
+                class_uri,
+                identifier_values,
+                required_slots,
+                is_optional,
+                ..
+            } => {
+                let mut identifier_values = identifier_values.clone();
+                identifier_values.sort();
+                let mut required_slots = required_slots.clone();
+                required_slots.sort();
+                Some((
+                    star_var.clone(),
+                    ScanFacts {
+                        class_uri: class_uri.clone(),
+                        identifier_values,
+                        required_slots,
+                        is_optional: *is_optional,
+                    },
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every condition a tree applies, as text a comparison can sort.
+///
+/// The reading and the numeric-ness are part of the identity: the same path
+/// and the same value read two different ways select different rows, which is
+/// the whole reason both facts are on the node.
+fn conditions_of(tree: &OpTree) -> Vec<String> {
+    let mut out: Vec<String> = tree
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Filter {
+                star_var,
+                slot_path,
+                condition,
+                numeric,
+                reading,
+                ..
+            } => Some(format!(
+                "?{star_var}.{} {condition} numeric={numeric} reading={reading}",
+                slot_path.join(".")
+            )),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn joins_of(tree: &OpTree) -> Vec<String> {
+    let mut out: Vec<String> = tree
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Join {
+                left_star,
+                right_star,
+                right_slot,
+                kind,
+                ..
+            } => Some(format!("?{left_star} ?{right_star}.{right_slot} {kind:?}")),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn fanouts_of(tree: &OpTree) -> Vec<String> {
+    let mut out: Vec<String> = tree
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Unnest {
+                star_var,
+                slot_path,
+                ..
+            } => Some(format!("?{star_var}.{}", slot_path.join("."))),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The operators that collapse or reorder rows, which is the work a fallback
+/// would hand back to the engine.
+///
+/// A slice is here only when it claims an obligation: the query's own `LIMIT`
+/// is work, and the scoper's fetch bound is a narrowing compared separately.
+fn collapsing_of(tree: &OpTree) -> Vec<String> {
+    let mut out: Vec<String> = tree
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Group { .. } | Op::Sort { .. } | Op::Distinct { .. } | Op::Project { .. } => {
+                Some(node.op.kind().to_owned())
+            }
+            Op::Slice { .. } if !node.discharges.is_empty() => Some("slice".to_owned()),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The first element of `wanted` that `have` does not cover, counting
+/// duplicates.
+fn missing_from(wanted: &[String], have: &[String]) -> Option<String> {
+    let mut left: Vec<&String> = have.iter().collect();
+    for item in wanted {
+        match left.iter().position(|candidate| *candidate == item) {
+            Some(index) => {
+                left.remove(index);
+            }
+            None => return Some(item.clone()),
+        }
+    }
+    None
+}
+
 /// The scan node for a star, in a tree being built.
 fn scan_of_star(nodes: &mut [OpNode], star_var: &str) -> Option<OpId> {
     nodes.iter().position(
@@ -945,6 +1085,121 @@ impl OpTree {
                 .iter()
                 .all(|input| *input < index && *input < self.nodes.len())
         })
+    }
+
+    /// Whether this tree fetches a row set no larger than `today`'s and leaves
+    /// no more work to the engine.
+    ///
+    /// **The question the switchover gate actually cares about.** The gate was
+    /// first written to compare *claims*, and for every tier-one rule the two
+    /// coincide -- a rule that pushes work claims what it pushed -- so the
+    /// difference did not show. They come apart on an `OPTIONAL` read: both
+    /// statements deliver the same column, the SQL is identical, nothing moved
+    /// to the engine, and the ledgers differ only because a narrowing scan
+    /// declines to claim optionality it does not render. Comparing claims
+    /// there rejects the *more truthful* plan for a difference that costs
+    /// nothing, so the comparand is the row source and the ledger stays out of
+    /// the decision.
+    ///
+    /// Decidable and conservative: every clause below either shows a
+    /// difference cannot make things worse, or refuses. `Ok(())` means it is
+    /// safe to switch; `Err` carries the reason for the caller's log.
+    ///
+    /// What "no worse" is made of, and why each direction:
+    ///
+    /// * **the same scans** -- same stars, same classes, same optionality.
+    ///   Scanning a different set of records is not a comparison this can
+    ///   reason about, so it refuses rather than guessing which is narrower.
+    /// * **at least today's existence checks.** More `object_data ? 'slot'`
+    ///   means fewer rows. Fewer means more, so today's must all be there.
+    /// * **at least today's conditions**, matched exactly -- path, condition,
+    ///   reading and numeric-ness. An extra condition narrows further, which
+    ///   is safe under the over-fetch contract; a missing one fetches rows
+    ///   today's statement excluded.
+    /// * **the same joins.** An inner join both narrows and adds a class to
+    ///   read, so neither direction is safely "no worse".
+    /// * **no new fan-out.** An `unnest` multiplies rows, so having one today
+    ///   lacks is worse by definition.
+    /// * **at least today's collapsing work** -- group, sort, distinct,
+    ///   project, and any slice that claims an obligation. Missing one means
+    ///   the engine does it instead, which is exactly the regression this
+    ///   refuses.
+    /// * **a fetch bound no looser than today's.** Losing it fetches every row
+    ///   of the class; `LIMIT 1` returning three rows is how that showed up
+    ///   the last time.
+    ///
+    /// `optional_slots` are deliberately not compared: they emit nothing. A
+    /// slot listed there suppresses an existence check it would not otherwise
+    /// have, so a difference in that list alone cannot change a row.
+    pub fn is_no_worse_than(&self, today: &OpTree) -> Result<(), String> {
+        let mine = scans_by_star(self);
+        let theirs = scans_by_star(today);
+        let stars = |scans: &BTreeMap<String, ScanFacts>| -> Vec<String> {
+            scans.keys().cloned().collect()
+        };
+        if stars(&mine) != stars(&theirs) {
+            return Err(format!(
+                "the two plans scan different stars: {:?} against {:?}",
+                stars(&mine),
+                stars(&theirs)
+            ));
+        }
+        for (star, today_scan) in &theirs {
+            let scan = &mine[star];
+            if scan.class_uri != today_scan.class_uri {
+                return Err(format!(
+                    "?{star} is scanned as {} rather than {}",
+                    scan.class_uri, today_scan.class_uri
+                ));
+            }
+            if scan.is_optional != today_scan.is_optional {
+                return Err(format!("?{star} disagrees about being optional"));
+            }
+            if scan.identifier_values != today_scan.identifier_values {
+                return Err(format!(
+                    "?{star} disagrees about identifier values: {:?} against {:?}",
+                    scan.identifier_values, today_scan.identifier_values
+                ));
+            }
+            if let Some(missing) = today_scan
+                .required_slots
+                .iter()
+                .find(|slot| !scan.required_slots.contains(slot))
+            {
+                return Err(format!(
+                    "?{star} would not require '{missing}', so the fetch is wider"
+                ));
+            }
+        }
+
+        if let Some(missing) = missing_from(&conditions_of(today), &conditions_of(self)) {
+            return Err(format!("the refined plan does not apply {missing}"));
+        }
+        if joins_of(self) != joins_of(today) {
+            return Err(format!(
+                "the two plans join differently: {:?} against {:?}",
+                joins_of(self),
+                joins_of(today)
+            ));
+        }
+        if let Some(extra) = missing_from(&fanouts_of(self), &fanouts_of(today)) {
+            return Err(format!(
+                "the refined plan fans out {extra}, which today does not"
+            ));
+        }
+        if let Some(missing) = missing_from(&collapsing_of(today), &collapsing_of(self)) {
+            return Err(format!("the refined plan leaves '{missing}' to the engine"));
+        }
+        match (fetch_bound_of(self), fetch_bound_of(today)) {
+            (_, None) => {}
+            (Some(mine), Some(theirs)) if mine <= theirs => {}
+            (mine, Some(theirs)) => {
+                return Err(format!(
+                    "the fetch bound is {mine:?} rather than {theirs:?}, so the fetch is wider"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Nodes of one kind, for a rule that looks for its own shape.
@@ -1171,6 +1426,145 @@ mod tests {
         };
         assert_eq!(*reading, SlotReading::AnyElement);
         assert_eq!(*enforcement, Enforcement::Narrows);
+    }
+
+    /// The comparator, in both directions, on trees built by hand -- so what
+    /// counts as "worse" is stated rather than inferred from whichever
+    /// difference two planners happen to produce.
+    #[test]
+    fn the_gate_refuses_every_way_a_statement_can_be_worse() {
+        let scan = |required: &[&str], identifier: &[&str], optional: bool| OpNode {
+            op: Op::Scan {
+                star_var: "s".to_owned(),
+                class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
+                identifier_values: identifier.iter().map(|v| (*v).to_owned()).collect(),
+                required_slots: required.iter().map(|v| (*v).to_owned()).collect(),
+                optional_slots: Vec::new(),
+                is_optional: optional,
+            },
+            discharges: Vec::new(),
+        };
+        let filter = |reading: SlotReading| OpNode {
+            op: Op::Filter {
+                input: 0,
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                condition: FilterCondition::Eq("BX".to_owned()),
+                enforcement: Enforcement::Narrows,
+                numeric: false,
+                reading,
+            },
+            discharges: Vec::new(),
+        };
+        let slice = |limit: Option<usize>, claims: Vec<ObligationId>| OpNode {
+            op: Op::Slice {
+                input: 0,
+                limit,
+                offset: 0,
+            },
+            discharges: claims,
+        };
+        let tree = |nodes: Vec<OpNode>| OpTree { nodes };
+
+        let today = tree(vec![
+            scan(&["name"], &[], false),
+            filter(SlotReading::Column),
+        ]);
+        // The same statement is trivially no worse than itself.
+        today.is_no_worse_than(&today).unwrap();
+        // Narrowing further is fine: an extra condition costs rows the engine
+        // would have discarded, which is the over-fetch contract.
+        tree(vec![
+            scan(&["name", "kind"], &[], false),
+            filter(SlotReading::Column),
+            filter(SlotReading::Column),
+        ])
+        .is_no_worse_than(&today)
+        .unwrap();
+
+        for (worse, why) in [
+            (
+                tree(vec![scan(&["name"], &[], false)]),
+                "a condition today applies is missing",
+            ),
+            (
+                tree(vec![scan(&[], &[], false), filter(SlotReading::Column)]),
+                "an existence check today applies is missing",
+            ),
+            (
+                tree(vec![
+                    scan(&["name"], &["u"], false),
+                    filter(SlotReading::Column),
+                ]),
+                "the identifier values disagree",
+            ),
+            (
+                tree(vec![
+                    scan(&["name"], &[], true),
+                    filter(SlotReading::Column),
+                ]),
+                "the star's optionality disagrees",
+            ),
+            (
+                tree(vec![
+                    scan(&["name"], &[], false),
+                    filter(SlotReading::AnyElement),
+                ]),
+                "the same path read a different way selects different rows",
+            ),
+            (
+                tree(vec![
+                    scan(&["name"], &[], false),
+                    filter(SlotReading::Column),
+                    OpNode {
+                        op: Op::Unnest {
+                            input: 1,
+                            star_var: "s".to_owned(),
+                            slot_path: vec!["trafficKinds".to_owned()],
+                        },
+                        discharges: Vec::new(),
+                    },
+                ]),
+                "a fan-out today does not have multiplies rows",
+            ),
+        ] {
+            worse
+                .is_no_worse_than(&today)
+                .expect_err(&format!("should have refused: {why}"));
+        }
+
+        // Work handed back to the engine, and a fetch bound loosened: two
+        // shapes with their own clause, so they get their own baseline.
+        let grouping = tree(vec![
+            scan(&["name"], &[], false),
+            OpNode {
+                op: Op::Group {
+                    input: 0,
+                    bindings: Vec::new(),
+                    keys: Vec::new(),
+                    measures: Vec::new(),
+                },
+                discharges: vec![0],
+            },
+        ]);
+        tree(vec![scan(&["name"], &[], false)])
+            .is_no_worse_than(&grouping)
+            .expect_err("dropping the grouping hands it back to the engine");
+
+        let bounded = tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())]);
+        tree(vec![scan(&[], &[], false)])
+            .is_no_worse_than(&bounded)
+            .expect_err("losing the fetch bound reads every row of the class");
+        tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())])
+            .is_no_worse_than(&bounded)
+            .unwrap();
+        // A tighter bound is narrower, which is not worse.
+        tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())])
+            .is_no_worse_than(&tree(vec![
+                scan(&[], &[], false),
+                slice(Some(5), Vec::new()),
+            ]))
+            .unwrap();
     }
 
     /// A refined plan whose `Sql` nodes are two islands is a legal plan and
