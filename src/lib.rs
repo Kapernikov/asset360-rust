@@ -89,6 +89,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sparql_inexact_reasons, m)?)?;
         m.add_function(wrap_pyfunction!(py_sparql_pushdown, m)?)?;
         m.add_function(wrap_pyfunction!(py_plan_query, m)?)?;
+        m.add_function(wrap_pyfunction!(py_plan_query_refined, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
@@ -2786,6 +2787,26 @@ impl ExecutionPlan {
             .collect()
     }
 
+    /// Where these operators came from: ``"not_attempted"``, ``"used"`` or
+    /// ``"fallback"``.
+    ///
+    /// ``"not_attempted"`` for a plan from :func:`plan_query`, which does not
+    /// refine. The other two only come from :func:`plan_query_refined`.
+    #[getter]
+    fn refinement(&self) -> &'static str {
+        self.inner.refinement.as_str()
+    }
+
+    /// Why the refinement pipeline's plan was not used, or ``None``.
+    ///
+    /// Worth logging with the query: it names the shape the rules do not
+    /// cover yet, and it is the signal that says when a gap has actually
+    /// closed rather than letting us assume it.
+    #[getter]
+    fn refinement_reason(&self) -> Option<String> {
+        self.inner.refinement.reason().map(ToOwned::to_owned)
+    }
+
     /// Every obligation the query imposes, rendered for reading.
     #[getter]
     fn obligations(&self) -> Vec<String> {
@@ -2878,6 +2899,50 @@ fn py_plan_query(
         .map(|inner| ExecutionPlan { inner })
         // ScopeError's Display carries the wording the other entry points use,
         // so the same failure reads the same however it was reached.
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "plan_query_refined")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Plan a SPARQL query through the refinement pipeline, falling back to
+/// :func:`plan_query` unless the refined plan claims at least as much.
+///
+/// Same artifact, same shape, same guarantees — a caller reads ``passes`` and
+/// their operators exactly as before. The difference is where the operators
+/// came from, and ``refinement`` says: ``"used"`` or ``"fallback"``, with
+/// ``refinement_reason`` naming what stopped it.
+///
+/// The gate compares *claims*: the refined operators are used only when the
+/// obligations they discharge are a superset of what the single-pass planner's
+/// SQL pass discharges. That makes a regression impossible by construction —
+/// SQL claiming more cannot lose rows the answer needs, while SQL claiming
+/// less means work moved back to the engine.
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_view: The LinkML schema.
+///
+/// Returns:
+///     ExecutionPlan. Log ``refinement_reason`` when it is not ``None``: a
+///     fallback nobody can see is a fallback that becomes permanent.
+///
+/// Raises:
+///     ValueError: the query does not parse, is an update, or cannot be
+///         scoped at all — the same failures as :func:`plan_query`, because
+///         the fallback plan is that function's.
+fn py_plan_query_refined(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+) -> PyResult<ExecutionPlan> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    let sv = sv_ref.as_rust();
+
+    crate::sparql_plan::plan_query_refined(query, sv)
+        .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
