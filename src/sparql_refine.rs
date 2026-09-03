@@ -746,15 +746,21 @@ pub struct SortTerm {
     pub desc: bool,
 }
 
-/// One slot a [`PlanOp::Scan`] reads, and whether reading it fans out.
+/// One value a [`PlanOp::Scan`] reads, and whether reading it fans out.
 ///
 /// `multivalued` is the field the fold rule's precondition rests on. 28d
 /// writes the scan as `requires [hasName, hasTrafficKind]` and observes that
 /// no invariant can catch a fold that drops the unnest; with multiplicity on
 /// the slot, [`Plan::fanout_restored`] can.
+///
+/// A *path* and not a name, because a value inside an inlined structure is
+/// still a value the SQL side can read: `?s :location ?loc . ?loc :longitude
+/// ?lon` reads `["location", "longitude"]`, which is what the star
+/// decomposition calls a `PathFilter` and renders by walking into the JSON.
+/// One name is the common case and a one-element path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanSlot {
-    pub slot: String,
+    pub path: Vec<String>,
     /// The variable the folded `match` bound to this slot's value.
     pub var: String,
     /// Whether the slot holds an array, so one record answers the query once
@@ -1108,10 +1114,10 @@ pub fn scan_with_fanout(
     at: NodeId,
     discharges: Vec<ObligationId>,
 ) -> Vec<Node> {
-    let fanning: Vec<(String, String)> = slots
+    let fanning: Vec<(Vec<String>, String)> = slots
         .iter()
         .filter(|slot| slot.multivalued)
-        .map(|slot| (slot.slot.clone(), slot.var.clone()))
+        .map(|slot| (slot.path.clone(), slot.var.clone()))
         .collect();
     let mut out = vec![Node::sql(
         PlanOp::Scan {
@@ -1121,13 +1127,13 @@ pub fn scan_with_fanout(
         },
         discharges,
     )];
-    for (slot, var) in fanning {
+    for (path, var) in fanning {
         let input = at + out.len() - 1;
         out.push(Node::sql(
             PlanOp::Unnest {
                 input,
                 star_var: star_var.to_owned(),
-                slot_path: vec![slot],
+                slot_path: path,
                 var,
             },
             Vec::new(),
@@ -1381,7 +1387,7 @@ impl Plan {
                             var,
                             ..
                         } if unnest_star == star_var
-                            && slot_path.as_slice() == std::slice::from_ref(&slot.slot)
+                            && slot_path == &slot.path
                             // The variable too, and not only the path. A
                             // condition above the unnest addresses the element
                             // *through* the name it bound
@@ -1395,7 +1401,7 @@ impl Plan {
                 if !restored {
                     return Err(PlanDefect::LostFanout {
                         scan: scan_id,
-                        slot: slot.slot.clone(),
+                        slot: slot.path.join("."),
                     });
                 }
             }
@@ -1424,9 +1430,7 @@ impl Plan {
                         ..
                     } if scan_star == star_var
                         && slots.iter().any(|slot| {
-                            slot.multivalued
-                                && slot_path.as_slice() == std::slice::from_ref(&slot.slot)
-                                && &slot.var == var
+                            slot.multivalued && slot_path == &slot.path && &slot.var == var
                         })
                 ) && self.feeds(scan_id, id)
             });
@@ -1474,7 +1478,14 @@ impl Plan {
                 scanned_on(side, &edge.holder).is_some_and(|slots| {
                     slots
                         .iter()
-                        .any(|slot| slot.slot == edge.slot && slot.var == edge.referenced)
+                        // A one-element path: a foreign key is a column of
+                        // the record, and `JoinEdge::right_slot` is one name.
+                        // A reference *inside* an inlined structure is not an
+                        // edge this vocabulary can express.
+                        .any(|slot| {
+                            slot.path.as_slice() == [edge.slot.clone()]
+                                && slot.var == edge.referenced
+                        })
                 })
             };
             let agrees = on.as_slice() == [edge.referenced.clone()]
@@ -1662,7 +1673,7 @@ impl PlanOp {
                     .iter()
                     .map(|slot| format!(
                         "{}→?{}{}",
-                        slot.slot,
+                        slot.path.join("."),
                         slot.var,
                         if slot.multivalued { "[]" } else { "" }
                     ))
@@ -2638,7 +2649,7 @@ mod tests {
                 star_var: "s".to_owned(),
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
                 slots: vec![ScanSlot {
-                    slot: "trafficKinds".to_owned(),
+                    path: vec!["trafficKinds".to_owned()],
                     var: "kind".to_owned(),
                     multivalued: true,
                 }],
@@ -2664,12 +2675,12 @@ mod tests {
     fn a_scan_comes_with_its_fanout() {
         let slots = vec![
             ScanSlot {
-                slot: "hasName".to_owned(),
+                path: vec!["hasName".to_owned()],
                 var: "nm".to_owned(),
                 multivalued: false,
             },
             ScanSlot {
-                slot: "trafficKinds".to_owned(),
+                path: vec!["trafficKinds".to_owned()],
                 var: "kind".to_owned(),
                 multivalued: true,
             },

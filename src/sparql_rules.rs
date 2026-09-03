@@ -236,7 +236,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
             found.push((
                 id,
                 ScanSlot {
-                    slot: slot.name.clone(),
+                    path: vec![slot.name.clone()],
                     var: var.to_owned(),
                     multivalued: on_class.determine_slot_container_mode()
                         != SlotContainerMode::SingleValue,
@@ -246,19 +246,19 @@ impl<'s> FoldMatchesIntoScan<'s> {
 
         // A multivalued slot read twice is a cross product, and one unnest is
         // not one. Both matches stay with the engine.
-        let repeated: Vec<String> = found
+        let repeated: Vec<Vec<String>> = found
             .iter()
             .filter(|(_, slot)| slot.multivalued)
             .filter(|(_, slot)| {
                 found
                     .iter()
-                    .filter(|(_, other)| other.slot == slot.slot)
+                    .filter(|(_, other)| other.path == slot.path)
                     .count()
                     > 1
             })
-            .map(|(_, slot)| slot.slot.clone())
+            .map(|(_, slot)| slot.path.clone())
             .collect();
-        found.retain(|(_, slot)| !repeated.contains(&slot.slot));
+        found.retain(|(_, slot)| !repeated.contains(&slot.path));
         found
     }
 }
@@ -475,7 +475,7 @@ fn joined_in(nodes: &[Node], lower: NodeId, upper: NodeId) -> bool {
 /// which value at that address the variable stands for.
 struct SlotBinding {
     star_var: String,
-    slot: String,
+    path: Vec<String>,
     /// [`SlotReading::Column`] for a single-valued slot, and
     /// [`SlotReading::BoundElement`] for a multivalued one whose
     /// [`PlanOp::Unnest`] is below the node being asked -- the variable then
@@ -534,7 +534,7 @@ impl Visible {
                 // rather than to the array, which would select records where
                 // the query selects rows.
                 let reading = if slot.multivalued {
-                    if unnest_below(plan, base, star_var, &slot.slot, &slot.var) {
+                    if unnest_below(plan, base, star_var, &slot.path, &slot.var) {
                         SlotReading::BoundElement
                     } else {
                         slots.insert(slot.var.clone(), None);
@@ -545,7 +545,7 @@ impl Visible {
                 };
                 let binding = SlotBinding {
                     star_var: star_var.clone(),
-                    slot: slot.slot.clone(),
+                    path: slot.path.clone(),
                     reading,
                 };
                 match slots.entry(slot.var.clone()) {
@@ -575,14 +575,12 @@ impl Visible {
 
 /// Whether the unnest that bound `var` to an element of `star.slot` is at or
 /// below `node`.
-fn unnest_below(plan: &Plan, node: NodeId, star: &str, slot: &str, var: &str) -> bool {
+fn unnest_below(plan: &Plan, node: NodeId, star: &str, path: &[String], var: &str) -> bool {
     plan.nodes.iter().enumerate().any(|(id, above)| {
         matches!(
             &above.op,
             PlanOp::Unnest { star_var, slot_path, var: bound, .. }
-                if star_var == star
-                    && slot_path.as_slice() == std::slice::from_ref(&slot.to_owned())
-                    && bound == var
+                if star_var == star && slot_path.as_slice() == path && bound == var
         ) && plan.feeds(id, node)
     })
 }
@@ -1060,7 +1058,7 @@ fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
             let binding = visible.slot_of(name)?;
             Expr::Slot {
                 star_var: binding.star_var.clone(),
-                slot_path: vec![binding.slot.clone()],
+                slot_path: binding.path.clone(),
                 reading: binding.reading,
             }
         }
@@ -1160,9 +1158,14 @@ impl<'s> PushReferenceJoin<'s> {
                     .find(|slot| {
                         slot.var == joined
                             && !slot.multivalued
-                            && self.stores_a_reference(class_uri, &slot.slot)
+                            // A foreign key is a column of the record. A
+                            // reference inside an inlined structure is not
+                            // something `JoinEdge`'s one slot name can
+                            // address, so it is not this rule's edge.
+                            && slot.path.len() == 1
+                            && self.stores_a_reference(class_uri, &slot.path[0])
                     })
-                    .map(|slot| (star_var.clone(), slot.slot.clone())),
+                    .map(|slot| (star_var.clone(), slot.path[0].clone())),
                 _ => None,
             })
     }
@@ -1299,7 +1302,7 @@ mod tests {
                 _ => None,
             })
             .flatten()
-            .map(|slot| (slot.slot, slot.var, slot.multivalued))
+            .map(|slot| (slot.path.join("."), slot.var, slot.multivalued))
             .collect()
     }
 
