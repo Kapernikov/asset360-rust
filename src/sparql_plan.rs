@@ -1320,6 +1320,10 @@ mod tests {
              ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
             "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
              VALUES ?nm { \"a\" \"b\" } }",
+            // The first collapsing shape, and the first plan whose answer is
+            // SQL's rather than a narrowing of what the engine will decide.
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm",
         ] {
             let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
             assert!(
@@ -1347,6 +1351,63 @@ mod tests {
                 .is_no_worse_than(&ops(&today))
                 .unwrap_or_else(|reason| panic!("{query}: {reason}"));
         }
+    }
+
+    /// A pushed grouping answers alone: SQL claims every obligation, there is
+    /// no engine pass, and the plan says so.
+    ///
+    /// That last part is what the endpoint reads to take the aggregate route
+    /// at all — a plan with an engine pass is a fetch, however much SQL
+    /// claims. The first refined plan for which it is true.
+    #[test]
+    fn a_pushed_grouping_answers_without_the_engine() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?nm }} GROUP BY ?nm"
+        );
+        let plan = plan_query_refined(&query, &sv).expect("should plan");
+
+        assert!(
+            matches!(plan.refinement, Refinement::Used(None)),
+            "refined, and with no ledger difference to report: {:?}",
+            plan.refinement
+        );
+        assert!(plan.sql_only(), "no engine pass:\n{plan}");
+        assert!(plan.is_accounted(), "{plan}");
+        plan.ledger_balances().unwrap();
+
+        // Every obligation, claimed in SQL -- including the grouping and the
+        // aggregate, which no rule could claim before this one.
+        let sql_claims: Vec<String> = plan
+            .passes
+            .iter()
+            .filter(|pass| matches!(pass.kind, PassKind::Sql(_)))
+            .flat_map(|pass| pass.discharges.iter())
+            .map(|id| plan.obligations[*id].to_string())
+            .collect();
+        assert_eq!(sql_claims.len(), plan.obligations.len(), "{plan}");
+        assert!(
+            sql_claims.iter().any(|claim| claim.contains("group")),
+            "{sql_claims:?}"
+        );
+        assert!(
+            sql_claims.iter().any(|claim| claim.contains("aggregate")),
+            "{sql_claims:?}"
+        );
+
+        // And the operators are a grouping, which is what the endpoint reads
+        // to decide the route.
+        let ops = plan
+            .passes
+            .iter()
+            .find_map(|pass| match &pass.kind {
+                PassKind::Sql(sql) => Some(sql.ops.clone()),
+                PassKind::Engine(_) => None,
+            })
+            .expect("every plan has an SQL pass");
+        assert_eq!(ops.find("group").len(), 1, "{plan}");
+        println!("{plan}");
     }
 
     /// The case the gate was corrected for: an `OPTIONAL` read is refined,
@@ -1420,12 +1481,13 @@ mod tests {
         let sv = test_schema_view();
         for (query, expected) in [
             (
-                // An aggregate today pushes whole, and no tier-one rule moves
-                // a collapsing operator -- so the refined statement would hand
-                // the grouping back to the engine, which is the regression the
-                // gate exists to refuse.
+                // An aggregate with more collapsing work above it: the
+                // grouping rule declines the whole shape rather than pushing
+                // the grouping and leaving the ordering to an engine that
+                // cannot do it, so the refined statement would hand the
+                // grouping back -- the regression the gate exists to refuse.
                 "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm } GROUP BY ?nm",
+                 asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n)",
                 "leaves 'group",
             ),
             (

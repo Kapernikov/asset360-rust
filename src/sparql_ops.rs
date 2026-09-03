@@ -863,6 +863,67 @@ pub fn lower_refined(
                     discharges: node.discharges.clone(),
                 });
             }
+            RefinedOp::Group { keys, measures, .. } => {
+                let input = remap[&node.op.inputs()[0]];
+                // One binding per group key, resolved against the schema by
+                // the same function the single-pass planner uses -- the
+                // renderer needs the term descriptor and the containers, and
+                // deriving them here a second way is how two planners come to
+                // disagree about a column.
+                let mut bindings = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let Some((star_var, class_uri, path)) = scanned_column(plan, key) else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    let Some(spec) = crate::sparql_pushdown::binding_spec(
+                        schema, &star_var, &class_uri, key, path,
+                    ) else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    bindings.push(spec);
+                }
+                let mut lowered = Vec::with_capacity(measures.len());
+                for measure in measures {
+                    // `COUNT(*)` only, which is what the rule pushes. Anything
+                    // else reaching here is a rule ahead of this lowering, and
+                    // a refusal is how it finds out.
+                    if !matches!(
+                        measure.aggregate,
+                        spargebra::algebra::AggregateExpression::CountSolutions { distinct: false }
+                    ) {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    }
+                    lowered.push(MeasureSpec {
+                        var: measure.var.clone(),
+                        func: crate::sparql_pushdown::Measure::Count {
+                            arg: None,
+                            distinct: false,
+                        },
+                    });
+                }
+                nodes.push(OpNode {
+                    op: Op::Group {
+                        input,
+                        keys: (0..bindings.len()).collect(),
+                        bindings,
+                        measures: lowered,
+                        // No rule pushes a condition on grouped rows into a
+                        // refined plan; the single-pass planner renders those.
+                        having: Vec::new(),
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Project { vars, .. } => {
+                let input = remap[&node.op.inputs()[0]];
+                nodes.push(OpNode {
+                    op: Op::Project {
+                        input,
+                        vars: vars.clone(),
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
             other => {
                 return Err(LoweringRefusal::UnknownOperator { kind: other.kind() });
             }
@@ -1078,6 +1139,40 @@ fn missing_from(wanted: &[String], have: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// The star, class and path an `Sql` scan binds a variable to, when one binds
+/// it as a column of its own record.
+///
+/// Deliberately narrow: a variable bound to an element of an array, or read
+/// without being required, is not a column a grouping can key on, and the
+/// rules decline those before the lowering sees them.
+fn scanned_column(
+    plan: &crate::sparql_refine::Plan,
+    var: &str,
+) -> Option<(String, String, Vec<String>)> {
+    use crate::sparql_refine::{Executor, PlanOp as RefinedOp, SlotPresence};
+    plan.nodes.iter().find_map(|node| {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            slots,
+        } = &node.op
+        else {
+            return None;
+        };
+        if node.executor != Executor::Sql {
+            return None;
+        }
+        slots
+            .iter()
+            .find(|slot| {
+                slot.var.as_deref() == Some(var)
+                    && !slot.multivalued
+                    && slot.presence == SlotPresence::Required
+            })
+            .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
+    })
 }
 
 /// The scan node for a star, in a tree being built.
@@ -1385,6 +1480,12 @@ mod tests {
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u\" }",
             "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
              VALUES ?nm { \"a\" \"b\" } }",
+            // The first collapsing shape: a scalar key and a count. Its
+            // lowered statement has to be today's, node for node, because
+            // today's planner already pushes this grouping -- which is exactly
+            // why it is the shape to start with.
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm",
         ] {
             let refined = lowered(query, &sv)
                 .unwrap_or_else(|refusal| panic!("{query} did not lower: {refusal}"));

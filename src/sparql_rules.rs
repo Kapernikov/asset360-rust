@@ -51,6 +51,7 @@ use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
+use spargebra::algebra::AggregateExpression;
 use spargebra::term::{GroundTerm, Term, TermPattern, TriplePattern};
 
 use crate::sparql_plan::ObligationId;
@@ -1895,13 +1896,236 @@ impl Rule for PushReferenceJoin<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Push a scalar-key count grouping
+// ---------------------------------------------------------------------------
+
+/// A `GROUP BY` one scalar key with `COUNT(*)`, and the projection above it,
+/// become `Sql`.
+///
+/// The first rule that moves a *collapsing* operator, and the last one this
+/// stage writes. After a grouping the rows are aggregates rather than triples,
+/// and oxigraph evaluates queries over RDF graphs -- so the engine leg, which
+/// re-runs the whole original query over materialised instances, cannot finish
+/// a query whose grouping already happened. That is why every rule before this
+/// one was free: a narrowing cannot change an answer while the engine remains
+/// authoritative. This one takes the answer.
+///
+/// **So it collapses fully or not at all.** A rule that grouped in SQL and
+/// left algebra above would be the first thing in this design able to change
+/// an answer, and there is no residual evaluator to catch it -- see 28d. The
+/// projection is therefore part of the same rewrite rather than a second rule:
+/// a grouping whose `Project` stayed with the engine is a partial collapse
+/// wearing a complete one's clothes.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **Everything below is already `Sql`.** A grouping over an engine node
+///   would group rows a filter has not seen. The frontier-is-a-cut invariant
+///   says the same thing after the fact; the rule declines before it, so a
+///   plan the driver would refuse is never built.
+/// * **One group key, single-valued, bound by a scan below.** A multivalued
+///   key is the next shape, not this one: its groups are elements, and the
+///   fetch narrowing and the group test come apart (as they do for a
+///   `HAVING`). One key, so the rule cannot quietly serve a shape whose
+///   ordering of keys the renderer decides.
+/// * **Exactly `COUNT(*)`.** `COUNT(?v)` must not count solutions where `?v`
+///   is unbound, and `COUNT(DISTINCT ?v)` counts values rather than
+///   solutions; both are real shapes with their own reasoning, and neither is
+///   this one.
+/// * **Nothing above but the alias and the projection.** An `ORDER BY`, a
+///   `LIMIT` or a `DISTINCT` above the grouping is more collapsing work, and
+///   leaving it to the engine is the partial collapse this rule refuses to
+///   make possible.
+/// * **The fan-out is below.** Guaranteed by the fifth invariant rather than
+///   by this rule -- and it is this rule that makes that invariant
+///   falsifiable, since nothing collapsed rows before.
+pub struct PushScalarCountGrouping<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> PushScalarCountGrouping<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for PushScalarCountGrouping<'_> {
+    fn name(&self) -> &'static str {
+        "push_scalar_count_grouping"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Group {
+                input,
+                keys,
+                measures,
+            } = &plan.nodes[id].op
+            else {
+                continue;
+            };
+            let (input, keys, measures) = (*input, keys.clone(), measures.clone());
+
+            if plan.nodes[input].executor != Executor::Sql {
+                continue;
+            }
+            let [key] = keys.as_slice() else {
+                continue;
+            };
+            let [measure] = measures.as_slice() else {
+                continue;
+            };
+            if !matches!(
+                measure.aggregate,
+                AggregateExpression::CountSolutions { distinct: false }
+            ) {
+                continue;
+            }
+
+            // The key has to be a column an `Sql` scan below binds, and a
+            // scalar one: `Visible` answers both, and returns nothing for a
+            // variable bound to an element of an array.
+            let visible = Visible::below(plan, input);
+            let Some(binding) = visible.slot_of(key) else {
+                continue;
+            };
+            if binding.reading != SlotReading::Column {
+                continue;
+            }
+            // Resolvable as a column, or the lowering could not render it.
+            let Some(class_uri) = visible.class_of_star.get(&binding.star_var) else {
+                continue;
+            };
+            if crate::sparql_scoper::push_form_of_path(self.schema, class_uri, &binding.path)
+                == crate::sparql_scoper::PushForm::Tagged
+            {
+                continue;
+            }
+
+            // What sits above: an optional alias for the measure, then the
+            // query's own projection, and nothing else.
+            let Some(shape) = grouping_tail(plan, id, &measure.var) else {
+                continue;
+            };
+            push_grouping(plan, id, shape);
+            return true;
+        }
+        false
+    }
+}
+
+/// The nodes above a grouping that this rule takes with it.
+struct GroupingTail {
+    /// The `Bind` that names the aggregate, when the query wrote `AS ?n`.
+    alias: Option<(NodeId, String)>,
+    project: NodeId,
+}
+
+/// The shape above a grouping, when it is one this rule can push whole.
+///
+/// `None` for anything else, and "anything else" is the point: an `ORDER BY`,
+/// a `LIMIT`, a `DISTINCT` or a second projection is collapsing or reordering
+/// work, and pushing the grouping under it would leave that work to an engine
+/// that cannot do it.
+fn grouping_tail(plan: &Plan, group: NodeId, measure_var: &str) -> Option<GroupingTail> {
+    let mut current = single_consumer(plan, group)?;
+    let mut alias = None;
+    if let PlanOp::Bind { var, expr, .. } = &plan.nodes[current].op {
+        // Only the rename spargebra emits for `(COUNT(*) AS ?n)`. A `BIND` of
+        // anything else computes a value, which SQL would have to evaluate.
+        if *expr != Expr::Var(measure_var.to_owned()) {
+            return None;
+        }
+        alias = Some((current, var.clone()));
+        current = single_consumer(plan, current)?;
+    }
+    if !matches!(plan.nodes[current].op, PlanOp::Project { .. }) {
+        return None;
+    }
+    // The projection is the top: a node above it is a shaping node
+    // (`CONSTRUCT`, `ASK`) or a modifier this rule does not push, and either
+    // way the grouping would be feeding something the engine still does.
+    if current != plan.nodes.len() - 1 {
+        return None;
+    }
+    Some(GroupingTail {
+        alias,
+        project: current,
+    })
+}
+
+/// The one node that reads this one, when exactly one does.
+fn single_consumer(plan: &Plan, node: NodeId) -> Option<NodeId> {
+    match consumers(plan, node).as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
+/// Flip the grouping and its projection to `Sql`, folding the alias into the
+/// measure it names.
+///
+/// The alias node disappears: SQL names a result column, so a rename above the
+/// grouping is a fact about the grouping rather than a step after it -- and
+/// the lowering has no operator for a `Bind`. Its claims move to the grouping,
+/// though a naive `Bind` has none.
+fn push_grouping(plan: &mut Plan, group: NodeId, shape: GroupingTail) {
+    if let Some((_, alias)) = &shape.alias
+        && let PlanOp::Group { measures, .. } = &mut plan.nodes[group].op
+        && let [measure] = measures.as_mut_slice()
+    {
+        // Renamed here so the lowered measure carries the name the query gave
+        // it. Without this the result column is spargebra's internal hash,
+        // which is not an answer anyone asked for.
+        measure.var = alias.clone();
+    }
+    plan.nodes[group].executor = Executor::Sql;
+    plan.nodes[shape.project].executor = Executor::Sql;
+
+    let Some((alias_node, _)) = shape.alias else {
+        return;
+    };
+    let mut claims = plan.nodes[alias_node].discharges.clone();
+    claims.sort_unstable();
+    plan.nodes[group].discharges.extend(claims);
+    plan.nodes[group].discharges.sort_unstable();
+
+    let input = plan.nodes[alias_node].op.inputs()[0];
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() - 1);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == alias_node {
+            remap[old] = remap[input];
+            continue;
+        }
+        nodes.push(node.clone());
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+// ---------------------------------------------------------------------------
 // The tier-one rule set
 // ---------------------------------------------------------------------------
 
-/// Every tier-one rule, in the order 28d lists them: scope a type, fold a
-/// nested read into a path, deliver an optional read, turn a constant object
-/// into a filter, turn a `VALUES` over a bound variable into one, push a
-/// comparison, push a reference join.
+/// Every rule, in the order 28d lists them: scope a type, fold a nested read
+/// into a path, deliver an optional read, turn a constant object into a
+/// filter, turn a `VALUES` over a bound variable into one, push a comparison,
+/// push a reference join, and -- the one that is not tier one --
+/// [`PushScalarCountGrouping`].
+///
+/// The name is now half a lie and kept anyway: seven of the eight are
+/// non-collapsing, and the eighth is the first rule that takes the answer
+/// rather than narrowing what the engine will decide. Renaming it would say
+/// less than this paragraph does.
 ///
 /// Tier one is the set that needs nothing new from the executor. The engine
 /// leg re-runs the whole query, so a node below the first row-collapsing
@@ -1926,6 +2150,7 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
         Box::new(ValuesBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
         Box::new(PushReferenceJoin::new(schema)),
+        Box::new(PushScalarCountGrouping::new(schema)),
     ]
 }
 
@@ -3722,6 +3947,8 @@ mod tests {
         "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
          asset360:name ?nm ; asset360:trafficKinds ?kind . FILTER(?nm > \"A\") } \
          GROUP BY ?kind ORDER BY DESC(?n) LIMIT 10",
+        "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+         asset360:name ?nm } GROUP BY ?nm",
         "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
          ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
         "SELECT ?v WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
@@ -3993,6 +4220,280 @@ mod tests {
             "triple    ?s asset360:trafficKinds ?k",
         ),
     ];
+
+    /// The first collapsing rule: the grouping and the projection above it are
+    /// SQL's, the alias the query wrote is on the measure, and the plan is
+    /// answered without the engine.
+    #[test]
+    fn a_scalar_key_count_grouping_is_pushed_whole() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm",
+            &schema,
+            false,
+        );
+
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "a grouping pushes whole or not at all:\n{plan}"
+        );
+        assert!(
+            plan.find("bind").is_empty(),
+            "the alias is a fact about the grouping, not a step after it:\n{plan}"
+        );
+        let group = plan.find("group")[0];
+        assert_eq!(
+            plan.nodes[group].op.describe(),
+            "keys=[?nm] measures=[?n ← COUNT(*)]",
+            "the measure carries the name the query gave it, not spargebra's hash:\n{plan}"
+        );
+        // The grouping keeps its own claims: it is what takes care of them
+        // now, and the ledger still balances.
+        assert_eq!(
+            plan.nodes[group]
+                .discharges
+                .iter()
+                .map(|id| plan.obligations[*id].to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "group     GROUP BY ?nm".to_owned(),
+                "aggregate COUNT(*) AS ?n".to_owned()
+            ],
+            "{plan}"
+        );
+        plan.check()
+            .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+        println!("{plan}");
+    }
+
+    /// Every shape this rule declines, and the wrong answer each would be.
+    ///
+    /// The list is long on purpose: a collapsing rule takes the answer rather
+    /// than narrowing what the engine will decide, so the preconditions are
+    /// the whole of its correctness.
+    #[test]
+    fn what_the_grouping_rule_declines_and_why() {
+        let schema = test_schema_view();
+        let grouped = |query: &str| -> bool {
+            let plan = refined(query, &schema, false);
+            plan.find("group")
+                .iter()
+                .any(|id| plan.nodes[*id].executor == Executor::Sql)
+        };
+
+        // An engine node below: the grouping would group rows the regex has
+        // not filtered yet. The frontier invariant would refuse the plan; the
+        // rule declines before building it.
+        assert!(
+            !grouped(
+                "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm . FILTER(REGEX(?nm, \"^A\")) } GROUP BY ?nm"
+            ),
+            "a grouping over an engine filter"
+        );
+
+        // A multivalued key groups *elements*, where the fetch narrowing and
+        // the group test come apart. The next shape, not this one.
+        assert!(
+            !grouped(
+                "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:trafficKinds ?k } GROUP BY ?k"
+            ),
+            "a multivalued key"
+        );
+
+        // `COUNT(?v)` must not count solutions where `?v` is unbound, and
+        // `COUNT(DISTINCT ?v)` counts values rather than solutions. Both are
+        // real shapes with their own reasoning.
+        assert!(
+            !grouped(
+                "SELECT ?nm (COUNT(?len) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm"
+            ),
+            "COUNT of a variable"
+        );
+        assert!(
+            !grouped(
+                "SELECT ?nm (COUNT(DISTINCT ?len) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm"
+            ),
+            "COUNT DISTINCT"
+        );
+
+        // More collapsing work above. Pushing the grouping under it would
+        // leave that work to an engine that cannot do it -- the partial
+        // collapse this design refuses to make possible.
+        for (query, why) in [
+            (
+                "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n)",
+                "an ordering above",
+            ),
+            (
+                "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm } GROUP BY ?nm LIMIT 3",
+                "a slice above",
+            ),
+            (
+                "SELECT DISTINCT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm } GROUP BY ?nm",
+                "a DISTINCT above",
+            ),
+        ] {
+            assert!(!grouped(query), "{why}");
+        }
+
+        // Two keys, and a bare aggregate with none: one key is what the
+        // renderer's column convention is written for here.
+        assert!(
+            !grouped(
+                "SELECT ?nm ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:kind ?k } GROUP BY ?nm ?k"
+            ),
+            "two keys"
+        );
+        assert!(
+            !grouped("SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal }"),
+            "a bare aggregate groups nothing"
+        );
+
+        // A measure over a value the plan cannot read as a column.
+        assert!(
+            !grouped(
+                "SELECT ?loc (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:location ?loc } GROUP BY ?loc"
+            ),
+            "an inlined structure is a blank node, not a column"
+        );
+    }
+
+    /// **Invariant, not argument.** A grouping over an engine node is refused
+    /// by the frontier check, so a rule that pushed one anyway could not hand
+    /// the plan back.
+    ///
+    /// The rule declines this shape, which is why the test drives a bad rule:
+    /// the guarantee has to hold for the rule nobody has written yet.
+    #[test]
+    fn a_grouping_over_an_engine_node_is_refused_by_the_frontier() {
+        struct PushesTheGroupingAnyway;
+        impl Rule for PushesTheGroupingAnyway {
+            fn name(&self) -> &'static str {
+                "pushes_the_grouping_anyway"
+            }
+            fn apply(&self, plan: &mut Plan) -> bool {
+                for id in plan.find("group") {
+                    plan.nodes[id].executor = Executor::Sql;
+                }
+                // Reports no change, so the driver's result check is what has
+                // to catch it.
+                false
+            }
+        }
+
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm . FILTER(REGEX(?nm, \"^A\")) } GROUP BY ?nm",
+        );
+        let rules = tier_one_rules(&schema);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        refine(&mut plan, &borrowed).expect("the regex keeps the grouping with the engine");
+        assert_eq!(
+            plan.nodes[plan.find("group")[0]].executor,
+            Executor::Engine,
+            "{plan}"
+        );
+
+        let failure = refine(&mut plan, &[&PushesTheGroupingAnyway])
+            .expect_err("a grouping over an engine filter must not be handed back");
+        assert!(
+            matches!(
+                failure.defect,
+                crate::sparql_refine::PlanDefect::FrontierBreach { .. }
+            ),
+            "{failure}"
+        );
+    }
+
+    /// **The fifth invariant, finally falsifiable.** A fan-out above the
+    /// grouping restores multiplicity too late: the count is one per record
+    /// where the query counts one per value.
+    ///
+    /// Stated in stage 1 and unfalsifiable until now, because nothing
+    /// collapsed rows. It needed strengthening to catch this: "there is an
+    /// unnest downstream of the scan" was true of the broken plan too.
+    #[test]
+    fn a_fanout_above_the_grouping_is_a_defect() {
+        struct MovesTheFanoutUp;
+        impl Rule for MovesTheFanoutUp {
+            fn name(&self) -> &'static str {
+                "moves_the_fanout_up"
+            }
+            fn apply(&self, plan: &mut Plan) -> bool {
+                let (Some(unnest), Some(group)) = (
+                    plan.find("unnest").first().copied(),
+                    plan.find("group").first().copied(),
+                ) else {
+                    return false;
+                };
+                if unnest > group {
+                    return false;
+                }
+                // Lift the unnest over the grouping: the grouping now reads
+                // the scan directly, and the unnest reads the grouping.
+                let below = plan.nodes[unnest].op.inputs()[0];
+                let mut nodes = plan.nodes.clone();
+                nodes[group].op.map_inputs(|_| below);
+                nodes[unnest].op.map_inputs(|_| group);
+                nodes.swap(unnest, group);
+                // ...and renumber, since the two exchanged positions.
+                for node in nodes.iter_mut() {
+                    node.op.map_inputs(|input| {
+                        if input == unnest {
+                            group
+                        } else if input == group {
+                            unnest
+                        } else {
+                            input
+                        }
+                    });
+                }
+                plan.nodes = nodes;
+                false
+            }
+        }
+
+        let schema = test_schema_view();
+        // A scalar key *and* a fanned-out read: the grouping pushes, so every
+        // node is `Sql` and moving the unnest leaves the frontier intact --
+        // which is what makes this the fan-out defect and not another one.
+        // The query also counts solutions rather than records: two traffic
+        // kinds on one signal are two solutions, and that is precisely the
+        // multiplicity the unnest carries.
+        let mut plan = plan_of(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:trafficKinds ?k } GROUP BY ?nm",
+        );
+        let rules = tier_one_rules(&schema);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        refine(&mut plan, &borrowed).expect("the fold inserts the unnest below everything");
+        assert_eq!(plan.find("unnest").len(), 1, "{plan}");
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "{plan}"
+        );
+
+        let failure = refine(&mut plan, &[&MovesTheFanoutUp])
+            .expect_err("a fan-out after a collapse must not be handed back");
+        assert!(
+            matches!(
+                failure.defect,
+                crate::sparql_refine::PlanDefect::FanoutAfterCollapse { .. }
+            ),
+            "{failure}"
+        );
+    }
 
     /// A rule chain is only testable if its result does not depend on the
     /// order the rules were listed in. Every tier-one rule is monotone -- two

@@ -1279,29 +1279,51 @@ fn binding_for(
         ));
     }
 
-    let (descriptor, container_modes) = resolve_column(schema_view, &star.class_uri, &slot_path)
-        .ok_or_else(|| {
+    let spec = binding_spec(
+        schema_view,
+        &star.variable,
+        &star.class_uri,
+        var_name,
+        slot_path,
+    )
+    .ok_or_else(|| {
         Blocked::new(
             BlockedCode::UnscopedBinding,
             format!(
-                "?{var_name} resolves to {slot_path:?} on <{}>, which the schema cannot describe \
-                 as an RDF term",
+                "?{var_name} resolves to a path on <{}> which the schema cannot \
+                     describe as an RDF term",
                 star.class_uri
             ),
             Some(format!("?{var_name}")),
         )
     })?;
-
-    let containers: Vec<Container> = container_modes.iter().map(Container::from_mode).collect();
-    bindings.push(BindingSpec {
-        var: var_name.to_owned(),
-        star_var: star.variable.clone(),
-        slot_path,
-        containers,
-        class_uri: star.class_uri.clone(),
-        descriptor,
-    });
+    bindings.push(spec);
     Ok(bindings.len() - 1)
+}
+
+/// One projected column, resolved against the schema.
+///
+/// The whole of what a `BindingSpec` needs beyond its names: how the column's
+/// stored text becomes an RDF term, and which of its hops hold collections.
+/// Extracted so a second planner can build one without a second copy of the
+/// resolution -- the refined plan's lowering has the star and the path
+/// already, and reproducing this would be two derivations of one column.
+pub(crate) fn binding_spec(
+    schema_view: &SchemaView,
+    star_var: &str,
+    class_uri: &str,
+    var_name: &str,
+    slot_path: Vec<String>,
+) -> Option<BindingSpec> {
+    let (descriptor, container_modes) = resolve_column(schema_view, class_uri, &slot_path)?;
+    Some(BindingSpec {
+        var: var_name.to_owned(),
+        star_var: star_var.to_owned(),
+        slot_path,
+        containers: container_modes.iter().map(Container::from_mode).collect(),
+        class_uri: class_uri.to_owned(),
+        descriptor,
+    })
 }
 
 fn measure_for(

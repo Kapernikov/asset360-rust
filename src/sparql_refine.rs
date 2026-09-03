@@ -1047,6 +1047,23 @@ impl PlanOp {
         }
     }
 
+    /// Whether this operator's result depends on how many rows it is given.
+    ///
+    /// The question the fifth invariant asks of a fan-out: a `COUNT` counts
+    /// rows, a `DISTINCT` removes duplicate ones, a `SLICE` takes the first
+    /// few. Restoring multiplicity *after* one of these has already read the
+    /// rows is a wrong answer -- a count of records where the query counts
+    /// solutions -- so the unnest has to be below them.
+    ///
+    /// A `Sort` is not here: it reorders rows without changing how many there
+    /// are, so a fan-out on either side of one produces the same multiset.
+    pub fn collapses_rows(&self) -> bool {
+        matches!(
+            self,
+            Self::Group { .. } | Self::Distinct { .. } | Self::Reduced { .. } | Self::Slice { .. }
+        )
+    }
+
     /// What this operator produces, which is a property of the operator and
     /// not a choice, so a node's [`Node::output`] cannot disagree with its op.
     pub fn output_kind(&self) -> OutputKind {
@@ -1204,6 +1221,13 @@ pub enum PlanDefect {
     StrayFanout {
         unnest: NodeId,
     },
+    /// A fan-out that happens after something already read the rows: a
+    /// `COUNT`, a `DISTINCT` or a `SLICE` between the scan and its `Unnest`.
+    /// The multiplicity is restored, and too late to be counted.
+    FanoutAfterCollapse {
+        unnest: NodeId,
+        collapse: NodeId,
+    },
     /// A join whose recorded [`ReferenceEdge`] is not what the scans below it
     /// say. Not one of 28d's, and the invariant that exists because the plan
     /// now records the direction rather than leaving it to be re-derived.
@@ -1242,6 +1266,11 @@ impl fmt::Display for PlanDefect {
             Self::MisrecordedJoin { join } => write!(
                 f,
                 "n{join} records a reference edge the scans below it do not support"
+            ),
+            Self::FanoutAfterCollapse { unnest, collapse } => write!(
+                f,
+                "n{collapse} reads rows the fan-out at n{unnest} has not produced yet, \
+                 so it counts records where the query counts solutions"
             ),
             Self::StrayFanout { unnest } => write!(
                 f,
@@ -1383,8 +1412,8 @@ impl Plan {
             for slot in slots.iter().filter(|slot| {
                 slot.multivalued && slot.presence == SlotPresence::Required && slot.var.is_some()
             }) {
-                let restored = self.nodes.iter().enumerate().any(|(id, above)| {
-                    matches!(
+                let restored = self.nodes.iter().enumerate().find_map(|(id, above)| {
+                    let matches = matches!(
                         &above.op,
                         PlanOp::Unnest {
                             star_var: unnest_star,
@@ -1401,13 +1430,28 @@ impl Plan {
                             // name leaves that condition naming an element
                             // nothing bound.
                             && Some(var) == slot.var.as_ref()
-                    ) && self.feeds(scan_id, id)
+                    ) && self.feeds(scan_id, id);
+                    matches.then_some(id)
                 });
-                if !restored {
+                let Some(unnest) = restored else {
                     return Err(PlanDefect::LostFanout {
                         scan: scan_id,
                         slot: slot.path.join("."),
                     });
+                };
+                // Restored, and restored *in time*. A fan-out below a scan
+                // says nothing about where it sits relative to a `COUNT`: an
+                // unnest above the grouping would count records where the
+                // query counts solutions, and every other check would pass.
+                //
+                // Stated only once a plan could group. Written for stage 1 it
+                // would have been unfalsifiable -- nothing collapsed rows --
+                // and this is the shape the invariant was always meant to
+                // catch.
+                if let Some(collapse) = self.nodes.iter().enumerate().position(|(id, node)| {
+                    node.op.collapses_rows() && self.feeds(scan_id, id) && !self.feeds(unnest, id)
+                }) {
+                    return Err(PlanDefect::FanoutAfterCollapse { unnest, collapse });
                 }
             }
         }
