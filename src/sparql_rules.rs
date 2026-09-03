@@ -17,15 +17,21 @@
 //! operator -- group, distinct, slice, sort -- are not here, and they are the
 //! ones that need a residual evaluator.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::SlotContainerMode;
 
+use spargebra::term::Term;
+
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
-    Executor, Node, NodeId, Plan, PlanOp, ScanSlot, inner_join_groups, is_type_pattern,
+    Executor, Expr, Node, NodeId, Plan, PlanOp, ScanSlot, inner_join_groups, is_type_pattern,
     object_variable, predicate_iri, scan_with_fanout, subject_variable, type_class_iri,
 };
+use crate::sparql_scoper::{PushForm, literal_pushable, push_form};
 
 /// One rewrite.
 pub trait Rule {
@@ -414,6 +420,457 @@ fn joined_in(nodes: &[Node], lower: NodeId, upper: NodeId) -> bool {
         }
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// What an `Sql` scan makes visible
+// ---------------------------------------------------------------------------
+
+/// One variable an `Sql` [`PlanOp::Scan`] binds to a slot of its record.
+struct SlotBinding {
+    star_var: String,
+    slot: String,
+    /// Whether the slot holds an array. Carried because a condition on one is
+    /// not a condition on a column -- see [`PushComparisonFilter`].
+    multivalued: bool,
+}
+
+/// The variables the `Sql` scans feeding a node have bound, and what to.
+///
+/// Built per landing site rather than once per plan: a variable is a column
+/// only where the scan that binds it is actually below, and two stars can bind
+/// one variable (`?a :name ?nm . ?b :hasName ?nm` is a value join) in which
+/// case naming either column answers a different question. An ambiguous
+/// variable is recorded as `None` rather than dropped, so a rule declines it
+/// instead of silently resolving the first match.
+struct Visible {
+    slots: HashMap<String, Option<SlotBinding>>,
+    class_of_star: HashMap<String, String>,
+}
+
+impl Visible {
+    /// Everything the `Sql` scans below `base` bind.
+    fn below(plan: &Plan, base: NodeId) -> Self {
+        let mut slots: HashMap<String, Option<SlotBinding>> = HashMap::new();
+        let mut class_of_star: HashMap<String, String> = HashMap::new();
+        for (id, node) in plan.nodes.iter().enumerate() {
+            let PlanOp::Scan {
+                star_var,
+                class_uri,
+                slots: scan_slots,
+            } = &node.op
+            else {
+                continue;
+            };
+            if node.executor != Executor::Sql || !plan.feeds(id, base) {
+                continue;
+            }
+            class_of_star.insert(star_var.clone(), class_uri.clone());
+            // The star variable names the *record*, not a slot of it. Its
+            // pushdown is the indexed identifier column rather than a JSONB
+            // path, which no `SqlCondition` can say, so it is entered as
+            // ambiguous: a rule then declines `FILTER(?s = <iri>)` rather than
+            // resolving `?s` through some other star's slot of the same name.
+            slots.insert(star_var.clone(), None);
+            for slot in scan_slots {
+                let binding = SlotBinding {
+                    star_var: star_var.clone(),
+                    slot: slot.slot.clone(),
+                    multivalued: slot.multivalued,
+                };
+                match slots.entry(slot.var.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(Some(binding));
+                    }
+                    Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+        Self {
+            slots,
+            class_of_star,
+        }
+    }
+
+    /// The slot a variable reads, when exactly one single-valued slot does.
+    fn slot_of(&self, var: &str) -> Option<&SlotBinding> {
+        match self.slots.get(var) {
+            Some(Some(binding)) if !binding.multivalued => Some(binding),
+            _ => None,
+        }
+    }
+}
+
+/// Every node that reads `id`.
+///
+/// A plan is a tree as the naive builder writes it, but a rule that collapses
+/// a join makes two nodes read one -- [`fold`] does exactly that -- so
+/// "the node above this one" is a question with several answers and a rule that
+/// assumes one has to check.
+fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
+    plan.nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.op.inputs().contains(&id))
+        .map(|(consumer, _)| consumer)
+        .collect()
+}
+
+/// Whether a constant the query wrote is the same RDF term the column's values
+/// render as.
+///
+/// The reason this is asked at all: 28d argues that a pushed condition is free
+/// of correctness risk because the engine re-runs the whole query, so SQL only
+/// ever *narrows*. That is true of a condition that selects a superset of the
+/// answer and false of one that selects nothing -- and comparing stored text
+/// against a term the column never spells that way selects nothing. An enum
+/// column storing `GSA` whose values render as `eul:GSA` answers a pushed
+/// `= 'http://ontorail.org/src/Eulynx/GSA'` with no rows at all, and the
+/// engine then re-runs the query over no instances and reports an empty answer
+/// where the query has one. So the same test the star decomposition applies --
+/// [`crate::sparql_scoper::push_form`] with
+/// [`crate::sparql_scoper::literal_pushable`] -- gates a pushed constant here.
+///
+/// Enum columns decline rather than translate. Selecting the codes that render
+/// as the term is a *rewrite* of the condition, and `Expr::to_sql` has no
+/// schema to do it with; the rule that translates backwards is a rule of its
+/// own.
+fn constant_is_the_columns_term(
+    schema: &SchemaView,
+    class_uri: &str,
+    slot: &str,
+    term: &Term,
+) -> bool {
+    let form = push_form(schema, class_uri, slot);
+    match (&form, term) {
+        (PushForm::Literal { .. }, Term::Literal(literal)) => literal_pushable(literal, &form),
+        (PushForm::Iri, Term::NamedNode(_)) => true,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Push a comparison filter
+// ---------------------------------------------------------------------------
+
+/// A `Filter` whose expression renders as SQL conditions over the slots an
+/// `Sql` scan below it binds becomes `Sql`, keeping its own obligation.
+///
+/// Two things happen here that 28d states separately, and both are the rule's
+/// rather than the expression's:
+///
+/// * **A variable becomes a slot.** A naive filter compares `Expr::Var`, and a
+///   variable is not a column, so [`Expr::to_sql`] declines every naive filter
+///   by construction. Which slot binds `?name` is a fact about the scan below,
+///   which is why the rewrite lives in the rule that can see one. The rewrite
+///   is committed only together with the flip to `Sql`: a node that stays with
+///   the engine keeps the expression the query wrote, because that is what the
+///   engine evaluates.
+/// * **A pushable conjunct sinks below an unpushable one.** See
+///   [`landing_site`]. Without it, `FILTER(REGEX(..)) FILTER(?nm > "A")` pushes
+///   nothing while `FILTER(?nm > "A") FILTER(REGEX(..))` pushes the
+///   comparison, for two spellings of one query.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **Every variable resolves to exactly one single-valued slot of a scan
+///   that feeds the landing site.** A variable two stars bind is a value join,
+///   and naming either column answers a different question. A variable bound
+///   by a *multivalued* slot is worse than ambiguous: the same
+///   `(star, slot_path)` address means the array below its [`PlanOp::Unnest`]
+///   and one element above it, so a condition carrying that address means one
+///   thing to a renderer reading it as a column and another to one reading it
+///   after the fan-out -- a containment test and an equality, which select
+///   different rows. That ambiguity is a missing fact in the representation
+///   (nothing names the *element*), and 28d's own lesson is that a rule facing
+///   one should not paper over it: this declines until an unnest binds the
+///   element.
+/// * **The constant is the term the column's values render as.** See
+///   [`constant_is_the_columns_term`]: the pushed-conditions-only-narrow
+///   argument fails for a constant no stored value spells.
+/// * **The landing site runs in SQL.** The frontier is a cut, so a filter over
+///   an engine node cannot be `Sql` however well it renders.
+pub struct PushComparisonFilter<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> PushComparisonFilter<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+
+    /// The condition with its variables resolved to slots, when SQL can
+    /// express the result.
+    fn render(&self, condition: &Expr, visible: &Visible) -> Option<Expr> {
+        let resolved = substitute_slots(condition, visible)?;
+        if !self.constants_are_terms(&resolved, visible) {
+            return None;
+        }
+        // The rendering test itself, and the one 28d asks a rule to *ask*
+        // rather than to decide: the pushable subset is the sum of what
+        // `to_sql` accepts, not a constant of this rule.
+        resolved.to_sql()?;
+        Some(resolved)
+    }
+
+    /// Whether every constant this condition compares against a slot is the
+    /// term that slot's values render as.
+    ///
+    /// Only the shapes [`Expr::to_sql`] turns into conditions are checked; the
+    /// rest it declines on its own, and declining twice for two reasons is not
+    /// a stronger claim.
+    fn constants_are_terms(&self, expr: &Expr, visible: &Visible) -> bool {
+        let comparable = |star_var: &String, slot_path: &Vec<String>, term: &Term| {
+            let [slot] = slot_path.as_slice() else {
+                // A path into a record, which no `ScanSlot` binds and this rule
+                // never builds.
+                return false;
+            };
+            visible
+                .class_of_star
+                .get(star_var)
+                .is_some_and(|class_uri| {
+                    constant_is_the_columns_term(self.schema, class_uri, slot, term)
+                })
+        };
+        match expr {
+            Expr::Compare { left, right, .. } => match (left.as_ref(), right.as_ref()) {
+                (
+                    Expr::Slot {
+                        star_var,
+                        slot_path,
+                    },
+                    Expr::Literal(term),
+                )
+                | (
+                    Expr::Literal(term),
+                    Expr::Slot {
+                        star_var,
+                        slot_path,
+                    },
+                ) => comparable(star_var, slot_path, term),
+                _ => true,
+            },
+            Expr::In { value, candidates } => match value.as_ref() {
+                Expr::Slot {
+                    star_var,
+                    slot_path,
+                } => candidates.iter().all(|candidate| match candidate {
+                    Expr::Literal(term) => comparable(star_var, slot_path, term),
+                    _ => true,
+                }),
+                _ => true,
+            },
+            Expr::And(parts) | Expr::Or(parts) | Expr::Function { args: parts, .. } => parts
+                .iter()
+                .all(|part| self.constants_are_terms(part, visible)),
+            Expr::Not(inner) => self.constants_are_terms(inner, visible),
+            Expr::Var(_) | Expr::Literal(_) | Expr::Slot { .. } | Expr::Opaque(_) => true,
+        }
+    }
+}
+
+impl Rule for PushComparisonFilter<'_> {
+    fn name(&self) -> &'static str {
+        "push_comparison_filter"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Filter { input, condition } = &plan.nodes[id].op else {
+                continue;
+            };
+            let (input, condition) = (*input, condition.clone());
+            let Some(base) = landing_site(plan, id) else {
+                continue;
+            };
+            let Some(rendered) = self.render(&condition, &Visible::below(plan, base)) else {
+                continue;
+            };
+            if base == input {
+                plan.nodes[id].op = PlanOp::Filter {
+                    input,
+                    condition: rendered,
+                };
+                plan.nodes[id].executor = Executor::Sql;
+            } else {
+                sink_below_engine_filters(plan, id, base, rendered);
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// Where a filter node can be pushed to: the highest `Sql` node it could sit
+/// directly above, commuting past engine filters on the way.
+///
+/// `None` when there is no such node, which is the case whenever anything but
+/// a privately-consumed engine filter is in the way.
+///
+/// **Why commuting is sound.** Two filters in sequence select the solutions
+/// satisfying both, and "both" does not depend on order: a filter is
+/// row-preserving (it drops solutions, never adds, reorders or duplicates
+/// them), binds nothing, and SPARQL's treatment of an expression that errors
+/// is that the solution is simply not selected -- so an error is a rejection
+/// like any other and not an outcome the second filter could have avoided by
+/// running first. Nothing in the algebra mutates, so evaluating a predicate on
+/// more rows or fewer has no consequence beyond its result.
+///
+/// **Why it is necessary.** Obligations are per top-level conjunct and the
+/// naive builder chains one `Filter` per conjunct with the first nearest the
+/// input. So `FILTER(?nm > "A") FILTER(REGEX(?nm, "^A"))` puts the comparison
+/// directly on the scan and it pushes, while
+/// `FILTER(REGEX(?nm, "^A")) FILTER(?nm > "A")` -- the same query -- puts the
+/// comparison above an engine node, where the frontier-is-a-cut invariant
+/// forbids pushing it. Without sinking, the plan a query gets depends on the
+/// order its filters were typed in.
+///
+/// **What stops the walk, and why each one has to.**
+///
+/// * A non-filter node. A `Bind` between the two would be the case that
+///   matters: `BIND(?len * 2 AS ?d) FILTER(?d > 3)` cannot sink below the node
+///   that binds `?d`. Stopping at every non-filter covers it without having to
+///   reason about which nodes bind what.
+/// * A filter with more than one consumer. Sinking rewires the chain so that
+///   the node above the moved filter is the old top of the chain; every node
+///   in between therefore starts filtering by the moved predicate, which is
+///   correct for the chain's own consumer and wrong for anyone else reading a
+///   node in the middle of it.
+fn landing_site(plan: &Plan, filter: NodeId) -> Option<NodeId> {
+    let mut current = match &plan.nodes[filter].op {
+        PlanOp::Filter { input, .. } => *input,
+        _ => return None,
+    };
+    loop {
+        if plan.nodes[current].executor == Executor::Sql {
+            return Some(current);
+        }
+        let PlanOp::Filter { input, .. } = &plan.nodes[current].op else {
+            return None;
+        };
+        if consumers(plan, current).len() != 1 {
+            return None;
+        }
+        current = *input;
+    }
+}
+
+/// Move `filter` down to sit directly above `base`, pushed, leaving the engine
+/// filters it commuted past in their order above it.
+///
+/// The chain `base → c_k → … → c_1 → filter` becomes
+/// `base → filter' → c_k → … → c_1`, so what used to read `filter` reads `c_1`
+/// -- which now selects the same solutions, because `filter'` is below it.
+fn sink_below_engine_filters(plan: &mut Plan, filter: NodeId, base: NodeId, condition: Expr) {
+    let pushed = Node::sql(
+        PlanOp::Filter {
+            input: base,
+            condition,
+        },
+        plan.nodes[filter].discharges.clone(),
+    );
+    // The old top of the chain: what the moved node's consumers read instead.
+    let chain_top = match &plan.nodes[filter].op {
+        PlanOp::Filter { input, .. } => *input,
+        _ => unreachable!("only a filter node is sunk"),
+    };
+    // The chain's lowest node, the one whose input becomes the moved filter.
+    let mut chain_bottom = chain_top;
+    while let PlanOp::Filter { input, .. } = &plan.nodes[chain_bottom].op {
+        if *input == base {
+            break;
+        }
+        chain_bottom = *input;
+    }
+
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() + 1);
+    let mut origin: Vec<Option<NodeId>> = Vec::with_capacity(plan.nodes.len() + 1);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == filter {
+            continue;
+        }
+        nodes.push(node.clone());
+        origin.push(Some(old));
+        remap[old] = Some(nodes.len() - 1);
+        if old == base {
+            // Directly above the landing site, so every node of the chain --
+            // all of which come after it -- still reads something that
+            // precedes it.
+            nodes.push(pushed.clone());
+            origin.push(None);
+        }
+    }
+    let base_landed = remap[base].expect("the landing site is not the node being moved");
+    let landed = base_landed + 1;
+
+    for index in 0..nodes.len() {
+        let Some(old) = origin[index] else {
+            nodes[index].op.map_inputs(|_| base_landed);
+            continue;
+        };
+        nodes[index].op.map_inputs(|input| {
+            if input == filter {
+                remap[chain_top].expect("the chain is not the node being moved")
+            } else if input == base && old == chain_bottom {
+                landed
+            } else {
+                remap[input].expect("inputs precede their node")
+            }
+        });
+    }
+
+    plan.nodes = nodes;
+}
+
+/// The condition with every variable rewritten into the slot that binds it.
+///
+/// `None` when any variable does not resolve, which is the honest answer
+/// rather than a partial rewrite: a condition mentioning one variable the SQL
+/// side cannot read is not a condition the SQL side can apply.
+fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
+    let all = |parts: &[Expr]| -> Option<Vec<Expr>> {
+        parts
+            .iter()
+            .map(|part| substitute_slots(part, visible))
+            .collect()
+    };
+    Some(match expr {
+        Expr::Var(name) => {
+            let binding = visible.slot_of(name)?;
+            Expr::Slot {
+                star_var: binding.star_var.clone(),
+                slot_path: vec![binding.slot.clone()],
+            }
+        }
+        Expr::Literal(term) => Expr::Literal(term.clone()),
+        Expr::Slot { .. } => expr.clone(),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: Box::new(substitute_slots(left, visible)?),
+            right: Box::new(substitute_slots(right, visible)?),
+        },
+        Expr::In { value, candidates } => Expr::In {
+            value: Box::new(substitute_slots(value, visible)?),
+            candidates: all(candidates)?,
+        },
+        Expr::And(parts) => Expr::And(all(parts)?),
+        Expr::Or(parts) => Expr::Or(all(parts)?),
+        Expr::Not(inner) => Expr::Not(Box::new(substitute_slots(inner, visible)?)),
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: all(args)?,
+        },
+        // A graph pattern in an expression position. Nothing renders it, and a
+        // rewrite of the text would be a rewrite of a query, not of a plan.
+        Expr::Opaque(_) => return None,
+    })
 }
 
 #[cfg(test)]
@@ -809,6 +1266,406 @@ mod tests {
             matches!(failure.defect, crate::sparql_refine::PlanDefect::Ledger(_)),
             "{failure}"
         );
+    }
+
+    /// Every `Sql` node as (kind, description, the obligations it claims).
+    ///
+    /// The unit two plans are compared in. Node *indices* cannot be: two
+    /// orderings of the same filters reach the same pushed work at different
+    /// positions, and the obligation a node claims has a different id in each
+    /// -- so the claim is compared by what it says.
+    fn pushed(plan: &Plan) -> Vec<(String, String, Vec<String>)> {
+        let mut out: Vec<(String, String, Vec<String>)> = plan
+            .nodes
+            .iter()
+            .filter(|node| node.executor == Executor::Sql)
+            .map(|node| {
+                (
+                    node.op.kind().to_owned(),
+                    node.op.describe(),
+                    node.discharges
+                        .iter()
+                        .map(|id| plan.obligations[*id].to_string())
+                        .collect(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// What the rule is for: a comparison over a slot an `Sql` scan binds
+    /// becomes `Sql`, keeping its own obligation, and the variable it compared
+    /// is a slot afterwards -- a column is what SQL can read.
+    #[test]
+    fn a_comparison_over_a_scanned_slot_is_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(?nm > \"A\") }",
+        );
+        let log = refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("both rules preserve every invariant");
+        assert_eq!(
+            log.applied,
+            vec!["fold_matches_into_scan", "push_comparison_filter"],
+            "{plan}"
+        );
+
+        let filter = plan.find("filter")[0];
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        assert_eq!(
+            plan.nodes[filter].op.describe(),
+            "(?s.name > \"A\")",
+            "the variable is rewritten into the slot that binds it:\n{plan}"
+        );
+        assert_eq!(
+            plan.nodes[filter].discharges.len(),
+            1,
+            "the filter claims its own obligation, and only its own:\n{plan}"
+        );
+        assert_eq!(
+            plan.nodes.last().unwrap().executor,
+            Executor::Engine,
+            "the projection above it stays with the engine:\n{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// The requirement 28d does not spell out. Obligations are per top-level
+    /// conjunct and the naive builder chains one `Filter` per conjunct, first
+    /// nearest the input -- so in one spelling the pushable comparison sits on
+    /// the scan and in the other it sits above an unpushable regex, where the
+    /// frontier-is-a-cut invariant forbids pushing it.
+    ///
+    /// The two spellings are the same query, so they must reach the same
+    /// pushed work. Filters commute -- row-preserving, binding nothing, and an
+    /// expression that errors simply does not select the solution -- so the
+    /// rule sinks the pushable conjunct below the unpushable one.
+    #[test]
+    fn the_order_two_filters_are_written_in_does_not_decide_the_plan() {
+        let schema = test_schema_view();
+        let rules: [&dyn Rule; 2] = [
+            &FoldMatchesIntoScan::new(&schema),
+            &PushComparisonFilter::new(&schema),
+        ];
+        let refined = |query: &str| {
+            let mut plan = plan_of(query);
+            refine(&mut plan, &rules).expect("every invariant holds");
+            plan
+        };
+
+        let comparison_first = refined(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(?nm > \"A\") FILTER(REGEX(?nm, \"^A\")) }",
+        );
+        let regex_first = refined(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(REGEX(?nm, \"^A\")) FILTER(?nm > \"A\") }",
+        );
+
+        assert_eq!(
+            pushed(&comparison_first),
+            pushed(&regex_first),
+            "the same query pushed differently:\n{comparison_first}\n{regex_first}"
+        );
+        // ...and it is the comparison that pushed, in both. A test that only
+        // compared the two would pass if neither pushed anything.
+        assert!(
+            pushed(&regex_first)
+                .iter()
+                .any(|(kind, text, _)| kind == "filter" && text == "(?s.name > \"A\")"),
+            "{regex_first}"
+        );
+        assert_eq!(
+            pushed(&regex_first).len(),
+            2,
+            "the scan and the comparison, and nothing else:\n{regex_first}"
+        );
+
+        // The sunk filter reads the scan, and the regex reads the sunk filter:
+        // the chain kept its order above the node that moved.
+        let sunk = *regex_first
+            .find("filter")
+            .iter()
+            .find(|id| regex_first.nodes[**id].executor == Executor::Sql)
+            .expect("the comparison pushed");
+        let scan = regex_first.find("scan")[0];
+        assert!(regex_first.feeds(scan, sunk), "{regex_first}");
+        let regex = *regex_first
+            .find("filter")
+            .iter()
+            .find(|id| regex_first.nodes[**id].executor == Executor::Engine)
+            .expect("the regex did not push");
+        assert!(
+            regex_first.feeds(sunk, regex),
+            "the regex still runs, above the comparison:\n{regex_first}"
+        );
+        println!("{regex_first}");
+    }
+
+    /// A filter the rule declines stays `Engine`, and says nothing about its
+    /// neighbours: the scan below it is still pushed and the grouping above it
+    /// is still the engine's, which is the whole point of a frontier that is
+    /// local rather than a verdict for the query.
+    #[test]
+    fn an_unpushable_filter_leaves_its_neighbours_alone() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm ; asset360:trafficKinds ?kind . \
+             FILTER(REGEX(?nm, \"^A\")) } GROUP BY ?kind",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        let filter = plan.find("filter")[0];
+        assert_eq!(plan.nodes[filter].executor, Executor::Engine, "{plan}");
+        assert_eq!(
+            plan.nodes[filter].op.describe(),
+            "REGEX(?nm, \"^A\")",
+            "an engine node keeps the expression the query wrote:\n{plan}"
+        );
+        assert_eq!(
+            plan.nodes[plan.find("scan")[0]].executor,
+            Executor::Sql,
+            "{plan}"
+        );
+        assert_eq!(
+            plan.nodes[plan.find("unnest")[0]].executor,
+            Executor::Sql,
+            "{plan}"
+        );
+        assert_eq!(
+            plan.nodes[plan.find("group")[0]].executor,
+            Executor::Engine,
+            "the grouping sits above an engine filter, so it cannot be SQL's \
+             -- and the plan names the node that blocked it:\n{plan}"
+        );
+    }
+
+    /// A comparison between two slots is a column against a column, which
+    /// `to_sql` declines: the condition vocabulary is (column, value).
+    #[test]
+    fn a_comparison_between_two_slots_is_not_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
+             asset360:hasName ?tn . FILTER(?nm = ?tn) }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        let filter = plan.find("filter")[0];
+        assert_eq!(plan.nodes[filter].executor, Executor::Engine, "{plan}");
+    }
+
+    /// A variable bound by a multivalued slot is not a column. The same
+    /// `(star, slot_path)` address means the array below its unnest and one
+    /// element above it, and a condition carrying it would be a containment
+    /// test to one reader and an equality to another -- different rows. The
+    /// missing fact is a name for the element, which is a change to the
+    /// representation and not to this rule.
+    #[test]
+    fn a_comparison_on_a_multivalued_slot_is_not_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             FILTER(?k = \"m\") }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert_eq!(
+            plan.nodes[plan.find("filter")[0]].executor,
+            Executor::Engine,
+            "{plan}"
+        );
+        assert_eq!(
+            plan.nodes[plan.find("scan")[0]].executor,
+            Executor::Sql,
+            "the scan still folds it; only the condition on it declines:\n{plan}"
+        );
+    }
+
+    /// A pushed condition compares stored text, so it asks the query's
+    /// question only when the constant is the term the column's values render
+    /// as. Where it is not, the condition selects *nothing* -- and the engine
+    /// leg then re-runs the query over no instances, which is a wrong answer
+    /// and not a narrowing.
+    #[test]
+    fn a_constant_the_column_never_spells_is_not_pushed() {
+        let schema = test_schema_view();
+        let rules: [&dyn Rule; 2] = [
+            &FoldMatchesIntoScan::new(&schema),
+            &PushComparisonFilter::new(&schema),
+        ];
+        for (query, why) in [
+            (
+                // `GSA` carries a `meaning`, so records storing it render as
+                // `eul:GSA` and no record answers the plain literal.
+                "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+                 FILTER(?k = \"GSA\") }",
+                "an enum code is not the term it renders as",
+            ),
+            (
+                // The other direction: the IRI is the term, and the column
+                // stores the code. Pushing it needs a translation backwards,
+                // which is a rule of its own rather than a rendering.
+                "PREFIX eul: <http://ontorail.org/src/Eulynx/> \
+                 SELECT ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+                 FILTER(?k = eul:GSA) }",
+                "an enum column is not compared, it is translated",
+            ),
+            (
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm = \"BX\"@en) }",
+                "a tagged literal is a different term from the plain one",
+            ),
+            (
+                "SELECT ?len WHERE { ?s a asset360:Signal ; asset360:length ?len . \
+                 FILTER(?len = \"003\"^^<http://www.w3.org/2001/XMLSchema#integer>) }",
+                "the stored text does not spell three as 003",
+            ),
+        ] {
+            let mut plan = plan_of(query);
+            refine(&mut plan, &rules).expect("every invariant holds");
+            assert_eq!(
+                plan.nodes[plan.find("filter")[0]].executor,
+                Executor::Engine,
+                "{why}: {query}\n{plan}"
+            );
+        }
+    }
+
+    /// The canonical constant on the same column does push, so the test above
+    /// is about the term and not about the operator.
+    #[test]
+    fn the_canonical_form_of_a_number_is_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?len WHERE { ?s a asset360:Signal ; asset360:length ?len . \
+             FILTER(?len >= 10) }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert_eq!(
+            plan.nodes[plan.find("filter")[0]].executor,
+            Executor::Sql,
+            "{plan}"
+        );
+    }
+
+    /// A filter over an engine node cannot be `Sql` however well it renders,
+    /// and the walk that looks for a landing site stops at anything but a
+    /// privately-consumed filter. Two shapes, two reasons.
+    #[test]
+    fn a_filter_with_no_sql_node_below_it_does_not_push() {
+        let schema = test_schema_view();
+        let rules: [&dyn Rule; 2] = [
+            &FoldMatchesIntoScan::new(&schema),
+            &PushComparisonFilter::new(&schema),
+        ];
+        // A left join is not a filter, so the walk stops there -- which is the
+        // answer that keeps the rows an `OPTIONAL` exists to preserve: `?nm`
+        // is unbound where the optional side did not match, and a pushed
+        // comparison drops exactly those.
+        let mut over_optional = plan_of(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } FILTER(?k = \"KSS\") }",
+        );
+        refine(&mut over_optional, &rules).expect("every invariant holds");
+        assert_eq!(
+            over_optional.nodes[over_optional.find("filter")[0]].executor,
+            Executor::Engine,
+            "{over_optional}"
+        );
+
+        // A `BIND` is not a filter either, and here it is load-bearing: `?d`
+        // is bound by the node below, so sinking past it would compare a
+        // variable nothing has bound yet.
+        let mut over_bind = plan_of(
+            "SELECT ?d WHERE { ?s a asset360:Signal ; asset360:length ?len . \
+             BIND(?len * 2 AS ?d) FILTER(?d > 3) }",
+        );
+        refine(&mut over_bind, &rules).expect("every invariant holds");
+        assert_eq!(
+            over_bind.nodes[over_bind.find("filter")[0]].executor,
+            Executor::Engine,
+            "{over_bind}"
+        );
+    }
+
+    /// Three pushable conjuncts, one unpushable, in the worst order: every
+    /// pushable one has to sink past the regex, and the plan has to come out
+    /// with all three below it.
+    #[test]
+    fn several_conjuncts_sink_past_one_regex() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?nm ?len WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:length ?len . FILTER(REGEX(?nm, \"^A\")) FILTER(?nm > \"A\") \
+             FILTER(?len >= 10) FILTER(?len < 100) }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        let sql: Vec<NodeId> = plan
+            .find("filter")
+            .into_iter()
+            .filter(|id| plan.nodes[*id].executor == Executor::Sql)
+            .collect();
+        assert_eq!(sql.len(), 3, "{plan}");
+        let regex = *plan
+            .find("filter")
+            .iter()
+            .find(|id| plan.nodes[**id].executor == Executor::Engine)
+            .expect("the regex stays");
+        for pushed in sql {
+            assert!(
+                plan.feeds(pushed, regex),
+                "every pushed conjunct is below the one that did not push:\n{plan}"
+            );
+        }
+        println!("{plan}");
     }
 
     /// Rules apply in the order they are given, and an empty rule set is a

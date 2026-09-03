@@ -2229,7 +2229,7 @@ fn match_var_literal(
 ///
 /// Unresolvable means unrepresentable, which is `Tagged`: refusing to push is
 /// always safe, and this runs before the class has been fully validated.
-fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &str) -> PushForm {
+pub(crate) fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &str) -> PushForm {
     let Some((descriptor, _)) = crate::sparql_terms::resolve_column(
         schema_view,
         class_uri,
@@ -2280,7 +2280,7 @@ fn push_form_of(descriptor: &crate::sparql_terms::TermDescriptor) -> PushForm {
 ///
 /// So this asks the column, never the operator. Whether an *ordering* is
 /// meaningful is a separate question, answered by `TermDescriptor::numeric`.
-fn literal_pushable(lit: &spargebra::term::Literal, form: &PushForm) -> bool {
+pub(crate) fn literal_pushable(lit: &spargebra::term::Literal, form: &PushForm) -> bool {
     let PushForm::Literal {
         datatype,
         lang,

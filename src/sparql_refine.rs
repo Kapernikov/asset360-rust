@@ -1208,7 +1208,7 @@ impl fmt::Display for Plan {
                 f,
                 "  n{id:<3} {:<9} {:<44} {}{claims}",
                 node.op.kind(),
-                describe(&node.op),
+                node.op.describe(),
                 node.executor.tag()
             )?;
         }
@@ -1230,102 +1230,111 @@ impl fmt::Display for Plan {
     }
 }
 
-/// The part of a node a reader needs beyond its kind.
-fn describe(op: &PlanOp) -> String {
-    match op {
-        PlanOp::Unit => "{}".to_owned(),
-        PlanOp::Match { pattern } => triple_text(pattern),
-        PlanOp::Path {
-            subject,
-            path,
-            object,
-        } => format!("{subject} {path} {object}"),
-        PlanOp::Values { variables, rows } => format!(
-            "{} × {} row(s)",
-            variables
+impl PlanOp {
+    /// The part of a node a reader needs beyond its kind.
+    ///
+    /// A method rather than a private helper of the printout because a rule --
+    /// and a test asserting which nodes a rule pushed -- needs to say what a
+    /// node *is* without re-deriving it from the operator. Two orderings of
+    /// the same filters produce the same pushed nodes at different indices, so
+    /// "the same plan" has to be stated in terms of node descriptions rather
+    /// than of `n3`.
+    pub fn describe(&self) -> String {
+        match self {
+            PlanOp::Unit => "{}".to_owned(),
+            PlanOp::Match { pattern } => triple_text(pattern),
+            PlanOp::Path {
+                subject,
+                path,
+                object,
+            } => format!("{subject} {path} {object}"),
+            PlanOp::Values { variables, rows } => format!(
+                "{} × {} row(s)",
+                variables
+                    .iter()
+                    .map(|variable| variable.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                rows.len()
+            ),
+            PlanOp::Join { left, right, on } => format!(
+                "n{left}, n{right}  on {}",
+                on.iter()
+                    .map(|var| format!("?{var}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            PlanOp::LeftJoin {
+                left,
+                right,
+                condition,
+            } => match condition {
+                Some(condition) => format!("n{left}, n{right}  if {condition}"),
+                None => format!("n{left}, n{right}"),
+            },
+            PlanOp::Union { left, right } | PlanOp::Minus { left, right } => {
+                format!("n{left}, n{right}")
+            }
+            PlanOp::Filter { condition, .. } => condition.to_string(),
+            PlanOp::Bind { var, expr, .. } => format!("?{var} ← {expr}"),
+            PlanOp::Group { keys, measures, .. } => format!(
+                "keys=[{}] measures=[{}]",
+                keys.iter()
+                    .map(|key| format!("?{key}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                measures
+                    .iter()
+                    .map(|measure| format!("?{} ← {}", measure.var, measure.aggregate))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            PlanOp::Sort { terms, .. } => terms
                 .iter()
-                .map(|variable| variable.to_string())
+                .map(|term| format!("{}{}", term.expr, if term.desc { " desc" } else { " asc" }))
                 .collect::<Vec<_>>()
-                .join(" "),
-            rows.len()
-        ),
-        PlanOp::Join { left, right, on } => format!(
-            "n{left}, n{right}  on {}",
-            on.iter()
+                .join(", "),
+            PlanOp::Distinct { .. } | PlanOp::Reduced { .. } | PlanOp::Ask { .. } => String::new(),
+            PlanOp::Slice { limit, offset, .. } => match limit {
+                Some(limit) => format!("limit {limit} offset {offset}"),
+                None => format!("offset {offset}"),
+            },
+            PlanOp::Project { vars, .. }
+            | PlanOp::SubSelect { vars, .. }
+            | PlanOp::Describe { vars, .. } => vars
+                .iter()
                 .map(|var| format!("?{var}"))
                 .collect::<Vec<_>>()
-                .join(" ")
-        ),
-        PlanOp::LeftJoin {
-            left,
-            right,
-            condition,
-        } => match condition {
-            Some(condition) => format!("n{left}, n{right}  if {condition}"),
-            None => format!("n{left}, n{right}"),
-        },
-        PlanOp::Union { left, right } | PlanOp::Minus { left, right } => {
-            format!("n{left}, n{right}")
-        }
-        PlanOp::Filter { condition, .. } => condition.to_string(),
-        PlanOp::Bind { var, expr, .. } => format!("?{var} ← {expr}"),
-        PlanOp::Group { keys, measures, .. } => format!(
-            "keys=[{}] measures=[{}]",
-            keys.iter()
-                .map(|key| format!("?{key}"))
-                .collect::<Vec<_>>()
                 .join(" "),
-            measures
-                .iter()
-                .map(|measure| format!("?{} ← {}", measure.var, measure.aggregate))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        PlanOp::Sort { terms, .. } => terms
-            .iter()
-            .map(|term| format!("{}{}", term.expr, if term.desc { " desc" } else { " asc" }))
-            .collect::<Vec<_>>()
-            .join(", "),
-        PlanOp::Distinct { .. } | PlanOp::Reduced { .. } | PlanOp::Ask { .. } => String::new(),
-        PlanOp::Slice { limit, offset, .. } => match limit {
-            Some(limit) => format!("limit {limit} offset {offset}"),
-            None => format!("offset {offset}"),
-        },
-        PlanOp::Project { vars, .. }
-        | PlanOp::SubSelect { vars, .. }
-        | PlanOp::Describe { vars, .. } => vars
-            .iter()
-            .map(|var| format!("?{var}"))
-            .collect::<Vec<_>>()
-            .join(" "),
-        PlanOp::Graph { name, .. } => name.clone(),
-        PlanOp::Service { name, silent, .. } => {
-            format!("{name}{}", if *silent { " silent" } else { "" })
+            PlanOp::Graph { name, .. } => name.clone(),
+            PlanOp::Service { name, silent, .. } => {
+                format!("{name}{}", if *silent { " silent" } else { "" })
+            }
+            PlanOp::Scan {
+                star_var,
+                class_uri,
+                slots,
+            } => format!(
+                "{} as ?{star_var}, requires [{}]",
+                shorten(class_uri),
+                slots
+                    .iter()
+                    .map(|slot| format!(
+                        "{}→?{}{}",
+                        slot.slot,
+                        slot.var,
+                        if slot.multivalued { "[]" } else { "" }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            PlanOp::Unnest {
+                star_var,
+                slot_path,
+                ..
+            } => format!("?{star_var}.{}", slot_path.join(".")),
+            PlanOp::Construct { template, .. } => format!("{} triple(s)", template.len()),
         }
-        PlanOp::Scan {
-            star_var,
-            class_uri,
-            slots,
-        } => format!(
-            "{} as ?{star_var}, requires [{}]",
-            shorten(class_uri),
-            slots
-                .iter()
-                .map(|slot| format!(
-                    "{}→?{}{}",
-                    slot.slot,
-                    slot.var,
-                    if slot.multivalued { "[]" } else { "" }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        PlanOp::Unnest {
-            star_var,
-            slot_path,
-            ..
-        } => format!("?{star_var}.{}", slot_path.join(".")),
-        PlanOp::Construct { template, .. } => format!("{} triple(s)", template.len()),
     }
 }
 
