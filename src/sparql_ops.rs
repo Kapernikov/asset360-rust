@@ -1837,9 +1837,28 @@ impl OpTree {
             if scan.is_optional != today_scan.is_optional {
                 return Err(format!("?{star} disagrees about being optional"));
             }
-            if scan.identifier_values != today_scan.identifier_values {
+            // Narrower is not worse, and identity is where that matters
+            // most: an empty list is *no* restriction, so a refined statement
+            // that names the record the query named is strictly better than
+            // one that reads the class. Only two cases are worse -- dropping a
+            // restriction today makes, or naming more records than today does
+            // -- and this reads them that way rather than as inequality, for
+            // the same reason the fetch bound below does.
+            //
+            // The soundness this rests on is stated where it is enforced: a
+            // narrowing may only be applied on a route where the engine
+            // re-runs the query, and an identity restriction may not answer
+            // one alone (`IdentityIsNotATriple`).
+            let today_names_records = !today_scan.identifier_values.is_empty();
+            let narrower = !scan.identifier_values.is_empty()
+                && scan
+                    .identifier_values
+                    .iter()
+                    .all(|value| today_scan.identifier_values.contains(value));
+            if today_names_records && !narrower {
                 return Err(format!(
-                    "?{star} disagrees about identifier values: {:?} against {:?}",
+                    "?{star} would fetch identifier values {:?} where today fetches {:?}, \
+                     so the fetch is wider",
                     scan.identifier_values, today_scan.identifier_values
                 ));
             }
@@ -2182,13 +2201,6 @@ mod tests {
             ),
             (
                 tree(vec![
-                    scan(&["name"], &["u"], false),
-                    filter(SlotReading::Column),
-                ]),
-                "the identifier values disagree",
-            ),
-            (
-                tree(vec![
                     scan(&["name"], &[], true),
                     filter(SlotReading::Column),
                 ]),
@@ -2221,6 +2233,42 @@ mod tests {
                 .is_no_worse_than(&today)
                 .expect_err(&format!("should have refused: {why}"));
         }
+
+        // Identity, which is one-directional: naming the record the query
+        // named is *narrower* than reading the class, so it needs its own
+        // baseline -- one that names a record -- to say what worse means here.
+        let named = tree(vec![
+            scan(&["name"], &["u"], false),
+            filter(SlotReading::Column),
+        ]);
+        for (worse, why) in [
+            (
+                tree(vec![
+                    scan(&["name"], &[], false),
+                    filter(SlotReading::Column),
+                ]),
+                "reading the class where today names one record",
+            ),
+            (
+                tree(vec![
+                    scan(&["name"], &["u", "v"], false),
+                    filter(SlotReading::Column),
+                ]),
+                "naming more records than today does",
+            ),
+        ] {
+            worse
+                .is_no_worse_than(&named)
+                .expect_err(&format!("should have refused: {why}"));
+        }
+        // And the other direction is admitted, which is the point of the
+        // clause: today reads the class, the refined statement reads one row.
+        named
+            .is_no_worse_than(&tree(vec![
+                scan(&["name"], &[], false),
+                filter(SlotReading::Column),
+            ]))
+            .expect("naming the record the query named is not worse");
 
         // Work handed back to the engine, and a fetch bound loosened: two
         // shapes with their own clause, so they get their own baseline.
