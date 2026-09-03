@@ -3207,6 +3207,143 @@ fn push_grouping(plan: &mut Plan, group: NodeId, tail: GroupingTail) {
 // ---------------------------------------------------------------------------
 // The tier-one rule set
 // ---------------------------------------------------------------------------
+// Narrow the scan by a hop the engine keeps
+// ---------------------------------------------------------------------------
+
+/// A read the engine keeps still says the record *has* that slot, and the scan
+/// may check it.
+///
+/// The shape this is for is a property path: SPARQL translates `?s :a/:b ?m`
+/// into `?s :a _:v . _:v :b ?m`, and no rule folds either half -- the first
+/// binds a blank node rather than a variable, and the second is rooted at one.
+/// So the whole path stays with the engine, which is right, and the fetch was
+/// a full class scan, which is not: every solution needs the record to have
+/// `:a`, and `object_data ? 'a'` says so in the statement.
+///
+/// This rule therefore *adds* rather than moves: it claims nothing, removes
+/// nothing, and leaves the match where it is. The obligation is still the
+/// engine's, because the engine is still the only thing that answers the read
+/// -- an existence check is not an answer to `?s :a _:v`.
+///
+/// It is also the last place the two planners disagreed about the width of a
+/// fetch. Today's scoper reaches the same conclusion from the same triple,
+/// through `required_fields`; the comparator reported the difference as "?s
+/// would not require 'hasLocality', so the fetch is wider".
+///
+/// Two conditions, both about whether the check is a narrowing at all:
+///
+/// * the read has to hold of every answer -- inside an `OPTIONAL`, a `UNION`
+///   or the far side of a `MINUS` it does not, and
+///   [`applies_to_every_answer`] is that question;
+/// * the slot has to be one of the record's own, at depth one, because that
+///   is what an existence check on the payload can express.
+pub struct NarrowByAKeptHop<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> NarrowByAKeptHop<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for NarrowByAKeptHop<'_> {
+    fn name(&self) -> &'static str {
+        "narrow_by_a_kept_hop"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        let keys = const_subject_stars(plan);
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+                continue;
+            };
+            if is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(star), Some(predicate)) =
+                (subject_star(&keys, pattern), predicate_iri(pattern))
+            else {
+                continue;
+            };
+            let predicate = predicate.to_owned();
+            if !applies_to_every_answer(plan, id) {
+                continue;
+            }
+            let Some(scan) = sole_scan_of_star(plan, id, &star).or_else(|| {
+                // `sole_scan_of_star` refuses a scan that already carries an
+                // identity, which is the right answer for a rule that *adds*
+                // one and the wrong one here: an existence check is not an
+                // identity, and a query naming one record may still read a
+                // path off it.
+                scan_of_star(plan, &star)
+            }) else {
+                continue;
+            };
+            let PlanOp::Scan {
+                class_uri, slots, ..
+            } = &plan.nodes[scan].op
+            else {
+                continue;
+            };
+            let Ok(Some(class)) = self.schema.get_class_by_uri(class_uri) else {
+                continue;
+            };
+            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
+                continue;
+            };
+            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+                continue;
+            };
+            // Already known: either the read was folded (with its variable, so
+            // the check is there) or this rule has already run on it. A rule
+            // that keeps adding the same slot never reaches a fixpoint.
+            if slots.iter().any(|known| known.path == [slot.name.clone()]) {
+                continue;
+            }
+            // The identifier's existence check is structurally always true --
+            // every row has an identity -- so it narrows nothing. The
+            // lowering drops it for that reason, and adding it here would
+            // make the plan depend on whether this rule ran before the
+            // identity fold: `the_rule_order_does_not_decide_the_fixpoint`
+            // caught exactly that.
+            if class
+                .identifier_slot()
+                .is_some_and(|identifier| identifier.name == slot.name)
+            {
+                continue;
+            }
+            let multivalued =
+                on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue;
+            if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+                slots.push(ScanSlot {
+                    path: vec![slot.name.clone()],
+                    // No variable: the value is not delivered and nothing
+                    // above may read it. The engine answers the read; this
+                    // only narrows the rows it reads over.
+                    var: None,
+                    multivalued,
+                    presence: SlotPresence::Required,
+                });
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// The `Sql` scan of a star, wherever it is in the plan.
+fn scan_of_star(plan: &Plan, star: &str) -> Option<NodeId> {
+    plan.nodes.iter().position(|node| {
+        matches!(&node.op, PlanOp::Scan { star_var, .. } if star_var == star)
+            && node.executor == Executor::Sql
+    })
+}
+
+// ---------------------------------------------------------------------------
 
 /// Every rule, in the order 28d lists them: scope a type, fold a nested read
 /// into a path, deliver an optional read, turn a constant object into a
@@ -3227,9 +3364,9 @@ fn push_grouping(plan: &mut Plan, group: NodeId, tail: GroupingTail) {
 ///
 /// The order is a preference and not a requirement: each rule is monotone --
 /// three of them remove a `match`, two turn an `Engine` node `Sql`, one adds a
-/// delivered slot to a scan, and none of them ever does the reverse -- so
-/// the
-/// driver reaches the same fixpoint from any order, and
+/// delivered slot to a scan, one adds an existence check to one, and none of
+/// them ever does the reverse -- so the driver reaches the same fixpoint from
+/// any order, and
 /// `the_rule_order_does_not_decide_the_fixpoint` holds it to that. What the
 /// order buys is rounds: a filter cannot push before the scan below it exists,
 /// so running the fold first reaches the fixpoint in fewer passes.
@@ -3245,6 +3382,7 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
         Box::new(PushComparisonFilter::new(schema)),
         Box::new(PushReferenceJoin::new(schema)),
         Box::new(PushLeftJoin::new(schema)),
+        Box::new(NarrowByAKeptHop::new(schema)),
         Box::new(PushGrouping::new(schema)),
     ]
 }
@@ -5656,6 +5794,77 @@ mod tests {
             let plan = refined(q, &schema, false);
             println!("--- {q}\n{plan}");
         }
+    }
+
+    /// A hop the engine keeps still narrows the fetch.
+    ///
+    /// The property path is the shape: SPARQL translates `?s :a/:b ?m` into
+    /// `?s :a _:v . _:v :b ?m`, and no rule folds either half -- one binds a
+    /// blank node, the other is rooted at one -- so the engine answers the
+    /// path. It answers it over a full class scan, though, and every solution
+    /// needs the record to have `:a`. The check costs nothing and the claim
+    /// stays with the engine: an existence check is not an answer to the read.
+    #[test]
+    fn a_hop_the_engine_keeps_narrows_the_fetch() {
+        let schema = test_schema_view();
+
+        let plan = refined(
+            "SELECT ?m WHERE { ?s a asset360:Signal ; \
+             asset360:locatedOnTrack/asset360:hasName ?m }",
+            &schema,
+            false,
+        );
+        assert_eq!(
+            scan_slots(&plan),
+            vec![("locatedOnTrack".to_owned(), String::new(), false)],
+            "the first hop is required, and binds nothing:\n{plan}"
+        );
+        // The match is still there, and still the engine's: the statement
+        // narrowed, it did not answer.
+        let matches = plan.find("match");
+        assert_eq!(matches.len(), 2, "{plan}");
+        assert!(
+            matches
+                .iter()
+                .all(|id| plan.nodes[*id].executor == Executor::Engine),
+            "{plan}"
+        );
+        assert!(
+            plan.nodes[matches[0]].discharges.len() == 1,
+            "the read is still claimed by the node that answers it:\n{plan}"
+        );
+
+        // A multivalued slot read twice is a cross product the fold declines,
+        // and the record still has to have the slot.
+        let plan = refined(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?a ; \
+             asset360:trafficKinds ?b }",
+            &schema,
+            false,
+        );
+        assert_eq!(
+            scan_slots(&plan),
+            vec![("trafficKinds".to_owned(), String::new(), true)],
+            "{plan}"
+        );
+        assert!(
+            plan.find("unnest").is_empty(),
+            "a read that binds nothing needs no fan-out -- there is no \
+             multiplicity to restore:\n{plan}"
+        );
+
+        // And inside an `OPTIONAL` it narrows nothing: the record without the
+        // hop is an answer, with the value unbound.
+        let plan = refined(
+            "SELECT ?s ?m WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:locatedOnTrack/asset360:hasName ?m } }",
+            &schema,
+            false,
+        );
+        assert!(
+            scan_slots(&plan).is_empty(),
+            "an optional hop is not a requirement:\n{plan}"
+        );
     }
 
     /// Four spellings of "this one asset, by identifier", and one plan.
