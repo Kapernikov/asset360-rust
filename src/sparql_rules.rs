@@ -24,12 +24,13 @@ use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::SlotContainerMode;
 
-use spargebra::term::Term;
+use spargebra::term::{Term, TermPattern, TriplePattern};
 
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
-    Executor, Expr, Node, NodeId, Plan, PlanOp, ScanSlot, inner_join_groups, is_type_pattern,
-    object_variable, predicate_iri, scan_with_fanout, subject_variable, type_class_iri,
+    CompareOp, Executor, Expr, Node, NodeId, Plan, PlanOp, ScanSlot, inner_join_groups,
+    is_type_pattern, object_variable, predicate_iri, scan_with_fanout, subject_variable,
+    type_class_iri,
 };
 use crate::sparql_scoper::{PushForm, literal_pushable, push_form};
 
@@ -404,6 +405,33 @@ fn fold(
     plan.nodes = nodes;
 }
 
+/// Whether every solution `upper` produces takes its bindings from a row of
+/// `lower`.
+///
+/// The mandatory-row-set question [`inner_join_groups`] answers for a naive
+/// plan, asked of a plan a rule has already edited: a scan's rows reach a node
+/// through plain joins, filters and unnests without any of them being able to
+/// produce a solution the scan did not contribute to.
+///
+/// Everything else stops the walk, and the left join is the case that matters.
+/// Joining a solution that leaves `?s` unbound against a pattern that binds it
+/// keeps the row -- the two are compatible -- so a constraint moved onto the
+/// preserved side of a left join is not the constraint the join applied.
+fn mandatorily_feeds(plan: &Plan, lower: NodeId, upper: NodeId) -> bool {
+    if lower == upper {
+        return true;
+    }
+    match &plan.nodes[upper].op {
+        PlanOp::Join { left, right, .. } => {
+            mandatorily_feeds(plan, lower, *left) || mandatorily_feeds(plan, lower, *right)
+        }
+        PlanOp::Filter { input, .. } | PlanOp::Unnest { input, .. } => {
+            mandatorily_feeds(plan, lower, *input)
+        }
+        _ => false,
+    }
+}
+
 /// Whether `lower`'s rows are joined into `upper` by plain joins only.
 ///
 /// Stops at anything else on purpose. Reaching `lower` through a `LEFT JOIN`
@@ -462,6 +490,12 @@ impl Visible {
             else {
                 continue;
             };
+            // `feeds` and not [`mandatorily_feeds`]: a landing site runs in
+            // SQL, the frontier is a cut, so its whole subtree is `Sql` -- and
+            // no rule pushes a left join, a union or a minus. Every path from a
+            // scan to an `Sql` node is therefore already mandatory, and asking
+            // the stronger question here would only hide a future rule that
+            // pushed one of them.
             if node.executor != Executor::Sql || !plan.feeds(id, base) {
                 continue;
             }
@@ -549,6 +583,205 @@ fn constant_is_the_columns_term(
         (PushForm::Iri, Term::NamedNode(_)) => true,
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Turn a constant object into a filter
+// ---------------------------------------------------------------------------
+
+/// A `match` with a constant in the object position is a claim about a
+/// *value*, so it becomes a `Filter` on the scan of its subject; the join that
+/// carried it disappears.
+///
+/// [`FoldMatchesIntoScan`] declines these deliberately -- "a constant object
+/// is a filter, and a filter is a claim about values rather than about
+/// existence" -- and this is that rule. It rewrites rather than pushes: the
+/// filter it leaves behind is `Engine`, and [`PushComparisonFilter`] is what
+/// decides whether SQL can express it. Two rules because there are two
+/// questions, and the second one already answers "is this constant the term
+/// the column stores" for every filter in the plan.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **The match's one consumer is a plain `Join` whose other side takes every
+///   row from an `Sql` scan of the same star.** A constant object inside an
+///   `OPTIONAL` is consumed by a `LeftJoin`, and turning it into a filter over
+///   the preserved side drops exactly the rows the join exists to keep -- the
+///   loss the star decomposition records as `Inexact::ConstantInOptional`.
+///   [`mandatorily_feeds`] is the other half: joining a solution that leaves
+///   `?s` unbound against a match that binds it *keeps* the row, so a scan
+///   reached through the optional side of a left join is not a row set this
+///   constraint can be moved onto.
+/// * **The slot is single-valued.** `:trafficKinds "m"` asks whether the array
+///   *contains* the value, which is not what a condition naming the column
+///   says. See [`PushComparisonFilter`] for why that ambiguity is declined
+///   rather than guessed.
+/// * **The constant is the term the column's values render as.** See
+///   [`constant_is_the_columns_term`]. Without it this rule would be the one
+///   that turns "no record renders as `eul:GSA`" into "no rows", which is a
+///   different answer rather than a narrower fetch.
+pub struct ConstantObjectBecomesFilter<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> ConstantObjectBecomesFilter<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+
+    /// The slot a constant-object match constrains on a scanned class, when
+    /// this rule can constrain it.
+    fn constrained_slot(&self, class_uri: &str, predicate: &str, term: &Term) -> Option<String> {
+        let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
+        let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
+        let on_class = class.slot(&Identifier::Name(slot.name.clone()))?;
+        if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue {
+            return None;
+        }
+        if !constant_is_the_columns_term(self.schema, class_uri, &slot.name, term) {
+            return None;
+        }
+        Some(slot.name.clone())
+    }
+}
+
+impl Rule for ConstantObjectBecomesFilter<'_> {
+    fn name(&self) -> &'static str {
+        "constant_object_becomes_filter"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+                continue;
+            };
+            // A type pattern with a constant object is the *scope*, not a
+            // value constraint on a slot, and folding it is the other rule's.
+            if is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(star), Some(predicate), Some(term)) = (
+                subject_variable(pattern),
+                predicate_iri(pattern),
+                constant_object(pattern),
+            ) else {
+                continue;
+            };
+            let (star, predicate) = (star.to_owned(), predicate.to_owned());
+
+            // The join that carried the match is the node that disappears, so
+            // the shape is checked before the schema: without it there is no
+            // edit to make even for a slot this rule could constrain.
+            let above = consumers(plan, id);
+            let [consumer] = above.as_slice() else {
+                continue;
+            };
+            let PlanOp::Join { left, right, on } = &plan.nodes[*consumer].op else {
+                continue;
+            };
+            if on.as_slice() != [star.clone()] {
+                continue;
+            }
+            let (consumer, other) = (*consumer, if *left == id { *right } else { *left });
+
+            let Some(class_uri) =
+                plan.nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(scan, node)| match &node.op {
+                        PlanOp::Scan {
+                            star_var,
+                            class_uri,
+                            ..
+                        } if node.executor == Executor::Sql
+                            && star_var == &star
+                            && mandatorily_feeds(plan, scan, other) =>
+                        {
+                            Some(class_uri.clone())
+                        }
+                        _ => None,
+                    })
+            else {
+                continue;
+            };
+            let Some(slot) = self.constrained_slot(&class_uri, &predicate, &term) else {
+                continue;
+            };
+
+            let condition = Expr::Compare {
+                op: CompareOp::Eq,
+                left: Box::new(Expr::Slot {
+                    star_var: star,
+                    slot_path: vec![slot],
+                }),
+                right: Box::new(Expr::Literal(term)),
+            };
+            replace_match_with_filter(plan, id, consumer, other, condition);
+            return true;
+        }
+        false
+    }
+}
+
+/// The term a triple pattern's object holds, when it is a constant.
+fn constant_object(pattern: &TriplePattern) -> Option<Term> {
+    match &pattern.object {
+        TermPattern::NamedNode(node) => Some(Term::NamedNode(node.clone())),
+        TermPattern::Literal(literal) => Some(Term::Literal(literal.clone())),
+        // A variable is a binding and not a constraint; a blank node names an
+        // existence the plan has no column for.
+        _ => None,
+    }
+}
+
+/// Drop the match, and turn the join that carried it into the filter, reading
+/// the side that stays.
+///
+/// The claims of both move to the filter. A naive join claims nothing, so the
+/// join's are empty in practice -- but a claim on a node that disappears has
+/// exactly one honest home, and losing it unbalances the ledger in a release
+/// build where the per-application check is only an assertion.
+fn replace_match_with_filter(
+    plan: &mut Plan,
+    matched: NodeId,
+    join: NodeId,
+    input: NodeId,
+    condition: Expr,
+) {
+    let mut claims = plan.nodes[matched].discharges.clone();
+    claims.extend(plan.nodes[join].discharges.iter().copied());
+    claims.sort_unstable();
+
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == matched {
+            continue;
+        }
+        if old == join {
+            // In the join's place, because everything that read the join
+            // reads the same solutions from the filter.
+            nodes.push(Node::engine(
+                PlanOp::Filter {
+                    input,
+                    condition: condition.clone(),
+                },
+                claims.clone(),
+            ));
+        } else {
+            nodes.push(node.clone());
+        }
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("nothing reads the match but the join"));
+    }
+
+    plan.nodes = nodes;
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,6 +1499,218 @@ mod tests {
             matches!(failure.defect, crate::sparql_refine::PlanDefect::Ledger(_)),
             "{failure}"
         );
+    }
+
+    /// What the rule is for: a constant object is a value constraint, so it
+    /// becomes a filter over the scan of its subject and the join that
+    /// carried it disappears. The filter is then pushable like any other.
+    #[test]
+    fn a_constant_object_becomes_a_pushed_filter() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?len WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" ; \
+             asset360:length ?len }",
+        );
+        let log = refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &ConstantObjectBecomesFilter::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+        assert!(
+            log.applied.contains(&"constant_object_becomes_filter"),
+            "{plan}"
+        );
+
+        assert!(
+            plan.find("match").is_empty(),
+            "the constant match is gone:\n{plan}"
+        );
+        assert!(
+            plan.find("join").is_empty(),
+            "and so is the join that carried it:\n{plan}"
+        );
+        let filter = plan.find("filter")[0];
+        assert_eq!(
+            plan.nodes[filter].op.describe(),
+            "(?s.name = \"BX517\")",
+            "{plan}"
+        );
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        // The obligation moves with the constraint: a constant object raises a
+        // *triple* obligation, and the filter that replaced the match is what
+        // takes care of it.
+        assert_eq!(
+            plan.nodes[filter]
+                .discharges
+                .iter()
+                .map(|id| plan.obligations[*id].to_string())
+                .collect::<Vec<_>>(),
+            vec!["triple    ?s asset360:name \"BX517\""],
+            "{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// Two constants on one star are two applications and two filters, and the
+    /// second one lands on the first -- which is what makes the chain the
+    /// filter rule sinks through something a rule can build as well as parse.
+    #[test]
+    fn two_constant_objects_become_two_filters() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" ; \
+             asset360:length 3 }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &ConstantObjectBecomesFilter::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert_eq!(plan.find("filter").len(), 2, "{plan}");
+        assert!(
+            plan.find("filter")
+                .iter()
+                .all(|id| plan.nodes[*id].executor == Executor::Sql),
+            "{plan}"
+        );
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert!(plan.find("join").is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// A constant object inside an `OPTIONAL` is consumed by a `LeftJoin`, and
+    /// a filter over the preserved side drops exactly the rows the join exists
+    /// to keep: a signal with no name would stop being an answer.
+    #[test]
+    fn a_constant_object_inside_an_optional_stays_a_match() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name \"BX517\" } }",
+        );
+        let log = refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &ConstantObjectBecomesFilter::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert!(
+            !log.applied.contains(&"constant_object_becomes_filter"),
+            "{plan}"
+        );
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
+        assert_eq!(plan.find("leftjoin").len(), 1, "{plan}");
+        assert!(plan.find("filter").is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// The other half of the optional precondition, and the one a structural
+    /// check alone misses: here the constant match *is* consumed by a plain
+    /// join, but the side it joins to reaches the scan of `?s` through the
+    /// optional side of a left join. A solution that leaves `?s` unbound is
+    /// compatible with a pattern that binds it, so that join keeps the row --
+    /// and a filter on the scan's column does not.
+    #[test]
+    fn a_constant_object_joined_through_an_optional_stays_a_match() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?s ?t WHERE { ?t a asset360:Track . \
+             OPTIONAL { ?s a asset360:Signal } . ?s asset360:name \"BX517\" }",
+        );
+        let log = refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &ConstantObjectBecomesFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert!(
+            !log.applied.contains(&"constant_object_becomes_filter"),
+            "the scan is reached through a left join:\n{plan}"
+        );
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
+        println!("{plan}");
+    }
+
+    /// A constant on a multivalued slot asks whether the array contains the
+    /// value, which is not what a condition naming the column says -- and the
+    /// scan's own fold declines it too, so the match stays whole.
+    #[test]
+    fn a_constant_on_a_multivalued_slot_stays_a_match() {
+        let schema = test_schema_view();
+        let mut plan =
+            plan_of("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }");
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &ConstantObjectBecomesFilter::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
+        assert!(plan.find("filter").is_empty(), "{plan}");
+    }
+
+    /// The same term test the filter rule applies, at the point the constant
+    /// enters the plan: an enum column stores `GSA` and its values render as
+    /// `eul:GSA`, so neither spelling is a condition on the column.
+    #[test]
+    fn a_constant_the_enum_column_never_spells_stays_a_match() {
+        let schema = test_schema_view();
+        let rules: [&dyn Rule; 3] = [
+            &FoldMatchesIntoScan::new(&schema),
+            &ConstantObjectBecomesFilter::new(&schema),
+            &PushComparisonFilter::new(&schema),
+        ];
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind \"GSA\" }",
+            "PREFIX eul: <http://ontorail.org/src/Eulynx/> \
+             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind eul:GSA }",
+        ] {
+            let mut plan = plan_of(query);
+            refine(&mut plan, &rules).expect("every invariant holds");
+            assert_eq!(plan.find("match").len(), 1, "{query}\n{plan}");
+            assert!(plan.find("filter").is_empty(), "{query}\n{plan}");
+        }
+    }
+
+    /// A star with no scan has no column to constrain, so the constant stays
+    /// where the query put it. The rule needs the class, not just the
+    /// predicate: which slot a predicate reads, and whether it holds one value,
+    /// is a fact about the class.
+    #[test]
+    fn a_constant_object_without_a_scan_stays_a_match() {
+        let schema = test_schema_view();
+        let mut plan = plan_of("SELECT ?s WHERE { ?s asset360:name \"BX517\" }");
+        let log = refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &ConstantObjectBecomesFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert!(log.applied.is_empty(), "{plan}");
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
     }
 
     /// Every `Sql` node as (kind, description, the obligations it claims).
