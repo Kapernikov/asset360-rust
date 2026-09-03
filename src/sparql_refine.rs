@@ -720,8 +720,20 @@ pub struct SortTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanSlot {
     pub path: Vec<String>,
-    /// The variable the folded `match` bound to this slot's value.
-    pub var: String,
+    /// The variable the folded `match` bound to this slot's value, when the
+    /// read binds one.
+    ///
+    /// `None` for a read that constrains the value without naming it: `?s
+    /// :name "BX517"` asserts that the slot exists *and* what it holds, and
+    /// the existence half is a slot the scan reads while the value half is a
+    /// condition above it. Today's star says the same thing by listing the
+    /// name in `required_fields` with no entry in `slot_variables`.
+    ///
+    /// A slot with no variable binds nothing, so nothing above the scan can
+    /// read it: no condition resolves through it, no join keys on it, and a
+    /// multivalued one owes no unnest -- there is no binding whose
+    /// multiplicity could be lost.
+    pub var: Option<String>,
     /// Whether the slot holds an array, so one record answers the query once
     /// per value.
     pub multivalued: bool,
@@ -1108,7 +1120,7 @@ pub fn scan_with_fanout(
     let fanning: Vec<(Vec<String>, String)> = slots
         .iter()
         .filter(|slot| slot.multivalued && slot.presence == SlotPresence::Required)
-        .map(|slot| (slot.path.clone(), slot.var.clone()))
+        .filter_map(|slot| slot.var.clone().map(|var| (slot.path.clone(), var)))
         .collect();
     let mut out = vec![Node::sql(
         PlanOp::Scan {
@@ -1368,10 +1380,9 @@ impl Plan {
             else {
                 continue;
             };
-            for slot in slots
-                .iter()
-                .filter(|slot| slot.multivalued && slot.presence == SlotPresence::Required)
-            {
+            for slot in slots.iter().filter(|slot| {
+                slot.multivalued && slot.presence == SlotPresence::Required && slot.var.is_some()
+            }) {
                 let restored = self.nodes.iter().enumerate().any(|(id, above)| {
                     matches!(
                         &above.op,
@@ -1389,7 +1400,7 @@ impl Plan {
                             // that fans out the right slot under the wrong
                             // name leaves that condition naming an element
                             // nothing bound.
-                            && var == &slot.var
+                            && Some(var) == slot.var.as_ref()
                     ) && self.feeds(scan_id, id)
                 });
                 if !restored {
@@ -1427,7 +1438,7 @@ impl Plan {
                             slot.multivalued
                                 && slot.presence == SlotPresence::Required
                                 && slot_path == &slot.path
-                                && &slot.var == var
+                                && slot.var.as_ref() == Some(var)
                         })
                 ) && self.feeds(scan_id, id)
             });
@@ -1481,7 +1492,7 @@ impl Plan {
                         // edge this vocabulary can express.
                         .any(|slot| {
                             slot.path.as_slice() == [edge.slot.clone()]
-                                && slot.var == edge.referenced
+                                && slot.var.as_deref() == Some(edge.referenced.as_str())
                                 // A delivered read is not a binding, so it
                                 // cannot be the key a join reads.
                                 && slot.presence == SlotPresence::Required
@@ -1672,9 +1683,12 @@ impl PlanOp {
                 slots
                     .iter()
                     .map(|slot| format!(
-                        "{}→?{}{}{}",
+                        "{}{}{}{}",
                         slot.path.join("."),
-                        slot.var,
+                        match &slot.var {
+                            Some(var) => format!("→?{var}"),
+                            None => String::new(),
+                        },
                         if slot.multivalued { "[]" } else { "" },
                         if slot.presence == SlotPresence::Delivered {
                             "?"
@@ -2655,7 +2669,7 @@ mod tests {
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
                 slots: vec![ScanSlot {
                     path: vec!["trafficKinds".to_owned()],
-                    var: "kind".to_owned(),
+                    var: Some("kind".to_owned()),
                     multivalued: true,
                     presence: SlotPresence::Required,
                 }],
@@ -2682,13 +2696,13 @@ mod tests {
         let slots = vec![
             ScanSlot {
                 path: vec!["hasName".to_owned()],
-                var: "nm".to_owned(),
+                var: Some("nm".to_owned()),
                 multivalued: false,
                 presence: SlotPresence::Required,
             },
             ScanSlot {
                 path: vec!["trafficKinds".to_owned()],
-                var: "kind".to_owned(),
+                var: Some("kind".to_owned()),
                 multivalued: true,
                 presence: SlotPresence::Required,
             },

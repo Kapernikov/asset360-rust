@@ -511,6 +511,367 @@ pub fn lower_sql_pass(
     OpTree { nodes }
 }
 
+// ---------------------------------------------------------------------------
+// Lowering a refined plan
+// ---------------------------------------------------------------------------
+
+/// Why a refined plan could not be lowered into operators.
+///
+/// A reason rather than a bare `None`, because the caller logs it: a fallback
+/// nobody can see is a fallback that becomes permanent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoweringRefusal {
+    /// No node runs in SQL, so there is nothing to render.
+    NothingPushed,
+    /// The `Sql` nodes form more than one island. The frontier is a *cut*, so
+    /// this is a legal plan -- an `OPTIONAL` over two stars is exactly it --
+    /// and it is not a statement: today's pass is one SQL query, and rendering
+    /// only one island would answer a narrower question than the pass claims.
+    /// The rule that would fix it pushes the left join itself.
+    SeveralIslands { islands: usize },
+    /// An operator the refined plan pushed that this lowering does not
+    /// translate. Every one of them is tier two, so a rule producing one is
+    /// ahead of the renderer rather than wrong.
+    UnknownOperator { kind: &'static str },
+    /// A pushed filter that does not render, or a pushed join with no
+    /// reference recorded. Both mean the plan claims SQL applies something SQL
+    /// cannot state, so refusing is the only safe answer.
+    Unrenderable { node: usize },
+}
+
+impl fmt::Display for LoweringRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NothingPushed => f.write_str("no operator runs in SQL"),
+            Self::SeveralIslands { islands } => write!(
+                f,
+                "the SQL frontier is {islands} islands, and a pass is one statement"
+            ),
+            Self::UnknownOperator { kind } => {
+                write!(f, "'{kind}' is pushed but this lowering cannot render it")
+            }
+            Self::Unrenderable { node } => {
+                write!(f, "n{node} is pushed but does not render")
+            }
+        }
+    }
+}
+
+/// The operator tree for the `Sql` frontier of a refined plan.
+///
+/// Lowering, not planning -- the same contract as [`lower_sql_pass`]. Every
+/// decision was made by the rules; this restates the result in the vocabulary
+/// `sql_builder.py` already renders, so the refined planner reaches the
+/// database through the path the differential oracle and the render tests
+/// already cover. Two node vocabularies is the duplication to remove, not to
+/// double.
+///
+/// The schema is needed for two facts the refined plan addresses *logically*
+/// and a renderer needs *physically*: whether a value compares as a number,
+/// and which slot is the class's identifier (whose values belong against the
+/// indexed `asset360_uri` column rather than the JSONB payload). Both come
+/// from the same `resolve_column` today's lowering uses, so the two cannot
+/// disagree about a column.
+pub fn lower_refined(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+) -> Result<OpTree, LoweringRefusal> {
+    use crate::sparql_refine::{Executor, PlanOp as RefinedOp, SlotPresence};
+
+    let sql: Vec<usize> = (0..plan.nodes.len())
+        .filter(|id| plan.nodes[*id].executor == Executor::Sql)
+        .collect();
+    if sql.is_empty() {
+        return Err(LoweringRefusal::NothingPushed);
+    }
+    // An island root is an `Sql` node no `Sql` node reads. One island is a
+    // statement; more than one is a plan whose frontier a single pass cannot
+    // express.
+    let roots: Vec<usize> = sql
+        .iter()
+        .copied()
+        .filter(|id| {
+            !plan
+                .nodes
+                .iter()
+                .any(|node| node.executor == Executor::Sql && node.op.inputs().contains(id))
+        })
+        .collect();
+    let [root] = roots.as_slice() else {
+        return Err(LoweringRefusal::SeveralIslands {
+            islands: roots.len(),
+        });
+    };
+    if !sql.iter().all(|id| plan.feeds(*id, *root)) {
+        return Err(LoweringRefusal::SeveralIslands { islands: 2 });
+    }
+
+    // A pass that answers the query enforces its filters; one that feeds the
+    // engine only narrows. The refined plan says which by whether anything
+    // above the frontier is left.
+    let enforcement = if plan.nodes.len() == sql.len() {
+        Enforcement::Enforces
+    } else {
+        Enforcement::Narrows
+    };
+
+    // Which class each star was scanned as, for the conditions and for the
+    // identifier hoist.
+    let classes: std::collections::HashMap<String, String> = plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            RefinedOp::Scan {
+                star_var,
+                class_uri,
+                ..
+            } => Some((star_var.clone(), class_uri.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let mut nodes: Vec<OpNode> = Vec::with_capacity(sql.len());
+    let mut remap: std::collections::HashMap<usize, OpId> = std::collections::HashMap::new();
+
+    for id in sql {
+        let node = &plan.nodes[id];
+        match &node.op {
+            RefinedOp::Scan {
+                star_var,
+                class_uri,
+                slots,
+            } => {
+                // Only a slot of the record itself is an existence check.
+                // A value further in is reached by walking into the column,
+                // which is what the path conditions do, and today's star does
+                // not check those either.
+                let column_slots = |presence: SlotPresence| -> Vec<String> {
+                    slots
+                        .iter()
+                        .filter(|slot| slot.presence == presence && slot.path.len() == 1)
+                        .map(|slot| slot.path[0].clone())
+                        .collect()
+                };
+                let identifier = identifier_slot_of(schema, class_uri);
+                nodes.push(OpNode {
+                    op: Op::Scan {
+                        star_var: star_var.clone(),
+                        class_uri: class_uri.clone(),
+                        // Filled by the filters below: a constraint on the
+                        // identifier slot belongs against the indexed column.
+                        identifier_values: Vec::new(),
+                        required_slots: column_slots(SlotPresence::Required)
+                            .into_iter()
+                            // The identifier's existence check is structurally
+                            // always true, and today's star leaves it out for
+                            // the same reason.
+                            .filter(|slot| Some(slot.as_str()) != identifier.as_deref())
+                            .collect(),
+                        optional_slots: column_slots(SlotPresence::Delivered),
+                        // No rule pushes a left join, so a scan this lowering
+                        // sees is never the optional side of one -- a plan
+                        // where it were has two islands and was refused above.
+                        is_optional: false,
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Unnest {
+                star_var,
+                slot_path,
+                ..
+            } => {
+                let input = remap[&node.op.inputs()[0]];
+                if enforcement == Enforcement::Narrows {
+                    // A fan-out makes row count equal *solution* count, which
+                    // only a pass that counts needs. This one hands rows to an
+                    // engine that re-runs the whole query, so the fan-out buys
+                    // nothing and costs the fetch a copy of the record per
+                    // element -- fifty traffic kinds, fifty identical records
+                    // triplified into the same graph. Dropping it is what
+                    // makes the conditions above weaken to a containment test;
+                    // see the filter arm.
+                    remap.insert(id, input);
+                    continue;
+                }
+                nodes.push(OpNode {
+                    op: Op::Unnest {
+                        input,
+                        star_var: star_var.clone(),
+                        slot_path: slot_path.clone(),
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Filter { condition, .. } => {
+                let Some(conditions) = condition.to_sql(schema, &classes) else {
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                };
+                let mut input = remap[&node.op.inputs()[0]];
+                // One node per condition, with the claim on the last of them:
+                // a conjunction is one obligation, and splitting the claim
+                // would leave the ledger describing conditions rather than
+                // demands.
+                let last = conditions.len() - 1;
+                for (index, condition) in conditions.into_iter().enumerate() {
+                    let discharges = if index == last {
+                        node.discharges.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    let class_uri = classes.get(&condition.star_var);
+                    // A constraint on the identifier slot is hoisted onto the
+                    // scan, against the indexed column. Rendering it as a
+                    // JSONB comparison would miss the B-tree, and today's star
+                    // hoists it for the same reason.
+                    let identifier = class_uri
+                        .and_then(|class_uri| identifier_slot_of(schema, class_uri))
+                        .is_some_and(|slot| condition.slot_path.as_slice() == [slot]);
+                    if identifier {
+                        let scan = scan_of_star(&mut nodes, &condition.star_var);
+                        if let Some(Op::Scan {
+                            identifier_values, ..
+                        }) = scan.map(|scan| &mut nodes[scan].op)
+                        {
+                            match &condition.condition {
+                                FilterCondition::Eq(value) => {
+                                    identifier_values.push(value.clone());
+                                }
+                                FilterCondition::In(values) => {
+                                    identifier_values.extend(values.iter().cloned());
+                                }
+                                // An ordering comparison on an identifier is
+                                // not a set of values, so it stays a filter --
+                                // the renderer collates the column itself.
+                                FilterCondition::Cmp { .. } => {
+                                    push_filter(
+                                        &mut nodes,
+                                        input,
+                                        &condition,
+                                        schema,
+                                        class_uri,
+                                        enforcement,
+                                        discharges,
+                                    );
+                                    input = nodes.len() - 1;
+                                    continue;
+                                }
+                            }
+                            if !discharges.is_empty() {
+                                nodes[scan.unwrap()].discharges.extend(discharges);
+                                nodes[scan.unwrap()].discharges.sort_unstable();
+                            }
+                            continue;
+                        }
+                    }
+                    push_filter(
+                        &mut nodes,
+                        input,
+                        &condition,
+                        schema,
+                        class_uri,
+                        enforcement,
+                        discharges,
+                    );
+                    input = nodes.len() - 1;
+                }
+            }
+            RefinedOp::Join {
+                left,
+                right,
+                reference,
+                ..
+            } => {
+                let Some(edge) = reference else {
+                    // A join the rules pushed without recording its edge
+                    // cannot be rendered: the renderer needs the slot that
+                    // holds the other row's identifier.
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                };
+                nodes.push(OpNode {
+                    op: Op::Join {
+                        left: remap[left],
+                        right: remap[right],
+                        left_star: edge.referenced.clone(),
+                        right_star: edge.holder.clone(),
+                        right_slot: edge.slot.clone(),
+                        // No rule pushes a left join, so a pushed join is
+                        // inner. The refusal above is what keeps that true.
+                        kind: JoinType::Inner,
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            other => {
+                return Err(LoweringRefusal::UnknownOperator { kind: other.kind() });
+            }
+        }
+        remap.insert(id, nodes.len() - 1);
+    }
+
+    Ok(OpTree { nodes })
+}
+
+/// The scan node for a star, in a tree being built.
+fn scan_of_star(nodes: &mut [OpNode], star_var: &str) -> Option<OpId> {
+    nodes.iter().position(
+        |node| matches!(&node.op, Op::Scan { star_var: scanned, .. } if scanned == star_var),
+    )
+}
+
+/// Append one filter operator, resolving the physical facts the condition does
+/// not carry.
+fn push_filter(
+    nodes: &mut Vec<OpNode>,
+    input: OpId,
+    condition: &crate::sparql_refine::SqlCondition,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    class_uri: Option<&String>,
+    enforcement: Enforcement,
+    discharges: Vec<ObligationId>,
+) {
+    // Numeric-ness is a property of the column, not of the condition, which is
+    // why the condition names a slot rather than carrying SQL: the renderer
+    // has to cast, or `'9' >= '10'` is true. Resolved through the same
+    // `resolve_column` today's lowering uses.
+    let numeric = class_uri.is_some_and(|class_uri| {
+        crate::sparql_scoper::numeric_at_path(schema, class_uri, &condition.slot_path)
+    });
+    // A condition on the element an unnest bound cannot name that element
+    // where the unnest was dropped, so it becomes the containment test that
+    // *narrows* to the same records -- one row per record instead of one per
+    // matching value, which is the shape a fetch wants and the shape today's
+    // star renders. Sound only in the narrowing direction: a pass that
+    // answers alone keeps its fan-out and its element condition, because
+    // "some element matches" counts a record once where SPARQL counts its
+    // matching values.
+    let reading = match (enforcement, condition.reading) {
+        (Enforcement::Narrows, SlotReading::BoundElement) => SlotReading::AnyElement,
+        (_, reading) => reading,
+    };
+    nodes.push(OpNode {
+        op: Op::Filter {
+            input,
+            star_var: condition.star_var.clone(),
+            slot_path: condition.slot_path.clone(),
+            condition: condition.condition.clone(),
+            enforcement,
+            numeric,
+            reading,
+        },
+        discharges,
+    });
+}
+
+/// The name of a class's identifier slot, when it has one.
+fn identifier_slot_of(
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    class_uri: &str,
+) -> Option<String> {
+    let class = schema.get_class_by_uri(class_uri).ok().flatten()?;
+    class.identifier_slot().map(|slot| slot.name.clone())
+}
+
 impl OpTree {
     pub fn root(&self) -> Option<&OpNode> {
         self.nodes.last()
@@ -563,6 +924,7 @@ mod tests {
     use super::*;
     use crate::sparql_plan::{PassKind, plan_query};
     use crate::sparql_scoper::tests::test_schema_view;
+    use linkml_schemaview::schemaview::SchemaView;
 
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
@@ -577,6 +939,301 @@ mod tests {
                 PassKind::Engine(_) => None,
             })
             .collect()
+    }
+
+    /// Every refined plan the rules produce for these queries lowers, and the
+    /// tree it lowers to is well formed -- the invariant a renderer walking
+    /// the list in order depends on.
+    #[test]
+    fn a_refined_plan_lowers_to_a_well_formed_tree() {
+        let sv = test_schema_view();
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Signal }",
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(?nm > \"A\") }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" ; \
+             asset360:length 3 }",
+            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             FILTER(?k = \"m\") }",
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn }",
+            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } }",
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             VALUES ?nm { \"a\" \"b\" } }",
+        ] {
+            let tree = lowered(query, &sv).unwrap_or_else(|refusal| {
+                panic!("{query} did not lower: {refusal}");
+            });
+            assert!(tree.is_well_formed(), "{query}");
+            assert!(!tree.nodes.is_empty(), "{query}");
+        }
+    }
+
+    /// The refined plan and today's planner render the same statement.
+    ///
+    /// The gate that matters at this level: the operators are what
+    /// `sql_builder.py` reads, so two trees that agree node for node produce
+    /// the same SQL. Compared as *data* rather than as SQL text because the
+    /// renderer lives in Python -- `tests/test_ops_render.py` closes that half
+    /// by rendering both.
+    #[test]
+    fn the_two_planners_lower_to_the_same_row_set() {
+        let sv = test_schema_view();
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Signal }",
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(?nm > \"A\") }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }",
+            "SELECT ?len WHERE { ?s a asset360:Signal ; asset360:length ?len . \
+             FILTER(?len >= 10) }",
+            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             FILTER(?k = \"m\") }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }",
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn }",
+            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u\" }",
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             VALUES ?nm { \"a\" \"b\" } }",
+        ] {
+            let refined = lowered(query, &sv)
+                .unwrap_or_else(|refusal| panic!("{query} did not lower: {refusal}"));
+            let passes = sql_passes(query);
+            let [(_, today)] = passes.as_slice() else {
+                panic!("{query} does not have exactly one SQL pass today");
+            };
+            assert_eq!(
+                row_set(&refined),
+                row_set(today),
+                "the two planners disagree about the statement for {query}"
+            );
+        }
+    }
+
+    /// The row set as data: what a renderer reads out of the operators, with
+    /// the order of a star's own conditions normalised away.
+    ///
+    /// `Star::filters` is a `HashMap`, so today's lowering emits one star's
+    /// conditions in whatever order it iterates; the refined plan emits them
+    /// in the order the query wrote them. A conjunction of `WHERE` clauses
+    /// means the same thing either way, so the difference is not one to hold a
+    /// planner to.
+    fn row_set(tree: &OpTree) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut conditions: Vec<String> = Vec::new();
+        for node in &tree.nodes {
+            match &node.op {
+                Op::Scan {
+                    star_var,
+                    class_uri,
+                    identifier_values,
+                    required_slots,
+                    optional_slots,
+                    is_optional,
+                } => {
+                    let mut identifiers = identifier_values.clone();
+                    identifiers.sort();
+                    let mut required = required_slots.clone();
+                    required.sort();
+                    let mut optional = optional_slots.clone();
+                    optional.sort();
+                    out.push(format!(
+                        "scan ?{star_var} {class_uri} ids={identifiers:?} \
+                         req={required:?} opt={optional:?} optional={is_optional}"
+                    ));
+                }
+                Op::Filter {
+                    star_var,
+                    slot_path,
+                    condition,
+                    numeric,
+                    reading,
+                    ..
+                } => conditions.push(format!(
+                    "filter ?{star_var}.{} {condition} numeric={numeric} reading={reading}",
+                    slot_path.join(".")
+                )),
+                Op::Join {
+                    left_star,
+                    right_star,
+                    right_slot,
+                    kind,
+                    ..
+                } => out.push(format!(
+                    "join ?{left_star} ?{right_star}.{right_slot} {kind:?}"
+                )),
+                Op::Unnest {
+                    star_var,
+                    slot_path,
+                    ..
+                } => out.push(format!("unnest ?{star_var}.{}", slot_path.join("."))),
+                other => out.push(other.kind().to_owned()),
+            }
+        }
+        conditions.sort();
+        out.extend(conditions);
+        out
+    }
+
+    /// A narrowing pass drops the fan-out and weakens the element condition to
+    /// a containment test.
+    ///
+    /// Both halves are one decision. The fan-out makes row count equal
+    /// *solution* count, which only a pass that counts needs; this one hands
+    /// rows to an engine that re-runs the query, so keeping it would fetch a
+    /// copy of the record per element for nothing. And once the unnest is
+    /// gone, a condition naming the element it bound has nothing to name, so
+    /// it becomes the test that narrows to the same records.
+    ///
+    /// Sound only in this direction. A pass that answers alone keeps both:
+    /// "some element matches" counts a record once where SPARQL counts its
+    /// matching values, which is the D11-shaped error the fan-out exists to
+    /// prevent.
+    #[test]
+    fn a_narrowing_pass_reads_the_record_and_not_the_element() {
+        let sv = test_schema_view();
+        let query = "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+                     FILTER(?k = \"m\") }";
+        let plan = refined_plan(query, &sv);
+        // The refined plan itself says element: the unnest is there and the
+        // condition names what it bound.
+        assert_eq!(plan.find("unnest").len(), 1, "{plan}");
+        assert!(
+            plan.nodes[plan.find("filter")[0]]
+                .op
+                .describe()
+                .contains("[each]"),
+            "{plan}"
+        );
+
+        let tree = lower_refined(&plan, &sv).expect("should lower");
+        assert!(
+            tree.find("unnest").is_empty(),
+            "a narrowing fetch does not fan out"
+        );
+        let Op::Filter {
+            reading,
+            enforcement,
+            ..
+        } = &tree.nodes[tree.find("filter")[0]].op
+        else {
+            panic!("the second node is the filter");
+        };
+        assert_eq!(*reading, SlotReading::AnyElement);
+        assert_eq!(*enforcement, Enforcement::Narrows);
+    }
+
+    /// A refined plan whose `Sql` nodes are two islands is a legal plan and
+    /// not a statement, so the lowering refuses rather than rendering one of
+    /// them and answering a narrower question.
+    ///
+    /// The shape is an `OPTIONAL` over a second star: nothing pushes a left
+    /// join, so the two scans have no `Sql` node joining them.
+    #[test]
+    fn two_islands_do_not_lower() {
+        let sv = test_schema_view();
+        let refusal = lowered(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
+            &sv,
+        )
+        .expect_err("two islands must not lower");
+        assert!(
+            matches!(refusal, LoweringRefusal::SeveralIslands { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// A plan with nothing pushed has nothing to render, which is a refusal
+    /// and not an empty statement -- an empty statement would fetch every row
+    /// of every class.
+    #[test]
+    fn a_plan_with_nothing_pushed_does_not_lower() {
+        let sv = test_schema_view();
+        let refusal = lowered("SELECT ?s WHERE { VALUES ?s { \"a\" \"b\" } }", &sv)
+            .expect_err("nothing pushed must not lower");
+        assert_eq!(refusal, LoweringRefusal::NothingPushed);
+    }
+
+    /// The identifier slot's values are hoisted onto the scan, against the
+    /// indexed column, exactly as today's star hoists them -- a JSONB
+    /// comparison would miss the B-tree.
+    #[test]
+    fn an_identifier_constraint_is_hoisted_onto_the_scan() {
+        let sv = test_schema_view();
+        let tree = lowered(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u\" }",
+            &sv,
+        )
+        .expect("should lower");
+        let Op::Scan {
+            identifier_values,
+            required_slots,
+            ..
+        } = &tree.nodes[0].op
+        else {
+            panic!("the first node is the scan");
+        };
+        assert_eq!(identifier_values, &vec!["u".to_owned()]);
+        assert!(
+            required_slots.is_empty(),
+            "every row has an identifier, so the existence check is structurally true"
+        );
+        assert!(
+            tree.find("filter").is_empty(),
+            "hoisted, not rendered twice"
+        );
+        // The claim moves with it: the triple is discharged by the scan, so
+        // the ledger still accounts for it.
+        assert_eq!(tree.claims().len(), 2, "the type and the identifier value");
+    }
+
+    /// Refinement moves claims, never invents them: what the lowered tree
+    /// claims is what the refined plan's `Sql` nodes claimed.
+    #[test]
+    fn lowering_carries_the_claims_across() {
+        let sv = test_schema_view();
+        for query in [
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(?nm > \"A\") }",
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn }",
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" ; \
+             asset360:length 3 }",
+        ] {
+            let plan = refined_plan(query, &sv);
+            let tree = lowered(query, &sv).expect("should lower");
+            let mut expected: Vec<ObligationId> = plan
+                .nodes
+                .iter()
+                .filter(|node| node.executor == crate::sparql_refine::Executor::Sql)
+                .flat_map(|node| node.discharges.iter().copied())
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(tree.claims(), expected, "{query}\n{plan}");
+        }
+    }
+
+    /// A refined plan, to fixpoint.
+    fn refined_plan(query: &str, sv: &SchemaView) -> crate::sparql_refine::Plan {
+        let rules = crate::sparql_rules::tier_one_rules(sv);
+        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+            rules.iter().map(|rule| rule.as_ref()).collect();
+        let mut plan = crate::sparql_refine::naive_plan_of(&format!("{PREFIX}{query}"))
+            .expect("should build a naive plan");
+        crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
+        plan
+    }
+
+    fn lowered(query: &str, sv: &SchemaView) -> Result<OpTree, LoweringRefusal> {
+        lower_refined(&refined_plan(query, sv), sv)
     }
 
     /// A condition on a multivalued slot is a test over the array's elements,

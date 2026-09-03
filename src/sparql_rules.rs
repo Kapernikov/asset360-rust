@@ -246,7 +246,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
                 id,
                 ScanSlot {
                     path: vec![slot.name.clone()],
-                    var: var.to_owned(),
+                    var: Some(var.to_owned()),
                     multivalued: on_class.determine_slot_container_mode()
                         != SlotContainerMode::SingleValue,
                     // A read the query wrote outside an `OPTIONAL` requires
@@ -570,7 +570,9 @@ impl Visible {
                 // variable instead of resolving it through another star's
                 // slot of the same name.
                 if slot.presence == SlotPresence::Delivered {
-                    slots.insert(slot.var.clone(), None);
+                    if let Some(var) = slot.var.clone() {
+                        slots.insert(var, None);
+                    }
                     continue;
                 }
                 // A multivalued slot's variable is one *element*, and it is
@@ -579,11 +581,16 @@ impl Visible {
                 // not happened yet -- so the variable resolves to nothing
                 // rather than to the array, which would select records where
                 // the query selects rows.
+                // A read that binds no variable is not visible to anything
+                // above: there is no name to resolve.
+                let Some(bound) = slot.var.clone() else {
+                    continue;
+                };
                 let reading = if slot.multivalued {
-                    if unnest_below(plan, base, star_var, &slot.path, &slot.var) {
+                    if unnest_below(plan, base, star_var, &slot.path, &bound) {
                         SlotReading::BoundElement
                     } else {
-                        slots.insert(slot.var.clone(), None);
+                        slots.insert(bound, None);
                         continue;
                     }
                 } else {
@@ -594,7 +601,7 @@ impl Visible {
                     path: slot.path.clone(),
                     reading,
                 };
-                match slots.entry(slot.var.clone()) {
+                match slots.entry(bound) {
                     Entry::Vacant(entry) => {
                         entry.insert(Some(binding));
                     }
@@ -726,7 +733,10 @@ impl Rule for DeliverOptionalRead<'_> {
                 if node.executor != Executor::Sql || star_var != &star {
                     return None;
                 }
-                if slots.iter().any(|slot| slot.var == var) {
+                if slots
+                    .iter()
+                    .any(|slot| slot.var.as_deref() == Some(var.as_str()))
+                {
                     return None;
                 }
                 let optional = plan.nodes.iter().any(|above| {
@@ -749,7 +759,7 @@ impl Rule for DeliverOptionalRead<'_> {
             };
             let delivered = ScanSlot {
                 path: vec![slot.name.clone()],
-                var,
+                var: Some(var),
                 multivalued: on_class.determine_slot_container_mode()
                     != SlotContainerMode::SingleValue,
                 presence: SlotPresence::Delivered,
@@ -823,7 +833,14 @@ fn subject_site(plan: &Plan, other: NodeId, subject: &str) -> Option<SubjectSite
             // a third reading of the address, which nothing renders. The
             // star decomposition walks single-valued hops only, for the
             // same reason.
-            .find(|slot| slot.var == subject && !slot.multivalued)
+            .find(|slot| {
+                slot.var.as_deref() == Some(subject)
+                    && !slot.multivalued
+                    // Walking into a value that may be absent would put a
+                    // condition two slots down on the preserved side of a left
+                    // join, dropping the rows it exists to keep.
+                    && slot.presence == SlotPresence::Required
+            })
             .map(|slot| SubjectSite {
                 scan,
                 star_var: star_var.clone(),
@@ -980,7 +997,7 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
                 site.scan,
                 ScanSlot {
                     path,
-                    var,
+                    var: Some(var),
                     multivalued: false,
                     presence: SlotPresence::Required,
                 },
@@ -1097,7 +1114,7 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
     /// The term test is not repeated here: [`Expr::to_sql`] is the only way to
     /// obtain a condition and asks it, so a constant no record spells declines
     /// at the same place for this rule as for every other.
-    fn condition_for(&self, site: &SubjectSite, predicate: &str, term: &Term) -> Option<Expr> {
+    fn condition_for(&self, site: &SubjectSite, predicate: &str, term: &Term) -> Option<Read> {
         let class = class_at_path(self.schema, &site.class_uri, &site.prefix)?;
         let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
         let on_class = class.slot(&Identifier::Name(slot.name.clone()))?;
@@ -1126,8 +1143,20 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         };
         let classes = HashMap::from([(site.star_var.clone(), site.class_uri.clone())]);
         condition.to_sql(self.schema, &classes)?;
-        Some(condition)
+        Some(Read {
+            condition,
+            slot: slot.name.clone(),
+            multivalued: reading != SlotReading::Column,
+        })
     }
+}
+
+/// What a constant-object match is worth: the condition on the value, and the
+/// slot whose presence it also asserts.
+struct Read {
+    condition: Expr,
+    slot: String,
+    multivalued: bool,
 }
 
 impl Rule for ConstantObjectBecomesFilter<'_> {
@@ -1178,10 +1207,35 @@ impl Rule for ConstantObjectBecomesFilter<'_> {
             let Some(site) = subject_site(plan, other, &subject) else {
                 continue;
             };
-            let Some(condition) = self.condition_for(&site, &predicate, &term) else {
+            let Some(read) = self.condition_for(&site, &predicate, &term) else {
                 continue;
             };
-            replace_match_with_filter(plan, id, consumer, other, condition);
+            // The existence half of the triple, on the scan. `?s :name
+            // "BX517"` asserts that the slot is there as well as what it
+            // holds, and today's star says so too: the name is in
+            // `required_fields` beside the condition in `filters`. It is not
+            // pedantry -- `object_data ? 'name'` is the half a GIN index can
+            // answer, and dropping it changes which index the statement can
+            // use.
+            //
+            // It claims nothing: the filter is what takes care of the
+            // obligation, and this is the narrowing that comes with it.
+            let mut path = site.prefix.clone();
+            path.push(read.slot);
+            let existence = ScanSlot {
+                path,
+                var: None,
+                multivalued: read.multivalued,
+                presence: SlotPresence::Required,
+            };
+            if let PlanOp::Scan { slots, .. } = &mut plan.nodes[site.scan].op
+                && !slots
+                    .iter()
+                    .any(|slot| slot.path == existence.path && slot.var.is_none())
+            {
+                slots.push(existence);
+            }
+            replace_match_with_filter(plan, id, consumer, other, read.condition);
             return true;
         }
         false
@@ -1705,7 +1759,7 @@ impl<'s> PushReferenceJoin<'s> {
                 } if node.executor == Executor::Sql && plan.feeds(id, holder) => slots
                     .iter()
                     .find(|slot| {
-                        slot.var == joined
+                        slot.var.as_deref() == Some(joined)
                             && slot.presence == SlotPresence::Required
                             && !slot.multivalued
                             // A foreign key is a column of the record. A
@@ -1859,7 +1913,13 @@ mod tests {
                 _ => None,
             })
             .flatten()
-            .map(|slot| (slot.path.join("."), slot.var, slot.multivalued))
+            .map(|slot| {
+                (
+                    slot.path.join("."),
+                    slot.var.unwrap_or_default(),
+                    slot.multivalued,
+                )
+            })
             .collect()
     }
 

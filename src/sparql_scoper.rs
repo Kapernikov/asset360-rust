@@ -2237,6 +2237,23 @@ pub(crate) fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &s
     )
 }
 
+/// Whether the value at this path compares as a number rather than as text.
+///
+/// The fact a `SqlCondition` deliberately does not carry: it names a slot, and
+/// how that slot's values compare is the renderer's to resolve -- from the
+/// same `resolve_column` `Star::numeric_fields` comes from, so a lowered
+/// condition and a scoped one cannot disagree about a column.
+pub(crate) fn numeric_at_path(
+    schema_view: &SchemaView,
+    class_uri: &str,
+    slot_path: &[String],
+) -> bool {
+    matches!(
+        push_form_of_path(schema_view, class_uri, slot_path),
+        PushForm::Literal { numeric: true, .. }
+    )
+}
+
 /// The same question about a value further inside the record.
 ///
 /// `resolve_column` walks a path already -- that is how a `PathFilter` learns
