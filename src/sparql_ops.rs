@@ -31,6 +31,8 @@
 //! only be inferred by comparing two structures. [`Enforcement`] states it, so
 //! a rule can ask a node directly whether removing it would change the answer.
 
+use std::fmt;
+
 use crate::sparql_plan::ObligationId;
 use crate::sparql_pushdown::{BindingSpec, MeasureSpec, OrderTerm};
 use crate::sparql_scoper::{FilterCondition, JoinType};
@@ -52,6 +54,60 @@ pub enum Enforcement {
     /// The case this exists for: a comparison SQL can express approximately,
     /// where the engine still applies SPARQL's term semantics afterwards.
     Narrows,
+}
+
+/// How to read the value a `(star, slot_path)` address names.
+///
+/// The fact 28d's `Slot` was missing, and the reason a rule could not push a
+/// condition on a multivalued slot at all: one address means three different
+/// things, and they select different rows.
+///
+/// The lesson is stage 1's, with a second instance. [`crate::sparql_refine::ScanSlot`] carries
+/// `multivalued` because a plan whose scan slots are bare names cannot see a
+/// cardinality error; an address with no reading cannot see this one. A
+/// consumer handed `(?s, [trafficKinds], = 'm')` and nothing else has to guess
+/// between an equality that matches no array, a containment test over the
+/// array, and a comparison against one unnested element -- and two of those
+/// answer a different question than the query asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotReading {
+    /// The column's own value: `object_data->>'name'`. Only correct for a
+    /// single-valued slot -- on an array it compares the array's text and
+    /// matches nothing.
+    Column,
+    /// Some element of the array the column holds. `?s :trafficKinds "m"` asks
+    /// whether the record carries that triple at all, which is a containment
+    /// test -- `EXISTS (SELECT 1 FROM jsonb_array_elements_text(...))`, what
+    /// the star decomposition's `multivalued_fields` tells its renderer to do
+    /// -- and matches a record once however many values it holds.
+    AnyElement,
+    /// The element a [`Op::Unnest`] below bound to a variable. One row per
+    /// value, so a condition on it selects *rows* rather than records, which
+    /// is what SPARQL means by `?s :trafficKinds ?k . FILTER(?k = "m")`: one
+    /// solution per matching value, not every value of a matching record.
+    BoundElement,
+}
+
+impl SlotReading {
+    /// The name a consumer outside Rust reads. Stable: a renderer switches on
+    /// it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Column => "column",
+            Self::AnyElement => "any_element",
+            Self::BoundElement => "bound_element",
+        }
+    }
+}
+
+impl fmt::Display for SlotReading {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Column => Ok(()),
+            Self::AnyElement => f.write_str("[any]"),
+            Self::BoundElement => f.write_str("[each]"),
+        }
+    }
 }
 
 /// One step of the SQL leaf.
@@ -97,6 +153,18 @@ pub enum Op {
         slot_path: Vec<String>,
         condition: FilterCondition,
         enforcement: Enforcement,
+        /// Which value at that path the condition holds of.
+        ///
+        /// Carried for the same reason as `numeric`, and it was missing: a
+        /// condition on a multivalued slot is a test over the array's
+        /// *elements*, and rendering it as an equality on the column compares
+        /// the array's text and matches nothing. The star decomposition tells
+        /// its renderer through `Star::multivalued_fields`; an operator tree
+        /// had no way to say it, so the renderer reading operators rendered
+        /// `object_data->>'trafficKinds' = 'm'` where the other path rendered
+        /// an `EXISTS` over the elements -- no rows for a query with an
+        /// answer.
+        reading: SlotReading,
         /// Whether the value compares as a number rather than as text.
         ///
         /// Carried per node because it cannot be recovered from the path: the
@@ -254,6 +322,15 @@ pub fn lower_sql_pass(
         // the path, which the node carries.
         for (slot, conditions) in &star.filters {
             let numeric = star.numeric_fields.iter().any(|field| field == slot);
+            // A condition the query wrote on a multivalued slot is a
+            // containment test over the record's array: `?s :kinds "m"` and
+            // `FILTER(?k = "m")` both ask whether the record carries the
+            // triple, which matches it once.
+            let reading = if star.multivalued_fields.iter().any(|field| field == slot) {
+                SlotReading::AnyElement
+            } else {
+                SlotReading::Column
+            };
             for condition in conditions {
                 let input = root_by_star[&star.variable];
                 nodes.push(OpNode {
@@ -264,6 +341,7 @@ pub fn lower_sql_pass(
                         condition: condition.clone(),
                         enforcement,
                         numeric,
+                        reading,
                     },
                     discharges: Vec::new(),
                 });
@@ -281,6 +359,11 @@ pub fn lower_sql_pass(
                         condition: condition.clone(),
                         enforcement,
                         numeric: path_filter.numeric,
+                        // Only single-valued hops become a path filter, and
+                        // only a single-valued value at the end of one -- the
+                        // scoper leaves an array to the engine, so a path
+                        // condition names a column.
+                        reading: SlotReading::Column,
                     },
                     discharges: Vec::new(),
                 });
@@ -494,6 +577,59 @@ mod tests {
                 PassKind::Engine(_) => None,
             })
             .collect()
+    }
+
+    /// A condition on a multivalued slot is a test over the array's elements,
+    /// and the operator has to say so.
+    ///
+    /// The bug this fixes was live: a renderer reading operators had no way to
+    /// know, so it rendered `object_data->>'trafficKinds' = 'm'` where the
+    /// star decomposition rendered an `EXISTS` over the elements. That returns
+    /// no rows for a query with an answer -- and it is a *fetch* for an engine
+    /// that re-runs the query, so the endpoint answered nothing rather than
+    /// answering slowly.
+    #[test]
+    fn a_condition_on_an_array_says_it_reads_the_elements() {
+        let readings = |query: &str| -> Vec<(Vec<String>, SlotReading)> {
+            sql_passes(query)
+                .into_iter()
+                .flat_map(|(_, tree)| tree.nodes)
+                .filter_map(|node| match node.op {
+                    Op::Filter {
+                        slot_path, reading, ..
+                    } => Some((slot_path, reading)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            readings("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }"),
+            vec![(vec!["trafficKinds".to_owned()], SlotReading::AnyElement)],
+        );
+        assert_eq!(
+            readings(
+                "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+                 FILTER(?k = \"m\") }"
+            ),
+            vec![(vec!["trafficKinds".to_owned()], SlotReading::AnyElement)],
+        );
+        // A single-valued slot names a column, and so does a value inside a
+        // structure: the scoper walks single-valued hops only.
+        assert_eq!(
+            readings("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }"),
+            vec![(vec!["name".to_owned()], SlotReading::Column)],
+        );
+        assert_eq!(
+            readings(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+                 ?loc asset360:longitude 5 }"
+            ),
+            vec![(
+                vec!["location".to_owned(), "longitude".to_owned()],
+                SlotReading::Column
+            )],
+        );
     }
 
     /// The invariant every rewrite has to preserve, checked on what the planner

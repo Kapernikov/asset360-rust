@@ -74,6 +74,7 @@ use spargebra::algebra::{
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, Term, TermPattern, TriplePattern, Variable};
 
+pub use crate::sparql_ops::SlotReading;
 use crate::sparql_plan::{LedgerError, Obligation, ObligationId, obligation_of_triple, shorten};
 use crate::sparql_scoper::{FilterCondition, PushForm, ScopeError, literal_pushable};
 
@@ -274,48 +275,6 @@ pub enum Expr {
     /// to reason about it, and "there is an EXISTS here, and no rule pushes
     /// it" is the whole of that reasoning today.
     Opaque(String),
-}
-
-/// How to read the value a `(star, slot_path)` address names.
-///
-/// The fact 28d's `Slot` was missing, and the reason a rule could not push a
-/// condition on a multivalued slot at all: one address means three different
-/// things, and they select different rows.
-///
-/// The lesson is stage 1's, with a second instance. `ScanSlot` carries
-/// `multivalued` because a plan whose scan slots are bare names cannot see a
-/// cardinality error; an address with no reading cannot see this one. A
-/// consumer handed `(?s, [trafficKinds], = 'm')` and nothing else has to guess
-/// between an equality that matches no array, a containment test over the
-/// array, and a comparison against one unnested element -- and two of those
-/// answer a different question than the query asked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotReading {
-    /// The column's own value: `object_data->>'name'`. Only correct for a
-    /// single-valued slot -- on an array it compares the array's text and
-    /// matches nothing.
-    Column,
-    /// Some element of the array the column holds. `?s :trafficKinds "m"` asks
-    /// whether the record carries that triple at all, which is a containment
-    /// test -- `EXISTS (SELECT 1 FROM jsonb_array_elements_text(...))`, what
-    /// the star decomposition's `multivalued_fields` tells its renderer to do
-    /// -- and matches a record once however many values it holds.
-    AnyElement,
-    /// The element a [`PlanOp::Unnest`] below bound to a variable. One row per
-    /// value, so a condition on it selects *rows* rather than records, which
-    /// is what SPARQL means by `?s :trafficKinds ?k . FILTER(?k = "m")`: one
-    /// solution per matching value, not every value of a matching record.
-    BoundElement,
-}
-
-impl fmt::Display for SlotReading {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Column => Ok(()),
-            Self::AnyElement => f.write_str("[any]"),
-            Self::BoundElement => f.write_str("[each]"),
-        }
-    }
 }
 
 /// A comparison SQL can express, in the vocabulary the renderer already

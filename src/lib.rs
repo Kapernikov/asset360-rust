@@ -2441,6 +2441,28 @@ impl PlanOp {
         }
     }
 
+    /// For ``"filter"``: which value at ``slot_path`` the condition holds of
+    /// — ``"column"``, ``"any_element"`` or ``"bound_element"``.
+    ///
+    /// A renderer that ignores this renders a containment test as an equality
+    /// on an array, which compares the array's text and matches nothing.
+    ///
+    /// * ``"column"`` — the column's own value: ``object_data->>'slot'``.
+    /// * ``"any_element"`` — the array *contains* a value satisfying the
+    ///   condition: ``EXISTS (SELECT 1 FROM
+    ///   jsonb_array_elements_text(object_data->'slot') …)``. Matches a record
+    ///   once however many values it holds.
+    /// * ``"bound_element"`` — the element an ``unnest`` below bound, so the
+    ///   condition selects rows rather than records.
+    #[getter]
+    fn reading(&self) -> Option<&'static str> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { reading, .. } => Some(reading.as_str()),
+            _ => None,
+        }
+    }
+
     /// For ``"join"``: the slot on the right input whose value is the left
     /// row's ``asset360_uri``.
     #[getter]
