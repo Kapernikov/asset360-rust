@@ -518,23 +518,7 @@ pub fn obligations_of(query: &Query) -> Result<Vec<Obligation>, ScopeError> {
     let mut triples = Vec::new();
     crate::sparql_scoper::tag_triples_by_depth(pattern, 0, &mut triples)?;
     for (triple, _depth) in triples {
-        let subject = term_text(&triple.subject.clone());
-        let object = term_text(&triple.object);
-        match &triple.predicate {
-            spargebra::term::NamedNodePattern::NamedNode(node)
-                if node.as_str() == crate::sparql_scoper::RDF_TYPE =>
-            {
-                out.push(Obligation::Type {
-                    subject,
-                    class_iri: strip_angles(&object),
-                });
-            }
-            predicate => out.push(Obligation::Triple {
-                subject,
-                predicate: format!("{predicate}"),
-                object,
-            }),
-        }
+        out.push(obligation_of_triple(triple));
     }
 
     // `(COUNT(*) AS ?n)` is a `Group` binding an internal variable plus an
@@ -545,6 +529,32 @@ pub fn obligations_of(query: &Query) -> Result<Vec<Obligation>, ScopeError> {
     collect_aliases(pattern, &mut aliases);
     collect_modifiers(pattern, &aliases, &mut out);
     Ok(out)
+}
+
+/// The obligation one triple pattern raises.
+///
+/// Extracted so a second planner can ask what a pattern obliges without
+/// re-deriving the answer: [`crate::sparql_refine`] matches a node against
+/// this rather than trusting that the obligation at the same index came from
+/// the same triple.
+pub(crate) fn obligation_of_triple(triple: &spargebra::term::TriplePattern) -> Obligation {
+    let subject = term_text(&triple.subject);
+    let object = term_text(&triple.object);
+    match &triple.predicate {
+        spargebra::term::NamedNodePattern::NamedNode(node)
+            if node.as_str() == crate::sparql_scoper::RDF_TYPE =>
+        {
+            Obligation::Type {
+                subject,
+                class_iri: strip_angles(&object),
+            }
+        }
+        predicate => Obligation::Triple {
+            subject,
+            predicate: format!("{predicate}"),
+            object,
+        },
+    }
 }
 
 /// Internal aggregate variable → the name the query gave it.
@@ -656,7 +666,7 @@ fn term_text(term: &spargebra::term::TermPattern) -> String {
 /// The prefixes the shared parser preloads, which are the ones a reader of a
 /// plan has in their head. Anything else prints in full rather than guessing at
 /// a prefix the query did not declare.
-fn shorten(iri: &str) -> String {
+pub(crate) fn shorten(iri: &str) -> String {
     const KNOWN: [(&str, &str); 4] = [
         ("https://data.infrabel.be/asset360/", "asset360"),
         ("https://data.infrabel.be/asset360-rsm-subset/", "irsm"),
