@@ -50,7 +50,6 @@ use crate::sparql_refine::{
     is_type_pattern, object_variable, predicate_iri, scan_with_fanout, subject_variable,
     type_class_iri,
 };
-use crate::sparql_scoper::{PushForm, literal_pushable, push_form};
 
 /// One rewrite.
 pub trait Rule {
@@ -570,39 +569,6 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
         .collect()
 }
 
-/// Whether a constant the query wrote is the same RDF term the column's values
-/// render as.
-///
-/// The reason this is asked at all: 28d argues that a pushed condition is free
-/// of correctness risk because the engine re-runs the whole query, so SQL only
-/// ever *narrows*. That is true of a condition that selects a superset of the
-/// answer and false of one that selects nothing -- and comparing stored text
-/// against a term the column never spells that way selects nothing. An enum
-/// column storing `GSA` whose values render as `eul:GSA` answers a pushed
-/// `= 'http://ontorail.org/src/Eulynx/GSA'` with no rows at all, and the
-/// engine then re-runs the query over no instances and reports an empty answer
-/// where the query has one. So the same test the star decomposition applies --
-/// [`crate::sparql_scoper::push_form`] with
-/// [`crate::sparql_scoper::literal_pushable`] -- gates a pushed constant here.
-///
-/// Enum columns decline rather than translate. Selecting the codes that render
-/// as the term is a *rewrite* of the condition, and `Expr::to_sql` has no
-/// schema to do it with; the rule that translates backwards is a rule of its
-/// own.
-fn constant_is_the_columns_term(
-    schema: &SchemaView,
-    class_uri: &str,
-    slot: &str,
-    term: &Term,
-) -> bool {
-    let form = push_form(schema, class_uri, slot);
-    match (&form, term) {
-        (PushForm::Literal { .. }, Term::Literal(literal)) => literal_pushable(literal, &form),
-        (PushForm::Iri, Term::NamedNode(_)) => true,
-        _ => false,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Turn a constant object into a filter
 // ---------------------------------------------------------------------------
@@ -647,19 +613,36 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         Self { schema }
     }
 
-    /// The slot a constant-object match constrains on a scanned class, when
-    /// this rule can constrain it.
-    fn constrained_slot(&self, class_uri: &str, predicate: &str, term: &Term) -> Option<String> {
+    /// The condition a constant-object match is worth on a scanned class, when
+    /// SQL can ask the same question.
+    ///
+    /// The term test is not repeated here: [`Expr::to_sql`] is the only way to
+    /// obtain a condition and asks it, so a constant no record spells declines
+    /// at the same place for this rule as for every other.
+    fn condition_for(
+        &self,
+        star: &str,
+        class_uri: &str,
+        predicate: &str,
+        term: &Term,
+    ) -> Option<Expr> {
         let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
         let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
         let on_class = class.slot(&Identifier::Name(slot.name.clone()))?;
         if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue {
             return None;
         }
-        if !constant_is_the_columns_term(self.schema, class_uri, &slot.name, term) {
-            return None;
-        }
-        Some(slot.name.clone())
+        let condition = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Slot {
+                star_var: star.to_owned(),
+                slot_path: vec![slot.name.clone()],
+            }),
+            right: Box::new(Expr::Literal(term.clone())),
+        };
+        let classes = HashMap::from([(star.to_owned(), class_uri.to_owned())]);
+        condition.to_sql(self.schema, &classes)?;
+        Some(condition)
     }
 }
 
@@ -725,17 +708,8 @@ impl Rule for ConstantObjectBecomesFilter<'_> {
             else {
                 continue;
             };
-            let Some(slot) = self.constrained_slot(&class_uri, &predicate, &term) else {
+            let Some(condition) = self.condition_for(&star, &class_uri, &predicate, &term) else {
                 continue;
-            };
-
-            let condition = Expr::Compare {
-                op: CompareOp::Eq,
-                left: Box::new(Expr::Slot {
-                    star_var: star,
-                    slot_path: vec![slot],
-                }),
-                right: Box::new(Expr::Literal(term)),
             };
             replace_match_with_filter(plan, id, consumer, other, condition);
             return true;
@@ -856,70 +830,13 @@ impl<'s> PushComparisonFilter<'s> {
     /// express the result.
     fn render(&self, condition: &Expr, visible: &Visible) -> Option<Expr> {
         let resolved = substitute_slots(condition, visible)?;
-        if !self.constants_are_terms(&resolved, visible) {
-            return None;
-        }
         // The rendering test itself, and the one 28d asks a rule to *ask*
         // rather than to decide: the pushable subset is the sum of what
-        // `to_sql` accepts, not a constant of this rule.
-        resolved.to_sql()?;
+        // `to_sql` accepts, not a constant of this rule. It is also where the
+        // constant-is-the-column's-term half is asked, which is why it takes
+        // the schema and the classes the scans below were scanned as.
+        resolved.to_sql(self.schema, &visible.class_of_star)?;
         Some(resolved)
-    }
-
-    /// Whether every constant this condition compares against a slot is the
-    /// term that slot's values render as.
-    ///
-    /// Only the shapes [`Expr::to_sql`] turns into conditions are checked; the
-    /// rest it declines on its own, and declining twice for two reasons is not
-    /// a stronger claim.
-    fn constants_are_terms(&self, expr: &Expr, visible: &Visible) -> bool {
-        let comparable = |star_var: &String, slot_path: &Vec<String>, term: &Term| {
-            let [slot] = slot_path.as_slice() else {
-                // A path into a record, which no `ScanSlot` binds and this rule
-                // never builds.
-                return false;
-            };
-            visible
-                .class_of_star
-                .get(star_var)
-                .is_some_and(|class_uri| {
-                    constant_is_the_columns_term(self.schema, class_uri, slot, term)
-                })
-        };
-        match expr {
-            Expr::Compare { left, right, .. } => match (left.as_ref(), right.as_ref()) {
-                (
-                    Expr::Slot {
-                        star_var,
-                        slot_path,
-                    },
-                    Expr::Literal(term),
-                )
-                | (
-                    Expr::Literal(term),
-                    Expr::Slot {
-                        star_var,
-                        slot_path,
-                    },
-                ) => comparable(star_var, slot_path, term),
-                _ => true,
-            },
-            Expr::In { value, candidates } => match value.as_ref() {
-                Expr::Slot {
-                    star_var,
-                    slot_path,
-                } => candidates.iter().all(|candidate| match candidate {
-                    Expr::Literal(term) => comparable(star_var, slot_path, term),
-                    _ => true,
-                }),
-                _ => true,
-            },
-            Expr::And(parts) | Expr::Or(parts) | Expr::Function { args: parts, .. } => parts
-                .iter()
-                .all(|part| self.constants_are_terms(part, visible)),
-            Expr::Not(inner) => self.constants_are_terms(inner, visible),
-            Expr::Var(_) | Expr::Literal(_) | Expr::Slot { .. } | Expr::Opaque(_) => true,
-        }
     }
 }
 

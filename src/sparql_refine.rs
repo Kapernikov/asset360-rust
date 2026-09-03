@@ -63,8 +63,10 @@
 //! [`Plan::fanout_restored`] catches the missing unnest that would otherwise
 //! only show up as a count of 1 where the answer was 3.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+
+use linkml_schemaview::schemaview::SchemaView;
 
 use spargebra::Query;
 use spargebra::algebra::{
@@ -73,7 +75,7 @@ use spargebra::algebra::{
 use spargebra::term::{GroundTerm, NamedNodePattern, Term, TermPattern, TriplePattern, Variable};
 
 use crate::sparql_plan::{LedgerError, Obligation, ObligationId, obligation_of_triple, shorten};
-use crate::sparql_scoper::{FilterCondition, ScopeError};
+use crate::sparql_scoper::{FilterCondition, PushForm, ScopeError, literal_pushable};
 
 /// Index into [`Plan::nodes`]. Printed as `n0`, `n1`, ... so a reader can
 /// follow a node's inputs by eye, the way `o0`, `o1` work for obligations.
@@ -286,8 +288,15 @@ pub struct SqlCondition {
 }
 
 impl Expr {
-    /// The conditions this expression is worth in SQL, or `None` when SQL
-    /// cannot express it.
+    /// The conditions this expression *has the shape of*, without asking
+    /// whether they mean what the query means.
+    ///
+    /// Not public, and the name says why: the shape is only half the test.
+    /// A condition compares stored text, so it asks the query's question only
+    /// when the constant is the term the column's values render as -- and
+    /// deciding that needs the schema, which an expression does not have.
+    /// [`Expr::to_sql`] is the public entry and asks both halves. See
+    /// [`constant_is_the_columns_term`] for what the second half prevents.
     ///
     /// Partial in two directions, and both are the point:
     ///
@@ -303,12 +312,12 @@ impl Expr {
     /// that renders and leaving the rest above -- changes who *claims* the
     /// filter obligation, and that is a rule's decision to make and to record,
     /// not a rendering detail.
-    pub fn to_sql(&self) -> Option<Vec<SqlCondition>> {
+    pub(crate) fn sql_shape_unchecked(&self) -> Option<Vec<SqlCondition>> {
         match self {
             Self::And(parts) => {
                 let mut out = Vec::new();
                 for part in parts {
-                    out.extend(part.to_sql()?);
+                    out.extend(part.sql_shape_unchecked()?);
                 }
                 Some(out)
             }
@@ -383,6 +392,112 @@ impl Expr {
             | Self::Function { .. }
             | Self::Opaque(_) => None,
         }
+    }
+
+    /// The conditions this expression is worth in SQL, or `None` when SQL
+    /// cannot ask the same question.
+    ///
+    /// The only public way to obtain a [`SqlCondition`], and it takes a schema
+    /// because half the test needs one. 28d argues a pushed condition carries
+    /// no correctness risk, since the engine leg re-runs the whole query and
+    /// SQL therefore only ever *narrows*. That holds for a condition selecting
+    /// a superset of the answer and fails for one selecting *nothing*: the
+    /// engine then re-runs the query over no instances and reports an empty
+    /// answer to a query that has one. Comparing stored text against a term
+    /// the column never spells is exactly that case.
+    ///
+    /// `class_of_star` says which class each star variable was scanned as,
+    /// which is what turns a slot path into a column whose stored form can be
+    /// asked about. A star the map does not name declines: an address nobody
+    /// can resolve is not a condition.
+    pub fn to_sql(
+        &self,
+        schema: &SchemaView,
+        class_of_star: &HashMap<String, String>,
+    ) -> Option<Vec<SqlCondition>> {
+        if !self.constants_are_the_columns_terms(schema, class_of_star) {
+            return None;
+        }
+        self.sql_shape_unchecked()
+    }
+
+    /// Whether every constant this expression compares against a slot is the
+    /// term that slot's values render as.
+    ///
+    /// Only the shapes [`Expr::sql_shape_unchecked`] turns into conditions are
+    /// checked; the rest it declines on its own, and declining twice for two
+    /// reasons is not a stronger claim.
+    fn constants_are_the_columns_terms(
+        &self,
+        schema: &SchemaView,
+        class_of_star: &HashMap<String, String>,
+    ) -> bool {
+        let comparable = |star_var: &String, slot_path: &[String], term: &Term| {
+            class_of_star.get(star_var).is_some_and(|class_uri| {
+                constant_is_the_columns_term(schema, class_uri, slot_path, term)
+            })
+        };
+        match self {
+            Self::Compare { left, right, .. } => match (left.as_ref(), right.as_ref()) {
+                (
+                    Self::Slot {
+                        star_var,
+                        slot_path,
+                    },
+                    Self::Literal(term),
+                )
+                | (
+                    Self::Literal(term),
+                    Self::Slot {
+                        star_var,
+                        slot_path,
+                    },
+                ) => comparable(star_var, slot_path, term),
+                _ => true,
+            },
+            Self::In { value, candidates } => match value.as_ref() {
+                Self::Slot {
+                    star_var,
+                    slot_path,
+                } => candidates.iter().all(|candidate| match candidate {
+                    Self::Literal(term) => comparable(star_var, slot_path, term),
+                    _ => true,
+                }),
+                _ => true,
+            },
+            Self::And(parts) | Self::Or(parts) | Self::Function { args: parts, .. } => parts
+                .iter()
+                .all(|part| part.constants_are_the_columns_terms(schema, class_of_star)),
+            Self::Not(inner) => inner.constants_are_the_columns_terms(schema, class_of_star),
+            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::Opaque(_) => true,
+        }
+    }
+}
+
+/// Whether a constant the query wrote is the same RDF term the value at this
+/// path renders as.
+///
+/// The reason a schema reaches into an expression at all. An enum column
+/// storing `GSA` whose values render as `eul:GSA` answers a pushed
+/// `= 'http://ontorail.org/src/Eulynx/GSA'` with no rows, and `= 'GSA'` with
+/// every row the query wanted excluded -- so the same test the star
+/// decomposition applies, from the same function, gates a pushed constant
+/// here.
+///
+/// Enum columns decline rather than translate. Selecting the codes that render
+/// as the term is a *rewrite* of the condition, and the rule that translates
+/// backwards is a rule of its own.
+fn constant_is_the_columns_term(
+    schema: &SchemaView,
+    class_uri: &str,
+    slot_path: &[String],
+    term: &Term,
+) -> bool {
+    let form = crate::sparql_scoper::push_form_of_path(schema, class_uri, slot_path);
+    match (&form, term) {
+        (PushForm::Literal { .. }, Term::Literal(literal)) => literal_pushable(literal, &form),
+        (PushForm::Iri, Term::NamedNode(_)) => true,
+        _ => false,
     }
 }
 
@@ -2338,11 +2453,19 @@ mod tests {
         );
     }
 
-    /// `to_sql` is partial in two directions, and both are the point: by
-    /// construct, and by whether a rule has yet resolved the variable to a
-    /// column.
+    /// The classes the stars of these tests were scanned as.
+    fn tunnel_star() -> HashMap<String, String> {
+        HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/TunnelComplex".to_owned(),
+        )])
+    }
+
+    /// The rendering half is partial in two directions, and both are the
+    /// point: by construct, and by whether a rule has yet resolved the
+    /// variable to a column.
     #[test]
-    fn to_sql_declines_what_sql_cannot_express() {
+    fn the_sql_shape_declines_what_sql_cannot_express() {
         let slot = Expr::Slot {
             star_var: "s".to_owned(),
             slot_path: vec!["hasName".to_owned()],
@@ -2355,7 +2478,7 @@ mod tests {
             right: Box::new(value.clone()),
         };
         assert_eq!(
-            pushable.to_sql(),
+            pushable.sql_shape_unchecked(),
             Some(vec![SqlCondition {
                 star_var: "s".to_owned(),
                 slot_path: vec!["hasName".to_owned()],
@@ -2368,7 +2491,7 @@ mod tests {
 
         // A conjunction of pushable comparisons is the conditions of both.
         let conjunction = Expr::And(vec![pushable.clone(), pushable.clone()]);
-        assert_eq!(conjunction.to_sql().map(|c| c.len()), Some(2));
+        assert_eq!(conjunction.sql_shape_unchecked().map(|c| c.len()), Some(2));
 
         // A variable is not a column: until a rule has rewritten it into a
         // slot, nothing about this filter can be rendered.
@@ -2377,7 +2500,7 @@ mod tests {
             left: Box::new(Expr::Var("nm".to_owned())),
             right: Box::new(value.clone()),
         };
-        assert_eq!(unresolved.to_sql(), None);
+        assert_eq!(unresolved.sql_shape_unchecked(), None);
 
         // `!=` is not `<>`: SPARQL's inequality is false for an unbound
         // variable where SQL's is unknown, so it declines rather than
@@ -2387,13 +2510,13 @@ mod tests {
             left: Box::new(slot.clone()),
             right: Box::new(value.clone()),
         };
-        assert_eq!(inequality.to_sql(), None);
+        assert_eq!(inequality.sql_shape_unchecked(), None);
 
         // And a whole conjunction declines when one conjunct does: pushing
         // the half that renders moves who claims the obligation, which is a
         // rule's decision and not a rendering detail.
         let half = Expr::And(vec![pushable, inequality]);
-        assert_eq!(half.to_sql(), None);
+        assert_eq!(half.sql_shape_unchecked(), None);
 
         // REGEX, arithmetic and a disjunction are all held whole and all
         // decline.
@@ -2401,14 +2524,14 @@ mod tests {
             name: "REGEX".to_owned(),
             args: vec![slot.clone(), value.clone()],
         };
-        assert_eq!(regex.to_sql(), None);
-        assert_eq!(Expr::Or(vec![regex.clone()]).to_sql(), None);
+        assert_eq!(regex.sql_shape_unchecked(), None);
+        assert_eq!(Expr::Or(vec![regex.clone()]).sql_shape_unchecked(), None);
         assert_eq!(
             Expr::Function {
                 name: "+".to_owned(),
                 args: vec![slot, value]
             }
-            .to_sql(),
+            .sql_shape_unchecked(),
             None
         );
 
@@ -2417,20 +2540,103 @@ mod tests {
         let members = Expr::In {
             value: Box::new(Expr::Slot {
                 star_var: "s".to_owned(),
-                slot_path: vec!["kind".to_owned()],
+                slot_path: vec!["hasName".to_owned()],
             }),
             candidates: vec![
-                Expr::Literal(Literal::new_simple_literal("KSS").into()),
-                Expr::Literal(NamedNode::new_unchecked("http://x/GSA").into()),
+                Expr::Literal(Literal::new_simple_literal("A").into()),
+                Expr::Literal(Literal::new_simple_literal("B").into()),
             ],
         };
         assert_eq!(
-            members.to_sql(),
+            members.sql_shape_unchecked(),
             Some(vec![SqlCondition {
                 star_var: "s".to_owned(),
-                slot_path: vec!["kind".to_owned()],
-                condition: FilterCondition::In(vec!["KSS".to_owned(), "http://x/GSA".to_owned()]),
+                slot_path: vec!["hasName".to_owned()],
+                condition: FilterCondition::In(vec!["A".to_owned(), "B".to_owned()]),
             }])
+        );
+        // ...and the public entry agrees, because these constants are the
+        // terms a string column's values render as.
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        assert!(members.to_sql(&schema, &tunnel_star()).is_some());
+    }
+
+    /// The other half of the public entry, and the reason it is the only one:
+    /// a condition with the right *shape* can still be the wrong question.
+    ///
+    /// `sql_shape_unchecked` accepts every one of these -- they are a slot
+    /// against a constant -- and `to_sql` declines them, because the stored
+    /// text is not what the query wrote. A pushed condition that matches
+    /// nothing is not a narrowing: the engine leg re-runs the query over no
+    /// instances and answers nothing.
+    #[test]
+    fn to_sql_declines_a_constant_the_column_never_spells() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let signal = HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )]);
+        let compare = |slot: &str, term: Term| Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec![slot.to_owned()],
+            }),
+            right: Box::new(Expr::Literal(term)),
+        };
+
+        for (expr, why) in [
+            (
+                // `GSA` carries a `meaning`, so a record storing it renders as
+                // `eul:GSA` and none answers the plain literal.
+                compare("kind", Literal::new_simple_literal("GSA").into()),
+                "an enum code is not the term it renders as",
+            ),
+            (
+                compare(
+                    "kind",
+                    NamedNode::new_unchecked("http://ontorail.org/src/Eulynx/GSA").into(),
+                ),
+                "an enum column is translated backwards, not compared",
+            ),
+            (
+                compare(
+                    "name",
+                    Literal::new_language_tagged_literal_unchecked("BX", "en").into(),
+                ),
+                "a tagged literal is a different term from the plain one",
+            ),
+            (
+                compare(
+                    "length",
+                    Literal::new_typed_literal(
+                        "003",
+                        NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+                    )
+                    .into(),
+                ),
+                "the stored text does not spell three as 003",
+            ),
+        ] {
+            assert!(
+                expr.sql_shape_unchecked().is_some(),
+                "the shape is a column against a value: {why}"
+            );
+            assert_eq!(expr.to_sql(&schema, &signal), None, "{why}");
+        }
+
+        // A star the map does not name is an address nobody can resolve, so
+        // even a faithful constant declines.
+        assert_eq!(
+            compare("name", Literal::new_simple_literal("BX").into())
+                .to_sql(&schema, &HashMap::new()),
+            None
+        );
+        // ...and with the class, it pushes.
+        assert!(
+            compare("name", Literal::new_simple_literal("BX").into())
+                .to_sql(&schema, &signal)
+                .is_some()
         );
     }
 
@@ -2464,11 +2670,11 @@ mod tests {
         for expected in ["||", "BOUND", "REGEX", "IN", "EXISTS"] {
             assert!(all.contains(expected), "{expected} missing from {all}");
         }
-        // Every one of them declines: a naive filter has variables, not
-        // columns.
+        // Every one of them declines even on shape alone: a naive filter has
+        // variables, not columns.
         for node in &plan.nodes {
             if let PlanOp::Filter { condition, .. } = &node.op {
-                assert_eq!(condition.to_sql(), None, "{condition}");
+                assert_eq!(condition.sql_shape_unchecked(), None, "{condition}");
             }
         }
     }

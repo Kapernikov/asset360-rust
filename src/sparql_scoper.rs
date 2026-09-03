@@ -2230,11 +2230,28 @@ fn match_var_literal(
 /// Unresolvable means unrepresentable, which is `Tagged`: refusing to push is
 /// always safe, and this runs before the class has been fully validated.
 pub(crate) fn push_form(schema_view: &SchemaView, class_uri: &str, slot_name: &str) -> PushForm {
-    let Some((descriptor, _)) = crate::sparql_terms::resolve_column(
+    push_form_of_path(
         schema_view,
         class_uri,
         std::slice::from_ref(&slot_name.to_owned()),
-    ) else {
+    )
+}
+
+/// The same question about a value further inside the record.
+///
+/// `resolve_column` walks a path already -- that is how a `PathFilter` learns
+/// whether a nested value compares as a number -- so a condition on
+/// `["location", "longitude"]` is gated by exactly the test a condition on a
+/// column is. Without this, a rule pushing a nested constant would have no way
+/// to ask, and "no way to ask" is how an unfaithful condition gets pushed.
+pub(crate) fn push_form_of_path(
+    schema_view: &SchemaView,
+    class_uri: &str,
+    slot_path: &[String],
+) -> PushForm {
+    let Some((descriptor, _)) =
+        crate::sparql_terms::resolve_column(schema_view, class_uri, slot_path)
+    else {
         return PushForm::Tagged;
     };
     push_form_of(&descriptor)
