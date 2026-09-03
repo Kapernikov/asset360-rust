@@ -4673,6 +4673,41 @@ mod tests {
         }
     }
 
+    /// No rule pushes an ordering, so the `NULLS FIRST` question cannot arise
+    /// through the refined path -- and this is the test that says so rather
+    /// than leaving it to be noticed.
+    ///
+    /// SPARQL sorts unbound *before* every bound value ascending; Postgres
+    /// defaults to `NULLS LAST` for `ASC`. With a missing-value bucket in play
+    /// that is the difference between the "no value" row heading a report and
+    /// hiding on its last page. Today's aggregate renderer states both ends
+    /// explicitly; a refined plan never emits an ordering at all, because the
+    /// grouping rule declines any collapsing work above it and nothing else
+    /// moves a `Sort`.
+    ///
+    /// If that changes, this test fails, which is the point: an ordering that
+    /// reaches SQL through a rule has to carry the null placement with it.
+    #[test]
+    fn an_ordering_never_reaches_sql_through_a_rule() {
+        let schema = test_schema_view();
+        for query in [
+            // Over an optional key, which is where the placement matters.
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } } ORDER BY ?nm",
+            // And over a grouping, where the rule declines the whole shape.
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n)",
+        ] {
+            let plan = refined(query, &schema, false);
+            assert!(
+                plan.find("sort")
+                    .iter()
+                    .all(|id| plan.nodes[*id].executor == Executor::Engine),
+                "an ordering is the engine's: {query}\n{plan}"
+            );
+        }
+    }
+
     /// What the left-join rule declines, and the answer each would break.
     #[test]
     fn what_the_left_join_rule_declines() {
