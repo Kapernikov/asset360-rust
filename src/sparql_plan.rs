@@ -969,7 +969,18 @@ pub fn plan_query_refined(
         .flat_map(|pass| pass.discharges.iter().copied())
         .collect();
 
-    let refined = match refined_ops(query_str, schema_view) {
+    // What the fetch may skip, decided by the analysis that owns that
+    // question. See `lower_refined`.
+    let fetch_bound = plan
+        .passes
+        .iter()
+        .find_map(|pass| match &pass.kind {
+            PassKind::Sql(sql) => Some(&sql.ops),
+            PassKind::Engine(_) => None,
+        })
+        .and_then(crate::sparql_ops::fetch_bound_of);
+
+    let refined = match refined_ops(query_str, schema_view, fetch_bound) {
         Ok(refined) => refined,
         Err(reason) => {
             plan.refinement = Refinement::Fallback(reason);
@@ -1036,6 +1047,7 @@ pub fn plan_query_refined(
 fn refined_ops(
     query_str: &str,
     schema_view: &SchemaView,
+    fetch_bound: Option<usize>,
 ) -> Result<crate::sparql_ops::OpTree, String> {
     let mut plan = crate::sparql_refine::naive_plan_of(query_str)
         .map_err(|error| format!("no naive plan: {error}"))?;
@@ -1044,7 +1056,7 @@ fn refined_ops(
         rules.iter().map(|rule| rule.as_ref()).collect();
     crate::sparql_rules::refine(&mut plan, &borrowed)
         .map_err(|failure| format!("a rule broke the plan: {failure}"))?;
-    crate::sparql_ops::lower_refined(&plan, schema_view)
+    crate::sparql_ops::lower_refined(&plan, schema_view, fetch_bound)
         .map_err(|refusal| format!("not lowerable: {refusal}"))
 }
 
@@ -1397,6 +1409,49 @@ mod tests {
         );
         refined.ledger_balances().unwrap();
         assert!(refined.is_accounted(), "{refined}");
+    }
+
+    /// The fetch bound survives the substitution.
+    ///
+    /// It claims nothing, so no ledger check would miss it and no answer would
+    /// be wrong -- the engine still applies the query's own `LIMIT`. What
+    /// happens without it is that `LIMIT 1` fetches every row of the class,
+    /// which is the regression `test_single_star_limit_1_returns_exactly_one`
+    /// caught the last time a planner mislaid it.
+    #[test]
+    fn the_fetch_bound_survives_refinement() {
+        let sv = test_schema_view();
+        let query = format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal }} LIMIT 1");
+        let bound_of = |plan: &ExecutionPlan| -> Option<usize> {
+            plan.passes
+                .iter()
+                .find_map(|pass| match &pass.kind {
+                    PassKind::Sql(sql) => Some(&sql.ops),
+                    PassKind::Engine(_) => None,
+                })
+                .and_then(crate::sparql_ops::fetch_bound_of)
+        };
+
+        let today = plan_query(&query, &sv).expect("should plan");
+        assert_eq!(bound_of(&today), Some(1), "{today}");
+
+        let refined = plan_query_refined(&query, &sv).expect("should plan");
+        assert_eq!(refined.refinement, Refinement::Used, "{refined}");
+        assert_eq!(bound_of(&refined), Some(1), "{refined}");
+
+        // And it still claims nothing, which is what makes reading it safe.
+        let sql_claims: Vec<&Pass> = refined
+            .passes
+            .iter()
+            .filter(|pass| matches!(pass.kind, PassKind::Sql(_)))
+            .collect();
+        assert!(
+            !sql_claims.iter().any(|pass| pass
+                .discharges
+                .iter()
+                .any(|id| matches!(refined.obligations[*id], Obligation::Slice { .. }))),
+            "the query's own LIMIT is the engine's: {refined}"
+        );
     }
 
     /// A query that never asked for an aggregate is owed no explanation.

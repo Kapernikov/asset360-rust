@@ -575,6 +575,7 @@ impl fmt::Display for LoweringRefusal {
 pub fn lower_refined(
     plan: &crate::sparql_refine::Plan,
     schema: &linkml_schemaview::schemaview::SchemaView,
+    fetch_bound: Option<usize>,
 ) -> Result<OpTree, LoweringRefusal> {
     use crate::sparql_refine::{Executor, PlanOp as RefinedOp, SlotPresence};
 
@@ -809,7 +810,49 @@ pub fn lower_refined(
         remap.insert(id, nodes.len() - 1);
     }
 
+    // The fetch bound: a row cap the scoper found safe to apply, which claims
+    // nothing -- the engine still applies the query's own `LIMIT` and this
+    // only spares the fetch rows no answer could use. Borrowed from the
+    // single-pass planner rather than re-derived, because deciding *whether* a
+    // limit may reach the fetch is its analysis (a dropped filter makes it
+    // unsafe, and `test_limit_is_not_pushed_past_a_dropped_filter` is why),
+    // and two derivations of one decision is how they come to disagree. A rule
+    // that decides it from the refined plan is later work.
+    //
+    // Losing it is not a wrong answer but it is a real regression:
+    // `LIMIT 1` fetched every row of the class, which is what
+    // `test_single_star_limit_1_returns_exactly_one` caught the last time a
+    // planner mislaid it.
+    if enforcement == Enforcement::Narrows
+        && let Some(limit) = fetch_bound
+        && let Some(input) = nodes.len().checked_sub(1)
+    {
+        nodes.push(OpNode {
+            op: Op::Slice {
+                input,
+                limit: Some(limit),
+                offset: 0,
+            },
+            discharges: Vec::new(),
+        });
+    }
+
     Ok(OpTree { nodes })
+}
+
+/// The row cap a lowered pass carries, when it is the fetch bound.
+///
+/// A claim-free `Slice` on a pass that does not group is the scoper's bound;
+/// the same reading `sql_builder.fetch_limit_from_ops` performs, from the same
+/// nodes, so the two cannot disagree about what the fetch may skip.
+pub fn fetch_bound_of(tree: &OpTree) -> Option<usize> {
+    if !tree.find("group").is_empty() {
+        return None;
+    }
+    tree.nodes.iter().rev().find_map(|node| match &node.op {
+        Op::Slice { limit, offset, .. } if node.discharges.is_empty() && *offset == 0 => *limit,
+        _ => None,
+    })
 }
 
 /// The scan node for a star, in a tree being built.
@@ -1113,7 +1156,7 @@ mod tests {
             "{plan}"
         );
 
-        let tree = lower_refined(&plan, &sv).expect("should lower");
+        let tree = lower_refined(&plan, &sv, None).expect("should lower");
         assert!(
             tree.find("unnest").is_empty(),
             "a narrowing fetch does not fan out"
@@ -1233,7 +1276,7 @@ mod tests {
     }
 
     fn lowered(query: &str, sv: &SchemaView) -> Result<OpTree, LoweringRefusal> {
-        lower_refined(&refined_plan(query, sv), sv)
+        lower_refined(&refined_plan(query, sv), sv, None)
     }
 
     /// A condition on a multivalued slot is a test over the array's elements,
