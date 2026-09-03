@@ -629,11 +629,12 @@ pub enum PlanOp {
     LeftJoin {
         left: NodeId,
         right: NodeId,
-        /// The condition spargebra lifts into the join itself.
+        /// The condition spargebra lifts out of `OPTIONAL { ... FILTER(x) }`.
         ///
-        /// It discharges nothing, because
-        /// [`crate::sparql_plan::obligations_of`] does not enumerate it --
-        /// see the note on [`naive_plan`].
+        /// Claimed by this node, per conjunct: nothing pushes it (it decides
+        /// whether the optional side matched, so applying it to the fetch
+        /// drops the rows the join exists to keep), and an obligation nobody
+        /// claims is what makes losing it visible.
         condition: Option<Expr>,
     },
     Union {
@@ -1398,18 +1399,12 @@ pub fn naive_plan_of(query_str: &str) -> Result<Plan, RefineError> {
 /// which is another way of saying this plan is already correct: it is what the
 /// endpoint does when nothing is pushed.
 ///
-/// Two consequences of reusing that enumeration, both of which are its
-/// properties and not this builder's:
-///
-/// * `UNION`, `MINUS` and property paths are refused, because
-///   `tag_triples_by_depth` refuses them. [`PlanOp::Union`], [`PlanOp::Minus`]
-///   and [`PlanOp::Path`] exist so that lifting the refusal is a change to
-///   obligation enumeration and not a change to the plan shape, but no query
-///   reaches them through this function yet.
-/// * the condition spargebra lifts into a `LeftJoin` is not enumerated, so
-///   [`PlanOp::LeftJoin::condition`] discharges nothing. A plan therefore
-///   cannot notice that condition being dropped -- a gap in the ledger that
-///   predates this module and that fixing would change `plan_query`'s output.
+/// One consequence of reusing that enumeration, and it is its property rather
+/// than this builder's: `UNION`, `MINUS` and property paths are refused,
+/// because `tag_triples_by_depth` refuses them. [`PlanOp::Union`],
+/// [`PlanOp::Minus`] and [`PlanOp::Path`] exist so that lifting the refusal is
+/// a change to obligation enumeration and not a change to the plan shape, but
+/// no query reaches them through this function yet.
 ///
 /// The plan is checked before it is returned, in every build rather than
 /// behind a debug assertion. The builder's one assumption is that the
@@ -1584,6 +1579,18 @@ impl Builder<'_> {
                 right,
                 expression,
             } => {
+                // The lifted condition is enumerated per conjunct like any
+                // other filter, and claimed here rather than on a node of its
+                // own: it decides whether the optional side *matched*, which
+                // is a property of the join and not a filter above it.
+                let condition = expression.as_ref().map(Expr::from);
+                let mut claims = Vec::new();
+                let conjuncts = condition.clone().map(conjuncts_of).unwrap_or_default();
+                for _ in &conjuncts {
+                    claims.extend(self.claim_modifier(|obligation| {
+                        matches!(obligation, Obligation::Filter { .. })
+                    }));
+                }
                 let left = self.pattern(left, false);
                 let right = self.pattern(right, false);
                 let vars: BTreeSet<String> =
@@ -1592,9 +1599,9 @@ impl Builder<'_> {
                     PlanOp::LeftJoin {
                         left,
                         right,
-                        condition: expression.as_ref().map(Expr::from),
+                        condition,
                     },
-                    Vec::new(),
+                    claims,
                     vars,
                 )
             }
@@ -1612,21 +1619,30 @@ impl Builder<'_> {
                 self.push(PlanOp::Minus { left, right }, Vec::new(), vars)
             }
             GraphPattern::Filter { expr, inner } => {
+                // One node per top-level conjunct, chained, each claiming its
+                // own obligation. That is what makes pushing one of them a
+                // decision about a node: `FILTER(?name > "A" && REGEX(?name,
+                // "^A"))` becomes a comparison a rule can push and a regex it
+                // declines, and the claim moves with the node instead of
+                // having to be split.
+                let conjuncts = conjuncts_of(Expr::from(expr));
                 // Claimed before descending, because that is the order the
-                // enumeration pushes them: a filter's obligation comes before
+                // enumeration pushes them: a filter's obligations come before
                 // anything under it.
-                let claims = self
-                    .claim_modifier(|obligation| matches!(obligation, Obligation::Filter { .. }));
-                let input = self.pattern(inner, on_spine);
+                let mut claims = Vec::with_capacity(conjuncts.len());
+                for _ in &conjuncts {
+                    claims.push(self.claim_modifier(|obligation| {
+                        matches!(obligation, Obligation::Filter { .. })
+                    }));
+                }
+                let mut input = self.pattern(inner, on_spine);
                 let vars = self.vars[input].clone();
-                self.push(
-                    PlanOp::Filter {
-                        input,
-                        condition: Expr::from(expr),
-                    },
-                    claims,
-                    vars,
-                )
+                // First conjunct nearest the input, so the plan reads in the
+                // order the query wrote it.
+                for (condition, claim) in conjuncts.into_iter().zip(claims) {
+                    input = self.push(PlanOp::Filter { input, condition }, claim, vars.clone());
+                }
+                input
             }
             GraphPattern::Extend {
                 inner,
@@ -1796,12 +1812,14 @@ impl Builder<'_> {
                     .iter()
                     .map(|variable| variable.as_str().to_owned())
                     .collect();
+                let claims = self
+                    .claim_modifier(|obligation| matches!(obligation, Obligation::Values { .. }));
                 self.push(
                     PlanOp::Values {
                         variables: variables.clone(),
                         rows: bindings.clone(),
                     },
-                    Vec::new(),
+                    claims,
                     vars,
                 )
             }
@@ -1843,6 +1861,20 @@ impl Builder<'_> {
             .collect();
         let vars: BTreeSet<String> = self.vars[left].union(&self.vars[right]).cloned().collect();
         self.push(PlanOp::Join { left, right, on }, Vec::new(), vars)
+    }
+}
+
+/// The top-level conjuncts of a condition, in the order the query wrote them.
+///
+/// [`Expr::from`] already flattens a nest of `And`s into one node, so this is
+/// the one place that decides how many obligations a `FILTER` raises here --
+/// and it has to agree with `obligations_of`, which flattens the spargebra
+/// expression the same way. A disagreement leaves an obligation unclaimed and
+/// fails the ledger rather than passing quietly.
+fn conjuncts_of(condition: Expr) -> Vec<Expr> {
+    match condition {
+        Expr::And(parts) => parts,
+        other => vec![other],
     }
 }
 
@@ -1955,6 +1987,8 @@ mod tests {
              FILTER(REGEX(?nm, \"^A\")) FILTER(?nm > \"A\") }",
             "SELECT ?s ?nm WHERE { ?s a asset360:Signal . \
              OPTIONAL { ?s asset360:name ?nm } }",
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\" && ?nm < \"B\") } }",
             "SELECT ?s ?len WHERE { ?s a asset360:Signal ; asset360:length ?len . \
              FILTER(?len >= 10 && ?len < 100) }",
             "SELECT ?s ?doubled WHERE { ?s a asset360:Signal ; asset360:length ?len . \
@@ -2000,14 +2034,31 @@ mod tests {
         assert!(plan.find("scan").is_empty(), "{plan}");
         assert_eq!(plan.find("match").len(), 3, "{plan}");
         assert_eq!(plan.find("join").len(), 2, "{plan}");
-        // One filter node, not two, and the reason is worth pinning: spargebra
-        // conjoins consecutive `FILTER`s of one group graph pattern into a
-        // single `Filter`, so `obligations_of` raises one filter obligation
-        // for both. 28d's worked example writes them as two nodes claiming
-        // `o3` and `o4` separately; they arrive as `(?nm > "A" && REGEX(...))`
-        // claiming one id. See the note on [`Expr::to_sql`]: splitting the
-        // conjunction is therefore also splitting an obligation.
-        assert_eq!(plan.find("filter").len(), 1, "{plan}");
+        // Two filter nodes for two `FILTER`s, even though spargebra conjoins
+        // them into a single `Filter { And(..) }` before anyone sees them.
+        // The split is per top-level conjunct precisely so that
+        // `FILTER(a) FILTER(b)` and `FILTER(a && b)` account identically --
+        // they are the same query -- and so that pushing the comparison while
+        // leaving the regex above is a decision about a node rather than a
+        // claim that has to be split in two.
+        assert_eq!(plan.find("filter").len(), 2, "{plan}");
+        let filters: Vec<String> = plan
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                PlanOp::Filter { condition, .. } => Some(condition.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(filters[0].contains('>'), "{filters:?}");
+        assert!(filters[1].contains("REGEX"), "{filters:?}");
+        assert!(
+            plan.nodes
+                .iter()
+                .filter(|node| node.op.kind() == "filter")
+                .all(|node| node.discharges.len() == 1),
+            "each conjunct claims its own obligation:\n{plan}"
+        );
         assert_eq!(plan.find("group").len(), 1, "{plan}");
         assert_eq!(plan.find("sort").len(), 1, "{plan}");
         assert_eq!(plan.find("slice").len(), 1, "{plan}");
@@ -2029,9 +2080,47 @@ mod tests {
                 Obligation::Order { .. } => "sort",
                 Obligation::Slice { .. } => "slice",
                 Obligation::Distinct => "distinct",
+                Obligation::Values { .. } => "values",
             };
             assert_eq!(claimant.op.kind(), expected, "o{id} ({obligation})\n{plan}");
         }
+        println!("{plan}");
+    }
+
+    /// The two constraints that used to have no obligation at all, claimed by
+    /// the nodes that hold them. An `OPTIONAL`'s lifted condition belongs to
+    /// the join (it decides whether the optional side matched), and a `VALUES`
+    /// block belongs to the inline table itself -- not to a filter above it,
+    /// which is what modelling it as one would have implied.
+    #[test]
+    fn the_optional_condition_and_the_values_block_are_claimed() {
+        let plan = plan_of(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\" && ?nm < \"B\") } }",
+        );
+        let leftjoin = plan.find("leftjoin");
+        assert_eq!(leftjoin.len(), 1, "{plan}");
+        assert_eq!(
+            plan.nodes[leftjoin[0]].discharges.len(),
+            2,
+            "one claim per conjunct of the lifted condition:\n{plan}"
+        );
+        assert!(
+            plan.find("filter").is_empty(),
+            "the lifted condition is the join's, not a filter above it:\n{plan}"
+        );
+        plan.check().unwrap();
+
+        let plan = plan_of("SELECT ?s WHERE { VALUES ?s { \"a\" \"b\" } }");
+        let values = plan.find("values");
+        assert_eq!(values.len(), 1, "{plan}");
+        assert!(
+            matches!(
+                plan.obligations[plan.nodes[values[0]].discharges[0]],
+                Obligation::Values { rows: 2, .. }
+            ),
+            "{plan}"
+        );
         println!("{plan}");
     }
 
@@ -2358,9 +2447,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // One node: the four `FILTER`s of one group are one conjunction by the
-        // time spargebra is done with them.
-        assert_eq!(conditions.len(), 1, "{plan}");
+        // Four nodes: spargebra conjoins the four `FILTER`s of one group, and
+        // the plan splits the conjunction back into the constraints the query
+        // wrote.
+        assert_eq!(conditions.len(), 4, "{plan}");
         let all = conditions.join(" | ");
         for expected in ["||", "BOUND", "REGEX", "IN", "EXISTS"] {
             assert!(all.contains(expected), "{expected} missing from {all}");

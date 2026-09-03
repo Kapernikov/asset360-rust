@@ -15,8 +15,8 @@
 //! [`Obligation`]s each one discharges.
 //!
 //! **The vocabulary, once:** an *obligation* is one thing the query demands --
-//! a triple pattern, a filter, the grouping, an aggregate, the ordering, the
-//! limit. To *discharge* one is for a pass to take care of it. The *residual*
+//! a triple pattern, one conjunct of a filter, an inline table, the grouping,
+//! an aggregate, the ordering, the limit. To *discharge* one is for a pass to take care of it. The *residual*
 //! is whatever no pass took care of, which means the plan answers a different
 //! question than the one asked. `o0`, `o1`, ... are just their positions in
 //! the list, so a pass can point at them without repeating the text.
@@ -52,7 +52,14 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// An executor that does not recognise the version refuses the plan. That makes
 /// a planner/executor version skew a loud failure rather than a wrong number,
 /// which is the failure this whole module is shaped around.
-pub const PLAN_CONTRACT: u32 = 1;
+///
+/// 2 added [`Obligation::Values`]. No consumer branches on this yet -- the
+/// endpoint reads passes and renders obligations as text -- so the bump is the
+/// marker the next consumer checks against, not a live gate. Splitting a
+/// conjunction into one obligation per conjunct did *not* bump it: that
+/// changes how many `Filter` obligations a query raises, not what kinds exist,
+/// and a consumer that reads the list rather than counting it is unaffected.
+pub const PLAN_CONTRACT: u32 = 2;
 
 /// Index into [`ExecutionPlan::obligations`]. Printed as `o1`, `o2`, ... so a
 /// human can check the ledger by eye.
@@ -60,9 +67,14 @@ pub type ObligationId = usize;
 
 /// One thing the query asks for.
 ///
-/// Granularity is per triple pattern and per filter, which is what the scoper
-/// already tracks. Finer would let a pass discharge half a pattern and make
-/// "exactly once" harder to check for no benefit anyone has needed.
+/// Granularity is per triple pattern and per *conjunct* of a filter. Per
+/// filter as the query wrote it would make syntax decide the accounting --
+/// spargebra conjoins `FILTER(a) FILTER(b)` into one node, so the same
+/// question would raise one obligation or two depending on how it was typed --
+/// and it would put a pass that pushes `a` and leaves `b` in the position of
+/// having to split a claim. Finer than a conjunct would let a pass discharge
+/// half a comparison, which "exactly once" cannot check for no benefit anyone
+/// has needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Obligation {
     /// `?s a asset360:Signal` -- the pattern that scopes a subject to a class.
@@ -85,6 +97,14 @@ pub enum Obligation {
     Slice { limit: Option<usize>, offset: usize },
     /// `DISTINCT`.
     Distinct,
+    /// A `VALUES` block: an inline table the query joins against.
+    ///
+    /// Its own kind rather than a filter, because a `VALUES` that binds a
+    /// variable nothing else binds is not a constraint on existing rows -- it
+    /// *adds* rows and columns. Calling that a filter would let a consumer
+    /// apply it as a `WHERE` and answer a narrower question than the query
+    /// asked.
+    Values { variables: Vec<String>, rows: usize },
 }
 
 impl fmt::Display for Obligation {
@@ -116,6 +136,11 @@ impl fmt::Display for Obligation {
                 None => write!(f, "slice     OFFSET {offset}"),
             },
             Self::Distinct => write!(f, "distinct  DISTINCT"),
+            Self::Values { variables, rows } => write!(
+                f,
+                "values    VALUES {} × {rows} row(s)",
+                variables.join(" ")
+            ),
         }
     }
 }
@@ -592,9 +617,7 @@ fn collect_modifiers(
     use spargebra::algebra::GraphPattern;
     match pattern {
         GraphPattern::Filter { expr, inner } => {
-            out.push(Obligation::Filter {
-                detail: format!("{expr}"),
-            });
+            push_filter_obligations(expr, out);
             collect_modifiers(inner, aliases, out);
         }
         GraphPattern::Group {
@@ -646,14 +669,74 @@ fn collect_modifiers(
         | GraphPattern::Extend { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => collect_modifiers(inner, aliases, out),
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            // The condition spargebra lifts out of `OPTIONAL { ... FILTER(x) }`
+            // and into the join itself. Enumerated because the ledger's whole
+            // value is that a dropped constraint cannot hide, and this one
+            // could: the planner leaves it to the engine every time (it
+            // decides whether the optional side *matched*, so pushing it drops
+            // the rows the LEFT JOIN exists to keep), and with no obligation
+            // for it a plan that lost it balanced anyway.
+            if let Some(expression) = expression {
+                push_filter_obligations(expression, out);
+            }
+            collect_modifiers(left, aliases, out);
+            collect_modifiers(right, aliases, out);
+        }
         GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
             collect_modifiers(left, aliases, out);
             collect_modifiers(right, aliases, out);
         }
+        GraphPattern::Values {
+            variables,
+            bindings,
+        } => out.push(Obligation::Values {
+            variables: variables.iter().map(|v| format!("{v}")).collect(),
+            rows: bindings.len(),
+        }),
         _ => {}
+    }
+}
+
+/// One obligation per top-level conjunct of a `FILTER`.
+///
+/// `FILTER(a) FILTER(b)` and `FILTER(a && b)` are the same query -- spargebra
+/// conjoins the first form into the second -- so accounting for them
+/// differently would make syntax decide the ledger. Per conjunct, a pass can
+/// push the comparison it can express and leave the `REGEX` above it, each
+/// claimed by the node that applies it; with one obligation for the
+/// conjunction, pushing half of it would mean splitting a claim, which
+/// "discharged exactly once" forbids.
+///
+/// Top-level conjuncts only. A disjunction stays whole: neither half of
+/// `a || b` constrains anything on its own, so there is nothing a pass could
+/// discharge separately.
+fn push_filter_obligations(expr: &spargebra::algebra::Expression, out: &mut Vec<Obligation>) {
+    let mut conjuncts = Vec::new();
+    flatten_conjunction(expr, &mut conjuncts);
+    for conjunct in conjuncts {
+        out.push(Obligation::Filter {
+            detail: format!("{conjunct}"),
+        });
+    }
+}
+
+fn flatten_conjunction<'e>(
+    expr: &'e spargebra::algebra::Expression,
+    out: &mut Vec<&'e spargebra::algebra::Expression>,
+) {
+    match expr {
+        spargebra::algebra::Expression::And(left, right) => {
+            flatten_conjunction(left, out);
+            flatten_conjunction(right, out);
+        }
+        other => out.push(other),
     }
 }
 
@@ -867,6 +950,153 @@ mod tests {
         assert!(printed.contains("not pushable"), "{printed}");
         assert!(printed.contains("unsupported_aggregate"), "{printed}");
         assert!(printed.contains("instead"), "{printed}");
+    }
+
+    /// Syntax must not decide the accounting: `FILTER(a) FILTER(b)` and
+    /// `FILTER(a && b)` are the same query -- spargebra turns the first into
+    /// the second -- so they raise the same obligations, one per conjunct.
+    ///
+    /// The granularity is what lets a pass push the comparison and leave the
+    /// regex above it, each claimed by whoever applies it. With one obligation
+    /// for the conjunction, pushing half of it would mean splitting a claim,
+    /// and "discharged exactly once" has no room for half.
+    #[test]
+    fn a_conjunction_is_one_obligation_per_conjunct() {
+        let separate = obligations_of(
+            &parse_query(&format!(
+                "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm > \"A\") FILTER(REGEX(?nm, \"^A\")) }}"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let conjoined = obligations_of(
+            &parse_query(&format!(
+                "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm > \"A\" && REGEX(?nm, \"^A\")) }}"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(separate, conjoined, "one query, one ledger");
+        assert_eq!(
+            separate
+                .iter()
+                .filter(|obligation| matches!(obligation, Obligation::Filter { .. }))
+                .count(),
+            2,
+            "{separate:#?}"
+        );
+
+        // A three-way conjunction flattens, however the parser nested it.
+        let nested = obligations_of(
+            &parse_query(&format!(
+                "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER((?nm > \"A\" && ?nm < \"B\") && REGEX(?nm, \"^A\")) }}"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            nested
+                .iter()
+                .filter(|obligation| matches!(obligation, Obligation::Filter { .. }))
+                .count(),
+            3,
+            "{nested:#?}"
+        );
+
+        // A disjunction stays whole: neither half of `a || b` constrains
+        // anything on its own, so there is nothing a pass could discharge
+        // separately.
+        let disjunction = obligations_of(
+            &parse_query(&format!(
+                "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm > \"A\" || ?nm < \"B\") }}"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            disjunction
+                .iter()
+                .filter(|obligation| matches!(obligation, Obligation::Filter { .. }))
+                .count(),
+            1,
+            "{disjunction:#?}"
+        );
+    }
+
+    /// The two constraints a plan could lose while its ledger still balanced:
+    /// the condition spargebra lifts out of an `OPTIONAL`, and a `VALUES`
+    /// block. Both are enumerated now, so losing either costs an unclaimed
+    /// obligation instead of nothing.
+    #[test]
+    fn an_optional_condition_and_a_values_block_are_accounted() {
+        let sv = test_schema_view();
+
+        let plan = plan_query(
+            &format!(
+                "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:name ?nm . FILTER(?nm > \"A\") }} }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        plan.ledger_balances().unwrap();
+        let lifted = plan
+            .obligations
+            .iter()
+            .position(|obligation| matches!(obligation, Obligation::Filter { .. }))
+            .expect("the lifted condition is an obligation");
+        // Nobody pushes it -- it decides whether the optional side matched --
+        // so it must sit with the engine, said rather than assumed.
+        let engine = plan
+            .passes
+            .iter()
+            .find(|pass| matches!(pass.kind, PassKind::Engine(_)))
+            .expect("the engine finishes this");
+        assert!(engine.discharges.contains(&lifted), "{plan}");
+
+        // A VALUES block the scoper cannot represent: its own obligation,
+        // claimed by the engine.
+        let plan = plan_query(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
+                 VALUES ?k {{ \"KSS\" }} }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        plan.ledger_balances().unwrap();
+        let values = plan
+            .obligations
+            .iter()
+            .position(|obligation| matches!(obligation, Obligation::Values { .. }))
+            .expect("a VALUES block is an obligation");
+        assert!(!plan.sql_only(), "{plan}");
+        let engine = plan
+            .passes
+            .iter()
+            .find(|pass| matches!(pass.kind, PassKind::Engine(_)))
+            .expect("the engine finishes this");
+        assert!(engine.discharges.contains(&values), "{plan}");
+
+        // And one the scoper *does* represent: SQL claims it, and the claim is
+        // honest because the pass renders it as the IN it hoisted.
+        let plan = plan_query(
+            &format!(
+                "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+                 asset360:name ?nm . VALUES ?nm {{ \"BX1\" \"BX2\" }} }} GROUP BY ?nm"
+            ),
+            &sv,
+        )
+        .unwrap();
+        plan.ledger_balances().unwrap();
+        assert!(plan.sql_only(), "{plan}");
+        let printed = plan.to_string();
+        assert!(printed.contains("values    VALUES ?nm"), "{printed}");
+        assert!(printed.contains("IN ('BX1', 'BX2')"), "{printed}");
     }
 
     /// A query that never asked for an aggregate is owed no explanation.
