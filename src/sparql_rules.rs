@@ -432,6 +432,41 @@ fn fold(
     }
 
     plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+/// Recompute every plain join's `on` from the variables its sides now bind.
+///
+/// A naive `on` is the variables the two *matches* shared, and a rule can make
+/// that stale in both directions. Folding a star's matches into a scan moves
+/// their bindings onto the scan, and collapsing a join that has become
+/// redundant removes the node that recorded the shared variable -- so
+/// `?c a :TunnelComplex . ?comp a :CivilEngineeringAsset ;
+/// :belongsToTunnelComplex ?c` ends up with the surviving join carrying the
+/// *cross product's* empty `on` while its sides do share `?c`.
+///
+/// That was a live defect and not a cosmetic one: the reference-join rule and
+/// [`Plan::reference_joins_agree`] both read `on`, so the same query pushed or
+/// declined depending on which order its two stars were written in -- the same
+/// class of bug as the filter ordering, found by the runtime gate's own log
+/// rather than by a test.
+///
+/// Called by every rule that removes or rewires a node, so `on` is a fact
+/// about the plan as it is rather than as it was parsed.
+pub fn refresh_join_variables(plan: &mut Plan) {
+    for id in 0..plan.nodes.len() {
+        let PlanOp::Join { left, right, .. } = &plan.nodes[id].op else {
+            continue;
+        };
+        let shared: Vec<String> = plan
+            .variables_of(*left)
+            .intersection(&plan.variables_of(*right))
+            .cloned()
+            .collect();
+        if let PlanOp::Join { on, .. } = &mut plan.nodes[id].op {
+            *on = shared;
+        }
+    }
 }
 
 /// Whether every solution `upper` produces takes its bindings from a row of
@@ -1055,6 +1090,7 @@ fn fold_into_scan(
     }
 
     plan.nodes = nodes;
+    refresh_join_variables(plan);
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,6 +1337,7 @@ fn replace_match_with_filter(
     }
 
     plan.nodes = nodes;
+    refresh_join_variables(plan);
 }
 
 // ---------------------------------------------------------------------------
@@ -1642,6 +1679,7 @@ fn sink_below_engine_filters(plan: &mut Plan, filter: NodeId, base: NodeId, cond
     }
 
     plan.nodes = nodes;
+    refresh_join_variables(plan);
 }
 
 /// The condition with every variable rewritten into the slot that binds it.
@@ -2393,6 +2431,43 @@ mod tests {
                 }
             ),
             "{value_join}"
+        );
+    }
+
+    /// The same query, its two stars written in either order, must push the
+    /// same join.
+    ///
+    /// The naive plan's join shape depends on that order: with the reference
+    /// in the first star the surviving join carries `on = [?t]`, and with the
+    /// two stars written separately it is a *cross product* whose `on` is
+    /// empty until the fold moves the reference onto a scan. A rule reading a
+    /// stale `on` pushed one and declined the other -- the filter-ordering bug
+    /// again, in a different operator, and found by the runtime gate's log
+    /// rather than by a test.
+    #[test]
+    fn the_order_two_stars_are_written_in_does_not_decide_the_join() {
+        let schema = test_schema_view();
+        let pushed = |query: &str| -> bool {
+            let plan = refined(query, &schema, false);
+            let joins = plan.find("join");
+            assert_eq!(joins.len(), 1, "{plan}");
+            plan.nodes[joins[0]].executor == Executor::Sql
+        };
+
+        assert!(
+            pushed(
+                "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+                 ?t a asset360:Track ; asset360:hasName ?tn }"
+            ),
+            "the reference in the first star"
+        );
+        assert!(
+            pushed(
+                "SELECT ?bn WHERE { ?sig a asset360:Signal . \
+                 ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?sig }"
+            ),
+            "the reference in the second star, which the naive plan joins as a \
+             cross product"
         );
     }
 

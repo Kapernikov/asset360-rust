@@ -1509,6 +1509,70 @@ impl Plan {
         Ok(())
     }
 
+    /// The variables a node's solutions bind.
+    ///
+    /// Derived from the nodes rather than remembered from the query, because a
+    /// rule changes it: folding a match into a scan moves a binding from one
+    /// node to another, and collapsing a join removes the node that recorded
+    /// which variables the two sides shared. See
+    /// [`crate::sparql_rules::refresh_join_variables`].
+    pub fn variables_of(&self, node: NodeId) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let Some(node) = self.nodes.get(node) else {
+            return out;
+        };
+        match &node.op {
+            PlanOp::Scan {
+                star_var, slots, ..
+            } => {
+                out.insert(star_var.clone());
+                // A delivered read binds nothing *here*: the `match` that
+                // stayed above is what binds it, and counting it twice would
+                // put an optional variable in a mandatory join's `on`.
+                out.extend(
+                    slots
+                        .iter()
+                        .filter(|slot| slot.presence == SlotPresence::Required)
+                        .filter_map(|slot| slot.var.clone()),
+                );
+            }
+            PlanOp::Match { pattern } => {
+                add_term_var(&pattern.subject, &mut out);
+                if let NamedNodePattern::Variable(variable) = &pattern.predicate {
+                    out.insert(variable.as_str().to_owned());
+                }
+                add_term_var(&pattern.object, &mut out);
+            }
+            PlanOp::Path {
+                subject, object, ..
+            } => {
+                add_term_var(subject, &mut out);
+                add_term_var(object, &mut out);
+            }
+            PlanOp::Values { variables, .. } => {
+                out.extend(variables.iter().map(|v| v.as_str().to_owned()));
+            }
+            PlanOp::Group { keys, measures, .. } => {
+                out.extend(keys.iter().cloned());
+                out.extend(measures.iter().map(|measure| measure.var.clone()));
+            }
+            PlanOp::Project { vars, .. }
+            | PlanOp::SubSelect { vars, .. }
+            | PlanOp::Describe { vars, .. } => out.extend(vars.iter().cloned()),
+            PlanOp::Bind { input, var, .. } => {
+                out.extend(self.variables_of(*input));
+                out.insert(var.clone());
+            }
+            PlanOp::Minus { left, .. } => out.extend(self.variables_of(*left)),
+            other => {
+                for input in other.inputs() {
+                    out.extend(self.variables_of(input));
+                }
+            }
+        }
+        out
+    }
+
     /// Whether `lower`'s rows reach `upper`, following inputs.
     pub fn feeds(&self, lower: NodeId, upper: NodeId) -> bool {
         if lower == upper {
