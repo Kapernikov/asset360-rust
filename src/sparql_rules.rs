@@ -870,6 +870,7 @@ impl Rule for AbsorbOptionalRead<'_> {
                 left,
                 right,
                 condition,
+                ..
             } = &plan.nodes[id].op
             else {
                 continue;
@@ -2046,6 +2047,151 @@ impl Rule for PushReferenceJoin<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Push a left join
+// ---------------------------------------------------------------------------
+
+/// An `OPTIONAL` over a second star, joined by a reference, becomes a SQL
+/// `LEFT JOIN`.
+///
+/// The rule that closes the two-islands fallback. Nothing pushed a left join
+/// before, so a plan with one had its `Sql` frontier in two pieces -- a legal
+/// plan and not a statement -- and every such query fell back. With the join
+/// pushed the pieces are one.
+///
+/// It is [`PushReferenceJoin`] with the rows of one side preserved, and the
+/// difference is entirely in what the *renderer* must then do: on the optional
+/// side, a condition may not eliminate a row. That is why the lowering marks
+/// the scan optional and every condition below the join with
+/// `Op::Filter::optional_side`, rather than leaving the placement to be
+/// remembered.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **No lifted condition.** `OPTIONAL { … FILTER(x) }` decides whether the
+///   optional side *matched*, which is a conditional binding rather than a row
+///   test. As a `WHERE` it deletes the row the join keeps; as an `ON` it needs
+///   a conditional binding expression this does not build. Declined, and the
+///   lowering refuses it a second time in case a later rule forgets.
+/// * **Both sides in SQL, joined by a single-valued reference**, exactly as an
+///   inner join needs -- the edge is what the renderer joins on, and a
+///   multivalued one would have to compare an element.
+/// * **The preserved side is not itself optional.** Two nested `OPTIONAL`s are
+///   an order of preservation this does not reason about, and the renderer
+///   picks its `FROM` star from the non-optional ones.
+pub struct PushLeftJoin<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> PushLeftJoin<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for PushLeftJoin<'_> {
+    fn name(&self) -> &'static str {
+        "push_left_join"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::LeftJoin {
+                left,
+                right,
+                condition,
+                ..
+            } = &plan.nodes[id].op
+            else {
+                continue;
+            };
+            if condition.is_some() {
+                continue;
+            }
+            let (left, right) = (*left, *right);
+            if plan.nodes[left].executor != Executor::Sql
+                || plan.nodes[right].executor != Executor::Sql
+            {
+                continue;
+            }
+            // The preserved side must not already be somebody's optional side.
+            if plan.nodes.iter().any(|node| {
+                matches!(&node.op, PlanOp::LeftJoin { right: other, .. } if plan.feeds(left, *other))
+            }) {
+                continue;
+            }
+
+            // The edge, found the same way an inner join finds it: one side
+            // scans a star, the other binds that star's identifier in a
+            // single-valued reference slot.
+            let Some(edge) = self.reference_between(plan, left, right) else {
+                continue;
+            };
+            plan.nodes[id].executor = Executor::Sql;
+            if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
+                *reference = Some(edge);
+            }
+            return true;
+        }
+        false
+    }
+}
+
+impl PushLeftJoin<'_> {
+    /// The reference edge between two sides, whichever of them holds the key.
+    fn reference_between(&self, plan: &Plan, left: NodeId, right: NodeId) -> Option<ReferenceEdge> {
+        let stars = |side: NodeId| -> Vec<String> {
+            plan.nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(scan, node)| match &node.op {
+                    PlanOp::Scan { star_var, .. }
+                        if node.executor == Executor::Sql && plan.feeds(scan, side) =>
+                    {
+                        Some(star_var.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        for referenced in stars(left).into_iter().chain(stars(right)) {
+            for holder in [left, right] {
+                let Some((holder_star, slot)) = self.foreign_key_on(plan, holder, &referenced)
+                else {
+                    continue;
+                };
+                // The two ends have to be on different sides, or this is a
+                // star referencing itself through the join rather than the
+                // join relating two row sets.
+                let other = if holder == left { right } else { left };
+                if !stars(other).contains(&referenced) {
+                    continue;
+                }
+                return Some(ReferenceEdge {
+                    referenced,
+                    holder: holder_star,
+                    slot,
+                });
+            }
+        }
+        None
+    }
+
+    /// The star and slot on the foreign-key side, as the inner-join rule finds
+    /// it -- same test, same reasons.
+    fn foreign_key_on(
+        &self,
+        plan: &Plan,
+        holder: NodeId,
+        joined: &str,
+    ) -> Option<(String, String)> {
+        PushReferenceJoin::new(self.schema).foreign_key_on(plan, holder, joined)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Push a scalar-key count grouping
 // ---------------------------------------------------------------------------
 
@@ -2315,6 +2461,7 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
         Box::new(ValuesBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
         Box::new(PushReferenceJoin::new(schema)),
+        Box::new(PushLeftJoin::new(schema)),
         Box::new(PushScalarCountGrouping::new(schema)),
     ]
 }
@@ -4482,6 +4629,135 @@ mod tests {
         plan.check()
             .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
         println!("{plan}");
+    }
+
+    /// The two-islands fallback, closed: an `OPTIONAL` over a second star is
+    /// one statement with a `LEFT JOIN` in it.
+    #[test]
+    fn an_optional_second_star_becomes_a_left_join() {
+        let schema = test_schema_view();
+        for query in [
+            // The foreign key on the preserved side.
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
+            // ...and on the optional side, which is the same edge read the
+            // other way round.
+            "SELECT ?s ?bn WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s ; \
+             asset360:asset360_uri ?bn } }",
+        ] {
+            let plan = refined(query, &schema, false);
+            let leftjoin = plan.find("leftjoin")[0];
+            assert_eq!(
+                plan.nodes[leftjoin].executor,
+                Executor::Sql,
+                "{query}\n{plan}"
+            );
+            let PlanOp::LeftJoin {
+                reference: Some(edge),
+                ..
+            } = &plan.nodes[leftjoin].op
+            else {
+                panic!("a pushed left join records its edge:\n{plan}");
+            };
+            assert!(
+                plan.nodes[leftjoin]
+                    .op
+                    .describe()
+                    .contains(&format!("via ?{}.{}", edge.holder, edge.slot)),
+                "{plan}"
+            );
+            plan.check()
+                .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+            println!("{plan}");
+        }
+    }
+
+    /// What the left-join rule declines, and the answer each would break.
+    #[test]
+    fn what_the_left_join_rule_declines() {
+        let schema = test_schema_view();
+        let pushed = |query: &str| -> bool {
+            let plan = refined(query, &schema, false);
+            plan.find("leftjoin")
+                .iter()
+                .any(|id| plan.nodes[*id].executor == Executor::Sql)
+        };
+
+        // A lifted condition decides whether the optional side *matched*: a
+        // signal whose track is named "A" is still an answer, with the name
+        // unbound. As a `WHERE` that row is deleted -- an inner join wearing a
+        // left join's clothes.
+        assert!(
+            !pushed(
+                "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+                 OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
+                 FILTER(?tn > \"A\") } }"
+            ),
+            "a lifted condition"
+        );
+
+        // No reference between the two sides: the optional block is unrelated,
+        // and joining unrelated row sets multiplies them.
+        assert!(
+            !pushed(
+                "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
+                 FILTER(?tn = ?nm) } }"
+            ),
+            "no reference edge"
+        );
+    }
+
+    /// A condition inside the `OPTIONAL` is marked as belonging to the
+    /// optional side, all the way to the operator the renderer reads.
+    ///
+    /// This is the placement that goes wrong quietly: in a `WHERE` it
+    /// eliminates the row the join exists to keep, and the answer is merely
+    /// smaller. The refined plan states it structurally -- the filter is below
+    /// the left join -- and the lowering turns that into a fact on the node,
+    /// so the renderer cannot forget to ask.
+    #[test]
+    fn a_condition_on_the_optional_side_says_so() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn ; \
+             asset360:hasName \"Main\" } }",
+            &schema,
+            false,
+        );
+        let tree = crate::sparql_ops::lower_refined(&plan, &schema, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
+
+        let mut sides = Vec::new();
+        for node in &tree.nodes {
+            match &node.op {
+                crate::sparql_ops::Op::Filter {
+                    star_var,
+                    optional_side,
+                    ..
+                } => sides.push((star_var.clone(), *optional_side)),
+                crate::sparql_ops::Op::Scan {
+                    star_var,
+                    is_optional,
+                    ..
+                } => sides.push((format!("scan {star_var}"), *is_optional)),
+                _ => {}
+            }
+        }
+        assert!(
+            sides.contains(&("t".to_owned(), true)),
+            "the condition inside the OPTIONAL is on the optional side: {sides:?}"
+        );
+        assert!(
+            sides.contains(&("scan t".to_owned(), true)),
+            "and so is the star it reads: {sides:?}"
+        );
+        assert!(
+            sides.contains(&("scan s".to_owned(), false)),
+            "while the preserved side is not: {sides:?}"
+        );
     }
 
     /// Grouping on a multivalued slot groups its *values*, and the count is

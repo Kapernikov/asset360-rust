@@ -154,6 +154,23 @@ pub enum Op {
         slot_path: Vec<String>,
         condition: FilterCondition,
         enforcement: Enforcement,
+        /// Whether this condition is on the *optional* side of a left join.
+        ///
+        /// The single most common way a left-join translation is wrong, made a
+        /// fact about the node rather than a habit of the renderer. A
+        /// condition on an optional star must not eliminate the row the join
+        /// exists to keep: in a plain `WHERE` it turns the left join into an
+        /// inner one, silently, with a plausible smaller answer and no error.
+        /// It belongs in the `ON` clause -- or, as this renderer states the
+        /// same thing, in a `WHERE` wrapped `(… OR alias.asset360_uri IS
+        /// NULL)`.
+        ///
+        /// Derivable from the star (`Op::Scan::is_optional`), and stated here
+        /// anyway for the reason `numeric` and `reading` are: the renderer
+        /// reads conditions one at a time, and a fact it has to fetch from
+        /// somewhere else is a fact it can forget to fetch. The Python adapter
+        /// refuses a plan where the two disagree.
+        optional_side: bool,
         /// Which value at that path the condition holds of.
         ///
         /// Carried for the same reason as `numeric`, and it was missing: a
@@ -358,6 +375,7 @@ pub fn lower_sql_pass(
                         enforcement,
                         numeric,
                         reading,
+                        optional_side: star.is_optional,
                     },
                     discharges: Vec::new(),
                 });
@@ -375,6 +393,7 @@ pub fn lower_sql_pass(
                         condition: condition.clone(),
                         enforcement,
                         numeric: path_filter.numeric,
+                        optional_side: star.is_optional,
                         // Only single-valued hops become a path filter, and
                         // only a single-valued value at the end of one -- the
                         // scoper leaves an array to the engine, so a path
@@ -554,11 +573,13 @@ pub enum LoweringRefusal {
     /// reference recorded. Both mean the plan claims SQL applies something SQL
     /// cannot state, so refusing is the only safe answer.
     Unrenderable { node: usize },
-    /// A pushed left join. No rule pushes one today, and this lowering emits
-    /// every scan with `is_optional: false` -- true only while that holds. A
-    /// refusal rather than a comment, so the first rule that renders optional
-    /// semantics in SQL fails here loudly instead of turning an optional block
-    /// into a required one and dropping the rows the join exists to keep.
+    /// A pushed left join carrying a lifted condition. The condition decides
+    /// whether the optional side *matched*, which is a conditional binding and
+    /// not a row test: as a `WHERE` it deletes the row the join exists to
+    /// keep, quietly and with a smaller answer.
+    ///
+    /// `PushLeftJoin` declines the shape, and this is the second lock -- the
+    /// rule that forgets is the one this catches.
     PushedOptional { node: usize },
     /// A scan on the optional side of a left join. Same reason: the star is
     /// optional and this lowering would call it mandatory, which wraps its
@@ -582,7 +603,8 @@ impl fmt::Display for LoweringRefusal {
             }
             Self::PushedOptional { node } => write!(
                 f,
-                "n{node} pushes a left join, which this lowering cannot render"
+                "n{node} pushes a left join whose lifted condition would have to \
+                 be a conditional binding rather than a row test"
             ),
             Self::OptionalScan { node } => write!(
                 f,
@@ -643,28 +665,45 @@ pub fn lower_refined(
         return Err(LoweringRefusal::SeveralIslands { islands: 2 });
     }
 
-    // Every scan below is emitted as mandatory, so a scan whose rows the query
-    // only optionally wants has to be refused here. Both shapes are
-    // unreachable today -- no rule pushes a left join, and a scan inside one's
-    // optional side makes the frontier two islands -- and both are checked
-    // rather than argued, because the argument stops holding the moment a
-    // tier-two rule renders optional semantics in SQL.
-    for &id in &sql {
-        if matches!(plan.nodes[id].op, RefinedOp::LeftJoin { .. }) {
-            return Err(LoweringRefusal::PushedOptional { node: id });
-        }
-    }
+    // A scan whose rows the query only optionally wants must be *marked*
+    // optional, or the renderer treats every condition on it as a row test and
+    // the left join becomes an inner one. The marking comes from a left join
+    // this lowering renders; a scan on the optional side of one that stays
+    // with the engine has no such marker, so it is refused rather than called
+    // mandatory.
+    //
+    // Unreachable through today's rules -- such a plan is two islands and
+    // refused above -- and checked because that is a fact about the rule set
+    // rather than about the shape.
     for &id in &sql {
         if !matches!(plan.nodes[id].op, RefinedOp::Scan { .. }) {
             continue;
         }
-        let optional_side = plan.nodes.iter().any(
-            |node| matches!(&node.op, RefinedOp::LeftJoin { right, .. } if plan.feeds(id, *right)),
-        );
-        if optional_side {
+        let under_engine_optional = plan.nodes.iter().any(|node| {
+            matches!(&node.op, RefinedOp::LeftJoin { right, .. }
+                if node.executor == Executor::Engine && plan.feeds(id, *right))
+        });
+        if under_engine_optional {
             return Err(LoweringRefusal::OptionalScan { node: id });
         }
     }
+
+    // Which nodes sit on the *optional* side of a left join this lowering
+    // renders. Everything there has to tolerate an unmatched row: a scan is
+    // marked optional so the renderer wraps its conditions, and each condition
+    // says so itself. Computed once from the structure -- the refined plan
+    // states optionality as a shape and the renderer states it as a flag, and
+    // this is the one place that translates between them.
+    let optional_nodes: std::collections::HashSet<usize> = plan
+        .nodes
+        .iter()
+        .filter(|node| node.executor == Executor::Sql)
+        .filter_map(|node| match &node.op {
+            RefinedOp::LeftJoin { right, .. } => Some(*right),
+            _ => None,
+        })
+        .flat_map(|right| (0..plan.nodes.len()).filter(move |id| plan.feeds(*id, right)))
+        .collect();
 
     // A pass that answers the query enforces its filters; one that feeds the
     // engine only narrows. The refined plan says which by whether anything
@@ -728,11 +767,12 @@ pub fn lower_refined(
                             .filter(|slot| Some(slot.as_str()) != identifier.as_deref())
                             .collect(),
                         optional_slots: column_slots(SlotPresence::Optional),
-                        // Mandatory, and checked rather than assumed:
-                        // `LoweringRefusal::OptionalScan` above refuses a scan
-                        // the query only optionally wants, and
-                        // `PushedOptional` refuses a left join in SQL.
-                        is_optional: false,
+                        // Whether the query only optionally wants these rows,
+                        // which is what decides how the renderer wraps every
+                        // condition on them. A scan on the optional side of a
+                        // left join *nothing pushed* is refused above, because
+                        // this statement would then call it mandatory.
+                        is_optional: optional_nodes.contains(&id),
                     },
                     discharges: node.discharges.clone(),
                 });
@@ -809,9 +849,12 @@ pub fn lower_refined(
                                         &mut nodes,
                                         input,
                                         &condition,
-                                        schema,
-                                        class_uri,
-                                        enforcement,
+                                        FilterFacts {
+                                            schema,
+                                            class_uri,
+                                            enforcement,
+                                            optional_side: optional_nodes.contains(&id),
+                                        },
                                         discharges,
                                     );
                                     input = nodes.len() - 1;
@@ -829,13 +872,44 @@ pub fn lower_refined(
                         &mut nodes,
                         input,
                         &condition,
-                        schema,
-                        class_uri,
-                        enforcement,
+                        FilterFacts {
+                            schema,
+                            class_uri,
+                            enforcement,
+                            optional_side: optional_nodes.contains(&id),
+                        },
                         discharges,
                     );
                     input = nodes.len() - 1;
                 }
+            }
+            RefinedOp::LeftJoin {
+                left,
+                right,
+                reference,
+                condition,
+            } => {
+                // A condition lifted into the left join decides whether the
+                // optional side *matched*, which is a conditional binding
+                // rather than a row test -- no rule pushes one, and rendering
+                // it as a `WHERE` would delete the rows the join keeps.
+                if condition.is_some() {
+                    return Err(LoweringRefusal::PushedOptional { node: id });
+                }
+                let Some(edge) = reference else {
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                };
+                nodes.push(OpNode {
+                    op: Op::Join {
+                        left: remap[left],
+                        right: remap[right],
+                        left_star: edge.referenced.clone(),
+                        right_star: edge.holder.clone(),
+                        right_slot: edge.slot.clone(),
+                        kind: JoinType::Left,
+                    },
+                    discharges: node.discharges.clone(),
+                });
             }
             RefinedOp::Join {
                 left,
@@ -1088,9 +1162,11 @@ fn conditions_of(tree: &OpTree) -> Vec<String> {
                 condition,
                 numeric,
                 reading,
+                optional_side,
                 ..
             } => Some(format!(
-                "?{star_var}.{} {condition} numeric={numeric} reading={reading}",
+                "?{star_var}.{} {condition} numeric={numeric} reading={reading} \
+                 optional={optional_side}",
                 slot_path.join(".")
             )),
             _ => None,
@@ -1238,15 +1314,31 @@ fn scan_of_star(nodes: &mut [OpNode], star_var: &str) -> Option<OpId> {
 
 /// Append one filter operator, resolving the physical facts the condition does
 /// not carry.
+/// What a lowered filter needs beyond its condition: the two physical facts
+/// the address does not carry, and where it sits relative to a left join.
+///
+/// A struct rather than four more parameters, because they are read together
+/// and a caller passing them positionally is a caller who can swap two bools.
+struct FilterFacts<'a> {
+    schema: &'a linkml_schemaview::schemaview::SchemaView,
+    class_uri: Option<&'a String>,
+    enforcement: Enforcement,
+    optional_side: bool,
+}
+
 fn push_filter(
     nodes: &mut Vec<OpNode>,
     input: OpId,
     condition: &crate::sparql_refine::SqlCondition,
-    schema: &linkml_schemaview::schemaview::SchemaView,
-    class_uri: Option<&String>,
-    enforcement: Enforcement,
+    facts: FilterFacts<'_>,
     discharges: Vec<ObligationId>,
 ) {
+    let FilterFacts {
+        schema,
+        class_uri,
+        enforcement,
+        optional_side,
+    } = facts;
     // Numeric-ness is a property of the column, not of the condition, which is
     // why the condition names a slot rather than carrying SQL: the renderer
     // has to cast, or `'9' >= '10'` is true. Resolved through the same
@@ -1275,6 +1367,7 @@ fn push_filter(
             enforcement,
             numeric,
             reading,
+            optional_side,
         },
         discharges,
     });
@@ -1693,6 +1786,7 @@ mod tests {
                 enforcement: Enforcement::Narrows,
                 numeric: false,
                 reading,
+                optional_side: false,
             },
             discharges: Vec::new(),
         };
@@ -1829,65 +1923,43 @@ mod tests {
         );
     }
 
-    /// A scan the query only optionally wants is refused, rather than lowered
-    /// as mandatory.
+    /// A left join with a lifted condition does not lower, even pushed.
     ///
-    /// Unreachable through the rules today -- nothing pushes a left join, and
-    /// a scan inside one's optional side makes the frontier two islands -- so
-    /// the plan is edited by hand to reach the check. That is the point: the
-    /// check exists so the first tier-two rule that renders optional semantics
-    /// in SQL fails loudly here instead of turning an optional block into a
-    /// required one.
+    /// The condition decides whether the optional side *matched*: a signal
+    /// whose track is named "A" is still an answer, with the track's name
+    /// unbound. Rendering it as a `WHERE` deletes that row -- an inner join
+    /// wearing a left join's clothes, with a smaller answer and no error --
+    /// and as an `ON` it needs a conditional binding expression this does not
+    /// build.
+    ///
+    /// `PushLeftJoin` declines it too. The refusal here is the second lock:
+    /// the rule that forgets is the one this catches.
     #[test]
-    fn a_scan_the_query_only_optionally_wants_does_not_lower() {
+    fn a_left_join_with_a_lifted_condition_does_not_lower() {
         let sv = test_schema_view();
         let mut plan = refined_plan(
-            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
+             FILTER(?tn > \"A\") } }",
             &sv,
         );
-        // A second star inside the `OPTIONAL`, which is a real left join and
-        // not an absorbed read -- so there is a `leftjoin` node to push, which
-        // is what this test needs. (A same-star optional read no longer leaves
-        // one: `AbsorbOptionalRead` turns it into a nullable column.)
-        assert_eq!(plan.find("leftjoin").len(), 1, "{plan}");
-
-        // Push the left join, as a tier-two rule eventually will.
         let leftjoin = plan.find("leftjoin")[0];
+        assert_eq!(
+            plan.nodes[leftjoin].executor,
+            crate::sparql_refine::Executor::Engine,
+            "the rule declines a lifted condition:\n{plan}"
+        );
+
+        // Push it anyway, as a rule that had not thought about the condition
+        // would.
         plan.nodes[leftjoin].executor = crate::sparql_refine::Executor::Sql;
         for input in plan.nodes[leftjoin].op.inputs() {
             plan.nodes[input].executor = crate::sparql_refine::Executor::Sql;
         }
         let refusal = lower_refined(&plan, &sv, None)
-            .expect_err("a pushed left join must not lower as an inner one");
+            .expect_err("a lifted condition must not be rendered as a WHERE");
         assert!(
             matches!(refusal, LoweringRefusal::PushedOptional { .. }),
-            "{refusal}"
-        );
-
-        // And the other half: the scan on the optional side, without the left
-        // join itself being pushed.
-        let mut sided = refined_plan(
-            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
-            &sv,
-        );
-        // Two islands as it stands, which is its own refusal; make the
-        // mandatory side engine-run so the optional scan is the only island
-        // and the reason has to be the optionality.
-        let mandatory = sided
-            .find("scan")
-            .into_iter()
-            .find(|id| {
-                matches!(&sided.nodes[*id].op,
-                    crate::sparql_refine::PlanOp::Scan { star_var, .. } if star_var == "s")
-            })
-            .expect("the mandatory star is scanned");
-        sided.nodes[mandatory].executor = crate::sparql_refine::Executor::Engine;
-        let refusal = lower_refined(&sided, &sv, None)
-            .expect_err("a scan on the optional side must not lower as mandatory");
-        assert!(
-            matches!(refusal, LoweringRefusal::OptionalScan { .. }),
             "{refusal}"
         );
     }

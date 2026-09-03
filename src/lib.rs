@@ -2546,6 +2546,27 @@ impl PlanOp {
         }
     }
 
+    /// For ``"filter"``: whether the condition is on the *optional* side of a
+    /// left join, so it must not eliminate an unmatched row.
+    ///
+    /// The single most common way a left-join translation is wrong: in a plain
+    /// ``WHERE`` such a condition turns the left join into an inner one,
+    /// silently, with a plausible smaller answer and no error. It belongs in
+    /// the ``ON`` clause — or, as this renderer states the same thing, in a
+    /// ``WHERE`` wrapped ``(… OR alias.asset360_uri IS NULL)``.
+    ///
+    /// Derivable from ``is_optional`` on the star's scan, and stated here for
+    /// the reason ``numeric`` and ``reading`` are: a fact the renderer has to
+    /// fetch from somewhere else is a fact it can forget to fetch.
+    #[getter]
+    fn optional_side(&self) -> bool {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter { optional_side, .. } => *optional_side,
+            _ => false,
+        }
+    }
+
     /// For ``"join"``: the slot on the right input whose value is the left
     /// row's ``asset360_uri``.
     #[getter]

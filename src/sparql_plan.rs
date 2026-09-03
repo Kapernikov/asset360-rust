@@ -1428,6 +1428,10 @@ mod tests {
             // SQL's rather than a narrowing of what the engine will decide.
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm } GROUP BY ?nm",
+            // An `OPTIONAL` over a second star, which used to be two islands
+            // and is now one statement with a `LEFT JOIN` in it.
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
         ] {
             let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
             assert!(
@@ -1724,10 +1728,13 @@ mod tests {
                 "leaves 'group",
             ),
             (
-                // An `OPTIONAL` over a second star: two islands, so the
-                // frontier is not a statement.
+                // An `OPTIONAL` whose condition is lifted into the left join.
+                // `PushLeftJoin` declines it -- the condition decides whether
+                // the optional side matched, not whether the row survives --
+                // so the frontier is two islands and not a statement.
                 "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-                 OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
+                 OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
+                 FILTER(?tn > \"A\") } }",
                 "not lowerable",
             ),
         ] {

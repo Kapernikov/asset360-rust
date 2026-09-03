@@ -847,6 +847,12 @@ pub enum PlanOp {
     LeftJoin {
         left: NodeId,
         right: NodeId,
+        /// The reference edge this join joins on, once a rule has pushed it.
+        ///
+        /// Same field and same reason as [`PlanOp::Join`]'s: the direction is
+        /// recorded rather than re-derived, and
+        /// [`Plan::reference_joins_agree`] checks it against the scans.
+        reference: Option<ReferenceEdge>,
         /// The condition spargebra lifts out of `OPTIONAL { ... FILTER(x) }`.
         ///
         /// Claimed by this node, per conjunct: nothing pushes it (it decides
@@ -1518,14 +1524,23 @@ impl Plan {
     /// variable and nothing else.
     pub fn reference_joins_agree(&self) -> Result<(), PlanDefect> {
         for (id, node) in self.nodes.iter().enumerate() {
-            let PlanOp::Join {
-                left,
-                right,
-                on,
-                reference: Some(edge),
-            } = &node.op
-            else {
-                continue;
+            // Both join kinds: a left join records the same edge, and a
+            // reversed one is the same wrong answer with the rows the
+            // `OPTIONAL` keeps thrown in.
+            let (left, right, on, edge) = match &node.op {
+                PlanOp::Join {
+                    left,
+                    right,
+                    on,
+                    reference: Some(edge),
+                } => (left, right, Some(on), edge),
+                PlanOp::LeftJoin {
+                    left,
+                    right,
+                    reference: Some(edge),
+                    ..
+                } => (left, right, None, edge),
+                _ => continue,
             };
             let scanned_on = |side: NodeId, star: &str| -> Option<&Vec<ScanSlot>> {
                 self.nodes
@@ -1555,7 +1570,10 @@ impl Plan {
                         })
                 })
             };
-            let agrees = on.as_slice() == [edge.referenced.clone()]
+            // A left join has no `on`: the variables the two sides share are
+            // the query's business, and what the renderer needs is the edge.
+            let joins_on_the_edge = on.is_none_or(|on| on.as_slice() == [edge.referenced.clone()]);
+            let agrees = joins_on_the_edge
                 && ((scanned_on(*left, &edge.referenced).is_some() && holds_the_key(*right))
                     || (scanned_on(*right, &edge.referenced).is_some() && holds_the_key(*left)));
             if !agrees {
@@ -1750,11 +1768,18 @@ impl PlanOp {
             PlanOp::LeftJoin {
                 left,
                 right,
+                reference,
                 condition,
-            } => match condition {
-                Some(condition) => format!("n{left}, n{right}  if {condition}"),
-                None => format!("n{left}, n{right}"),
-            },
+            } => {
+                let edge = match reference {
+                    Some(edge) => format!("  via ?{}.{}", edge.holder, edge.slot),
+                    None => String::new(),
+                };
+                match condition {
+                    Some(condition) => format!("n{left}, n{right}{edge}  if {condition}"),
+                    None => format!("n{left}, n{right}{edge}"),
+                }
+            }
             PlanOp::Union { left, right } | PlanOp::Minus { left, right } => {
                 format!("n{left}, n{right}")
             }
@@ -2100,6 +2125,7 @@ impl Builder<'_> {
                     PlanOp::LeftJoin {
                         left,
                         right,
+                        reference: None,
                         condition,
                     },
                     claims,
