@@ -22,7 +22,7 @@ use std::collections::hash_map::Entry;
 
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
-use linkml_schemaview::slotview::SlotContainerMode;
+use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
 use spargebra::term::{Term, TermPattern, TriplePattern};
 
@@ -1106,6 +1106,147 @@ fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Push a reference join
+// ---------------------------------------------------------------------------
+
+/// A `Join` between two `Sql` scans on a reference slot becomes `Sql`.
+///
+/// The edge is [`crate::sparql_scoper::JoinEdge`]'s: the *right* star holds the
+/// foreign key -- a slot whose value is the left star's `asset360_uri` -- and
+/// the plan spells that as one scan binding the variable to a slot while the
+/// other scans it as a star. `?s :locatedOnTrack ?t . ?t a Track` folds into
+/// exactly that pair, so the rule reads the join's variable and asks which
+/// side is which.
+///
+/// The direction is not recorded on the node, and that is deliberate: `on`
+/// plus the two scans determine it, which is the derivation this rule performs
+/// and any consumer can repeat. Recording it would be a change to the
+/// representation, and the fact worth recording is the one an invariant could
+/// then check -- which this one is not, since a wrong direction is a wrong
+/// answer no invariant of a plan can see.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **Exactly one join variable.** Two stars sharing two variables are joined
+///   by more than the reference, and a SQL join on the foreign key alone
+///   answers a weaker question than the query asked.
+/// * **One side scans the variable as a star, the other binds it to a slot of
+///   its own class.** A variable two stars bind as *slots* (`?a :name ?nm .
+///   ?b :hasName ?nm`) is a value join between two columns, which is not this
+///   edge and does not render as one.
+/// * **The slot stores a reference.** An inlined slot holds the structure
+///   itself, so there is no column holding the other record's identifier and
+///   no row to join to -- the loss the star decomposition records as
+///   `Inexact::TypedNestedStructure`. `?s :documents ?d . ?d a Document` is
+///   that case.
+/// * **The slot is single-valued.** A multivalued reference is an array of
+///   identifiers, and while its scan's [`PlanOp::Unnest`] does restore the
+///   fan-out, the join condition would then have to name the *element* rather
+///   than the column -- the same missing fact that stops
+///   [`PushComparisonFilter`] on a multivalued slot, and declined here for the
+///   same reason rather than left to a renderer to guess.
+/// * **Both sides already run in SQL.** The frontier is a cut.
+pub struct PushReferenceJoin<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> PushReferenceJoin<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+
+    /// Whether a scan feeding `holder` binds `joined` to a single-valued
+    /// reference slot of its own class -- the foreign key side of the edge.
+    fn holds_the_foreign_key(&self, plan: &Plan, holder: NodeId, joined: &str) -> bool {
+        plan.nodes
+            .iter()
+            .enumerate()
+            .any(|(id, node)| match &node.op {
+                PlanOp::Scan {
+                    class_uri, slots, ..
+                } => {
+                    node.executor == Executor::Sql
+                        && plan.feeds(id, holder)
+                        && slots.iter().any(|slot| {
+                            slot.var == joined
+                                && !slot.multivalued
+                                && self.stores_a_reference(class_uri, &slot.slot)
+                        })
+                }
+                _ => false,
+            })
+    }
+
+    /// Whether this slot of this class holds another record's identifier.
+    ///
+    /// Asked of the class rather than of the slot's own definition, and with
+    /// the same test the star decomposition uses to raise a join edge, so the
+    /// two cannot disagree about what a reference is.
+    fn stores_a_reference(&self, class_uri: &str, slot_name: &str) -> bool {
+        self.schema
+            .get_class_by_uri(class_uri)
+            .ok()
+            .flatten()
+            .and_then(|class| class.slot(&Identifier::Name(slot_name.to_owned())))
+            .is_some_and(|slot| slot.determine_slot_inline_mode() == SlotInlineMode::Reference)
+    }
+}
+
+impl Rule for PushReferenceJoin<'_> {
+    fn name(&self) -> &'static str {
+        "push_reference_join"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            // A left join is a different operator, and no rule pushes one: the
+            // preserved side keeps rows the optional side did not match, which
+            // is not what an inner join on the foreign key returns.
+            let PlanOp::Join { left, right, on } = &plan.nodes[id].op else {
+                continue;
+            };
+            let (left, right) = (*left, *right);
+            let [joined] = on.as_slice() else {
+                continue;
+            };
+            let joined = joined.clone();
+            if plan.nodes[left].executor != Executor::Sql
+                || plan.nodes[right].executor != Executor::Sql
+            {
+                continue;
+            }
+            // Which side scans the joined variable as a star. `feeds` rather
+            // than [`mandatorily_feeds`] for the reason given in
+            // [`Visible::below`]: an `Sql` subtree holds no left join.
+            let scans_the_star = |side: NodeId| {
+                plan.nodes.iter().enumerate().any(|(scan, node)| {
+                    matches!(&node.op, PlanOp::Scan { star_var, .. } if star_var == &joined)
+                        && node.executor == Executor::Sql
+                        && plan.feeds(scan, side)
+                })
+            };
+            let referenced = if scans_the_star(left) {
+                left
+            } else if scans_the_star(right) {
+                right
+            } else {
+                continue;
+            };
+            let holder = if referenced == left { right } else { left };
+            if !self.holds_the_foreign_key(plan, holder, &joined) {
+                continue;
+            }
+            plan.nodes[id].executor = Executor::Sql;
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1498,6 +1639,157 @@ mod tests {
         assert!(
             matches!(failure.defect, crate::sparql_refine::PlanDefect::Ledger(_)),
             "{failure}"
+        );
+    }
+
+    /// What the rule is for: two stars joined on a reference slot become one
+    /// SQL statement -- the scan of the referenced star, the scan of the star
+    /// holding the foreign key, and the join between them.
+    #[test]
+    fn a_reference_join_between_two_scans_is_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn }",
+        );
+        let log = refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushReferenceJoin::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+        assert!(log.applied.contains(&"push_reference_join"), "{plan}");
+
+        let join = plan.find("join")[0];
+        assert_eq!(plan.nodes[join].executor, Executor::Sql, "{plan}");
+        assert!(
+            plan.nodes
+                .iter()
+                .filter(|node| node.op.kind() == "scan")
+                .all(|node| node.executor == Executor::Sql),
+            "{plan}"
+        );
+        assert_eq!(
+            plan.nodes.last().unwrap().executor,
+            Executor::Engine,
+            "the projection is still the engine's:\n{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// A left join is a different operator and no rule pushes one, even with
+    /// both sides pushed: the preserved side keeps rows the optional side did
+    /// not match, which is not what an inner join on the foreign key returns.
+    #[test]
+    fn a_left_join_is_not_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushReferenceJoin::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        let leftjoin = plan.find("leftjoin")[0];
+        assert_eq!(plan.nodes[leftjoin].executor, Executor::Engine, "{plan}");
+        // Both sides *are* pushed, so this is the rule declining rather than
+        // the frontier being unreachable -- which is the case worth testing.
+        for input in plan.nodes[leftjoin].op.inputs() {
+            assert_eq!(plan.nodes[input].executor, Executor::Sql, "{plan}");
+        }
+        assert!(plan.find("join").is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// An inlined slot holds the structure itself, so there is no column
+    /// holding the other record's identifier and no row to join to. The same
+    /// query without the nested `rdf:type` is a path into the JSON, which is a
+    /// different plan and not this rule's.
+    #[test]
+    fn a_join_into_an_inlined_structure_is_not_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?title WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
+             ?d a asset360:Document ; asset360:title ?title }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushReferenceJoin::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert_eq!(
+            plan.nodes[plan.find("join")[0]].executor,
+            Executor::Engine,
+            "{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// A multivalued reference is an array of identifiers. Its unnest does
+    /// restore the fan-out, but the join would have to compare the *element*
+    /// and the plan has no name for one -- the same missing fact that stops a
+    /// comparison on a multivalued slot.
+    #[test]
+    fn a_multivalued_reference_join_is_not_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?ln WHERE { ?g a asset360:LineGroup ; asset360:groupsLines ?l . \
+             ?l a asset360:Line ; asset360:hasName ?ln }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushReferenceJoin::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert_eq!(
+            plan.nodes[plan.find("join")[0]].executor,
+            Executor::Engine,
+            "{plan}"
+        );
+        // The fan-out is still restored, which is what makes the *scan* side
+        // of this correct however the join is executed.
+        assert_eq!(plan.find("unnest").len(), 1, "{plan}");
+        println!("{plan}");
+    }
+
+    /// A variable two stars bind as slots is a value join between two columns,
+    /// not a reference edge: neither side scans it as a star.
+    #[test]
+    fn a_value_join_between_two_columns_is_not_pushed() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             ?t a asset360:Track ; asset360:hasName ?nm }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushReferenceJoin::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+
+        assert_eq!(
+            plan.nodes[plan.find("join")[0]].executor,
+            Executor::Engine,
+            "{plan}"
         );
     }
 

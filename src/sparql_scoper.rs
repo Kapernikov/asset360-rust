@@ -2982,6 +2982,18 @@ classes:
         identifier: true
       hasName:
         range: string
+  # A multivalued *reference*: an array of other records' identifiers, as
+  # opposed to `documents`, which is an array of inlined structures. The two
+  # are the same shape to a check that only asks whether a slot is
+  # multivalued, and different questions in SQL.
+  LineGroup:
+    class_uri: asset360:LineGroup
+    attributes:
+      asset360_uri:
+        identifier: true
+      groupsLines:
+        range: Line
+        multivalued: true
 "#;
         let schema: SchemaDefinition =
             p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
