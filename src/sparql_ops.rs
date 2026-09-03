@@ -327,6 +327,13 @@ pub fn lower_sql_pass(
             // containment test over the record's array: `?s :kinds "m"` and
             // `FILTER(?k = "m")` both ask whether the record carries the
             // triple, which matches it once.
+            //
+            // One of two places that decide a reading -- `lower_refined` is
+            // the other, where it comes from the condition the rules built.
+            // Both resolve it through the schema (here via
+            // `Star::multivalued_fields`, there via the scan slot's own
+            // multiplicity), so they agree; whoever changes one should look at
+            // the other.
             let reading = if star.multivalued_fields.iter().any(|field| field == slot) {
                 SlotReading::AnyElement
             } else {
@@ -538,6 +545,16 @@ pub enum LoweringRefusal {
     /// reference recorded. Both mean the plan claims SQL applies something SQL
     /// cannot state, so refusing is the only safe answer.
     Unrenderable { node: usize },
+    /// A pushed left join. No rule pushes one today, and this lowering emits
+    /// every scan with `is_optional: false` -- true only while that holds. A
+    /// refusal rather than a comment, so the first rule that renders optional
+    /// semantics in SQL fails here loudly instead of turning an optional block
+    /// into a required one and dropping the rows the join exists to keep.
+    PushedOptional { node: usize },
+    /// A scan on the optional side of a left join. Same reason: the star is
+    /// optional and this lowering would call it mandatory, which wraps its
+    /// conditions the wrong way.
+    OptionalScan { node: usize },
 }
 
 impl fmt::Display for LoweringRefusal {
@@ -554,6 +571,15 @@ impl fmt::Display for LoweringRefusal {
             Self::Unrenderable { node } => {
                 write!(f, "n{node} is pushed but does not render")
             }
+            Self::PushedOptional { node } => write!(
+                f,
+                "n{node} pushes a left join, which this lowering cannot render"
+            ),
+            Self::OptionalScan { node } => write!(
+                f,
+                "n{node} scans the optional side of a left join, which this \
+                 lowering would render as mandatory"
+            ),
         }
     }
 }
@@ -606,6 +632,29 @@ pub fn lower_refined(
     };
     if !sql.iter().all(|id| plan.feeds(*id, *root)) {
         return Err(LoweringRefusal::SeveralIslands { islands: 2 });
+    }
+
+    // Every scan below is emitted as mandatory, so a scan whose rows the query
+    // only optionally wants has to be refused here. Both shapes are
+    // unreachable today -- no rule pushes a left join, and a scan inside one's
+    // optional side makes the frontier two islands -- and both are checked
+    // rather than argued, because the argument stops holding the moment a
+    // tier-two rule renders optional semantics in SQL.
+    for &id in &sql {
+        if matches!(plan.nodes[id].op, RefinedOp::LeftJoin { .. }) {
+            return Err(LoweringRefusal::PushedOptional { node: id });
+        }
+    }
+    for &id in &sql {
+        if !matches!(plan.nodes[id].op, RefinedOp::Scan { .. }) {
+            continue;
+        }
+        let optional_side = plan.nodes.iter().any(
+            |node| matches!(&node.op, RefinedOp::LeftJoin { right, .. } if plan.feeds(id, *right)),
+        );
+        if optional_side {
+            return Err(LoweringRefusal::OptionalScan { node: id });
+        }
     }
 
     // A pass that answers the query enforces its filters; one that feeds the
@@ -670,9 +719,10 @@ pub fn lower_refined(
                             .filter(|slot| Some(slot.as_str()) != identifier.as_deref())
                             .collect(),
                         optional_slots: column_slots(SlotPresence::Delivered),
-                        // No rule pushes a left join, so a scan this lowering
-                        // sees is never the optional side of one -- a plan
-                        // where it were has two islands and was refused above.
+                        // Mandatory, and checked rather than assumed:
+                        // `LoweringRefusal::OptionalScan` above refuses a scan
+                        // the query only optionally wants, and
+                        // `PushedOptional` refuses a left join in SQL.
                         is_optional: false,
                     },
                     discharges: node.discharges.clone(),
@@ -813,12 +863,15 @@ pub fn lower_refined(
 
     // The fetch bound: a row cap the scoper found safe to apply, which claims
     // nothing -- the engine still applies the query's own `LIMIT` and this
-    // only spares the fetch rows no answer could use. Borrowed from the
-    // single-pass planner rather than re-derived, because deciding *whether* a
-    // limit may reach the fetch is its analysis (a dropped filter makes it
-    // unsafe, and `test_limit_is_not_pushed_past_a_dropped_filter` is why),
-    // and two derivations of one decision is how they come to disagree. A rule
-    // that decides it from the refined plan is later work.
+    // only spares the fetch rows no answer could use.
+    //
+    // Borrowed from the single-pass planner rather than re-derived, and that
+    // is a decision rather than a shortcut: whether a limit may reach the
+    // fetch is the scoper's analysis (a dropped filter makes it unsafe, and
+    // `test_limit_is_not_pushed_past_a_dropped_filter` is why), and a second
+    // derivation of one decision is how two planners come to disagree about
+    // it. Duplicating that reasoning here would be worse than depending on
+    // it, so this dependency stays until a rule owns the question outright.
     //
     // Losing it is not a wrong answer but it is a real regression:
     // `LIMIT 1` fetched every row of the class, which is what
@@ -1584,6 +1637,67 @@ mod tests {
         .expect_err("two islands must not lower");
         assert!(
             matches!(refusal, LoweringRefusal::SeveralIslands { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// A scan the query only optionally wants is refused, rather than lowered
+    /// as mandatory.
+    ///
+    /// Unreachable through the rules today -- nothing pushes a left join, and
+    /// a scan inside one's optional side makes the frontier two islands -- so
+    /// the plan is edited by hand to reach the check. That is the point: the
+    /// check exists so the first tier-two rule that renders optional semantics
+    /// in SQL fails loudly here instead of turning an optional block into a
+    /// required one.
+    #[test]
+    fn a_scan_the_query_only_optionally_wants_does_not_lower() {
+        let sv = test_schema_view();
+        let mut plan = refined_plan(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } }",
+            &sv,
+        );
+        // As it stands, this lowers: the optional read is a delivered slot on
+        // a mandatory scan.
+        lower_refined(&plan, &sv, None).expect("should lower as it is");
+
+        // Push the left join, as a tier-two rule eventually will.
+        let leftjoin = plan.find("leftjoin")[0];
+        plan.nodes[leftjoin].executor = crate::sparql_refine::Executor::Sql;
+        for input in plan.nodes[leftjoin].op.inputs() {
+            plan.nodes[input].executor = crate::sparql_refine::Executor::Sql;
+        }
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a pushed left join must not lower as an inner one");
+        assert!(
+            matches!(refusal, LoweringRefusal::PushedOptional { .. }),
+            "{refusal}"
+        );
+
+        // And the other half: the scan on the optional side, without the left
+        // join itself being pushed.
+        let mut sided = refined_plan(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
+            &sv,
+        );
+        // Two islands as it stands, which is its own refusal; make the
+        // mandatory side engine-run so the optional scan is the only island
+        // and the reason has to be the optionality.
+        let mandatory = sided
+            .find("scan")
+            .into_iter()
+            .find(|id| {
+                matches!(&sided.nodes[*id].op,
+                    crate::sparql_refine::PlanOp::Scan { star_var, .. } if star_var == "s")
+            })
+            .expect("the mandatory star is scanned");
+        sided.nodes[mandatory].executor = crate::sparql_refine::Executor::Engine;
+        let refusal = lower_refined(&sided, &sv, None)
+            .expect_err("a scan on the optional side must not lower as mandatory");
+        assert!(
+            matches!(refusal, LoweringRefusal::OptionalScan { .. }),
             "{refusal}"
         );
     }
