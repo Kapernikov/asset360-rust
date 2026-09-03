@@ -42,7 +42,7 @@ use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
-use spargebra::term::{Term, TermPattern, TriplePattern};
+use spargebra::term::{GroundTerm, Term, TermPattern, TriplePattern};
 
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
@@ -498,7 +498,25 @@ struct Visible {
 
 impl Visible {
     /// Everything the `Sql` scans below `base` bind.
+    ///
+    /// `feeds` and not [`mandatorily_feeds`]: a landing site runs in SQL, the
+    /// frontier is a cut, so its whole subtree is `Sql` -- and no rule pushes
+    /// a left join, a union or a minus. Every path from a scan to an `Sql`
+    /// node is therefore already mandatory.
     fn below(plan: &Plan, base: NodeId) -> Self {
+        Self::collect(plan, base, false)
+    }
+
+    /// The same, of a node that is *not* known to run in SQL.
+    ///
+    /// A rule that rewrites a join into a filter needs the stronger question:
+    /// the variable has to be bound in every row of the side that stays, and a
+    /// scan reached through the optional side of a left join is not that.
+    fn mandatorily_below(plan: &Plan, base: NodeId) -> Self {
+        Self::collect(plan, base, true)
+    }
+
+    fn collect(plan: &Plan, base: NodeId, mandatory: bool) -> Self {
         let mut slots: HashMap<String, Option<SlotBinding>> = HashMap::new();
         let mut class_of_star: HashMap<String, String> = HashMap::new();
         for (id, node) in plan.nodes.iter().enumerate() {
@@ -510,13 +528,12 @@ impl Visible {
             else {
                 continue;
             };
-            // `feeds` and not [`mandatorily_feeds`]: a landing site runs in
-            // SQL, the frontier is a cut, so its whole subtree is `Sql` -- and
-            // no rule pushes a left join, a union or a minus. Every path from a
-            // scan to an `Sql` node is therefore already mandatory, and asking
-            // the stronger question here would only hide a future rule that
-            // pushed one of them.
-            if node.executor != Executor::Sql || !plan.feeds(id, base) {
+            let reaches = if mandatory {
+                mandatorily_feeds(plan, id, base)
+            } else {
+                plan.feeds(id, base)
+            };
+            if node.executor != Executor::Sql || !reaches {
                 continue;
             }
             class_of_star.insert(star_var.clone(), class_uri.clone());
@@ -525,6 +542,13 @@ impl Visible {
             // path, which no `SqlCondition` can say, so it is entered as
             // ambiguous: a rule then declines `FILTER(?s = <iri>)` rather than
             // resolving `?s` through some other star's slot of the same name.
+            //
+            // That is a capability gap against today's planner, which pushes
+            // such a constraint as `Star::identifier_values`. Closing it needs
+            // an *address* for a record's identity, which no `Expr::Slot` has
+            // -- a representation change rather than a rule. A constraint
+            // written on the identifier slot itself
+            // (`?s :asset360_uri "u"`) does push, through the slot.
             slots.insert(star_var.clone(), None);
             for slot in scan_slots {
                 // A multivalued slot's variable is one *element*, and it is
@@ -1032,8 +1056,11 @@ fn constant_object(pattern: &TriplePattern) -> Option<Term> {
     }
 }
 
-/// Drop the match, and turn the join that carried it into the filter, reading
-/// the side that stays.
+/// Drop a leaf, and turn the join that carried it into the filter, reading the
+/// side that stays.
+///
+/// Serves a constant-object `match` and a `VALUES` block alike: both are a
+/// value constraint the join applied, and both leave exactly one node behind.
 ///
 /// The claims of both move to the filter. A naive join claims nothing, so the
 /// join's are empty in practice -- but a claim on a node that disappears has
@@ -1077,6 +1104,128 @@ fn replace_match_with_filter(
     }
 
     plan.nodes = nodes;
+}
+
+// ---------------------------------------------------------------------------
+// Turn a VALUES over a bound variable into a filter
+// ---------------------------------------------------------------------------
+
+/// A `VALUES` block joined on a variable a scan already binds is a set
+/// membership test, so it becomes a `Filter` with an `IN`.
+///
+/// The case that makes [`crate::sparql_plan::Obligation::Values`] its own kind
+/// worth having. That kind exists because a `VALUES` binding a variable
+/// nothing else binds *adds rows and columns*, so calling it a filter would
+/// invite a consumer to apply it as a `WHERE` and answer a narrower question.
+/// The precondition here is exactly the discriminator that warning implies: a
+/// `VALUES` whose variable a scan below already binds adds nothing, and then
+/// it is a filter -- which is what the star decomposition does with it, as an
+/// `In` condition on the slot.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **One variable, and a scan below the other side binds it.** Two
+///   variables is a table, not a set of values for a column; a variable
+///   nothing else binds adds rows.
+/// * **No `UNDEF`.** An unbound cell makes the row match anything, so the
+///   block is not a set of values at all.
+/// * **No duplicate row.** A join against `{ "a" "a" }` returns each matching
+///   solution twice -- `VALUES` is a *bag* -- while `IN ('a', 'a')` returns it
+///   once. Rejecting duplicates is the only reading that keeps the row count.
+/// * **The side that stays binds the variable in every row**
+///   ([`Visible::mandatorily_below`]), for the same reason a constant object
+///   inside an `OPTIONAL` cannot become a filter.
+pub struct ValuesBecomesFilter<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> ValuesBecomesFilter<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for ValuesBecomesFilter<'_> {
+    fn name(&self) -> &'static str {
+        "values_becomes_filter"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Values { variables, rows } = &plan.nodes[id].op else {
+                continue;
+            };
+            let [variable] = variables.as_slice() else {
+                continue;
+            };
+            let var = variable.as_str().to_owned();
+            let mut terms: Vec<Term> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let [Some(ground)] = row.as_slice() else {
+                    // An `UNDEF`, or a row of the wrong width: neither is a
+                    // value this variable takes.
+                    terms.clear();
+                    break;
+                };
+                terms.push(ground_term(ground));
+            }
+            if terms.is_empty() {
+                continue;
+            }
+            // A bag, not a set: see the precondition above.
+            if (1..terms.len()).any(|i| terms[..i].contains(&terms[i])) {
+                continue;
+            }
+
+            let above = consumers(plan, id);
+            let [consumer] = above.as_slice() else {
+                continue;
+            };
+            let PlanOp::Join {
+                left, right, on, ..
+            } = &plan.nodes[*consumer].op
+            else {
+                continue;
+            };
+            if on.as_slice() != [var.clone()] {
+                continue;
+            }
+            let (consumer, other) = (*consumer, if *left == id { *right } else { *left });
+
+            let visible = Visible::mandatorily_below(plan, other);
+            let Some(binding) = visible.slot_of(&var) else {
+                continue;
+            };
+            let condition = Expr::In {
+                value: Box::new(Expr::Slot {
+                    star_var: binding.star_var.clone(),
+                    slot_path: binding.path.clone(),
+                    reading: binding.reading,
+                }),
+                candidates: terms.into_iter().map(Expr::Literal).collect(),
+            };
+            if condition
+                .to_sql(self.schema, &visible.class_of_star)
+                .is_none()
+            {
+                continue;
+            }
+            replace_match_with_filter(plan, id, consumer, other, condition);
+            return true;
+        }
+        false
+    }
+}
+
+/// A `VALUES` cell as a term. Total, because the cell kinds are the term kinds.
+fn ground_term(ground: &GroundTerm) -> Term {
+    match ground {
+        GroundTerm::NamedNode(node) => Term::NamedNode(node.clone()),
+        GroundTerm::Literal(literal) => Term::Literal(literal.clone()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1514,8 +1663,9 @@ impl Rule for PushReferenceJoin<'_> {
 // ---------------------------------------------------------------------------
 
 /// Every tier-one rule, in the order 28d lists them: scope a type, fold a
-/// nested read into a path, turn a constant object into a filter, push a
-/// comparison, push a reference join.
+/// nested read into a path, turn a constant object into a filter, turn a
+/// `VALUES` over a bound variable into one, push a comparison, push a
+/// reference join.
 ///
 /// Tier one is the set that needs nothing new from the executor. The engine
 /// leg re-runs the whole query, so a node below the first row-collapsing
@@ -1535,6 +1685,7 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
         Box::new(FoldMatchesIntoScan::new(schema)),
         Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(ConstantObjectBecomesFilter::new(schema)),
+        Box::new(ValuesBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
         Box::new(PushReferenceJoin::new(schema)),
     ]
@@ -1543,6 +1694,7 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sparql_plan::Obligation;
     use crate::sparql_refine::naive_plan_of;
     use crate::sparql_scoper::tests::test_schema_view;
 
@@ -2210,6 +2362,87 @@ mod tests {
     /// The whole rule set, for a test that does not care which rule fired.
     fn refine_with_tier_one(query: &str, schema: &SchemaView) -> Plan {
         refined(query, schema, false)
+    }
+
+    /// What the rule is for: a `VALUES` whose variable a scan already binds is
+    /// a set membership test, which is what the star decomposition makes of it
+    /// too -- an `In` condition on the slot.
+    #[test]
+    fn values_over_a_bound_variable_becomes_an_in_filter() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             VALUES ?nm { \"a\" \"b\" } }",
+            &schema,
+            false,
+        );
+
+        assert!(plan.find("values").is_empty(), "{plan}");
+        assert!(plan.find("join").is_empty(), "{plan}");
+        let filter = plan.find("filter")[0];
+        assert_eq!(
+            plan.nodes[filter].op.describe(),
+            "(?s.name IN (\"a\", \"b\"))",
+            "{plan}"
+        );
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        // The `Values` obligation moves with the constraint -- and the refined
+        // plan claims it in SQL, which today's ledger does not.
+        assert_eq!(
+            plan.nodes[filter]
+                .discharges
+                .iter()
+                .map(|id| plan.obligations[*id].to_string())
+                .collect::<Vec<_>>(),
+            vec!["values    VALUES ?nm × 2 row(s)"],
+            "{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// The three shapes that are not a set of values for a column, and the
+    /// fourth that is a set but not a filter.
+    #[test]
+    fn a_values_block_that_is_not_a_membership_test_stays_a_join() {
+        let schema = test_schema_view();
+        for (query, why) in [
+            (
+                // A bag, not a set: the join returns each matching solution
+                // twice and `IN ('a', 'a')` returns it once.
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 VALUES ?nm { \"a\" \"a\" } }",
+                "a duplicate row multiplies solutions",
+            ),
+            (
+                // An unbound cell matches anything, so the block is not a set
+                // of values for the column.
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 VALUES ?nm { \"a\" UNDEF } }",
+                "UNDEF is not a value",
+            ),
+            (
+                // Two variables is a table, not a column's values.
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+                 asset360:length ?len . VALUES (?nm ?len) { (\"a\" 1) } }",
+                "two variables is a table",
+            ),
+            (
+                // The star variable is the record's identity, and the plan has
+                // no address for that -- only for a record's slots. Today's
+                // planner pushes it as `identifier_values`, so this is a gap
+                // and not a refusal: see the note on `Visible`.
+                "SELECT ?s WHERE { ?s a asset360:Signal . VALUES ?s { \"u\" } }",
+                "a star variable is not a slot",
+            ),
+        ] {
+            let plan = refined(query, &schema, false);
+            assert_eq!(
+                plan.find("values").len(),
+                1,
+                "{why}, so the block stays: {query}\n{plan}"
+            );
+            assert!(plan.find("filter").is_empty(), "{why}: {query}\n{plan}");
+        }
     }
 
     /// A nested read becomes a path on the scan, and a filter on it pushes.
@@ -3073,6 +3306,12 @@ mod tests {
         "SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal ; \
          asset360:name ?nm } LIMIT 3 } }",
         "SELECT ?s WHERE { VALUES ?s { \"a\" \"b\" } }",
+        "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u\" }",
+        "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+         VALUES ?nm { \"a\" \"b\" } }",
+        "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+         asset360:name ?nm ; asset360:trafficKinds ?kind . FILTER(?nm > \"A\") } \
+         GROUP BY ?kind ORDER BY DESC(?n) LIMIT 10",
         "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
          ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
         "SELECT ?v WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
@@ -3104,6 +3343,235 @@ mod tests {
     fn refined(query: &str, schema: &SchemaView, reverse: bool) -> Plan {
         refine_naive(&plan_of(query), schema, reverse)
     }
+
+    /// What today's planner's SQL pass claims, as obligation *text*.
+    ///
+    /// Text and not ids: the two planners enumerate the same obligations, but
+    /// a comparison by id would pass for the wrong reason if either ever
+    /// reordered them.
+    ///
+    /// `None` when today's planner refuses the query outright, which is not a
+    /// parity failure -- there is nothing to be at parity with.
+    fn claimed_by_sql_today(query: &str, schema: &SchemaView) -> Option<Vec<String>> {
+        let plan = crate::sparql_plan::plan_query(&format!("{PREFIX}{query}"), schema).ok()?;
+        Some(
+            plan.passes
+                .iter()
+                .filter(|pass| matches!(pass.kind, crate::sparql_plan::PassKind::Sql(_)))
+                .flat_map(|pass| pass.discharges.iter())
+                .filter(|id| tier_one_shaped(&plan.obligations[**id]))
+                .map(|id| plan.obligations[*id].to_string())
+                .collect(),
+        )
+    }
+
+    /// Whether an obligation is one tier one could take care of at all.
+    ///
+    /// A grouping, an ordering, a slice and a `DISTINCT` all *collapse or
+    /// reorder rows*, and every rule here is non-collapsing by construction --
+    /// the engine leg re-runs the query, which is what makes a partial push
+    /// correct, and it cannot re-run one over rows that are already
+    /// aggregates. So today's eligible route claims them in SQL and the
+    /// refined plan does not, and that difference is tier two rather than a
+    /// regression. Comparing them would only assert that tier two is unbuilt.
+    fn tier_one_shaped(obligation: &Obligation) -> bool {
+        matches!(
+            obligation,
+            Obligation::Type { .. }
+                | Obligation::Triple { .. }
+                | Obligation::Filter { .. }
+                | Obligation::Values { .. }
+        )
+    }
+
+    /// The obligations the refined plan's `Sql` nodes claim, as text.
+    fn claimed_by_sql_refined(plan: &Plan) -> Vec<String> {
+        plan.nodes
+            .iter()
+            .filter(|node| node.executor == Executor::Sql)
+            .flat_map(|node| node.discharges.iter())
+            .filter(|id| tier_one_shaped(&plan.obligations[**id]))
+            .map(|id| plan.obligations[*id].to_string())
+            .collect()
+    }
+
+    /// The value conditions today's star decomposition pushes, as
+    /// `?star.path <condition>`.
+    ///
+    /// `identifier_values` is rendered against the class's identifier slot,
+    /// which is where it came from: the star keeps it apart from `filters`
+    /// because it renders against the indexed `asset360_uri` column rather
+    /// than the JSONB payload, and that is a *rendering* difference over the
+    /// same constraint.
+    fn conditions_pushed_today(query: &str, schema: &SchemaView) -> Vec<String> {
+        let Ok(scoped) = crate::sparql_scoper::sparql_scope(&format!("{PREFIX}{query}"), schema)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for star in scoped.root.all_stars() {
+            let mut slots: Vec<(&String, &Vec<crate::sparql_scoper::FilterCondition>)> =
+                star.filters.iter().collect();
+            slots.sort_by(|a, b| a.0.cmp(b.0));
+            for (slot, conditions) in slots {
+                for condition in conditions {
+                    out.push(format!("?{}.{slot} {condition}", star.variable));
+                }
+            }
+            for path in &star.path_filters {
+                for condition in &path.conditions {
+                    out.push(format!(
+                        "?{}.{} {condition}",
+                        star.variable,
+                        path.slot_path.join(".")
+                    ));
+                }
+            }
+            if !star.identifier_values.is_empty() {
+                let identifier = match schema.get_class_by_uri(&star.class_uri).ok().flatten() {
+                    Some(class) => class
+                        .identifier_slot()
+                        .map(|slot| slot.name.clone())
+                        .unwrap_or_default(),
+                    None => String::new(),
+                };
+                let condition = if star.identifier_values.len() == 1 {
+                    crate::sparql_scoper::FilterCondition::Eq(star.identifier_values[0].clone())
+                } else {
+                    crate::sparql_scoper::FilterCondition::In(star.identifier_values.clone())
+                };
+                out.push(format!("?{}.{identifier} {condition}", star.variable));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The same, of a refined plan: every condition its `Sql` filters render.
+    ///
+    /// The *reading* is dropped from the comparison, deliberately. On a
+    /// multivalued slot today's renderer performs a containment test over the
+    /// record's array while the refined plan names the element its unnest
+    /// bound, which selects rows rather than records -- the stricter and, for
+    /// SPARQL, the correct one. Comparing the reading would report that
+    /// difference as a parity failure when it is an improvement; the reading
+    /// itself is asserted by
+    /// `a_comparison_on_a_multivalued_slot_is_pushed_as_the_element`.
+    fn conditions_pushed_refined(plan: &Plan, schema: &SchemaView) -> Vec<String> {
+        let classes: HashMap<String, String> = plan
+            .nodes
+            .iter()
+            .filter(|node| node.executor == Executor::Sql)
+            .filter_map(|node| match &node.op {
+                PlanOp::Scan {
+                    star_var,
+                    class_uri,
+                    ..
+                } => Some((star_var.clone(), class_uri.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        for node in &plan.nodes {
+            if node.executor != Executor::Sql {
+                continue;
+            }
+            let PlanOp::Filter { condition, .. } = &node.op else {
+                continue;
+            };
+            // Every pushed filter must render: the rule pushed it *because*
+            // `to_sql` accepted it, so a `None` here would mean the plan says
+            // SQL applies a condition SQL cannot state.
+            let rendered = condition
+                .to_sql(schema, &classes)
+                .unwrap_or_else(|| panic!("a pushed filter that does not render:\n{plan}"));
+            for condition in rendered {
+                out.push(format!(
+                    "?{}.{} {}",
+                    condition.star_var,
+                    condition.slot_path.join("."),
+                    condition.condition
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// **The gate on stage 3.** Whatever today's SQL pass claims, the refined
+    /// plan's `Sql` nodes claim too -- and whatever conditions today's star
+    /// decomposition pushes, the refined plan pushes too.
+    ///
+    /// Stated as containment rather than equality, in that direction: the
+    /// refined plan legitimately claims *more* (a `VALUES` over a bound
+    /// variable, a filter today's ledger applies without claiming). Switching
+    /// the endpoint onto a planner that pushed *less* would regress answers or
+    /// lose pushdown, which is what this refuses to let happen quietly.
+    ///
+    /// Where parity is not reached, the gap is named below rather than
+    /// smoothed over: an entry in `KNOWN_GAPS` fails the test if it stops
+    /// being a gap, so the list cannot rot in either direction.
+    #[test]
+    fn the_refined_plan_claims_everything_todays_sql_pass_claims() {
+        let schema = test_schema_view();
+        for query in CORPUS {
+            let Some(today) = claimed_by_sql_today(query, &schema) else {
+                continue;
+            };
+            let plan = refined(query, &schema, false);
+            let refined_claims = claimed_by_sql_refined(&plan);
+            let missing: Vec<&String> = today
+                .iter()
+                .filter(|claim| !refined_claims.contains(claim))
+                .collect();
+            let expected: Vec<&str> = KNOWN_GAPS
+                .iter()
+                .filter(|(gap_query, _)| gap_query == query)
+                .map(|(_, claim)| *claim)
+                .collect();
+            assert_eq!(
+                missing
+                    .iter()
+                    .map(|claim| claim.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "claim parity for {query}\n{plan}"
+            );
+
+            let today_conditions = conditions_pushed_today(query, &schema);
+            let refined_conditions = conditions_pushed_refined(&plan, &schema);
+            for condition in &today_conditions {
+                assert!(
+                    refined_conditions.contains(condition),
+                    "today pushes {condition} and the refined plan does not, for \
+                     {query}\n{plan}\nrefined pushes {refined_conditions:?}"
+                );
+            }
+        }
+    }
+
+    /// Every claim today's SQL pass makes that the refined plan does not, with
+    /// why. One entry, and it is not a pushdown difference: it is a
+    /// disagreement about what claiming a triple *means*.
+    ///
+    /// A read inside an `OPTIONAL` reaches today's star as an
+    /// `optional_fields` entry: the prefetch delivers the column without a
+    /// `WHERE object_data ? 'name'`, and the pass claims the triple because
+    /// the data reaches oxigraph. The refined plan claims an obligation when a
+    /// node *takes care of* it, and a fetch that requires nothing does not
+    /// enforce a triple -- so the `match` stays with the engine, which re-runs
+    /// the query anyway and gets the same answer from the same rows.
+    ///
+    /// I would argue against closing this by claiming it: `plan_query`'s own
+    /// comment refuses to let a pass "say it enforced something it did not",
+    /// and an optional read is exactly that. Stage 3 has to pick a meaning; if
+    /// it wants today's, a scan needs a slot that is fetched without being
+    /// required, which is a representation change and not a rule.
+    const KNOWN_GAPS: &[(&str, &str)] = &[(
+        "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+         OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
+        "triple    ?s asset360:name ?nm",
+    )];
 
     /// A rule chain is only testable if its result does not depend on the
     /// order the rules were listed in. Every tier-one rule is monotone -- two
