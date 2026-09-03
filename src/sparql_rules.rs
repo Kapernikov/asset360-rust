@@ -601,6 +601,279 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
 }
 
 // ---------------------------------------------------------------------------
+// Where a match's subject lives
+// ---------------------------------------------------------------------------
+
+/// The record, and the place inside it, that a match's subject variable names.
+///
+/// Two shapes, and the second is what makes a nested path pushable: the
+/// subject is either a star an `Sql` scan scanned, or a structure *inside* one
+/// of its records that a scan slot bound. `?s :location ?loc` binds `?loc` to
+/// the inlined `location` value, so `?loc :longitude 5` constrains
+/// `["location", "longitude"]` of the same record -- a `PathFilter` in the
+/// star decomposition's vocabulary.
+struct SubjectSite {
+    scan: NodeId,
+    star_var: String,
+    /// The class of the *record*, which is what a slot path is resolved
+    /// against.
+    class_uri: String,
+    /// The path from the record's root to the structure the subject names.
+    /// Empty when the subject is the star itself.
+    prefix: Vec<String>,
+}
+
+/// Where a subject variable's rows come from, when they mandatorily come from
+/// one `Sql` scan feeding `other`.
+///
+/// [`mandatorily_feeds`] rather than `feeds` for the reason the constant rule
+/// gives: a scan reached through the optional side of a left join is not a row
+/// set a constraint can be moved onto.
+fn subject_site(plan: &Plan, other: NodeId, subject: &str) -> Option<SubjectSite> {
+    plan.nodes.iter().enumerate().find_map(|(scan, node)| {
+        let PlanOp::Scan {
+            star_var,
+            class_uri,
+            slots,
+        } = &node.op
+        else {
+            return None;
+        };
+        if node.executor != Executor::Sql || !mandatorily_feeds(plan, scan, other) {
+            return None;
+        }
+        if star_var == subject {
+            return Some(SubjectSite {
+                scan,
+                star_var: star_var.clone(),
+                class_uri: class_uri.clone(),
+                prefix: Vec::new(),
+            });
+        }
+        slots
+            .iter()
+            // A multivalued slot's variable is one element of an array,
+            // and walking into it would address a field of that element --
+            // a third reading of the address, which nothing renders. The
+            // star decomposition walks single-valued hops only, for the
+            // same reason.
+            .find(|slot| slot.var == subject && !slot.multivalued)
+            .map(|slot| SubjectSite {
+                scan,
+                star_var: star_var.clone(),
+                class_uri: class_uri.clone(),
+                prefix: slot.path.clone(),
+            })
+    })
+}
+
+/// The class of the structure at `path`, when every hop is one a plan may walk
+/// into.
+///
+/// Declines a *reference* hop, which is the distinction that keeps this from
+/// answering a different question: a reference stores the target's identifier,
+/// so there is no nested JSON to walk and the value two hops down lives in
+/// another record -- the case the star decomposition covers with a join edge
+/// and refuses to treat as a path. Declines a multivalued hop for the reason
+/// in [`subject_site`].
+fn class_at_path(
+    schema: &SchemaView,
+    class_uri: &str,
+    path: &[String],
+) -> Option<linkml_schemaview::classview::ClassView> {
+    let mut class = schema.get_class_by_uri(class_uri).ok().flatten()?;
+    for name in path {
+        let slot = class.slot(&Identifier::Name(name.clone()))?;
+        if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
+            return None;
+        }
+        if slot.determine_slot_inline_mode() == SlotInlineMode::Reference {
+            return None;
+        }
+        class = slot.get_range_class()?;
+    }
+    Some(class)
+}
+
+// ---------------------------------------------------------------------------
+// Fold a nested match into a path
+// ---------------------------------------------------------------------------
+
+/// A `match` reading a slot of a structure *inside* a scanned record folds
+/// into that scan as a path, and the join that carried it disappears.
+///
+/// The remaining half of what the star decomposition pushes and the refined
+/// plan rejected: `?s :location ?loc . ?loc :longitude ?lon` reads
+/// `["location", "longitude"]` of one record, which `Star::path_filters`
+/// renders by walking into the JSON. Without this the whole star declines any
+/// filter on `?lon`, which is a capability gap against the planner that serves
+/// queries today rather than a conservative choice.
+///
+/// Only a *variable* object folds here. A constant one is a value constraint
+/// and [`ConstantObjectBecomesFilter`] resolves the same nested subject
+/// through the same [`subject_site`], so `?loc :longitude 5` becomes a filter
+/// on that path rather than a slot the scan reads.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **The subject is a structure inside a scanned record**, reached by
+///   single-valued inlined hops only ([`class_at_path`]). A reference hop
+///   stores an identifier, so the value beyond it lives in *another record*
+///   and is a join rather than a path -- walking into it would read a column
+///   that does not exist.
+/// * **The nested slot is single-valued.** A multivalued one fans out, and a
+///   scan owes an [`PlanOp::Unnest`] for every multivalued slot it reads
+///   (invariant five). This rule extends a scan that already exists, so it
+///   cannot honour that debt through [`scan_with_fanout`] -- the one function
+///   allowed to build a scan -- and paying it by hand is exactly the
+///   discipline stage 1 replaced with a constructor. Lifting this means
+///   rebuilding the scan through that function, not editing it here.
+/// * **The match's one consumer is a plain `Join` on the subject variable,
+///   whose other side takes every row from that scan.** As for a constant
+///   object: a nested read inside an `OPTIONAL` is not a column of the
+///   preserved side.
+pub struct FoldNestedMatchIntoPath<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> FoldNestedMatchIntoPath<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for FoldNestedMatchIntoPath<'_> {
+    fn name(&self) -> &'static str {
+        "fold_nested_match_into_path"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+                continue;
+            };
+            if is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(subject), Some(predicate), Some(var)) = (
+                subject_variable(pattern),
+                predicate_iri(pattern),
+                object_variable(pattern),
+            ) else {
+                continue;
+            };
+            let (subject, predicate, var) =
+                (subject.to_owned(), predicate.to_owned(), var.to_owned());
+
+            let above = consumers(plan, id);
+            let [consumer] = above.as_slice() else {
+                continue;
+            };
+            let PlanOp::Join {
+                left, right, on, ..
+            } = &plan.nodes[*consumer].op
+            else {
+                continue;
+            };
+            if on.as_slice() != [subject.clone()] {
+                continue;
+            }
+            let (consumer, other) = (*consumer, if *left == id { *right } else { *left });
+
+            let Some(site) = subject_site(plan, other, &subject) else {
+                continue;
+            };
+            // An empty prefix is the star itself, which is the fold rule's:
+            // that one has the type pattern to fold with and the multiplicity
+            // machinery to fold it safely.
+            if site.prefix.is_empty() {
+                continue;
+            }
+            let Some(class) = class_at_path(self.schema, &site.class_uri, &site.prefix) else {
+                continue;
+            };
+            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
+                continue;
+            };
+            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+                continue;
+            };
+            if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue {
+                continue;
+            }
+            let mut path = site.prefix.clone();
+            path.push(slot.name.clone());
+            fold_into_scan(
+                plan,
+                id,
+                consumer,
+                other,
+                site.scan,
+                ScanSlot {
+                    path,
+                    var,
+                    multivalued: false,
+                },
+            );
+            return true;
+        }
+        false
+    }
+}
+
+/// Add a path to a scan's slot list, drop the match that asked for it, and
+/// collapse the join that carried it.
+///
+/// The claim moves to the scan, which is where the other reads of the same
+/// record are claimed. The join disappears rather than becoming anything: a
+/// natural join with a row set already inside it adds no constraint and no
+/// column, which is the same collapse [`fold`] performs.
+fn fold_into_scan(
+    plan: &mut Plan,
+    matched: NodeId,
+    join: NodeId,
+    other: NodeId,
+    scan: NodeId,
+    slot: ScanSlot,
+) {
+    debug_assert!(
+        !slot.multivalued,
+        "a scan built outside `scan_with_fanout` cannot owe an unnest"
+    );
+    let mut claims = plan.nodes[matched].discharges.clone();
+    claims.extend(plan.nodes[join].discharges.iter().copied());
+    if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+        slots.push(slot);
+    }
+    plan.nodes[scan].discharges.extend(claims);
+    plan.nodes[scan].discharges.sort_unstable();
+
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == matched {
+            continue;
+        }
+        if old == join {
+            // Everything that read the join reads the side that stays.
+            remap[old] = remap[other];
+            continue;
+        }
+        nodes.push(node.clone());
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("nothing reads the match but the join"));
+    }
+
+    plan.nodes = nodes;
+}
+
+// ---------------------------------------------------------------------------
 // Turn a constant object into a filter
 // ---------------------------------------------------------------------------
 
@@ -619,7 +892,7 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
 /// Preconditions, each with the wrong answer it prevents:
 ///
 /// * **The match's one consumer is a plain `Join` whose other side takes every
-///   row from an `Sql` scan of the same star.** A constant object inside an
+///   row from an `Sql` scan the subject lives on.** A constant object inside an
 ///   `OPTIONAL` is consumed by a `LeftJoin`, and turning it into a filter over
 ///   the preserved side drops exactly the rows the join exists to keep -- the
 ///   loss the star decomposition records as `Inexact::ConstantInOptional`.
@@ -627,6 +900,11 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
 ///   `?s` unbound against a match that binds it *keeps* the row, so a scan
 ///   reached through the optional side of a left join is not a row set this
 ///   constraint can be moved onto.
+/// * **The subject is a star, or a structure inside a scanned record.**
+///   [`subject_site`] answers both, so `?loc :longitude 5` constrains
+///   `["location", "longitude"]` of the record `?loc` came out of -- the
+///   `PathFilter` the star decomposition pushes -- and the rule does not need
+///   a second copy of that resolution.
 /// * **A multivalued slot is a containment test, not a column.**
 ///   `:trafficKinds "m"` asks whether the record carries that triple at all,
 ///   which matches a record once however many values it holds -- so the
@@ -652,14 +930,8 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
     /// The term test is not repeated here: [`Expr::to_sql`] is the only way to
     /// obtain a condition and asks it, so a constant no record spells declines
     /// at the same place for this rule as for every other.
-    fn condition_for(
-        &self,
-        star: &str,
-        class_uri: &str,
-        predicate: &str,
-        term: &Term,
-    ) -> Option<Expr> {
-        let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
+    fn condition_for(&self, site: &SubjectSite, predicate: &str, term: &Term) -> Option<Expr> {
+        let class = class_at_path(self.schema, &site.class_uri, &site.prefix)?;
         let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
         let on_class = class.slot(&Identifier::Name(slot.name.clone()))?;
         // A constant object on a multivalued slot is a containment test, and
@@ -674,16 +946,18 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         } else {
             SlotReading::AnyElement
         };
+        let mut slot_path = site.prefix.clone();
+        slot_path.push(slot.name.clone());
         let condition = Expr::Compare {
             op: CompareOp::Eq,
             left: Box::new(Expr::Slot {
-                star_var: star.to_owned(),
-                slot_path: vec![slot.name.clone()],
+                star_var: site.star_var.clone(),
+                slot_path,
                 reading,
             }),
             right: Box::new(Expr::Literal(term.clone())),
         };
-        let classes = HashMap::from([(star.to_owned(), class_uri.to_owned())]);
+        let classes = HashMap::from([(site.star_var.clone(), site.class_uri.clone())]);
         condition.to_sql(self.schema, &classes)?;
         Some(condition)
     }
@@ -707,14 +981,14 @@ impl Rule for ConstantObjectBecomesFilter<'_> {
             if is_type_pattern(pattern) {
                 continue;
             }
-            let (Some(star), Some(predicate), Some(term)) = (
+            let (Some(subject), Some(predicate), Some(term)) = (
                 subject_variable(pattern),
                 predicate_iri(pattern),
                 constant_object(pattern),
             ) else {
                 continue;
             };
-            let (star, predicate) = (star.to_owned(), predicate.to_owned());
+            let (subject, predicate) = (subject.to_owned(), predicate.to_owned());
 
             // The join that carried the match is the node that disappears, so
             // the shape is checked before the schema: without it there is no
@@ -729,32 +1003,15 @@ impl Rule for ConstantObjectBecomesFilter<'_> {
             else {
                 continue;
             };
-            if on.as_slice() != [star.clone()] {
+            if on.as_slice() != [subject.clone()] {
                 continue;
             }
             let (consumer, other) = (*consumer, if *left == id { *right } else { *left });
 
-            let Some(class_uri) =
-                plan.nodes
-                    .iter()
-                    .enumerate()
-                    .find_map(|(scan, node)| match &node.op {
-                        PlanOp::Scan {
-                            star_var,
-                            class_uri,
-                            ..
-                        } if node.executor == Executor::Sql
-                            && star_var == &star
-                            && mandatorily_feeds(plan, scan, other) =>
-                        {
-                            Some(class_uri.clone())
-                        }
-                        _ => None,
-                    })
-            else {
+            let Some(site) = subject_site(plan, other, &subject) else {
                 continue;
             };
-            let Some(condition) = self.condition_for(&star, &class_uri, &predicate, &term) else {
+            let Some(condition) = self.condition_for(&site, &predicate, &term) else {
                 continue;
             };
             replace_match_with_filter(plan, id, consumer, other, condition);
@@ -1256,8 +1513,9 @@ impl Rule for PushReferenceJoin<'_> {
 // The tier-one rule set
 // ---------------------------------------------------------------------------
 
-/// Every tier-one rule, in the order 28d lists them: scope a type, turn a
-/// constant object into a filter, push a comparison, push a reference join.
+/// Every tier-one rule, in the order 28d lists them: scope a type, fold a
+/// nested read into a path, turn a constant object into a filter, push a
+/// comparison, push a reference join.
 ///
 /// Tier one is the set that needs nothing new from the executor. The engine
 /// leg re-runs the whole query, so a node below the first row-collapsing
@@ -1266,8 +1524,8 @@ impl Rule for PushReferenceJoin<'_> {
 /// than that argument (see [`constant_is_the_columns_term`]).
 ///
 /// The order is a preference and not a requirement: each rule is monotone --
-/// the fold and the constant rewrite remove a `match`, the other two turn an
-/// `Engine` node `Sql`, and none of them ever does the reverse -- so the
+/// three of them remove a `match`, two turn an `Engine` node `Sql`, and none
+/// of them ever does the reverse -- so the
 /// driver reaches the same fixpoint from any order, and
 /// `the_rule_order_does_not_decide_the_fixpoint` holds it to that. What the
 /// order buys is rounds: a filter cannot push before the scan below it exists,
@@ -1275,6 +1533,7 @@ impl Rule for PushReferenceJoin<'_> {
 pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
     vec![
         Box::new(FoldMatchesIntoScan::new(schema)),
+        Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(ConstantObjectBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
         Box::new(PushReferenceJoin::new(schema)),
@@ -1946,6 +2205,175 @@ mod tests {
             Executor::Engine,
             "{plan}"
         );
+    }
+
+    /// The whole rule set, for a test that does not care which rule fired.
+    fn refine_with_tier_one(query: &str, schema: &SchemaView) -> Plan {
+        refined(query, schema, false)
+    }
+
+    /// A nested read becomes a path on the scan, and a filter on it pushes.
+    /// This is `Star::path_filters` reached by rules: `?z` lives two slots
+    /// down, which no column key can name, and dropping the condition counted
+    /// every record where the query counts some.
+    #[test]
+    fn a_nested_read_folds_into_a_path_a_filter_can_push() {
+        let schema = test_schema_view();
+        let plan = refine_with_tier_one(
+            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
+            &schema,
+        );
+
+        assert_eq!(
+            scan_slots(&plan),
+            vec![
+                ("location".to_owned(), "loc".to_owned(), false),
+                ("location.longitude".to_owned(), "lon".to_owned(), false),
+            ],
+            "{plan}"
+        );
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert!(
+            plan.find("join").is_empty(),
+            "the join that carried the nested read collapses:\n{plan}"
+        );
+        let filter = plan.find("filter")[0];
+        assert_eq!(
+            plan.nodes[filter].op.describe(),
+            "(?s.location.longitude > \"3\"^^<http://www.w3.org/2001/XMLSchema#integer>)",
+            "{plan}"
+        );
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        println!("{plan}");
+    }
+
+    /// A constant two slots down is the same path, reached by the constant
+    /// rule through the same resolution -- one place decides where a subject
+    /// lives.
+    #[test]
+    fn a_nested_constant_becomes_a_path_filter() {
+        let schema = test_schema_view();
+        let plan = refine_with_tier_one(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:longitude 5 }",
+            &schema,
+        );
+
+        let filter = plan.find("filter")[0];
+        assert_eq!(
+            plan.nodes[filter].op.describe(),
+            "(?s.location.longitude = \"5\"^^<http://www.w3.org/2001/XMLSchema#integer>)",
+            "{plan}"
+        );
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        assert!(plan.find("match").is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// Three hops, because a path is a path: the rule applies to its own
+    /// output, one hop per application.
+    #[test]
+    fn a_path_can_be_deeper_than_two_slots() {
+        let schema = test_schema_view();
+        let plan = refine_with_tier_one(
+            "SELECT ?v WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:detail ?d . ?d asset360:value ?v . FILTER(?v = \"x\") }",
+            &schema,
+        );
+
+        assert!(
+            scan_slots(&plan).contains(&(
+                "location.detail.value".to_owned(),
+                "v".to_owned(),
+                false
+            )),
+            "{plan}"
+        );
+        assert_eq!(
+            plan.nodes[plan.find("filter")[0]].op.describe(),
+            "(?s.location.detail.value = \"x\")",
+            "{plan}"
+        );
+        assert_eq!(
+            plan.nodes[plan.find("filter")[0]].executor,
+            Executor::Sql,
+            "{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// A reference hop is not walked into, and this is the distinction that
+    /// keeps a path from answering a different question: the foreign key holds
+    /// an identifier, so `?tn` lives in *another record*. The star
+    /// decomposition refuses the same shape, and the query with the nested
+    /// `rdf:type` is the one that becomes a join.
+    #[test]
+    fn a_reference_hop_is_not_walked_into() {
+        let schema = test_schema_view();
+        let plan = refine_with_tier_one(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t asset360:hasName ?tn . FILTER(?tn > \"A\") }",
+            &schema,
+        );
+
+        assert_eq!(
+            scan_slots(&plan),
+            vec![("locatedOnTrack".to_owned(), "t".to_owned(), false)],
+            "the reference folds as a column; what is beyond it does not:\n{plan}"
+        );
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
+        assert_eq!(
+            plan.nodes[plan.find("filter")[0]].executor,
+            Executor::Engine,
+            "{plan}"
+        );
+        println!("{plan}");
+    }
+
+    /// A multivalued hop does not fold. The value beyond it belongs to one
+    /// element of an array, which is a third reading of an address and one
+    /// nothing renders; and a scan owing an unnest can only be built by
+    /// `scan_with_fanout`, which this rule does not go through.
+    #[test]
+    fn a_multivalued_hop_is_not_walked_into() {
+        let schema = test_schema_view();
+        let plan = refine_with_tier_one(
+            "SELECT ?ti WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
+             ?d asset360:title ?ti }",
+            &schema,
+        );
+
+        assert_eq!(
+            scan_slots(&plan),
+            vec![("documents".to_owned(), "d".to_owned(), true)],
+            "{plan}"
+        );
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
+        // The array itself still folds, so its fan-out is still restored.
+        assert_eq!(plan.find("unnest").len(), 1, "{plan}");
+        println!("{plan}");
+    }
+
+    /// A nested read inside an `OPTIONAL` is not a column of the preserved
+    /// side, the same way a constant object is not.
+    #[test]
+    fn a_nested_read_inside_an_optional_stays_a_match() {
+        let schema = test_schema_view();
+        let plan = refine_with_tier_one(
+            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             OPTIONAL { ?loc asset360:longitude ?lon } }",
+            &schema,
+        );
+
+        assert_eq!(
+            scan_slots(&plan),
+            vec![("location".to_owned(), "loc".to_owned(), false)],
+            "{plan}"
+        );
+        assert_eq!(plan.find("match").len(), 1, "{plan}");
+        assert_eq!(plan.find("leftjoin").len(), 1, "{plan}");
+        println!("{plan}");
     }
 
     /// What the rule is for: a constant object is a value constraint, so it
@@ -2645,6 +3073,10 @@ mod tests {
         "SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal ; \
          asset360:name ?nm } LIMIT 3 } }",
         "SELECT ?s WHERE { VALUES ?s { \"a\" \"b\" } }",
+        "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+         ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
+        "SELECT ?v WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+         ?loc asset360:detail ?d . ?d asset360:value \"x\" }",
         "ASK WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }",
         "CONSTRUCT { ?s asset360:name ?nm } WHERE { ?s a asset360:Signal ; \
          asset360:name ?nm . FILTER(?nm > \"A\") }",
