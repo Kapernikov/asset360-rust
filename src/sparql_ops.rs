@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::sparql_plan::ObligationId;
-use crate::sparql_pushdown::{BindingSpec, MeasureSpec, OrderTerm};
+use crate::sparql_pushdown::{BindingSpec, HavingTerm, MeasureSpec, OrderTerm};
 use crate::sparql_scoper::{FilterCondition, JoinType};
 
 /// Index into an [`OpTree`]'s node list. Nodes refer to their inputs by index,
@@ -199,6 +199,14 @@ pub enum Op {
         bindings: Vec<BindingSpec>,
         keys: Vec<usize>,
         measures: Vec<MeasureSpec>,
+        /// Conditions on the grouped rows — SQL `HAVING`.
+        ///
+        /// On the grouping node rather than as an operator above it, because
+        /// SQL has no operator there: a `HAVING` is a clause of the grouping,
+        /// and its terms name that grouping's own measures. A separate node
+        /// would have to point back into this one's measure list to be
+        /// rendered at all.
+        having: Vec<HavingTerm>,
     },
     Sort {
         input: OpId,
@@ -445,6 +453,7 @@ pub fn lower_sql_pass(
                 bindings: solution.bindings.clone(),
                 keys: solution.group_keys.clone(),
                 measures: solution.measures.clone(),
+                having: solution.having.clone(),
             },
             // The claims sit here rather than spread over the nodes: the
             // analyser decides eligibility for the pass as a whole, so
@@ -1022,7 +1031,30 @@ fn collapsing_of(tree: &OpTree) -> Vec<String> {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Op::Group { .. } | Op::Sort { .. } | Op::Distinct { .. } | Op::Project { .. } => {
+            // A grouping's `HAVING` is work the grouping does, so it is part
+            // of what a fallback would hand back. Rendered into the key rather
+            // than counted, so a *different* condition is a difference too.
+            Op::Group { having, .. } => Some(format!(
+                "group having=[{}]",
+                having
+                    .iter()
+                    .map(|term| format!(
+                        "{}{} {} numeric={}",
+                        match term.key {
+                            crate::sparql_pushdown::OrderKey::Binding(_) => "c",
+                            crate::sparql_pushdown::OrderKey::Measure(_) => "m",
+                        },
+                        match term.key {
+                            crate::sparql_pushdown::OrderKey::Binding(index)
+                            | crate::sparql_pushdown::OrderKey::Measure(index) => index,
+                        },
+                        term.condition,
+                        term.numeric
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Op::Sort { .. } | Op::Distinct { .. } | Op::Project { .. } => {
                 Some(node.op.kind().to_owned())
             }
             Op::Slice { .. } if !node.discharges.is_empty() => Some("slice".to_owned()),
@@ -1596,6 +1628,7 @@ mod tests {
                     bindings: Vec::new(),
                     keys: Vec::new(),
                     measures: Vec::new(),
+                    having: Vec::new(),
                 },
                 discharges: vec![0],
             },

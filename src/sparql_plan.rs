@@ -1426,7 +1426,7 @@ mod tests {
                 // gate exists to refuse.
                 "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
                  asset360:name ?nm } GROUP BY ?nm",
-                "leaves 'group' to the engine",
+                "leaves 'group",
             ),
             (
                 // An `OPTIONAL` over a second star: two islands, so the

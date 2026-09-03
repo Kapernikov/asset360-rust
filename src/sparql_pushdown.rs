@@ -26,7 +26,9 @@ use spargebra::term::Variable;
 
 use linkml_schemaview::schemaview::SchemaView;
 
-use crate::sparql_scoper::{PathBinding, QueryPlan, ScopeError, Star, parse_query, scope_parsed};
+use crate::sparql_scoper::{
+    CmpOp, FilterCondition, PathBinding, QueryPlan, ScopeError, Star, parse_query, scope_parsed,
+};
 use crate::sparql_terms::{TermDescriptor, resolve_column};
 
 /// Verdict for one query.
@@ -118,12 +120,19 @@ pub enum BlockedCode {
     /// cannot express, a triple whose subject is not a scoped class, a
     /// sub-`SELECT`, a `FILTER` inside `OPTIONAL`.
     IncompletePlan,
-    /// `HAVING`: a condition on the grouped rows.
+    /// `HAVING`: a condition on the grouped rows that this cannot express.
     ///
     /// Its own code because its rewrite is its own: every other unsupported
     /// pattern is a shape to be written differently, and this one is a feature
-    /// SQL has and this does not translate yet. Sending the generic pattern
-    /// hint told an author to avoid UNION in a query with no UNION in it.
+    /// SQL has. Sending the generic pattern hint told an author to avoid UNION
+    /// in a query with no UNION in it.
+    ///
+    /// Narrower than it was. A `HAVING` comparing an aggregate or a group key
+    /// against a constant is now rendered, so this code is for what is left: a
+    /// disjunction, `!=`, a comparison between two computed values, or a
+    /// constant that is not the term the value renders as. The hint says so —
+    /// a blocked code whose advice tells the caller to do something they no
+    /// longer need to do is worse than no advice.
     UnsupportedHaving,
     /// `SUM`/`AVG` over a slot whose declared range is not numeric.
     NonNumericMeasure,
@@ -172,8 +181,11 @@ impl BlockedCode {
                  be aggregated in the database."
             }
             Self::UnsupportedHaving => {
-                "Ask for the groups without HAVING and drop the ones you do \
-                 not want from the result — the counts are already there."
+                "Compare an aggregate or a group key against a constant with \
+                 =, <, <=, > or >=, and join several such comparisons with &&. \
+                 For anything else — a disjunction, !=, or a comparison \
+                 between two aggregates — ask for the groups without HAVING \
+                 and drop the ones you do not want from the result."
             }
             Self::NonNumericMeasure => {
                 "SUM and AVG need a numeric slot. Use COUNT to count values, \
@@ -201,6 +213,9 @@ pub struct SolutionSpec {
     /// aggregate (a SQL `GROUP BY` over no rows would return none).
     pub group_keys: Vec<usize>,
     pub measures: Vec<MeasureSpec>,
+    /// Conditions on the *grouped* rows -- SQL `HAVING`. A conjunction: every
+    /// term must hold, which is what `&&` between two of them means.
+    pub having: Vec<HavingTerm>,
     pub order_by: Vec<OrderTerm>,
     pub distinct: bool,
     pub limit: Option<usize>,
@@ -318,6 +333,33 @@ pub enum Measure {
     },
 }
 
+/// One `HAVING` comparison: a solution column against a constant.
+///
+/// The key is an [`OrderKey`] because it is the same question `ORDER BY`
+/// asks -- which column of the grouped result -- and reusing it means a
+/// `HAVING` over an aggregate names the *same* measure the projection
+/// computes. That is the point rather than a convenience: `HAVING (COUNT(*) >
+/// 1)` beside `(COUNT(*) AS ?n)` is one entry in spargebra's aggregate list,
+/// so the renderer emits one expression for both, and there is no second
+/// derivation to disagree with the column beside it.
+///
+/// A measure the projection does *not* ask for works the same way, and is
+/// supported deliberately: `HAVING (MAX(?len) > 3)` hoists an aggregate
+/// spargebra names internally, which becomes a measure that is computed and
+/// not projected -- the shape `ORDER BY DESC(COUNT(*))` already relies on.
+#[derive(Debug, Clone)]
+pub struct HavingTerm {
+    pub key: OrderKey,
+    /// The same condition vocabulary a `FILTER` pushes, so a `HAVING` and a
+    /// `WHERE` are held to one notion of what SQL can compare -- including the
+    /// term test that decides whether a constant is the query's own.
+    pub condition: FilterCondition,
+    /// Whether the comparison is numeric rather than textual. On an aggregate
+    /// this is a property of the *result*: a count is an integer whatever it
+    /// counted, while `MIN`/`MAX` carry the term of the column they read.
+    pub numeric: bool,
+}
+
 /// `ORDER BY` term. The key says whether it sorts on a projected value or on an
 /// aggregate result, which the renderer needs to place it inside or outside the
 /// grouping.
@@ -393,7 +435,7 @@ struct Peeled<'a> {
     group: Option<GroupParts<'a>>,
     /// Whether a `FILTER` sits *above* the grouping -- which is what `HAVING`
     /// is. Peeling stops at the `Group`, so any filter reached here is one.
-    having: bool,
+    having: Vec<&'a Expression>,
     /// Variables from the outermost `Project` — what the query asks for.
     projection: Vec<String>,
     /// Two Slices on one path, which would need composing rather than
@@ -478,11 +520,15 @@ fn peel<'a>(pattern: &'a GraphPattern, out: &mut Peeled<'a>) {
             out.extends.push((variable, expression));
             peel(inner, out);
         }
-        GraphPattern::Filter { inner, .. } => {
+        GraphPattern::Filter { inner, expr } => {
             // A `FILTER` in the WHERE clause lives inside the group's own
             // inner pattern, which this never descends into. One out here
             // constrains the grouped rows, and that is a HAVING.
-            out.having = true;
+            //
+            // Collected rather than counted: several `HAVING` clauses are
+            // several nodes, and each one is a demand that has to be rendered
+            // or refused on its own terms.
+            out.having.push(expr);
             peel(inner, out);
         }
         GraphPattern::Group {
@@ -536,7 +582,7 @@ pub fn analyse_pushdown_scoped(
         order_by: &[],
         extends: Vec::new(),
         group: None,
-        having: false,
+        having: Vec::new(),
         projection: Vec::new(),
         nested_slice: false,
     };
@@ -550,20 +596,6 @@ pub fn analyse_pushdown_scoped(
     else {
         return Ok(Pushdown::NotApplicable);
     };
-
-    if peeled.having {
-        // Reported rather than ignored. Left as `NotApplicable` -- which is
-        // what a query with no aggregate at all returns -- a HAVING fell
-        // through to the engine, and on any class worth grouping the engine
-        // cannot answer: 30 seconds, then a triple limit, about a query the
-        // planner could have named. A SQL `HAVING` would express it, and that
-        // is a feature rather than a rewrite; until then, say so.
-        return Ok(blocked(
-            BlockedCode::UnsupportedHaving,
-            "HAVING filters the grouped rows, which this does not translate yet",
-            None,
-        ));
-    }
 
     if peeled.nested_slice {
         return Ok(blocked(
@@ -860,11 +892,17 @@ pub fn analyse_pushdown_scoped(
         ));
     }
 
+    let having = match having_terms(&peeled.having, &bindings, &measures, &group_keys, &aliases) {
+        Ok(terms) => terms,
+        Err(blocked) => return Ok(Pushdown::Blocked(blocked)),
+    };
+
     Ok(Pushdown::Eligible {
         solution: SolutionSpec {
             bindings,
             group_keys,
             measures,
+            having,
             order_by,
             distinct: peeled.distinct,
             limit: peeled.limit,
@@ -873,6 +911,249 @@ pub fn analyse_pushdown_scoped(
         },
         plan,
     })
+}
+
+/// Translate the `HAVING` conditions into terms over the grouped result, or
+/// refuse.
+///
+/// All or nothing, and that is a property of this route rather than a
+/// preference: an eligible verdict means SQL answers the question *alone*, so
+/// there is nowhere to leave a condition it cannot express. A partial `HAVING`
+/// is what the refinement pipeline is for; here one unexpressible conjunct
+/// blocks the aggregate, and the refusal names which one.
+///
+/// No schema is needed, which is worth noticing rather than assuming: every
+/// fact a term test wants is already on the binding a measure argues over
+/// (`BindingSpec::descriptor`, resolved once when the binding was built) or is
+/// a property of the aggregate itself. A `HAVING` gets the same term rule as a
+/// `FILTER` for free, which is what it looks like when the intermediate
+/// representation was factored right.
+fn having_terms(
+    conditions: &[&Expression],
+    bindings: &[BindingSpec],
+    measures: &[MeasureSpec],
+    group_keys: &[usize],
+    aliases: &[(&str, &str)],
+) -> Result<Vec<HavingTerm>, Blocked> {
+    let mut terms = Vec::new();
+    for condition in conditions {
+        for conjunct in conjuncts(condition) {
+            terms.push(having_term(
+                conjunct, bindings, measures, group_keys, aliases,
+            )?);
+        }
+    }
+    Ok(terms)
+}
+
+/// The top-level conjuncts of a condition. `&&` between two demands is two
+/// demands, which is what a `HAVING` list is; anything else is one.
+fn conjuncts(condition: &Expression) -> Vec<&Expression> {
+    match condition {
+        Expression::And(left, right) => {
+            let mut out = conjuncts(left);
+            out.extend(conjuncts(right));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+fn having_term(
+    conjunct: &Expression,
+    bindings: &[BindingSpec],
+    measures: &[MeasureSpec],
+    group_keys: &[usize],
+    aliases: &[(&str, &str)],
+) -> Result<HavingTerm, Blocked> {
+    let unsupported = |detail: String| Blocked {
+        code: BlockedCode::UnsupportedHaving,
+        detail,
+        at: None,
+        instead: Some(BlockedCode::UnsupportedHaving.instead()),
+    };
+
+    // `!=` is left out for the reason a pushed `FILTER` leaves it out: SPARQL's
+    // inequality is false where SQL's `<>` is unknown, and the two disagree
+    // about exactly the group whose aggregate is unbound.
+    let (op, left, right) = match conjunct {
+        Expression::Equal(left, right) => (None, left, right),
+        Expression::Greater(left, right) => (Some(CmpOp::Gt), left, right),
+        Expression::GreaterOrEqual(left, right) => (Some(CmpOp::Gte), left, right),
+        Expression::Less(left, right) => (Some(CmpOp::Lt), left, right),
+        Expression::LessOrEqual(left, right) => (Some(CmpOp::Lte), left, right),
+        _ => {
+            return Err(unsupported(
+                "this HAVING compares something other than one value against one \
+                 constant"
+                    .to_owned(),
+            ));
+        }
+    };
+
+    // One side names a column of the grouped result, the other is a constant.
+    // A comparison between two aggregates, or between an aggregate and a group
+    // key, is not a (column, value) condition and is refused rather than
+    // guessed at.
+    let (name, literal, op) = match (left.as_ref(), right.as_ref()) {
+        (Expression::Variable(var), Expression::Literal(literal)) => (var.as_str(), literal, op),
+        // Flipped, with the operator flipped to match: `3 < COUNT(*)` is the
+        // same demand as `COUNT(*) > 3`, and refusing it would refuse a
+        // spelling rather than a question.
+        (Expression::Literal(literal), Expression::Variable(var)) => {
+            (var.as_str(), literal, op.map(CmpOp::flipped))
+        }
+        _ => {
+            return Err(unsupported(
+                "this HAVING compares two computed values; SQL can compare one \
+                 against a constant"
+                    .to_owned(),
+            ));
+        }
+    };
+
+    // The alias the query gave an aggregate and the internal name spargebra
+    // gave it are the same measure, and a `HAVING` may use either: `HAVING
+    // (COUNT(*) > 1)` references the internal one, `HAVING (?n > 1)` the alias.
+    let resolved = aliases
+        .iter()
+        .find(|(internal, _)| *internal == name)
+        .map(|(_, alias)| *alias)
+        .unwrap_or(name);
+
+    let (key, form) = if let Some(index) = measures
+        .iter()
+        .position(|measure| measure.var == resolved || measure.var == name)
+    {
+        (
+            OrderKey::Measure(index),
+            measure_form(&measures[index].func),
+        )
+    } else if let Some(index) = group_keys
+        .iter()
+        .copied()
+        .find(|index| bindings[*index].var == name)
+    {
+        (OrderKey::Binding(index), MeasureForm::Column(index))
+    } else if bindings.iter().any(|binding| binding.var == name) {
+        // Bound, but not a group key -- a measure's argument, say. Its value is
+        // per *solution*, and a grouped row has no single one, so there is
+        // nothing for SQL to compare. SPARQL says the same: outside a grouping
+        // the variable is not in scope, and the comparison errors.
+        return Err(Blocked {
+            code: BlockedCode::UnscopedBinding,
+            detail: format!(
+                "HAVING compares ?{name}, which the query reads but neither groups \
+                 by nor aggregates, so a grouped row has no single value for it"
+            ),
+            at: Some(format!("?{name}")),
+            instead: Some(BlockedCode::UnscopedBinding.instead()),
+        });
+    } else {
+        return Err(Blocked {
+            code: BlockedCode::UnscopedBinding,
+            detail: format!(
+                "HAVING compares ?{name}, which the query neither groups by nor \
+                 aggregates"
+            ),
+            at: Some(format!("?{name}")),
+            instead: Some(BlockedCode::UnscopedBinding.instead()),
+        });
+    };
+
+    // Term fidelity, and the same rule as everywhere else: a comparison asks
+    // the query's question only when the constant is the term the value
+    // renders as. Wrong here would select no groups rather than the wrong ones,
+    // which is a wrong answer and not a narrowing -- there is no engine leg to
+    // re-apply anything on this route.
+    let (value, numeric) = match form {
+        // A count is an integer whatever it counted; a sum or an average over a
+        // numeric range is a number. Both compare by *value*, so any numeric
+        // literal is the same question -- unlike a stored-text comparison,
+        // where the lexical form has to match.
+        MeasureForm::Number => match numeric_value(literal) {
+            Some(value) => (value, true),
+            None => {
+                return Err(unsupported(format!(
+                    "HAVING compares an aggregate against {literal}, which is not a \
+                     number"
+                )));
+            }
+        },
+        // `MIN`/`MAX` hand back one of the column's own values, so the column's
+        // term rule decides, exactly as it would for a `FILTER` on that slot.
+        MeasureForm::Column(index) => {
+            let binding = &bindings[index];
+            let form = crate::sparql_scoper::push_form_of_descriptor(&binding.descriptor);
+            if !crate::sparql_scoper::literal_pushable(literal, &form) {
+                return Err(unsupported(format!(
+                    "HAVING compares ?{} against {literal}, which is not the term \
+                     that column's values render as",
+                    binding.var
+                )));
+            }
+            (literal.value().to_owned(), binding.descriptor.numeric)
+        }
+    };
+
+    let condition = match op {
+        Some(op) => FilterCondition::Cmp { op, value },
+        None => FilterCondition::Eq(value),
+    };
+    Ok(HavingTerm {
+        key,
+        condition,
+        numeric,
+    })
+}
+
+/// What an aggregate's result compares as.
+enum MeasureForm {
+    /// A number in its own right: a count, a sum, an average.
+    Number,
+    /// One of a column's own values, so that column's term rule applies.
+    Column(usize),
+}
+
+fn measure_form(func: &Measure) -> MeasureForm {
+    match func {
+        Measure::Count { .. } | Measure::Sum { .. } | Measure::Avg { .. } => MeasureForm::Number,
+        Measure::Min { arg } | Measure::Max { arg } => MeasureForm::Column(*arg),
+    }
+}
+
+/// A literal's value when it is a number SPARQL would compare numerically.
+///
+/// A plain literal is not one: `COUNT(*) > "3"` compares an integer with a
+/// string, which is a type error in SPARQL and selects no group -- so pushing
+/// it as a numeric comparison would answer a question the query did not ask.
+fn numeric_value(literal: &spargebra::term::Literal) -> Option<String> {
+    if literal.language().is_some() {
+        return None;
+    }
+    const NUMERIC: &[&str] = &[
+        "http://www.w3.org/2001/XMLSchema#integer",
+        "http://www.w3.org/2001/XMLSchema#decimal",
+        "http://www.w3.org/2001/XMLSchema#double",
+        "http://www.w3.org/2001/XMLSchema#float",
+        "http://www.w3.org/2001/XMLSchema#long",
+        "http://www.w3.org/2001/XMLSchema#int",
+        "http://www.w3.org/2001/XMLSchema#short",
+        "http://www.w3.org/2001/XMLSchema#byte",
+        "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+        "http://www.w3.org/2001/XMLSchema#positiveInteger",
+    ];
+    if !NUMERIC.contains(&literal.datatype().as_str()) {
+        return None;
+    }
+    // It has to parse as one too: the datatype is what the query claims, and a
+    // value the database cannot read as a number would be a runtime error
+    // rather than an answer.
+    literal
+        .value()
+        .parse::<f64>()
+        .ok()
+        .map(|_| literal.value().to_owned())
 }
 
 /// A star that no chain of join edges connects to the first one, if any.
@@ -1707,30 +1988,221 @@ mod tests {
     /// `Filter`, so the `Group` beneath it was never found. The query then
     /// went to the engine, which on a real class spends thirty seconds before
     /// reporting a triple limit -- for a shape the planner can name up front.
-    #[test]
-    fn having_is_refused_rather_than_unrecognised() {
-        let sv = crate::sparql_scoper::tests::test_schema_view();
-        let verdict = analyse_pushdown(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
-             asset360:name ?n } GROUP BY ?n HAVING (COUNT(*) > 1)",
-            &sv,
-        )
-        .unwrap();
+    /// Then it was a refusal with its own advice. Now it is rendered, and what
+    /// remains refused is narrower than the feature; the tests below say which
+    /// half is which.
+    fn having_of(query: &str) -> Vec<HavingTerm> {
+        eligible(query).having
+    }
 
-        match verdict {
-            Pushdown::Blocked(blocked) => {
-                assert_eq!(blocked.code, BlockedCode::UnsupportedHaving);
-                assert!(blocked.detail.contains("HAVING"), "{}", blocked.detail);
-                // Its own hint: the generic pattern advice told an author to
-                // avoid UNION in a query that contains none.
-                assert!(
-                    blocked.instead().contains("HAVING"),
-                    "the hint must be about HAVING, got: {}",
-                    blocked.instead()
-                );
-            }
-            other => panic!("expected a refusal naming HAVING, got {other:?}"),
+    fn refusal_of(query: &str) -> Blocked {
+        match analyse(query) {
+            Pushdown::Blocked(blocked) => blocked,
+            other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    /// D10, the shape this was blocked for: "categories with more than one
+    /// asset". The condition is one term over the measure the projection
+    /// already computes.
+    #[test]
+    fn a_having_over_a_count_is_pushed() {
+        let solution = eligible(
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?n } GROUP BY ?n HAVING (COUNT(*) > 1)",
+        );
+
+        // One measure, not two: `HAVING (COUNT(*) > 1)` beside
+        // `(COUNT(*) AS ?c)` is one aggregate in the algebra, so the renderer
+        // emits one expression and there is no second derivation to disagree
+        // with the column beside it.
+        assert_eq!(solution.measures.len(), 1);
+        let [term] = solution.having.as_slice() else {
+            panic!("expected one HAVING term, got {:?}", solution.having);
+        };
+        assert_eq!(term.key, OrderKey::Measure(0));
+        assert!(
+            matches!(&term.condition, FilterCondition::Cmp { op: CmpOp::Gt, value } if value == "1"),
+            "{:?}",
+            term.condition
+        );
+        assert!(term.numeric, "a count compares as a number");
+    }
+
+    /// The same query written with the alias, which is the same measure.
+    #[test]
+    fn a_having_may_name_the_aggregate_by_its_alias() {
+        let by_alias = having_of(
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?n } GROUP BY ?n HAVING (?c > 1)",
+        );
+        let by_aggregate = having_of(
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?n } GROUP BY ?n HAVING (COUNT(*) > 1)",
+        );
+        assert_eq!(by_alias.len(), 1);
+        assert_eq!(by_alias[0].key, by_aggregate[0].key);
+    }
+
+    /// An aggregate the query does not ask for. SQL allows it, spargebra
+    /// hoists it into the grouping under an internal name, and it becomes a
+    /// measure that is computed and not projected -- the same shape
+    /// `ORDER BY DESC(COUNT(*))` already relies on. Supported deliberately:
+    /// refusing it would refuse "the classes whose longest asset exceeds 3"
+    /// for no reason other than the projection.
+    #[test]
+    fn a_having_over_an_aggregate_the_query_does_not_project_is_pushed() {
+        let solution = eligible(
+            "SELECT ?n WHERE { ?s a asset360:Signal ; asset360:name ?n ; \
+             asset360:length ?l } GROUP BY ?n HAVING (MAX(?l) > 3)",
+        );
+
+        assert_eq!(solution.measures.len(), 1);
+        assert_eq!(solution.projected, vec!["n".to_owned()]);
+        assert!(
+            !solution
+                .projected
+                .contains(&solution.measures[0].var.clone()),
+            "the measure is machinery, not an answer"
+        );
+        let [term] = solution.having.as_slice() else {
+            panic!("expected one term");
+        };
+        assert_eq!(term.key, OrderKey::Measure(0));
+        // `MAX` hands back one of the column's own values, so the column's
+        // term rule decides -- and `length` is numeric, so the comparison
+        // casts rather than comparing text.
+        assert!(
+            term.numeric,
+            "MAX over a numeric column compares as a number"
+        );
+    }
+
+    /// A condition on a group key, which is a column of the grouped result
+    /// like any other.
+    #[test]
+    fn a_having_over_a_group_key_is_pushed() {
+        let terms = having_of(
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?n } GROUP BY ?n HAVING (?n > \"A\")",
+        );
+        let [term] = terms.as_slice() else {
+            panic!("expected one term");
+        };
+        assert_eq!(term.key, OrderKey::Binding(0));
+        assert!(!term.numeric, "a name compares as text, under C collation");
+    }
+
+    /// `1 < COUNT(*)` is `COUNT(*) > 1`. Refusing it would refuse a spelling
+    /// rather than a question -- the same lesson as the filter ordering.
+    #[test]
+    fn a_flipped_comparison_is_the_same_demand() {
+        let flipped = having_of(
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?n } GROUP BY ?n HAVING (1 < COUNT(*))",
+        );
+        let plain = having_of(
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?n } GROUP BY ?n HAVING (COUNT(*) > 1)",
+        );
+        assert_eq!(
+            format!("{:?}", flipped[0].condition),
+            format!("{:?}", plain[0].condition)
+        );
+    }
+
+    /// `&&` between two demands is two terms, and a `HAVING` list is a
+    /// conjunction. Same accounting as a `FILTER`'s conjuncts.
+    #[test]
+    fn several_conjuncts_are_several_terms() {
+        let terms = having_of(
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?n } GROUP BY ?n HAVING (COUNT(*) > 1 && ?n > \"A\")",
+        );
+        assert_eq!(terms.len(), 2, "{terms:?}");
+        assert_eq!(terms[0].key, OrderKey::Measure(0));
+        assert_eq!(terms[1].key, OrderKey::Binding(0));
+    }
+
+    /// What stays refused, and each with the answer it prevents. The route
+    /// answers alone, so an unexpressible condition cannot be left above --
+    /// one conjunct blocks the aggregate, and the refusal says which.
+    #[test]
+    fn what_having_still_refuses_says_why() {
+        let base = "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+                    asset360:name ?n ; asset360:length ?l ; asset360:kind ?k } \
+                    GROUP BY ?n HAVING ";
+
+        // Not grouped and not aggregated: a grouped row has no single value
+        // for it, and SPARQL says the same -- the comparison errors and
+        // selects nothing. Pushing it would answer a different question.
+        let refusal = refusal_of(&format!("{base}(?l > 3)"));
+        assert_eq!(refusal.code, BlockedCode::UnscopedBinding);
+        assert!(refusal.detail.contains("?l"), "{}", refusal.detail);
+        assert!(
+            refusal.detail.contains("neither groups"),
+            "{}",
+            refusal.detail
+        );
+
+        // A variable the query does not mention at all.
+        let refusal = refusal_of(&format!("{base}(?nope > 3)"));
+        assert_eq!(refusal.code, BlockedCode::UnscopedBinding);
+
+        // `!=` for the reason a pushed FILTER leaves it out: SPARQL's
+        // inequality is false where SQL's `<>` is unknown, and they disagree
+        // about exactly the group whose aggregate is unbound.
+        let refusal = refusal_of(&format!("{base}(COUNT(*) != 1)"));
+        assert_eq!(refusal.code, BlockedCode::UnsupportedHaving);
+
+        // A disjunction is one demand SQL could express and this vocabulary
+        // cannot: the term list is a conjunction.
+        let refusal = refusal_of(&format!("{base}(COUNT(*) > 1 || ?n > \"A\")"));
+        assert_eq!(refusal.code, BlockedCode::UnsupportedHaving);
+
+        // A count against a string is a type error in SPARQL, so it selects no
+        // group; pushing it as a numeric comparison would ask something else.
+        let refusal = refusal_of(&format!("{base}(COUNT(*) > \"3\")"));
+        assert_eq!(refusal.code, BlockedCode::UnsupportedHaving);
+        assert!(
+            refusal.detail.contains("not a number"),
+            "{}",
+            refusal.detail
+        );
+
+        // Term fidelity, the same rule as everywhere else: a tagged literal is
+        // not the term a plain-literal column's values render as.
+        let refusal = refusal_of(&format!("{base}(MIN(?n) > \"A\"@en)"));
+        assert_eq!(refusal.code, BlockedCode::UnsupportedHaving);
+        assert!(refusal.detail.contains("term"), "{}", refusal.detail);
+
+        // An enum column stores a code and renders as an IRI, so no plain
+        // literal is the term its values render as.
+        let refusal = refusal_of(&format!("{base}(MIN(?k) > \"GSA\")"));
+        assert_eq!(refusal.code, BlockedCode::UnsupportedHaving);
+
+        // Two computed values is not a (column, constant) comparison.
+        let refusal = refusal_of(&format!("{base}(COUNT(*) > MAX(?l))"));
+        assert_eq!(refusal.code, BlockedCode::UnsupportedHaving);
+
+        // Every refusal above still has to tell the author what to write
+        // instead, and the hint has to be about what remains unsupported
+        // rather than about HAVING as a whole.
+        let hint = BlockedCode::UnsupportedHaving.instead();
+        assert!(hint.contains("=") && hint.contains(">"), "{hint}");
+        assert!(hint.contains("&&"), "{hint}");
+    }
+
+    /// A query with no HAVING has no terms, so the field is not something a
+    /// renderer has to guess at.
+    #[test]
+    fn a_grouping_without_having_carries_no_terms() {
+        assert!(
+            having_of(
+                "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?n } GROUP BY ?n"
+            )
+            .is_empty()
+        );
     }
 }

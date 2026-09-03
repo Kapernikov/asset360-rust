@@ -105,6 +105,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PushdownBinding>()?;
         m.add_class::<PushdownMeasure>()?;
         m.add_class::<PushdownOrder>()?;
+        m.add_class::<PushdownHaving>()?;
     }
     Ok(())
 }
@@ -2025,6 +2026,74 @@ impl PushdownMeasure {
 #[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
+/// One ``HAVING`` comparison: a column of the grouped result against a
+/// constant.
+///
+/// ``kind`` and ``index`` address that column exactly as ``PushdownOrder``
+/// does — so a term over an aggregate names the *same* measure the projection
+/// computes, and the renderer emits one expression for both rather than
+/// deriving the aggregate twice.
+///
+/// The terms are a conjunction: every one must hold.
+pub struct PushdownHaving {
+    inner: crate::sparql_pushdown::HavingTerm,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownHaving {
+    /// ``"binding"`` for a group key, ``"measure"`` for an aggregate.
+    #[getter]
+    fn kind(&self) -> &str {
+        use crate::sparql_pushdown::OrderKey;
+        match self.inner.key {
+            OrderKey::Binding(_) => "binding",
+            OrderKey::Measure(_) => "measure",
+        }
+    }
+
+    /// Index into ``bindings`` or ``measures``, per ``kind``.
+    #[getter]
+    fn index(&self) -> usize {
+        use crate::sparql_pushdown::OrderKey;
+        match self.inner.key {
+            OrderKey::Binding(i) | OrderKey::Measure(i) => i,
+        }
+    }
+
+    /// What the value must satisfy — the same vocabulary a pushed ``FILTER``
+    /// uses, so a ``HAVING`` and a ``WHERE`` are rendered by one notion of
+    /// what SQL can compare.
+    #[getter]
+    fn condition(&self) -> FilterCondition {
+        FilterCondition::from_rust(&self.inner.condition)
+    }
+
+    /// Whether the comparison is numeric rather than textual.
+    ///
+    /// A property of the *result*, not of any column: a count is an integer
+    /// whatever it counted, while ``MIN``/``MAX`` carry the term of the column
+    /// they read. Ignoring it compares a count as text, where ``'9' > '10'``.
+    #[getter]
+    fn numeric(&self) -> bool {
+        self.inner.numeric
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PushdownHaving(kind={:?}, index={}, numeric={})",
+            self.kind(),
+            self.index(),
+            self.numeric()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[derive(Clone)]
 /// One ``ORDER BY`` term.
 ///
 /// ``kind`` says whether it sorts on a projected value or on an aggregate
@@ -2115,6 +2184,19 @@ impl PushdownSolution {
             .measures
             .iter()
             .map(|m| PushdownMeasure { inner: m.clone() })
+            .collect()
+    }
+
+    /// Conditions on the grouped rows — SQL ``HAVING``. A conjunction: every
+    /// term must hold. Empty when the query has none.
+    #[getter]
+    fn having(&self) -> Vec<PushdownHaving> {
+        self.inner
+            .having
+            .iter()
+            .map(|term| PushdownHaving {
+                inner: term.clone(),
+            })
             .collect()
     }
 
@@ -2539,6 +2621,25 @@ impl PlanOp {
             Op::Group { measures, .. } => measures
                 .iter()
                 .map(|inner| PushdownMeasure {
+                    inner: inner.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"group"``: the conditions on the grouped rows — SQL ``HAVING``.
+    ///
+    /// On the grouping operator rather than as one of its own, because SQL has
+    /// no operator there: a ``HAVING`` is a clause of the grouping, and its
+    /// terms index that grouping's measures.
+    #[getter]
+    fn having(&self) -> Vec<PushdownHaving> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Group { having, .. } => having
+                .iter()
+                .map(|inner| PushdownHaving {
                     inner: inner.clone(),
                 })
                 .collect(),
