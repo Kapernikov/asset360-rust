@@ -32,7 +32,7 @@ class Annotation:
     @property
     def extension_value(self) -> typing.Any: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @extension_tag.setter
@@ -40,8 +40,8 @@ class Annotation:
     @extension_value.setter
     def extension_value(self, value: typing.Any) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
-    def __new__(cls, extension_tag:builtins.str, extension_value:typing.Any, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None) -> Annotation: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
+    def __new__(cls, extension_tag:builtins.str, extension_value:typing.Any, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None) -> Annotation: ...
 
 class AnonymousClassExpression:
     @property
@@ -57,7 +57,7 @@ class AnonymousClassExpression:
     @property
     def slot_conditions(self) -> typing.Optional[builtins.dict[builtins.str, SlotDefinition]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -139,7 +139,7 @@ class AnonymousClassExpression:
     @slot_conditions.setter
     def slot_conditions(self, value: typing.Optional[builtins.dict[builtins.str, SlotDefinition]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -208,7 +208,7 @@ class AnonymousClassExpression:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, is_a:typing.Optional[builtins.str]=None, any_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, none_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, slot_conditions:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> AnonymousClassExpression: ...
+    def __new__(cls, is_a:typing.Optional[builtins.str]=None, any_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, none_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, slot_conditions:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> AnonymousClassExpression: ...
 
 class AnonymousEnumExpression:
     @property
@@ -259,7 +259,7 @@ class AnonymousEnumExpression:
 
 class AnonymousExpression:
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -329,7 +329,7 @@ class AnonymousExpression:
     @property
     def keywords(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -398,7 +398,7 @@ class AnonymousExpression:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> AnonymousExpression: ...
+    def __new__(cls, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> AnonymousExpression: ...
 
 class AnonymousSlotExpression:
     @property
@@ -406,7 +406,7 @@ class AnonymousSlotExpression:
     @property
     def range_expression(self) -> typing.Optional[AnonymousClassExpression]: ...
     @property
-    def enum_range(self) -> typing.Optional[AnonymousEnumExpression | EnumDefinition]: ...
+    def enum_range(self) -> typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]: ...
     @property
     def bindings(self) -> typing.Optional[builtins.list[EnumBinding]]: ...
     @property
@@ -462,7 +462,7 @@ class AnonymousSlotExpression:
     @property
     def array(self) -> typing.Optional[ArrayExpression]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -536,7 +536,7 @@ class AnonymousSlotExpression:
     @range_expression.setter
     def range_expression(self, value: typing.Optional[AnonymousClassExpression]) -> None: ...
     @enum_range.setter
-    def enum_range(self, value: typing.Optional[AnonymousEnumExpression | EnumDefinition]) -> None: ...
+    def enum_range(self, value: typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]) -> None: ...
     @bindings.setter
     def bindings(self, value: typing.Optional[builtins.list[EnumBinding]]) -> None: ...
     @required.setter
@@ -592,7 +592,7 @@ class AnonymousSlotExpression:
     @array.setter
     def array(self, value: typing.Optional[ArrayExpression]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -661,7 +661,7 @@ class AnonymousSlotExpression:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, range:typing.Optional[builtins.str]=None, range_expression:typing.Optional[AnonymousClassExpression]=None, enum_range:typing.Optional[AnonymousEnumExpression | EnumDefinition]=None, bindings:typing.Optional[builtins.list[EnumBinding]]=None, required:typing.Optional[builtins.bool]=None, recommended:typing.Optional[builtins.bool]=None, multivalued:typing.Optional[builtins.bool]=None, inlined:typing.Optional[builtins.bool]=None, inlined_as_list:typing.Optional[builtins.bool]=None, minimum_value:typing.Optional[typing.Any]=None, maximum_value:typing.Optional[typing.Any]=None, pattern:typing.Optional[builtins.str]=None, structured_pattern:typing.Optional[PatternExpression]=None, unit:typing.Optional[UnitOfMeasure]=None, implicit_prefix:typing.Optional[builtins.str]=None, value_presence:typing.Optional[typing.Literal['UNCOMMITTED', 'PRESENT', 'ABSENT']]=None, equals_string:typing.Optional[builtins.str]=None, equals_string_in:typing.Optional[typing.Sequence[builtins.str]]=None, equals_number:typing.Optional[builtins.int]=None, equals_expression:typing.Optional[builtins.str]=None, exact_cardinality:typing.Optional[builtins.int]=None, minimum_cardinality:typing.Optional[builtins.int]=None, maximum_cardinality:typing.Optional[builtins.int]=None, has_member:typing.Optional[AnonymousSlotExpression]=None, all_members:typing.Optional[AnonymousSlotExpression]=None, none_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, any_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, array:typing.Optional[ArrayExpression]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> AnonymousSlotExpression: ...
+    def __new__(cls, range:typing.Optional[builtins.str]=None, range_expression:typing.Optional[AnonymousClassExpression]=None, enum_range:typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]=None, bindings:typing.Optional[builtins.list[EnumBinding]]=None, required:typing.Optional[builtins.bool]=None, recommended:typing.Optional[builtins.bool]=None, multivalued:typing.Optional[builtins.bool]=None, inlined:typing.Optional[builtins.bool]=None, inlined_as_list:typing.Optional[builtins.bool]=None, minimum_value:typing.Optional[typing.Any]=None, maximum_value:typing.Optional[typing.Any]=None, pattern:typing.Optional[builtins.str]=None, structured_pattern:typing.Optional[PatternExpression]=None, unit:typing.Optional[UnitOfMeasure]=None, implicit_prefix:typing.Optional[builtins.str]=None, value_presence:typing.Optional[typing.Literal['UNCOMMITTED', 'PRESENT', 'ABSENT']]=None, equals_string:typing.Optional[builtins.str]=None, equals_string_in:typing.Optional[typing.Sequence[builtins.str]]=None, equals_number:typing.Optional[builtins.int]=None, equals_expression:typing.Optional[builtins.str]=None, exact_cardinality:typing.Optional[builtins.int]=None, minimum_cardinality:typing.Optional[builtins.int]=None, maximum_cardinality:typing.Optional[builtins.int]=None, has_member:typing.Optional[AnonymousSlotExpression]=None, all_members:typing.Optional[AnonymousSlotExpression]=None, none_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, any_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, array:typing.Optional[ArrayExpression]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> AnonymousSlotExpression: ...
 
 class AnonymousTypeExpression:
     @property
@@ -728,7 +728,7 @@ class ArrayExpression:
     @property
     def dimensions(self) -> typing.Optional[builtins.list[DimensionExpression]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -806,7 +806,7 @@ class ArrayExpression:
     @dimensions.setter
     def dimensions(self, value: typing.Optional[builtins.list[DimensionExpression]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -875,7 +875,7 @@ class ArrayExpression:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, exact_number_dimensions:typing.Optional[builtins.int]=None, minimum_number_dimensions:typing.Optional[builtins.int]=None, maximum_number_dimensions:typing.Optional[typing.Any | builtins.int | builtins.bool]=None, dimensions:typing.Optional[builtins.list[DimensionExpression]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ArrayExpression: ...
+    def __new__(cls, exact_number_dimensions:typing.Optional[builtins.int]=None, minimum_number_dimensions:typing.Optional[builtins.int]=None, maximum_number_dimensions:typing.Optional[typing.Any | builtins.int | builtins.bool]=None, dimensions:typing.Optional[builtins.list[DimensionExpression]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ArrayExpression: ...
 
 class Asset360ChangeMeta:
     @property
@@ -983,7 +983,7 @@ class ClassDefinition:
     @property
     def instantiates(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -1127,7 +1127,7 @@ class ClassDefinition:
     @instantiates.setter
     def instantiates(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -1196,7 +1196,7 @@ class ClassDefinition:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, name:builtins.str, slots:typing.Optional[typing.Sequence[builtins.str]]=None, slot_usage:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, attributes:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, class_uri:typing.Optional[builtins.str]=None, subclass_of:typing.Optional[builtins.str]=None, union_of:typing.Optional[typing.Sequence[builtins.str]]=None, defining_slots:typing.Optional[typing.Sequence[builtins.str]]=None, tree_root:typing.Optional[builtins.bool]=None, unique_keys:typing.Optional[builtins.dict[builtins.str, UniqueKey]]=None, rules:typing.Optional[builtins.list[ClassRule]]=None, classification_rules:typing.Optional[builtins.list[AnonymousClassExpression]]=None, slot_names_unique:typing.Optional[builtins.bool]=None, represents_relationship:typing.Optional[builtins.bool]=None, disjoint_with:typing.Optional[typing.Sequence[builtins.str]]=None, children_are_mutually_disjoint:typing.Optional[builtins.bool]=None, extra_slots:typing.Optional[ExtraSlotsExpression]=None, alias:typing.Optional[builtins.str]=None, any_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, none_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, slot_conditions:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, is_a:typing.Optional[builtins.str]=None, abstract_:typing.Optional[builtins.bool]=None, mixin:typing.Optional[builtins.bool]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, apply_to:typing.Optional[typing.Sequence[builtins.str]]=None, values_from:typing.Optional[typing.Sequence[builtins.str]]=None, string_serialization:typing.Optional[builtins.str]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ClassDefinition: ...
+    def __new__(cls, name:builtins.str, slots:typing.Optional[typing.Sequence[builtins.str]]=None, slot_usage:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, attributes:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, class_uri:typing.Optional[builtins.str]=None, subclass_of:typing.Optional[builtins.str]=None, union_of:typing.Optional[typing.Sequence[builtins.str]]=None, defining_slots:typing.Optional[typing.Sequence[builtins.str]]=None, tree_root:typing.Optional[builtins.bool]=None, unique_keys:typing.Optional[builtins.dict[builtins.str, UniqueKey]]=None, rules:typing.Optional[builtins.list[ClassRule]]=None, classification_rules:typing.Optional[builtins.list[AnonymousClassExpression]]=None, slot_names_unique:typing.Optional[builtins.bool]=None, represents_relationship:typing.Optional[builtins.bool]=None, disjoint_with:typing.Optional[typing.Sequence[builtins.str]]=None, children_are_mutually_disjoint:typing.Optional[builtins.bool]=None, extra_slots:typing.Optional[ExtraSlotsExpression]=None, alias:typing.Optional[builtins.str]=None, any_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, none_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousClassExpression]]=None, slot_conditions:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, is_a:typing.Optional[builtins.str]=None, abstract_:typing.Optional[builtins.bool]=None, mixin:typing.Optional[builtins.bool]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, apply_to:typing.Optional[typing.Sequence[builtins.str]]=None, values_from:typing.Optional[typing.Sequence[builtins.str]]=None, string_serialization:typing.Optional[builtins.str]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ClassDefinition: ...
 
 class ClassExpression:
     @property
@@ -1240,7 +1240,7 @@ class ClassRule:
     @property
     def deactivated(self) -> typing.Optional[builtins.bool]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -1322,7 +1322,7 @@ class ClassRule:
     @deactivated.setter
     def deactivated(self, value: typing.Optional[builtins.bool]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -1389,7 +1389,7 @@ class ClassRule:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, preconditions:typing.Optional[AnonymousClassExpression]=None, postconditions:typing.Optional[AnonymousClassExpression]=None, elseconditions:typing.Optional[AnonymousClassExpression]=None, bidirectional:typing.Optional[builtins.bool]=None, open_world:typing.Optional[builtins.bool]=None, rank:typing.Optional[builtins.int]=None, deactivated:typing.Optional[builtins.bool]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ClassRule: ...
+    def __new__(cls, preconditions:typing.Optional[AnonymousClassExpression]=None, postconditions:typing.Optional[AnonymousClassExpression]=None, elseconditions:typing.Optional[AnonymousClassExpression]=None, bidirectional:typing.Optional[builtins.bool]=None, open_world:typing.Optional[builtins.bool]=None, rank:typing.Optional[builtins.int]=None, deactivated:typing.Optional[builtins.bool]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ClassRule: ...
 
 class ClassView:
     @property
@@ -1643,7 +1643,7 @@ class Definition:
     @property
     def instantiates(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -1743,7 +1743,7 @@ class Definition:
     @instantiates.setter
     def instantiates(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -1812,7 +1812,7 @@ class Definition:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, name:builtins.str, is_a:typing.Optional[builtins.str]=None, abstract_:typing.Optional[builtins.bool]=None, mixin:typing.Optional[builtins.bool]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, apply_to:typing.Optional[typing.Sequence[builtins.str]]=None, values_from:typing.Optional[typing.Sequence[builtins.str]]=None, string_serialization:typing.Optional[builtins.str]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> Definition: ...
+    def __new__(cls, name:builtins.str, is_a:typing.Optional[builtins.str]=None, abstract_:typing.Optional[builtins.bool]=None, mixin:typing.Optional[builtins.bool]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, apply_to:typing.Optional[typing.Sequence[builtins.str]]=None, values_from:typing.Optional[typing.Sequence[builtins.str]]=None, string_serialization:typing.Optional[builtins.str]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> Definition: ...
 
 class Delta:
     @property
@@ -1838,7 +1838,7 @@ class DimensionExpression:
     @property
     def exact_cardinality(self) -> typing.Optional[builtins.int]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -1916,7 +1916,7 @@ class DimensionExpression:
     @exact_cardinality.setter
     def exact_cardinality(self, value: typing.Optional[builtins.int]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -1985,7 +1985,7 @@ class DimensionExpression:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, alias:typing.Optional[builtins.str]=None, maximum_cardinality:typing.Optional[builtins.int]=None, minimum_cardinality:typing.Optional[builtins.int]=None, exact_cardinality:typing.Optional[builtins.int]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> DimensionExpression: ...
+    def __new__(cls, alias:typing.Optional[builtins.str]=None, maximum_cardinality:typing.Optional[builtins.int]=None, minimum_cardinality:typing.Optional[builtins.int]=None, exact_cardinality:typing.Optional[builtins.int]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> DimensionExpression: ...
 
 class Element:
     @property
@@ -2005,7 +2005,7 @@ class Element:
     @property
     def instantiates(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -2091,7 +2091,7 @@ class Element:
     @instantiates.setter
     def instantiates(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -2160,7 +2160,7 @@ class Element:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, name:builtins.str, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> Element: ...
+    def __new__(cls, name:builtins.str, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> Element: ...
 
 class EnumBinding:
     @property
@@ -2172,7 +2172,7 @@ class EnumBinding:
     @property
     def pv_formula(self) -> typing.Optional[typing.Literal['CODE', 'CURIE', 'URI', 'FHIR_CODING', 'LABEL']]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -2250,7 +2250,7 @@ class EnumBinding:
     @pv_formula.setter
     def pv_formula(self, value: typing.Optional[typing.Literal['CODE', 'CURIE', 'URI', 'FHIR_CODING', 'LABEL']]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -2319,7 +2319,7 @@ class EnumBinding:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, range:typing.Optional[builtins.str]=None, obligation_level:typing.Optional[typing.Literal['REQUIRED', 'RECOMMENDED', 'OPTIONAL', 'EXAMPLE', 'DISCOURAGED']]=None, binds_value_of:typing.Optional[builtins.str]=None, pv_formula:typing.Optional[typing.Literal['CODE', 'CURIE', 'URI', 'FHIR_CODING', 'LABEL']]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> EnumBinding: ...
+    def __new__(cls, range:typing.Optional[builtins.str]=None, obligation_level:typing.Optional[typing.Literal['REQUIRED', 'RECOMMENDED', 'OPTIONAL', 'EXAMPLE', 'DISCOURAGED']]=None, binds_value_of:typing.Optional[builtins.str]=None, pv_formula:typing.Optional[typing.Literal['CODE', 'CURIE', 'URI', 'FHIR_CODING', 'LABEL']]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> EnumBinding: ...
 
 class EnumDefinition:
     @property
@@ -2377,7 +2377,7 @@ class EnumDefinition:
     @property
     def instantiates(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -2501,7 +2501,7 @@ class EnumDefinition:
     @instantiates.setter
     def instantiates(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -2570,7 +2570,7 @@ class EnumDefinition:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, name:builtins.str, enum_uri:typing.Optional[builtins.str]=None, code_set:typing.Optional[builtins.str]=None, code_set_tag:typing.Optional[builtins.str]=None, code_set_version:typing.Optional[builtins.str]=None, pv_formula:typing.Optional[typing.Literal['CODE', 'CURIE', 'URI', 'FHIR_CODING', 'LABEL']]=None, permissible_values:typing.Optional[builtins.dict[builtins.str, PermissibleValue]]=None, include:typing.Optional[builtins.list[AnonymousEnumExpression]]=None, minus:typing.Optional[builtins.list[AnonymousEnumExpression]]=None, inherits:typing.Optional[typing.Sequence[builtins.str]]=None, reachable_from:typing.Optional[ReachabilityQuery]=None, matches:typing.Optional[MatchQuery]=None, concepts:typing.Optional[typing.Sequence[builtins.str]]=None, is_a:typing.Optional[builtins.str]=None, abstract_:typing.Optional[builtins.bool]=None, mixin:typing.Optional[builtins.bool]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, apply_to:typing.Optional[typing.Sequence[builtins.str]]=None, values_from:typing.Optional[typing.Sequence[builtins.str]]=None, string_serialization:typing.Optional[builtins.str]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> EnumDefinition: ...
+    def __new__(cls, name:builtins.str, enum_uri:typing.Optional[builtins.str]=None, code_set:typing.Optional[builtins.str]=None, code_set_tag:typing.Optional[builtins.str]=None, code_set_version:typing.Optional[builtins.str]=None, pv_formula:typing.Optional[typing.Literal['CODE', 'CURIE', 'URI', 'FHIR_CODING', 'LABEL']]=None, permissible_values:typing.Optional[builtins.dict[builtins.str, PermissibleValue]]=None, include:typing.Optional[builtins.list[AnonymousEnumExpression]]=None, minus:typing.Optional[builtins.list[AnonymousEnumExpression]]=None, inherits:typing.Optional[typing.Sequence[builtins.str]]=None, reachable_from:typing.Optional[ReachabilityQuery]=None, matches:typing.Optional[MatchQuery]=None, concepts:typing.Optional[typing.Sequence[builtins.str]]=None, is_a:typing.Optional[builtins.str]=None, abstract_:typing.Optional[builtins.bool]=None, mixin:typing.Optional[builtins.bool]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, apply_to:typing.Optional[typing.Sequence[builtins.str]]=None, values_from:typing.Optional[typing.Sequence[builtins.str]]=None, string_serialization:typing.Optional[builtins.str]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> EnumDefinition: ...
 
 class EnumExpression:
     @property
@@ -2648,15 +2648,123 @@ class Example:
     def value_object(self, value: typing.Optional[typing.Any]) -> None: ...
     def __new__(cls, value:typing.Optional[builtins.str]=None, value_description:typing.Optional[builtins.str]=None, value_object:typing.Optional[typing.Any]=None) -> Example: ...
 
+class ExecutionPlan:
+    r"""
+    What answering a query takes: the obligations it imposes, the passes that
+    discharge them, and anything left over.
+    
+    One artifact from one parse. ``sparql_scope`` and ``sparql_pushdown``
+    each re-parse and answer a question this already contains.
+    """
+    @property
+    def contract(self) -> builtins.int:
+        r"""
+        Version of the plan shape. A consumer built against an older contract
+        must refuse rather than interpret fields it may not understand.
+        """
+    @property
+    def is_accounted(self) -> builtins.bool:
+        r"""
+        Whether every obligation has a pass to enforce it.
+        
+        ``False`` means the plan answers a *different* question than the one
+        asked, so the caller must refuse to run it.
+        """
+    @property
+    def sql_only(self) -> builtins.bool:
+        r"""
+        Whether SQL answers the whole question, with no engine pass — what a
+        consumer with no fallback (a stored question) has to ask.
+        """
+    @property
+    def passes(self) -> builtins.list[PlanPass]: ...
+    @property
+    def refinement(self) -> builtins.str:
+        r"""
+        Where these operators came from: ``"not_attempted"``, ``"used"``,
+        ``"used_alone"`` or ``"fallback"``.
+        
+        ``"not_attempted"`` for a plan from :func:`plan_query`, which does not
+        refine. The rest only come from :func:`plan_query_refined`.
+        
+        ``"used"`` and ``"used_alone"`` are different risks and read
+        differently on purpose. ``"used"`` is a *substitution*: the single-pass
+        planner had a plan, and the refined statement was shown to read no more
+        rows and leave no more work to the engine. ``"used_alone"`` is a
+        *capability*: that planner refuses the query outright, so nothing was
+        compared — the plan was admitted because it answers the whole question
+        in SQL by construction, and ``refinement_note`` says what was refused.
+        """
+    @property
+    def refinement_reason(self) -> typing.Optional[builtins.str]:
+        r"""
+        Why the refinement pipeline's plan was not used, or ``None``.
+        
+        Worth logging with the query: it names the shape the rules do not
+        cover yet, and it is the signal that says when a gap has actually
+        closed rather than letting us assume it.
+        """
+    @property
+    def refinement_note(self) -> typing.Optional[builtins.str]:
+        r"""
+        A claim difference the gate allowed, or ``None``.
+        
+        Set when the refined plan *was* used and its ledger still differs from
+        the single-pass planner's: the two statements read the same rows and do
+        the same work, while an obligation SQL applies stays claimed by the
+        engine. The gate compares the row source, not the ledger, because the
+        two coincide for every rule that pushes work and come apart only where
+        a narrowing scan declines to claim semantics it does not render.
+        
+        Worth logging too: this is the tier-two backlog, observed rather than
+        assumed.
+        """
+    @property
+    def obligations(self) -> builtins.list[builtins.str]:
+        r"""
+        Every obligation the query imposes, rendered for reading.
+        """
+    @property
+    def residual(self) -> builtins.list[builtins.str]:
+        r"""
+        The obligations no pass discharges, rendered for reading. Empty when
+        the plan answers exactly the question asked; anything here belongs in
+        the refusal message.
+        """
+    @property
+    def unpushed_aggregate(self) -> typing.Optional[builtins.str]:
+        r"""
+        The aggregate the statement did not take, or ``None`` when that did
+        not arise — either SQL answered it, or the query never asked for one.
+        
+        Read off the ledger: a ``GROUP BY`` or an aggregate that an *engine*
+        pass discharges is one SQL did not push. It replaces the structured
+        refusal the deleted single-pass planner carried — a stable ``code``, an
+        ``at`` and an ``instead`` rewrite hint — which went with the analyser
+        that decided eligibility for the grouped question as a whole. What is
+        left is the obligation itself, which still names the aggregate.
+        
+        Distinct from a pass's ``causes``, which explain a *slower* answer.
+        This is the one a caller weighs against the size of the class the
+        engine would have to materialise to answer it.
+        """
+    def __str__(self) -> builtins.str:
+        r"""
+        The whole ledger, as text: state, passes with what each discharges, the
+        residual, and any refusal. Meant for a human — an explain output, a log
+        line, or a test failure that has to say *why* a plan was refused.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class Expression:
     ...
 
 class Extensible:
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
-    def __new__(cls, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None) -> Extensible: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
+    def __new__(cls, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None) -> Extensible: ...
 
 class Extension:
     @property
@@ -2664,14 +2772,14 @@ class Extension:
     @property
     def extension_value(self) -> typing.Any: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @extension_tag.setter
     def extension_tag(self, value: builtins.str) -> None: ...
     @extension_value.setter
     def extension_value(self, value: typing.Any) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
-    def __new__(cls, extension_tag:builtins.str, extension_value:typing.Any, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None) -> Extension: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
+    def __new__(cls, extension_tag:builtins.str, extension_value:typing.Any, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None) -> Extension: ...
 
 class ExtraSlotsExpression:
     @property
@@ -2772,7 +2880,7 @@ class ImportExpression:
     @property
     def import_map(self) -> typing.Optional[builtins.dict[builtins.str, Setting]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -2848,7 +2956,7 @@ class ImportExpression:
     @import_map.setter
     def import_map(self, value: typing.Optional[builtins.dict[builtins.str, Setting]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -2917,7 +3025,7 @@ class ImportExpression:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, import_from:builtins.str, import_as:typing.Optional[builtins.str]=None, import_map:typing.Optional[builtins.dict[builtins.str, Setting]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ImportExpression: ...
+    def __new__(cls, import_from:builtins.str, import_as:typing.Optional[builtins.str]=None, import_map:typing.Optional[builtins.dict[builtins.str, Setting]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ImportExpression: ...
 
 class JoinEdge:
     r"""
@@ -2972,7 +3080,12 @@ class LinkMLInstance:
     def __getitem__(self, key:typing.Any) -> LinkMLInstance: ...
     def navigate(self, path:typing.Any) -> typing.Optional[LinkMLInstance]:
         r"""
-        Navigate by a path of strings (map keys or list indices).
+        Navigate by a path of strings: slot names, mapping keys, and — for
+        lists — element identity labels (identifier/key or `unique_keys` value)
+        when the list carries unique labels, numeric indices otherwise. This is
+        the same addressing `diff` emits and `patch` applies, so delta paths are
+        navigable; a numeric segment aimed at a label-addressed list resolves to
+        nothing rather than to that position.
         Returns a new LinkMLInstance if found, otherwise None.
         """
     def keys(self) -> builtins.list[builtins.str]: ...
@@ -3044,7 +3157,7 @@ class PathExpression:
     @property
     def range_expression(self) -> typing.Optional[AnonymousClassExpression]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -3130,7 +3243,7 @@ class PathExpression:
     @range_expression.setter
     def range_expression(self, value: typing.Optional[AnonymousClassExpression]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -3199,7 +3312,7 @@ class PathExpression:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, followed_by:typing.Optional[PathExpression]=None, none_of:typing.Optional[builtins.list[PathExpression]]=None, any_of:typing.Optional[builtins.list[PathExpression]]=None, all_of:typing.Optional[builtins.list[PathExpression]]=None, exactly_one_of:typing.Optional[builtins.list[PathExpression]]=None, reversed:typing.Optional[builtins.bool]=None, traverse:typing.Optional[builtins.str]=None, range_expression:typing.Optional[AnonymousClassExpression]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> PathExpression: ...
+    def __new__(cls, followed_by:typing.Optional[PathExpression]=None, none_of:typing.Optional[builtins.list[PathExpression]]=None, any_of:typing.Optional[builtins.list[PathExpression]]=None, all_of:typing.Optional[builtins.list[PathExpression]]=None, exactly_one_of:typing.Optional[builtins.list[PathExpression]]=None, reversed:typing.Optional[builtins.bool]=None, traverse:typing.Optional[builtins.str]=None, range_expression:typing.Optional[AnonymousClassExpression]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> PathExpression: ...
 
 class PatternExpression:
     @property
@@ -3209,7 +3322,7 @@ class PatternExpression:
     @property
     def partial_match(self) -> typing.Optional[builtins.bool]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -3285,7 +3398,7 @@ class PatternExpression:
     @partial_match.setter
     def partial_match(self, value: typing.Optional[builtins.bool]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -3354,7 +3467,7 @@ class PatternExpression:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, syntax:typing.Optional[builtins.str]=None, interpolated:typing.Optional[builtins.bool]=None, partial_match:typing.Optional[builtins.bool]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> PatternExpression: ...
+    def __new__(cls, syntax:typing.Optional[builtins.str]=None, interpolated:typing.Optional[builtins.bool]=None, partial_match:typing.Optional[builtins.bool]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> PatternExpression: ...
 
 class PermissibleValue:
     @property
@@ -3374,7 +3487,7 @@ class PermissibleValue:
     @property
     def mixins(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -3458,7 +3571,7 @@ class PermissibleValue:
     @mixins.setter
     def mixins(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @alt_descriptions.setter
@@ -3525,7 +3638,7 @@ class PermissibleValue:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, text:builtins.str, description:typing.Optional[builtins.str]=None, meaning:typing.Optional[builtins.str]=None, unit:typing.Optional[UnitOfMeasure]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, is_a:typing.Optional[builtins.str]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> PermissibleValue: ...
+    def __new__(cls, text:builtins.str, description:typing.Optional[builtins.str]=None, meaning:typing.Optional[builtins.str]=None, unit:typing.Optional[UnitOfMeasure]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, is_a:typing.Optional[builtins.str]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> PermissibleValue: ...
 
 class PlanNode:
     r"""
@@ -3568,6 +3681,247 @@ class PlanNode:
         r"""
         For ``kind=="left_join"``: the right (optional) sub-plan.
         For ``kind=="bgp"``: returns ``None``.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+class PlanOp:
+    r"""
+    One operator of a database pass: a scan, a filter, a join, an unnest, a
+    grouping, a sort, a distinct, a slice, or a projection.
+    
+    Read ``kind`` first and refuse a value you do not know: skipping an operator
+    you cannot render answers a different question, which is the failure the
+    whole plan is shaped to prevent. The accessors for other kinds return
+    ``None`` or an empty list, so a renderer branches on ``kind`` and reads only
+    what belongs to it.
+    """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        ``"scan"``, ``"unnest"``, ``"filter"``, ``"join"``, ``"group"``,
+        ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+        """
+    @property
+    def inputs(self) -> builtins.list[builtins.int]:
+        r"""
+        Indices of the operators this one consumes. Always lower than this
+        operator's own index, so a renderer can walk the list in order.
+        """
+    @property
+    def discharges(self) -> builtins.list[builtins.int]:
+        r"""
+        Obligations this operator discharges. An operator that only narrows
+        claims nothing — see ``enforcement``.
+        """
+    @property
+    def star_var(self) -> typing.Optional[builtins.str]:
+        r"""
+        The star this operator works on, for the kinds that name one: scan,
+        unnest, filter.
+        """
+    @property
+    def class_uri(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"scan"``: the class IRI to match against ``asset_type``.
+        """
+    @property
+    def identifier_values(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"scan"``: values bound against the class's identifier slot, to be
+        compared against the indexed ``asset360_uri`` column rather than the
+        JSONB payload.
+        """
+    @property
+    def required_slots(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"scan"``: slots that must be present (``object_data ? 'slot'``).
+        """
+    @property
+    def optional_slots(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"scan"``: slots that may be absent, so no existence check.
+        """
+    @property
+    def is_optional(self) -> builtins.bool:
+        r"""
+        For ``"scan"``: whether the star appears only inside ``OPTIONAL``, so
+        its conditions must tolerate a row the join did not match. Rendering it
+        as required drops rows the query keeps.
+        """
+    @property
+    def numeric(self) -> builtins.bool:
+        r"""
+        For ``"filter"``: whether the value compares as a number rather than as
+        text. Comparing a number as text makes ``'9' >= '10'`` true.
+        """
+    @property
+    def slot_path(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"filter"`` and ``"unnest"``: the path from the record root to the
+        value. One element is a column; more walks into a nested structure.
+        """
+    @property
+    def condition(self) -> typing.Optional[FilterCondition]:
+        r"""
+        For ``"filter"``: what the value must satisfy.
+        """
+    @property
+    def enforcement(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"filter"``: ``"enforces"`` when this operator decides the
+        obligation, ``"narrows"`` when it only reduces rows and a later pass
+        decides.
+        
+        A renderer may drop a ``"narrows"`` filter and still be correct — only
+        slower. Dropping an ``"enforces"`` one answers a different question.
+        """
+    @property
+    def reading(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"filter"``: which value at ``slot_path`` the condition holds of
+        — ``"column"``, ``"any_element"`` or ``"bound_element"``.
+        
+        A renderer that ignores this renders a containment test as an equality
+        on an array, which compares the array's text and matches nothing.
+        
+        * ``"column"`` — the column's own value: ``object_data->>'slot'``.
+        * ``"any_element"`` — the array *contains* a value satisfying the
+          condition: ``EXISTS (SELECT 1 FROM
+          jsonb_array_elements_text(object_data->'slot') …)``. Matches a record
+          once however many values it holds.
+        * ``"bound_element"`` — the element an ``unnest`` below bound, so the
+          condition selects rows rather than records.
+        """
+    @property
+    def optional_side(self) -> builtins.bool:
+        r"""
+        For ``"filter"``: whether the condition is on the *optional* side of a
+        left join, so it must not eliminate an unmatched row.
+        
+        The single most common way a left-join translation is wrong: in a plain
+        ``WHERE`` such a condition turns the left join into an inner one,
+        silently, with a plausible smaller answer and no error. It belongs in
+        the ``ON`` clause — or, as this renderer states the same thing, in a
+        ``WHERE`` wrapped ``(… OR alias.asset360_uri IS NULL)``.
+        
+        Derivable from ``is_optional`` on the star's scan, and stated here for
+        the reason ``numeric`` and ``reading`` are: a fact the renderer has to
+        fetch from somewhere else is a fact it can forget to fetch.
+        """
+    @property
+    def right_slot(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"join"``: the slot on the right input whose value is the left
+        row's ``asset360_uri``.
+        """
+    @property
+    def join_stars(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"join"``: the SPARQL variables the two sides bind, left first.
+        A renderer needs them to reach the right table aliases; the input
+        indices alone would have to be walked down to their scans.
+        """
+    @property
+    def join_kind(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"join"``: ``"inner"`` or ``"left"``.
+        """
+    @property
+    def bindings(self) -> builtins.list[PushdownBinding]:
+        r"""
+        For ``"group"``: one entry per projected value, addressed by position.
+        """
+    @property
+    def keys(self) -> builtins.list[builtins.int]:
+        r"""
+        For ``"group"``: indices into ``bindings`` that form the ``GROUP BY``.
+        Empty means one row over the whole input, which is what SPARQL returns
+        for a bare aggregate.
+        """
+    @property
+    def measures(self) -> builtins.list[PushdownMeasure]:
+        r"""
+        For ``"group"``: the aggregates.
+        """
+    @property
+    def having(self) -> builtins.list[PushdownHaving]:
+        r"""
+        For ``"group"``: the conditions on the grouped rows — SQL ``HAVING``.
+        
+        On the grouping operator rather than as one of its own, because SQL has
+        no operator there: a ``HAVING`` is a clause of the grouping, and its
+        terms index that grouping's measures.
+        """
+    @property
+    def terms(self) -> builtins.list[PushdownOrder]:
+        r"""
+        For ``"sort"``: the ordering terms, outermost first.
+        """
+    @property
+    def limit(self) -> typing.Optional[builtins.int]:
+        r"""
+        For ``"slice"``: the row limit, or ``None`` for an offset with no limit.
+        """
+    @property
+    def offset(self) -> builtins.int:
+        r"""
+        For ``"slice"``: rows to skip.
+        """
+    @property
+    def vars(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"project"``: the variables the query asked for, in ``SELECT``
+        order. Anything absent is machinery — a variable that exists only to be
+        grouped by, or an aggregate the parser named internally.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+class PlanPass:
+    r"""
+    One step of an execution plan.
+    """
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        ``"sql"`` or ``"engine"``.
+        
+        Closed set: a consumer meeting a kind it does not know must refuse the
+        plan rather than skip the pass, which would answer a different question
+        than the one asked.
+        """
+    @property
+    def inputs(self) -> builtins.list[builtins.int]:
+        r"""
+        Ids of the passes whose solutions this one consumes.
+        """
+    @property
+    def emits(self) -> builtins.list[builtins.str]:
+        r"""
+        Variables this pass binds.
+        """
+    @property
+    def discharges(self) -> builtins.list[builtins.int]:
+        r"""
+        Ids of the obligations this pass enforces.
+        """
+    @property
+    def ops(self) -> builtins.list[PlanOp]:
+        r"""
+        For ``kind == "sql"``: the pass as operators, in an order a renderer can
+        walk front to back — every operator's inputs come before it.
+        
+        The only description of the pass. It carried a star decomposition and a
+        solution spec as well until every consumer read the nodes; three
+        descriptions of one pass is how a reader comes to use the stale one.
+        """
+    @property
+    def causes(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``kind == "engine"``: why the engine is needed, as stable cause
+        codes. Useful in a log line or an explain output — the reader wants to
+        know what stopped SQL from answering alone.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -3670,6 +4024,46 @@ class PushdownBinding:
         """
     def __repr__(self) -> builtins.str: ...
 
+class PushdownHaving:
+    r"""
+    One ``HAVING`` comparison: a column of the grouped result against a
+    constant.
+    
+    ``kind`` and ``index`` address that column exactly as ``PushdownOrder``
+    does — so a term over an aggregate names the *same* measure the projection
+    computes, and the renderer emits one expression for both rather than
+    deriving the aggregate twice.
+    
+    The terms are a conjunction: every one must hold.
+    """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        ``"binding"`` for a group key, ``"measure"`` for an aggregate.
+        """
+    @property
+    def index(self) -> builtins.int:
+        r"""
+        Index into ``bindings`` or ``measures``, per ``kind``.
+        """
+    @property
+    def condition(self) -> FilterCondition:
+        r"""
+        What the value must satisfy — the same vocabulary a pushed ``FILTER``
+        uses, so a ``HAVING`` and a ``WHERE`` are rendered by one notion of
+        what SQL can compare.
+        """
+    @property
+    def numeric(self) -> builtins.bool:
+        r"""
+        Whether the comparison is numeric rather than textual.
+        
+        A property of the *result*, not of any column: a count is an integer
+        whatever it counted, while ``MIN``/``MAX`` carry the term of the column
+        they read. Ignoring it compares a count as text, where ``'9' > '10'``.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class PushdownMeasure:
     r"""
     One aggregate in the SELECT list.
@@ -3727,109 +4121,6 @@ class PushdownOrder:
         Note for the renderer: SPARQL sorts unbound *before* every bound value
         ascending, where Postgres defaults to NULLS LAST for ASC — so the
         generated SQL must say ``NULLS FIRST`` / ``NULLS LAST`` explicitly.
-        """
-    def __repr__(self) -> builtins.str: ...
-
-class PushdownSolution:
-    r"""
-    What SQL must produce for an eligible query: one row per solution, then
-    grouping on top.
-    """
-    @property
-    def bindings(self) -> builtins.list[PushdownBinding]: ...
-    @property
-    def group_keys(self) -> builtins.list[builtins.int]:
-        r"""
-        Indices into ``bindings`` forming the ``GROUP BY``. Empty is legal and
-        means one row over the whole input — SPARQL returns exactly one
-        solution for a bare aggregate, where a SQL ``GROUP BY`` over no rows
-        would return none, so the renderer must omit ``GROUP BY`` entirely.
-        """
-    @property
-    def measures(self) -> builtins.list[PushdownMeasure]: ...
-    @property
-    def order_by(self) -> builtins.list[PushdownOrder]: ...
-    @property
-    def distinct(self) -> builtins.bool: ...
-    @property
-    def limit(self) -> typing.Optional[builtins.int]: ...
-    @property
-    def offset(self) -> builtins.int: ...
-    @property
-    def projected(self) -> builtins.list[builtins.str]:
-        r"""
-        The variables the query asks for, in ``SELECT`` order.
-        
-        A measure or binding absent from this list is machinery: a value grouped
-        by but not selected, or an aggregate that exists only to order by — the
-        latter has no ``AS`` name, so emitting it would produce a column named
-        after an internal identifier.
-        """
-    def __repr__(self) -> builtins.str: ...
-
-class PushdownVerdict:
-    r"""
-    Verdict on whether a query's grouping and aggregation can be answered in
-    SQL.
-    
-    Three-way on purpose. ``"not_applicable"`` (not an aggregate at all) and
-    ``"blocked"`` (an aggregate outside the supported subset) must not collapse
-    into one falsy value: the first keeps the existing route silently, the
-    second is reportable to whoever wrote the query.
-    """
-    @property
-    def kind(self) -> builtins.str:
-        r"""
-        ``"not_applicable"``, ``"blocked"`` or ``"eligible"``.
-        """
-    @property
-    def code(self) -> typing.Optional[builtins.str]:
-        r"""
-        Stable machine-readable refusal code, or ``None`` when not blocked.
-        Branch on this, never on ``detail``.
-        """
-    @property
-    def detail(self) -> typing.Optional[builtins.str]:
-        r"""
-        What blocked, in terms of the query and the data model.
-        """
-    @property
-    def at(self) -> typing.Optional[builtins.str]:
-        r"""
-        Where in the query, when locatable — a variable or an operator.
-        """
-    @property
-    def instead(self) -> typing.Optional[builtins.str]:
-        r"""
-        A supported shape to use instead. This is the field that turns a
-        refusal into a repair, so it is meant to be shown verbatim.
-        """
-    @property
-    def plan(self) -> typing.Optional[QueryPlan]:
-        r"""
-        The plan the verdict was derived from, when ``kind == "eligible"``.
-        
-        A consumer needs **both**: the solution says what to project, group and
-        aggregate, and the plan says which rows — the classes, their filters and
-        the join edges. Reading only the solution silently drops every
-        constraint: ``FILTER(?l > 5)`` on a ``COUNT(*)`` yields a solution with
-        no bindings, and a bare aggregate's solution does not even name the
-        class.
-        
-        Use this rather than calling ``sparql_scope`` again — a second call
-        re-parses and could in principle disagree with the one behind the
-        verdict.
-        
-        One field does not carry over: this plan's :attr:`~QueryPlan.sql_limit`
-        is always ``None`` here, because an aggregate must see every solution
-        before it can be limited. The query's own ``LIMIT`` is
-        ``solution.limit``, which applies to the *grouped* rows — take it from
-        there, never from the plan.
-        """
-    @property
-    def solution(self) -> typing.Optional[PushdownSolution]:
-        r"""
-        The solution spec when ``kind == "eligible"``, else ``None``.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -4030,7 +4321,7 @@ class SchemaDefinition:
     @property
     def instantiates(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -4160,7 +4451,7 @@ class SchemaDefinition:
     @instantiates.setter
     def instantiates(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -4229,7 +4520,7 @@ class SchemaDefinition:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, id:builtins.str, name:builtins.str, version:typing.Optional[builtins.str]=None, imports:typing.Optional[typing.Sequence[builtins.str]]=None, license:typing.Optional[builtins.str]=None, prefixes:typing.Optional[builtins.dict[builtins.str, Prefix]]=None, emit_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, default_curi_maps:typing.Optional[typing.Sequence[builtins.str]]=None, default_prefix:typing.Optional[builtins.str]=None, default_range:typing.Optional[builtins.str]=None, subsets:typing.Optional[builtins.dict[builtins.str, SubsetDefinition]]=None, types:typing.Optional[builtins.dict[builtins.str, TypeDefinition]]=None, enums:typing.Optional[builtins.dict[builtins.str, EnumDefinition]]=None, slot_definitions:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, classes:typing.Optional[builtins.dict[builtins.str, ClassDefinition]]=None, metamodel_version:typing.Optional[builtins.str]=None, source_file:typing.Optional[builtins.str]=None, source_file_date:typing.Optional[datetime.datetime]=None, source_file_size:typing.Optional[builtins.int]=None, generation_date:typing.Optional[datetime.datetime]=None, slot_names_unique:typing.Optional[builtins.bool]=None, settings:typing.Optional[builtins.dict[builtins.str, Setting]]=None, bindings:typing.Optional[builtins.list[EnumBinding]]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> SchemaDefinition: ...
+    def __new__(cls, id:builtins.str, name:builtins.str, version:typing.Optional[builtins.str]=None, imports:typing.Optional[typing.Sequence[builtins.str]]=None, license:typing.Optional[builtins.str]=None, prefixes:typing.Optional[builtins.dict[builtins.str, Prefix]]=None, emit_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, default_curi_maps:typing.Optional[typing.Sequence[builtins.str]]=None, default_prefix:typing.Optional[builtins.str]=None, default_range:typing.Optional[builtins.str]=None, subsets:typing.Optional[builtins.dict[builtins.str, SubsetDefinition]]=None, types:typing.Optional[builtins.dict[builtins.str, TypeDefinition]]=None, enums:typing.Optional[builtins.dict[builtins.str, EnumDefinition]]=None, slot_definitions:typing.Optional[builtins.dict[builtins.str, SlotDefinition]]=None, classes:typing.Optional[builtins.dict[builtins.str, ClassDefinition]]=None, metamodel_version:typing.Optional[builtins.str]=None, source_file:typing.Optional[builtins.str]=None, source_file_date:typing.Optional[datetime.datetime]=None, source_file_size:typing.Optional[builtins.int]=None, generation_date:typing.Optional[datetime.datetime]=None, slot_names_unique:typing.Optional[builtins.bool]=None, settings:typing.Optional[builtins.dict[builtins.str, Setting]]=None, bindings:typing.Optional[builtins.list[EnumBinding]]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> SchemaDefinition: ...
 
 class SchemaView:
     def __new__(cls, source:typing.Optional[typing.Any]=None) -> SchemaView: ...
@@ -4439,7 +4730,7 @@ class SlotDefinition:
     @property
     def range_expression(self) -> typing.Optional[AnonymousClassExpression]: ...
     @property
-    def enum_range(self) -> typing.Optional[AnonymousEnumExpression | EnumDefinition]: ...
+    def enum_range(self) -> typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]: ...
     @property
     def bindings(self) -> typing.Optional[builtins.list[EnumBinding]]: ...
     @property
@@ -4525,7 +4816,7 @@ class SlotDefinition:
     @property
     def instantiates(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -4673,7 +4964,7 @@ class SlotDefinition:
     @range_expression.setter
     def range_expression(self, value: typing.Optional[AnonymousClassExpression]) -> None: ...
     @enum_range.setter
-    def enum_range(self, value: typing.Optional[AnonymousEnumExpression | EnumDefinition]) -> None: ...
+    def enum_range(self, value: typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]) -> None: ...
     @bindings.setter
     def bindings(self, value: typing.Optional[builtins.list[EnumBinding]]) -> None: ...
     @required.setter
@@ -4759,7 +5050,7 @@ class SlotDefinition:
     @instantiates.setter
     def instantiates(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -4828,7 +5119,7 @@ class SlotDefinition:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, name:builtins.str, singular_name:typing.Optional[builtins.str]=None, domain:typing.Optional[builtins.str]=None, slot_uri:typing.Optional[builtins.str]=None, inherited:typing.Optional[builtins.bool]=None, readonly:typing.Optional[builtins.str]=None, ifabsent:typing.Optional[builtins.str]=None, list_elements_unique:typing.Optional[builtins.bool]=None, list_elements_ordered:typing.Optional[builtins.bool]=None, shared:typing.Optional[builtins.bool]=None, key:typing.Optional[builtins.bool]=None, identifier:typing.Optional[builtins.bool]=None, designates_type:typing.Optional[builtins.bool]=None, alias:typing.Optional[builtins.str]=None, owner:typing.Optional[builtins.str]=None, domain_of:typing.Optional[typing.Sequence[builtins.str]]=None, subproperty_of:typing.Optional[builtins.str]=None, symmetric:typing.Optional[builtins.bool]=None, reflexive:typing.Optional[builtins.bool]=None, locally_reflexive:typing.Optional[builtins.bool]=None, irreflexive:typing.Optional[builtins.bool]=None, asymmetric:typing.Optional[builtins.bool]=None, transitive:typing.Optional[builtins.bool]=None, inverse:typing.Optional[builtins.str]=None, is_class_field:typing.Optional[builtins.bool]=None, transitive_form_of:typing.Optional[builtins.str]=None, reflexive_transitive_form_of:typing.Optional[builtins.str]=None, role:typing.Optional[builtins.str]=None, is_usage_slot:typing.Optional[builtins.bool]=None, usage_slot_name:typing.Optional[builtins.str]=None, relational_role:typing.Optional[typing.Literal['SUBJECT', 'OBJECT', 'PREDICATE', 'NODE', 'OTHER_ROLE']]=None, slot_group:typing.Optional[builtins.str]=None, is_grouping_slot:typing.Optional[builtins.bool]=None, path_rule:typing.Optional[PathExpression]=None, disjoint_with:typing.Optional[typing.Sequence[builtins.str]]=None, children_are_mutually_disjoint:typing.Optional[builtins.bool]=None, union_of:typing.Optional[typing.Sequence[builtins.str]]=None, type_mappings:typing.Optional[builtins.dict[builtins.str, TypeMapping]]=None, range:typing.Optional[builtins.str]=None, range_expression:typing.Optional[AnonymousClassExpression]=None, enum_range:typing.Optional[AnonymousEnumExpression | EnumDefinition]=None, bindings:typing.Optional[builtins.list[EnumBinding]]=None, required:typing.Optional[builtins.bool]=None, recommended:typing.Optional[builtins.bool]=None, multivalued:typing.Optional[builtins.bool]=None, inlined:typing.Optional[builtins.bool]=None, inlined_as_list:typing.Optional[builtins.bool]=None, minimum_value:typing.Optional[typing.Any]=None, maximum_value:typing.Optional[typing.Any]=None, pattern:typing.Optional[builtins.str]=None, structured_pattern:typing.Optional[PatternExpression]=None, unit:typing.Optional[UnitOfMeasure]=None, implicit_prefix:typing.Optional[builtins.str]=None, value_presence:typing.Optional[typing.Literal['UNCOMMITTED', 'PRESENT', 'ABSENT']]=None, equals_string:typing.Optional[builtins.str]=None, equals_string_in:typing.Optional[typing.Sequence[builtins.str]]=None, equals_number:typing.Optional[builtins.int]=None, equals_expression:typing.Optional[builtins.str]=None, exact_cardinality:typing.Optional[builtins.int]=None, minimum_cardinality:typing.Optional[builtins.int]=None, maximum_cardinality:typing.Optional[builtins.int]=None, has_member:typing.Optional[AnonymousSlotExpression]=None, all_members:typing.Optional[AnonymousSlotExpression]=None, none_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, any_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, array:typing.Optional[ArrayExpression]=None, is_a:typing.Optional[builtins.str]=None, abstract_:typing.Optional[builtins.bool]=None, mixin:typing.Optional[builtins.bool]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, apply_to:typing.Optional[typing.Sequence[builtins.str]]=None, values_from:typing.Optional[typing.Sequence[builtins.str]]=None, string_serialization:typing.Optional[builtins.str]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> SlotDefinition: ...
+    def __new__(cls, name:builtins.str, singular_name:typing.Optional[builtins.str]=None, domain:typing.Optional[builtins.str]=None, slot_uri:typing.Optional[builtins.str]=None, inherited:typing.Optional[builtins.bool]=None, readonly:typing.Optional[builtins.str]=None, ifabsent:typing.Optional[builtins.str]=None, list_elements_unique:typing.Optional[builtins.bool]=None, list_elements_ordered:typing.Optional[builtins.bool]=None, shared:typing.Optional[builtins.bool]=None, key:typing.Optional[builtins.bool]=None, identifier:typing.Optional[builtins.bool]=None, designates_type:typing.Optional[builtins.bool]=None, alias:typing.Optional[builtins.str]=None, owner:typing.Optional[builtins.str]=None, domain_of:typing.Optional[typing.Sequence[builtins.str]]=None, subproperty_of:typing.Optional[builtins.str]=None, symmetric:typing.Optional[builtins.bool]=None, reflexive:typing.Optional[builtins.bool]=None, locally_reflexive:typing.Optional[builtins.bool]=None, irreflexive:typing.Optional[builtins.bool]=None, asymmetric:typing.Optional[builtins.bool]=None, transitive:typing.Optional[builtins.bool]=None, inverse:typing.Optional[builtins.str]=None, is_class_field:typing.Optional[builtins.bool]=None, transitive_form_of:typing.Optional[builtins.str]=None, reflexive_transitive_form_of:typing.Optional[builtins.str]=None, role:typing.Optional[builtins.str]=None, is_usage_slot:typing.Optional[builtins.bool]=None, usage_slot_name:typing.Optional[builtins.str]=None, relational_role:typing.Optional[typing.Literal['SUBJECT', 'OBJECT', 'PREDICATE', 'NODE', 'OTHER_ROLE']]=None, slot_group:typing.Optional[builtins.str]=None, is_grouping_slot:typing.Optional[builtins.bool]=None, path_rule:typing.Optional[PathExpression]=None, disjoint_with:typing.Optional[typing.Sequence[builtins.str]]=None, children_are_mutually_disjoint:typing.Optional[builtins.bool]=None, union_of:typing.Optional[typing.Sequence[builtins.str]]=None, type_mappings:typing.Optional[builtins.dict[builtins.str, TypeMapping]]=None, range:typing.Optional[builtins.str]=None, range_expression:typing.Optional[AnonymousClassExpression]=None, enum_range:typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]=None, bindings:typing.Optional[builtins.list[EnumBinding]]=None, required:typing.Optional[builtins.bool]=None, recommended:typing.Optional[builtins.bool]=None, multivalued:typing.Optional[builtins.bool]=None, inlined:typing.Optional[builtins.bool]=None, inlined_as_list:typing.Optional[builtins.bool]=None, minimum_value:typing.Optional[typing.Any]=None, maximum_value:typing.Optional[typing.Any]=None, pattern:typing.Optional[builtins.str]=None, structured_pattern:typing.Optional[PatternExpression]=None, unit:typing.Optional[UnitOfMeasure]=None, implicit_prefix:typing.Optional[builtins.str]=None, value_presence:typing.Optional[typing.Literal['UNCOMMITTED', 'PRESENT', 'ABSENT']]=None, equals_string:typing.Optional[builtins.str]=None, equals_string_in:typing.Optional[typing.Sequence[builtins.str]]=None, equals_number:typing.Optional[builtins.int]=None, equals_expression:typing.Optional[builtins.str]=None, exact_cardinality:typing.Optional[builtins.int]=None, minimum_cardinality:typing.Optional[builtins.int]=None, maximum_cardinality:typing.Optional[builtins.int]=None, has_member:typing.Optional[AnonymousSlotExpression]=None, all_members:typing.Optional[AnonymousSlotExpression]=None, none_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, any_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, array:typing.Optional[ArrayExpression]=None, is_a:typing.Optional[builtins.str]=None, abstract_:typing.Optional[builtins.bool]=None, mixin:typing.Optional[builtins.bool]=None, mixins:typing.Optional[typing.Sequence[builtins.str]]=None, apply_to:typing.Optional[typing.Sequence[builtins.str]]=None, values_from:typing.Optional[typing.Sequence[builtins.str]]=None, string_serialization:typing.Optional[builtins.str]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> SlotDefinition: ...
 
 class SlotExpression:
     @property
@@ -4836,7 +5127,7 @@ class SlotExpression:
     @property
     def range_expression(self) -> typing.Optional[AnonymousClassExpression]: ...
     @property
-    def enum_range(self) -> typing.Optional[AnonymousEnumExpression | EnumDefinition]: ...
+    def enum_range(self) -> typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]: ...
     @property
     def bindings(self) -> typing.Optional[builtins.list[EnumBinding]]: ...
     @property
@@ -4896,7 +5187,7 @@ class SlotExpression:
     @range_expression.setter
     def range_expression(self, value: typing.Optional[AnonymousClassExpression]) -> None: ...
     @enum_range.setter
-    def enum_range(self, value: typing.Optional[AnonymousEnumExpression | EnumDefinition]) -> None: ...
+    def enum_range(self, value: typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]) -> None: ...
     @bindings.setter
     def bindings(self, value: typing.Optional[builtins.list[EnumBinding]]) -> None: ...
     @required.setter
@@ -4951,7 +5242,7 @@ class SlotExpression:
     def all_of(self, value: typing.Optional[builtins.list[AnonymousSlotExpression]]) -> None: ...
     @array.setter
     def array(self, value: typing.Optional[ArrayExpression]) -> None: ...
-    def __new__(cls, range:typing.Optional[builtins.str]=None, range_expression:typing.Optional[AnonymousClassExpression]=None, enum_range:typing.Optional[AnonymousEnumExpression | EnumDefinition]=None, bindings:typing.Optional[builtins.list[EnumBinding]]=None, required:typing.Optional[builtins.bool]=None, recommended:typing.Optional[builtins.bool]=None, multivalued:typing.Optional[builtins.bool]=None, inlined:typing.Optional[builtins.bool]=None, inlined_as_list:typing.Optional[builtins.bool]=None, minimum_value:typing.Optional[typing.Any]=None, maximum_value:typing.Optional[typing.Any]=None, pattern:typing.Optional[builtins.str]=None, structured_pattern:typing.Optional[PatternExpression]=None, unit:typing.Optional[UnitOfMeasure]=None, implicit_prefix:typing.Optional[builtins.str]=None, value_presence:typing.Optional[typing.Literal['UNCOMMITTED', 'PRESENT', 'ABSENT']]=None, equals_string:typing.Optional[builtins.str]=None, equals_string_in:typing.Optional[typing.Sequence[builtins.str]]=None, equals_number:typing.Optional[builtins.int]=None, equals_expression:typing.Optional[builtins.str]=None, exact_cardinality:typing.Optional[builtins.int]=None, minimum_cardinality:typing.Optional[builtins.int]=None, maximum_cardinality:typing.Optional[builtins.int]=None, has_member:typing.Optional[AnonymousSlotExpression]=None, all_members:typing.Optional[AnonymousSlotExpression]=None, none_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, any_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, array:typing.Optional[ArrayExpression]=None) -> SlotExpression: ...
+    def __new__(cls, range:typing.Optional[builtins.str]=None, range_expression:typing.Optional[AnonymousClassExpression]=None, enum_range:typing.Optional[AnonymousEnumExpression | EnumDefinition | EnumExpression]=None, bindings:typing.Optional[builtins.list[EnumBinding]]=None, required:typing.Optional[builtins.bool]=None, recommended:typing.Optional[builtins.bool]=None, multivalued:typing.Optional[builtins.bool]=None, inlined:typing.Optional[builtins.bool]=None, inlined_as_list:typing.Optional[builtins.bool]=None, minimum_value:typing.Optional[typing.Any]=None, maximum_value:typing.Optional[typing.Any]=None, pattern:typing.Optional[builtins.str]=None, structured_pattern:typing.Optional[PatternExpression]=None, unit:typing.Optional[UnitOfMeasure]=None, implicit_prefix:typing.Optional[builtins.str]=None, value_presence:typing.Optional[typing.Literal['UNCOMMITTED', 'PRESENT', 'ABSENT']]=None, equals_string:typing.Optional[builtins.str]=None, equals_string_in:typing.Optional[typing.Sequence[builtins.str]]=None, equals_number:typing.Optional[builtins.int]=None, equals_expression:typing.Optional[builtins.str]=None, exact_cardinality:typing.Optional[builtins.int]=None, minimum_cardinality:typing.Optional[builtins.int]=None, maximum_cardinality:typing.Optional[builtins.int]=None, has_member:typing.Optional[AnonymousSlotExpression]=None, all_members:typing.Optional[AnonymousSlotExpression]=None, none_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, any_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousSlotExpression]]=None, array:typing.Optional[ArrayExpression]=None) -> SlotExpression: ...
 
 class SlotView:
     @property
@@ -5142,7 +5433,7 @@ class StructuredAlias:
     @property
     def alias_contexts(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -5218,7 +5509,7 @@ class StructuredAlias:
     @alias_contexts.setter
     def alias_contexts(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -5285,7 +5576,7 @@ class StructuredAlias:
     def rank(self, value: typing.Optional[builtins.int]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, literal_form:builtins.str, alias_predicate:typing.Optional[typing.Literal['EXACT_SYNONYM', 'RELATED_SYNONYM', 'BROAD_SYNONYM', 'NARROW_SYNONYM']]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, alias_contexts:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> StructuredAlias: ...
+    def __new__(cls, literal_form:builtins.str, alias_predicate:typing.Optional[typing.Literal['EXACT_SYNONYM', 'RELATED_SYNONYM', 'BROAD_SYNONYM', 'NARROW_SYNONYM']]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, alias_contexts:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> StructuredAlias: ...
 
 class SubsetDefinition:
     @property
@@ -5305,7 +5596,7 @@ class SubsetDefinition:
     @property
     def instantiates(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -5391,7 +5682,7 @@ class SubsetDefinition:
     @instantiates.setter
     def instantiates(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -5460,7 +5751,7 @@ class SubsetDefinition:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, name:builtins.str, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> SubsetDefinition: ...
+    def __new__(cls, name:builtins.str, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> SubsetDefinition: ...
 
 class TypeDefinition:
     @property
@@ -5516,7 +5807,7 @@ class TypeDefinition:
     @property
     def instantiates(self) -> typing.Optional[builtins.list[builtins.str]]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -5638,7 +5929,7 @@ class TypeDefinition:
     @instantiates.setter
     def instantiates(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -5707,7 +5998,7 @@ class TypeDefinition:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, name:builtins.str, typeof_:typing.Optional[builtins.str]=None, base:typing.Optional[builtins.str]=None, type_uri:typing.Optional[builtins.str]=None, repr:typing.Optional[builtins.str]=None, union_of:typing.Optional[typing.Sequence[builtins.str]]=None, pattern:typing.Optional[builtins.str]=None, structured_pattern:typing.Optional[PatternExpression]=None, unit:typing.Optional[UnitOfMeasure]=None, implicit_prefix:typing.Optional[builtins.str]=None, equals_string:typing.Optional[builtins.str]=None, equals_string_in:typing.Optional[typing.Sequence[builtins.str]]=None, equals_number:typing.Optional[builtins.int]=None, minimum_value:typing.Optional[typing.Any]=None, maximum_value:typing.Optional[typing.Any]=None, none_of:typing.Optional[builtins.list[AnonymousTypeExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousTypeExpression]]=None, any_of:typing.Optional[builtins.list[AnonymousTypeExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousTypeExpression]]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> TypeDefinition: ...
+    def __new__(cls, name:builtins.str, typeof_:typing.Optional[builtins.str]=None, base:typing.Optional[builtins.str]=None, type_uri:typing.Optional[builtins.str]=None, repr:typing.Optional[builtins.str]=None, union_of:typing.Optional[typing.Sequence[builtins.str]]=None, pattern:typing.Optional[builtins.str]=None, structured_pattern:typing.Optional[PatternExpression]=None, unit:typing.Optional[UnitOfMeasure]=None, implicit_prefix:typing.Optional[builtins.str]=None, equals_string:typing.Optional[builtins.str]=None, equals_string_in:typing.Optional[typing.Sequence[builtins.str]]=None, equals_number:typing.Optional[builtins.int]=None, minimum_value:typing.Optional[typing.Any]=None, maximum_value:typing.Optional[typing.Any]=None, none_of:typing.Optional[builtins.list[AnonymousTypeExpression]]=None, exactly_one_of:typing.Optional[builtins.list[AnonymousTypeExpression]]=None, any_of:typing.Optional[builtins.list[AnonymousTypeExpression]]=None, all_of:typing.Optional[builtins.list[AnonymousTypeExpression]]=None, id_prefixes:typing.Optional[typing.Sequence[builtins.str]]=None, id_prefixes_are_closed:typing.Optional[builtins.bool]=None, definition_uri:typing.Optional[builtins.str]=None, local_names:typing.Optional[builtins.dict[builtins.str, LocalName]]=None, conforms_to:typing.Optional[builtins.str]=None, implements:typing.Optional[typing.Sequence[builtins.str]]=None, instantiates:typing.Optional[typing.Sequence[builtins.str]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> TypeDefinition: ...
 
 class TypeExpression:
     @property
@@ -5772,7 +6063,7 @@ class TypeMapping:
     @property
     def string_serialization(self) -> typing.Optional[builtins.str]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -5848,7 +6139,7 @@ class TypeMapping:
     @string_serialization.setter
     def string_serialization(self, value: typing.Optional[builtins.str]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -5917,7 +6208,7 @@ class TypeMapping:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, framework_key:builtins.str, mapped_type:typing.Optional[builtins.str]=None, string_serialization:typing.Optional[builtins.str]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> TypeMapping: ...
+    def __new__(cls, framework_key:builtins.str, mapped_type:typing.Optional[builtins.str]=None, string_serialization:typing.Optional[builtins.str]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> TypeMapping: ...
 
 class UniqueKey:
     @property
@@ -5927,7 +6218,7 @@ class UniqueKey:
     @property
     def consider_nulls_inequal(self) -> typing.Optional[builtins.bool]: ...
     @property
-    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
+    def extensions(self) -> typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]: ...
     @property
     def annotations(self) -> typing.Optional[builtins.dict[builtins.str, Annotation]]: ...
     @property
@@ -6003,7 +6294,7 @@ class UniqueKey:
     @consider_nulls_inequal.setter
     def consider_nulls_inequal(self, value: typing.Optional[builtins.bool]) -> None: ...
     @extensions.setter
-    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
+    def extensions(self, value: typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]) -> None: ...
     @annotations.setter
     def annotations(self, value: typing.Optional[builtins.dict[builtins.str, Annotation]]) -> None: ...
     @description.setter
@@ -6072,7 +6363,7 @@ class UniqueKey:
     def categories(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     @keywords.setter
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
-    def __new__(cls, unique_key_name:builtins.str, unique_key_slots:typing.Sequence[builtins.str], consider_nulls_inequal:typing.Optional[builtins.bool]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> UniqueKey: ...
+    def __new__(cls, unique_key_name:builtins.str, unique_key_slots:typing.Sequence[builtins.str], consider_nulls_inequal:typing.Optional[builtins.bool]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> UniqueKey: ...
 
 class UnitOfMeasure:
     @property
@@ -6211,6 +6502,43 @@ def import_turtle(reader:typing.Any, schema_view:SchemaView, root_classes:typing
     Import RDF/Turtle into a streaming iterator of LinkML instances.
     """
 
+def lint_element_identity(schema_view:SchemaView) -> builtins.list[ValidationResult]:
+    r"""
+    Schema-level lint: warn where a multivalued inlined slot's element identity
+    is absent, ambiguous, or cannot address the list.
+    
+    Five rules: (1) no identity declared at all; (2) the declared identity is
+    the element class's type designator, whose value describes the class rather
+    than the element; (3) several ``unique_keys`` entries to choose from across
+    the range class and its descendants, of which only the name-sorted first is
+    load-bearing; (4) those classes labelled in different ways, so one list
+    carries two label spaces; (5) two classes of one ``is_a`` hierarchy
+    declaring the same ``class_uri`` while the hierarchy designates its type.
+    
+    Warnings only — the schema stays usable. Results are deterministic: sorted
+    by subject, deduplicated across class URIs, and an inherited slot is
+    reported once, at the class that introduces the problem. Rules 1-4 are
+    per-slot and their ``subject`` is ``[class_name, slot_name]``; rule 5 is
+    class-level and its ``subject`` is ``"shared_class_uri"`` followed by the
+    classes sharing the URI — the marker distinguishes it from a per-slot
+    subject, which a rendering that joins the segments could not otherwise do.
+    """
+
+def lint_instance_identity(instance:LinkMLInstance) -> builtins.list[ValidationResult]:
+    r"""
+    Data-level lint: warn where loaded data defeats a declared element identity.
+    
+    Two rules: a list whose elements repeat a declared identity — key/identifier
+    or ``unique_keys`` value — reported as ``duplicate_element_identity``; and a
+    list addressed positionally *despite* a declared identity, because some
+    element leaves the slot that identity names empty, reported as
+    ``ambiguous_element_identity``. Neither is visible in the schema: an
+    identity slot that is not ``required`` may be absent, and repeated or
+    missing values are alike valid data.
+    
+    Warnings only. ``subject`` is the container's instance path.
+    """
+
 def load_json(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[typing.Optional[LinkMLInstance], builtins.list[ValidationResult]]: ...
 
 def load_yaml(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[typing.Optional[LinkMLInstance], builtins.list[ValidationResult]]: ...
@@ -6219,26 +6547,60 @@ def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def py_sparql_pushdown(query:builtins.str, schema_view:SchemaView) -> PushdownVerdict:
+def py_plan_query_refined(query:builtins.str, schema_view:SchemaView) -> ExecutionPlan:
     r"""
-    Classify a SPARQL query for aggregate pushdown.
+    Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
     
-    Unlike :func:`sparql_scope`, which decides what to *load* for oxigraph to
-    query, this decides whether the query's grouping and aggregation can be
-    answered by SQL without loading anything — the only shape that works for an
-    aggregate, which by definition touches every object of its class.
+    The only planner. A naive plan of the whole query is refined by rules to a
+    fixpoint and lowered into the operators the caller renders. There used to
+    be a second one — :func:`plan_query`, a single-pass analysis — and a
+    runtime gate that ran both and compared them; both are gone.
+    
+    ``refinement`` says how to run it:
+    
+    * ``"used_alone"`` — the statement answers the whole query in SQL.
+    * ``"used"`` — the statement is a *fetch* that narrows the rows and the
+      engine finishes the query over them. ``refinement_note`` says what it
+      left for the engine. Most queries are this shape, and it is not a
+      defect: the engine re-runs the whole query, so the answer is correct
+      either way.
+    * ``"fallback"`` — the pipeline produced no statement and the scoper's
+      fetch is used instead, with ``refinement_reason`` saying why. No shape in
+      the frozen inventory does this.
     
     Args:
         query: SPARQL query string.
-        schema_view: The LinkML schema, for resolving slots and ranges.
+        schema_view: The LinkML schema.
     
     Returns:
-        PushdownVerdict — inspect ``.kind`` first.
+        ExecutionPlan. Check ``is_accounted`` before running it — a plan with a
+        residual answers a different question than the one asked. ``print()``
+        it to read the ledger.
     
     Raises:
-        ValueError: the query does not parse or cannot be scoped at all. A
-            query that parses but cannot be pushed down is a ``"blocked"``
-            verdict, not an exception.
+        ValueError: the query does not parse, is an update, or cannot be
+            scoped at all.
+    """
+
+def py_refined_plan_text(query:builtins.str, schema_view:SchemaView) -> builtins.str:
+    r"""
+    The refined plan for a query, as the text the Rust tests print.
+    
+    Diagnostics, and the one thing the `ExecutionPlan` artifact cannot show: on
+    a fallback the artifact carries *today's* operators, so the plan that was
+    rejected leaves no trace beyond `refinement_reason`. Reading a table of
+    fallbacks without it means guessing which rule declined -- which cost a
+    round of guessing once.
+    
+    Args:
+        query: SPARQL query string.
+        schema_view: The LinkML schema.
+    
+    Returns:
+        str: the plan, one line per node, with the obligation ledger.
+    
+    Raises:
+        ValueError: the query does not parse or cannot be represented.
     """
 
 def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str:
