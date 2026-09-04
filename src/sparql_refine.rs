@@ -206,6 +206,41 @@ pub enum CompareOp {
 }
 
 impl CompareOp {
+    /// The condition SQL renders for this comparison against `value`, when
+    /// there is one.
+    ///
+    /// The one mapping from SPARQL's comparison vocabulary to the renderer's,
+    /// shared by [`Expr::to_sql`] and by the `HAVING` lowering. `!=` has no
+    /// mapping, and that is not an oversight: SPARQL's inequality is false for
+    /// an unbound variable where SQL's `<>` on NULL is unknown, and the two
+    /// disagree about exactly the rows an `OPTIONAL` keeps and the groups whose
+    /// aggregate is unbound.
+    pub fn as_condition(&self, value: String) -> Option<FilterCondition> {
+        use crate::sparql_scoper::CmpOp;
+        let op = match self {
+            Self::Eq => return Some(FilterCondition::Eq(value)),
+            Self::Lt => CmpOp::Lt,
+            Self::Lte => CmpOp::Lte,
+            Self::Gt => CmpOp::Gt,
+            Self::Gte => CmpOp::Gte,
+            Self::Ne => return None,
+        };
+        Some(FilterCondition::Cmp { op, value })
+    }
+
+    /// The same comparison written the other way round: `3 < ?n` asks what
+    /// `?n > 3` asks, so a flipped spelling is not a different question.
+    pub fn flipped(&self) -> Self {
+        match self {
+            Self::Eq => Self::Eq,
+            Self::Ne => Self::Ne,
+            Self::Lt => Self::Gt,
+            Self::Lte => Self::Gte,
+            Self::Gt => Self::Lt,
+            Self::Gte => Self::Lte,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Eq => "=",
@@ -321,6 +356,68 @@ impl Expr {
     /// that renders and leaving the rest above -- changes who *claims* the
     /// filter obligation, and that is a rule's decision to make and to record,
     /// not a rendering detail.
+    /// The same expression with one variable replaced by an expression.
+    ///
+    /// For the rule that sinks a condition on a group key below the grouping:
+    /// the key is a variable in the query's vocabulary and a column in SQL's,
+    /// and this is the substitution between them.
+    pub fn substitute_var(&self, from: &str, to: &Expr) -> Self {
+        match self {
+            Self::Var(var) if var == from => to.clone(),
+            Self::And(parts) => Self::And(
+                parts
+                    .iter()
+                    .map(|part| part.substitute_var(from, to))
+                    .collect(),
+            ),
+            Self::Or(parts) => Self::Or(
+                parts
+                    .iter()
+                    .map(|part| part.substitute_var(from, to))
+                    .collect(),
+            ),
+            Self::Not(inner) => Self::Not(Box::new(inner.substitute_var(from, to))),
+            Self::Compare { op, left, right } => Self::Compare {
+                op: *op,
+                left: Box::new(left.substitute_var(from, to)),
+                right: Box::new(right.substitute_var(from, to)),
+            },
+            Self::In { value, candidates } => Self::In {
+                value: Box::new(value.substitute_var(from, to)),
+                candidates: candidates.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// The same expression with one variable renamed.
+    ///
+    /// For a rule that folds a rename into the node that produces the value:
+    /// the alias disappears, so every reference to the old name has to become
+    /// a reference to the new one or it names nothing.
+    pub fn rename_var(&self, from: &str, to: &str) -> Self {
+        match self {
+            Self::Var(var) if var == from => Self::Var(to.to_owned()),
+            Self::And(parts) => {
+                Self::And(parts.iter().map(|part| part.rename_var(from, to)).collect())
+            }
+            Self::Or(parts) => {
+                Self::Or(parts.iter().map(|part| part.rename_var(from, to)).collect())
+            }
+            Self::Not(inner) => Self::Not(Box::new(inner.rename_var(from, to))),
+            Self::Compare { op, left, right } => Self::Compare {
+                op: *op,
+                left: Box::new(left.rename_var(from, to)),
+                right: Box::new(right.rename_var(from, to)),
+            },
+            Self::In { value, candidates } => Self::In {
+                value: Box::new(value.rename_var(from, to)),
+                candidates: candidates.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     pub(crate) fn sql_shape_unchecked(&self) -> Option<Vec<SqlCondition>> {
         match self {
             Self::And(parts) => {
@@ -332,29 +429,7 @@ impl Expr {
             }
             Self::Compare { op, left, right } => {
                 let (slot, value) = slot_and_value(left, right)?;
-                let condition = match op {
-                    CompareOp::Eq => FilterCondition::Eq(value),
-                    CompareOp::Lt => FilterCondition::Cmp {
-                        op: crate::sparql_scoper::CmpOp::Lt,
-                        value,
-                    },
-                    CompareOp::Lte => FilterCondition::Cmp {
-                        op: crate::sparql_scoper::CmpOp::Lte,
-                        value,
-                    },
-                    CompareOp::Gt => FilterCondition::Cmp {
-                        op: crate::sparql_scoper::CmpOp::Gt,
-                        value,
-                    },
-                    CompareOp::Gte => FilterCondition::Cmp {
-                        op: crate::sparql_scoper::CmpOp::Gte,
-                        value,
-                    },
-                    // Not an oversight: SPARQL's `!=` is false for an unbound
-                    // variable, SQL's `<>` on NULL is unknown, and the two
-                    // disagree about exactly the rows an OPTIONAL keeps.
-                    CompareOp::Ne => return None,
-                };
+                let condition = op.as_condition(value)?;
                 let Self::Slot {
                     star_var,
                     slot_path,
@@ -528,6 +603,14 @@ fn slot_and_value<'e>(left: &'e Expr, right: &'e Expr) -> Option<(&'e Expr, Stri
         // normalises the expression instead of being guessed at here.
         _ => None,
     }
+}
+
+/// The stored text of a term, for a caller outside this module.
+///
+/// Used by the identity fold, where a literal and an IRI carrying the same URI
+/// are the same question -- see `FoldIdentityConstant`.
+pub fn lexical_of(term: &Term) -> String {
+    lexical(term)
 }
 
 /// The stored text of a term: a literal's lexical form, an IRI's string.
@@ -883,6 +966,16 @@ pub enum PlanOp {
         input: NodeId,
         keys: Vec<String>,
         measures: Vec<Measure>,
+        /// Conditions on the grouped rows: SPARQL's `HAVING`, as SQL's.
+        ///
+        /// Empty until the grouping rule pushes the filters above the grouping
+        /// into it, which it may do only because SQL says the same thing with
+        /// a `HAVING` clause -- a filter over aggregates is not an operator
+        /// above a grouping in SQL, it is part of it. Each condition names a
+        /// key or a measure; which column that is, and whether the constant it
+        /// compares against is one SQL may compare against that column, is the
+        /// lowering's question.
+        having: Vec<Expr>,
     },
     Sort {
         input: NodeId,
@@ -930,6 +1023,19 @@ pub enum PlanOp {
         star_var: String,
         class_uri: String,
         slots: Vec<ScanSlot>,
+        /// Values the query fixed the record's *identity* to.
+        ///
+        /// Not a slot and not a JSONB path: the identifier is the record's own
+        /// URI, which lives in an indexed column, and today's star
+        /// decomposition carries it apart from `filters` for exactly that
+        /// reason. A scan with one of these reads one record; a scan without
+        /// reads the class.
+        ///
+        /// The writer emits *no triple* for the identifier -- it is the
+        /// subject IRI -- so a constant here narrows the fetch and is never an
+        /// answer on its own. `LoweringRefusal::IdentityIsNotATriple` is what
+        /// keeps that true.
+        identifier_values: Vec<String>,
     },
     /// One row per element of a multivalued slot, so row count matches
     /// solution count. Without it a record with three values counts once.
@@ -947,6 +1053,20 @@ pub enum PlanOp {
         /// the unnest restoring a slot's fan-out is the one binding that
         /// slot's variable.
         var: String,
+        /// Whether the row survives a collection with no elements.
+        ///
+        /// [`SlotPresence::Required`] is a `CROSS JOIN LATERAL`: a record with
+        /// an empty array supplies no rows, which is what a required read
+        /// means. [`SlotPresence::Optional`] is a `LEFT JOIN LATERAL`: the
+        /// record answers once with the variable unbound, which is what an
+        /// `OPTIONAL` over a collection means -- and getting it wrong is a
+        /// smaller count with nothing to say a record was dropped.
+        ///
+        /// Stated on the fan-out as well as on the slot it fans out, for the
+        /// reason `reading` and `optional_side` are stated on a filter: a fact
+        /// a renderer has to fetch from another node is a fact it can forget
+        /// to fetch. The lowering refuses a plan where the two disagree.
+        presence: SlotPresence,
     },
     /// Solutions to triples.
     Construct {
@@ -1142,26 +1262,38 @@ pub fn scan_with_fanout(
     star_var: &str,
     class_uri: &str,
     slots: Vec<ScanSlot>,
+    // `identifier_values`: the record's identity, when the query named it
+    // rather than a variable. A constant subject scans one row, against the
+    // indexed identifier column. Empty for a variable subject, whose identity
+    // a rule folds later if the query constrains it.
+    identifier_values: Vec<String>,
     at: NodeId,
     discharges: Vec<ObligationId>,
 ) -> Vec<Node> {
-    // A *delivered* slot exposes no binding above the scan, so nothing counts
-    // its values and there is no multiplicity to restore. Fanning one out
-    // would multiply rows for a read nobody reads.
-    let fanning: Vec<(Vec<String>, String)> = slots
+    // A slot that *binds* a variable owes a fan-out, whatever its presence: a
+    // consumer counting solutions counts one per element. A delivered slot
+    // exposes no binding above the scan, so nothing counts its values and
+    // there is no multiplicity to restore -- fanning one out would multiply
+    // rows for a read nobody reads.
+    let fanning: Vec<(Vec<String>, String, SlotPresence)> = slots
         .iter()
-        .filter(|slot| slot.multivalued && slot.presence == SlotPresence::Required)
-        .filter_map(|slot| slot.var.clone().map(|var| (slot.path.clone(), var)))
+        .filter(|slot| slot.multivalued)
+        .filter_map(|slot| {
+            slot.var
+                .clone()
+                .map(|var| (slot.path.clone(), var, slot.presence))
+        })
         .collect();
     let mut out = vec![Node::sql(
         PlanOp::Scan {
             star_var: star_var.to_owned(),
             class_uri: class_uri.to_owned(),
             slots,
+            identifier_values,
         },
         discharges,
     )];
-    for (path, var) in fanning {
+    for (path, var, presence) in fanning {
         let input = at + out.len() - 1;
         out.push(Node::sql(
             PlanOp::Unnest {
@@ -1169,6 +1301,7 @@ pub fn scan_with_fanout(
                 star_var: star_var.to_owned(),
                 slot_path: path,
                 var,
+                presence,
             },
             Vec::new(),
         ));
@@ -1424,9 +1557,9 @@ impl Plan {
                 continue;
             };
             // Any read that *binds* a multivalued slot owes a fan-out,
-            // whatever its presence. An optional one would need the fan-out
-            // inside the optional side, which no rule builds -- so the shape
-            // is refused here rather than mis-rendered.
+            // whatever its presence. An optional one needs the fan-out inside
+            // the optional side, which is a `LEFT JOIN LATERAL` -- the
+            // presence on the [`PlanOp::Unnest`] is what says so.
             for slot in slots
                 .iter()
                 .filter(|slot| slot.multivalued && slot.var.is_some())
@@ -1785,8 +1918,13 @@ impl PlanOp {
             }
             PlanOp::Filter { condition, .. } => condition.to_string(),
             PlanOp::Bind { var, expr, .. } => format!("?{var} ← {expr}"),
-            PlanOp::Group { keys, measures, .. } => format!(
-                "keys=[{}] measures=[{}]",
+            PlanOp::Group {
+                keys,
+                measures,
+                having,
+                ..
+            } => format!(
+                "keys=[{}] measures=[{}]{}",
                 keys.iter()
                     .map(|key| format!("?{key}"))
                     .collect::<Vec<_>>()
@@ -1795,7 +1933,19 @@ impl PlanOp {
                     .iter()
                     .map(|measure| format!("?{} ← {}", measure.var, measure.aggregate))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                if having.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " having=[{}]",
+                        having
+                            .iter()
+                            .map(|condition| condition.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" && ")
+                    )
+                }
             ),
             PlanOp::Sort { terms, .. } => terms
                 .iter()
@@ -1822,9 +1972,15 @@ impl PlanOp {
                 star_var,
                 class_uri,
                 slots,
+                identifier_values,
             } => format!(
-                "{} as ?{star_var}, requires [{}]",
+                "{} as ?{star_var}{}, requires [{}]",
                 shorten(class_uri),
+                if identifier_values.is_empty() {
+                    String::new()
+                } else {
+                    format!(" is {}", identifier_values.join(", "))
+                },
                 slots
                     .iter()
                     .map(|slot| format!(
@@ -2230,6 +2386,7 @@ impl Builder<'_> {
                         input,
                         keys,
                         measures,
+                        having: Vec::new(),
                     },
                     claims,
                     vars,
@@ -2424,6 +2581,20 @@ fn add_term_var(term: &TermPattern, out: &mut BTreeSet<String>) {
 pub fn subject_variable(pattern: &TriplePattern) -> Option<&str> {
     match &pattern.subject {
         TermPattern::Variable(variable) => Some(variable.as_str()),
+        _ => None,
+    }
+}
+
+/// The IRI a triple pattern's subject names, when the query named a record
+/// rather than a variable.
+///
+/// `<uri> a asset360:Signal ; asset360:name ?nm` is the canonical way to ask
+/// about one asset, and it is the spelling the form configurations should be
+/// moving *to* -- so a planner that reads it as "every Signal, narrowed later"
+/// is a planner nobody should migrate onto.
+pub fn subject_iri(pattern: &TriplePattern) -> Option<&str> {
+    match &pattern.subject {
+        TermPattern::NamedNode(node) => Some(node.as_str()),
         _ => None,
     }
 }
@@ -2813,6 +2984,7 @@ mod tests {
             PlanOp::Scan {
                 star_var: "s".to_owned(),
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
+                identifier_values: Vec::new(),
                 slots: vec![ScanSlot {
                     path: vec!["trafficKinds".to_owned()],
                     var: Some("kind".to_owned()),
@@ -2857,6 +3029,7 @@ mod tests {
             "s",
             "https://data.infrabel.be/asset360/TunnelComplex",
             slots,
+            Vec::new(),
             0,
             vec![0],
         );

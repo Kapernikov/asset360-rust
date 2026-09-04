@@ -23,9 +23,15 @@
 //! oxigraph the original SPARQL string together with the materialised
 //! instances, so whatever SQL filtered, the engine filters again. Every rule
 //! below the first row-collapsing operator therefore only narrows, and a
-//! narrowing cannot change an answer. The rules that would move a *collapsing*
-//! operator -- group, distinct, slice, sort -- are not here, and they are the
-//! ones that need a residual evaluator.
+//! narrowing cannot change an answer.
+//!
+//! One rule moves a *collapsing* operator, and it is the exception that
+//! carries the whole weight of that argument: [`PushGrouping`] takes the
+//! grouping, its measures, its `HAVING`, and every modifier above it, or it
+//! takes none of them. Past a grouping there is nothing for the engine to
+//! re-run -- the rows are aggregates, not triples -- so a partial collapse
+//! would need a residual evaluator, which 28d decided against. Collapse
+//! wholly, or fall back.
 //!
 //! That argument has one hole, and the tier-one rules are stricter than 28d
 //! because of it: a condition SQL applies is a narrowing only if it selects a
@@ -56,9 +62,9 @@ use spargebra::term::{GroundTerm, Term, TermPattern, TriplePattern};
 
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
-    CompareOp, Executor, Expr, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot, SlotPresence,
-    SlotReading, inner_join_groups, is_type_pattern, object_variable, predicate_iri,
-    scan_with_fanout, subject_variable, type_class_iri,
+    CompareOp, Executor, Expr, Measure, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot,
+    SlotPresence, SlotReading, SortTerm, inner_join_groups, is_type_pattern, object_variable,
+    predicate_iri, scan_with_fanout, subject_iri, subject_variable, type_class_iri,
 };
 
 /// One rewrite.
@@ -211,6 +217,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
     fn foldable_slots(
         &self,
         plan: &Plan,
+        keys: &HashMap<String, String>,
         star: &str,
         class_uri: &str,
         group: &[usize],
@@ -227,7 +234,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
             let PlanOp::Match { pattern } = &node.op else {
                 continue;
             };
-            if subject_variable(pattern) != Some(star) || is_type_pattern(pattern) {
+            if subject_star(keys, pattern).as_deref() != Some(star) || is_type_pattern(pattern) {
                 continue;
             }
             let (Some(predicate), Some(var)) = (predicate_iri(pattern), object_variable(pattern))
@@ -276,6 +283,47 @@ impl<'s> FoldMatchesIntoScan<'s> {
     }
 }
 
+/// The synthetic star name each constant-IRI subject in this plan gets, keyed
+/// by IRI.
+///
+/// Numbered in node order, which is the query's own triple order, because
+/// today's scoper numbers them in that order too and the gate compares the two
+/// plans by the *names* of the stars they scan. Reproducing the convention is
+/// therefore not cosmetic: a different name is a different plan as far as the
+/// comparator is concerned. If the two orders ever disagree the comparator
+/// reports different stars and the query falls back, which is the safe
+/// direction.
+fn const_subject_stars(plan: &Plan) -> HashMap<String, String> {
+    let mut keys: HashMap<String, String> = HashMap::new();
+    for node in &plan.nodes {
+        let PlanOp::Match { pattern } = &node.op else {
+            continue;
+        };
+        let Some(iri) = subject_iri(pattern) else {
+            continue;
+        };
+        let next = keys.len();
+        keys.entry(iri.to_owned())
+            .or_insert_with(|| format!("_const_subject_{next}"));
+    }
+    keys
+}
+
+/// The star a triple pattern's subject names: its variable, or the synthetic
+/// name its constant IRI was given.
+///
+/// One function so the two questions a rule asks about a subject -- "which
+/// star is this" and "does this triple belong to that star" -- cannot answer
+/// differently for a constant than for a variable. That they used to is the
+/// whole of why `<uri> a :Class ; :slot ?v` scanned the class instead of the
+/// record.
+fn subject_star(keys: &HashMap<String, String>, pattern: &TriplePattern) -> Option<String> {
+    if let Some(var) = subject_variable(pattern) {
+        return Some(var.to_owned());
+    }
+    keys.get(subject_iri(pattern)?).cloned()
+}
+
 impl Rule for FoldMatchesIntoScan<'_> {
     fn name(&self) -> &'static str {
         "fold_matches_into_scan"
@@ -283,6 +331,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
 
     fn apply(&self, plan: &mut Plan) -> bool {
         let groups = inner_join_groups(plan);
+        let keys = const_subject_stars(plan);
         for (type_node, node) in plan.nodes.iter().enumerate() {
             if node.executor != Executor::Engine {
                 continue;
@@ -290,25 +339,47 @@ impl Rule for FoldMatchesIntoScan<'_> {
             let PlanOp::Match { pattern } = &node.op else {
                 continue;
             };
+            // A constant subject is a star of one record: the query named the
+            // identity, so the scan carries it as an identifier value and the
+            // statement reads one row against the indexed column. Without
+            // this the plan scanned the whole class and left the narrowing to
+            // the engine -- correct, and the wrong statement.
+            let identifier_values: Vec<String> = subject_iri(pattern)
+                .map(|iri| vec![iri.to_owned()])
+                .into_iter()
+                .flatten()
+                .collect();
             let (Some(star), Some(class_uri)) =
-                (subject_variable(pattern), type_class_iri(pattern))
+                (subject_star(&keys, pattern), type_class_iri(pattern))
             else {
                 continue;
             };
-            // An intersection of classes, or a type read into a variable
-            // alongside a constant one: a scan of one class is not either of
-            // those questions.
-            let types_on_star = plan
+            let star = star.as_str();
+            // An intersection of classes is not a scan of one class:
+            // `?s a :Signal ; a :Track` matches nothing unless one subclasses
+            // the other, and a statement holding one of them counts every
+            // instance of it.
+            //
+            // A type read into a *variable* alongside the constant one is a
+            // different matter, and folding is right there: `?s a ?t . ?s a
+            // :CivilEngineeringAsset` wants every asset of that class, which
+            // is exactly what the scan fetches, and the engine binds `?t` from
+            // the instance's own types. The triple stays unclaimed, so it is
+            // the engine's -- and the grouping above it declines, because `?t`
+            // is not a column any scan binds. That is today's plan for this
+            // query, arrived at by the rules.
+            let classes_on_star = plan
                 .nodes
                 .iter()
                 .filter(|other| match &other.op {
                     PlanOp::Match { pattern } => {
-                        is_type_pattern(pattern) && subject_variable(pattern) == Some(star)
+                        type_class_iri(pattern).is_some()
+                            && subject_star(&keys, pattern).as_deref() == Some(star)
                     }
                     _ => false,
                 })
                 .count();
-            if types_on_star != 1 {
+            if classes_on_star != 1 {
                 continue;
             }
             if self
@@ -324,8 +395,9 @@ impl Rule for FoldMatchesIntoScan<'_> {
             }
             let star = star.to_owned();
             let class_uri = class_uri.to_owned();
-            let slots = self.foldable_slots(plan, &star, &class_uri, &groups, groups[type_node]);
-            fold(plan, type_node, &star, &class_uri, slots);
+            let slots =
+                self.foldable_slots(plan, &keys, &star, &class_uri, &groups, groups[type_node]);
+            fold(plan, type_node, &star, &class_uri, identifier_values, slots);
             return true;
         }
         false
@@ -343,6 +415,7 @@ fn fold(
     type_node: NodeId,
     star: &str,
     class_uri: &str,
+    identifier_values: Vec<String>,
     slots: Vec<(NodeId, ScanSlot)>,
 ) {
     let mut folded: Vec<NodeId> = slots.iter().map(|(id, _)| *id).collect();
@@ -372,6 +445,7 @@ fn fold(
                 star,
                 class_uri,
                 scan_slots.clone(),
+                identifier_values.clone(),
                 nodes.len(),
                 claims.clone(),
             );
@@ -572,6 +646,7 @@ impl Visible {
                 star_var,
                 class_uri,
                 slots: scan_slots,
+                ..
             } = &node.op
             else {
                 continue;
@@ -645,6 +720,20 @@ impl Visible {
             slots,
             class_of_star,
         }
+    }
+
+    /// The class of the record whose *identity* a variable names, when an
+    /// `Sql` scan below scans it.
+    ///
+    /// Kept apart from [`Visible::slot_of`], which reports a star variable as
+    /// ambiguous, because the two answers are not interchangeable. A record's
+    /// identity has no `Expr::Slot` address, so no `SqlCondition` can compare
+    /// against it and a filter must still decline. A `GROUP BY` key and an
+    /// aggregate's argument are not conditions: they are *columns* of the
+    /// grouped result, and the identifier column is one -- so the grouping
+    /// rule may resolve what a filter may not.
+    fn identity_of(&self, var: &str) -> Option<&String> {
+        self.class_of_star.get(var)
     }
 
     /// The slot a variable reads, when exactly one does.
@@ -756,6 +845,7 @@ impl Rule for DeliverOptionalRead<'_> {
                     star_var,
                     class_uri,
                     slots,
+                    ..
                 } = &node.op
                 else {
                     return None;
@@ -915,22 +1005,47 @@ impl Rule for AbsorbOptionalRead<'_> {
             let Some(delivered) = slots.iter().position(|slot| slot.path == path) else {
                 continue;
             };
-            if slots[delivered].multivalued || slots[delivered].var.is_some() {
+            if slots[delivered].var.is_some() {
                 continue;
             }
+            let multivalued = slots[delivered].multivalued;
 
             // Bind it. From here the column is the read: a value where there
             // is one, `NULL` where there is not.
             if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
-                slots[delivered].var = Some(var);
+                slots[delivered].var = Some(var.clone());
                 slots[delivered].presence = SlotPresence::Optional;
             }
+
             let mut claims = plan.nodes[right].discharges.clone();
             claims.extend(plan.nodes[id].discharges.iter().copied());
             plan.nodes[scan].discharges.extend(claims);
             plan.nodes[scan].discharges.sort_unstable();
 
             drop_optional_pair(plan, id, right, left);
+
+            // A collection read this way owes a fan-out, and an *optional*
+            // one: the record with no elements answers once with the variable
+            // unbound, which is a `LEFT JOIN LATERAL`. Without the fan-out a
+            // consumer counting solutions counts one per record; with a
+            // required one it drops the record entirely -- a smaller count
+            // with nothing to say it happened.
+            //
+            // After the drop, and the scan located again: dropping the pair
+            // renumbers the plan, and an insertion at a stale index is how a
+            // rewrite reparents a node onto the wrong input.
+            if multivalued {
+                let scan = plan
+                    .nodes
+                    .iter()
+                    .position(|node| {
+                        matches!(&node.op, PlanOp::Scan { star_var, slots, .. }
+                            if star_var == &star
+                                && slots.iter().any(|slot| slot.path == path))
+                    })
+                    .expect("the scan this rule just bound");
+                insert_unnest_above(plan, scan, &star, path, var);
+            }
             return true;
         }
         false
@@ -958,6 +1073,109 @@ fn drop_optional_pair(plan: &mut Plan, leftjoin: NodeId, matched: NodeId, left: 
     for node in &mut nodes {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+/// One `HAVING` conjunct as a condition on a column, when the variable it
+/// names is a group key an `Sql` scan below binds.
+///
+/// `None` for a conjunct over a measure -- there is no row to test it against
+/// until the rows are grouped -- and for a key with no column address, which
+/// is a record's identity: SQL can compare against the identifier column, but
+/// no [`Expr::Slot`] names it, so that one stays a `HAVING`.
+fn sinkable(visible: &Visible, condition: &Expr) -> Option<Expr> {
+    let name = having_names(condition)?;
+    let binding = visible.slot_of(&name)?;
+    Some(condition.substitute_var(
+        &name,
+        &Expr::Slot {
+            star_var: binding.star_var.clone(),
+            slot_path: binding.path.clone(),
+            reading: binding.reading,
+        },
+    ))
+}
+
+/// Insert an optional fan-out immediately above a scan.
+///
+/// Immediately above, because that is the earliest position: every consumer of
+/// the variable the fan-out binds comes later, and an unnest that sits above a
+/// grouping would count records where the query counts solutions
+/// ([`Plan::fanout_restored`] checks exactly that).
+fn insert_unnest_above(plan: &mut Plan, scan: NodeId, star: &str, path: Vec<String>, var: String) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() + 1);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        let mut op = node.op.clone();
+        op.map_inputs(|input| remap[input].expect("inputs precede their node"));
+        nodes.push(Node {
+            op,
+            executor: node.executor,
+            output: node.output,
+            discharges: node.discharges.clone(),
+        });
+        remap[old] = Some(nodes.len() - 1);
+        if old == scan {
+            let input = nodes.len() - 1;
+            nodes.push(Node::sql(
+                PlanOp::Unnest {
+                    input,
+                    star_var: star.to_owned(),
+                    slot_path: path.clone(),
+                    var: var.clone(),
+                    presence: SlotPresence::Optional,
+                },
+                Vec::new(),
+            ));
+            // Consumers of the scan read the fan-out instead: the rows they
+            // want are one per element, not one per record.
+            remap[old] = Some(nodes.len() - 1);
+        }
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+/// Insert filters immediately below a node, in order, each reading the one
+/// before it.
+fn insert_filters_below(plan: &mut Plan, target: NodeId, filters: Vec<(Vec<ObligationId>, Expr)>) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() + filters.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == target {
+            let mut input = remap[node.op.inputs()[0]].expect("inputs precede their node");
+            for (claims, condition) in &filters {
+                nodes.push(Node::sql(
+                    PlanOp::Filter {
+                        input,
+                        condition: condition.clone(),
+                    },
+                    claims.clone(),
+                ));
+                input = nodes.len() - 1;
+            }
+            let mut op = node.op.clone();
+            op.map_inputs(|_| input);
+            nodes.push(Node {
+                op,
+                executor: node.executor,
+                output: node.output,
+                discharges: node.discharges.clone(),
+            });
+            remap[old] = Some(nodes.len() - 1);
+            continue;
+        }
+        let mut op = node.op.clone();
+        op.map_inputs(|input| remap[input].expect("inputs precede their node"));
+        nodes.push(Node {
+            op,
+            executor: node.executor,
+            output: node.output,
+            discharges: node.discharges.clone(),
+        });
+        remap[old] = Some(nodes.len() - 1);
     }
     plan.nodes = nodes;
     refresh_join_variables(plan);
@@ -998,6 +1216,7 @@ fn subject_site(plan: &Plan, other: NodeId, subject: &str) -> Option<SubjectSite
             star_var,
             class_uri,
             slots,
+            ..
         } = &node.op
         else {
             return None;
@@ -1306,6 +1525,22 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         let class = class_at_path(self.schema, &site.class_uri, &site.prefix)?;
         let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
         let on_class = class.slot(&Identifier::Name(slot.name.clone()))?;
+        // Identity is [`FoldIdentityConstant`]'s, and the two rules have to be
+        // disjoint or the plan depends on which fired first -- which it did:
+        // reversed, this rule turned `?s :id "u"` into a JSONB path condition
+        // plus an existence check on a column that is structurally always
+        // there, and the identity fold then had nothing left to fold.
+        //
+        // Declining is also the right answer on its own terms. The identifier
+        // is the record's URI in an indexed column, not a value in the
+        // payload, and a condition naming it as a path is a different (and
+        // slower) question.
+        if class
+            .identifier_slot()
+            .is_some_and(|identifier| identifier.name == slot.name)
+        {
+            return None;
+        }
         // A constant object on a multivalued slot is a containment test, and
         // *not* a fan-out: `?s :trafficKinds "m"` binds nothing, so a record
         // whose array carries the value answers the query once however many
@@ -1488,6 +1723,411 @@ fn replace_match_with_filter(
             .map_inputs(|input| remap[input].expect("nothing reads the match but the join"));
     }
 
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+// ---------------------------------------------------------------------------
+// Fold a constant on the identifier slot
+// ---------------------------------------------------------------------------
+
+/// `?ce asset360:id "X"` becomes the scan's identity, not a condition on a
+/// column.
+///
+/// Without it the refined planner is *blind to identity*: its scan reads every
+/// record of the class and leaves the restriction to the engine, on the query
+/// every named source in the product runs. The comparator caught it as
+/// "?ce disagrees about identifier values: [] against [X]", which is also why
+/// the two-star form fell back with "2 islands" -- with identity unfolded,
+/// nothing joined the two stars in SQL.
+///
+/// **Identity is not a slot value.** The identifier is the record's own URI,
+/// which lives in an indexed column, and the writer emits no triple for it --
+/// so this is neither [`ConstantObjectBecomesFilter`]'s JSONB path condition
+/// nor a claim that can answer anything on its own. Two consequences, both
+/// load-bearing:
+///
+/// * **The term rule does not apply.** A condition on a column compares stored
+///   text, and [`Expr::to_sql`] refuses a constant the column's values never
+///   spell. Here there is no column and no stored text: the comparison is
+///   against the identity, and the query may write it as a literal or as an
+///   IRI -- the product does both, in the same set of form configs -- with the
+///   same string either way. Today's star decomposition bypasses the term rule
+///   here for the same reason, in the same words.
+/// * **It narrows, and never answers.** The engine's answer to `?ce :id "X"`
+///   is *empty*, because the graph has no such triple.
+///   `LoweringRefusal::IdentityIsNotATriple` refuses a statement that would
+///   answer alone while resting on one, which is the wrong answer today's
+///   aggregate route gives: one record where the engine reports none.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **The predicate is the class's `identifier` slot**, from the class view
+///   rather than by name, so this works for any managed class. A `key`-only
+///   slot is *not* folded: a key is a local name rather than the record's URI,
+///   so comparing it against the identity column would narrow to nothing and
+///   answer empty. (Today's decomposition folds those too; no managed class
+///   has one, so the divergence is unreachable -- see the report.)
+/// * **One identity per scan.** `?s :id "a" ; :id "b"` asks for a record whose
+///   identity is both, which is no record; folding both into a set would ask
+///   for *either* and answer two. The second constant declines and the engine
+///   answers it -- correctly, with nothing.
+/// * **The match's one consumer is a plain join whose other side takes every
+///   row from the scan**, as for any constant object: identity inside an
+///   `OPTIONAL` is not a restriction on the preserved side.
+pub struct FoldIdentityConstant<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> FoldIdentityConstant<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+
+    /// The name of the class's identifier slot, when it has one.
+    ///
+    /// `identifier_slot` and not `key_or_identifier_slot`: see the
+    /// precondition above.
+    fn identifier_of(&self, class_uri: &str) -> Option<String> {
+        let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
+        class.identifier_slot().map(|slot| slot.name.clone())
+    }
+}
+
+/// The identity constraint a node states on a *star variable*, when it states
+/// one this rule can fold: the IRIs a record's own name is allowed to be.
+///
+/// Three spellings of one question reach here, and the point of resolving them
+/// in one place is that they are the same question:
+///
+/// * `?s asset360:id "<uri>"` -- a triple on the identifier slot, handled by
+///   the other arm because it has a slot address.
+/// * `VALUES ?s { <uri> }`
+/// * `FILTER(?s = <uri>)`
+///
+/// A star variable is bound to the record's own IRI, which is the identifier
+/// column -- so these fold into [`PlanOp::Scan::identifier_values`] and the
+/// statement reads one row against the index. Without the fold both spellings
+/// scan the whole class and let the engine narrow: a correct answer from a
+/// statement nobody would write, and a trap for anyone reading the
+/// configurations to learn how to name one asset.
+///
+/// **Only IRIs.** `FILTER(?s = "https://…")` compares a record's identity
+/// against a *literal*, and in SPARQL an IRI is never equal to a literal, so
+/// the query has no solutions -- while a statement comparing that text against
+/// `asset360_uri` would find the row. That is the one way this fold could
+/// answer a question the query did not ask, so a non-IRI declines.
+fn identity_terms(condition: &Expr) -> Option<(String, Vec<String>)> {
+    let iri_of = |expr: &Expr| -> Option<String> {
+        match expr {
+            Expr::Literal(Term::NamedNode(node)) => Some(node.as_str().to_owned()),
+            _ => None,
+        }
+    };
+    match condition {
+        Expr::Compare {
+            op: CompareOp::Eq,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Var(var), other) | (other, Expr::Var(var)) => {
+                Some((var.clone(), vec![iri_of(other)?]))
+            }
+            _ => None,
+        },
+        Expr::In { value, candidates } => {
+            let Expr::Var(var) = value.as_ref() else {
+                return None;
+            };
+            let mut out = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                out.push(iri_of(candidate)?);
+            }
+            (!out.is_empty()).then_some((var.clone(), out))
+        }
+        _ => None,
+    }
+}
+
+/// The single `Sql` scan of a star below `node`, when there is exactly one and
+/// it has no identity yet.
+fn sole_scan_of_star(plan: &Plan, node: NodeId, star: &str) -> Option<NodeId> {
+    let mut found = None;
+    for (id, scanned) in plan.nodes.iter().enumerate() {
+        let PlanOp::Scan {
+            star_var,
+            identifier_values,
+            ..
+        } = &scanned.op
+        else {
+            continue;
+        };
+        if scanned.executor != Executor::Sql || star_var != star || !plan.feeds(id, node) {
+            continue;
+        }
+        if !identifier_values.is_empty() {
+            // A second identity is an intersection, and two of them is either
+            // nothing or the same row: not a question this states by appending
+            // to a list that renders as `IN`.
+            return None;
+        }
+        if found.replace(id).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+/// Whether a node's rows reach every answer: no left join above it keeps rows
+/// it did not match, no union offers an alternative to it, no minus subtracts
+/// through it.
+///
+/// The condition an identity fold needs, and not
+/// [`mandatorily_feeds`] to the root, which stops at the first modifier and
+/// would answer `false` for every plan with a projection. What matters is not
+/// that the path is joins all the way up but that nothing on it makes this
+/// node's constraint conditional.
+fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
+    !plan.nodes.iter().any(|other| match &other.op {
+        // The preserved side keeps rows the optional side did not match, so a
+        // constraint inside the optional side decides whether the *value*
+        // binds -- not whether the row survives.
+        PlanOp::LeftJoin { right, .. } => plan.feeds(node, *right),
+        // Either branch of a union is an alternative, so narrowing one is not
+        // narrowing the answer.
+        PlanOp::Union { left, right } => plan.feeds(node, *left) || plan.feeds(node, *right),
+        // Narrowing what is subtracted *widens* the answer.
+        PlanOp::Minus { right, .. } => plan.feeds(node, *right),
+        _ => false,
+    })
+}
+
+/// Drop nodes whose work another node has taken over, reparenting each one's
+/// consumers onto its input.
+fn remove_nodes(plan: &mut Plan, removed: &[NodeId]) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if removed.contains(&old) {
+            remap[old] = remap[node.op.inputs()[0]];
+            continue;
+        }
+        nodes.push(node.clone());
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+impl Rule for FoldIdentityConstant<'_> {
+    fn name(&self) -> &'static str {
+        "fold_identity_constant"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+                continue;
+            };
+            if is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(star), Some(predicate), Some(term)) = (
+                subject_variable(pattern),
+                predicate_iri(pattern),
+                constant_object(pattern),
+            ) else {
+                continue;
+            };
+            let (star, predicate) = (star.to_owned(), predicate.to_owned());
+
+            let above = consumers(plan, id);
+            let [consumer] = above.as_slice() else {
+                continue;
+            };
+            let PlanOp::Join {
+                left, right, on, ..
+            } = &plan.nodes[*consumer].op
+            else {
+                continue;
+            };
+            if on.as_slice() != [star.clone()] {
+                continue;
+            }
+            let (consumer, other) = (*consumer, if *left == id { *right } else { *left });
+
+            // The scan this identity belongs to, and its class's identifier.
+            let Some(site) = subject_site(plan, other, &star) else {
+                continue;
+            };
+            if !site.prefix.is_empty() {
+                // A nested structure has no identity of its own to fix.
+                continue;
+            }
+            let Some(identifier) = self.identifier_of(&site.class_uri) else {
+                continue;
+            };
+            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
+                continue;
+            };
+            if slot.name != identifier {
+                continue;
+            }
+            if let PlanOp::Scan {
+                identifier_values, ..
+            } = &plan.nodes[site.scan].op
+                && !identifier_values.is_empty()
+            {
+                continue;
+            }
+
+            // The value as the identity column stores it: a literal's lexical
+            // form and an IRI's string are the same URI, which is what makes
+            // both spellings the same question here.
+            let value = crate::sparql_refine::lexical_of(&term);
+            if let PlanOp::Scan {
+                identifier_values, ..
+            } = &mut plan.nodes[site.scan].op
+            {
+                identifier_values.push(value);
+            }
+            let mut claims = plan.nodes[id].discharges.clone();
+            claims.extend(plan.nodes[consumer].discharges.iter().copied());
+            plan.nodes[site.scan].discharges.extend(claims);
+            plan.nodes[site.scan].discharges.sort_unstable();
+
+            collapse_leaf_into(plan, id, consumer, other);
+            return true;
+        }
+
+        // The same fold, from a constraint written on the star variable
+        // itself. Separate loop rather than a second shape in the one above,
+        // because what it collapses differs -- a `VALUES` takes its join with
+        // it, a `FILTER` is unary -- while what it *decides* is shared.
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            // The constraint has to hold of every answer. Inside an
+            // `OPTIONAL` it does not: folding it into the scan would delete
+            // the rows the left join exists to keep.
+            if !applies_to_every_answer(plan, id) {
+                continue;
+            }
+            // `join` is the join a `VALUES` was applied by, which goes with
+            // it; a `FILTER` is unary and has none.
+            let (star, values, join, below) = match &plan.nodes[id].op {
+                PlanOp::Filter { input, condition } => {
+                    let Some((star, values)) = identity_terms(condition) else {
+                        continue;
+                    };
+                    (star, values, None, *input)
+                }
+                PlanOp::Values { variables, rows } => {
+                    let [variable] = variables.as_slice() else {
+                        continue;
+                    };
+                    let var = variable.as_str().to_owned();
+                    let mut values = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let [Some(GroundTerm::NamedNode(node))] = row.as_slice() else {
+                            values.clear();
+                            break;
+                        };
+                        values.push(node.as_str().to_owned());
+                    }
+                    if values.is_empty() {
+                        continue;
+                    }
+                    // A bag, not a set: `VALUES` with a repeated row
+                    // duplicates solutions, and an `IN` does not.
+                    if (1..values.len()).any(|i| values[..i].contains(&values[i])) {
+                        continue;
+                    }
+                    // The join that applies it, which goes with it.
+                    let above = consumers(plan, id);
+                    let [consumer] = above.as_slice() else {
+                        continue;
+                    };
+                    let PlanOp::Join {
+                        left, right, on, ..
+                    } = &plan.nodes[*consumer].op
+                    else {
+                        continue;
+                    };
+                    if on.as_slice() != [var.clone()] {
+                        continue;
+                    }
+                    let other = if *left == id { *right } else { *left };
+                    (var, values, Some((*consumer, other)), other)
+                }
+                _ => continue,
+            };
+
+            // A star variable names a record's identity, which
+            // `Visible::identity_of` resolves and `slot_of` deliberately does
+            // not: there is no slot address to compare against, and that is
+            // why a *filter* on it cannot be pushed as a condition. It can be
+            // pushed as an identity.
+            let visible = Visible::mandatorily_below(plan, below);
+            if visible.identity_of(&star).is_none() {
+                continue;
+            }
+            let Some(scan) = sole_scan_of_star(plan, below, &star) else {
+                continue;
+            };
+
+            if let PlanOp::Scan {
+                identifier_values, ..
+            } = &mut plan.nodes[scan].op
+            {
+                identifier_values.extend(values);
+            }
+            let mut claims = plan.nodes[id].discharges.clone();
+            if let Some((join, _)) = join {
+                claims.extend(plan.nodes[join].discharges.iter().copied());
+            }
+            plan.nodes[scan].discharges.extend(claims);
+            plan.nodes[scan].discharges.sort_unstable();
+            match join {
+                Some((join, other)) => collapse_leaf_into(plan, id, join, other),
+                None => remove_nodes(plan, &[id]),
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// Drop a leaf and the join that carried it, leaving the side that stays.
+///
+/// The same edit [`fold_into_scan`] performs, without the slot -- what the
+/// leaf contributed is already on the scan.
+fn collapse_leaf_into(plan: &mut Plan, leaf: NodeId, join: NodeId, other: NodeId) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() - 1);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == leaf {
+            continue;
+        }
+        if old == join {
+            remap[old] = remap[other];
+            continue;
+        }
+        nodes.push(node.clone());
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("nothing reads the leaf but the join"));
+    }
     plan.nodes = nodes;
     refresh_join_variables(plan);
 }
@@ -1946,6 +2586,7 @@ impl<'s> PushReferenceJoin<'s> {
                     star_var,
                     class_uri,
                     slots,
+                    ..
                 } if node.executor == Executor::Sql && plan.feeds(id, holder) => slots
                     .iter()
                     .find(|slot| {
@@ -2107,9 +2748,7 @@ impl Rule for PushLeftJoin<'_> {
             else {
                 continue;
             };
-            if condition.is_some() {
-                continue;
-            }
+            let lifted = condition.is_some();
             let (left, right) = (*left, *right);
             if plan.nodes[left].executor != Executor::Sql
                 || plan.nodes[right].executor != Executor::Sql
@@ -2130,8 +2769,38 @@ impl Rule for PushLeftJoin<'_> {
                 continue;
             };
             plan.nodes[id].executor = Executor::Sql;
-            if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
+            if let PlanOp::LeftJoin {
+                reference,
+                condition,
+                ..
+            } = &mut plan.nodes[id].op
+            {
                 *reference = Some(edge);
+                // A lifted condition stays with the engine, and the plan says
+                // so by giving it up rather than by carrying it unrendered.
+                //
+                // The condition decides whether the optional side *matched*,
+                // which is a conditional binding and not a row test: as a
+                // `WHERE` it deletes the row the join exists to keep, and this
+                // renderer has no `ON` clause to put it in. So the join goes
+                // to SQL without it and the obligation goes to the residual --
+                // the engine re-runs the whole query, and a left join that
+                // matches too generously still fetches a superset of the
+                // records the answer needs. Which is today's statement for
+                // this query, exactly: a join, two scans, and no condition.
+                //
+                // What is *not* sound is answering from this statement, and
+                // that is already refused elsewhere: an unclaimed obligation
+                // means `admit_alone` declines, so the rows can only ever be a
+                // fetch.
+                if lifted {
+                    *condition = None;
+                }
+            }
+            if lifted {
+                let claims = std::mem::take(&mut plan.nodes[id].discharges);
+                plan.residual.extend(claims);
+                plan.residual.sort_unstable();
             }
             return true;
         }
@@ -2192,62 +2861,146 @@ impl PushLeftJoin<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Push a scalar-key count grouping
+// Push a grouping
 // ---------------------------------------------------------------------------
 
-/// A `GROUP BY` one scalar key with `COUNT(*)`, and the projection above it,
-/// become `Sql`.
+/// A `GROUP BY` and everything above it -- measures, `HAVING`, `ORDER BY`,
+/// `DISTINCT`, `LIMIT`, the projection -- become `Sql`, or none of it does.
 ///
-/// The first rule that moves a *collapsing* operator, and the last one this
-/// stage writes. After a grouping the rows are aggregates rather than triples,
-/// and oxigraph evaluates queries over RDF graphs -- so the engine leg, which
-/// re-runs the whole original query over materialised instances, cannot finish
-/// a query whose grouping already happened. That is why every rule before this
-/// one was free: a narrowing cannot change an answer while the engine remains
-/// authoritative. This one takes the answer.
+/// The one rule that moves a *collapsing* operator, widened from the single
+/// shape it started as. After a grouping the rows are aggregates rather than
+/// triples, and oxigraph evaluates queries over RDF graphs -- so the engine
+/// leg, which re-runs the whole original query over materialised instances,
+/// cannot finish a query whose grouping already happened. Every rule below the
+/// frontier is free because a narrowing cannot change an answer while the
+/// engine stays authoritative; this one takes the answer.
 ///
-/// **So it collapses fully or not at all.** A rule that grouped in SQL and
-/// left algebra above would be the first thing in this design able to change
-/// an answer, and there is no residual evaluator to catch it -- see 28d. The
-/// projection is therefore part of the same rewrite rather than a second rule:
-/// a grouping whose `Project` stayed with the engine is a partial collapse
-/// wearing a complete one's clothes.
+/// **So it collapses wholly or declines.** The whole tail above the grouping
+/// is part of the same rewrite rather than a rule each: a grouping whose
+/// `ORDER BY` stayed with the engine is a partial collapse wearing a complete
+/// one's clothes, and there is no residual evaluator to finish one (28d).
 ///
-/// Preconditions, each with the wrong answer it prevents:
+/// What it accepts, and the reasoning each part rests on:
 ///
-/// * **Everything below is already `Sql`.** A grouping over an engine node
-///   would group rows a filter has not seen. The frontier-is-a-cut invariant
-///   says the same thing after the fact; the rule declines before it, so a
-///   plan the driver would refuse is never built.
-/// * **One group key, bound by a scan below as a column or as an unnested
-///   element.** Grouping on a multivalued slot groups its *values*, which the
-///   fan-out below has already turned into solutions -- so the key is the
-///   element, never the array. One key, so the rule cannot quietly serve a
-///   shape whose ordering of keys the renderer decides.
-/// * **Exactly `COUNT(*)`.** `COUNT(?v)` must not count solutions where `?v`
-///   is unbound, and `COUNT(DISTINCT ?v)` counts values rather than
-///   solutions; both are real shapes with their own reasoning, and neither is
-///   this one.
-/// * **Nothing above but the alias and the projection.** An `ORDER BY`, a
-///   `LIMIT` or a `DISTINCT` above the grouping is more collapsing work, and
-///   leaving it to the engine is the partial collapse this rule refuses to
-///   make possible.
-/// * **The fan-out is below.** Guaranteed by the fifth invariant rather than
-///   by this rule -- and it is this rule that makes that invariant
-///   falsifiable, since nothing collapsed rows before.
-pub struct PushScalarCountGrouping<'s> {
+/// * **Any number of keys**, including none. No keys is a bare aggregate,
+///   which SPARQL answers with exactly one row even over no input -- the
+///   renderer omits `GROUP BY` for it, since `GROUP BY ()` would return
+///   nothing.
+/// * **A key that is a column, an unnested element, or a record's identity.**
+///   Grouping on a multivalued slot groups its *values*, which the fan-out
+///   below has already turned into solutions. Grouping on a star variable
+///   groups by the record's own URI, which is a column of the row rather than
+///   a value in its payload.
+/// * **`COUNT(*)`, `COUNT(?v)`, `COUNT(DISTINCT ?v)`, `MIN`, `MAX`, `SUM`,
+///   `AVG`** over a variable a scan below binds. `COUNT(?v)` counts the
+///   solutions where `?v` is bound, which is `count(column)` and not
+///   `count(*)`; `SUM`/`AVG` need a numeric column, or the sum of a text
+///   column is a cast the query never asked for.
+/// * **`HAVING`**, as conditions on the grouped rows -- see
+///   [`Plan`]'s `Group` node and the lowering, which resolves each one against
+///   the measures and keys it names.
+/// * **`ORDER BY`, `DISTINCT`, `LIMIT`/`OFFSET`, and the projection.** An
+///   ordering over an aggregate or a key is a column of the grouped result;
+///   the renderer states the null placement explicitly, because SPARQL sorts
+///   unbound before every bound value and Postgres defaults the other way.
+///
+/// What it declines, each with the wrong answer it prevents:
+///
+/// * **An engine node below.** A grouping over one would group rows a filter
+///   has not seen. The frontier-is-a-cut invariant says so after the fact; the
+///   rule declines before it.
+/// * **`COUNT(DISTINCT *)`**, which counts distinct *solutions* -- not the
+///   same as `count(*)`, and today's renderer ignores the distinct. Refusing
+///   is better than copying that.
+/// * **`GROUP_CONCAT`, `SAMPLE`, a custom aggregate**: no defined result
+///   order, so the two routes could not be held to one answer.
+/// * **An aggregate over an expression**, a `BIND` above the grouping, a
+///   sub-select, a shaping node: all of them are work SQL would have to
+///   evaluate rather than read.
+/// * **A key or measure argument the scans below do not bind.**
+pub struct PushGrouping<'s> {
     schema: &'s SchemaView,
 }
 
-impl<'s> PushScalarCountGrouping<'s> {
+impl<'s> PushGrouping<'s> {
     pub fn new(schema: &'s SchemaView) -> Self {
         Self { schema }
     }
+
+    /// Whether a key names something a grouped statement can key on.
+    fn key_is_readable(&self, plan: &Plan, input: NodeId, key: &str) -> bool {
+        let visible = Visible::below(plan, input);
+        if let Some(binding) = visible.slot_of(key) {
+            if !matches!(
+                binding.reading,
+                SlotReading::Column | SlotReading::BoundElement
+            ) {
+                // `AnyElement` is a test over a record's array, with no single
+                // value to group by.
+                return false;
+            }
+            return visible
+                .class_of_star
+                .get(&binding.star_var)
+                .is_some_and(|class_uri| {
+                    crate::sparql_scoper::push_form_of_path(self.schema, class_uri, &binding.path)
+                        != crate::sparql_scoper::PushForm::Tagged
+                });
+        }
+        // Or the record's own identity: `GROUP BY ?t` over a scanned star
+        // groups by its URI, which is a column of the row.
+        visible.identity_of(key).is_some()
+    }
+
+    /// Whether an aggregate is one a grouped statement can compute, and its
+    /// argument something the scans below bind.
+    fn measure_is_renderable(&self, plan: &Plan, input: NodeId, measure: &Measure) -> bool {
+        use spargebra::algebra::AggregateFunction;
+        let visible = Visible::below(plan, input);
+        let numeric_column = |var: &str| -> bool {
+            visible.slot_of(var).is_some_and(|binding| {
+                visible
+                    .class_of_star
+                    .get(&binding.star_var)
+                    .is_some_and(|class_uri| {
+                        crate::sparql_scoper::numeric_at_path(self.schema, class_uri, &binding.path)
+                    })
+            })
+        };
+        match &measure.aggregate {
+            // `COUNT(*)` counts solutions and needs no column.
+            AggregateExpression::CountSolutions { distinct } => !*distinct,
+            AggregateExpression::FunctionCall {
+                name,
+                expr,
+                distinct: _,
+            } => {
+                let Expr::Var(var) = Expr::from(expr) else {
+                    // An aggregate over an expression would have to be
+                    // evaluated with SPARQL's semantics, which SQL does not
+                    // reproduce.
+                    return false;
+                };
+                let readable = self.key_is_readable(plan, input, &var);
+                match name {
+                    AggregateFunction::Count | AggregateFunction::Min | AggregateFunction::Max => {
+                        readable
+                    }
+                    AggregateFunction::Sum | AggregateFunction::Avg => {
+                        readable && numeric_column(&var)
+                    }
+                    AggregateFunction::GroupConcat { .. }
+                    | AggregateFunction::Sample
+                    | AggregateFunction::Custom(_) => false,
+                }
+            }
+        }
+    }
 }
 
-impl Rule for PushScalarCountGrouping<'_> {
+impl Rule for PushGrouping<'_> {
     fn name(&self) -> &'static str {
-        "push_scalar_count_grouping"
+        "push_grouping"
     }
 
     fn apply(&self, plan: &mut Plan) -> bool {
@@ -2259,112 +3012,151 @@ impl Rule for PushScalarCountGrouping<'_> {
                 input,
                 keys,
                 measures,
+                having,
             } = &plan.nodes[id].op
             else {
                 continue;
             };
             let (input, keys, measures) = (*input, keys.clone(), measures.clone());
+            if !having.is_empty() {
+                // Already pushed by an earlier application; nothing to do.
+                continue;
+            }
 
             if plan.nodes[input].executor != Executor::Sql {
                 continue;
             }
-            let [key] = keys.as_slice() else {
-                continue;
-            };
-            let [measure] = measures.as_slice() else {
-                continue;
-            };
-            if !matches!(
-                measure.aggregate,
-                AggregateExpression::CountSolutions { distinct: false }
-            ) {
+            if !keys
+                .iter()
+                .all(|key| self.key_is_readable(plan, input, key))
+            {
                 continue;
             }
-
-            // The key has to be a value an `Sql` scan below binds, and
-            // `Visible` answers both which one and how to read it.
-            //
-            // Two readings are keys. A `Column` is the scalar case. A
-            // `BoundElement` is one element of an array, and grouping on it is
-            // what SPARQL means by grouping on a multivalued slot: the fan-out
-            // below has already turned each value into its own solution, so
-            // the groups are values and the count is one per solution. That
-            // the unnest is below is not assumed -- `Visible` only reports
-            // `BoundElement` when it is, and the fifth invariant refuses a
-            // plan where it drifts above the grouping.
-            //
-            // `AnyElement` is not a key: it is a test over a record's array,
-            // and there is no single value to group by.
-            let visible = Visible::below(plan, input);
-            let Some(binding) = visible.slot_of(key) else {
-                continue;
-            };
-            if !matches!(
-                binding.reading,
-                SlotReading::Column | SlotReading::BoundElement
-            ) {
-                continue;
-            }
-            // Resolvable as a column, or the lowering could not render it.
-            let Some(class_uri) = visible.class_of_star.get(&binding.star_var) else {
-                continue;
-            };
-            if crate::sparql_scoper::push_form_of_path(self.schema, class_uri, &binding.path)
-                == crate::sparql_scoper::PushForm::Tagged
+            if !measures
+                .iter()
+                .all(|measure| self.measure_is_renderable(plan, input, measure))
             {
                 continue;
             }
 
-            // What sits above: an optional alias for the measure, then the
-            // query's own projection, and nothing else.
-            let Some(shape) = grouping_tail(plan, id, &measure.var) else {
+            // What sits above, all of it or nothing.
+            let Some(tail) = grouping_tail(plan, id, &measures) else {
                 continue;
             };
-            push_grouping(plan, id, shape);
+            // Every `HAVING` conjunct and every ordering term has to name a
+            // column of the grouped result -- a key or a measure -- or the
+            // statement cannot state it.
+            let named = |name: &str, aliases: &[(NodeId, String, String)]| -> bool {
+                let resolved = aliases
+                    .iter()
+                    .find(|(_, _, alias)| alias == name)
+                    .map(|(_, measure, _)| measure.as_str())
+                    .unwrap_or(name);
+                measures
+                    .iter()
+                    .any(|measure| measure.var == resolved || measure.var == name)
+                    || keys.iter().any(|key| key == name)
+            };
+            if !tail.having.iter().all(|(_, condition)| {
+                having_names(condition).is_some_and(|name| named(&name, &tail.aliases))
+            }) {
+                continue;
+            }
+            if !tail.sorts.iter().all(|(_, terms)| {
+                terms.iter().all(|term| match &term.expr {
+                    Expr::Var(name) => named(name, &tail.aliases),
+                    _ => false,
+                })
+            }) {
+                continue;
+            }
+
+            push_grouping(plan, id, tail);
             return true;
         }
         false
     }
 }
 
+/// The variable a `HAVING` conjunct compares, when it is a comparison of one
+/// column of the grouped result against one constant.
+///
+/// The shape check only. Whether the *constant* is one SQL can compare against
+/// that column is the lowering's question, because it needs the term the
+/// measure produces -- and asking it in one place is what keeps a `HAVING` and
+/// a `WHERE` held to one rule.
+fn having_names(condition: &Expr) -> Option<String> {
+    let (left, right) = match condition {
+        Expr::Compare { left, right, .. } => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    match (left, right) {
+        (Expr::Var(name), Expr::Literal(_)) | (Expr::Literal(_), Expr::Var(name)) => {
+            Some(name.clone())
+        }
+        _ => None,
+    }
+}
+
 /// The nodes above a grouping that this rule takes with it.
 struct GroupingTail {
-    /// The `Bind` that names the aggregate, when the query wrote `AS ?n`.
-    alias: Option<(NodeId, String)>,
-    project: NodeId,
+    /// `(node, measure variable, the name the query gave it)`.
+    aliases: Vec<(NodeId, String, String)>,
+    /// Filter nodes to become `HAVING` conjuncts.
+    having: Vec<(NodeId, Expr)>,
+    /// Sort nodes, for the ordering terms they carry.
+    sorts: Vec<(NodeId, Vec<SortTerm>)>,
+    /// Every node from the grouping to the root, in order. The aliases among
+    /// them disappear; the rest turn `Sql`.
+    chain: Vec<NodeId>,
 }
 
 /// The shape above a grouping, when it is one this rule can push whole.
 ///
-/// `None` for anything else, and "anything else" is the point: an `ORDER BY`,
-/// a `LIMIT`, a `DISTINCT` or a second projection is collapsing or reordering
-/// work, and pushing the grouping under it would leave that work to an engine
-/// that cannot do it.
-fn grouping_tail(plan: &Plan, group: NodeId, measure_var: &str) -> Option<GroupingTail> {
+/// `None` for anything else, and "anything else" is the point: whatever this
+/// does not take stays with an engine that cannot finish a grouped query.
+fn grouping_tail(plan: &Plan, group: NodeId, measures: &[Measure]) -> Option<GroupingTail> {
+    let mut tail = GroupingTail {
+        aliases: Vec::new(),
+        having: Vec::new(),
+        sorts: Vec::new(),
+        chain: Vec::new(),
+    };
     let mut current = single_consumer(plan, group)?;
-    let mut alias = None;
-    if let PlanOp::Bind { var, expr, .. } = &plan.nodes[current].op {
-        // Only the rename spargebra emits for `(COUNT(*) AS ?n)`. A `BIND` of
-        // anything else computes a value, which SQL would have to evaluate.
-        if *expr != Expr::Var(measure_var.to_owned()) {
-            return None;
+    let mut projected = false;
+    loop {
+        match &plan.nodes[current].op {
+            PlanOp::Bind { var, expr, .. } => {
+                // Only the rename spargebra emits for `(COUNT(*) AS ?n)`. A
+                // `BIND` of anything else computes a value SQL would have to
+                // evaluate.
+                let Expr::Var(measure) = expr else {
+                    return None;
+                };
+                if !measures.iter().any(|spec| &spec.var == measure) {
+                    return None;
+                }
+                tail.aliases.push((current, measure.clone(), var.clone()));
+            }
+            PlanOp::Filter { condition, .. } => {
+                tail.having.push((current, condition.clone()));
+            }
+            PlanOp::Sort { terms, .. } => tail.sorts.push((current, terms.clone())),
+            PlanOp::Distinct { .. } | PlanOp::Reduced { .. } | PlanOp::Slice { .. } => {}
+            PlanOp::Project { .. } => projected = true,
+            // A sub-select, a shaping node, a second grouping: work the engine
+            // still has to do, so the grouping cannot be the answer.
+            _ => return None,
         }
-        alias = Some((current, var.clone()));
+        tail.chain.push(current);
+        if current == plan.nodes.len() - 1 {
+            break;
+        }
         current = single_consumer(plan, current)?;
     }
-    if !matches!(plan.nodes[current].op, PlanOp::Project { .. }) {
-        return None;
-    }
-    // The projection is the top: a node above it is a shaping node
-    // (`CONSTRUCT`, `ASK`) or a modifier this rule does not push, and either
-    // way the grouping would be feeding something the engine still does.
-    if current != plan.nodes.len() - 1 {
-        return None;
-    }
-    Some(GroupingTail {
-        alias,
-        project: current,
-    })
+    // A `SELECT` roots in its projection (possibly under a slice), and a plan
+    // with no projection at all is a shape this does not push.
+    projected.then_some(tail)
 }
 
 /// The one node that reads this one, when exactly one does.
@@ -2375,40 +3167,114 @@ fn single_consumer(plan: &Plan, node: NodeId) -> Option<NodeId> {
     }
 }
 
-/// Flip the grouping and its projection to `Sql`, folding the alias into the
-/// measure it names.
+/// Flip the grouping and its whole tail to `Sql`, folding the aliases into the
+/// measures they name and the filters into the grouping's `HAVING`.
 ///
-/// The alias node disappears: SQL names a result column, so a rename above the
+/// The alias nodes disappear: SQL names a result column, so a rename above the
 /// grouping is a fact about the grouping rather than a step after it -- and
-/// the lowering has no operator for a `Bind`. Its claims move to the grouping,
-/// though a naive `Bind` has none.
-fn push_grouping(plan: &mut Plan, group: NodeId, shape: GroupingTail) {
-    if let Some((_, alias)) = &shape.alias
-        && let PlanOp::Group { measures, .. } = &mut plan.nodes[group].op
-        && let [measure] = measures.as_mut_slice()
-    {
-        // Renamed here so the lowered measure carries the name the query gave
-        // it. Without this the result column is spargebra's internal hash,
-        // which is not an answer anyone asked for.
-        measure.var = alias.clone();
+/// the lowering has no operator for a `Bind`. The filters disappear for the
+/// same reason: a `HAVING` is a clause of the grouping, not an operator above
+/// it. Their claims move to the grouping, which is what now takes care of
+/// them.
+fn push_grouping(plan: &mut Plan, group: NodeId, tail: GroupingTail) {
+    for (_, measure, alias) in &tail.aliases {
+        if let PlanOp::Group { measures, .. } = &mut plan.nodes[group].op
+            && let Some(spec) = measures.iter_mut().find(|spec| &spec.var == measure)
+        {
+            // Renamed here so the lowered measure carries the name the query
+            // gave it; without this the result column is spargebra's internal
+            // hash.
+            spec.var = alias.clone();
+        }
     }
-    plan.nodes[group].executor = Executor::Sql;
-    plan.nodes[shape.project].executor = Executor::Sql;
-
-    let Some((alias_node, _)) = shape.alias else {
-        return;
+    // Every reference to a renamed measure moves with the rename. The alias
+    // node is gone, so a `HAVING` or an `ORDER BY` still naming spargebra's
+    // internal variable would name a column the statement does not have --
+    // which is how `ORDER BY DESC(COUNT(*))` beside `(COUNT(*) AS ?n)` came
+    // out unrenderable rather than sorted.
+    let renamed = |expr: &Expr| -> Expr {
+        let mut out = expr.clone();
+        for (_, measure, alias) in &tail.aliases {
+            out = out.rename_var(measure, alias);
+        }
+        out
     };
-    let mut claims = plan.nodes[alias_node].discharges.clone();
-    claims.sort_unstable();
+    for node in &tail.chain {
+        if let PlanOp::Sort { terms, .. } = &mut plan.nodes[*node].op {
+            for term in terms.iter_mut() {
+                term.expr = {
+                    let mut out = term.expr.clone();
+                    for (_, measure, alias) in &tail.aliases {
+                        out = out.rename_var(measure, alias);
+                    }
+                    out
+                };
+            }
+        }
+    }
+    // A condition on a *group key* is a condition on the column the key
+    // reads, and it belongs below the grouping rather than after it: SQL says
+    // the same thing either way, but a `WHERE` narrows before the grouping
+    // does its work and a `HAVING` after. Today's planner extracts these, so
+    // sinking them is also what keeps the two statements comparable -- a
+    // condition the comparator finds in one plan and not the other is a
+    // difference whether or not it changes the answer.
+    //
+    // A condition on a measure cannot sink: there is no row to test it
+    // against until the rows are grouped. That one stays a `HAVING`.
+    let input = plan.nodes[group].op.inputs()[0];
+    let visible = Visible::below(plan, input);
+    let mut sinks: Vec<(Vec<ObligationId>, Expr)> = Vec::new();
+    let mut conditions: Vec<Expr> = Vec::new();
+    for (node, condition) in &tail.having {
+        let condition = renamed(condition);
+        match sinkable(&visible, &condition) {
+            Some(sunk) => sinks.push((plan.nodes[*node].discharges.clone(), sunk)),
+            None => conditions.push(condition),
+        }
+    }
+    if let PlanOp::Group { having, .. } = &mut plan.nodes[group].op {
+        *having = conditions;
+    }
+
+    let sunk_claims: Vec<ObligationId> = sinks
+        .iter()
+        .flat_map(|(claims, _)| claims.iter().copied())
+        .collect();
+    let removed: Vec<NodeId> = tail
+        .aliases
+        .iter()
+        .map(|(node, _, _)| *node)
+        .chain(tail.having.iter().map(|(node, _)| *node))
+        .collect();
+    // The grouping takes the claims of the nodes that disappear into it --
+    // except the ones that go to a filter it sinks, which carries its own.
+    let mut claims: Vec<ObligationId> = Vec::new();
+    for node in &removed {
+        claims.extend(
+            plan.nodes[*node]
+                .discharges
+                .iter()
+                .copied()
+                .filter(|claim| !sunk_claims.contains(claim)),
+        );
+    }
     plan.nodes[group].discharges.extend(claims);
     plan.nodes[group].discharges.sort_unstable();
 
-    let input = plan.nodes[alias_node].op.inputs()[0];
-    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() - 1);
+    plan.nodes[group].executor = Executor::Sql;
+    for node in &tail.chain {
+        if !removed.contains(node) {
+            plan.nodes[*node].executor = Executor::Sql;
+        }
+    }
+
+    // Drop the nodes whose work is now a clause of the grouping.
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len());
     let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
     for (old, node) in plan.nodes.iter().enumerate() {
-        if old == alias_node {
-            remap[old] = remap[input];
+        if removed.contains(&old) {
+            remap[old] = remap[node.op.inputs()[0]];
             continue;
         }
         nodes.push(node.clone());
@@ -2420,17 +3286,163 @@ fn push_grouping(plan: &mut Plan, group: NodeId, shape: GroupingTail) {
     }
     plan.nodes = nodes;
     refresh_join_variables(plan);
+    // Below the grouping, which is now wherever the renumbering put it.
+    if !sinks.is_empty() {
+        let group = plan
+            .nodes
+            .iter()
+            .position(|node| matches!(node.op, PlanOp::Group { .. }))
+            .expect("the grouping this rule just pushed");
+        insert_filters_below(plan, group, sinks);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // The tier-one rule set
+// ---------------------------------------------------------------------------
+// Narrow the scan by a hop the engine keeps
+// ---------------------------------------------------------------------------
+
+/// A read the engine keeps still says the record *has* that slot, and the scan
+/// may check it.
+///
+/// The shape this is for is a property path: SPARQL translates `?s :a/:b ?m`
+/// into `?s :a _:v . _:v :b ?m`, and no rule folds either half -- the first
+/// binds a blank node rather than a variable, and the second is rooted at one.
+/// So the whole path stays with the engine, which is right, and the fetch was
+/// a full class scan, which is not: every solution needs the record to have
+/// `:a`, and `object_data ? 'a'` says so in the statement.
+///
+/// This rule therefore *adds* rather than moves: it claims nothing, removes
+/// nothing, and leaves the match where it is. The obligation is still the
+/// engine's, because the engine is still the only thing that answers the read
+/// -- an existence check is not an answer to `?s :a _:v`.
+///
+/// It is also the last place the two planners disagreed about the width of a
+/// fetch. Today's scoper reaches the same conclusion from the same triple,
+/// through `required_fields`; the comparator reported the difference as "?s
+/// would not require 'hasLocality', so the fetch is wider".
+///
+/// Two conditions, both about whether the check is a narrowing at all:
+///
+/// * the read has to hold of every answer -- inside an `OPTIONAL`, a `UNION`
+///   or the far side of a `MINUS` it does not, and
+///   [`applies_to_every_answer`] is that question;
+/// * the slot has to be one of the record's own, at depth one, because that
+///   is what an existence check on the payload can express.
+pub struct NarrowByAKeptHop<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> NarrowByAKeptHop<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for NarrowByAKeptHop<'_> {
+    fn name(&self) -> &'static str {
+        "narrow_by_a_kept_hop"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        let keys = const_subject_stars(plan);
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+                continue;
+            };
+            if is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(star), Some(predicate)) =
+                (subject_star(&keys, pattern), predicate_iri(pattern))
+            else {
+                continue;
+            };
+            let predicate = predicate.to_owned();
+            if !applies_to_every_answer(plan, id) {
+                continue;
+            }
+            let Some(scan) = sole_scan_of_star(plan, id, &star).or_else(|| {
+                // `sole_scan_of_star` refuses a scan that already carries an
+                // identity, which is the right answer for a rule that *adds*
+                // one and the wrong one here: an existence check is not an
+                // identity, and a query naming one record may still read a
+                // path off it.
+                scan_of_star(plan, &star)
+            }) else {
+                continue;
+            };
+            let PlanOp::Scan {
+                class_uri, slots, ..
+            } = &plan.nodes[scan].op
+            else {
+                continue;
+            };
+            let Ok(Some(class)) = self.schema.get_class_by_uri(class_uri) else {
+                continue;
+            };
+            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
+                continue;
+            };
+            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+                continue;
+            };
+            // Already known: either the read was folded (with its variable, so
+            // the check is there) or this rule has already run on it. A rule
+            // that keeps adding the same slot never reaches a fixpoint.
+            if slots.iter().any(|known| known.path == [slot.name.clone()]) {
+                continue;
+            }
+            // The identifier's existence check is structurally always true --
+            // every row has an identity -- so it narrows nothing. The
+            // lowering drops it for that reason, and adding it here would
+            // make the plan depend on whether this rule ran before the
+            // identity fold: `the_rule_order_does_not_decide_the_fixpoint`
+            // caught exactly that.
+            if class
+                .identifier_slot()
+                .is_some_and(|identifier| identifier.name == slot.name)
+            {
+                continue;
+            }
+            let multivalued =
+                on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue;
+            if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+                slots.push(ScanSlot {
+                    path: vec![slot.name.clone()],
+                    // No variable: the value is not delivered and nothing
+                    // above may read it. The engine answers the read; this
+                    // only narrows the rows it reads over.
+                    var: None,
+                    multivalued,
+                    presence: SlotPresence::Required,
+                });
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// The `Sql` scan of a star, wherever it is in the plan.
+fn scan_of_star(plan: &Plan, star: &str) -> Option<NodeId> {
+    plan.nodes.iter().position(|node| {
+        matches!(&node.op, PlanOp::Scan { star_var, .. } if star_var == star)
+            && node.executor == Executor::Sql
+    })
+}
+
 // ---------------------------------------------------------------------------
 
 /// Every rule, in the order 28d lists them: scope a type, fold a nested read
 /// into a path, deliver an optional read, turn a constant object into a
 /// filter, turn a `VALUES` over a bound variable into one, push a comparison,
 /// push a reference join, and -- the one that is not tier one --
-/// [`PushScalarCountGrouping`].
+/// [`PushGrouping`].
 ///
 /// The name is now half a lie and kept anyway: seven of the eight are
 /// non-collapsing, and the eighth is the first rule that takes the answer
@@ -2445,9 +3457,9 @@ fn push_grouping(plan: &mut Plan, group: NodeId, shape: GroupingTail) {
 ///
 /// The order is a preference and not a requirement: each rule is monotone --
 /// three of them remove a `match`, two turn an `Engine` node `Sql`, one adds a
-/// delivered slot to a scan, and none of them ever does the reverse -- so
-/// the
-/// driver reaches the same fixpoint from any order, and
+/// delivered slot to a scan, one adds an existence check to one, and none of
+/// them ever does the reverse -- so the driver reaches the same fixpoint from
+/// any order, and
 /// `the_rule_order_does_not_decide_the_fixpoint` holds it to that. What the
 /// order buys is rounds: a filter cannot push before the scan below it exists,
 /// so running the fold first reaches the fixpoint in fewer passes.
@@ -2457,19 +3469,20 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
         Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(DeliverOptionalRead::new(schema)),
         Box::new(AbsorbOptionalRead::new(schema)),
+        Box::new(FoldIdentityConstant::new(schema)),
         Box::new(ConstantObjectBecomesFilter::new(schema)),
         Box::new(ValuesBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
         Box::new(PushReferenceJoin::new(schema)),
         Box::new(PushLeftJoin::new(schema)),
-        Box::new(PushScalarCountGrouping::new(schema)),
+        Box::new(NarrowByAKeptHop::new(schema)),
+        Box::new(PushGrouping::new(schema)),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparql_plan::Obligation;
     use crate::sparql_refine::naive_plan_of;
     use crate::sparql_scoper::tests::test_schema_view;
 
@@ -3420,7 +4433,7 @@ mod tests {
     /// and the fifth invariant refuses that shape rather than trusting a rule
     /// to decline it, since any *bound* multivalued read owes an unnest.
     #[test]
-    fn a_delivered_array_does_not_fan_out() {
+    fn an_optional_array_is_absorbed_and_fans_out_optionally() {
         let schema = test_schema_view();
         let plan = refined(
             "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
@@ -3429,11 +4442,33 @@ mod tests {
             false,
         );
 
+        // The read is the scan's, bound to the variable, and optional.
         assert!(
-            scan_slots(&plan).contains(&("trafficKinds".to_owned(), String::new(), true)),
+            scan_slots(&plan).contains(&("trafficKinds".to_owned(), "k".to_owned(), true)),
             "{plan}"
         );
-        assert!(plan.find("unnest").is_empty(), "{plan}");
+        let PlanOp::Scan { slots, .. } = &plan.nodes[plan.find("scan")[0]].op else {
+            unreachable!()
+        };
+        let slot = slots
+            .iter()
+            .find(|slot| slot.path == ["trafficKinds".to_owned()])
+            .expect("the absorbed slot");
+        assert_eq!(slot.presence, SlotPresence::Optional, "{plan}");
+
+        // And the fan-out is optional too, which is the whole difficulty: a
+        // record with no kinds answers once with `?k` unbound, so the lateral
+        // has to be a `LEFT JOIN` -- a `CROSS JOIN` drops the record and the
+        // count comes out smaller with nothing to say it happened.
+        let unnests = plan.find("unnest");
+        let [unnest] = unnests.as_slice() else {
+            panic!("one fan-out, for the one collection read:\n{plan}");
+        };
+        let PlanOp::Unnest { presence, var, .. } = &plan.nodes[*unnest].op else {
+            unreachable!()
+        };
+        assert_eq!(*presence, SlotPresence::Optional, "{plan}");
+        assert_eq!(var, "k", "{plan}");
         plan.check()
             .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
         println!("{plan}");
@@ -3601,6 +4636,131 @@ mod tests {
         assert_eq!(plan.find("match").len(), 1, "{plan}");
         assert_eq!(plan.find("leftjoin").len(), 1, "{plan}");
         println!("{plan}");
+    }
+
+    /// The rule the application needed: identity folds onto the scan, so the
+    /// statement reads one record instead of a class.
+    ///
+    /// Both spellings, because the product's own form configs use both -- a
+    /// literal in the civil-engineering form, an IRI in the locality one --
+    /// and they carry the same URI.
+    #[test]
+    fn an_identifier_constant_folds_onto_the_scan() {
+        let schema = test_schema_view();
+        for object in ["\"u-1\"", "<https://data.infrabel.be/data/Signals/u-1>"] {
+            let plan = refined(
+                &format!(
+                    "SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:asset360_uri {object} ; \
+                     asset360:name ?nm }}"
+                ),
+                &schema,
+                false,
+            );
+
+            assert!(plan.find("match").is_empty(), "{object}\n{plan}");
+            assert!(plan.find("join").is_empty(), "{object}\n{plan}");
+            assert!(
+                plan.find("filter").is_empty(),
+                "identity is not a condition on a column:\n{plan}"
+            );
+            let PlanOp::Scan {
+                identifier_values,
+                slots,
+                ..
+            } = &plan.nodes[plan.find("scan")[0]].op
+            else {
+                panic!("{plan}");
+            };
+            assert_eq!(identifier_values.len(), 1, "{object}\n{plan}");
+            assert!(
+                identifier_values[0].ends_with("u-1"),
+                "the same URI either way: {identifier_values:?}"
+            );
+            // And no existence check for it: every record has an identity.
+            assert!(
+                !slots.iter().any(|slot| slot.path == ["asset360_uri"]),
+                "{plan}"
+            );
+            // The scan claims the triple, since it is what restricts the rows.
+            assert_eq!(
+                plan.nodes[plan.find("scan")[0]].discharges.len(),
+                3,
+                "{plan}"
+            );
+            plan.check()
+                .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+            println!("{plan}");
+        }
+    }
+
+    /// The two-star form the product actually sends: with identity folded, the
+    /// reference join has something to join *on*, and the plan is one
+    /// statement rather than two islands.
+    #[test]
+    fn identity_folded_lets_the_reference_join_push() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
+             asset360:locatedOnTrack ?t . ?t a asset360:Track ; asset360:hasName ?tn }",
+            &schema,
+            false,
+        );
+
+        assert_eq!(plan.find("scan").len(), 2, "{plan}");
+        assert_eq!(
+            plan.nodes[plan.find("join")[0]].executor,
+            Executor::Sql,
+            "the join pushes now that identity is on the scan:\n{plan}"
+        );
+        assert!(plan.find("match").is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// What the identity fold declines, and the answer each would break.
+    #[test]
+    fn what_the_identity_fold_declines() {
+        let schema = test_schema_view();
+        let identity_of = |query: &str| -> Vec<String> {
+            let plan = refined(query, &schema, false);
+            plan.nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    PlanOp::Scan {
+                        identifier_values, ..
+                    } => Some(identifier_values.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+
+        // Two identities is no record, and folding both as a set would ask for
+        // either and answer two. The second declines and the engine answers
+        // it -- correctly, with nothing.
+        assert_eq!(
+            identity_of(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"a\" ; \
+                 asset360:asset360_uri \"b\" }"
+            )
+            .len(),
+            1,
+            "one identity per scan"
+        );
+
+        // A constant on an ordinary slot is not identity.
+        assert!(
+            identity_of("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }")
+                .is_empty()
+        );
+
+        // Identity inside an `OPTIONAL` does not restrict the preserved side.
+        assert!(
+            identity_of(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+                 OPTIONAL { ?s asset360:asset360_uri \"a\" } }"
+            )
+            .is_empty()
+        );
     }
 
     /// What the rule is for: a constant object is a value constraint, so it
@@ -4342,57 +5502,6 @@ mod tests {
         refine_naive(&plan_of(query), schema, reverse)
     }
 
-    /// What today's planner's SQL pass claims, as obligation *text*.
-    ///
-    /// Text and not ids: the two planners enumerate the same obligations, but
-    /// a comparison by id would pass for the wrong reason if either ever
-    /// reordered them.
-    ///
-    /// `None` when today's planner refuses the query outright, which is not a
-    /// parity failure -- there is nothing to be at parity with.
-    fn claimed_by_sql_today(query: &str, schema: &SchemaView) -> Option<Vec<String>> {
-        let plan = crate::sparql_plan::plan_query(&format!("{PREFIX}{query}"), schema).ok()?;
-        Some(
-            plan.passes
-                .iter()
-                .filter(|pass| matches!(pass.kind, crate::sparql_plan::PassKind::Sql(_)))
-                .flat_map(|pass| pass.discharges.iter())
-                .filter(|id| tier_one_shaped(&plan.obligations[**id]))
-                .map(|id| plan.obligations[*id].to_string())
-                .collect(),
-        )
-    }
-
-    /// Whether an obligation is one tier one could take care of at all.
-    ///
-    /// A grouping, an ordering, a slice and a `DISTINCT` all *collapse or
-    /// reorder rows*, and every rule here is non-collapsing by construction --
-    /// the engine leg re-runs the query, which is what makes a partial push
-    /// correct, and it cannot re-run one over rows that are already
-    /// aggregates. So today's eligible route claims them in SQL and the
-    /// refined plan does not, and that difference is tier two rather than a
-    /// regression. Comparing them would only assert that tier two is unbuilt.
-    fn tier_one_shaped(obligation: &Obligation) -> bool {
-        matches!(
-            obligation,
-            Obligation::Type { .. }
-                | Obligation::Triple { .. }
-                | Obligation::Filter { .. }
-                | Obligation::Values { .. }
-        )
-    }
-
-    /// The obligations the refined plan's `Sql` nodes claim, as text.
-    fn claimed_by_sql_refined(plan: &Plan) -> Vec<String> {
-        plan.nodes
-            .iter()
-            .filter(|node| node.executor == Executor::Sql)
-            .flat_map(|node| node.discharges.iter())
-            .filter(|id| tier_one_shaped(&plan.obligations[**id]))
-            .map(|id| plan.obligations[*id].to_string())
-            .collect()
-    }
-
     /// The value conditions today's star decomposition pushes, as
     /// `?star.path <condition>`.
     ///
@@ -4456,6 +5565,44 @@ mod tests {
     /// itself is asserted by
     /// `a_comparison_on_a_multivalued_slot_is_pushed_as_the_element`.
     fn conditions_pushed_refined(plan: &Plan, schema: &SchemaView) -> Vec<String> {
+        // Identity, stated where both planners state it: on the scan. It is
+        // not a condition on a column -- the identifier is the record's URI in
+        // an indexed column -- so it is rendered into the same text the
+        // today-side helper builds from `Star::identifier_values`.
+        let mut identity: Vec<String> = plan
+            .nodes
+            .iter()
+            .filter(|node| node.executor == Executor::Sql)
+            .filter_map(|node| match &node.op {
+                PlanOp::Scan {
+                    star_var,
+                    class_uri,
+                    identifier_values,
+                    ..
+                } if !identifier_values.is_empty() => {
+                    let slot = schema
+                        .get_class_by_uri(class_uri)
+                        .ok()
+                        .flatten()
+                        .and_then(|class| class.identifier_slot().map(|slot| slot.name.clone()))
+                        .unwrap_or_default();
+                    let condition = if identifier_values.len() == 1 {
+                        crate::sparql_scoper::FilterCondition::Eq(identifier_values[0].clone())
+                    } else {
+                        crate::sparql_scoper::FilterCondition::In(identifier_values.clone())
+                    };
+                    Some(format!("?{star_var}.{slot} {condition}"))
+                }
+                _ => None,
+            })
+            .collect();
+        identity.extend(conditions_of_filters(plan, schema));
+        identity.sort();
+        identity
+    }
+
+    /// Every condition the plan's `Sql` filters render.
+    fn conditions_of_filters(plan: &Plan, schema: &SchemaView) -> Vec<String> {
         let classes: HashMap<String, String> = plan
             .nodes
             .iter()
@@ -4492,98 +5639,346 @@ mod tests {
                 ));
             }
         }
-        out.sort();
         out
     }
 
-    /// **The gate on stage 3.** Whatever today's SQL pass claims, the refined
-    /// plan's `Sql` nodes claim too -- and whatever conditions today's star
-    /// decomposition pushes, the refined plan pushes too.
+    /// **Whatever conditions the scoper's star decomposition pushes, the
+    /// refined plan pushes too.**
     ///
-    /// Stated as containment rather than equality, in that direction: the
-    /// refined plan legitimately claims *more* (a `VALUES` over a bound
-    /// variable, a filter today's ledger applies without claiming). Switching
-    /// the endpoint onto a planner that pushed *less* would regress answers or
-    /// lose pushdown, which is what this refuses to let happen quietly.
+    /// The half of the stage-3 gate that outlives the deleted planner. The
+    /// other half compared *claims* — what today's SQL pass said it enforced
+    /// against what the refined plan's `Sql` nodes say — and it went with the
+    /// planner it compared against, along with the `KNOWN_GAPS` list that
+    /// named the shapes where the two ledgers legitimately differed. Claims
+    /// were always the weaker check: two plans can claim the same thing and
+    /// read different rows, which is why the runtime gate ended up comparing
+    /// the row source and not the ledger.
     ///
-    /// Where parity is not reached, the gap is named below rather than
-    /// smoothed over: an entry in `KNOWN_GAPS` fails the test if it stops
-    /// being a gap, so the list cannot rot in either direction.
+    /// What is compared here is a *condition*, against the scoper — which is
+    /// still the analysis that decides which records a query reads, and is
+    /// not going anywhere. A refined plan that pushed less would fetch rows
+    /// the scoper knew it could exclude.
     #[test]
-    fn the_refined_plan_claims_everything_todays_sql_pass_claims() {
+    fn the_refined_plan_pushes_every_condition_the_scoper_pushes() {
         let schema = test_schema_view();
         for query in CORPUS {
-            let Some(today) = claimed_by_sql_today(query, &schema) else {
-                continue;
-            };
             let plan = refined(query, &schema, false);
-            let refined_claims = claimed_by_sql_refined(&plan);
-            let missing: Vec<&String> = today
-                .iter()
-                .filter(|claim| !refined_claims.contains(claim))
-                .collect();
-            let expected: Vec<&str> = KNOWN_GAPS
-                .iter()
-                .filter(|(gap_query, _)| gap_query == query)
-                .map(|(_, claim)| *claim)
-                .collect();
-            assert_eq!(
-                missing
-                    .iter()
-                    .map(|claim| claim.as_str())
-                    .collect::<Vec<_>>(),
-                expected,
-                "claim parity for {query}\n{plan}"
-            );
-
             let today_conditions = conditions_pushed_today(query, &schema);
             let refined_conditions = conditions_pushed_refined(&plan, &schema);
             for condition in &today_conditions {
                 assert!(
                     refined_conditions.contains(condition),
-                    "today pushes {condition} and the refined plan does not, for \
+                    "the scoper pushes {condition} and the refined plan does not, for \
                      {query}\n{plan}\nrefined pushes {refined_conditions:?}"
                 );
             }
         }
     }
 
-    /// Every claim today's SQL pass makes that the refined plan does not, with
-    /// why. One entry, and it is not a pushdown difference: it is a
-    /// disagreement about what claiming a triple *means*.
+    /// A condition on a group key sinks below the grouping; one on a measure
+    /// stays a `HAVING`.
     ///
-    /// A read inside an `OPTIONAL` reaches today's star as an
-    /// `optional_fields` entry: the prefetch delivers the column without an
-    /// existence check, and the pass claims the triple because the data
-    /// reaches oxigraph. The refined plan delivers the same column and does
-    /// not claim it, so the difference is in the ledger and not in the SQL.
+    /// Both halves are the same reasoning read in two directions. A key is a
+    /// column of every row, so the condition can be a `WHERE` -- and should
+    /// be, because it narrows before the grouping does its work. A measure has
+    /// no value until the rows are grouped, so it cannot.
     ///
-    /// **Two entries left, where there used to be one for every optional
-    /// read.** [`AbsorbOptionalRead`] closes the general case by giving the
-    /// delivered column its variable, at which point the scan answers the read
-    /// and the claim is its own -- the argument for keeping it unclaimed was
-    /// right about a column nothing binds, and the way to settle it was to
-    /// make the node answer rather than to keep arguing about the ledger.
+    /// It is also what keeps the two statements comparable: today's planner
+    /// extracts these, and a condition the comparator finds in one plan and
+    /// not the other is a difference whether or not it changes the answer.
+    #[test]
+    fn a_condition_on_a_group_key_sinks_below_the_grouping() {
+        let schema = test_schema_view();
+
+        let plan = refined(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm HAVING (?nm > \"S\")",
+            &schema,
+            false,
+        );
+        let filters = plan.find("filter");
+        let [filter] = filters.as_slice() else {
+            panic!("the condition is a filter now:\n{plan}");
+        };
+        let group = plan.find("group")[0];
+        assert!(*filter < group, "and it is below the grouping:\n{plan}");
+        assert_eq!(
+            plan.nodes[*filter].op.describe(),
+            "(?s.name > \"S\")",
+            "as a condition on the column the key reads:\n{plan}"
+        );
+        assert!(
+            plan.nodes[group].op.describe().contains("measures"),
+            "{plan}"
+        );
+        assert!(
+            !plan.nodes[group].op.describe().contains("having"),
+            "nothing is left for the HAVING:\n{plan}"
+        );
+
+        // Both at once: the key sinks, the measure stays.
+        let plan = refined(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm HAVING (?nm > \"S\" && COUNT(*) > 1)",
+            &schema,
+            false,
+        );
+        assert_eq!(plan.find("filter").len(), 1, "{plan}");
+        let group = plan.find("group")[0];
+        assert!(
+            plan.nodes[group].op.describe().contains("having=[(?n >"),
+            "the measure's condition is the grouping's:\n{plan}"
+        );
+
+        // And on a multivalued key, where the column is one element: the
+        // filter has to be above the fan-out, and read the element the
+        // fan-out bound rather than the record's array.
+        let plan = refined(
+            "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?k } GROUP BY ?k HAVING (?k > \"F\")",
+            &schema,
+            false,
+        );
+        let filter = plan.find("filter")[0];
+        let unnest = plan.find("unnest")[0];
+        assert!(unnest < filter, "above the fan-out:\n{plan}");
+        assert_eq!(
+            plan.nodes[filter].op.describe(),
+            "(?s.trafficKinds[each] > \"F\")",
+            "reading the element, not the array:\n{plan}"
+        );
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "{plan}"
+        );
+    }
+
+    /// A type read into a variable beside a constant one still scans the
+    /// class.
     ///
-    /// What remains is the two shapes absorption declines: a condition lifted
-    /// into the left join (which decides whether the *value* binds, not
-    /// whether the row survives) and a multivalued optional read (whose
-    /// fan-out would have to live inside the optional side). Both keep the
-    /// `match`, and the `match` keeps the claim.
-    const KNOWN_GAPS: &[(&str, &str)] = &[
-        (
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-             OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
-            "triple    ?s asset360:name ?nm",
-        ),
-        (
-            // The same gap, listed per query rather than folded in: a list of
-            // queries is what says whether the gap is one thing or several.
-            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-             OPTIONAL { ?s asset360:trafficKinds ?k } }",
-            "triple    ?s asset360:trafficKinds ?k",
-        ),
-    ];
+    /// `?s a ?t . ?s a :CivilEngineeringAsset` (the subclass roll-up) wants
+    /// every asset of that class, which is what the scan fetches; the engine
+    /// binds `?t` from the instance's own types. An *intersection* of two
+    /// constant classes is a different question and still declines -- a
+    /// statement holding one of them counts every instance of it.
+    #[test]
+    fn a_variable_type_beside_a_constant_one_still_scans_the_class() {
+        let schema = test_schema_view();
+
+        let plan = refined(
+            "SELECT ?t (COUNT(*) AS ?c) WHERE { ?s a ?t . ?s a asset360:Signal } \
+             GROUP BY ?t",
+            &schema,
+            false,
+        );
+        let scans = plan.find("scan");
+        assert_eq!(scans.len(), 1, "the class is scanned:\n{plan}");
+        assert_eq!(plan.nodes[scans[0]].executor, Executor::Sql, "{plan}");
+        // And the grouping is not pushed: `?t` is not a column any scan binds,
+        // so this is a fetch the engine groups -- which is today's plan for
+        // this query.
+        let group = plan.find("group")[0];
+        assert_eq!(plan.nodes[group].executor, Executor::Engine, "{plan}");
+
+        let plan = refined(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; a asset360:Track }",
+            &schema,
+            false,
+        );
+        assert!(
+            plan.find("scan").is_empty(),
+            "an intersection of classes is not a scan of one:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn probe2() {
+        let schema = test_schema_view();
+        for q in [
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; asset360:name ?n } GROUP BY ?n HAVING (?n > \"S\")",
+            "SELECT ?n (COUNT(*) AS ?c) WHERE { ?s a asset360:Signal ; asset360:name ?n } GROUP BY ?n HAVING (COUNT(*) >= 1 && ?n > \"S\")",
+        ] {
+            let plan = refined(q, &schema, false);
+            println!("--- {q}\n{plan}");
+        }
+    }
+
+    /// A hop the engine keeps still narrows the fetch.
+    ///
+    /// The property path is the shape: SPARQL translates `?s :a/:b ?m` into
+    /// `?s :a _:v . _:v :b ?m`, and no rule folds either half -- one binds a
+    /// blank node, the other is rooted at one -- so the engine answers the
+    /// path. It answers it over a full class scan, though, and every solution
+    /// needs the record to have `:a`. The check costs nothing and the claim
+    /// stays with the engine: an existence check is not an answer to the read.
+    #[test]
+    fn a_hop_the_engine_keeps_narrows_the_fetch() {
+        let schema = test_schema_view();
+
+        let plan = refined(
+            "SELECT ?m WHERE { ?s a asset360:Signal ; \
+             asset360:locatedOnTrack/asset360:hasName ?m }",
+            &schema,
+            false,
+        );
+        assert_eq!(
+            scan_slots(&plan),
+            vec![("locatedOnTrack".to_owned(), String::new(), false)],
+            "the first hop is required, and binds nothing:\n{plan}"
+        );
+        // The match is still there, and still the engine's: the statement
+        // narrowed, it did not answer.
+        let matches = plan.find("match");
+        assert_eq!(matches.len(), 2, "{plan}");
+        assert!(
+            matches
+                .iter()
+                .all(|id| plan.nodes[*id].executor == Executor::Engine),
+            "{plan}"
+        );
+        assert!(
+            plan.nodes[matches[0]].discharges.len() == 1,
+            "the read is still claimed by the node that answers it:\n{plan}"
+        );
+
+        // A multivalued slot read twice is a cross product the fold declines,
+        // and the record still has to have the slot.
+        let plan = refined(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?a ; \
+             asset360:trafficKinds ?b }",
+            &schema,
+            false,
+        );
+        assert_eq!(
+            scan_slots(&plan),
+            vec![("trafficKinds".to_owned(), String::new(), true)],
+            "{plan}"
+        );
+        assert!(
+            plan.find("unnest").is_empty(),
+            "a read that binds nothing needs no fan-out -- there is no \
+             multiplicity to restore:\n{plan}"
+        );
+
+        // And inside an `OPTIONAL` it narrows nothing: the record without the
+        // hop is an answer, with the value unbound.
+        let plan = refined(
+            "SELECT ?s ?m WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:locatedOnTrack/asset360:hasName ?m } }",
+            &schema,
+            false,
+        );
+        assert!(
+            scan_slots(&plan).is_empty(),
+            "an optional hop is not a requirement:\n{plan}"
+        );
+    }
+
+    /// Four spellings of "this one asset, by identifier", and one plan.
+    ///
+    /// The four are what the form configurations actually contain or are being
+    /// asked to move to, so the planner has to read all of them as one row
+    /// against the indexed identifier column rather than as a class scan the
+    /// engine narrows afterwards. The second is the *canonical* one and was
+    /// the one refinement did not handle -- which mattered more than the
+    /// others, because it is the spelling to migrate towards.
+    ///
+    /// A class scan plus an engine filter is not a wrong answer, which is why
+    /// only a test like this finds it: correct, and the wrong statement.
+    #[test]
+    fn every_spelling_of_one_asset_scans_one_row() {
+        let schema = test_schema_view();
+        let uri = "https://data.infrabel.be/asset360/sig-1";
+        for (query, spelling) in [
+            (
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+                 asset360:asset360_uri \"https://data.infrabel.be/asset360/sig-1\" }",
+                "the identifier slot, which is what the configurations send today",
+            ),
+            (
+                "SELECT ?nm WHERE { <https://data.infrabel.be/asset360/sig-1> \
+                 a asset360:Signal ; asset360:name ?nm }",
+                "a constant subject, which is canonical",
+            ),
+            (
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 VALUES ?s { <https://data.infrabel.be/asset360/sig-1> } }",
+                "a VALUES over the subject",
+            ),
+            (
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?s = <https://data.infrabel.be/asset360/sig-1>) }",
+                "an equality filter on the subject",
+            ),
+        ] {
+            let plan = refined(query, &schema, false);
+            let scans = plan.find("scan");
+            let [scan] = scans.as_slice() else {
+                panic!("{spelling}: one scan, not {}\n{plan}", scans.len());
+            };
+            let PlanOp::Scan {
+                identifier_values, ..
+            } = &plan.nodes[*scan].op
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                identifier_values,
+                &vec![uri.to_owned()],
+                "{spelling}: the identity is the scan's:\n{plan}"
+            );
+            // And nothing is left holding it: a constraint the scan applies
+            // and a node above re-applies would be the same row test twice.
+            assert!(
+                plan.find("filter").is_empty() && plan.find("values").is_empty(),
+                "{spelling}: the constraint moved rather than being copied:\n{plan}"
+            );
+        }
+    }
+
+    /// What an identity fold on the star variable declines, and why each
+    /// refusal is a wrong answer prevented rather than a shape not reached.
+    #[test]
+    fn what_the_identity_fold_declines_on_a_star_variable() {
+        let schema = test_schema_view();
+        let folded = |query: &str| -> bool {
+            let plan = refined(query, &schema, false);
+            plan.find("scan").iter().any(|id| {
+                matches!(&plan.nodes[*id].op, PlanOp::Scan { identifier_values, .. }
+                    if !identifier_values.is_empty())
+            })
+        };
+
+        // A *literal* compared against a record's identity. In SPARQL an IRI
+        // is never equal to a literal, so the query has no solutions -- while
+        // a statement comparing that text against `asset360_uri` would find
+        // the row. The one way this fold could answer a question the query did
+        // not ask.
+        assert!(
+            !folded(
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm .                  FILTER(?s = \"https://data.infrabel.be/asset360/sig-1\") }"
+            ),
+            "a literal is not an IRI"
+        );
+
+        // Inside an `OPTIONAL`: the constraint decides whether the optional
+        // side matched, and folding it into the scan would delete the rows the
+        // left join exists to keep.
+        assert!(
+            !folded(
+                "SELECT ?nm ?tn WHERE { ?s a asset360:Signal ; asset360:name ?nm ;                  asset360:locatedOnTrack ?t . OPTIONAL { ?t a asset360:Track ;                  asset360:hasName ?tn .                  FILTER(?t = <https://data.infrabel.be/asset360/trk-1>) } }"
+            ),
+            "an identity inside an OPTIONAL is conditional"
+        );
+
+        // An inequality is not a set of identities.
+        assert!(
+            !folded(
+                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm .                  FILTER(?s != <https://data.infrabel.be/asset360/sig-1>) }"
+            ),
+            "an inequality on identity"
+        );
+    }
 
     /// The first collapsing rule: the grouping and the projection above it are
     /// SQL's, the alias the query wrote is on the measure, and the plan is
@@ -4688,24 +6083,40 @@ mod tests {
     /// If that changes, this test fails, which is the point: an ordering that
     /// reaches SQL through a rule has to carry the null placement with it.
     #[test]
-    fn an_ordering_never_reaches_sql_through_a_rule() {
+    fn an_ordering_reaches_sql_only_with_a_grouping() {
         let schema = test_schema_view();
-        for query in [
-            // Over an optional key, which is where the placement matters.
+        // No rule pushes an ordering on its own: below a grouping the rows SQL
+        // hands back are a fetch the engine re-sorts, and ordering them there
+        // would be work with no answer attached. The nullable key is where the
+        // placement would matter -- SPARQL sorts unbound before every bound
+        // value, Postgres defaults the other way -- and this is why that
+        // question only arises above a grouping.
+        let plan = refined(
             "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL { ?s asset360:name ?nm } } ORDER BY ?nm",
-            // And over a grouping, where the rule declines the whole shape.
+            &schema,
+            false,
+        );
+        assert!(
+            plan.find("sort")
+                .iter()
+                .all(|id| plan.nodes[*id].executor == Executor::Engine),
+            "an ordering with no grouping is the engine's:\n{plan}"
+        );
+
+        // Above one it is part of the collapse, and goes with it or not at
+        // all: an aggregate the engine cannot recompute, ordered by an engine
+        // that never saw it, is the partial collapse this design refuses.
+        let plan = refined(
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n)",
-        ] {
-            let plan = refined(query, &schema, false);
-            assert!(
-                plan.find("sort")
-                    .iter()
-                    .all(|id| plan.nodes[*id].executor == Executor::Engine),
-                "an ordering is the engine's: {query}\n{plan}"
-            );
-        }
+            &schema,
+            false,
+        );
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "the grouping takes its ordering with it:\n{plan}"
+        );
     }
 
     /// What the left-join rule declines, and the answer each would break.
@@ -4719,19 +6130,6 @@ mod tests {
                 .any(|id| plan.nodes[*id].executor == Executor::Sql)
         };
 
-        // A lifted condition decides whether the optional side *matched*: a
-        // signal whose track is named "A" is still an answer, with the name
-        // unbound. As a `WHERE` that row is deleted -- an inner join wearing a
-        // left join's clothes.
-        assert!(
-            !pushed(
-                "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-                 OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
-                 FILTER(?tn > \"A\") } }"
-            ),
-            "a lifted condition"
-        );
-
         // No reference between the two sides: the optional block is unrelated,
         // and joining unrelated row sets multiplies them.
         assert!(
@@ -4742,6 +6140,61 @@ mod tests {
             ),
             "no reference edge"
         );
+    }
+
+    /// A lifted condition goes to the engine, and the join still pushes.
+    ///
+    /// The condition decides whether the optional side *matched*, which is a
+    /// conditional binding and not a row test: as a `WHERE` it deletes the row
+    /// the join exists to keep, and this renderer has no `ON` clause to put it
+    /// in. So the plan gives the condition up -- to the residual, where an
+    /// obligation nobody claims is the engine's -- and keeps the join, which
+    /// is a left join that matches too generously and therefore fetches a
+    /// superset of the records the answer needs. That is today's statement for
+    /// this query, exactly.
+    ///
+    /// Giving it up rather than carrying it unrendered is the load-bearing
+    /// part: a plan that held a condition it does not apply would have to be
+    /// read carefully to be understood, and the ledger would say the work was
+    /// accounted for.
+    #[test]
+    fn a_lifted_condition_goes_to_the_engine_and_the_join_still_pushes() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
+             FILTER(?tn > \"A\") } }",
+            &schema,
+            false,
+        );
+        let leftjoin = plan.find("leftjoin")[0];
+        assert_eq!(plan.nodes[leftjoin].executor, Executor::Sql, "{plan}");
+        let PlanOp::LeftJoin { condition, .. } = &plan.nodes[leftjoin].op else {
+            unreachable!()
+        };
+        assert!(
+            condition.is_none(),
+            "the plan does not carry a condition it will not apply:\n{plan}"
+        );
+        assert!(
+            plan.nodes[leftjoin].discharges.is_empty(),
+            "and it claims nothing for it:\n{plan}"
+        );
+        assert_eq!(
+            plan.residual.len(),
+            1,
+            "the condition is unaccounted for, which is what the residual is \
+             for:\n{plan}"
+        );
+        assert!(
+            plan.obligations[plan.residual[0]]
+                .to_string()
+                .contains("(?tn > \"A\")"),
+            "{plan}"
+        );
+        // And the invariants hold, including the ledger: an obligation in the
+        // residual is claimed once, there.
+        plan.check().expect("the plan is well formed");
     }
 
     /// A condition inside the `OPTIONAL` is marked as belonging to the
@@ -4853,61 +6306,6 @@ mod tests {
             "a grouping over an engine filter"
         );
 
-        // `COUNT(?v)` must not count solutions where `?v` is unbound, and
-        // `COUNT(DISTINCT ?v)` counts values rather than solutions. Both are
-        // real shapes with their own reasoning.
-        assert!(
-            !grouped(
-                "SELECT ?nm (COUNT(?len) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm"
-            ),
-            "COUNT of a variable"
-        );
-        assert!(
-            !grouped(
-                "SELECT ?nm (COUNT(DISTINCT ?len) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm"
-            ),
-            "COUNT DISTINCT"
-        );
-
-        // More collapsing work above. Pushing the grouping under it would
-        // leave that work to an engine that cannot do it -- the partial
-        // collapse this design refuses to make possible.
-        for (query, why) in [
-            (
-                "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n)",
-                "an ordering above",
-            ),
-            (
-                "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm } GROUP BY ?nm LIMIT 3",
-                "a slice above",
-            ),
-            (
-                "SELECT DISTINCT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm } GROUP BY ?nm",
-                "a DISTINCT above",
-            ),
-        ] {
-            assert!(!grouped(query), "{why}");
-        }
-
-        // Two keys, and a bare aggregate with none: one key is what the
-        // renderer's column convention is written for here.
-        assert!(
-            !grouped(
-                "SELECT ?nm ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-                 asset360:name ?nm ; asset360:kind ?k } GROUP BY ?nm ?k"
-            ),
-            "two keys"
-        );
-        assert!(
-            !grouped("SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal }"),
-            "a bare aggregate groups nothing"
-        );
-
         // A measure over a value the plan cannot read as a column.
         assert!(
             !grouped(
@@ -4916,6 +6314,143 @@ mod tests {
             ),
             "an inlined structure is a blank node, not a column"
         );
+
+        // `COUNT(DISTINCT *)` counts distinct *solutions*, which `count(*)`
+        // does not. Today's renderer drops the distinct; refusing is better
+        // than copying that.
+        assert!(
+            !grouped(
+                "SELECT (COUNT(DISTINCT *) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm }"
+            ),
+            "COUNT(DISTINCT *)"
+        );
+
+        // Aggregates with no defined result order: the two routes could not be
+        // held to one answer, so neither planner offers one.
+        for (query, why) in [
+            (
+                "SELECT ?nm (GROUP_CONCAT(?k) AS ?ks) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:trafficKinds ?k } GROUP BY ?nm",
+                "GROUP_CONCAT has no defined order",
+            ),
+            (
+                "SELECT ?nm (SAMPLE(?k) AS ?k1) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:trafficKinds ?k } GROUP BY ?nm",
+                "SAMPLE picks arbitrarily",
+            ),
+        ] {
+            assert!(!grouped(query), "{why}");
+        }
+
+        // `SUM` and `AVG` over a column that is not a number would be a cast
+        // the query never asked for, and a total over text is not an answer.
+        assert!(
+            !grouped(
+                "SELECT ?k (SUM(?nm) AS ?t) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:trafficKinds ?k } GROUP BY ?k"
+            ),
+            "a sum over a text column"
+        );
+
+        // An aggregate over an expression, which SQL would have to evaluate
+        // with SPARQL's semantics rather than read.
+        assert!(
+            !grouped(
+                "SELECT ?k (SUM(?len + 1) AS ?t) WHERE { ?s a asset360:Signal ; \
+                 asset360:length ?len ; asset360:trafficKinds ?k } GROUP BY ?k"
+            ),
+            "an aggregate over an expression"
+        );
+
+        // A `BIND` above the grouping that is not the rename spargebra emits
+        // for an `AS`: computing a value is work, and the lowering has no
+        // operator for it.
+        assert!(
+            !grouped(
+                "SELECT ?nm (COUNT(*) AS ?n) (CONCAT(?nm, \"!\") AS ?tag) WHERE { \
+                 ?s a asset360:Signal ; asset360:name ?nm } GROUP BY ?nm"
+            ),
+            "a BIND above the grouping"
+        );
+    }
+
+    /// The surface the one collapsing rule now takes whole -- measures, key
+    /// arity, and the modifiers above.
+    ///
+    /// Each of these is the same rule, not a rule each. What makes them one
+    /// question is the standing decision behind the rule: whatever it does not
+    /// take stays with an engine that cannot finish a grouped query, so a
+    /// shape is pushed *entirely* or declined. The assertion is therefore not
+    /// "the grouping is SQL's" but "every node is", which is the only outcome
+    /// that answers the query.
+    #[test]
+    fn what_the_grouping_rule_takes_whole() {
+        let schema = test_schema_view();
+        for (query, what) in [
+            (
+                "SELECT ?nm (COUNT(?len) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm",
+                "COUNT of a variable, which counts the solutions where it is bound",
+            ),
+            (
+                "SELECT ?nm (COUNT(DISTINCT ?len) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:length ?len } GROUP BY ?nm",
+                "COUNT DISTINCT of a variable, which counts values",
+            ),
+            (
+                "SELECT ?nm (MIN(?len) AS ?lo) (MAX(?len) AS ?hi) WHERE { \
+                 ?s a asset360:Signal ; asset360:name ?nm ; asset360:length ?len } \
+                 GROUP BY ?nm",
+                "MIN and MAX, which hand back one of the column's own values",
+            ),
+            (
+                "SELECT ?nm (SUM(?len) AS ?t) (AVG(?len) AS ?a) WHERE { \
+                 ?s a asset360:Signal ; asset360:name ?nm ; asset360:length ?len } \
+                 GROUP BY ?nm",
+                "SUM and AVG over a numeric column",
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal }",
+                "a bare aggregate: no keys, one row",
+            ),
+            (
+                "SELECT ?nm ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm ; asset360:kind ?k } GROUP BY ?nm ?k",
+                "two keys",
+            ),
+            (
+                "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n) LIMIT 3",
+                "an ordering and a slice above",
+            ),
+            (
+                "SELECT DISTINCT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm } GROUP BY ?nm",
+                "a DISTINCT above",
+            ),
+            (
+                "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(COUNT(*))",
+                "an ordering over an aggregate the projection does not name",
+            ),
+            (
+                "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:trafficKinds ?k } GROUP BY ?k",
+                "a multivalued key, whose fan-out is below the grouping",
+            ),
+            (
+                "SELECT ?t (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:locatedOnTrack ?t . ?t a asset360:Track } GROUP BY ?t",
+                "a key that is a record's own identity",
+            ),
+        ] {
+            let plan = refined(query, &schema, false);
+            assert!(
+                plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+                "{what}:\n{plan}"
+            );
+        }
     }
 
     /// **Invariant, not argument.** A grouping over an engine node is refused
@@ -5232,7 +6767,7 @@ mod tests {
     /// operator is one SQL statement. The grouping itself is tier two and
     /// stays with the engine -- no rule here moves a collapsing operator.
     #[test]
-    fn without_the_regex_the_frontier_reaches_the_grouping() {
+    fn without_the_regex_the_frontier_reaches_the_top() {
         let schema = test_schema_view();
         let plan = refined(
             "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
@@ -5242,14 +6777,14 @@ mod tests {
             false,
         );
 
-        let group = plan.find("group")[0];
+        // The whole query: a filter, a fan-out, a grouping over an element,
+        // an ordering over the aggregate, a slice. Nothing is left for the
+        // engine, which is what a collapsing push has to achieve -- the same
+        // query with a `REGEX` stops at the filter and hands all of it back.
         assert!(
-            plan.nodes[..group]
-                .iter()
-                .all(|node| node.executor == Executor::Sql),
-            "everything below the grouping is SQL's:\n{plan}"
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "every node is SQL's:\n{plan}"
         );
-        assert_eq!(plan.nodes[group].executor, Executor::Engine, "{plan}");
         println!("{plan}");
     }
 
@@ -5296,6 +6831,7 @@ mod tests {
                         star_var: "s".to_owned(),
                         slot_path: vec!["name".to_owned()],
                         var: "nm".to_owned(),
+                        presence: SlotPresence::Required,
                     },
                     Vec::new(),
                 );

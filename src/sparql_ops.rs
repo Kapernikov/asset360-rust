@@ -31,7 +31,6 @@
 //! only be inferred by comparing two structures. [`Enforcement`] states it, so
 //! a rule can ask a node directly whether removing it would change the answer.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::sparql_plan::ObligationId;
@@ -299,29 +298,26 @@ pub struct OpTree {
     pub nodes: Vec<OpNode>,
 }
 
-/// Build the operator tree for an SQL pass.
+/// Build the operator tree for a *fetch*: the scoper's star decomposition,
+/// restated as nodes.
 ///
-/// Lowering, not planning: every decision was already made by the scoper and
-/// the pushdown analyser. This restates their result as nodes so a rewrite has
-/// something local to edit, and so the same result can be printed and compared
-/// as data.
+/// Lowering, not planning — the scoper made every decision here, and this
+/// states it as operators so the pass is fully described by its nodes and a
+/// consumer reading only operators fetches what the scoper said it should.
 ///
-/// `enforcing` says whether this pass answers the query or only narrows what an
-/// engine pass will decide, which fixes the [`Enforcement`] on every filter it
-/// emits — a distinction the two composite structures could only express by
-/// which pass claimed the obligation.
+/// **What it is not, any more.** It used to lower an eligible aggregate too:
+/// the deleted single-pass planner handed it a `SolutionSpec` and it emitted
+/// the grouping, the sort, the slice and the projection above the scan, with
+/// [`Enforcement::Enforces`] on the filters because that pass answered the
+/// query. Every statement that answers a query now comes from
+/// [`lower_refined`], so what is left narrows rows for an engine that decides:
+/// [`Enforcement::Narrows`], and no solution layer.
 pub fn lower_sql_pass(
     plan: &crate::sparql_scoper::QueryPlan,
-    solution: Option<&crate::sparql_pushdown::SolutionSpec>,
     discharges: &[ObligationId],
-    enforcing: bool,
 ) -> OpTree {
     let mut nodes: Vec<OpNode> = Vec::new();
-    let enforcement = if enforcing {
-        Enforcement::Enforces
-    } else {
-        Enforcement::Narrows
-    };
+    let enforcement = Enforcement::Narrows;
 
     // Scans, in the order the plan lists them, so a printed tree matches a
     // printed plan.
@@ -437,111 +433,35 @@ pub fn lower_sql_pass(
         current = Some(joined);
     }
 
-    let mut input = match current {
+    let input = match current {
         Some(id) => id,
         // No stars at all: nothing to lower, and the caller has already
         // refused a query with nothing scoped.
         None => return OpTree { nodes },
     };
 
-    if let Some(solution) = solution {
-        // Unnest before grouping: a multivalued binding must fan out first, or
-        // the count is one per record instead of one per value.
-        for binding in &solution.bindings {
-            let multivalued = binding
-                .containers
-                .iter()
-                .any(|container| *container != crate::sparql_pushdown::Container::Single);
-            if !multivalued {
-                continue;
-            }
-            nodes.push(OpNode {
-                op: Op::Unnest {
-                    input,
-                    star_var: binding.star_var.clone(),
-                    slot_path: binding.slot_path.clone(),
-                },
-                discharges: Vec::new(),
-            });
-            input = nodes.len() - 1;
-        }
+    // The rows are the product, and the claims are exactly the triples the
+    // scoper represented.
+    if let Some(last) = nodes.last_mut() {
+        last.discharges = discharges.to_vec();
+    }
 
+    // The fetch bound, when the scoper found one safe to apply. It is a
+    // *narrowing* and claims nothing: the engine still applies the query's
+    // own LIMIT and OFFSET, and this only spares the fetch from reading
+    // rows no answer could use. Represented as an operator so the fetch
+    // pass is fully described by its nodes -- otherwise a consumer reading
+    // only operators would fetch unbounded where the scoper said it need
+    // not.
+    if let Some(limit) = plan.sql_limit {
         nodes.push(OpNode {
-            op: Op::Group {
+            op: Op::Slice {
                 input,
-                bindings: solution.bindings.clone(),
-                keys: solution.group_keys.clone(),
-                measures: solution.measures.clone(),
-                having: solution.having.clone(),
-            },
-            // The claims sit here rather than spread over the nodes: the
-            // analyser decides eligibility for the pass as a whole, so
-            // attributing an obligation to a particular node would be a guess.
-            // A rewrite that splits this node inherits the job of splitting the
-            // claims with it.
-            discharges: discharges.to_vec(),
-        });
-        input = nodes.len() - 1;
-
-        if solution.distinct {
-            nodes.push(OpNode {
-                op: Op::Distinct { input },
-                discharges: Vec::new(),
-            });
-            input = nodes.len() - 1;
-        }
-        if !solution.order_by.is_empty() {
-            nodes.push(OpNode {
-                op: Op::Sort {
-                    input,
-                    terms: solution.order_by.clone(),
-                },
-                discharges: Vec::new(),
-            });
-            input = nodes.len() - 1;
-        }
-        if solution.limit.is_some() || solution.offset > 0 {
-            nodes.push(OpNode {
-                op: Op::Slice {
-                    input,
-                    limit: solution.limit,
-                    offset: solution.offset,
-                },
-                discharges: Vec::new(),
-            });
-            input = nodes.len() - 1;
-        }
-        nodes.push(OpNode {
-            op: Op::Project {
-                input,
-                vars: solution.projected.clone(),
+                limit: Some(limit),
+                offset: 0,
             },
             discharges: Vec::new(),
         });
-    } else {
-        // A scan feeding an engine pass: the rows are the product, and the
-        // claims are the triples the scoper represented.
-        if let Some(last) = nodes.last_mut() {
-            last.discharges = discharges.to_vec();
-        }
-
-        // The fetch bound, when the scoper found one safe to apply. It is a
-        // *narrowing* and claims nothing: the engine still applies the query's
-        // own LIMIT and OFFSET, and this only spares the fetch from reading
-        // rows no answer could use. Represented as an operator so the fetch
-        // pass is fully described by its nodes -- otherwise a consumer reading
-        // only operators would fetch unbounded where the scoper said it need
-        // not.
-        if let Some(limit) = plan.sql_limit {
-            nodes.push(OpNode {
-                op: Op::Slice {
-                    input,
-                    limit: Some(limit),
-                    offset: 0,
-                },
-                discharges: Vec::new(),
-            });
-        }
     }
 
     OpTree { nodes }
@@ -578,13 +498,57 @@ pub enum LoweringRefusal {
     /// not a row test: as a `WHERE` it deletes the row the join exists to
     /// keep, quietly and with a smaller answer.
     ///
-    /// `PushLeftJoin` declines the shape, and this is the second lock -- the
-    /// rule that forgets is the one this catches.
+    /// `PushLeftJoin` pushes the join and gives the condition up to the
+    /// residual, so no plan the rules build reaches here with one. This is the
+    /// second lock: the rule that starts carrying a condition it cannot apply
+    /// is the one this catches.
     PushedOptional { node: usize },
     /// A scan on the optional side of a left join. Same reason: the star is
     /// optional and this lowering would call it mandatory, which wraps its
     /// conditions the wrong way.
     OptionalScan { node: usize },
+    /// A row cap on the fetch tighter than the query's own `LIMIT` + `OFFSET`.
+    ///
+    /// The bound claims nothing, so no ledger notices it, and it is the one
+    /// narrowing that can drop an answer: the engine cannot find a solution in
+    /// a row the fetch did not return.
+    FetchBoundTooTight { bound: usize, demanded: usize },
+    /// A node claiming an obligation the work it renders does not discharge.
+    ///
+    /// Today this catches one shape: a scan claiming to scope a subject to a
+    /// class while scanning another. The clause is stated generally because
+    /// the *category* is what matters -- a ledger that balances says every
+    /// obligation is claimed once, and says nothing about whether the claimant
+    /// does the work.
+    ClaimWithoutTheWork { node: usize, claim: String },
+    /// A condition on a slot that holds several values, rendered as a
+    /// comparison against the column.
+    ///
+    /// The one defect this pipeline shipped, as a refusal: the array's text is
+    /// compared against the constant and nothing matches, so the query answers
+    /// empty while every ledger balances.
+    ConditionReadsACollection { node: usize, slot: String },
+    /// A statement that reads a whole class while the query fixes the
+    /// record's identity.
+    ///
+    /// **A comparator clause, promoted.** It was found by comparing against
+    /// the single-pass planner -- "?ce disagrees about identifier values: []
+    /// against [X]" -- on the query every form field in the product runs. It
+    /// needs no second plan to state: a `match` on the identifier slot with a
+    /// constant object, still unfolded above a scan of the same star, *is* the
+    /// difference between reading one record and reading the class.
+    IdentityUnfolded { node: usize },
+    /// A statement that would answer *alone* while resting on an identifier
+    /// restriction.
+    ///
+    /// The identifier is the subject IRI and the writer emits no triple for
+    /// it, so `?ce :id "X"` matches nothing in the graph: the engine's answer
+    /// to such a query is *empty*. A restriction on the identity column is
+    /// therefore a narrowing of a fetch and never an answer -- today's
+    /// aggregate route counts the record and reports one where the engine
+    /// reports none, which is the wrong answer this refusal exists to avoid
+    /// repeating.
+    IdentityIsNotATriple { node: usize },
 }
 
 impl fmt::Display for LoweringRefusal {
@@ -605,6 +569,33 @@ impl fmt::Display for LoweringRefusal {
                 f,
                 "n{node} pushes a left join whose lifted condition would have to \
                  be a conditional binding rather than a row test"
+            ),
+            Self::IdentityUnfolded { node } => write!(
+                f,
+                "n{node} reads a whole class while the query fixes the record's \
+                 identity, so the statement is wider than the question"
+            ),
+            Self::IdentityIsNotATriple { node } => write!(
+                f,
+                "n{node} rests on an identifier restriction, which narrows a fetch \
+                 but cannot answer alone: the writer emits no triple for an \
+                 identifier, so the engine's answer to such a query is empty"
+            ),
+            Self::FetchBoundTooTight { bound, demanded } => write!(
+                f,
+                "the fetch is capped at {bound} rows and the query asks for \
+                 {demanded}, so an answer could be in a row the statement never \
+                 returns"
+            ),
+            Self::ClaimWithoutTheWork { node, claim } => write!(
+                f,
+                "n{node} claims '{claim}' and renders nothing that discharges it"
+            ),
+            Self::ConditionReadsACollection { node, slot } => write!(
+                f,
+                "n{node} compares '{slot}' as a column, and that slot holds \
+                 several values -- the comparison would be against the array's \
+                 text and would match nothing"
             ),
             Self::OptionalScan { node } => write!(
                 f,
@@ -635,7 +626,7 @@ pub fn lower_refined(
     schema: &linkml_schemaview::schemaview::SchemaView,
     fetch_bound: Option<usize>,
 ) -> Result<OpTree, LoweringRefusal> {
-    use crate::sparql_refine::{Executor, PlanOp as RefinedOp, SlotPresence};
+    use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp, SlotPresence};
 
     let sql: Vec<usize> = (0..plan.nodes.len())
         .filter(|id| plan.nodes[*id].executor == Executor::Sql)
@@ -705,6 +696,42 @@ pub fn lower_refined(
         .flat_map(|right| (0..plan.nodes.len()).filter(move |id| plan.feeds(*id, right)))
         .collect();
 
+    // A statement must not read a whole class while the query names one
+    // record. This is the comparator clause that caught the identity blindness,
+    // stated on one plan: an unfolded identifier constant above a scan of the
+    // same star is the difference, and it is visible without anything to
+    // compare against.
+    for &id in &sql {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            identifier_values,
+            ..
+        } = &plan.nodes[id].op
+        else {
+            continue;
+        };
+        if !identifier_values.is_empty() {
+            continue;
+        }
+        let Some(identifier) = identifier_slot_of(schema, class_uri) else {
+            continue;
+        };
+        let unfolded = plan.nodes.iter().any(|node| {
+            let RefinedOp::Match { pattern } = &node.op else {
+                return false;
+            };
+            crate::sparql_refine::subject_variable(pattern) == Some(star_var.as_str())
+                && crate::sparql_refine::predicate_iri(pattern)
+                    .and_then(|iri| schema.get_slot_by_uri(iri).ok().flatten())
+                    .is_some_and(|slot| slot.name == identifier)
+                && !matches!(pattern.object, spargebra::term::TermPattern::Variable(_))
+        });
+        if unfolded {
+            return Err(LoweringRefusal::IdentityUnfolded { node: id });
+        }
+    }
+
     // A pass that answers the query enforces its filters; one that feeds the
     // engine only narrows. The refined plan says which by whether anything
     // above the frontier is left.
@@ -713,6 +740,22 @@ pub fn lower_refined(
     } else {
         Enforcement::Narrows
     };
+
+    // An identifier restriction narrows a fetch and cannot answer alone. The
+    // engine's answer to `?ce :id "X"` is *empty* -- the writer emits no
+    // triple for an identifier, because it is the subject IRI -- so a
+    // statement that both restricts the identity and answers on its own
+    // reports a record the query has no solution for. Today's aggregate route
+    // does exactly that (one where the engine says none); this is where the
+    // refined planner declines to.
+    if enforcement == Enforcement::Enforces
+        && let Some(id) = sql.iter().copied().find(|id| {
+            matches!(&plan.nodes[*id].op,
+                RefinedOp::Scan { identifier_values, .. } if !identifier_values.is_empty())
+        })
+    {
+        return Err(LoweringRefusal::IdentityIsNotATriple { node: id });
+    }
 
     // Which class each star was scanned as, for the conditions and for the
     // identifier hoist.
@@ -731,14 +774,20 @@ pub fn lower_refined(
 
     let mut nodes: Vec<OpNode> = Vec::with_capacity(sql.len());
     let mut remap: std::collections::HashMap<usize, OpId> = std::collections::HashMap::new();
+    // The columns a grouping produced, for the modifiers above it. An
+    // `ORDER BY` term names one of them, and only a grouping can say which
+    // index that is -- the refined plan names variables, and the renderer
+    // needs positions.
+    let mut grouped: Option<GroupedColumns> = None;
 
-    for id in sql {
+    for id in sql.iter().copied() {
         let node = &plan.nodes[id];
         match &node.op {
             RefinedOp::Scan {
                 star_var,
                 class_uri,
                 slots,
+                identifier_values,
             } => {
                 // Only a slot of the record itself is an existence check.
                 // A value further in is reached by walking into the column,
@@ -756,9 +805,10 @@ pub fn lower_refined(
                     op: Op::Scan {
                         star_var: star_var.clone(),
                         class_uri: class_uri.clone(),
-                        // Filled by the filters below: a constraint on the
-                        // identifier slot belongs against the indexed column.
-                        identifier_values: Vec::new(),
+                        // What the query fixed the identity to, plus anything
+                        // the filters below hoist here: both belong against
+                        // the indexed column rather than the JSONB payload.
+                        identifier_values: identifier_values.clone(),
                         required_slots: column_slots(SlotPresence::Required)
                             .into_iter()
                             // The identifier's existence check is structurally
@@ -780,9 +830,27 @@ pub fn lower_refined(
             RefinedOp::Unnest {
                 star_var,
                 slot_path,
+                presence,
                 ..
             } => {
                 let input = remap[&node.op.inputs()[0]];
+                // The fan-out and the slot it fans out must agree about
+                // whether a record with no elements survives. The renderer
+                // reads that from the *scan* -- an optional slot gets a `LEFT
+                // JOIN LATERAL`, a required one a `CROSS JOIN` -- so a plan
+                // whose unnest says one thing and whose slot says the other
+                // renders as whichever the scan said, silently. One of the two
+                // is then a lie, and there is no way to tell which.
+                let agrees = plan.nodes.iter().any(|below| {
+                    matches!(&below.op, RefinedOp::Scan { star_var: scan_star, slots, .. }
+                    if scan_star == star_var
+                        && slots.iter().any(|slot| {
+                            &slot.path == slot_path && slot.presence == *presence
+                        }))
+                });
+                if !agrees {
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                }
                 if enforcement == Enforcement::Narrows {
                     // A fan-out makes row count equal *solution* count, which
                     // only a pass that counts needs. This one hands rows to an
@@ -937,25 +1005,41 @@ pub fn lower_refined(
                     discharges: node.discharges.clone(),
                 });
             }
-            RefinedOp::Group { keys, measures, .. } => {
+            RefinedOp::Group {
+                keys,
+                measures,
+                having,
+                ..
+            } => {
                 let input = remap[&node.op.inputs()[0]];
                 // One binding per group key, resolved against the schema by
                 // the same function the single-pass planner uses -- the
                 // renderer needs the term descriptor and the containers, and
                 // deriving them here a second way is how two planners come to
                 // disagree about a column.
-                let mut bindings = Vec::with_capacity(keys.len());
+                //
+                // Keys first, so their indices are stable and low: the same
+                // order the single-pass planner builds, which is what lets the
+                // comparator compare two `HAVING` clauses term by term.
+                let mut bindings: Vec<crate::sparql_pushdown::BindingSpec> =
+                    Vec::with_capacity(keys.len());
                 for key in keys {
-                    let Some((star_var, class_uri, path)) = scanned_column(plan, key) else {
-                        return Err(LoweringRefusal::Unrenderable { node: id });
-                    };
-                    let Some(spec) = crate::sparql_pushdown::binding_spec(
-                        schema, &star_var, &class_uri, key, path,
-                    ) else {
-                        return Err(LoweringRefusal::Unrenderable { node: id });
-                    };
-                    bindings.push(spec);
+                    bind_column(plan, schema, key, &mut bindings)
+                        .ok_or(LoweringRefusal::Unrenderable { node: id })?;
                 }
+
+                // Then the measures, whose arguments are bindings too. Built
+                // before the fan-outs for the same reason: an index the
+                // comparator prints must not depend on how many arrays the
+                // statement had to unnest.
+                let mut lowered = Vec::with_capacity(measures.len());
+                for measure in measures {
+                    lowered.push(
+                        lower_measure(plan, schema, measure, &mut bindings)
+                            .ok_or(LoweringRefusal::Unrenderable { node: id })?,
+                    );
+                }
+
                 // Every fan-out below the grouping, as a binding.
                 //
                 // The two vocabularies say the same thing differently: the
@@ -987,9 +1071,9 @@ pub fn lower_refined(
                         .iter()
                         .any(|spec| spec.star_var == *star_var && spec.slot_path == *slot_path)
                     {
-                        // Already a key: the element the grouping keys on is
-                        // the same element the fan-out produces, and one
-                        // LATERAL is one fan-out.
+                        // Already a key or a measure's argument: the element
+                        // the grouping reads is the same element the fan-out
+                        // produces, and one LATERAL is one fan-out.
                         continue;
                     }
                     let Some(class_uri) = classes.get(star_var) else {
@@ -1007,37 +1091,82 @@ pub fn lower_refined(
                     bindings.push(spec);
                 }
 
-                let mut lowered = Vec::with_capacity(measures.len());
-                for measure in measures {
-                    // `COUNT(*)` only, which is what the rule pushes. Anything
-                    // else reaching here is a rule ahead of this lowering, and
-                    // a refusal is how it finds out.
-                    if !matches!(
-                        measure.aggregate,
-                        spargebra::algebra::AggregateExpression::CountSolutions { distinct: false }
-                    ) {
-                        return Err(LoweringRefusal::Unrenderable { node: id });
-                    }
-                    lowered.push(MeasureSpec {
-                        var: measure.var.clone(),
-                        func: crate::sparql_pushdown::Measure::Count {
-                            arg: None,
-                            distinct: false,
-                        },
-                    });
+                let group_keys: Vec<usize> = (0..keys.len()).collect();
+                let mut terms = Vec::with_capacity(having.len());
+                for condition in having {
+                    terms.push(
+                        lower_having(condition, &bindings, &lowered, &group_keys)
+                            .ok_or(LoweringRefusal::Unrenderable { node: id })?,
+                    );
                 }
+
+                grouped = Some(GroupedColumns {
+                    bindings: bindings.clone(),
+                    measures: lowered.clone(),
+                });
                 nodes.push(OpNode {
                     op: Op::Group {
                         input,
                         // The keys are the first bindings, in the order the
-                        // query grouped by; anything after them is a fan-out
-                        // the statement needs and the answer does not name.
-                        keys: (0..keys.len()).collect(),
+                        // query grouped by; anything after them is a measure's
+                        // argument or a fan-out the statement needs and the
+                        // answer does not name.
+                        keys: group_keys,
                         bindings,
                         measures: lowered,
-                        // No rule pushes a condition on grouped rows into a
-                        // refined plan; the single-pass planner renders those.
-                        having: Vec::new(),
+                        having: terms,
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Sort { terms, .. } => {
+                let input = remap[&node.op.inputs()[0]];
+                // An ordering is only renderable over a grouped result: it
+                // sorts columns of one, and the renderer places a term inside
+                // or outside the grouping by which kind of column it names.
+                // Below a grouping an ordering is the engine's -- the rows SQL
+                // hands back there are a fetch, not an answer.
+                let Some(columns) = &grouped else {
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                };
+                let mut lowered = Vec::with_capacity(terms.len());
+                for term in terms {
+                    let RefinedExpr::Var(name) = &term.expr else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    let Some(key) = columns.key_of(name) else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    lowered.push(crate::sparql_pushdown::OrderTerm {
+                        key,
+                        desc: term.desc,
+                    });
+                }
+                nodes.push(OpNode {
+                    op: Op::Sort {
+                        input,
+                        terms: lowered,
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Distinct { .. } | RefinedOp::Reduced { .. } => {
+                let input = remap[&node.op.inputs()[0]];
+                // `REDUCED` permits duplicate elimination without requiring
+                // it, so answering a `DISTINCT` satisfies it -- and this
+                // renderer has no third behaviour to offer.
+                nodes.push(OpNode {
+                    op: Op::Distinct { input },
+                    discharges: node.discharges.clone(),
+                });
+            }
+            RefinedOp::Slice { limit, offset, .. } => {
+                let input = remap[&node.op.inputs()[0]];
+                nodes.push(OpNode {
+                    op: Op::Slice {
+                        input,
+                        limit: *limit,
+                        offset: *offset,
                     },
                     discharges: node.discharges.clone(),
                 });
@@ -1089,7 +1218,180 @@ pub fn lower_refined(
         });
     }
 
-    Ok(OpTree { nodes })
+    // The other half of the same clause, asked of the plan because that is
+    // where the claims are attributed to nodes: a scan claiming to scope a
+    // subject to a class must be scanning that class. The comparator needed a
+    // second plan to say "?s is scanned as X rather than Y"; this needs none
+    // to say "this scan claims to scope ?s to Y and scans X".
+    for &id in &sql {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            identifier_values,
+            slots,
+            ..
+        } = &plan.nodes[id].op
+        else {
+            continue;
+        };
+        for claim in &plan.nodes[id].discharges {
+            let wrong = |claim: &crate::sparql_plan::Obligation| {
+                Err(LoweringRefusal::ClaimWithoutTheWork {
+                    node: id,
+                    claim: claim.to_string(),
+                })
+            };
+            match plan.obligations.get(*claim) {
+                Some(claim @ crate::sparql_plan::Obligation::Type { subject, class_iri }) => {
+                    // The obligation writes its subject as the query did: `?s`
+                    // for a variable, `<uri>` for a record the query named --
+                    // and a named record's star is the synthetic one, so the
+                    // identity is what matches, not the name.
+                    let scopes_the_subject = match subject.strip_prefix('?') {
+                        Some(variable) => variable == star_var,
+                        None => identifier_values
+                            .iter()
+                            .any(|value| subject.trim_matches(['<', '>']) == value),
+                    };
+                    if !scopes_the_subject || class_iri != class_uri {
+                        return wrong(claim);
+                    }
+                }
+                // **A scan claiming a read must make it.** The asymmetry:
+                // reading *more* than the query asked is a wider fetch and
+                // costs only time, while claiming a read the statement does
+                // not make means nobody makes it -- the engine was told this
+                // node answered it.
+                //
+                // Any position in any path: a nested read is claimed by the
+                // scan that folded it, and the predicate is then one hop of a
+                // longer address. The identifier is the exception the identity
+                // fold makes -- it becomes a value against the indexed column
+                // rather than a slot of the payload.
+                Some(claim @ crate::sparql_plan::Obligation::Triple { predicate, .. }) => {
+                    let slot = predicate
+                        .trim_matches(['<', '>'])
+                        .rsplit(['/', '#'])
+                        .next()
+                        .unwrap_or_default();
+                    let read = slots
+                        .iter()
+                        .any(|scanned| scanned.path.iter().any(|hop| hop == slot));
+                    let is_the_identity = identifier_slot_of(schema, class_uri)
+                        .is_some_and(|identifier| identifier == slot)
+                        && !identifier_values.is_empty();
+                    if !read && !is_the_identity {
+                        return wrong(claim);
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    // **A fetch bound must not be tighter than the query's own limit.** The
+    // other asymmetry, and the one with a wrong answer on the tight side: a
+    // looser bound costs a few rows of fetch, while a tighter one drops
+    // answers the engine would have found. It claims nothing, so no ledger
+    // notices.
+    //
+    // Promoted from the comparator clause that compared two bounds. The
+    // single-plan form is better than the comparison it replaces: it holds
+    // against the *query*, which is the thing that decides how many rows an
+    // answer can need, rather than against whatever the other planner
+    // happened to compute.
+    if let Some(bound) = fetch_bound {
+        let demanded = plan.obligations.iter().find_map(|obligation| {
+            match obligation {
+                crate::sparql_plan::Obligation::Slice { limit, offset } => {
+                    // No limit at all: every row may be needed, so no bound is
+                    // safe -- but the bound came from the scoper, which is the
+                    // analysis that owns that question, so this only checks
+                    // the arithmetic it did.
+                    limit.map(|limit| limit + offset)
+                }
+                _ => None,
+            }
+        });
+        if let Some(demanded) = demanded
+            && bound < demanded
+        {
+            return Err(LoweringRefusal::FetchBoundTooTight { bound, demanded });
+        }
+    }
+
+    let tree = OpTree { nodes };
+    claims_are_backed_by_rendered_work(&tree, schema)?;
+    Ok(tree)
+}
+
+/// **A comparator clause, promoted: claims backed by rendered work.**
+///
+/// A node that claims an obligation must render something that discharges it.
+/// Nothing checked that, and the one defect this pipeline shipped is exactly
+/// its violation: a filter claimed `?k = "m"` on a multivalued slot and
+/// rendered `object_data->>'trafficKinds' = 'm'`, which compares the array's
+/// text and matches nothing. The claim ledger balanced, the frontier was a
+/// cut, the comparator's *claims* agreed -- and the answer was empty.
+///
+/// Two clauses, both about a claim and the work behind it:
+///
+/// * **a condition on a collection must not read it as a column.** Whether a
+///   path holds several values is the schema's answer, asked here with the
+///   same function the single-pass planner asks (`path_multiplies`), so the
+///   two cannot disagree about a column. A `Column` reading of a multivalued
+///   path is the shipped bug, stated as a refusal.
+/// * **a scan claiming a `Type` obligation must scan that class.** The other
+///   half of a comparator clause, which needed a second plan to say
+///   "?s is scanned as X rather than Y" and needs none to say "this scan
+///   claims to scope ?s to Y and scans X".
+///
+/// It runs on the lowered tree rather than on the refined plan because the
+/// tree is what executes: a plan can be as truthful as it likes about work its
+/// lowering then renders differently.
+fn claims_are_backed_by_rendered_work(
+    tree: &OpTree,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+) -> Result<(), LoweringRefusal> {
+    let class_of_star: std::collections::HashMap<&str, &str> = tree
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Scan {
+                star_var,
+                class_uri,
+                ..
+            } => Some((star_var.as_str(), class_uri.as_str())),
+            _ => None,
+        })
+        .collect();
+
+    for (id, node) in tree.nodes.iter().enumerate() {
+        match &node.op {
+            Op::Filter {
+                star_var,
+                slot_path,
+                reading,
+                ..
+            } => {
+                let Some(class_uri) = class_of_star.get(star_var.as_str()) else {
+                    // A condition on a star this statement does not scan has
+                    // no column at all.
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                };
+                if *reading == SlotReading::Column
+                    && crate::sparql_pushdown::path_multiplies(schema, class_uri, slot_path)
+                {
+                    return Err(LoweringRefusal::ConditionReadsACollection {
+                        node: id,
+                        slot: slot_path.join("."),
+                    });
+                }
+            }
+            _ => continue,
+        }
+    }
+    Ok(())
 }
 
 /// The row cap a lowered pass carries, when it is the fetch bound.
@@ -1107,202 +1409,233 @@ pub fn fetch_bound_of(tree: &OpTree) -> Option<usize> {
     })
 }
 
-/// A scan's facts, for a comparison that does not depend on node order.
-struct ScanFacts {
-    class_uri: String,
-    identifier_values: Vec<String>,
-    required_slots: Vec<String>,
-    is_optional: bool,
-}
-
-fn scans_by_star(tree: &OpTree) -> BTreeMap<String, ScanFacts> {
-    tree.nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Scan {
-                star_var,
-                class_uri,
-                identifier_values,
-                required_slots,
-                is_optional,
-                ..
-            } => {
-                let mut identifier_values = identifier_values.clone();
-                identifier_values.sort();
-                let mut required_slots = required_slots.clone();
-                required_slots.sort();
-                Some((
-                    star_var.clone(),
-                    ScanFacts {
-                        class_uri: class_uri.clone(),
-                        identifier_values,
-                        required_slots,
-                        is_optional: *is_optional,
-                    },
-                ))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// Every condition a tree applies, as text a comparison can sort.
+/// The columns of a grouped result: its bindings and its measures, in the
+/// order the statement will list them.
 ///
-/// The reading and the numeric-ness are part of the identity: the same path
-/// and the same value read two different ways select different rows, which is
-/// the whole reason both facts are on the node.
-fn conditions_of(tree: &OpTree) -> Vec<String> {
-    let mut out: Vec<String> = tree
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Filter {
-                star_var,
-                slot_path,
-                condition,
-                numeric,
-                reading,
-                optional_side,
-                ..
-            } => Some(format!(
-                "?{star_var}.{} {condition} numeric={numeric} reading={reading} \
-                 optional={optional_side}",
-                slot_path.join(".")
-            )),
-            _ => None,
-        })
-        .collect();
-    out.sort();
-    out
+/// Held while lowering the nodes above a grouping, because an `ORDER BY` term
+/// or a `HAVING` names a variable and the renderer needs an index into one of
+/// these two lists. The refined plan states the same fact structurally -- the
+/// grouping is below -- and this is where that becomes a position.
+struct GroupedColumns {
+    bindings: Vec<crate::sparql_pushdown::BindingSpec>,
+    measures: Vec<crate::sparql_pushdown::MeasureSpec>,
 }
 
-fn joins_of(tree: &OpTree) -> Vec<String> {
-    let mut out: Vec<String> = tree
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Join {
-                left_star,
-                right_star,
-                right_slot,
-                kind,
-                ..
-            } => Some(format!("?{left_star} ?{right_star}.{right_slot} {kind:?}")),
-            _ => None,
-        })
-        .collect();
-    out.sort();
-    out
+impl GroupedColumns {
+    /// Which column of the grouped result a variable names.
+    ///
+    /// Measures first: an aggregate aliased to a name that also happens to be
+    /// a binding's is the aggregate, which is what SPARQL's scoping says --
+    /// the projected `?n` of `(COUNT(*) AS ?n)` is the count.
+    fn key_of(&self, var: &str) -> Option<crate::sparql_pushdown::OrderKey> {
+        if let Some(index) = self.measures.iter().position(|m| m.var == var) {
+            return Some(crate::sparql_pushdown::OrderKey::Measure(index));
+        }
+        self.bindings
+            .iter()
+            .position(|b| b.var == var)
+            .map(crate::sparql_pushdown::OrderKey::Binding)
+    }
 }
 
-fn fanouts_of(tree: &OpTree) -> Vec<String> {
-    let mut out: Vec<String> = tree
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Unnest {
-                star_var,
-                slot_path,
-                ..
-            } => Some(format!("?{star_var}.{}", slot_path.join("."))),
-            _ => None,
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-/// The operators that collapse or reorder rows, which is the work a fallback
-/// would hand back to the engine.
+/// Add a binding for the column a variable reads, or return the index of the
+/// one already there.
 ///
-/// A slice is here only when it claims an obligation: the query's own `LIMIT`
-/// is work, and the scoper's fetch bound is a narrowing compared separately.
-fn collapsing_of(tree: &OpTree) -> Vec<String> {
-    let mut out: Vec<String> = tree
-        .nodes
+/// Deduplicated by address rather than by name: a group key and an aggregate's
+/// argument that read the same slot of the same record are one column, and two
+/// bindings for it would make the renderer build two LATERALs over one array.
+fn bind_column(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    var: &str,
+    bindings: &mut Vec<crate::sparql_pushdown::BindingSpec>,
+) -> Option<usize> {
+    let (star_var, class_uri, path) = scanned_column(plan, var)?;
+    if let Some(index) = bindings
         .iter()
-        .filter_map(|node| match &node.op {
-            // A grouping's `HAVING` is work the grouping does, so it is part
-            // of what a fallback would hand back. Rendered into the key rather
-            // than counted, so a *different* condition is a difference too.
-            Op::Group { having, .. } => Some(format!(
-                "group having=[{}]",
-                having
-                    .iter()
-                    .map(|term| format!(
-                        "{}{} {} numeric={}",
-                        match term.key {
-                            crate::sparql_pushdown::OrderKey::Binding(_) => "c",
-                            crate::sparql_pushdown::OrderKey::Measure(_) => "m",
-                        },
-                        match term.key {
-                            crate::sparql_pushdown::OrderKey::Binding(index)
-                            | crate::sparql_pushdown::OrderKey::Measure(index) => index,
-                        },
-                        term.condition,
-                        term.numeric
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            Op::Sort { .. } | Op::Distinct { .. } | Op::Project { .. } => {
-                Some(node.op.kind().to_owned())
-            }
-            Op::Slice { .. } if !node.discharges.is_empty() => Some("slice".to_owned()),
-            _ => None,
-        })
-        .collect();
-    out.sort();
-    out
+        .position(|spec| spec.star_var == star_var && spec.slot_path == path)
+    {
+        return Some(index);
+    }
+    let spec = crate::sparql_pushdown::binding_spec(schema, &star_var, &class_uri, var, path)?;
+    bindings.push(spec);
+    Some(bindings.len() - 1)
 }
 
-/// The first element of `wanted` that `have` does not cover, counting
-/// duplicates.
-fn missing_from(wanted: &[String], have: &[String]) -> Option<String> {
-    let mut left: Vec<&String> = have.iter().collect();
-    for item in wanted {
-        match left.iter().position(|candidate| *candidate == item) {
-            Some(index) => {
-                left.remove(index);
-            }
-            None => return Some(item.clone()),
+/// One aggregate, with its argument bound as a column.
+///
+/// The vocabulary check is the rule's -- it declined everything this cannot
+/// render -- so a shape reaching here that this refuses is a rule ahead of the
+/// lowering, and the refusal is how it finds out.
+fn lower_measure(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    measure: &crate::sparql_refine::Measure,
+    bindings: &mut Vec<crate::sparql_pushdown::BindingSpec>,
+) -> Option<crate::sparql_pushdown::MeasureSpec> {
+    use crate::sparql_pushdown::Measure as Func;
+    use spargebra::algebra::{AggregateExpression, AggregateFunction};
+
+    let var = measure.var.clone();
+    match &measure.aggregate {
+        AggregateExpression::CountSolutions { distinct: false } => {
+            Some(crate::sparql_pushdown::MeasureSpec {
+                var,
+                func: Func::Count {
+                    arg: None,
+                    distinct: false,
+                },
+            })
+        }
+        // `COUNT(DISTINCT *)` counts distinct *solutions*, which `count(*)`
+        // does not; the rule declines it rather than let the renderer's
+        // approximation stand.
+        AggregateExpression::CountSolutions { distinct: true } => None,
+        AggregateExpression::FunctionCall {
+            name,
+            expr,
+            distinct,
+        } => {
+            let crate::sparql_refine::Expr::Var(arg_var) = crate::sparql_refine::Expr::from(expr)
+            else {
+                return None;
+            };
+            let arg = bind_column(plan, schema, &arg_var, bindings)?;
+            let func = match name {
+                AggregateFunction::Count => Func::Count {
+                    arg: Some(arg),
+                    distinct: *distinct,
+                },
+                // Checked here as well as in the rule, and deliberately: the
+                // descriptor is what the renderer casts on, so the fact that
+                // decides a cast and the fact that decides the push are the
+                // same fact.
+                AggregateFunction::Sum if bindings[arg].descriptor.numeric => Func::Sum { arg },
+                AggregateFunction::Avg if bindings[arg].descriptor.numeric => Func::Avg { arg },
+                AggregateFunction::Min => Func::Min { arg },
+                AggregateFunction::Max => Func::Max { arg },
+                _ => return None,
+            };
+            Some(crate::sparql_pushdown::MeasureSpec { var, func })
         }
     }
-    None
 }
 
-/// The star, class and path an `Sql` scan binds a variable to, when one binds
-/// it as a column of its own record.
+/// One `HAVING` conjunct as the renderer's term, or `None` when it is not a
+/// comparison of one column of the grouped result against a faithful
+/// constant.
 ///
-/// Deliberately narrow: a variable bound to an element of an array, or read
-/// without being required, is not a column a grouping can key on, and the
-/// rules decline those before the lowering sees them.
+/// The constant's fidelity is [`crate::sparql_pushdown::having_constant`],
+/// which the single-pass planner asks too: a `HAVING` on this route and a
+/// `HAVING` on that one are held to one notion of what SQL may compare.
+fn lower_having(
+    condition: &crate::sparql_refine::Expr,
+    bindings: &[crate::sparql_pushdown::BindingSpec],
+    measures: &[crate::sparql_pushdown::MeasureSpec],
+    group_keys: &[usize],
+) -> Option<crate::sparql_pushdown::HavingTerm> {
+    use crate::sparql_pushdown::{MeasureForm, OrderKey};
+    use crate::sparql_refine::Expr as RefinedExpr;
+
+    let crate::sparql_refine::Expr::Compare { op, left, right } = condition else {
+        return None;
+    };
+    // One side names a column, the other is a constant -- and a flipped
+    // spelling is the same question, so the operator flips with it. `!=` is
+    // absent for the reason a pushed `FILTER` leaves it out: SPARQL's
+    // inequality is false where SQL's `<>` is unknown, and they disagree about
+    // exactly the group whose aggregate is unbound.
+    let (name, term, op) = match (left.as_ref(), right.as_ref()) {
+        (RefinedExpr::Var(name), RefinedExpr::Literal(term)) => (name, term, *op),
+        (RefinedExpr::Literal(term), RefinedExpr::Var(name)) => (name, term, op.flipped()),
+        _ => return None,
+    };
+    // A literal, and not an IRI: the fidelity rule below is written for a
+    // literal's lexical form, and an aggregate compared against an IRI is a
+    // question this cannot ask.
+    let spargebra::term::Term::Literal(literal) = term else {
+        return None;
+    };
+
+    let (key, form) = if let Some(index) = measures.iter().position(|m| &m.var == name) {
+        (
+            OrderKey::Measure(index),
+            crate::sparql_pushdown::measure_form(&measures[index].func),
+        )
+    } else {
+        // Bound but neither grouped nor aggregated is no match: a grouped row
+        // has no single value for it, and SPARQL agrees -- outside a grouping
+        // the variable is not in scope.
+        let index = group_keys
+            .iter()
+            .copied()
+            .find(|index| &bindings[*index].var == name)?;
+        (OrderKey::Binding(index), MeasureForm::Column(index))
+    };
+
+    let (value, numeric) =
+        crate::sparql_pushdown::having_constant(&form, bindings, literal).ok()?;
+    // Through the same mapping a pushed `FILTER` uses, so a `HAVING` and a
+    // `WHERE` cannot come to mean different things by the same operator.
+    let condition = op.as_condition(value)?;
+    Some(crate::sparql_pushdown::HavingTerm {
+        key,
+        condition,
+        numeric,
+    })
+}
+
 fn scanned_column(
     plan: &crate::sparql_refine::Plan,
     var: &str,
 ) -> Option<(String, String, Vec<String>)> {
     use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
-    plan.nodes.iter().find_map(|node| {
-        let RefinedOp::Scan {
-            star_var,
-            class_uri,
-            slots,
-        } = &node.op
-        else {
-            return None;
-        };
-        if node.executor != Executor::Sql {
-            return None;
-        }
-        // Either presence: a group key may be a value the record need not
-        // have. That is the missing-value bucket -- the column reads `NULL`
-        // and the bucket is a group like any other -- and the existence check
-        // is what `presence` decides, which the scan carries separately.
-        slots
-            .iter()
-            .find(|slot| slot.var.as_deref() == Some(var))
-            .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
-    })
+    plan.nodes
+        .iter()
+        .find_map(|node| {
+            let RefinedOp::Scan {
+                star_var,
+                class_uri,
+                slots,
+                ..
+            } = &node.op
+            else {
+                return None;
+            };
+            if node.executor != Executor::Sql {
+                return None;
+            }
+            // Either presence: a group key may be a value the record need not
+            // have. That is the missing-value bucket -- the column reads `NULL`
+            // and the bucket is a group like any other -- and the existence check
+            // is what `presence` decides, which the scan carries separately.
+            slots
+                .iter()
+                .find(|slot| slot.var.as_deref() == Some(var))
+                .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
+        })
+        // Or the record's own identity. `GROUP BY ?t` over a scanned star groups
+        // by its URI, which the renderer reads from the identifier column at the
+        // empty path -- a column of the row rather than a value in its payload.
+        //
+        // Slots first, and that order is the resolution the rule used: a variable
+        // that is both some star's identity and another star's slot value is a
+        // value join, which `Visible` reports as ambiguous and the rule declines
+        // before reaching here.
+        .or_else(|| {
+            plan.nodes.iter().find_map(|node| {
+                let RefinedOp::Scan {
+                    star_var,
+                    class_uri,
+                    ..
+                } = &node.op
+                else {
+                    return None;
+                };
+                (node.executor == Executor::Sql && star_var == var)
+                    .then(|| (star_var.clone(), class_uri.clone(), Vec::new()))
+            })
+        })
 }
 
 /// The scan node for a star, in a tree being built.
@@ -1414,121 +1747,6 @@ impl OpTree {
         })
     }
 
-    /// Whether this tree fetches a row set no larger than `today`'s and leaves
-    /// no more work to the engine.
-    ///
-    /// **The question the switchover gate actually cares about.** The gate was
-    /// first written to compare *claims*, and for every tier-one rule the two
-    /// coincide -- a rule that pushes work claims what it pushed -- so the
-    /// difference did not show. They come apart on an `OPTIONAL` read: both
-    /// statements deliver the same column, the SQL is identical, nothing moved
-    /// to the engine, and the ledgers differ only because a narrowing scan
-    /// declines to claim optionality it does not render. Comparing claims
-    /// there rejects the *more truthful* plan for a difference that costs
-    /// nothing, so the comparand is the row source and the ledger stays out of
-    /// the decision.
-    ///
-    /// Decidable and conservative: every clause below either shows a
-    /// difference cannot make things worse, or refuses. `Ok(())` means it is
-    /// safe to switch; `Err` carries the reason for the caller's log.
-    ///
-    /// What "no worse" is made of, and why each direction:
-    ///
-    /// * **the same scans** -- same stars, same classes, same optionality.
-    ///   Scanning a different set of records is not a comparison this can
-    ///   reason about, so it refuses rather than guessing which is narrower.
-    /// * **at least today's existence checks.** More `object_data ? 'slot'`
-    ///   means fewer rows. Fewer means more, so today's must all be there.
-    /// * **at least today's conditions**, matched exactly -- path, condition,
-    ///   reading and numeric-ness. An extra condition narrows further, which
-    ///   is safe under the over-fetch contract; a missing one fetches rows
-    ///   today's statement excluded.
-    /// * **the same joins.** An inner join both narrows and adds a class to
-    ///   read, so neither direction is safely "no worse".
-    /// * **no new fan-out.** An `unnest` multiplies rows, so having one today
-    ///   lacks is worse by definition.
-    /// * **at least today's collapsing work** -- group, sort, distinct,
-    ///   project, and any slice that claims an obligation. Missing one means
-    ///   the engine does it instead, which is exactly the regression this
-    ///   refuses.
-    /// * **a fetch bound no looser than today's.** Losing it fetches every row
-    ///   of the class; `LIMIT 1` returning three rows is how that showed up
-    ///   the last time.
-    ///
-    /// `optional_slots` are deliberately not compared: they emit nothing. A
-    /// slot listed there suppresses an existence check it would not otherwise
-    /// have, so a difference in that list alone cannot change a row.
-    pub fn is_no_worse_than(&self, today: &OpTree) -> Result<(), String> {
-        let mine = scans_by_star(self);
-        let theirs = scans_by_star(today);
-        let stars = |scans: &BTreeMap<String, ScanFacts>| -> Vec<String> {
-            scans.keys().cloned().collect()
-        };
-        if stars(&mine) != stars(&theirs) {
-            return Err(format!(
-                "the two plans scan different stars: {:?} against {:?}",
-                stars(&mine),
-                stars(&theirs)
-            ));
-        }
-        for (star, today_scan) in &theirs {
-            let scan = &mine[star];
-            if scan.class_uri != today_scan.class_uri {
-                return Err(format!(
-                    "?{star} is scanned as {} rather than {}",
-                    scan.class_uri, today_scan.class_uri
-                ));
-            }
-            if scan.is_optional != today_scan.is_optional {
-                return Err(format!("?{star} disagrees about being optional"));
-            }
-            if scan.identifier_values != today_scan.identifier_values {
-                return Err(format!(
-                    "?{star} disagrees about identifier values: {:?} against {:?}",
-                    scan.identifier_values, today_scan.identifier_values
-                ));
-            }
-            if let Some(missing) = today_scan
-                .required_slots
-                .iter()
-                .find(|slot| !scan.required_slots.contains(slot))
-            {
-                return Err(format!(
-                    "?{star} would not require '{missing}', so the fetch is wider"
-                ));
-            }
-        }
-
-        if let Some(missing) = missing_from(&conditions_of(today), &conditions_of(self)) {
-            return Err(format!("the refined plan does not apply {missing}"));
-        }
-        if joins_of(self) != joins_of(today) {
-            return Err(format!(
-                "the two plans join differently: {:?} against {:?}",
-                joins_of(self),
-                joins_of(today)
-            ));
-        }
-        if let Some(extra) = missing_from(&fanouts_of(self), &fanouts_of(today)) {
-            return Err(format!(
-                "the refined plan fans out {extra}, which today does not"
-            ));
-        }
-        if let Some(missing) = missing_from(&collapsing_of(today), &collapsing_of(self)) {
-            return Err(format!("the refined plan leaves '{missing}' to the engine"));
-        }
-        match (fetch_bound_of(self), fetch_bound_of(today)) {
-            (_, None) => {}
-            (Some(mine), Some(theirs)) if mine <= theirs => {}
-            (mine, Some(theirs)) => {
-                return Err(format!(
-                    "the fetch bound is {mine:?} rather than {theirs:?}, so the fetch is wider"
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// Nodes of one kind, for a rule that looks for its own shape.
     pub fn find(&self, kind: &str) -> Vec<OpId> {
         self.nodes
@@ -1547,7 +1765,7 @@ impl OpTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparql_plan::{PassKind, plan_query};
+    use crate::sparql_plan::{PassKind, plan_query_refined};
     use crate::sparql_scoper::tests::test_schema_view;
     use linkml_schemaview::schemaview::SchemaView;
 
@@ -1556,7 +1774,7 @@ mod tests {
     /// Every SQL pass of a planned query, as (pass claims, operator tree).
     fn sql_passes(query: &str) -> Vec<(Vec<ObligationId>, OpTree)> {
         let sv = test_schema_view();
-        let plan = plan_query(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+        let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
         plan.passes
             .iter()
             .filter_map(|pass| match &pass.kind {
@@ -1595,122 +1813,6 @@ mod tests {
             assert!(tree.is_well_formed(), "{query}");
             assert!(!tree.nodes.is_empty(), "{query}");
         }
-    }
-
-    /// The refined plan and today's planner render the same statement.
-    ///
-    /// The gate that matters at this level: the operators are what
-    /// `sql_builder.py` reads, so two trees that agree node for node produce
-    /// the same SQL. Compared as *data* rather than as SQL text because the
-    /// renderer lives in Python -- `tests/test_ops_render.py` closes that half
-    /// by rendering both.
-    #[test]
-    fn the_two_planners_lower_to_the_same_row_set() {
-        let sv = test_schema_view();
-        for query in [
-            "SELECT ?s WHERE { ?s a asset360:Signal }",
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-             FILTER(?nm > \"A\") }",
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }",
-            "SELECT ?len WHERE { ?s a asset360:Signal ; asset360:length ?len . \
-             FILTER(?len >= 10) }",
-            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
-             FILTER(?k = \"m\") }",
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }",
-            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-             ?t a asset360:Track ; asset360:hasName ?tn }",
-            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
-             ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-             OPTIONAL { ?s asset360:name ?nm } }",
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u\" }",
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-             VALUES ?nm { \"a\" \"b\" } }",
-            // The first collapsing shape: a scalar key and a count. Its
-            // lowered statement has to be today's, node for node, because
-            // today's planner already pushes this grouping -- which is exactly
-            // why it is the shape to start with.
-            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-             asset360:name ?nm } GROUP BY ?nm",
-        ] {
-            let refined = lowered(query, &sv)
-                .unwrap_or_else(|refusal| panic!("{query} did not lower: {refusal}"));
-            let passes = sql_passes(query);
-            let [(_, today)] = passes.as_slice() else {
-                panic!("{query} does not have exactly one SQL pass today");
-            };
-            assert_eq!(
-                row_set(&refined),
-                row_set(today),
-                "the two planners disagree about the statement for {query}"
-            );
-        }
-    }
-
-    /// The row set as data: what a renderer reads out of the operators, with
-    /// the order of a star's own conditions normalised away.
-    ///
-    /// `Star::filters` is a `HashMap`, so today's lowering emits one star's
-    /// conditions in whatever order it iterates; the refined plan emits them
-    /// in the order the query wrote them. A conjunction of `WHERE` clauses
-    /// means the same thing either way, so the difference is not one to hold a
-    /// planner to.
-    fn row_set(tree: &OpTree) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut conditions: Vec<String> = Vec::new();
-        for node in &tree.nodes {
-            match &node.op {
-                Op::Scan {
-                    star_var,
-                    class_uri,
-                    identifier_values,
-                    required_slots,
-                    optional_slots,
-                    is_optional,
-                } => {
-                    let mut identifiers = identifier_values.clone();
-                    identifiers.sort();
-                    let mut required = required_slots.clone();
-                    required.sort();
-                    let mut optional = optional_slots.clone();
-                    optional.sort();
-                    out.push(format!(
-                        "scan ?{star_var} {class_uri} ids={identifiers:?} \
-                         req={required:?} opt={optional:?} optional={is_optional}"
-                    ));
-                }
-                Op::Filter {
-                    star_var,
-                    slot_path,
-                    condition,
-                    numeric,
-                    reading,
-                    ..
-                } => conditions.push(format!(
-                    "filter ?{star_var}.{} {condition} numeric={numeric} reading={reading}",
-                    slot_path.join(".")
-                )),
-                Op::Join {
-                    left_star,
-                    right_star,
-                    right_slot,
-                    kind,
-                    ..
-                } => out.push(format!(
-                    "join ?{left_star} ?{right_star}.{right_slot} {kind:?}"
-                )),
-                Op::Unnest {
-                    star_var,
-                    slot_path,
-                    ..
-                } => out.push(format!("unnest ?{star_var}.{}", slot_path.join("."))),
-                other => out.push(other.kind().to_owned()),
-            }
-        }
-        conditions.sort();
-        out.extend(conditions);
-        out
     }
 
     /// A narrowing pass drops the fan-out and weakens the element condition to
@@ -1761,147 +1863,6 @@ mod tests {
         assert_eq!(*enforcement, Enforcement::Narrows);
     }
 
-    /// The comparator, in both directions, on trees built by hand -- so what
-    /// counts as "worse" is stated rather than inferred from whichever
-    /// difference two planners happen to produce.
-    #[test]
-    fn the_gate_refuses_every_way_a_statement_can_be_worse() {
-        let scan = |required: &[&str], identifier: &[&str], optional: bool| OpNode {
-            op: Op::Scan {
-                star_var: "s".to_owned(),
-                class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
-                identifier_values: identifier.iter().map(|v| (*v).to_owned()).collect(),
-                required_slots: required.iter().map(|v| (*v).to_owned()).collect(),
-                optional_slots: Vec::new(),
-                is_optional: optional,
-            },
-            discharges: Vec::new(),
-        };
-        let filter = |reading: SlotReading| OpNode {
-            op: Op::Filter {
-                input: 0,
-                star_var: "s".to_owned(),
-                slot_path: vec!["name".to_owned()],
-                condition: FilterCondition::Eq("BX".to_owned()),
-                enforcement: Enforcement::Narrows,
-                numeric: false,
-                reading,
-                optional_side: false,
-            },
-            discharges: Vec::new(),
-        };
-        let slice = |limit: Option<usize>, claims: Vec<ObligationId>| OpNode {
-            op: Op::Slice {
-                input: 0,
-                limit,
-                offset: 0,
-            },
-            discharges: claims,
-        };
-        let tree = |nodes: Vec<OpNode>| OpTree { nodes };
-
-        let today = tree(vec![
-            scan(&["name"], &[], false),
-            filter(SlotReading::Column),
-        ]);
-        // The same statement is trivially no worse than itself.
-        today.is_no_worse_than(&today).unwrap();
-        // Narrowing further is fine: an extra condition costs rows the engine
-        // would have discarded, which is the over-fetch contract.
-        tree(vec![
-            scan(&["name", "kind"], &[], false),
-            filter(SlotReading::Column),
-            filter(SlotReading::Column),
-        ])
-        .is_no_worse_than(&today)
-        .unwrap();
-
-        for (worse, why) in [
-            (
-                tree(vec![scan(&["name"], &[], false)]),
-                "a condition today applies is missing",
-            ),
-            (
-                tree(vec![scan(&[], &[], false), filter(SlotReading::Column)]),
-                "an existence check today applies is missing",
-            ),
-            (
-                tree(vec![
-                    scan(&["name"], &["u"], false),
-                    filter(SlotReading::Column),
-                ]),
-                "the identifier values disagree",
-            ),
-            (
-                tree(vec![
-                    scan(&["name"], &[], true),
-                    filter(SlotReading::Column),
-                ]),
-                "the star's optionality disagrees",
-            ),
-            (
-                tree(vec![
-                    scan(&["name"], &[], false),
-                    filter(SlotReading::AnyElement),
-                ]),
-                "the same path read a different way selects different rows",
-            ),
-            (
-                tree(vec![
-                    scan(&["name"], &[], false),
-                    filter(SlotReading::Column),
-                    OpNode {
-                        op: Op::Unnest {
-                            input: 1,
-                            star_var: "s".to_owned(),
-                            slot_path: vec!["trafficKinds".to_owned()],
-                        },
-                        discharges: Vec::new(),
-                    },
-                ]),
-                "a fan-out today does not have multiplies rows",
-            ),
-        ] {
-            worse
-                .is_no_worse_than(&today)
-                .expect_err(&format!("should have refused: {why}"));
-        }
-
-        // Work handed back to the engine, and a fetch bound loosened: two
-        // shapes with their own clause, so they get their own baseline.
-        let grouping = tree(vec![
-            scan(&["name"], &[], false),
-            OpNode {
-                op: Op::Group {
-                    input: 0,
-                    bindings: Vec::new(),
-                    keys: Vec::new(),
-                    measures: Vec::new(),
-                    having: Vec::new(),
-                },
-                discharges: vec![0],
-            },
-        ]);
-        tree(vec![scan(&["name"], &[], false)])
-            .is_no_worse_than(&grouping)
-            .expect_err("dropping the grouping hands it back to the engine");
-
-        let bounded = tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())]);
-        tree(vec![scan(&[], &[], false)])
-            .is_no_worse_than(&bounded)
-            .expect_err("losing the fetch bound reads every row of the class");
-        tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())])
-            .is_no_worse_than(&bounded)
-            .unwrap();
-        // A tighter bound is narrower, which is not worse.
-        tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())])
-            .is_no_worse_than(&tree(vec![
-                scan(&[], &[], false),
-                slice(Some(5), Vec::new()),
-            ]))
-            .unwrap();
-    }
-
     /// A refined plan whose `Sql` nodes are two islands is a legal plan and
     /// not a statement, so the lowering refuses rather than rendering one of
     /// them and answering a narrower question.
@@ -1919,6 +1880,248 @@ mod tests {
         .expect_err("two islands must not lower");
         assert!(
             matches!(refusal, LoweringRefusal::SeveralIslands { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// **The wrong answer this refusal exists to prevent.** A statement that
+    /// restricts the identity and answers *alone* reports a record the query
+    /// has no solution for.
+    ///
+    /// The writer emits no triple for an identifier -- it is the subject IRI
+    /// -- so `?s :id "u"` matches nothing in the graph and the engine's answer
+    /// is empty. Today's aggregate route counts the record and reports one;
+    /// the refined planner declines to render such a statement at all, which
+    /// is why the grouping falls back to that route rather than repeating its
+    /// number from a second place.
+    #[test]
+    fn an_identity_restriction_cannot_answer_alone() {
+        let sv = test_schema_view();
+        // A fetch: identity narrows, the engine decides, and this is the whole
+        // point of the fold.
+        let fetch = lowered(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
+             asset360:name ?nm }",
+            &sv,
+        )
+        .expect("a narrowing fetch lowers");
+        let Op::Scan {
+            identifier_values, ..
+        } = &fetch.nodes[0].op
+        else {
+            panic!("the first node is the scan");
+        };
+        assert_eq!(identifier_values, &vec!["u-1".to_owned()]);
+
+        // A grouping over the same restriction would answer alone, so it does
+        // not lower.
+        let refusal = lowered(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:asset360_uri \"u-1\" ; asset360:name ?nm } GROUP BY ?nm",
+            &sv,
+        )
+        .expect_err("an identity restriction must not answer alone");
+        assert!(
+            matches!(refusal, LoweringRefusal::IdentityIsNotATriple { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// **The promoted clause: claims backed by rendered work.**
+    ///
+    /// Both halves, each sabotaged on a plan the rules actually built, because
+    /// a check nobody has broken deliberately is a check nobody knows the
+    /// strength of.
+    ///
+    /// The first half is the one defect this pipeline shipped: a condition on
+    /// a multivalued slot rendered as a comparison against the column, which
+    /// compares the array's text and matches nothing. Every ledger balanced
+    /// and the comparator's claims agreed; the answer was empty.
+    #[test]
+    fn a_claim_needs_the_work_behind_it() {
+        use crate::sparql_refine::{PlanOp as RefinedOp, SlotReading as Reading};
+
+        let sv = test_schema_view();
+
+        // A containment test on a collection, which the rules render as an
+        // element test.
+        let mut plan = refined_plan(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }",
+            &sv,
+        );
+        lower_refined(&plan, &sv, None).expect("as built, it lowers");
+        let filter = plan.find("filter")[0];
+        if let RefinedOp::Filter { condition, .. } = &mut plan.nodes[filter].op
+            && let crate::sparql_refine::Expr::Compare { left, .. } = condition
+            && let crate::sparql_refine::Expr::Slot { reading, .. } = left.as_mut()
+        {
+            *reading = Reading::Column;
+        }
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a column reading of a collection must not render");
+        assert!(
+            matches!(refusal, LoweringRefusal::ConditionReadsACollection { .. }),
+            "{refusal}"
+        );
+
+        // And a scan claiming to scope a subject to a class it does not scan.
+        let mut plan = refined_plan(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            &sv,
+        );
+        let scan = plan.find("scan")[0];
+        if let RefinedOp::Scan { class_uri, .. } = &mut plan.nodes[scan].op {
+            *class_uri = "https://data.infrabel.be/asset360/Track".to_owned();
+        }
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a scan must scan the class it claims to scope");
+        assert!(
+            matches!(refusal, LoweringRefusal::ClaimWithoutTheWork { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// **The asymmetries, as invariants on one plan.** Narrower is fine;
+    /// missing is not.
+    ///
+    /// The comparator's clause list was the accumulated definition of *worse*,
+    /// and each clause promoted here keeps the half of it that survives the
+    /// deletion. "Different is suspicious" does not survive — there will be
+    /// nothing to differ from — so what is kept is the direction: reading more
+    /// rows than the query needs costs time, and reading fewer than it needs
+    /// costs an answer.
+    #[test]
+    fn narrower_is_fine_and_missing_is_not() {
+        use crate::sparql_refine::PlanOp as RefinedOp;
+
+        let sv = test_schema_view();
+
+        // A read the scan claims and does not make. The claim is what makes it
+        // wrong: the engine was told this node answered it, so nobody does.
+        let mut plan = refined_plan(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            &sv,
+        );
+        let scan = plan.find("scan")[0];
+        if let RefinedOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+            slots.clear();
+        }
+        let refusal =
+            lower_refined(&plan, &sv, None).expect_err("a scan must make the reads it claims");
+        assert!(
+            matches!(refusal, LoweringRefusal::ClaimWithoutTheWork { .. }),
+            "{refusal}"
+        );
+
+        // A fetch bound tighter than the query's own limit. It claims nothing,
+        // so no ledger notices, and the engine cannot find a solution in a row
+        // the fetch never returned.
+        let plan = refined_plan(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
+             LIMIT 10 OFFSET 5",
+            &sv,
+        );
+        lower_refined(&plan, &sv, Some(15)).expect("exactly enough rows lowers");
+        lower_refined(&plan, &sv, Some(50)).expect("more than enough lowers too");
+        let refusal =
+            lower_refined(&plan, &sv, Some(14)).expect_err("one row short must not lower");
+        assert!(
+            matches!(refusal, LoweringRefusal::FetchBoundTooTight { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// A fan-out that disagrees with the slot it fans out does not lower.
+    ///
+    /// The renderer decides `LEFT` versus `CROSS JOIN LATERAL` from the
+    /// *scan*, so a plan whose unnest says optional and whose slot says
+    /// required renders as required, silently, and one of the two statements
+    /// is a lie with no way to tell which. Refusing is how the plan stays
+    /// readable as a description of what will run.
+    #[test]
+    fn a_fanout_that_disagrees_with_its_slot_does_not_lower() {
+        use crate::sparql_refine::{PlanOp as RefinedOp, SlotPresence};
+
+        let sv = test_schema_view();
+        let mut plan = refined_plan(
+            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             OPTIONAL { ?s asset360:trafficKinds ?k } }",
+            &sv,
+        );
+        // As built, the two agree and it lowers.
+        lower_refined(&plan, &sv, None).expect("an optional collection read lowers");
+
+        let unnest = plan.find("unnest")[0];
+        if let RefinedOp::Unnest { presence, .. } = &mut plan.nodes[unnest].op {
+            *presence = SlotPresence::Required;
+        }
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a fan-out that contradicts its slot must not render");
+        assert!(
+            matches!(refusal, LoweringRefusal::Unrenderable { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// **A comparator clause, promoted to a check on one plan.** A statement
+    /// that reads a whole class while the query fixes the identity is refused,
+    /// whether or not there is a second planner to compare against.
+    ///
+    /// This is the shape the comparator caught -- "?ce disagrees about
+    /// identifier values: [] against [X]" -- on the query every named source
+    /// in the product runs. Stating it here is what keeps the knowledge after
+    /// the comparator goes.
+    #[test]
+    fn a_statement_may_not_read_a_class_the_query_narrows_to_one_record() {
+        let sv = test_schema_view();
+        let mut plan = refined_plan(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
+             asset360:name ?nm }",
+            &sv,
+        );
+        // As the rules leave it, identity is folded and it lowers.
+        lower_refined(&plan, &sv, None).expect("folded identity lowers");
+
+        // Unfold it, as a planner blind to identity would leave it: the
+        // constant back as a `match`, the scan reading the class.
+        let scan = plan.find("scan")[0];
+        if let crate::sparql_refine::PlanOp::Scan {
+            identifier_values, ..
+        } = &mut plan.nodes[scan].op
+        {
+            identifier_values.clear();
+        }
+        let pattern = spargebra::term::TriplePattern {
+            subject: spargebra::term::TermPattern::Variable(
+                spargebra::term::Variable::new_unchecked("s"),
+            ),
+            predicate: spargebra::term::NamedNodePattern::NamedNode(
+                spargebra::term::NamedNode::new_unchecked(
+                    "https://data.infrabel.be/asset360/asset360_uri",
+                ),
+            ),
+            object: spargebra::term::TermPattern::Literal(
+                spargebra::term::Literal::new_simple_literal("u-1"),
+            ),
+        };
+        plan.nodes.insert(
+            scan + 1,
+            crate::sparql_refine::Node::engine(
+                crate::sparql_refine::PlanOp::Match {
+                    pattern: Box::new(pattern),
+                },
+                Vec::new(),
+            ),
+        );
+        for node in plan.nodes.iter_mut().skip(scan + 2) {
+            node.op
+                .map_inputs(|input| if input > scan { input + 1 } else { input });
+        }
+
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a class scan where the query names one record must not render");
+        assert!(
+            matches!(refusal, LoweringRefusal::IdentityUnfolded { .. }),
             "{refusal}"
         );
     }
@@ -1944,18 +2147,28 @@ mod tests {
             &sv,
         );
         let leftjoin = plan.find("leftjoin")[0];
+        // The rules push this join *without* the condition, which the engine
+        // then re-applies. Put the condition back, as a rule that had not
+        // thought about it would.
+        let condition = crate::sparql_refine::Expr::Compare {
+            op: crate::sparql_refine::CompareOp::Gt,
+            left: Box::new(crate::sparql_refine::Expr::Var("tn".to_owned())),
+            right: Box::new(crate::sparql_refine::Expr::Literal(
+                spargebra::term::Literal::new_simple_literal("A").into(),
+            )),
+        };
+        if let crate::sparql_refine::PlanOp::LeftJoin {
+            condition: slot, ..
+        } = &mut plan.nodes[leftjoin].op
+        {
+            *slot = Some(condition);
+        }
         assert_eq!(
             plan.nodes[leftjoin].executor,
-            crate::sparql_refine::Executor::Engine,
-            "the rule declines a lifted condition:\n{plan}"
+            crate::sparql_refine::Executor::Sql,
+            "the join itself is pushed:\n{plan}"
         );
 
-        // Push it anyway, as a rule that had not thought about the condition
-        // would.
-        plan.nodes[leftjoin].executor = crate::sparql_refine::Executor::Sql;
-        for input in plan.nodes[leftjoin].op.inputs() {
-            plan.nodes[input].executor = crate::sparql_refine::Executor::Sql;
-        }
         let refusal = lower_refined(&plan, &sv, None)
             .expect_err("a lifted condition must not be rendered as a WHERE");
         assert!(
@@ -2145,12 +2358,19 @@ mod tests {
     /// A filter's enforcement is the thing a pushdown rule reads, so it has to
     /// follow the pass rather than the syntax: the same comparison enforces
     /// when SQL answers alone and only narrows when an engine pass decides.
+    ///
+    /// The constant is on `name` and not on `kind`, and that is the rule
+    /// rather than an accident: `kind` is an enum, whose stored codes are not
+    /// the terms the graph spells, so no rule pushes a constant at it. Past a
+    /// grouping there is no engine leg to re-apply anything, so an unfaithful
+    /// comparison there selects no groups and answers a query that has an
+    /// answer with nothing.
     #[test]
     fn enforcement_follows_who_answers() {
         // SQL answers alone: the constant is applied and claimed.
         let (_claims, ops) = sql_passes(
-            "SELECT ?n (COUNT(*) AS ?c) WHERE { \
-             ?s a asset360:Signal ; asset360:name ?n ; asset360:kind \"main\" } GROUP BY ?n",
+            "SELECT ?k (COUNT(*) AS ?c) WHERE { \
+             ?s a asset360:Signal ; asset360:kind ?k ; asset360:name \"BX517\" } GROUP BY ?k",
         )
         .into_iter()
         .next()
@@ -2172,8 +2392,8 @@ mod tests {
         // The engine finishes: the same shape of filter narrows only, because
         // the engine reapplies it with SPARQL's term semantics.
         let (_claims, ops) = sql_passes(
-            "SELECT ?s ?n WHERE { ?s a asset360:Signal ; asset360:name ?n ; \
-             asset360:kind \"main\" } LIMIT 3",
+            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k ; \
+             asset360:name \"BX517\" } LIMIT 3",
         )
         .into_iter()
         .next()
@@ -2207,13 +2427,17 @@ mod tests {
         .expect("one SQL pass");
 
         let kinds: Vec<&str> = ops.nodes.iter().map(|node| node.op.kind()).collect();
+        // Project below the slice, which is SPARQL's own order: group, order,
+        // project, then offset and limit. The deleted planner emitted the
+        // slice first and projected on top; both render the same statement,
+        // and this one matches the algebra.
         assert_eq!(
             kinds,
-            vec!["scan", "group", "sort", "slice", "project"],
+            vec!["scan", "group", "sort", "project", "slice"],
             "{:#?}",
             ops.nodes
         );
-        assert_eq!(ops.root().map(|node| node.op.kind()), Some("project"));
+        assert_eq!(ops.root().map(|node| node.op.kind()), Some("slice"));
     }
 
     /// Lowering must carry the two facts a renderer cannot recover from the
