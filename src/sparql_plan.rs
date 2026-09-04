@@ -1095,6 +1095,186 @@ pub fn plan_query_refined(
     Ok(substitute(plan, refined, note))
 }
 
+/// The refined pipeline's own artifact, built from the query rather than from
+/// another planner's plan.
+///
+/// **The three inputs `plan_query` used to supply, and where each comes from
+/// now:**
+///
+/// * **the obligation list** — [`obligations_of`], which takes the parsed
+///   query and nothing else. It was already the single derivation: the naive
+///   plan builder calls it too, so the refined plan's ledger and this list are
+///   the same list rather than two lists that agree. Nothing moved, and that
+///   is the point — a second derivation that agrees today is the failure mode
+///   worth avoiding.
+/// * **the fetch bound** — `QueryPlan::sql_limit`, straight from the scoper.
+///   Whether a `LIMIT` may reach the fetch is an analysis with a subtlety in
+///   it (a dropped filter makes it unsafe), so it stays where that analysis
+///   lives. Reading it here rather than recovering it from another planner's
+///   operators removes a dependency without adding a derivation.
+/// * **the pass structure** — built below. Two shapes and no third: one SQL
+///   pass when the statement answers the whole query, or an SQL fetch plus an
+///   engine pass that finishes it.
+///
+/// The scoper is still called, and not only for the bound: it is what refuses
+/// `UNION`, `MINUS` and an unscoped subject, which the endpoint turns into a
+/// 422 rather than a wrong answer. Those refusals are the user's, not the
+/// planner's, and they predate all of this.
+fn refined_execution_plan(
+    query_str: &str,
+    schema_view: &SchemaView,
+) -> Result<ExecutionPlan, ScopeError> {
+    let parsed = crate::sparql_scoper::parse_query(query_str)?;
+    let obligations = obligations_of(&parsed)?;
+    let scoped = crate::sparql_scoper::scope_parsed(&parsed, schema_view)?;
+
+    let mut refined = match crate::sparql_refine::naive_plan(&parsed) {
+        Ok(plan) => plan,
+        // A naive plan the builder cannot make is a query this pipeline does
+        // not represent. The scoper has already accepted it, so there are rows
+        // to fetch: hand back the star decomposition's fetch and let the
+        // engine answer over it.
+        Err(error) => return Ok(fetch_only(obligations, &scoped, error.to_string())),
+    };
+    let rules = crate::sparql_rules::tier_one_rules(schema_view);
+    let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+        rules.iter().map(|rule| rule.as_ref()).collect();
+    if let Err(failure) = crate::sparql_rules::refine(&mut refined, &borrowed) {
+        return Ok(fetch_only(
+            obligations,
+            &scoped,
+            format!("a rule broke the plan: {failure}"),
+        ));
+    }
+
+    let ops = match crate::sparql_ops::lower_refined(&refined, schema_view, scoped.sql_limit) {
+        Ok(ops) => ops,
+        // No statement the renderer can express. Every shape in the inventory
+        // lowers, so this is a guard rather than a path -- and the guard has
+        // to be a *fetch* rather than an error, because a query that answers
+        // slowly today must not start refusing.
+        Err(refusal) => {
+            return Ok(fetch_only(
+                obligations,
+                &scoped,
+                format!("not lowerable: {refusal}"),
+            ));
+        }
+    };
+
+    let mut plan = ExecutionPlan {
+        contract: PLAN_CONTRACT,
+        passes: Vec::new(),
+        residual: Vec::new(),
+        obligations,
+        blocked: None,
+        refinement: Refinement::NotAttempted,
+    };
+
+    match answers_alone(&plan, &ops) {
+        Ok(()) => {
+            let claimed: Vec<ObligationId> = ops.claims();
+            plan.passes = vec![Pass {
+                id: 0,
+                inputs: Vec::new(),
+                discharges: claimed,
+                emits: emitted_from(&ops),
+                kind: PassKind::Sql(Box::new(SqlPass { ops })),
+            }];
+            plan.refinement =
+                Refinement::UsedAlone("the statement answers the whole query in SQL".to_owned());
+        }
+        Err(why) => {
+            // A fetch, and the engine finishes. What the statement does not
+            // claim is the engine's, computed rather than assumed, because
+            // "exactly once" is the invariant this whole design rests on.
+            let claimed: BTreeSet<ObligationId> = ops.claims().into_iter().collect();
+            let engine_claims: Vec<ObligationId> = (0..plan.obligations.len())
+                .filter(|id| !claimed.contains(id))
+                .collect();
+            plan.passes = vec![
+                Pass {
+                    id: 0,
+                    inputs: Vec::new(),
+                    discharges: claimed.iter().copied().collect(),
+                    emits: Vec::new(),
+                    kind: PassKind::Sql(Box::new(SqlPass { ops })),
+                },
+                Pass {
+                    id: 1,
+                    inputs: vec![0],
+                    discharges: engine_claims,
+                    emits: Vec::new(),
+                    kind: PassKind::Engine(EnginePass {
+                        causes: scoped.inexact.iter().cloned().collect(),
+                    }),
+                },
+            ];
+            plan.refinement = Refinement::Used(Some(why));
+        }
+    }
+    Ok(plan)
+}
+
+/// A fetch from the star decomposition, with the engine answering over it.
+///
+/// The last resort, and deliberately not a planner: the scoper decided which
+/// records the query reads, and this states that decision as operators. No
+/// aggregate, no solution, nothing claimed beyond the triples the scoper
+/// represented -- which is what the endpoint has always fetched when the
+/// aggregate route refused.
+fn fetch_only(
+    obligations: Vec<Obligation>,
+    scoped: &crate::sparql_scoper::QueryPlan,
+    why: String,
+) -> ExecutionPlan {
+    let triple_count = obligations
+        .iter()
+        .filter(|obligation| {
+            matches!(
+                obligation,
+                Obligation::Type { .. } | Obligation::Triple { .. }
+            )
+        })
+        .count();
+    let unconsumed: BTreeSet<usize> = scoped.unconsumed.iter().copied().collect();
+    // Exactly the triples the scoper represented, and nothing else: a pass
+    // that claimed more would be saying it enforced something it did not.
+    let sql_claims: Vec<ObligationId> = (0..triple_count)
+        .filter(|index| !unconsumed.contains(index))
+        .collect();
+    let engine_claims: Vec<ObligationId> = (0..obligations.len())
+        .filter(|id| !sql_claims.contains(id))
+        .collect();
+    ExecutionPlan {
+        contract: PLAN_CONTRACT,
+        passes: vec![
+            Pass {
+                id: 0,
+                inputs: Vec::new(),
+                discharges: sql_claims.clone(),
+                emits: Vec::new(),
+                kind: PassKind::Sql(Box::new(SqlPass {
+                    ops: crate::sparql_ops::lower_sql_pass(scoped, None, &sql_claims, false),
+                })),
+            },
+            Pass {
+                id: 1,
+                inputs: vec![0],
+                discharges: engine_claims,
+                emits: Vec::new(),
+                kind: PassKind::Engine(EnginePass {
+                    causes: scoped.inexact.iter().cloned().collect(),
+                }),
+            },
+        ],
+        residual: Vec::new(),
+        obligations,
+        blocked: None,
+        refinement: Refinement::Fallback(why),
+    }
+}
+
 /// Admission with the comparator removed — what the gate becomes once the
 /// single-pass planner is gone.
 ///
@@ -1108,39 +1288,15 @@ pub fn plan_query_refined(
 /// nothing standing between it and an answer. Finding those now is the whole
 /// point.
 ///
-/// It still calls [`plan_query`] for the artifact around the statement — the
-/// obligation list, the passes, the fetch bound — so this is the *admission*
-/// rehearsed, not the deletion. Owning those three things is the second half
-/// of the work.
+/// It builds the artifact itself — [`refined_execution_plan`] — so what is
+/// rehearsed is the whole post-deletion path and not only the admission
+/// question: the obligation list, the pass structure and the fetch bound all
+/// come from the query rather than from another planner's plan.
 pub fn plan_query_refined_alone(
     query_str: &str,
     schema_view: &SchemaView,
 ) -> Result<ExecutionPlan, ScopeError> {
-    let mut plan = plan_query(query_str, schema_view)?;
-    let fetch_bound = plan
-        .passes
-        .iter()
-        .find_map(|pass| match &pass.kind {
-            PassKind::Sql(sql) => Some(crate::sparql_ops::fetch_bound_of(&sql.ops)),
-            PassKind::Engine(_) => None,
-        })
-        .flatten();
-
-    let refined = match refined_ops(query_str, schema_view, fetch_bound) {
-        Ok(refined) => refined,
-        Err(reason) => {
-            plan.refinement = Refinement::Fallback(reason);
-            return Ok(plan);
-        }
-    };
-
-    // The one question, asked by the same predicate the gated path asks.
-    if answers_alone(&plan, &refined).is_ok() {
-        return Ok(admit_alone(plan, refined, "there is no comparator"));
-    }
-    // Not the whole query, so the statement is a fetch and the engine
-    // finishes — the substitution, with no gate in front of it.
-    Ok(substitute(plan, refined, None))
+    refined_execution_plan(query_str, schema_view)
 }
 
 /// Put the refined statement in place of today's, and rebalance the ledger.
