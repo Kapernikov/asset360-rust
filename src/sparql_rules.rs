@@ -3483,7 +3483,6 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparql_plan::Obligation;
     use crate::sparql_refine::naive_plan_of;
     use crate::sparql_scoper::tests::test_schema_view;
 
@@ -5503,57 +5502,6 @@ mod tests {
         refine_naive(&plan_of(query), schema, reverse)
     }
 
-    /// What today's planner's SQL pass claims, as obligation *text*.
-    ///
-    /// Text and not ids: the two planners enumerate the same obligations, but
-    /// a comparison by id would pass for the wrong reason if either ever
-    /// reordered them.
-    ///
-    /// `None` when today's planner refuses the query outright, which is not a
-    /// parity failure -- there is nothing to be at parity with.
-    fn claimed_by_sql_today(query: &str, schema: &SchemaView) -> Option<Vec<String>> {
-        let plan = crate::sparql_plan::plan_query(&format!("{PREFIX}{query}"), schema).ok()?;
-        Some(
-            plan.passes
-                .iter()
-                .filter(|pass| matches!(pass.kind, crate::sparql_plan::PassKind::Sql(_)))
-                .flat_map(|pass| pass.discharges.iter())
-                .filter(|id| tier_one_shaped(&plan.obligations[**id]))
-                .map(|id| plan.obligations[*id].to_string())
-                .collect(),
-        )
-    }
-
-    /// Whether an obligation is one tier one could take care of at all.
-    ///
-    /// A grouping, an ordering, a slice and a `DISTINCT` all *collapse or
-    /// reorder rows*, and every rule here is non-collapsing by construction --
-    /// the engine leg re-runs the query, which is what makes a partial push
-    /// correct, and it cannot re-run one over rows that are already
-    /// aggregates. So today's eligible route claims them in SQL and the
-    /// refined plan does not, and that difference is tier two rather than a
-    /// regression. Comparing them would only assert that tier two is unbuilt.
-    fn tier_one_shaped(obligation: &Obligation) -> bool {
-        matches!(
-            obligation,
-            Obligation::Type { .. }
-                | Obligation::Triple { .. }
-                | Obligation::Filter { .. }
-                | Obligation::Values { .. }
-        )
-    }
-
-    /// The obligations the refined plan's `Sql` nodes claim, as text.
-    fn claimed_by_sql_refined(plan: &Plan) -> Vec<String> {
-        plan.nodes
-            .iter()
-            .filter(|node| node.executor == Executor::Sql)
-            .flat_map(|node| node.discharges.iter())
-            .filter(|id| tier_one_shaped(&plan.obligations[**id]))
-            .map(|id| plan.obligations[*id].to_string())
-            .collect()
-    }
-
     /// The value conditions today's star decomposition pushes, as
     /// `?star.path <condition>`.
     ///
@@ -5694,91 +5642,38 @@ mod tests {
         out
     }
 
-    /// **The gate on stage 3.** Whatever today's SQL pass claims, the refined
-    /// plan's `Sql` nodes claim too -- and whatever conditions today's star
-    /// decomposition pushes, the refined plan pushes too.
+    /// **Whatever conditions the scoper's star decomposition pushes, the
+    /// refined plan pushes too.**
     ///
-    /// Stated as containment rather than equality, in that direction: the
-    /// refined plan legitimately claims *more* (a `VALUES` over a bound
-    /// variable, a filter today's ledger applies without claiming). Switching
-    /// the endpoint onto a planner that pushed *less* would regress answers or
-    /// lose pushdown, which is what this refuses to let happen quietly.
+    /// The half of the stage-3 gate that outlives the deleted planner. The
+    /// other half compared *claims* — what today's SQL pass said it enforced
+    /// against what the refined plan's `Sql` nodes say — and it went with the
+    /// planner it compared against, along with the `KNOWN_GAPS` list that
+    /// named the shapes where the two ledgers legitimately differed. Claims
+    /// were always the weaker check: two plans can claim the same thing and
+    /// read different rows, which is why the runtime gate ended up comparing
+    /// the row source and not the ledger.
     ///
-    /// Where parity is not reached, the gap is named below rather than
-    /// smoothed over: an entry in `KNOWN_GAPS` fails the test if it stops
-    /// being a gap, so the list cannot rot in either direction.
+    /// What is compared here is a *condition*, against the scoper — which is
+    /// still the analysis that decides which records a query reads, and is
+    /// not going anywhere. A refined plan that pushed less would fetch rows
+    /// the scoper knew it could exclude.
     #[test]
-    fn the_refined_plan_claims_everything_todays_sql_pass_claims() {
+    fn the_refined_plan_pushes_every_condition_the_scoper_pushes() {
         let schema = test_schema_view();
         for query in CORPUS {
-            let Some(today) = claimed_by_sql_today(query, &schema) else {
-                continue;
-            };
             let plan = refined(query, &schema, false);
-            let refined_claims = claimed_by_sql_refined(&plan);
-            let missing: Vec<&String> = today
-                .iter()
-                .filter(|claim| !refined_claims.contains(claim))
-                .collect();
-            let expected: Vec<&str> = KNOWN_GAPS
-                .iter()
-                .filter(|(gap_query, _)| gap_query == query)
-                .map(|(_, claim)| *claim)
-                .collect();
-            assert_eq!(
-                missing
-                    .iter()
-                    .map(|claim| claim.as_str())
-                    .collect::<Vec<_>>(),
-                expected,
-                "claim parity for {query}\n{plan}"
-            );
-
             let today_conditions = conditions_pushed_today(query, &schema);
             let refined_conditions = conditions_pushed_refined(&plan, &schema);
             for condition in &today_conditions {
                 assert!(
                     refined_conditions.contains(condition),
-                    "today pushes {condition} and the refined plan does not, for \
+                    "the scoper pushes {condition} and the refined plan does not, for \
                      {query}\n{plan}\nrefined pushes {refined_conditions:?}"
                 );
             }
         }
     }
-
-    /// Every claim today's SQL pass makes that the refined plan does not, with
-    /// why. One entry, and it is not a pushdown difference: it is a
-    /// disagreement about what claiming a triple *means*.
-    ///
-    /// A read inside an `OPTIONAL` reaches today's star as an
-    /// `optional_fields` entry: the prefetch delivers the column without an
-    /// existence check, and the pass claims the triple because the data
-    /// reaches oxigraph. The refined plan delivers the same column and does
-    /// not claim it, so the difference is in the ledger and not in the SQL.
-    ///
-    /// **Two entries left, where there used to be one for every optional
-    /// read.** [`AbsorbOptionalRead`] closes the general case by giving the
-    /// delivered column its variable, at which point the scan answers the read
-    /// and the claim is its own -- the argument for keeping it unclaimed was
-    /// right about a column nothing binds, and the way to settle it was to
-    /// make the node answer rather than to keep arguing about the ledger.
-    ///
-    /// **One entry left.** The multivalued optional read is absorbed now: the
-    /// fan-out it needed lives inside the optional side, which is a `LEFT JOIN
-    /// LATERAL`, and [`SlotPresence`] on the [`PlanOp::Unnest`] is what says
-    /// so.
-    ///
-    /// What remains is the one shape absorption declines: an optional read
-    /// with a condition lifted into the left join. The condition decides
-    /// whether the *value* binds rather than whether the row survives, so the
-    /// read stays a `match` -- and the `match` keeps the claim. `PushLeftJoin`
-    /// pushes the join anyway, without the condition, so the statement is
-    /// today's; the claim is the only difference left.
-    const KNOWN_GAPS: &[(&str, &str)] = &[(
-        "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-         OPTIONAL { ?s asset360:name ?nm . FILTER(?nm > \"A\") } }",
-        "triple    ?s asset360:name ?nm",
-    )];
 
     /// A condition on a group key sinks below the grouping; one on a measure
     /// stays a `HAVING`.

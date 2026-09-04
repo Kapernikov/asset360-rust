@@ -31,7 +31,6 @@
 //! only be inferred by comparing two structures. [`Enforcement`] states it, so
 //! a rule can ask a node directly whether removing it would change the answer.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::sparql_plan::ObligationId;
@@ -299,29 +298,26 @@ pub struct OpTree {
     pub nodes: Vec<OpNode>,
 }
 
-/// Build the operator tree for an SQL pass.
+/// Build the operator tree for a *fetch*: the scoper's star decomposition,
+/// restated as nodes.
 ///
-/// Lowering, not planning: every decision was already made by the scoper and
-/// the pushdown analyser. This restates their result as nodes so a rewrite has
-/// something local to edit, and so the same result can be printed and compared
-/// as data.
+/// Lowering, not planning — the scoper made every decision here, and this
+/// states it as operators so the pass is fully described by its nodes and a
+/// consumer reading only operators fetches what the scoper said it should.
 ///
-/// `enforcing` says whether this pass answers the query or only narrows what an
-/// engine pass will decide, which fixes the [`Enforcement`] on every filter it
-/// emits — a distinction the two composite structures could only express by
-/// which pass claimed the obligation.
+/// **What it is not, any more.** It used to lower an eligible aggregate too:
+/// the deleted single-pass planner handed it a `SolutionSpec` and it emitted
+/// the grouping, the sort, the slice and the projection above the scan, with
+/// [`Enforcement::Enforces`] on the filters because that pass answered the
+/// query. Every statement that answers a query now comes from
+/// [`lower_refined`], so what is left narrows rows for an engine that decides:
+/// [`Enforcement::Narrows`], and no solution layer.
 pub fn lower_sql_pass(
     plan: &crate::sparql_scoper::QueryPlan,
-    solution: Option<&crate::sparql_pushdown::SolutionSpec>,
     discharges: &[ObligationId],
-    enforcing: bool,
 ) -> OpTree {
     let mut nodes: Vec<OpNode> = Vec::new();
-    let enforcement = if enforcing {
-        Enforcement::Enforces
-    } else {
-        Enforcement::Narrows
-    };
+    let enforcement = Enforcement::Narrows;
 
     // Scans, in the order the plan lists them, so a printed tree matches a
     // printed plan.
@@ -437,111 +433,35 @@ pub fn lower_sql_pass(
         current = Some(joined);
     }
 
-    let mut input = match current {
+    let input = match current {
         Some(id) => id,
         // No stars at all: nothing to lower, and the caller has already
         // refused a query with nothing scoped.
         None => return OpTree { nodes },
     };
 
-    if let Some(solution) = solution {
-        // Unnest before grouping: a multivalued binding must fan out first, or
-        // the count is one per record instead of one per value.
-        for binding in &solution.bindings {
-            let multivalued = binding
-                .containers
-                .iter()
-                .any(|container| *container != crate::sparql_pushdown::Container::Single);
-            if !multivalued {
-                continue;
-            }
-            nodes.push(OpNode {
-                op: Op::Unnest {
-                    input,
-                    star_var: binding.star_var.clone(),
-                    slot_path: binding.slot_path.clone(),
-                },
-                discharges: Vec::new(),
-            });
-            input = nodes.len() - 1;
-        }
+    // The rows are the product, and the claims are exactly the triples the
+    // scoper represented.
+    if let Some(last) = nodes.last_mut() {
+        last.discharges = discharges.to_vec();
+    }
 
+    // The fetch bound, when the scoper found one safe to apply. It is a
+    // *narrowing* and claims nothing: the engine still applies the query's
+    // own LIMIT and OFFSET, and this only spares the fetch from reading
+    // rows no answer could use. Represented as an operator so the fetch
+    // pass is fully described by its nodes -- otherwise a consumer reading
+    // only operators would fetch unbounded where the scoper said it need
+    // not.
+    if let Some(limit) = plan.sql_limit {
         nodes.push(OpNode {
-            op: Op::Group {
+            op: Op::Slice {
                 input,
-                bindings: solution.bindings.clone(),
-                keys: solution.group_keys.clone(),
-                measures: solution.measures.clone(),
-                having: solution.having.clone(),
-            },
-            // The claims sit here rather than spread over the nodes: the
-            // analyser decides eligibility for the pass as a whole, so
-            // attributing an obligation to a particular node would be a guess.
-            // A rewrite that splits this node inherits the job of splitting the
-            // claims with it.
-            discharges: discharges.to_vec(),
-        });
-        input = nodes.len() - 1;
-
-        if solution.distinct {
-            nodes.push(OpNode {
-                op: Op::Distinct { input },
-                discharges: Vec::new(),
-            });
-            input = nodes.len() - 1;
-        }
-        if !solution.order_by.is_empty() {
-            nodes.push(OpNode {
-                op: Op::Sort {
-                    input,
-                    terms: solution.order_by.clone(),
-                },
-                discharges: Vec::new(),
-            });
-            input = nodes.len() - 1;
-        }
-        if solution.limit.is_some() || solution.offset > 0 {
-            nodes.push(OpNode {
-                op: Op::Slice {
-                    input,
-                    limit: solution.limit,
-                    offset: solution.offset,
-                },
-                discharges: Vec::new(),
-            });
-            input = nodes.len() - 1;
-        }
-        nodes.push(OpNode {
-            op: Op::Project {
-                input,
-                vars: solution.projected.clone(),
+                limit: Some(limit),
+                offset: 0,
             },
             discharges: Vec::new(),
         });
-    } else {
-        // A scan feeding an engine pass: the rows are the product, and the
-        // claims are the triples the scoper represented.
-        if let Some(last) = nodes.last_mut() {
-            last.discharges = discharges.to_vec();
-        }
-
-        // The fetch bound, when the scoper found one safe to apply. It is a
-        // *narrowing* and claims nothing: the engine still applies the query's
-        // own LIMIT and OFFSET, and this only spares the fetch from reading
-        // rows no answer could use. Represented as an operator so the fetch
-        // pass is fully described by its nodes -- otherwise a consumer reading
-        // only operators would fetch unbounded where the scoper said it need
-        // not.
-        if let Some(limit) = plan.sql_limit {
-            nodes.push(OpNode {
-                op: Op::Slice {
-                    input,
-                    limit: Some(limit),
-                    offset: 0,
-                },
-                discharges: Vec::new(),
-            });
-        }
     }
 
     OpTree { nodes }
@@ -1489,202 +1409,6 @@ pub fn fetch_bound_of(tree: &OpTree) -> Option<usize> {
     })
 }
 
-/// A scan's facts, for a comparison that does not depend on node order.
-struct ScanFacts {
-    class_uri: String,
-    identifier_values: Vec<String>,
-    required_slots: Vec<String>,
-    is_optional: bool,
-}
-
-fn scans_by_star(tree: &OpTree) -> BTreeMap<String, ScanFacts> {
-    tree.nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Scan {
-                star_var,
-                class_uri,
-                identifier_values,
-                required_slots,
-                is_optional,
-                ..
-            } => {
-                let mut identifier_values = identifier_values.clone();
-                identifier_values.sort();
-                let mut required_slots = required_slots.clone();
-                required_slots.sort();
-                Some((
-                    star_var.clone(),
-                    ScanFacts {
-                        class_uri: class_uri.clone(),
-                        identifier_values,
-                        required_slots,
-                        is_optional: *is_optional,
-                    },
-                ))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// Every condition a tree applies, as text a comparison can sort.
-///
-/// The reading and the numeric-ness are part of the identity: the same path
-/// and the same value read two different ways select different rows, which is
-/// the whole reason both facts are on the node.
-fn conditions_of(tree: &OpTree) -> Vec<String> {
-    let mut out: Vec<String> = tree
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Filter {
-                star_var,
-                slot_path,
-                condition,
-                numeric,
-                reading,
-                optional_side,
-                ..
-            } => Some(format!(
-                "?{star_var}.{} {condition} numeric={numeric} reading={reading} \
-                 optional={optional_side}",
-                slot_path.join(".")
-            )),
-            _ => None,
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-fn joins_of(tree: &OpTree) -> Vec<String> {
-    let mut out: Vec<String> = tree
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Join {
-                left_star,
-                right_star,
-                right_slot,
-                kind,
-                ..
-            } => Some(format!("?{left_star} ?{right_star}.{right_slot} {kind:?}")),
-            _ => None,
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-fn fanouts_of(tree: &OpTree) -> Vec<String> {
-    let mut out: Vec<String> = tree
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Unnest {
-                star_var,
-                slot_path,
-                ..
-            } => Some(format!("?{star_var}.{}", slot_path.join("."))),
-            _ => None,
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-/// The operators that collapse or reorder rows, which is the work a fallback
-/// would hand back to the engine.
-///
-/// A slice is here only when it claims an obligation: the query's own `LIMIT`
-/// is work, and the scoper's fetch bound is a narrowing compared separately.
-fn collapsing_of(tree: &OpTree) -> Vec<String> {
-    let mut out: Vec<String> = tree
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            // A grouping's `HAVING` is work the grouping does, so it is part
-            // of what a fallback would hand back. Rendered into the key rather
-            // than counted, so a *different* condition is a difference too.
-            Op::Group { having, .. } => Some(format!(
-                "group having=[{}]",
-                having
-                    .iter()
-                    // Only the terms over *aggregates*. A condition on a group
-                    // key is a condition on a column of every row -- it can be
-                    // a `WHERE`, and the refined pipeline sinks it into one --
-                    // so a plan that states it there has not handed anything
-                    // back. The condition clause above is what checks it is
-                    // still applied; counting it here as well would make
-                    // sinking it look like losing it.
-                    .filter(|term| matches!(term.key, crate::sparql_pushdown::OrderKey::Measure(_)))
-                    .map(|term| format!(
-                        "{}{} {} numeric={}",
-                        match term.key {
-                            crate::sparql_pushdown::OrderKey::Binding(_) => "c",
-                            crate::sparql_pushdown::OrderKey::Measure(_) => "m",
-                        },
-                        match term.key {
-                            crate::sparql_pushdown::OrderKey::Binding(index)
-                            | crate::sparql_pushdown::OrderKey::Measure(index) => index,
-                        },
-                        term.condition,
-                        term.numeric
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            Op::Sort { .. } | Op::Distinct { .. } | Op::Project { .. } => {
-                Some(node.op.kind().to_owned())
-            }
-            Op::Slice { .. } if !node.discharges.is_empty() => Some("slice".to_owned()),
-            _ => None,
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-/// The first element of `wanted` that `have` does not cover, counting
-/// duplicates.
-/// Whether a containment test is answered by a condition on the bound element
-/// of the same slot.
-///
-/// Both are rendered strings, and comparing them as strings is the point: this
-/// is the one place where two *different* conditions may stand for the same
-/// narrowing, so the substitution is written out rather than left to whoever
-/// reads the diff.
-fn subsumed_by_an_element_condition(missing: &str, have: &[String]) -> bool {
-    let Some(wanted) = missing.split_once(" reading=[any] ") else {
-        return false;
-    };
-    have.iter().any(|condition| {
-        condition
-            .split_once(" reading=[each] ")
-            .is_some_and(|mine| mine == wanted)
-    })
-}
-
-fn missing_from(wanted: &[String], have: &[String]) -> Option<String> {
-    let mut left: Vec<&String> = have.iter().collect();
-    for item in wanted {
-        match left.iter().position(|candidate| *candidate == item) {
-            Some(index) => {
-                left.remove(index);
-            }
-            None => return Some(item.clone()),
-        }
-    }
-    None
-}
-
-/// The star, class and path an `Sql` scan binds a variable to, when one binds
-/// it as a column of its own record.
-///
-/// Deliberately narrow: a variable bound to an element of an array, or read
-/// without being required, is not a column a grouping can key on, and the
-/// rules decline those before the lowering sees them.
 /// The columns of a grouped result: its bindings and its measures, in the
 /// order the statement will list them.
 ///
@@ -2025,154 +1749,6 @@ impl OpTree {
         })
     }
 
-    /// Whether this tree fetches a row set no larger than `today`'s and leaves
-    /// no more work to the engine.
-    ///
-    /// **The question the switchover gate actually cares about.** The gate was
-    /// first written to compare *claims*, and for every tier-one rule the two
-    /// coincide -- a rule that pushes work claims what it pushed -- so the
-    /// difference did not show. They come apart on an `OPTIONAL` read: both
-    /// statements deliver the same column, the SQL is identical, nothing moved
-    /// to the engine, and the ledgers differ only because a narrowing scan
-    /// declines to claim optionality it does not render. Comparing claims
-    /// there rejects the *more truthful* plan for a difference that costs
-    /// nothing, so the comparand is the row source and the ledger stays out of
-    /// the decision.
-    ///
-    /// Decidable and conservative: every clause below either shows a
-    /// difference cannot make things worse, or refuses. `Ok(())` means it is
-    /// safe to switch; `Err` carries the reason for the caller's log.
-    ///
-    /// What "no worse" is made of, and why each direction:
-    ///
-    /// * **the same scans** -- same stars, same classes, same optionality.
-    ///   Scanning a different set of records is not a comparison this can
-    ///   reason about, so it refuses rather than guessing which is narrower.
-    /// * **at least today's existence checks.** More `object_data ? 'slot'`
-    ///   means fewer rows. Fewer means more, so today's must all be there.
-    /// * **at least today's conditions**, matched exactly -- path, condition,
-    ///   reading and numeric-ness. An extra condition narrows further, which
-    ///   is safe under the over-fetch contract; a missing one fetches rows
-    ///   today's statement excluded.
-    /// * **the same joins.** An inner join both narrows and adds a class to
-    ///   read, so neither direction is safely "no worse".
-    /// * **no new fan-out.** An `unnest` multiplies rows, so having one today
-    ///   lacks is worse by definition.
-    /// * **at least today's collapsing work** -- group, sort, distinct,
-    ///   project, and any slice that claims an obligation. Missing one means
-    ///   the engine does it instead, which is exactly the regression this
-    ///   refuses.
-    /// * **a fetch bound no looser than today's.** Losing it fetches every row
-    ///   of the class; `LIMIT 1` returning three rows is how that showed up
-    ///   the last time.
-    ///
-    /// `optional_slots` are deliberately not compared: they emit nothing. A
-    /// slot listed there suppresses an existence check it would not otherwise
-    /// have, so a difference in that list alone cannot change a row.
-    pub fn is_no_worse_than(&self, today: &OpTree) -> Result<(), String> {
-        let mine = scans_by_star(self);
-        let theirs = scans_by_star(today);
-        let stars = |scans: &BTreeMap<String, ScanFacts>| -> Vec<String> {
-            scans.keys().cloned().collect()
-        };
-        if stars(&mine) != stars(&theirs) {
-            return Err(format!(
-                "the two plans scan different stars: {:?} against {:?}",
-                stars(&mine),
-                stars(&theirs)
-            ));
-        }
-        for (star, today_scan) in &theirs {
-            let scan = &mine[star];
-            if scan.class_uri != today_scan.class_uri {
-                return Err(format!(
-                    "?{star} is scanned as {} rather than {}",
-                    scan.class_uri, today_scan.class_uri
-                ));
-            }
-            if scan.is_optional != today_scan.is_optional {
-                return Err(format!("?{star} disagrees about being optional"));
-            }
-            // Narrower is not worse, and identity is where that matters
-            // most: an empty list is *no* restriction, so a refined statement
-            // that names the record the query named is strictly better than
-            // one that reads the class. Only two cases are worse -- dropping a
-            // restriction today makes, or naming more records than today does
-            // -- and this reads them that way rather than as inequality, for
-            // the same reason the fetch bound below does.
-            //
-            // The soundness this rests on is stated where it is enforced: a
-            // narrowing may only be applied on a route where the engine
-            // re-runs the query, and an identity restriction may not answer
-            // one alone (`IdentityIsNotATriple`).
-            let today_names_records = !today_scan.identifier_values.is_empty();
-            let narrower = !scan.identifier_values.is_empty()
-                && scan
-                    .identifier_values
-                    .iter()
-                    .all(|value| today_scan.identifier_values.contains(value));
-            if today_names_records && !narrower {
-                return Err(format!(
-                    "?{star} would fetch identifier values {:?} where today fetches {:?}, \
-                     so the fetch is wider",
-                    scan.identifier_values, today_scan.identifier_values
-                ));
-            }
-            if let Some(missing) = today_scan
-                .required_slots
-                .iter()
-                .find(|slot| !scan.required_slots.contains(slot))
-            {
-                return Err(format!(
-                    "?{star} would not require '{missing}', so the fetch is wider"
-                ));
-            }
-        }
-
-        if let Some(missing) = missing_from(&conditions_of(today), &conditions_of(self)) {
-            // One exception, and it is a subsumption rather than an excuse: a
-            // containment test over a record's array (`[any]`) asks whether
-            // *some* element satisfies the condition, and a condition on the
-            // element a fan-out bound (`[each]`) holds of the element in the
-            // row. Every row the second keeps comes from a record the first
-            // would keep, so the refined row source is a subset -- while the
-            // strings differ, because the reading does.
-            //
-            // Today's planner applies both, on the same query: it narrows the
-            // fetch with the containment test and then states the exact
-            // condition again as a `HAVING` over the group key. The refined
-            // plan states it once, on the element.
-            if !subsumed_by_an_element_condition(&missing, &conditions_of(self)) {
-                return Err(format!("the refined plan does not apply {missing}"));
-            }
-        }
-        if joins_of(self) != joins_of(today) {
-            return Err(format!(
-                "the two plans join differently: {:?} against {:?}",
-                joins_of(self),
-                joins_of(today)
-            ));
-        }
-        if let Some(extra) = missing_from(&fanouts_of(self), &fanouts_of(today)) {
-            return Err(format!(
-                "the refined plan fans out {extra}, which today does not"
-            ));
-        }
-        if let Some(missing) = missing_from(&collapsing_of(today), &collapsing_of(self)) {
-            return Err(format!("the refined plan leaves '{missing}' to the engine"));
-        }
-        match (fetch_bound_of(self), fetch_bound_of(today)) {
-            (_, None) => {}
-            (Some(mine), Some(theirs)) if mine <= theirs => {}
-            (mine, Some(theirs)) => {
-                return Err(format!(
-                    "the fetch bound is {mine:?} rather than {theirs:?}, so the fetch is wider"
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// Nodes of one kind, for a rule that looks for its own shape.
     pub fn find(&self, kind: &str) -> Vec<OpId> {
         self.nodes
@@ -2191,7 +1767,7 @@ impl OpTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparql_plan::{PassKind, plan_query};
+    use crate::sparql_plan::{PassKind, plan_query_refined};
     use crate::sparql_scoper::tests::test_schema_view;
     use linkml_schemaview::schemaview::SchemaView;
 
@@ -2200,7 +1776,7 @@ mod tests {
     /// Every SQL pass of a planned query, as (pass claims, operator tree).
     fn sql_passes(query: &str) -> Vec<(Vec<ObligationId>, OpTree)> {
         let sv = test_schema_view();
-        let plan = plan_query(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+        let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
         plan.passes
             .iter()
             .filter_map(|pass| match &pass.kind {
@@ -2239,122 +1815,6 @@ mod tests {
             assert!(tree.is_well_formed(), "{query}");
             assert!(!tree.nodes.is_empty(), "{query}");
         }
-    }
-
-    /// The refined plan and today's planner render the same statement.
-    ///
-    /// The gate that matters at this level: the operators are what
-    /// `sql_builder.py` reads, so two trees that agree node for node produce
-    /// the same SQL. Compared as *data* rather than as SQL text because the
-    /// renderer lives in Python -- `tests/test_ops_render.py` closes that half
-    /// by rendering both.
-    #[test]
-    fn the_two_planners_lower_to_the_same_row_set() {
-        let sv = test_schema_view();
-        for query in [
-            "SELECT ?s WHERE { ?s a asset360:Signal }",
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-             FILTER(?nm > \"A\") }",
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }",
-            "SELECT ?len WHERE { ?s a asset360:Signal ; asset360:length ?len . \
-             FILTER(?len >= 10) }",
-            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
-             FILTER(?k = \"m\") }",
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }",
-            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-             ?t a asset360:Track ; asset360:hasName ?tn }",
-            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
-             ?loc asset360:longitude ?lon . FILTER(?lon > 3) }",
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-             OPTIONAL { ?s asset360:name ?nm } }",
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u\" }",
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-             VALUES ?nm { \"a\" \"b\" } }",
-            // The first collapsing shape: a scalar key and a count. Its
-            // lowered statement has to be today's, node for node, because
-            // today's planner already pushes this grouping -- which is exactly
-            // why it is the shape to start with.
-            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-             asset360:name ?nm } GROUP BY ?nm",
-        ] {
-            let refined = lowered(query, &sv)
-                .unwrap_or_else(|refusal| panic!("{query} did not lower: {refusal}"));
-            let passes = sql_passes(query);
-            let [(_, today)] = passes.as_slice() else {
-                panic!("{query} does not have exactly one SQL pass today");
-            };
-            assert_eq!(
-                row_set(&refined),
-                row_set(today),
-                "the two planners disagree about the statement for {query}"
-            );
-        }
-    }
-
-    /// The row set as data: what a renderer reads out of the operators, with
-    /// the order of a star's own conditions normalised away.
-    ///
-    /// `Star::filters` is a `HashMap`, so today's lowering emits one star's
-    /// conditions in whatever order it iterates; the refined plan emits them
-    /// in the order the query wrote them. A conjunction of `WHERE` clauses
-    /// means the same thing either way, so the difference is not one to hold a
-    /// planner to.
-    fn row_set(tree: &OpTree) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut conditions: Vec<String> = Vec::new();
-        for node in &tree.nodes {
-            match &node.op {
-                Op::Scan {
-                    star_var,
-                    class_uri,
-                    identifier_values,
-                    required_slots,
-                    optional_slots,
-                    is_optional,
-                } => {
-                    let mut identifiers = identifier_values.clone();
-                    identifiers.sort();
-                    let mut required = required_slots.clone();
-                    required.sort();
-                    let mut optional = optional_slots.clone();
-                    optional.sort();
-                    out.push(format!(
-                        "scan ?{star_var} {class_uri} ids={identifiers:?} \
-                         req={required:?} opt={optional:?} optional={is_optional}"
-                    ));
-                }
-                Op::Filter {
-                    star_var,
-                    slot_path,
-                    condition,
-                    numeric,
-                    reading,
-                    ..
-                } => conditions.push(format!(
-                    "filter ?{star_var}.{} {condition} numeric={numeric} reading={reading}",
-                    slot_path.join(".")
-                )),
-                Op::Join {
-                    left_star,
-                    right_star,
-                    right_slot,
-                    kind,
-                    ..
-                } => out.push(format!(
-                    "join ?{left_star} ?{right_star}.{right_slot} {kind:?}"
-                )),
-                Op::Unnest {
-                    star_var,
-                    slot_path,
-                    ..
-                } => out.push(format!("unnest ?{star_var}.{}", slot_path.join("."))),
-                other => out.push(other.kind().to_owned()),
-            }
-        }
-        conditions.sort();
-        out.extend(conditions);
-        out
     }
 
     /// A narrowing pass drops the fan-out and weakens the element condition to
@@ -2403,176 +1863,6 @@ mod tests {
         };
         assert_eq!(*reading, SlotReading::AnyElement);
         assert_eq!(*enforcement, Enforcement::Narrows);
-    }
-
-    /// The comparator, in both directions, on trees built by hand -- so what
-    /// counts as "worse" is stated rather than inferred from whichever
-    /// difference two planners happen to produce.
-    #[test]
-    fn the_gate_refuses_every_way_a_statement_can_be_worse() {
-        let scan = |required: &[&str], identifier: &[&str], optional: bool| OpNode {
-            op: Op::Scan {
-                star_var: "s".to_owned(),
-                class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
-                identifier_values: identifier.iter().map(|v| (*v).to_owned()).collect(),
-                required_slots: required.iter().map(|v| (*v).to_owned()).collect(),
-                optional_slots: Vec::new(),
-                is_optional: optional,
-            },
-            discharges: Vec::new(),
-        };
-        let filter = |reading: SlotReading| OpNode {
-            op: Op::Filter {
-                input: 0,
-                star_var: "s".to_owned(),
-                slot_path: vec!["name".to_owned()],
-                condition: FilterCondition::Eq("BX".to_owned()),
-                enforcement: Enforcement::Narrows,
-                numeric: false,
-                reading,
-                optional_side: false,
-            },
-            discharges: Vec::new(),
-        };
-        let slice = |limit: Option<usize>, claims: Vec<ObligationId>| OpNode {
-            op: Op::Slice {
-                input: 0,
-                limit,
-                offset: 0,
-            },
-            discharges: claims,
-        };
-        let tree = |nodes: Vec<OpNode>| OpTree { nodes };
-
-        let today = tree(vec![
-            scan(&["name"], &[], false),
-            filter(SlotReading::Column),
-        ]);
-        // The same statement is trivially no worse than itself.
-        today.is_no_worse_than(&today).unwrap();
-        // Narrowing further is fine: an extra condition costs rows the engine
-        // would have discarded, which is the over-fetch contract.
-        tree(vec![
-            scan(&["name", "kind"], &[], false),
-            filter(SlotReading::Column),
-            filter(SlotReading::Column),
-        ])
-        .is_no_worse_than(&today)
-        .unwrap();
-
-        for (worse, why) in [
-            (
-                tree(vec![scan(&["name"], &[], false)]),
-                "a condition today applies is missing",
-            ),
-            (
-                tree(vec![scan(&[], &[], false), filter(SlotReading::Column)]),
-                "an existence check today applies is missing",
-            ),
-            (
-                tree(vec![
-                    scan(&["name"], &[], true),
-                    filter(SlotReading::Column),
-                ]),
-                "the star's optionality disagrees",
-            ),
-            (
-                tree(vec![
-                    scan(&["name"], &[], false),
-                    filter(SlotReading::AnyElement),
-                ]),
-                "the same path read a different way selects different rows",
-            ),
-            (
-                tree(vec![
-                    scan(&["name"], &[], false),
-                    filter(SlotReading::Column),
-                    OpNode {
-                        op: Op::Unnest {
-                            input: 1,
-                            star_var: "s".to_owned(),
-                            slot_path: vec!["trafficKinds".to_owned()],
-                        },
-                        discharges: Vec::new(),
-                    },
-                ]),
-                "a fan-out today does not have multiplies rows",
-            ),
-        ] {
-            worse
-                .is_no_worse_than(&today)
-                .expect_err(&format!("should have refused: {why}"));
-        }
-
-        // Identity, which is one-directional: naming the record the query
-        // named is *narrower* than reading the class, so it needs its own
-        // baseline -- one that names a record -- to say what worse means here.
-        let named = tree(vec![
-            scan(&["name"], &["u"], false),
-            filter(SlotReading::Column),
-        ]);
-        for (worse, why) in [
-            (
-                tree(vec![
-                    scan(&["name"], &[], false),
-                    filter(SlotReading::Column),
-                ]),
-                "reading the class where today names one record",
-            ),
-            (
-                tree(vec![
-                    scan(&["name"], &["u", "v"], false),
-                    filter(SlotReading::Column),
-                ]),
-                "naming more records than today does",
-            ),
-        ] {
-            worse
-                .is_no_worse_than(&named)
-                .expect_err(&format!("should have refused: {why}"));
-        }
-        // And the other direction is admitted, which is the point of the
-        // clause: today reads the class, the refined statement reads one row.
-        named
-            .is_no_worse_than(&tree(vec![
-                scan(&["name"], &[], false),
-                filter(SlotReading::Column),
-            ]))
-            .expect("naming the record the query named is not worse");
-
-        // Work handed back to the engine, and a fetch bound loosened: two
-        // shapes with their own clause, so they get their own baseline.
-        let grouping = tree(vec![
-            scan(&["name"], &[], false),
-            OpNode {
-                op: Op::Group {
-                    input: 0,
-                    bindings: Vec::new(),
-                    keys: Vec::new(),
-                    measures: Vec::new(),
-                    having: Vec::new(),
-                },
-                discharges: vec![0],
-            },
-        ]);
-        tree(vec![scan(&["name"], &[], false)])
-            .is_no_worse_than(&grouping)
-            .expect_err("dropping the grouping hands it back to the engine");
-
-        let bounded = tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())]);
-        tree(vec![scan(&[], &[], false)])
-            .is_no_worse_than(&bounded)
-            .expect_err("losing the fetch bound reads every row of the class");
-        tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())])
-            .is_no_worse_than(&bounded)
-            .unwrap();
-        // A tighter bound is narrower, which is not worse.
-        tree(vec![scan(&[], &[], false), slice(Some(1), Vec::new())])
-            .is_no_worse_than(&tree(vec![
-                scan(&[], &[], false),
-                slice(Some(5), Vec::new()),
-            ]))
-            .unwrap();
     }
 
     /// A refined plan whose `Sql` nodes are two islands is a legal plan and
@@ -2773,133 +2063,6 @@ mod tests {
             matches!(refusal, LoweringRefusal::Unrenderable { .. }),
             "{refusal}"
         );
-    }
-
-    /// The two ways the comparator now reads a *different* statement as no
-    /// worse, each written out because both look like a loss to a string
-    /// comparison.
-    ///
-    /// This is the clause pair that decides whether a `HAVING` over a group
-    /// key can be sunk at all. Today's planner applies such a condition
-    /// twice -- as a fetch narrowing and again as a `HAVING` -- and the
-    /// refined pipeline applies it once, on the rows. Without these the gate
-    /// called that a regression.
-    #[test]
-    fn the_gate_reads_a_sunk_condition_as_applied() {
-        use crate::sparql_pushdown::{HavingTerm, OrderKey};
-        use crate::sparql_scoper::FilterCondition;
-
-        let condition = |reading: SlotReading| OpNode {
-            op: Op::Filter {
-                input: 0,
-                star_var: "s".to_owned(),
-                slot_path: vec!["trafficKinds".to_owned()],
-                condition: FilterCondition::Cmp {
-                    op: crate::sparql_scoper::CmpOp::Gt,
-                    value: "F".to_owned(),
-                },
-                enforcement: Enforcement::Enforces,
-                optional_side: false,
-                reading,
-                numeric: false,
-            },
-            discharges: Vec::new(),
-        };
-        let scan = OpNode {
-            op: Op::Scan {
-                star_var: "s".to_owned(),
-                class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
-                identifier_values: Vec::new(),
-                required_slots: vec!["trafficKinds".to_owned()],
-                optional_slots: Vec::new(),
-                is_optional: false,
-            },
-            discharges: Vec::new(),
-        };
-        let grouping = |having: Vec<HavingTerm>| OpNode {
-            op: Op::Group {
-                input: 2,
-                bindings: Vec::new(),
-                keys: Vec::new(),
-                measures: Vec::new(),
-                having,
-            },
-            discharges: vec![0],
-        };
-        let key_term = HavingTerm {
-            key: OrderKey::Binding(0),
-            condition: FilterCondition::Cmp {
-                op: crate::sparql_scoper::CmpOp::Gt,
-                value: "F".to_owned(),
-            },
-            numeric: false,
-        };
-
-        // Today: a containment test on the record's array, and the exact
-        // condition again as a `HAVING` over the key.
-        let today = OpTree {
-            nodes: vec![
-                scan.clone(),
-                condition(SlotReading::AnyElement),
-                OpNode {
-                    op: Op::Unnest {
-                        input: 1,
-                        star_var: "s".to_owned(),
-                        slot_path: vec!["trafficKinds".to_owned()],
-                    },
-                    discharges: Vec::new(),
-                },
-                grouping(vec![key_term.clone()]),
-            ],
-        };
-        // The refined plan: one condition, on the element the fan-out bound.
-        let refined = OpTree {
-            nodes: vec![
-                scan.clone(),
-                condition(SlotReading::BoundElement),
-                OpNode {
-                    op: Op::Unnest {
-                        input: 1,
-                        star_var: "s".to_owned(),
-                        slot_path: vec!["trafficKinds".to_owned()],
-                    },
-                    discharges: Vec::new(),
-                },
-                grouping(Vec::new()),
-            ],
-        };
-        refined
-            .is_no_worse_than(&today)
-            .expect("a condition on the bound element subsumes the containment test");
-
-        // And neither substitution is a hole: a plan that applies *no*
-        // condition is still worse.
-        let neither = OpTree {
-            nodes: vec![
-                scan,
-                OpNode {
-                    op: Op::Unnest {
-                        input: 0,
-                        star_var: "s".to_owned(),
-                        slot_path: vec!["trafficKinds".to_owned()],
-                    },
-                    discharges: Vec::new(),
-                },
-                OpNode {
-                    op: Op::Group {
-                        input: 1,
-                        bindings: Vec::new(),
-                        keys: Vec::new(),
-                        measures: Vec::new(),
-                        having: Vec::new(),
-                    },
-                    discharges: vec![0],
-                },
-            ],
-        };
-        neither
-            .is_no_worse_than(&today)
-            .expect_err("dropping the condition altogether is worse");
     }
 
     /// **A comparator clause, promoted to a check on one plan.** A statement
@@ -3197,12 +2360,19 @@ mod tests {
     /// A filter's enforcement is the thing a pushdown rule reads, so it has to
     /// follow the pass rather than the syntax: the same comparison enforces
     /// when SQL answers alone and only narrows when an engine pass decides.
+    ///
+    /// The constant is on `name` and not on `kind`, and that is the rule
+    /// rather than an accident: `kind` is an enum, whose stored codes are not
+    /// the terms the graph spells, so no rule pushes a constant at it. Past a
+    /// grouping there is no engine leg to re-apply anything, so an unfaithful
+    /// comparison there selects no groups and answers a query that has an
+    /// answer with nothing.
     #[test]
     fn enforcement_follows_who_answers() {
         // SQL answers alone: the constant is applied and claimed.
         let (_claims, ops) = sql_passes(
-            "SELECT ?n (COUNT(*) AS ?c) WHERE { \
-             ?s a asset360:Signal ; asset360:name ?n ; asset360:kind \"main\" } GROUP BY ?n",
+            "SELECT ?k (COUNT(*) AS ?c) WHERE { \
+             ?s a asset360:Signal ; asset360:kind ?k ; asset360:name \"BX517\" } GROUP BY ?k",
         )
         .into_iter()
         .next()
@@ -3224,8 +2394,8 @@ mod tests {
         // The engine finishes: the same shape of filter narrows only, because
         // the engine reapplies it with SPARQL's term semantics.
         let (_claims, ops) = sql_passes(
-            "SELECT ?s ?n WHERE { ?s a asset360:Signal ; asset360:name ?n ; \
-             asset360:kind \"main\" } LIMIT 3",
+            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k ; \
+             asset360:name \"BX517\" } LIMIT 3",
         )
         .into_iter()
         .next()
@@ -3259,13 +2429,17 @@ mod tests {
         .expect("one SQL pass");
 
         let kinds: Vec<&str> = ops.nodes.iter().map(|node| node.op.kind()).collect();
+        // Project below the slice, which is SPARQL's own order: group, order,
+        // project, then offset and limit. The deleted planner emitted the
+        // slice first and projected on top; both render the same statement,
+        // and this one matches the algebra.
         assert_eq!(
             kinds,
-            vec!["scan", "group", "sort", "slice", "project"],
+            vec!["scan", "group", "sort", "project", "slice"],
             "{:#?}",
             ops.nodes
         );
-        assert_eq!(ops.root().map(|node| node.op.kind()), Some("project"));
+        assert_eq!(ops.root().map(|node| node.op.kind()), Some("slice"));
     }
 
     /// Lowering must carry the two facts a renderer cannot recover from the

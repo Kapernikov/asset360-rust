@@ -87,23 +87,17 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_function(wrap_pyfunction!(sparql_scope, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_inexact_reasons, m)?)?;
-        m.add_function(wrap_pyfunction!(py_sparql_pushdown, m)?)?;
-        m.add_function(wrap_pyfunction!(py_plan_query, m)?)?;
         m.add_function(wrap_pyfunction!(py_plan_query_refined, m)?)?;
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
-        m.add_function(wrap_pyfunction!(py_plan_query_refined_alone, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
         m.add_class::<Star>()?;
         m.add_class::<JoinEdge>()?;
         m.add_class::<FilterCondition>()?;
-        m.add_class::<PushdownVerdict>()?;
         m.add_class::<ExecutionPlan>()?;
         m.add_class::<PlanPass>()?;
-        m.add_class::<PushdownRefusal>()?;
         m.add_class::<PlanOp>()?;
-        m.add_class::<PushdownSolution>()?;
         m.add_class::<PushdownBinding>()?;
         m.add_class::<PushdownMeasure>()?;
         m.add_class::<PushdownOrder>()?;
@@ -2152,224 +2146,6 @@ impl PushdownOrder {
 #[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
-/// What SQL must produce for an eligible query: one row per solution, then
-/// grouping on top.
-pub struct PushdownSolution {
-    inner: crate::sparql_pushdown::SolutionSpec,
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
-#[pymethods]
-impl PushdownSolution {
-    #[getter]
-    fn bindings(&self) -> Vec<PushdownBinding> {
-        self.inner
-            .bindings
-            .iter()
-            .map(|b| PushdownBinding { inner: b.clone() })
-            .collect()
-    }
-
-    /// Indices into ``bindings`` forming the ``GROUP BY``. Empty is legal and
-    /// means one row over the whole input — SPARQL returns exactly one
-    /// solution for a bare aggregate, where a SQL ``GROUP BY`` over no rows
-    /// would return none, so the renderer must omit ``GROUP BY`` entirely.
-    #[getter]
-    fn group_keys(&self) -> Vec<usize> {
-        self.inner.group_keys.clone()
-    }
-
-    #[getter]
-    fn measures(&self) -> Vec<PushdownMeasure> {
-        self.inner
-            .measures
-            .iter()
-            .map(|m| PushdownMeasure { inner: m.clone() })
-            .collect()
-    }
-
-    /// Conditions on the grouped rows — SQL ``HAVING``. A conjunction: every
-    /// term must hold. Empty when the query has none.
-    #[getter]
-    fn having(&self) -> Vec<PushdownHaving> {
-        self.inner
-            .having
-            .iter()
-            .map(|term| PushdownHaving {
-                inner: term.clone(),
-            })
-            .collect()
-    }
-
-    #[getter]
-    fn order_by(&self) -> Vec<PushdownOrder> {
-        self.inner
-            .order_by
-            .iter()
-            .map(|o| PushdownOrder { inner: o.clone() })
-            .collect()
-    }
-
-    #[getter]
-    fn distinct(&self) -> bool {
-        self.inner.distinct
-    }
-
-    #[getter]
-    fn limit(&self) -> Option<usize> {
-        self.inner.limit
-    }
-
-    #[getter]
-    fn offset(&self) -> usize {
-        self.inner.offset
-    }
-
-    /// The variables the query asks for, in ``SELECT`` order.
-    ///
-    /// A measure or binding absent from this list is machinery: a value grouped
-    /// by but not selected, or an aggregate that exists only to order by — the
-    /// latter has no ``AS`` name, so emitting it would produce a column named
-    /// after an internal identifier.
-    #[getter]
-    fn projected(&self) -> Vec<String> {
-        self.inner.projected.clone()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "PushdownSolution(bindings={}, group_keys={:?}, measures={})",
-            self.inner.bindings.len(),
-            self.inner.group_keys,
-            self.inner.measures.len()
-        )
-    }
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
-#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[derive(Clone)]
-/// Verdict on whether a query's grouping and aggregation can be answered in
-/// SQL.
-///
-/// Three-way on purpose. ``"not_applicable"`` (not an aggregate at all) and
-/// ``"blocked"`` (an aggregate outside the supported subset) must not collapse
-/// into one falsy value: the first keeps the existing route silently, the
-/// second is reportable to whoever wrote the query.
-pub struct PushdownVerdict {
-    inner: crate::sparql_pushdown::Pushdown,
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
-#[pymethods]
-impl PushdownVerdict {
-    /// ``"not_applicable"``, ``"blocked"`` or ``"eligible"``.
-    #[getter]
-    fn kind(&self) -> &str {
-        use crate::sparql_pushdown::Pushdown;
-        match &self.inner {
-            Pushdown::NotApplicable => "not_applicable",
-            Pushdown::Blocked(_) => "blocked",
-            Pushdown::Eligible { .. } => "eligible",
-        }
-    }
-
-    /// Stable machine-readable refusal code, or ``None`` when not blocked.
-    /// Branch on this, never on ``detail``.
-    #[getter]
-    fn code(&self) -> Option<&'static str> {
-        use crate::sparql_pushdown::Pushdown;
-        match &self.inner {
-            Pushdown::Blocked(b) => Some(b.code.as_str()),
-            _ => None,
-        }
-    }
-
-    /// What blocked, in terms of the query and the data model.
-    #[getter]
-    fn detail(&self) -> Option<String> {
-        use crate::sparql_pushdown::Pushdown;
-        match &self.inner {
-            Pushdown::Blocked(b) => Some(b.detail.clone()),
-            _ => None,
-        }
-    }
-
-    /// Where in the query, when locatable — a variable or an operator.
-    #[getter]
-    fn at(&self) -> Option<String> {
-        use crate::sparql_pushdown::Pushdown;
-        match &self.inner {
-            Pushdown::Blocked(b) => b.at.clone(),
-            _ => None,
-        }
-    }
-
-    /// A supported shape to use instead. This is the field that turns a
-    /// refusal into a repair, so it is meant to be shown verbatim.
-    #[getter]
-    fn instead(&self) -> Option<&'static str> {
-        use crate::sparql_pushdown::Pushdown;
-        match &self.inner {
-            Pushdown::Blocked(b) => Some(b.instead()),
-            _ => None,
-        }
-    }
-
-    /// The plan the verdict was derived from, when ``kind == "eligible"``.
-    ///
-    /// A consumer needs **both**: the solution says what to project, group and
-    /// aggregate, and the plan says which rows — the classes, their filters and
-    /// the join edges. Reading only the solution silently drops every
-    /// constraint: ``FILTER(?l > 5)`` on a ``COUNT(*)`` yields a solution with
-    /// no bindings, and a bare aggregate's solution does not even name the
-    /// class.
-    ///
-    /// Use this rather than calling ``sparql_scope`` again — a second call
-    /// re-parses and could in principle disagree with the one behind the
-    /// verdict.
-    ///
-    /// One field does not carry over: this plan's :attr:`~QueryPlan.sql_limit`
-    /// is always ``None`` here, because an aggregate must see every solution
-    /// before it can be limited. The query's own ``LIMIT`` is
-    /// ``solution.limit``, which applies to the *grouped* rows — take it from
-    /// there, never from the plan.
-    #[getter]
-    fn plan(&self) -> Option<QueryPlan> {
-        use crate::sparql_pushdown::Pushdown;
-        match &self.inner {
-            Pushdown::Eligible { plan, .. } => Some(plan.clone().into()),
-            _ => None,
-        }
-    }
-
-    /// The solution spec when ``kind == "eligible"``, else ``None``.
-    #[getter]
-    fn solution(&self) -> Option<PushdownSolution> {
-        use crate::sparql_pushdown::Pushdown;
-        match &self.inner {
-            Pushdown::Eligible { solution, .. } => Some(PushdownSolution {
-                inner: solution.clone(),
-            }),
-            _ => None,
-        }
-    }
-
-    fn __repr__(&self) -> String {
-        match self.code() {
-            Some(code) => format!("PushdownVerdict(kind={:?}, code={:?})", self.kind(), code),
-            None => format!("PushdownVerdict(kind={:?})", self.kind()),
-        }
-    }
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
-#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[derive(Clone)]
 /// One operator of a database pass: a scan, a filter, a join, an unnest, a
 /// grouping, a sort, a distinct, a slice, or a projection.
 ///
@@ -2730,50 +2506,6 @@ impl PlanOp {
 #[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[derive(Clone)]
-/// Why an aggregate could not be pushed into SQL, in terms its author can act
-/// on.
-pub struct PushdownRefusal {
-    inner: crate::sparql_pushdown::Blocked,
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
-#[pymethods]
-impl PushdownRefusal {
-    /// Stable code from a closed set. Branch on this, never on ``detail``.
-    #[getter]
-    fn code(&self) -> &'static str {
-        self.inner.code.as_str()
-    }
-
-    /// What blocked, in terms of the query and the data model.
-    #[getter]
-    fn detail(&self) -> String {
-        self.inner.detail.clone()
-    }
-
-    /// Where in the query, when it can be located — a variable or a pattern.
-    #[getter]
-    fn at(&self) -> Option<String> {
-        self.inner.at.clone()
-    }
-
-    /// A supported shape to use instead. Meant to be shown verbatim: it is
-    /// what turns a rejection into a repair.
-    #[getter]
-    fn instead(&self) -> &'static str {
-        self.inner.instead()
-    }
-
-    fn __repr__(&self) -> String {
-        format!("PushdownRefusal(code={:?})", self.code())
-    }
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
-#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[derive(Clone)]
 /// One step of an execution plan.
 pub struct PlanPass {
     inner: crate::sparql_plan::Pass,
@@ -2978,20 +2710,22 @@ impl ExecutionPlan {
             .collect()
     }
 
-    /// Why an aggregate could not be answered in SQL, or ``None`` when that
-    /// did not arise — either SQL answered it, or the query never asked for
-    /// one.
+    /// The aggregate the statement did not take, or ``None`` when that did
+    /// not arise — either SQL answered it, or the query never asked for one.
+    ///
+    /// Read off the ledger: a ``GROUP BY`` or an aggregate that an *engine*
+    /// pass discharges is one SQL did not push. It replaces the structured
+    /// refusal the deleted single-pass planner carried — a stable ``code``, an
+    /// ``at`` and an ``instead`` rewrite hint — which went with the analyser
+    /// that decided eligibility for the grouped question as a whole. What is
+    /// left is the obligation itself, which still names the aggregate.
     ///
     /// Distinct from a pass's ``causes``, which explain a *slower* answer.
-    /// This is what to tell whoever wrote the query: a stable ``code``, the
-    /// ``detail``, optionally ``at`` (the variable or pattern), and
-    /// ``instead`` — the shape that would work.
+    /// This is the one a caller weighs against the size of the class the
+    /// engine would have to materialise to answer it.
     #[getter]
-    fn blocked(&self) -> Option<PushdownRefusal> {
-        self.inner
-            .blocked
-            .clone()
-            .map(|inner| PushdownRefusal { inner })
+    fn unpushed_aggregate(&self) -> Option<String> {
+        self.inner.unpushed_aggregate()
     }
 
     /// The whole ledger, as text: state, passes with what each discharges, the
@@ -3014,13 +2748,26 @@ impl ExecutionPlan {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
-#[pyo3(name = "plan_query")]
+#[pyo3(name = "plan_query_refined")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-/// Plan a SPARQL query: one parse, one scope, one analysis, one artifact.
+/// Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
 ///
-/// The entry point an executor should use. :func:`sparql_scope` and
-/// :func:`sparql_pushdown` remain for callers that predate it, and each
-/// re-parses the query to answer a question this artifact already contains.
+/// The only planner. A naive plan of the whole query is refined by rules to a
+/// fixpoint and lowered into the operators the caller renders. There used to
+/// be a second one — :func:`plan_query`, a single-pass analysis — and a
+/// runtime gate that ran both and compared them; both are gone.
+///
+/// ``refinement`` says how to run it:
+///
+/// * ``"used_alone"`` — the statement answers the whole query in SQL.
+/// * ``"used"`` — the statement is a *fetch* that narrows the rows and the
+///   engine finishes the query over them. ``refinement_note`` says what it
+///   left for the engine. Most queries are this shape, and it is not a
+///   defect: the engine re-runs the whole query, so the answer is correct
+///   either way.
+/// * ``"fallback"`` — the pipeline produced no statement and the scoper's
+///   fetch is used instead, with ``refinement_reason`` saying why. No shape in
+///   the frozen inventory does this.
 ///
 /// Args:
 ///     query: SPARQL query string.
@@ -3034,53 +2781,6 @@ impl ExecutionPlan {
 /// Raises:
 ///     ValueError: the query does not parse, is an update, or cannot be
 ///         scoped at all.
-fn py_plan_query(
-    py: Python<'_>,
-    query: &str,
-    schema_view: Py<PySchemaView>,
-) -> PyResult<ExecutionPlan> {
-    let bound = schema_view.bind(py);
-    let sv_ref = bound.borrow();
-    let sv = sv_ref.as_rust();
-
-    crate::sparql_plan::plan_query(query, sv)
-        .map(|inner| ExecutionPlan { inner })
-        // ScopeError's Display carries the wording the other entry points use,
-        // so the same failure reads the same however it was reached.
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyfunction]
-#[pyo3(name = "plan_query_refined")]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-/// Plan a SPARQL query through the refinement pipeline, falling back to
-/// :func:`plan_query` unless the refined plan claims at least as much.
-///
-/// Same artifact, same shape, same guarantees — a caller reads ``passes`` and
-/// their operators exactly as before. The difference is where the operators
-/// came from, and ``refinement`` says: ``"used"`` or ``"fallback"``, with
-/// ``refinement_reason`` naming what stopped it.
-///
-/// The gate compares the *row source*: the refined operators are used only
-/// when the statement they lower to is no wider a fetch and applies no less
-/// than the single-pass planner's — scanned classes, identifier restrictions,
-/// existence checks, conditions, joins, fan-outs, collapsing work. The claim
-/// ledger is reported beside it rather than gating on it, because a plan can
-/// claim more while rendering less.
-///
-/// Args:
-///     query: SPARQL query string.
-///     schema_view: The LinkML schema.
-///
-/// Returns:
-///     ExecutionPlan. Log ``refinement_reason`` when it is not ``None``: a
-///     fallback nobody can see is a fallback that becomes permanent.
-///
-/// Raises:
-///     ValueError: the query does not parse, is an update, or cannot be
-///         scoped at all — the same failures as :func:`plan_query`, because
-///         the fallback plan is that function's.
 fn py_plan_query_refined(
     py: Python<'_>,
     query: &str,
@@ -3091,45 +2791,6 @@ fn py_plan_query_refined(
     let sv = sv_ref.as_rust();
 
     crate::sparql_plan::plan_query_refined(query, sv)
-        .map(|inner| ExecutionPlan { inner })
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyfunction]
-#[pyo3(name = "plan_query_refined_alone")]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-/// Plan a query with the comparator removed — admission as it will be once the
-/// single-pass planner is deleted.
-///
-/// **A rehearsal, not a route.** The endpoint uses
-/// :func:`plan_query_refined`; this exists so the inventory can run the whole
-/// corpus through the post-deletion question while the planner it replaces is
-/// still here to contradict the answer. Every query asks one thing — does this
-/// plan answer the whole query in SQL — and a plan that does not has its
-/// statement used as a fetch with the engine finishing.
-///
-/// Args:
-///     query: SPARQL query string.
-///     schema_view: The LinkML schema.
-///
-/// Returns:
-///     ExecutionPlan, with ``refinement`` of ``"used_alone"`` (SQL answers
-///     it), ``"used"`` (SQL fetches, the engine finishes) or ``"fallback"``
-///     (no refined statement at all).
-///
-/// Raises:
-///     ValueError: the query does not parse or cannot be scoped.
-fn py_plan_query_refined_alone(
-    py: Python<'_>,
-    query: &str,
-    schema_view: Py<PySchemaView>,
-) -> PyResult<ExecutionPlan> {
-    let bound = schema_view.bind(py);
-    let sv_ref = bound.borrow();
-    let sv = sv_ref.as_rust();
-
-    crate::sparql_plan::plan_query_refined_alone(query, sv)
         .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -3165,46 +2826,6 @@ fn py_refined_plan_text(
     let sv = sv_ref.as_rust();
     crate::sparql_plan::refined_plan_text(query, sv)
         .map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyfunction]
-#[pyo3(name = "sparql_pushdown")]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-/// Classify a SPARQL query for aggregate pushdown.
-///
-/// Unlike :func:`sparql_scope`, which decides what to *load* for oxigraph to
-/// query, this decides whether the query's grouping and aggregation can be
-/// answered by SQL without loading anything — the only shape that works for an
-/// aggregate, which by definition touches every object of its class.
-///
-/// Args:
-///     query: SPARQL query string.
-///     schema_view: The LinkML schema, for resolving slots and ranges.
-///
-/// Returns:
-///     PushdownVerdict — inspect ``.kind`` first.
-///
-/// Raises:
-///     ValueError: the query does not parse or cannot be scoped at all. A
-///         query that parses but cannot be pushed down is a ``"blocked"``
-///         verdict, not an exception.
-fn py_sparql_pushdown(
-    py: Python<'_>,
-    query: &str,
-    schema_view: Py<PySchemaView>,
-) -> PyResult<PushdownVerdict> {
-    let bound = schema_view.bind(py);
-    let sv_ref = bound.borrow();
-    let sv = sv_ref.as_rust();
-
-    match crate::sparql_pushdown::analyse_pushdown(query, sv) {
-        Ok(verdict) => Ok(PushdownVerdict { inner: verdict }),
-        // ScopeError's Display produces exactly these strings, so there is one
-        // place to change when a variant is added — rather than two blocks
-        // fifty lines apart that stayed identical by luck.
-        Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e.to_string())),
-    }
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
