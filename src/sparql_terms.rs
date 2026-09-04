@@ -297,7 +297,9 @@ mod tests {
         // `trackLength` is the case that motivated resolving numeric-ness from
         // the datatype rather than the range's name: a schema-defined type
         // whose `typeof` chain ends at integer is a number, though nothing
-        // about the spelling "TrackLength" says so.
+        // about the spelling "TrackLength" says so. Since upstream learned to
+        // inherit a datatype through `typeof`, it is also the case that proves
+        // the chain is followed rather than the range looked up by name.
         let schema_yaml = r#"
 id: https://data.infrabel.be/asset360
 name: asset360
@@ -404,19 +406,27 @@ classes:
         assert!(d.numeric);
     }
 
-    /// A type declared only via `typeof`, with no `uri` of its own, gets no
-    /// datatype from the schema — so it is a plain literal to the turtle writer
-    /// and non-numeric here. Asserted rather than fixed: the two routes agree,
-    /// which is the property that matters, and summing plain literals is a type
-    /// error in SPARQL too. Fixing it means teaching upstream's
-    /// `determine_rdf_type_info` to inherit a datatype through `typeof`, which
-    /// changes serialisation and belongs there, not here.
+    /// A type declared only via `typeof`, with no `uri` of its own, now
+    /// inherits its datatype through the `typeof` chain — so `TrackLength`,
+    /// which is an `integer` by way of nothing but its `typeof`, is a typed
+    /// literal and a number here.
+    ///
+    /// This test used to assert the opposite, and said so: the datatype was
+    /// lost, both routes agreed it was a plain literal, and the fix belonged
+    /// upstream in `determine_rdf_type_info` because it changes serialisation.
+    /// Upstream made exactly that fix. The assertion is inverted rather than
+    /// deleted, because the property being guarded has not changed — the SQL
+    /// route and the turtle writer must describe this slot the same way — and
+    /// a summable number is the better answer of the two.
     #[test]
-    fn typeof_only_type_has_no_datatype_and_is_not_numeric() {
+    fn typeof_only_type_inherits_its_datatype_and_is_numeric() {
         let d = describe("trackLength");
-        assert_eq!(d.datatype, None);
-        assert!(!d.numeric);
-        // The parity that matters: a plain literal on both routes.
+        assert_eq!(
+            d.datatype.as_deref(),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+        assert!(d.numeric);
+        // The parity that matters: the same literal on both routes.
         assert_eq!(d.kind, TermKind::Literal);
     }
 
