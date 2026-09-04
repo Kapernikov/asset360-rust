@@ -969,6 +969,31 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
     tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
 
+    // Phase 0b: forget what a `GRAPH` clause asked of the *schema* graph.
+    //
+    // Scoping decides which golden records to fetch. The endpoint serves one
+    // named graph and it holds the datamodel, so a pattern inside it names
+    // schema terms and no record at all. Feeding those into star building asks
+    // the wrong question and gets a wrong answer: a schema pattern with a
+    // constant IRI subject — which is how every enum-value lookup is written —
+    // was rejected as an unscopable instance subject.
+    //
+    // Any *other* named graph keeps the behaviour it had. The endpoint holds no
+    // such graph, so the triples inside are still walked into the fetch and the
+    // plan is still marked `Inexact::NamedGraph`, leaving the engine to answer
+    // from a graph that is empty. Over-fetching for a graph nobody has is
+    // wasteful, not wrong, and narrowing it is a separate change.
+    //
+    // Filtered here rather than inside `tag_triples_by_depth`, because that
+    // enumeration is also the obligation list the plan refiner consumes
+    // positionally: dropping triples there would leave the refiner's algebra
+    // walk claiming obligations that no longer exist.
+    let schema_triples = triples_in_the_schema_graph(pattern);
+    if !schema_triples.is_empty() {
+        triples_with_depth
+            .retain(|(triple, _)| !schema_triples.contains(&std::ptr::from_ref(*triple)));
+    }
+
     // Anything dropped along the way is recorded here, at the point it is
     // dropped. The first cause wins: one actionable reason beats a list.
     let mut inexact: Option<Inexact> = None;
@@ -1962,6 +1987,68 @@ pub(crate) fn tag_triples_by_depth<'a>(
     }
 }
 
+/// Every triple pattern that reads the schema graph, by identity.
+///
+/// Identity and not value: two textually identical patterns, one inside the
+/// `GRAPH` and one outside, are different obligations and only the first is a
+/// schema pattern.
+///
+/// A `GRAPH` naming a *variable* counts too. It may bind to the schema graph,
+/// and a pattern that might be about the datamodel cannot be scoped as if it
+/// were certainly about golden records. A `GRAPH` naming some other constant
+/// IRI does not: the endpoint has no such graph, and its long-standing
+/// behaviour — walk the triples into the fetch, mark the plan inexact, let the
+/// engine answer from an empty graph — is left exactly as it was.
+fn triples_in_the_schema_graph(pattern: &GraphPattern) -> HashSet<*const TriplePattern> {
+    fn reads_the_schema_graph(name: &spargebra::term::NamedNodePattern) -> bool {
+        match name {
+            spargebra::term::NamedNodePattern::NamedNode(node) => {
+                node.as_str() == crate::sparql_schema_graph::SCHEMA_GRAPH_IRI
+            }
+            spargebra::term::NamedNodePattern::Variable(_) => true,
+        }
+    }
+
+    fn walk(pattern: &GraphPattern, inside: bool, out: &mut HashSet<*const TriplePattern>) {
+        match pattern {
+            GraphPattern::Bgp { patterns } => {
+                if inside {
+                    for triple in patterns {
+                        out.insert(std::ptr::from_ref(triple));
+                    }
+                }
+            }
+            GraphPattern::Graph { name, inner } => {
+                walk(inner, inside || reads_the_schema_graph(name), out)
+            }
+            GraphPattern::Join { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Minus { left, right } => {
+                walk(left, inside, out);
+                walk(right, inside, out);
+            }
+            GraphPattern::LeftJoin { left, right, .. } => {
+                walk(left, inside, out);
+                walk(right, inside, out);
+            }
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => walk(inner, inside, out),
+            GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+        }
+    }
+
+    let mut out = HashSet::new();
+    walk(pattern, false, &mut out);
+    out
+}
+
 /// Collect the FILTER conditions that can be pushed to SQL.
 ///
 /// Returns the cause when anything was left behind, which the caller records as
@@ -2881,11 +2968,17 @@ fn cause_for_unconsumed(tp: &TriplePattern, depth: usize, schema_view: &SchemaVi
 
 /// A `GRAPH` or `SERVICE` block anywhere in the pattern.
 ///
-/// Both are walked transparently by everything else here, which is right for a
-/// prefetch — the triples inside still say which classes to load — and wrong
-/// for an exact plan: the plan reads the default graph of the local database,
-/// so a named-graph pattern is answered from the wrong graph and a remote
-/// pattern from the wrong endpoint.
+/// Either one makes the plan inexact, so the engine re-applies the whole query:
+/// the plan reads one relation — the local default graph — so a named-graph
+/// pattern is answered from the wrong graph and a remote pattern from the wrong
+/// endpoint.
+///
+/// A `SERVICE` block is still walked transparently by the triple enumeration,
+/// on the old assumption that the triples inside say which classes to load. A
+/// `GRAPH` block no longer is: the endpoint's only named graph holds the
+/// datamodel, so its patterns name schema terms rather than golden records.
+/// `triples_inside_named_graphs` drops them before star building, and this
+/// inexactness is what still routes the query to the engine.
 fn contains_foreign_scope(pattern: &GraphPattern) -> Option<Inexact> {
     match pattern {
         GraphPattern::Graph { .. } => Some(Inexact::NamedGraph),
@@ -3434,17 +3527,20 @@ classes:
                 Inexact::TaggedConstant,
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX1\"@en }",
             ),
+            // A GRAPH block over a graph the endpoint does not have: the plan
+            // reads the default one. (The *schema* graph is different — its
+            // patterns are dropped before star building, and the query below
+            // has none.)
+            (
+                Inexact::NamedGraph,
+                "SELECT ?s WHERE { GRAPH <urn:g> { ?s a asset360:Signal } }",
+            ),
             // UNDEF means "no constraint", so dropping the cell turned a union
             // into an intersection.
             (
                 Inexact::UndefInValues,
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  VALUES ?nm { \"BX1\" UNDEF } }",
-            ),
-            // A GRAPH block names a graph; the plan reads the default one.
-            (
-                Inexact::NamedGraph,
-                "SELECT ?s WHERE { GRAPH <urn:g> { ?s a asset360:Signal } }",
             ),
             // A SERVICE block reads another endpoint entirely.
             (
@@ -3540,13 +3636,64 @@ classes:
                  asset360:location [ asset360:longitude ?v ] }",
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv)
+                .unwrap_or_else(|e| panic!("scope failed for {query}: {e:?}"));
             assert_eq!(
                 plan.inexact,
                 Some(expected),
                 "wrong cause recorded for: {query}"
             );
         }
+    }
+
+    /// A `GRAPH` pattern is not an instance pattern.
+    ///
+    /// The endpoint's only named graph holds the datamodel, so a pattern inside
+    /// one says nothing about which golden records to fetch. Two things follow,
+    /// and both used to be wrong: the instance scope must come from the default
+    /// graph alone, and a constant IRI subject inside a `GRAPH` — a schema term,
+    /// which is how every enum-value lookup is written — must not be refused as
+    /// an unscopable instance subject.
+    #[test]
+    fn a_named_graph_pattern_does_not_scope_the_fetch() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/>                       PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
+
+        let plan = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?s ?l WHERE {{ ?s a asset360:Signal .                  GRAPH <https://data.infrabel.be/asset360/schema> {{                  <https://example.org/term> rdfs:label ?l }} }}"
+            ),
+            &sv,
+        )
+        .expect("a schema pattern must not make the query unscopable");
+
+        let stars = plan.root.all_stars();
+        assert_eq!(
+            stars.len(),
+            1,
+            "the fetch must come from the default graph alone, got {stars:?}"
+        );
+        assert!(stars[0].class_uri.ends_with("Signal"), "{stars:?}");
+        // The engine has to finish it, because the plan cannot read the graph.
+        assert_eq!(plan.inexact, Some(Inexact::NamedGraph));
+    }
+
+    /// A query that reads *only* a named graph has no instance scope at all.
+    ///
+    /// This is the honest answer rather than a fetch of everything: the scoper
+    /// owns golden records and this query asks about none. The endpoint answers
+    /// it from the schema graph with no objects loaded.
+    #[test]
+    fn a_query_reading_only_a_named_graph_is_unscoped() {
+        let sv = test_schema_view();
+        let result = sparql_scope(
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>              SELECT ?c ?l WHERE { GRAPH <https://data.infrabel.be/asset360/schema>              { ?c rdfs:label ?l } }",
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::Unscoped(_))),
+            "expected Unscoped, got {result:?}"
+        );
     }
 
     /// Every cause carries all three strings, and no two share a wire form.

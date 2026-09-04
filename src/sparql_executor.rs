@@ -13,6 +13,15 @@
 //!
 //! No data persists between queries — the store is created and destroyed per
 //! request. Caching is planned as a future optimisation.
+//!
+//! The active datamodel is also loaded, into its own named graph, so a client
+//! can discover classes, slots and enum values instead of being told them out
+//! of band. See [`crate::sparql_schema_graph`] for what it holds and why it is
+//! a *named* graph. It is built only for a query that carries a `GRAPH` clause
+//! — nothing else can read it — so an instance query pays nothing for it. A
+//! query that does read it pays the build every time: ~3,200 quads and ~80 ms
+//! against the live asset360 schema, which is where a cache keyed on the
+//! schema view would go if discovery queries ever become frequent.
 
 #[cfg(feature = "sparql-endpoint")]
 use oxigraph::io::RdfFormat;
@@ -183,6 +192,27 @@ pub fn sparql_execute(
             count: triple_count,
             limit: limits.max_triples,
         });
+    }
+
+    // The datamodel, in its own named graph. Deliberately *after* the triple
+    // limit check: the limit is about how much instance data a query scoped to,
+    // and folding a fixed schema overhead into it would change which queries
+    // are refused without telling anyone. It is deliberately in a named graph
+    // and not the default one — see [`crate::sparql_schema_graph`] — so the
+    // default graph stays byte-identical and the two routes still agree.
+    //
+    // Built only when the query could actually read it. That is not an
+    // optimisation bolted on afterwards but the same fact stated twice: a named
+    // graph is unreachable without a `GRAPH` clause, so for an instance query
+    // the work would be pure waste. It also means this feature adds exactly
+    // zero cost to every request that existed before it.
+    if crate::sparql_schema_graph::query_reads_named_graphs(query_str) {
+        let schema_graph = crate::sparql_schema_graph::SchemaGraph::build(schema_view);
+        for quad in &schema_graph.quads {
+            store
+                .insert(quad)
+                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+        }
     }
 
     // Execute query
@@ -727,6 +757,317 @@ classes:
             assert!(
                 plan.root.all_stars()[0].filters.contains_key(slot),
                 "exact, but nothing pushed for {triple}"
+            );
+        }
+    }
+}
+
+/// The schema named graph, seen from the query engine.
+///
+/// [`crate::sparql_schema_graph`] tests what is emitted; these test what a
+/// client actually gets back, and — the load-bearing one — that its presence
+/// does not change a single instance answer.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod schema_graph_tests {
+    use super::*;
+    use crate::sparql_schema_graph::SCHEMA_GRAPH_IRI;
+    use linkml_runtime::load_json_str;
+    use linkml_schemaview::identifier::Identifier;
+
+    const GSA_IRI: &str = "http://ontorail.org/src/Eulynx/eul2207a/EAID_28C3D8B9";
+
+    fn schema() -> SchemaView {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+
+        let schema_yaml = r#"
+id: https://data.infrabel.be/asset360
+name: asset360
+prefixes:
+  asset360:
+    prefix_reference: https://data.infrabel.be/asset360/
+  eulynx:
+    prefix_reference: http://ontorail.org/src/Eulynx/eul2207a/
+  linkml:
+    prefix_reference: https://w3id.org/linkml/
+default_prefix: asset360
+default_range: string
+
+enums:
+  SignalTypeEnum:
+    description: The kind of signal.
+    permissible_values:
+      GSA:
+        description: Group start signal, type A.
+        meaning: eulynx:EAID_28C3D8B9
+      LOCAL_ONLY: {}
+
+classes:
+  Signal:
+    class_uri: asset360:Signal
+    description: A signal.
+    attributes:
+      asset360_uri:
+        identifier: true
+      name:
+        range: string
+      signalType:
+        range: SignalTypeEnum
+"#;
+        let schema: SchemaDefinition =
+            p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        sv
+    }
+
+    fn instances(sv: &SchemaView) -> Vec<LinkMLInstance> {
+        let conv = sv.converter();
+        let cv = sv
+            .get_class(&Identifier::new("Signal"), &conv)
+            .unwrap()
+            .unwrap();
+        [
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/BX517", "name": "BX517", "signalType": "GSA"}"#,
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/BX518", "name": "BX518", "signalType": "LOCAL_ONLY"}"#,
+        ]
+        .iter()
+        .map(|json| {
+            load_json_str(json, sv, &cv, &conv)
+                .unwrap()
+                .into_instance_tolerate_errors()
+                .unwrap()
+        })
+        .collect()
+    }
+
+    fn run(sv: &SchemaView, instances: &[LinkMLInstance], query: &str) -> serde_json::Value {
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let raw = sparql_execute(query, &refs, sv, "json", ExecuteLimits::default())
+            .unwrap_or_else(|err| panic!("query failed: {err}\n{query}"));
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// The question that motivated the feature: an enum value comes back as an
+    /// opaque IRI, and the client wants the code.
+    #[test]
+    fn the_schema_graph_answers_a_label_lookup_for_an_enum_value() {
+        let sv = schema();
+        let instances = instances(&sv);
+        let answer = run(
+            &sv,
+            &instances,
+            &format!(
+                "SELECT ?code WHERE {{ GRAPH <{SCHEMA_GRAPH_IRI}> {{ \
+                 <{GSA_IRI}> <http://www.w3.org/2000/01/rdf-schema#label> ?code }} }}"
+            ),
+        );
+        let bindings = answer["results"]["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 1, "expected exactly one label: {answer}");
+        assert_eq!(bindings[0]["code"]["value"], "GSA");
+    }
+
+    /// Discovery without knowing any IRI up front: from the class, to its
+    /// slot, to the slot's enum, to the enum's permissible values.
+    #[test]
+    fn a_client_can_walk_from_a_class_to_an_enum_s_permissible_values() {
+        let sv = schema();
+        let instances = instances(&sv);
+        let answer = run(
+            &sv,
+            &instances,
+            &format!(
+                "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+                 PREFIX skos: <http://www.w3.org/2004/02/skos/core#> \
+                 PREFIX schema: <https://schema.org/> \
+                 SELECT ?code WHERE {{ GRAPH <{SCHEMA_GRAPH_IRI}> {{ \
+                   ?class rdfs:label \"Signal\" . \
+                   ?slot schema:domainIncludes ?class ; rdfs:label \"signalType\" ; rdfs:range ?enum . \
+                   ?value skos:inScheme ?enum ; rdfs:label ?code . \
+                 }} }} ORDER BY ?code"
+            ),
+        );
+        let bindings = answer["results"]["bindings"].as_array().unwrap();
+        let codes: Vec<&str> = bindings
+            .iter()
+            .map(|b| b["code"]["value"].as_str().unwrap())
+            .collect();
+        // Only `GSA` has a `meaning`, so only `GSA` has an IRI to describe.
+        // `LOCAL_ONLY` is legible in the instance data as a plain literal and
+        // is deliberately absent here.
+        assert_eq!(codes, vec!["GSA"], "{answer}");
+    }
+
+    /// The parity guard, asserted directly rather than trusted: the schema
+    /// graph must not add, remove or change one instance solution — including
+    /// for the wide-open `?s ?p ?o` shape the differential oracle uses.
+    #[test]
+    fn instance_answers_are_unchanged_by_the_schema_graph() {
+        let sv = schema();
+        let instances = instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+
+        // The second half of each pair carries a `GRAPH` clause that can never
+        // match, so it binds nothing and drops no row — but it does force the
+        // schema graph to be built and loaded. Without it the executor's
+        // "only build when a GRAPH clause could read it" gate would mean these
+        // cases never see a loaded schema graph, and the test would prove the
+        // gate rather than the isolation.
+        let noop_graph = format!(
+            "OPTIONAL {{ GRAPH <{SCHEMA_GRAPH_IRI}> {{ <urn:x:none> <urn:x:none> <urn:x:none> }} }}"
+        );
+        let cases = [
+            (
+                "SELECT ?s ?p ?o WHERE { ?s ?p ?o } ORDER BY ?s ?p ?o".to_owned(),
+                format!("SELECT ?s ?p ?o WHERE {{ ?s ?p ?o {noop_graph} }} ORDER BY ?s ?p ?o"),
+            ),
+            (
+                "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                 SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name } \
+                 ORDER BY ?name"
+                    .to_owned(),
+                format!(
+                    "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                     SELECT ?s ?name WHERE {{ ?s a asset360:Signal ; asset360:name ?name . \
+                     {noop_graph} }} ORDER BY ?name"
+                ),
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }".to_owned(),
+                format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s ?p ?o {noop_graph} }}"),
+            ),
+        ];
+
+        for (query, forced) in &cases {
+            let query = query.as_str();
+            let with_schema = sparql_execute(query, &refs, &sv, "json", ExecuteLimits::default())
+                .unwrap_or_else(|err| panic!("{query}: {err}"));
+            let with_schema_loaded =
+                sparql_execute(forced, &refs, &sv, "json", ExecuteLimits::default())
+                    .unwrap_or_else(|err| panic!("{forced}: {err}"));
+
+            // The same query against a store holding instance data only.
+            let store = Store::new().unwrap();
+            let conv = sv.converter();
+            let primary = sv.primary_schema().unwrap();
+            for instance in &refs {
+                let turtle = turtle_to_string(
+                    instance,
+                    &sv,
+                    &primary,
+                    &conv,
+                    TurtleOptions { skolem: false },
+                )
+                .unwrap();
+                store
+                    .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
+                    .unwrap();
+            }
+            let baseline = match store.query(query).unwrap() {
+                QueryResults::Solutions(solutions) => {
+                    let vars: Vec<String> = solutions
+                        .variables()
+                        .iter()
+                        .map(|v| v.as_str().to_owned())
+                        .collect();
+                    let mut rows = Vec::new();
+                    for solution in solutions {
+                        let solution = solution.unwrap();
+                        let mut row = serde_json::Map::new();
+                        for var in &vars {
+                            if let Some(term) = solution.get(var.as_str()) {
+                                row.insert(var.clone(), term_to_json(term));
+                            }
+                        }
+                        rows.push(serde_json::Value::Object(row));
+                    }
+                    serde_json::json!({
+                        "head": { "vars": vars },
+                        "results": { "bindings": rows }
+                    })
+                }
+                _ => panic!("expected solutions for {query}"),
+            };
+
+            let with_schema: serde_json::Value = serde_json::from_str(&with_schema).unwrap();
+            let with_schema_loaded: serde_json::Value =
+                serde_json::from_str(&with_schema_loaded).unwrap();
+            assert_eq!(
+                with_schema, baseline,
+                "the schema graph changed a default-graph answer: {query}"
+            );
+            assert_eq!(
+                with_schema_loaded, baseline,
+                "with the schema graph actually loaded, a default-graph answer changed: {forced}"
+            );
+        }
+    }
+
+    /// A query mixing schema and instance patterns must answer, not error: the
+    /// instance half from the default graph, the schema half from the named
+    /// one. Tier 1 does not teach the SQL planner about schema patterns, so
+    /// this shape is expected to be finished by the engine leg — which is the
+    /// leg under test here.
+    #[test]
+    fn a_mixed_schema_and_instance_query_answers() {
+        let sv = schema();
+        let instances = instances(&sv);
+        let answer = run(
+            &sv,
+            &instances,
+            &format!(
+                "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+                 SELECT ?name ?code WHERE {{ \
+                   ?s a asset360:Signal ; asset360:name ?name ; asset360:signalType ?type . \
+                   OPTIONAL {{ GRAPH <{SCHEMA_GRAPH_IRI}> {{ ?type rdfs:label ?code }} }} \
+                 }} ORDER BY ?name"
+            ),
+        );
+        let bindings = answer["results"]["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 2, "{answer}");
+        assert_eq!(bindings[0]["name"]["value"], "BX517");
+        assert_eq!(
+            bindings[0]["code"]["value"], "GSA",
+            "the enum IRI should have resolved to its code: {answer}"
+        );
+        assert_eq!(bindings[1]["name"]["value"], "BX518");
+        // `LOCAL_ONLY` has no meaning, so `?type` is a literal with no IRI to
+        // describe and the OPTIONAL binds nothing. That is the honest answer,
+        // not an error.
+        assert!(
+            bindings[1].get("code").is_none(),
+            "a meaning-less value must not acquire a label: {answer}"
+        );
+    }
+
+    /// A schema pattern in the *default* graph must still find nothing. This is
+    /// what keeps the two execution routes in agreement, so it is asserted
+    /// rather than left implied by the named-graph loading code.
+    #[test]
+    fn schema_triples_are_invisible_in_the_default_graph() {
+        let sv = schema();
+        let instances = instances(&sv);
+        // The UNION's second branch loads the schema graph and proves it is
+        // non-empty; the first branch asks the default graph the same question.
+        // Every solution must therefore carry a bound `?g`.
+        let answer = run(
+            &sv,
+            &instances,
+            "SELECT ?g ?l WHERE { \
+               { ?t <http://www.w3.org/2000/01/rdf-schema#label> ?l } UNION \
+               { GRAPH ?g { ?t <http://www.w3.org/2000/01/rdf-schema#label> ?l } } }",
+        );
+        let bindings = answer["results"]["bindings"].as_array().unwrap();
+        assert!(
+            !bindings.is_empty(),
+            "the schema graph should have supplied labels: {answer}"
+        );
+        for binding in bindings {
+            assert_eq!(
+                binding["g"]["value"], SCHEMA_GRAPH_IRI,
+                "an rdfs:label was visible outside the schema graph: {answer}"
             );
         }
     }
