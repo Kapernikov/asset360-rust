@@ -1562,17 +1562,15 @@ fn lower_having(
             OrderKey::Measure(index),
             crate::sparql_pushdown::measure_form(&measures[index].func),
         )
-    } else if let Some(index) = group_keys
-        .iter()
-        .copied()
-        .find(|index| &bindings[*index].var == name)
-    {
-        (OrderKey::Binding(index), MeasureForm::Column(index))
     } else {
-        // Bound but neither grouped nor aggregated: a grouped row has no
-        // single value for it, and SPARQL agrees -- outside a grouping the
-        // variable is not in scope.
-        return None;
+        // Bound but neither grouped nor aggregated is no match: a grouped row
+        // has no single value for it, and SPARQL agrees -- outside a grouping
+        // the variable is not in scope.
+        let index = group_keys
+            .iter()
+            .copied()
+            .find(|index| &bindings[*index].var == name)?;
+        (OrderKey::Binding(index), MeasureForm::Column(index))
     };
 
     let (value, numeric) =
