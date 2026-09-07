@@ -1532,8 +1532,17 @@ fn lower_measure(
                 // descriptor is what the renderer casts on, so the fact that
                 // decides a cast and the fact that decides the push are the
                 // same fact.
-                AggregateFunction::Sum if bindings[arg].descriptor.numeric => Func::Sum { arg },
-                AggregateFunction::Avg if bindings[arg].descriptor.numeric => Func::Avg { arg },
+                // `distinct` is carried, not dropped: `SUM(DISTINCT ?y)` over
+                // 9, 9, 2001 is 2010 and `SUM(?y)` is 2019, and a renderer
+                // that cannot see the flag emits the second for the first.
+                AggregateFunction::Sum if bindings[arg].descriptor.numeric => Func::Sum {
+                    arg,
+                    distinct: *distinct,
+                },
+                AggregateFunction::Avg if bindings[arg].descriptor.numeric => Func::Avg {
+                    arg,
+                    distinct: *distinct,
+                },
                 AggregateFunction::Min => Func::Min { arg },
                 AggregateFunction::Max => Func::Max { arg },
                 _ => return None,
@@ -2379,6 +2388,79 @@ mod tests {
                  ?t a asset360:Track ; asset360:hasName ?tn }"
             ),
             vec![("locatedOnTrack".to_owned(), false)],
+        );
+    }
+
+    /// `SUM(DISTINCT ?v)` and `AVG(DISTINCT ?v)` keep their DISTINCT through
+    /// lowering.
+    ///
+    /// The bug this fixes was live and silent: the lowering admitted the
+    /// aggregate and dropped the flag, so the SQL renderer -- which can only
+    /// see what the operators say -- emitted a plain `sum`. Over the years 9,
+    /// 9 and 2001 the endpoint answered 2019 from SQL where the engine
+    /// answered 2010, and nothing raised.
+    ///
+    /// `MIN`/`MAX` are asserted *not* to carry it, which is not an oversight:
+    /// the extreme of a multiset is the extreme of its distinct values, so a
+    /// consumer has nothing to do differently and a flag would only invite a
+    /// pointless deduplication.
+    #[test]
+    fn distinct_survives_lowering_for_sum_and_avg() {
+        let measures = |query: &str| -> Vec<(String, String, bool)> {
+            sql_passes(query)
+                .into_iter()
+                .flat_map(|(_, tree)| tree.nodes)
+                .filter_map(|node| match node.op {
+                    Op::Group { measures, .. } => Some(measures),
+                    _ => None,
+                })
+                .flatten()
+                .map(|m| {
+                    use crate::sparql_pushdown::Measure;
+                    let (name, distinct) = match m.func {
+                        Measure::Count { distinct, .. } => ("count", distinct),
+                        Measure::Sum { distinct, .. } => ("sum", distinct),
+                        Measure::Avg { distinct, .. } => ("avg", distinct),
+                        Measure::Min { .. } => ("min", false),
+                        Measure::Max { .. } => ("max", false),
+                    };
+                    (m.var, name.to_owned(), distinct)
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            measures(
+                "SELECT (SUM(DISTINCT ?y) AS ?t) WHERE { ?s a asset360:Signal ; \
+                 asset360:length ?y }"
+            ),
+            vec![("t".to_owned(), "sum".to_owned(), true)],
+        );
+        assert_eq!(
+            measures(
+                "SELECT (AVG(DISTINCT ?y) AS ?a) WHERE { ?s a asset360:Signal ; \
+                 asset360:length ?y }"
+            ),
+            vec![("a".to_owned(), "avg".to_owned(), true)],
+        );
+        // The plain forms must stay plain, or every sum would deduplicate.
+        assert_eq!(
+            measures(
+                "SELECT (SUM(?y) AS ?t) (AVG(?y) AS ?a) WHERE { ?s a asset360:Signal ; \
+                 asset360:length ?y }"
+            ),
+            vec![
+                ("t".to_owned(), "sum".to_owned(), false),
+                ("a".to_owned(), "avg".to_owned(), false),
+            ],
+        );
+        // A DISTINCT on MIN/MAX is a no-op and is not carried.
+        assert_eq!(
+            measures(
+                "SELECT (MIN(DISTINCT ?y) AS ?lo) WHERE { ?s a asset360:Signal ; \
+                 asset360:length ?y }"
+            ),
+            vec![("lo".to_owned(), "min".to_owned(), false)],
         );
     }
 

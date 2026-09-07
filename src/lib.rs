@@ -2010,19 +2010,27 @@ impl PushdownMeasure {
         use crate::sparql_pushdown::Measure;
         match self.inner.func {
             Measure::Count { arg, .. } => arg,
-            Measure::Sum { arg }
-            | Measure::Avg { arg }
+            Measure::Sum { arg, .. }
+            | Measure::Avg { arg, .. }
             | Measure::Min { arg }
             | Measure::Max { arg } => Some(arg),
         }
     }
 
-    /// ``True`` for ``COUNT(DISTINCT ...)``. Always ``False`` for the other
-    /// functions, where SPARQL has no DISTINCT form this subset accepts.
+    /// ``True`` for ``COUNT(DISTINCT ...)``, ``SUM(DISTINCT ...)`` and
+    /// ``AVG(DISTINCT ...)``.
+    ///
+    /// Always ``False`` for ``MIN`` and ``MAX``, where it is a no-op: the
+    /// extreme of a multiset is the extreme of its distinct values.
     #[getter]
     fn distinct(&self) -> bool {
         use crate::sparql_pushdown::Measure;
-        matches!(self.inner.func, Measure::Count { distinct: true, .. })
+        matches!(
+            self.inner.func,
+            Measure::Count { distinct: true, .. }
+                | Measure::Sum { distinct: true, .. }
+                | Measure::Avg { distinct: true, .. }
+        )
     }
 
     fn __repr__(&self) -> String {

@@ -110,22 +110,23 @@ pub struct MeasureSpec {
 #[derive(Debug, Clone)]
 pub enum Measure {
     /// `COUNT(*)` when `arg` is `None`, `COUNT(?v)` when it is a binding index.
-    Count {
-        arg: Option<usize>,
-        distinct: bool,
-    },
-    Sum {
-        arg: usize,
-    },
-    Avg {
-        arg: usize,
-    },
-    Min {
-        arg: usize,
-    },
-    Max {
-        arg: usize,
-    },
+    Count { arg: Option<usize>, distinct: bool },
+    /// `SUM(?v)`, or `SUM(DISTINCT ?v)` when `distinct`.
+    ///
+    /// The flag is carried rather than dropped because it changes the number:
+    /// `SUM(DISTINCT ...)` sums each *distinct value* once, and a consumer that
+    /// cannot see the flag renders a plain `sum` and answers a different
+    /// question. It was dropped here once, and the endpoint's SQL route
+    /// reported 2019 where the engine reported 2010.
+    Sum { arg: usize, distinct: bool },
+    /// `AVG(?v)`, or `AVG(DISTINCT ?v)`. Same reason as `Sum`.
+    Avg { arg: usize, distinct: bool },
+    /// `MIN(?v)`. `DISTINCT` is deliberately not carried: the minimum of a
+    /// multiset and the minimum of its distinct values are the same term, so
+    /// there is nothing for a consumer to do differently.
+    Min { arg: usize },
+    /// `MAX(?v)`. `DISTINCT` is a no-op, as for `Min`.
+    Max { arg: usize },
 }
 
 /// One `HAVING` comparison: a solution column against a constant.
@@ -183,8 +184,14 @@ impl Measure {
                 let distinct = if *distinct { "distinct " } else { "" };
                 format!("count({distinct}#{arg})")
             }
-            Self::Sum { arg } => format!("sum(#{arg})"),
-            Self::Avg { arg } => format!("avg(#{arg})"),
+            Self::Sum { arg, distinct } => {
+                let distinct = if *distinct { "distinct " } else { "" };
+                format!("sum({distinct}#{arg})")
+            }
+            Self::Avg { arg, distinct } => {
+                let distinct = if *distinct { "distinct " } else { "" };
+                format!("avg({distinct}#{arg})")
+            }
             Self::Min { arg } => format!("min(#{arg})"),
             Self::Max { arg } => format!("max(#{arg})"),
         }
