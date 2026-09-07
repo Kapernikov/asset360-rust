@@ -50,7 +50,7 @@ stubgen = [
     "linkml_meta/stubgen"
 ]
 shacl-parser = ["dep:oxttl", "dep:oxrdf"]
-sparql-endpoint = ["shacl-parser", "dep:oxigraph"]
+sparql-endpoint = ["shacl-parser", "dep:oxigraph", "dep:oxrdf"]
 wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys", "dep:getrandom", "dep:getrandom_03"]
 minijinja-wasm = [
     "wasm-bindings",

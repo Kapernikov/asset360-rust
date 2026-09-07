@@ -205,6 +205,13 @@ pub enum Op {
         right_star: String,
         /// Slot on the right whose value is the left row's `asset360_uri`.
         right_slot: String,
+        /// Whether `right_slot` holds a collection of identifiers.
+        ///
+        /// Same fact and same reason as [`JoinEdge::right_multivalued`]: a
+        /// renderer that ignores it emits `object_data->>'slot' = uri`, which
+        /// compares an array's text and matches nothing — an empty join with
+        /// no error to say so.
+        right_multivalued: bool,
         kind: JoinType,
     },
     /// Grouping and aggregation. `keys` are indices into `bindings`; empty
@@ -423,6 +430,7 @@ pub fn lower_sql_pass(
                 left_star: join.left.clone(),
                 right_star: join.right.clone(),
                 right_slot: join.right_slot.clone(),
+                right_multivalued: join.right_multivalued,
                 kind: join.join_type,
             },
             discharges: Vec::new(),
@@ -974,6 +982,16 @@ pub fn lower_refined(
                         left_star: edge.referenced.clone(),
                         right_star: edge.holder.clone(),
                         right_slot: edge.slot.clone(),
+                        // A *pushed* join is single-valued by construction:
+                        // `PushReferenceJoin::foreign_key_on` only takes a
+                        // scan slot with `!multivalued`, and
+                        // `Plan::reference_joins_agree` refuses a recorded
+                        // edge whose slot is multivalued — so this is an
+                        // invariant of the plan rather than a distant rule's
+                        // promise. A multivalued reference reaches the
+                        // renderer only through the scoper's own fetch, where
+                        // `JoinEdge::right_multivalued` carries it.
+                        right_multivalued: false,
                         kind: JoinType::Left,
                     },
                     discharges: node.discharges.clone(),
@@ -998,6 +1016,10 @@ pub fn lower_refined(
                         left_star: edge.referenced.clone(),
                         right_star: edge.holder.clone(),
                         right_slot: edge.slot.clone(),
+                        // Single-valued for the reason given on the left join
+                        // above: `reference_joins_agree` refuses a recorded
+                        // edge on a multivalued slot.
+                        right_multivalued: false,
                         // No rule pushes a left join, so a pushed join is
                         // inner. The refusal above is what keeps that true.
                         kind: JoinType::Inner,
@@ -2312,6 +2334,51 @@ mod tests {
                 vec!["location".to_owned(), "longitude".to_owned()],
                 SlotReading::Column
             )],
+        );
+    }
+
+    /// A join across a multivalued reference says so, for the same reason a
+    /// condition on an array does.
+    ///
+    /// The same bug one level up, and live in exactly the same way: no rule
+    /// pushes a join on a collection, so the query falls back and the
+    /// *scoper's* fetch is what runs — and that fetch's join op said only
+    /// "slot `groupsLines`", which a renderer turns into
+    /// `object_data->>'groupsLines' = uri`. That compares the array's text,
+    /// matches nothing, and the engine is handed a Store with one side of the
+    /// join missing: zero rows for a query with an answer, and no error.
+    #[test]
+    fn a_join_across_an_array_says_the_slot_is_multivalued() {
+        let joins = |query: &str| -> Vec<(String, bool)> {
+            sql_passes(query)
+                .into_iter()
+                .flat_map(|(_, tree)| tree.nodes)
+                .filter_map(|node| match node.op {
+                    Op::Join {
+                        right_slot,
+                        right_multivalued,
+                        ..
+                    } => Some((right_slot, right_multivalued)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            joins(
+                "SELECT ?g ?ln WHERE { ?g a asset360:LineGroup ; asset360:groupsLines ?l . \
+                 ?l a asset360:Line ; asset360:hasName ?ln }"
+            ),
+            vec![("groupsLines".to_owned(), true)],
+        );
+        // A single-valued reference is the shape the plain equality is right
+        // for, and it must stay that shape.
+        assert_eq!(
+            joins(
+                "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+                 ?t a asset360:Track ; asset360:hasName ?tn }"
+            ),
+            vec![("locatedOnTrack".to_owned(), false)],
         );
     }
 

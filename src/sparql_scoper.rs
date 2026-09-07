@@ -723,6 +723,12 @@ pub struct Star {
 /// JOIN goldenrecords t1
 ///   ON t1.object_data->>'right_slot' = t0.asset360_uri
 /// ```
+///
+/// — but only when the slot is single-valued. A *multivalued* reference holds
+/// a JSON **array** of identifiers, and `->>` on an array yields the array's
+/// own text (`["…/Ports/1", "…/Ports/2"]`), which equals no identifier — so
+/// that ON clause matches nothing and the join is silently empty. Which of the
+/// two it is, is what [`JoinEdge::right_multivalued`] says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinEdge {
     /// Variable of the referenced star (the join target).
@@ -734,6 +740,16 @@ pub struct JoinEdge {
     /// The slot on the right star whose value equals left's `asset360_uri`.
     /// E.g. `"belongsToTunnelComplex"`.
     pub right_slot: String,
+
+    /// Whether `right_slot` holds a *collection* of identifiers rather than
+    /// one.
+    ///
+    /// Stated here for the reason [`Star::multivalued_fields`] and
+    /// `PlanOp::reading` are: a renderer that has to fetch this fact from the
+    /// schema is a renderer that can forget to fetch it, and the failure mode
+    /// when it forgets is an equality against an array's text — no error, no
+    /// rows, and a join that reports "no such data" for data that is there.
+    pub right_multivalued: bool,
 
     /// Join type.
     pub join_type: JoinType,
@@ -913,8 +929,24 @@ pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#ty
 /// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
 /// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update.
 pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
+    sparql_scope_with_schema_graph(query_str, schema_view, None)
+}
+
+/// [`sparql_scope`], for a deployment that serves a schema graph.
+///
+/// `schema_graph_iri` is the named graph the active datamodel serves its
+/// datamodel in, which the endpoint reads from that datamodel's configuration.
+/// It is a parameter and not a constant because `DATAMODEL` decides it — see
+/// [`crate::sparql_schema_graph`]. `None`, which is what plain
+/// [`sparql_scope`] passes, means no schema graph exists, so no pattern is in
+/// one and every triple is scoped as an instance pattern.
+pub fn sparql_scope_with_schema_graph(
+    query_str: &str,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+) -> Result<QueryPlan, ScopeError> {
     let query = parse_query(query_str)?;
-    scope_parsed(&query, schema_view)
+    scope_parsed_with_schema_graph(&query, schema_view, schema_graph_iri)
 }
 
 /// The parser every entry point must use.
@@ -957,6 +989,18 @@ pub fn parse_query(query_str: &str) -> Result<Query, ScopeError> {
 /// the result, instead of parsing the same string again with a parser that
 /// might not match.
 pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
+    scope_parsed_with_schema_graph(query, schema_view, None)
+}
+
+/// [`scope_parsed`], for a deployment that serves a schema graph.
+///
+/// See [`sparql_scope_with_schema_graph`] for what `schema_graph_iri` is and
+/// why it is not a constant.
+pub fn scope_parsed_with_schema_graph(
+    query: &Query,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+) -> Result<QueryPlan, ScopeError> {
     let pattern = match query {
         Query::Select { pattern, .. } => pattern,
         Query::Construct { pattern, .. } => pattern,
@@ -968,6 +1012,31 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // constructs along the way (UNION, MINUS, property paths).
     let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
     tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
+
+    // Phase 0b: forget what a `GRAPH` clause asked of the *schema* graph.
+    //
+    // Scoping decides which golden records to fetch. The endpoint serves one
+    // named graph and it holds the datamodel, so a pattern inside it names
+    // schema terms and no record at all. Feeding those into star building asks
+    // the wrong question and gets a wrong answer: a schema pattern with a
+    // constant IRI subject — which is how every enum-value lookup is written —
+    // was rejected as an unscopable instance subject.
+    //
+    // Any *other* named graph keeps the behaviour it had. The endpoint holds no
+    // such graph, so the triples inside are still walked into the fetch and the
+    // plan is still marked `Inexact::NamedGraph`, leaving the engine to answer
+    // from a graph that is empty. Over-fetching for a graph nobody has is
+    // wasteful, not wrong, and narrowing it is a separate change.
+    //
+    // Filtered here rather than inside `tag_triples_by_depth`, because that
+    // enumeration is also the obligation list the plan refiner consumes
+    // positionally: dropping triples there would leave the refiner's algebra
+    // walk claiming obligations that no longer exist.
+    let schema_triples = triples_in_the_schema_graph(pattern, schema_graph_iri);
+    if !schema_triples.is_empty() {
+        triples_with_depth
+            .retain(|(triple, _)| !schema_triples.contains(&std::ptr::from_ref(*triple)));
+    }
 
     // Anything dropped along the way is recorded here, at the point it is
     // dropped. The first cause wins: one actionable reason beats a list.
@@ -1443,7 +1512,12 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 // row to join to. The same question without the nested
                 // `rdf:type` is a path, which the plan does carry — so refuse
                 // rather than invent an edge, and say that in the hint.
-                let stores_a_reference = schema_view
+                //
+                // The same lookup answers the second question the renderer
+                // has to ask — whether the slot holds one identifier or a
+                // collection of them — so it is resolved once here rather
+                // than twice, in two places that could disagree.
+                let referenced_slot = schema_view
                     .get_class_by_uri(&var_to_class[&builder.variable])
                     .ok()
                     .flatten()
@@ -1452,14 +1526,16 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                             slot_name.clone(),
                         ))
                     })
-                    .is_some_and(|slot| {
+                    .filter(|slot| {
                         slot.determine_slot_inline_mode()
                             == linkml_schemaview::slotview::SlotInlineMode::Reference
                     });
-                if !stores_a_reference {
+                let Some(referenced_slot) = referenced_slot else {
                     record_loss(Inexact::TypedNestedStructure);
                     continue;
-                }
+                };
+                let right_multivalued = referenced_slot.determine_slot_container_mode()
+                    != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
                 let slot_d = *builder.slot_depth.get(slot_name).unwrap_or(&0);
                 let left_d = *star_depths.get(obj_var).unwrap_or(&0);
                 let right_d = *star_depths.get(&builder.variable).unwrap_or(&0);
@@ -1472,6 +1548,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                     left: obj_var.clone(),
                     right: builder.variable.clone(),
                     right_slot: slot_name.clone(),
+                    right_multivalued,
                     join_type,
                 });
             }
@@ -1960,6 +2037,77 @@ pub(crate) fn tag_triples_by_depth<'a>(
             "SPARQL property paths are not supported; use explicit triple patterns".into(),
         )),
     }
+}
+
+/// Every triple pattern that reads the schema graph, by identity.
+///
+/// Identity and not value: two textually identical patterns, one inside the
+/// `GRAPH` and one outside, are different obligations and only the first is a
+/// schema pattern.
+///
+/// A `GRAPH` naming a *variable* counts too. It may bind to the schema graph,
+/// and a pattern that might be about the datamodel cannot be scoped as if it
+/// were certainly about golden records. A `GRAPH` naming some other constant
+/// IRI does not: the endpoint has no such graph, and its long-standing
+/// behaviour — walk the triples into the fetch, mark the plan inexact, let the
+/// engine answer from an empty graph — is left exactly as it was.
+fn triples_in_the_schema_graph(
+    pattern: &GraphPattern,
+    schema_graph_iri: Option<&str>,
+) -> HashSet<*const TriplePattern> {
+    // No schema graph configured for the active datamodel: there is no such
+    // graph, so no pattern is in it and every triple is scoped as before.
+    let Some(schema_graph_iri) = schema_graph_iri else {
+        return HashSet::new();
+    };
+    let reads_the_schema_graph = |name: &spargebra::term::NamedNodePattern| match name {
+        spargebra::term::NamedNodePattern::NamedNode(node) => node.as_str() == schema_graph_iri,
+        spargebra::term::NamedNodePattern::Variable(_) => true,
+    };
+
+    fn walk(
+        pattern: &GraphPattern,
+        inside: bool,
+        out: &mut HashSet<*const TriplePattern>,
+        is_schema_graph: &dyn Fn(&spargebra::term::NamedNodePattern) -> bool,
+    ) {
+        match pattern {
+            GraphPattern::Bgp { patterns } => {
+                if inside {
+                    for triple in patterns {
+                        out.insert(std::ptr::from_ref(triple));
+                    }
+                }
+            }
+            GraphPattern::Graph { name, inner } => {
+                walk(inner, inside || is_schema_graph(name), out, is_schema_graph)
+            }
+            GraphPattern::Join { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Minus { left, right } => {
+                walk(left, inside, out, is_schema_graph);
+                walk(right, inside, out, is_schema_graph);
+            }
+            GraphPattern::LeftJoin { left, right, .. } => {
+                walk(left, inside, out, is_schema_graph);
+                walk(right, inside, out, is_schema_graph);
+            }
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => walk(inner, inside, out, is_schema_graph),
+            GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+        }
+    }
+
+    let mut out = HashSet::new();
+    walk(pattern, false, &mut out, &reads_the_schema_graph);
+    out
 }
 
 /// Collect the FILTER conditions that can be pushed to SQL.
@@ -2881,11 +3029,17 @@ fn cause_for_unconsumed(tp: &TriplePattern, depth: usize, schema_view: &SchemaVi
 
 /// A `GRAPH` or `SERVICE` block anywhere in the pattern.
 ///
-/// Both are walked transparently by everything else here, which is right for a
-/// prefetch — the triples inside still say which classes to load — and wrong
-/// for an exact plan: the plan reads the default graph of the local database,
-/// so a named-graph pattern is answered from the wrong graph and a remote
-/// pattern from the wrong endpoint.
+/// Either one makes the plan inexact, so the engine re-applies the whole query:
+/// the plan reads one relation — the local default graph — so a named-graph
+/// pattern is answered from the wrong graph and a remote pattern from the wrong
+/// endpoint.
+///
+/// A `SERVICE` block is still walked transparently by the triple enumeration,
+/// on the old assumption that the triples inside say which classes to load. A
+/// `GRAPH` block no longer is: the endpoint's only named graph holds the
+/// datamodel, so its patterns name schema terms rather than golden records.
+/// `triples_inside_named_graphs` drops them before star building, and this
+/// inexactness is what still routes the query to the engine.
 fn contains_foreign_scope(pattern: &GraphPattern) -> Option<Inexact> {
     match pattern {
         GraphPattern::Graph { .. } => Some(Inexact::NamedGraph),
@@ -3434,17 +3588,20 @@ classes:
                 Inexact::TaggedConstant,
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX1\"@en }",
             ),
+            // A GRAPH block over a graph the endpoint does not have: the plan
+            // reads the default one. (The *schema* graph is different — its
+            // patterns are dropped before star building, and the query below
+            // has none.)
+            (
+                Inexact::NamedGraph,
+                "SELECT ?s WHERE { GRAPH <urn:g> { ?s a asset360:Signal } }",
+            ),
             // UNDEF means "no constraint", so dropping the cell turned a union
             // into an intersection.
             (
                 Inexact::UndefInValues,
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  VALUES ?nm { \"BX1\" UNDEF } }",
-            ),
-            // A GRAPH block names a graph; the plan reads the default one.
-            (
-                Inexact::NamedGraph,
-                "SELECT ?s WHERE { GRAPH <urn:g> { ?s a asset360:Signal } }",
             ),
             // A SERVICE block reads another endpoint entirely.
             (
@@ -3540,13 +3697,69 @@ classes:
                  asset360:location [ asset360:longitude ?v ] }",
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv)
+                .unwrap_or_else(|e| panic!("scope failed for {query}: {e:?}"));
             assert_eq!(
                 plan.inexact,
                 Some(expected),
                 "wrong cause recorded for: {query}"
             );
         }
+    }
+
+    /// A `GRAPH` pattern is not an instance pattern.
+    ///
+    /// The endpoint's only named graph holds the datamodel, so a pattern inside
+    /// one says nothing about which golden records to fetch. Two things follow,
+    /// and both used to be wrong: the instance scope must come from the default
+    /// graph alone, and a constant IRI subject inside a `GRAPH` — a schema term,
+    /// which is how every enum-value lookup is written — must not be refused as
+    /// an unscopable instance subject.
+    #[test]
+    fn a_named_graph_pattern_does_not_scope_the_fetch() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/>                       PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
+
+        // The asset360 datamodel's configured schema graph. Passed in, because
+        // it is configuration and not a constant -- see
+        // `crate::sparql_schema_graph`.
+        let schema_graph = "https://data.infrabel.be/asset360/schema";
+        let plan = sparql_scope_with_schema_graph(
+            &format!(
+                "{prefix}SELECT ?s ?l WHERE {{ ?s a asset360:Signal .                  GRAPH <{schema_graph}> {{                  <https://example.org/term> rdfs:label ?l }} }}"
+            ),
+            &sv,
+            Some(schema_graph),
+        )
+        .expect("a schema pattern must not make the query unscopable");
+
+        let stars = plan.root.all_stars();
+        assert_eq!(
+            stars.len(),
+            1,
+            "the fetch must come from the default graph alone, got {stars:?}"
+        );
+        assert!(stars[0].class_uri.ends_with("Signal"), "{stars:?}");
+        // The engine has to finish it, because the plan cannot read the graph.
+        assert_eq!(plan.inexact, Some(Inexact::NamedGraph));
+    }
+
+    /// A query that reads *only* a named graph has no instance scope at all.
+    ///
+    /// This is the honest answer rather than a fetch of everything: the scoper
+    /// owns golden records and this query asks about none. The endpoint answers
+    /// it from the schema graph with no objects loaded.
+    #[test]
+    fn a_query_reading_only_a_named_graph_is_unscoped() {
+        let sv = test_schema_view();
+        let result = sparql_scope(
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>              SELECT ?c ?l WHERE { GRAPH <https://data.infrabel.be/asset360/schema>              { ?c rdfs:label ?l } }",
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::Unscoped(_))),
+            "expected Unscoped, got {result:?}"
+        );
     }
 
     /// Every cause carries all three strings, and no two share a wire form.
@@ -4104,10 +4317,46 @@ classes:
         assert_eq!(join.left, "complex");
         assert_eq!(join.right, "component");
         assert_eq!(join.right_slot, "belongsToTunnelComplex");
+        assert!(
+            !join.right_multivalued,
+            "belongsToTunnelComplex holds one identifier"
+        );
         assert_eq!(join.join_type, JoinType::Inner);
 
         // Multi-type join → no SQL LIMIT pushdown
         assert_eq!(plan.sql_limit, None);
+    }
+
+    /// A join across a *multivalued* reference says so, and the renderer needs
+    /// it to.
+    ///
+    /// `groupsLines` holds an array of identifiers, so
+    /// `object_data->>'groupsLines' = uri` compares the array's own text —
+    /// `["…/Line/1", "…/Line/2"]` — and matches nothing, for a record whose
+    /// data is there. That is a join that answers *empty* rather than
+    /// erroring, which a caller cannot tell from "no such data": the worst
+    /// available failure. The renderer avoids it only by being told, so the
+    /// edge carries the fact.
+    #[test]
+    fn a_multivalued_reference_edge_says_it_is_multivalued() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?g ?l ?ln WHERE { \
+               ?g a asset360:LineGroup ; asset360:groupsLines ?l . \
+               ?l a asset360:Line ; asset360:hasName ?ln . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let joins = all_joins(&plan);
+        assert_eq!(joins.len(), 1, "{joins:?}");
+        let join = joins[0];
+        assert_eq!(join.left, "l");
+        assert_eq!(join.right, "g");
+        assert_eq!(join.right_slot, "groupsLines");
+        assert!(join.right_multivalued);
     }
 
     // ---- Reverse direction join ----

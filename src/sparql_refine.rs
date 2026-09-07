@@ -1700,6 +1700,19 @@ impl Plan {
                                 // A delivered read is not a binding, so it
                                 // cannot be the key a join reads.
                                 && slot.presence == SlotPresence::Required
+                                // A *collection* of identifiers is not a
+                                // foreign key an equality can compare: the
+                                // renderer would emit
+                                // `object_data->>'slot' = uri`, compare the
+                                // array's text, and match nothing. No rule
+                                // pushes one — `foreign_key_on` filters
+                                // `!multivalued` — and stating it here makes
+                                // that a property of the plan rather than a
+                                // promise made elsewhere, which is what lets
+                                // the lowering record
+                                // `right_multivalued: false` without asking
+                                // the schema again.
+                                && !slot.multivalued
                         })
                 })
             };

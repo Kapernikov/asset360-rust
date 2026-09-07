@@ -495,11 +495,13 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 left_star,
                 right_star,
                 right_slot,
+                right_multivalued,
                 kind,
                 ..
             } => writeln!(
                 f,
-                "      join      ?{right_star}.{right_slot} = ?{left_star}{}",
+                "      join      ?{right_star}.{right_slot}{} = ?{left_star}{}",
+                if *right_multivalued { "[]" } else { "" },
                 match kind {
                     crate::sparql_scoper::JoinType::Inner => "",
                     crate::sparql_scoper::JoinType::Left => "   left",
@@ -942,13 +944,35 @@ pub fn refined_plan_text(
 /// `UNION`, `MINUS` and an unscoped subject, which the endpoint turns into a
 /// 422 rather than a wrong answer. Those refusals are the user's, not the
 /// planner's, and they predate all of this.
+///
+/// `schema_graph_iri` is the named graph the active datamodel serves its schema
+/// in, or `None` when it configures none. The scoper needs it to tell a pattern
+/// about the datamodel apart from a pattern about a golden record; it is a
+/// parameter and not a constant because the deployment's datamodel decides it
+/// (see [`crate::sparql_schema_graph`]).
 pub fn plan_query_refined(
     query_str: &str,
     schema_view: &SchemaView,
 ) -> Result<ExecutionPlan, ScopeError> {
+    plan_query_refined_with_schema_graph(query_str, schema_view, None)
+}
+
+/// [`plan_query_refined`], for a deployment that serves a schema graph.
+///
+/// See [`crate::sparql_scoper::sparql_scope_with_schema_graph`] for what
+/// `schema_graph_iri` is and why it is not a constant.
+pub fn plan_query_refined_with_schema_graph(
+    query_str: &str,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+) -> Result<ExecutionPlan, ScopeError> {
     let parsed = crate::sparql_scoper::parse_query(query_str)?;
     let obligations = obligations_of(&parsed)?;
-    let scoped = crate::sparql_scoper::scope_parsed(&parsed, schema_view)?;
+    let scoped = crate::sparql_scoper::scope_parsed_with_schema_graph(
+        &parsed,
+        schema_view,
+        schema_graph_iri,
+    )?;
 
     let mut refined = match crate::sparql_refine::naive_plan(&parsed) {
         Ok(plan) => plan,
