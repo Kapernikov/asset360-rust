@@ -1010,7 +1010,7 @@ pub fn plan_query_refined_with_schema_graph(
         ));
     }
 
-    let ops = match crate::sparql_ops::lower_refined(&refined, schema_view, scoped.sql_limit) {
+    let mut ops = match crate::sparql_ops::lower_refined(&refined, schema_view, scoped.sql_limit) {
         Ok(ops) => ops,
         // No statement the renderer can express. Every shape in the inventory
         // lowers, so this is a guard rather than a path -- and the guard has
@@ -1024,6 +1024,13 @@ pub fn plan_query_refined_with_schema_graph(
             ));
         }
     };
+
+    // The planner's last decision, and the one the fetch obeys: what each scan
+    // must retrieve. It runs here, after the rules and after lowering, because
+    // the answer depends on the *query* — the engine is handed the original
+    // query text, so what it can still observe is a property of the query and
+    // not of what the rules made of it. See `sparql_ops::Retrieval`.
+    crate::sparql_ops::declare_retrieval(&mut ops, &parsed, schema_view);
 
     let mut plan = ExecutionPlan {
         contract: PLAN_CONTRACT,

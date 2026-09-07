@@ -31,7 +31,10 @@
 //! only be inferred by comparing two structures. [`Enforcement`] states it, so
 //! a rule can ask a node directly whether removing it would change the answer.
 
+use std::collections::BTreeSet;
 use std::fmt;
+
+use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_plan::ObligationId;
 use crate::sparql_pushdown::{BindingSpec, HavingTerm, MeasureSpec, OrderTerm};
@@ -138,6 +141,14 @@ pub enum Op {
         /// misses it turns an optional block into a required one, which drops
         /// rows the query keeps.
         is_optional: bool,
+        /// What the fetch must yield for each matching record.
+        ///
+        /// [`Retrieval::Whole`] unless [`declare_retrieval`] narrowed it, and
+        /// that is the direction the default has to point: a renderer that
+        /// ignores this field fetches whole records, which is what it did
+        /// before the field existed. See [`Retrieval`] for why the planner
+        /// rather than the fetch decides it.
+        retrieval: Retrieval,
     },
     /// One row per element of a multivalued slot, so row count matches
     /// solution count. Without it a record with three values counts once.
@@ -341,6 +352,10 @@ pub fn lower_sql_pass(
                 required_slots: star.required_fields.clone(),
                 optional_slots: star.optional_fields.clone(),
                 is_optional: star.is_optional,
+                // The scoper's decomposition, used when the refinement
+                // pipeline produced nothing. Nothing here knows what the query
+                // can still reach, so nothing here may narrow the fetch.
+                retrieval: Retrieval::Whole,
             },
             discharges: Vec::new(),
         });
@@ -831,6 +846,10 @@ pub fn lower_refined(
                         // left join *nothing pushed* is refused above, because
                         // this statement would then call it mandatory.
                         is_optional: optional_nodes.contains(&id),
+                        // Narrowed by `declare_retrieval`, which runs after
+                        // lowering because it reads the query rather than the
+                        // plan. Whole until it does.
+                        retrieval: Retrieval::Whole,
                     },
                     discharges: node.discharges.clone(),
                 });
@@ -2672,5 +2691,424 @@ mod tests {
         for input in inputs {
             assert_eq!(ops.nodes[input].op.kind(), "scan");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What the SQL leaf retrieves
+// ---------------------------------------------------------------------------
+
+/// What a scan must yield for each record it matches.
+///
+/// The fetch used to hand the engine whole records always, because nothing in
+/// the plan said what less would be safe. That is expensive in the common
+/// shape: answering
+///
+/// ```sparql
+/// SELECT ?code (COUNT(*) AS ?n) WHERE {
+///   ?s a asset360:Signal ; asset360:signalType ?t .
+///   GRAPH <…/schema> { ?t skos:notation ?code } } GROUP BY ?code
+/// ```
+///
+/// materialises 2553 Signal records of nine slots each to read *two* of them,
+/// and the engine then triplifies and re-parses all nine.
+///
+/// **The planner decides this, and the fetch obeys it.** That division is the
+/// whole safety argument. The engine re-runs the *original whole query* over
+/// whatever it is given, so a slot projected away that the query can still
+/// reach produces missing rows and no error — the silent under-count this
+/// pipeline exists to prevent. Only the planner holds the query, so only the
+/// planner can enumerate what is reachable; a fetch that guessed would be
+/// guessing about a query it cannot see. Where the planner cannot enumerate,
+/// it says [`Retrieval::Whole`], so the safe answer is also the planner's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retrieval {
+    /// The stored record, entire. The default, and what every shape whose
+    /// reachable slots cannot be enumerated gets.
+    Whole,
+    /// Only these top-level slots.
+    ///
+    /// Top-level and not paths: keeping a slot keeps everything beneath it, so
+    /// a nested read (`?s :locationInfo ?li . ?li :longitude ?lon`) is covered
+    /// by keeping `locationInfo`, and no rule has to reason about how deep a
+    /// query walks. The identifier and the type-designator slot are always in
+    /// here — the writer mints the subject IRI from the identifier, and a
+    /// record whose subject the engine cannot name joins to nothing.
+    Slots(Vec<String>),
+}
+
+impl Retrieval {
+    /// The slot list, or `None` for the whole record.
+    pub fn slots(&self) -> Option<&[String]> {
+        match self {
+            Self::Whole => None,
+            Self::Slots(slots) => Some(slots),
+        }
+    }
+}
+
+impl fmt::Display for Retrieval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Whole => f.write_str("whole record"),
+            Self::Slots(slots) => write!(f, "slots [{}]", slots.join(", ")),
+        }
+    }
+}
+
+/// Why a query cannot have its reachable slots enumerated.
+///
+/// Kept as a reason rather than a bool so the log says which shape gave up the
+/// projection, which is the first thing anyone asks when a query is still slow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotEnumerable {
+    /// `?s ?p ?o` — the predicate is a variable, so every slot is reachable.
+    VariablePredicate,
+    /// A property path can traverse predicates the query never names. A
+    /// sequence of plain IRIs could be enumerated; `!`, `^`, `*` and `+`
+    /// cannot without care this does not take, and paths are rare enough that
+    /// declining all of them costs nothing worth having.
+    PropertyPath,
+    /// `DESCRIBE` asks for *the triples about* a resource — by definition
+    /// every slot it has.
+    Describe,
+}
+
+impl fmt::Display for NotEnumerable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::VariablePredicate => "a variable predicate reaches every slot",
+            Self::PropertyPath => "a property path can traverse unnamed predicates",
+            Self::Describe => "DESCRIBE asks for every triple about a resource",
+        })
+    }
+}
+
+/// The slots a query can observe, or why they cannot be enumerated.
+///
+/// A *superset*, deliberately: every predicate IRI the query mentions anywhere
+/// is resolved against the schema, and the union is used for every star. A
+/// slot in the set that this star's class does not have costs nothing; one
+/// missing costs an answer.
+///
+/// The set is over predicates rather than over the plan's residual nodes for
+/// the same reason: the engine is handed the original query text, not the
+/// residual, so what the engine can observe is a property of the query.
+pub fn observable_slots(
+    query: &spargebra::Query,
+    schema: &SchemaView,
+) -> Result<BTreeSet<String>, NotEnumerable> {
+    use spargebra::Query;
+    use spargebra::algebra::GraphPattern;
+    use spargebra::term::NamedNodePattern;
+
+    if matches!(query, Query::Describe { .. }) {
+        return Err(NotEnumerable::Describe);
+    }
+
+    // A predicate the schema does not know is not a slot of any record, so it
+    // cannot be read off one — the schema graph's own `skos:notation` and
+    // `rdfs:label` are exactly that, and ignoring them is what makes the
+    // cross-graph shape projectable at all. `rdf:type` likewise: the writer
+    // emits it from the class, not from a slot.
+    fn note(
+        pred: &NamedNodePattern,
+        schema: &SchemaView,
+        found: &mut BTreeSet<String>,
+    ) -> Result<(), NotEnumerable> {
+        match pred {
+            NamedNodePattern::Variable(_) => Err(NotEnumerable::VariablePredicate),
+            NamedNodePattern::NamedNode(node) => {
+                if let Ok(Some(slot)) = schema.get_slot_by_uri(node.as_str()) {
+                    found.insert(slot.name.clone());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn walk(
+        pattern: &GraphPattern,
+        schema: &SchemaView,
+        found: &mut BTreeSet<String>,
+    ) -> Result<(), NotEnumerable> {
+        match pattern {
+            GraphPattern::Bgp { patterns } => {
+                for triple in patterns {
+                    note(&triple.predicate, schema, found)?;
+                }
+                Ok(())
+            }
+            GraphPattern::Path { .. } => Err(NotEnumerable::PropertyPath),
+            GraphPattern::Join { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Minus { left, right }
+            | GraphPattern::LeftJoin { left, right, .. } => {
+                walk(left, schema, found)?;
+                walk(right, schema, found)
+            }
+            GraphPattern::Graph { inner, .. }
+            | GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => walk(inner, schema, found),
+            GraphPattern::Values { .. } => Ok(()),
+        }
+    }
+
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    let pattern = match query {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    };
+    walk(pattern, schema, &mut found)?;
+    Ok(found)
+}
+
+/// Declare, on every scan, what the fetch must retrieve for it.
+///
+/// The planner step that makes [`Retrieval`] a decision rather than an
+/// inference. Called once, after the rules have reached a fixpoint and the
+/// plan has been lowered, because the answer depends on the *query* and not on
+/// what the rules did with it.
+///
+/// Three things are always kept whatever the query asks:
+///
+/// * the **identifier slot**, because the writer mints the record's subject
+///   IRI from it and a record with no subject joins to nothing;
+/// * the **type-designator slot** (`typeURI`), because the record's own stored
+///   type is what several configurations read and it costs one short string;
+/// * every slot the scan itself narrows on, so a condition the statement
+///   pushed and the engine re-applies still sees its column.
+///
+/// Anything the query cannot be shown to leave alone gets [`Retrieval::Whole`]
+/// — the fetch is then exactly what it was before this existed.
+pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &SchemaView) {
+    let observable = match observable_slots(query, schema) {
+        Ok(slots) => slots,
+        Err(_why) => return, // every scan keeps its `Whole` default
+    };
+
+    for node in &mut ops.nodes {
+        let Op::Scan {
+            class_uri,
+            required_slots,
+            optional_slots,
+            retrieval,
+            ..
+        } = &mut node.op
+        else {
+            continue;
+        };
+
+        let mut keep: BTreeSet<String> = observable.clone();
+        // The scan's own reads. `required_slots` and `optional_slots` are what
+        // the statement narrows on, and the engine re-applies every one of
+        // them: a column it cannot see is a condition that cannot be true.
+        keep.extend(required_slots.iter().cloned());
+        keep.extend(optional_slots.iter().cloned());
+        if let Some(identifier) = identifier_slot_of(schema, class_uri) {
+            keep.insert(identifier);
+        }
+        keep.insert("typeURI".to_owned());
+
+        *retrieval = Retrieval::Slots(keep.into_iter().collect());
+    }
+}
+
+#[cfg(test)]
+mod retrieval_tests {
+    use super::*;
+    use crate::sparql_plan::{PassKind, plan_query_refined};
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                          PREFIX skos: <http://www.w3.org/2004/02/skos/core#> ";
+
+    /// Every scan's retrieval, in plan order.
+    fn retrievals(query: &str) -> Vec<Retrieval> {
+        let sv = test_schema_view();
+        let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+        plan.passes
+            .iter()
+            .filter_map(|pass| match &pass.kind {
+                PassKind::Sql(sql) => Some(sql.ops.clone()),
+                PassKind::Engine(_) => None,
+            })
+            .flat_map(|ops| {
+                ops.nodes
+                    .into_iter()
+                    .filter_map(|node| match node.op {
+                        Op::Scan { retrieval, .. } => Some(retrieval),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn slots_of(retrieval: &Retrieval) -> Vec<String> {
+        match retrieval {
+            Retrieval::Whole => panic!("expected a projection, got the whole record"),
+            Retrieval::Slots(slots) => slots.clone(),
+        }
+    }
+
+    /// The shape this whole field exists for: two slots read, the rest left in
+    /// the database.
+    #[test]
+    fn a_query_that_reads_one_slot_retrieves_it_and_the_identity() {
+        let got = retrievals("SELECT ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k }");
+        assert_eq!(got.len(), 1, "one scan");
+        let slots = slots_of(&got[0]);
+        assert!(slots.contains(&"kind".to_owned()), "{slots:?}");
+        assert!(slots.contains(&"typeURI".to_owned()), "{slots:?}");
+        assert!(
+            !slots.contains(&"name".to_owned()),
+            "a slot the query never mentions must not be fetched: {slots:?}"
+        );
+    }
+
+    /// The trap, stated as a test. A variable predicate reaches every slot, so
+    /// nothing may be projected away — and a planner that got this wrong would
+    /// answer with missing rows and no error.
+    #[test]
+    fn a_variable_predicate_retrieves_the_whole_record() {
+        let got = retrievals("SELECT ?p ?o WHERE { ?s a asset360:Signal ; ?p ?o }");
+        assert!(!got.is_empty());
+        for retrieval in &got {
+            assert_eq!(*retrieval, Retrieval::Whole, "{retrieval}");
+        }
+    }
+
+    /// `DESCRIBE` asks for every triple about a resource.
+    #[test]
+    fn describe_retrieves_the_whole_record() {
+        let got = retrievals("DESCRIBE ?s WHERE { ?s a asset360:Signal }");
+        assert!(!got.is_empty());
+        for retrieval in &got {
+            assert_eq!(*retrieval, Retrieval::Whole, "{retrieval}");
+        }
+    }
+
+    /// A property path that is really a path — `+`, `*`, `!` — can
+    /// traverse predicates the query never names, so nothing may be projected.
+    ///
+    /// A *sequence* path is not one of these: spargebra expands `a/b` into two
+    /// ordinary triple patterns joined by a blank node, and an inverse `^a`
+    /// into one triple pattern with its ends swapped, so in both the
+    /// predicates are named and enumerable and the shape projects like any
+    /// other. That is checked below rather than assumed, because it is the
+    /// difference between a safe projection and a silent under-count.
+    #[test]
+    fn a_real_property_path_is_not_enumerable() {
+        let sv = test_schema_view();
+        for path in [
+            "asset360:location+",
+            "asset360:location*",
+            "!(asset360:kind)",
+        ] {
+            let query = format!("{PREFIX}SELECT ?x WHERE {{ ?s a asset360:Signal ; {path} ?x }}");
+            let parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            assert_eq!(
+                observable_slots(&parsed, &sv),
+                Err(NotEnumerable::PropertyPath),
+                "{path}"
+            );
+        }
+    }
+
+    /// A sequence path is expanded by the parser into named predicates, so it
+    /// enumerates — and what it enumerates is the slot that contains the read.
+    #[test]
+    fn a_sequence_path_enumerates_its_named_predicates() {
+        let sv = test_schema_view();
+        let got = retrievals(
+            "SELECT ?x WHERE { ?s a asset360:Signal ; asset360:location/asset360:longitude ?x }",
+        );
+        assert_eq!(got.len(), 1);
+        assert!(slots_of(&got[0]).contains(&"location".to_owned()));
+        let _ = sv;
+    }
+
+    /// An `OPTIONAL` reads a slot the required part never mentions, and the
+    /// engine binds it from what the fetch delivered. Projecting it away would
+    /// leave `?nm` unbound for every row.
+    #[test]
+    fn an_optional_read_survives_the_projection() {
+        let got = retrievals(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } }",
+        );
+        assert_eq!(got.len(), 1);
+        let slots = slots_of(&got[0]);
+        assert!(slots.contains(&"name".to_owned()), "{slots:?}");
+        assert!(slots.contains(&"kind".to_owned()), "{slots:?}");
+    }
+
+    /// A filter on a slot that is not projected is still a filter the engine
+    /// re-applies, so its column has to come back.
+    #[test]
+    fn a_filtered_slot_survives_even_when_the_query_does_not_select_it() {
+        let got = retrievals(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(?nm > \"A\") }",
+        );
+        assert_eq!(got.len(), 1);
+        assert!(slots_of(&got[0]).contains(&"name".to_owned()));
+    }
+
+    /// A nested read is covered by keeping the top-level slot: keeping
+    /// `location` keeps everything beneath it, so no rule has to know how deep
+    /// the query walks.
+    #[test]
+    fn a_nested_read_keeps_the_slot_that_contains_it() {
+        let got = retrievals(
+            "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
+             ?loc asset360:longitude ?lon }",
+        );
+        assert_eq!(got.len(), 1);
+        assert!(slots_of(&got[0]).contains(&"location".to_owned()));
+    }
+
+    /// A join reads two classes; each scan keeps what its own side needs, and
+    /// the union is a superset for both.
+    #[test]
+    fn a_join_keeps_both_sides_reference_slots() {
+        let got = retrievals(
+            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             ?t a asset360:Track ; asset360:hasName ?tn }",
+        );
+        assert_eq!(got.len(), 2, "two scans");
+        for retrieval in &got {
+            let slots = slots_of(retrieval);
+            assert!(slots.contains(&"locatedOnTrack".to_owned()), "{slots:?}");
+            assert!(slots.contains(&"hasName".to_owned()), "{slots:?}");
+        }
+    }
+
+    /// A predicate the schema does not know is not a slot of any record, so it
+    /// adds nothing — which is what makes the cross-graph shape projectable.
+    #[test]
+    fn a_schema_graph_predicate_adds_no_slot() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?code WHERE {{ ?s a asset360:Signal ; asset360:kind ?t . \
+             GRAPH <urn:schema> {{ ?t skos:notation ?code }} }}"
+        );
+        let parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let slots = observable_slots(&parsed, &sv).expect("enumerable");
+        assert!(slots.contains("kind"), "{slots:?}");
+        assert!(
+            !slots.iter().any(|slot| slot.contains("notation")),
+            "{slots:?}"
+        );
     }
 }

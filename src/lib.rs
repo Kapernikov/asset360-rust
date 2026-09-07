@@ -2266,6 +2266,27 @@ impl PlanOp {
         }
     }
 
+    /// What the fetch must retrieve for a scan's records.
+    ///
+    /// ``None`` means the whole stored record — the answer for every shape
+    /// whose reachable slots the planner could not enumerate, and for every
+    /// node that is not a scan. A list means those top-level slots and nothing
+    /// else; the identifier and the type designator are always in it.
+    ///
+    /// A renderer that does not read this getter fetches whole records, which
+    /// is what it did before the field existed. That is the direction the
+    /// default has to point: projecting away a slot the query can still reach
+    /// answers with missing rows and no error.
+    #[getter]
+    fn retrieval(&self) -> Option<Vec<String>> {
+        match &self.inner.op {
+            crate::sparql_ops::Op::Scan { retrieval, .. } => {
+                retrieval.slots().map(|slots| slots.to_vec())
+            }
+            _ => None,
+        }
+    }
+
     /// For ``"scan"``: whether the star appears only inside ``OPTIONAL``, so
     /// its conditions must tolerate a row the join did not match. Rendering it
     /// as required drops rows the query keeps.
