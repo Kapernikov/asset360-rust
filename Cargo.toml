@@ -10,10 +10,17 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pyo3 = { version = "0.25.0", optional = true }
 pyo3-stub-gen = { version = "0.13.1", optional = true }
-linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python", optional = true }
-linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta" }
-linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview", default-features = false }
-linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime", default-features = false, features = ["slim", "ttl"] }
+# TEMPORARY PIN -- MUST BE REVERTED BEFORE A RELEASE.
+#
+# These four track rust-linkml-core's default branch. They are pinned to
+# `feat/schema-rdf` only so this repo can build against the not-yet-merged
+# `linkml_runtime::schema_rdf` module that `src/sparql_schema_graph.rs` now
+# delegates to. Once that branch is merged upstream, delete every
+# `branch = "feat/schema-rdf"` below (or replace it with the merged rev).
+linkml_runtime_python = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime_python", branch = "feat/schema-rdf", optional = true }
+linkml_meta = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_meta", branch = "feat/schema-rdf" }
+linkml_schemaview = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "schemaview", branch = "feat/schema-rdf", default-features = false }
+linkml_runtime = { git = "https://github.com/Kapernikov/rust-linkml-core", package = "linkml_runtime", branch = "feat/schema-rdf", default-features = false, features = ["slim", "ttl"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_path_to_error = "0.1.17"
@@ -50,7 +57,7 @@ stubgen = [
     "linkml_meta/stubgen"
 ]
 shacl-parser = ["dep:oxttl", "dep:oxrdf"]
-sparql-endpoint = ["shacl-parser", "dep:oxigraph"]
+sparql-endpoint = ["shacl-parser", "dep:oxigraph", "dep:oxrdf"]
 wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys", "dep:getrandom", "dep:getrandom_03"]
 minijinja-wasm = [
     "wasm-bindings",

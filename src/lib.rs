@@ -40,6 +40,7 @@ pub mod shacl_ast;
 
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
+pub mod sparql_graph_clauses;
 pub mod sparql_ops;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
@@ -91,7 +92,6 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_plan_query_refined, m)?)?;
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
-        m.add_function(wrap_pyfunction!(sparql_schema_graph_iri, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_ntriples, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_skipped, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_reads_only_the_schema_graph, m)?)?;
@@ -2754,6 +2754,7 @@ impl ExecutionPlan {
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
 #[pyo3(name = "plan_query_refined")]
+#[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
 ///
@@ -2790,12 +2791,13 @@ fn py_plan_query_refined(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
+    schema_graph_iri: Option<String>,
 ) -> PyResult<ExecutionPlan> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    crate::sparql_plan::plan_query_refined(query, sv)
+    crate::sparql_plan::plan_query_refined_with_schema_graph(query, sv, schema_graph_iri.as_deref())
         .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -2853,6 +2855,7 @@ fn sparql_inexact_reasons() -> Vec<&'static str> {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
+#[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Analyse a SPARQL query and produce a structured fetch plan.
 ///
@@ -2870,12 +2873,21 @@ fn sparql_inexact_reasons() -> Vec<&'static str> {
 ///
 /// Raises:
 ///     ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
-fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> PyResult<QueryPlan> {
+fn sparql_scope(
+    py: Python<'_>,
+    query: &str,
+    schema_view: Py<PySchemaView>,
+    schema_graph_iri: Option<String>,
+) -> PyResult<QueryPlan> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    match crate::sparql_scoper::sparql_scope(query, sv) {
+    match crate::sparql_scoper::sparql_scope_with_schema_graph(
+        query,
+        sv,
+        schema_graph_iri.as_deref(),
+    ) {
         Ok(plan) => Ok(plan.into()),
         // ScopeError's Display produces exactly these strings, so there is one
         // place to change when a variant is added — rather than two blocks
@@ -2886,7 +2898,7 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
-#[pyo3(signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000))]
+#[pyo3(signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Execute a SPARQL query against a list of LinkML instances.
 ///
@@ -2902,6 +2914,12 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
 ///         ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
 ///     max_triples: Maximum triples in the store (default 500,000).
 ///     max_result_rows: Maximum result rows (default 10,000).
+///     schema_graph_iri: The named graph to serve the active datamodel's
+///         schema in — ``asset360_model.datamodel_config.get_schema_graph_iri()``.
+///         ``None`` means this datamodel serves no schema graph, and then none
+///         is built. There is deliberately no default: the correct IRI depends
+///         on which datamodel is deployed, and guessing would put an
+///         infrabel-named graph into an unrelated deployment.
 ///
 /// Returns:
 ///     JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
@@ -2909,6 +2927,10 @@ fn sparql_scope(py: Python<'_>, query: &str, schema_view: Py<PySchemaView>) -> P
 /// Raises:
 ///     RuntimeError: Conversion failure (with object URI), limit exceeded,
 ///         or query execution error.
+// A Python-facing signature: every argument is a distinct knob the caller sets
+// by keyword, and grouping them into a struct would only move the same list
+// behind a name Python cannot see.
+#[allow(clippy::too_many_arguments)]
 fn sparql_execute(
     py: Python<'_>,
     query: &str,
@@ -2917,6 +2939,7 @@ fn sparql_execute(
     format: &str,
     max_triples: usize,
     max_result_rows: usize,
+    schema_graph_iri: Option<String>,
 ) -> PyResult<String> {
     let bound_sv = schema_view.bind(py);
     let sv_ref = bound_sv.borrow();
@@ -2935,6 +2958,7 @@ fn sparql_execute(
             max_triples,
             max_result_rows,
         },
+        schema_graph_iri.as_deref(),
     ) {
         Ok(result) => Ok(result),
         Err(crate::sparql_executor::ExecuteError::ConversionError {
@@ -2960,27 +2984,29 @@ fn sparql_execute(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-/// The IRI of the named graph the datamodel is served in.
-///
-/// A client discovers classes, slots and enum values with
-/// ``GRAPH <this IRI> { ... }``. The schema is deliberately *not* in the
-/// default graph, so that instance queries answer identically whichever
-/// execution route serves them.
-fn sparql_schema_graph_iri() -> &'static str {
-    crate::sparql_schema_graph::SCHEMA_GRAPH_IRI
-}
-
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyfunction]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// The datamodel's schema graph, as N-Triples.
 ///
 /// The same triples ``sparql_execute`` loads into the schema named graph.
 /// Exposed for tests and for inspecting what a client can discover.
-fn sparql_schema_graph_ntriples(py: Python<'_>, schema_view: Py<PySchemaView>) -> String {
+///
+/// Args:
+///     schema_view: The LinkML schema.
+///     schema_graph_iri: The named graph to put them in — see
+///         ``sparql_execute``. Only the graph name depends on it; the triples
+///         are the same either way.
+///
+/// Raises:
+///     ValueError: ``schema_graph_iri`` is not an absolute IRI.
+fn sparql_schema_graph_ntriples(
+    py: Python<'_>,
+    schema_view: Py<PySchemaView>,
+    schema_graph_iri: &str,
+) -> PyResult<String> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
-    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust()).to_ntriples()
+    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), schema_graph_iri)
+        .map(|graph| graph.to_ntriples())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -2991,14 +3017,24 @@ fn sparql_schema_graph_ntriples(py: Python<'_>, schema_view: Py<PySchemaView>) -
 /// Each entry names what was dropped and the offending CURIE. A non-empty list
 /// means a prefix the schema's converter never saw — a schema defect worth
 /// reporting, not a query failure, so the graph is served without them.
-fn sparql_schema_graph_skipped(py: Python<'_>, schema_view: Py<PySchemaView>) -> Vec<String> {
+///
+/// Raises:
+///     ValueError: ``schema_graph_iri`` is not an absolute IRI.
+fn sparql_schema_graph_skipped(
+    py: Python<'_>,
+    schema_view: Py<PySchemaView>,
+    schema_graph_iri: &str,
+) -> PyResult<Vec<String>> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
-    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust()).skipped
+    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), schema_graph_iri)
+        .map(|graph| graph.skipped)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[pyfunction]
+#[pyo3(signature = (query, schema_graph_iri=None))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Whether every triple pattern in the query reads the schema graph.
 ///
@@ -3006,8 +3042,14 @@ fn sparql_schema_graph_skipped(py: Python<'_>, schema_view: Py<PySchemaView>) ->
 /// scoper refuses it as unscoped — correctly, since there is nothing to fetch.
 /// The endpoint uses this to tell that case apart from a query with a genuinely
 /// missing scope, and answers it from the schema graph with no instances.
-fn sparql_reads_only_the_schema_graph(query: &str) -> bool {
-    crate::sparql_schema_graph::reads_only_the_schema_graph(query)
+///
+/// Args:
+///     query: SPARQL query string.
+///     schema_graph_iri: The named graph the active datamodel serves its
+///         schema in, or ``None`` when it serves none — in which case no
+///         query reads only it.
+fn sparql_reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<String>) -> bool {
+    crate::sparql_graph_clauses::reads_only_the_schema_graph(query, schema_graph_iri.as_deref())
 }
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]

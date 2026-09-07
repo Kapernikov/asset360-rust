@@ -913,8 +913,24 @@ pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#ty
 /// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
 /// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update.
 pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
+    sparql_scope_with_schema_graph(query_str, schema_view, None)
+}
+
+/// [`sparql_scope`], for a deployment that serves a schema graph.
+///
+/// `schema_graph_iri` is the named graph the active datamodel serves its
+/// datamodel in, which the endpoint reads from that datamodel's configuration.
+/// It is a parameter and not a constant because `DATAMODEL` decides it — see
+/// [`crate::sparql_schema_graph`]. `None`, which is what plain
+/// [`sparql_scope`] passes, means no schema graph exists, so no pattern is in
+/// one and every triple is scoped as an instance pattern.
+pub fn sparql_scope_with_schema_graph(
+    query_str: &str,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+) -> Result<QueryPlan, ScopeError> {
     let query = parse_query(query_str)?;
-    scope_parsed(&query, schema_view)
+    scope_parsed_with_schema_graph(&query, schema_view, schema_graph_iri)
 }
 
 /// The parser every entry point must use.
@@ -957,6 +973,18 @@ pub fn parse_query(query_str: &str) -> Result<Query, ScopeError> {
 /// the result, instead of parsing the same string again with a parser that
 /// might not match.
 pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
+    scope_parsed_with_schema_graph(query, schema_view, None)
+}
+
+/// [`scope_parsed`], for a deployment that serves a schema graph.
+///
+/// See [`sparql_scope_with_schema_graph`] for what `schema_graph_iri` is and
+/// why it is not a constant.
+pub fn scope_parsed_with_schema_graph(
+    query: &Query,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+) -> Result<QueryPlan, ScopeError> {
     let pattern = match query {
         Query::Select { pattern, .. } => pattern,
         Query::Construct { pattern, .. } => pattern,
@@ -988,7 +1016,7 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
     // enumeration is also the obligation list the plan refiner consumes
     // positionally: dropping triples there would leave the refiner's algebra
     // walk claiming obligations that no longer exist.
-    let schema_triples = triples_in_the_schema_graph(pattern);
+    let schema_triples = triples_in_the_schema_graph(pattern, schema_graph_iri);
     if !schema_triples.is_empty() {
         triples_with_depth
             .retain(|(triple, _)| !schema_triples.contains(&std::ptr::from_ref(*triple)));
@@ -1468,7 +1496,12 @@ pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan
                 // row to join to. The same question without the nested
                 // `rdf:type` is a path, which the plan does carry — so refuse
                 // rather than invent an edge, and say that in the hint.
-                let stores_a_reference = schema_view
+                //
+                // The same lookup answers the second question the renderer
+                // has to ask — whether the slot holds one identifier or a
+                // collection of them — so it is resolved once here rather
+                // than twice, in two places that could disagree.
+                let referenced_slot = schema_view
                     .get_class_by_uri(&var_to_class[&builder.variable])
                     .ok()
                     .flatten()
@@ -1999,17 +2032,26 @@ pub(crate) fn tag_triples_by_depth<'a>(
 /// IRI does not: the endpoint has no such graph, and its long-standing
 /// behaviour — walk the triples into the fetch, mark the plan inexact, let the
 /// engine answer from an empty graph — is left exactly as it was.
-fn triples_in_the_schema_graph(pattern: &GraphPattern) -> HashSet<*const TriplePattern> {
-    fn reads_the_schema_graph(name: &spargebra::term::NamedNodePattern) -> bool {
-        match name {
-            spargebra::term::NamedNodePattern::NamedNode(node) => {
-                node.as_str() == crate::sparql_schema_graph::SCHEMA_GRAPH_IRI
-            }
-            spargebra::term::NamedNodePattern::Variable(_) => true,
-        }
-    }
+fn triples_in_the_schema_graph(
+    pattern: &GraphPattern,
+    schema_graph_iri: Option<&str>,
+) -> HashSet<*const TriplePattern> {
+    // No schema graph configured for the active datamodel: there is no such
+    // graph, so no pattern is in it and every triple is scoped as before.
+    let Some(schema_graph_iri) = schema_graph_iri else {
+        return HashSet::new();
+    };
+    let reads_the_schema_graph = |name: &spargebra::term::NamedNodePattern| match name {
+        spargebra::term::NamedNodePattern::NamedNode(node) => node.as_str() == schema_graph_iri,
+        spargebra::term::NamedNodePattern::Variable(_) => true,
+    };
 
-    fn walk(pattern: &GraphPattern, inside: bool, out: &mut HashSet<*const TriplePattern>) {
+    fn walk(
+        pattern: &GraphPattern,
+        inside: bool,
+        out: &mut HashSet<*const TriplePattern>,
+        is_schema_graph: &dyn Fn(&spargebra::term::NamedNodePattern) -> bool,
+    ) {
         match pattern {
             GraphPattern::Bgp { patterns } => {
                 if inside {
@@ -2019,17 +2061,17 @@ fn triples_in_the_schema_graph(pattern: &GraphPattern) -> HashSet<*const TripleP
                 }
             }
             GraphPattern::Graph { name, inner } => {
-                walk(inner, inside || reads_the_schema_graph(name), out)
+                walk(inner, inside || is_schema_graph(name), out, is_schema_graph)
             }
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
             | GraphPattern::Minus { left, right } => {
-                walk(left, inside, out);
-                walk(right, inside, out);
+                walk(left, inside, out, is_schema_graph);
+                walk(right, inside, out, is_schema_graph);
             }
             GraphPattern::LeftJoin { left, right, .. } => {
-                walk(left, inside, out);
-                walk(right, inside, out);
+                walk(left, inside, out, is_schema_graph);
+                walk(right, inside, out, is_schema_graph);
             }
             GraphPattern::Filter { inner, .. }
             | GraphPattern::Extend { inner, .. }
@@ -2039,13 +2081,13 @@ fn triples_in_the_schema_graph(pattern: &GraphPattern) -> HashSet<*const TripleP
             | GraphPattern::Reduced { inner }
             | GraphPattern::Slice { inner, .. }
             | GraphPattern::Group { inner, .. }
-            | GraphPattern::Service { inner, .. } => walk(inner, inside, out),
+            | GraphPattern::Service { inner, .. } => walk(inner, inside, out, is_schema_graph),
             GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
         }
     }
 
     let mut out = HashSet::new();
-    walk(pattern, false, &mut out);
+    walk(pattern, false, &mut out, &reads_the_schema_graph);
     out
 }
 
@@ -3659,11 +3701,16 @@ classes:
         let sv = test_schema_view();
         let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/>                       PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
 
-        let plan = sparql_scope(
+        // The asset360 datamodel's configured schema graph. Passed in, because
+        // it is configuration and not a constant -- see
+        // `crate::sparql_schema_graph`.
+        let schema_graph = "https://data.infrabel.be/asset360/schema";
+        let plan = sparql_scope_with_schema_graph(
             &format!(
-                "{prefix}SELECT ?s ?l WHERE {{ ?s a asset360:Signal .                  GRAPH <https://data.infrabel.be/asset360/schema> {{                  <https://example.org/term> rdfs:label ?l }} }}"
+                "{prefix}SELECT ?s ?l WHERE {{ ?s a asset360:Signal .                  GRAPH <{schema_graph}> {{                  <https://example.org/term> rdfs:label ?l }} }}"
             ),
             &sv,
+            Some(schema_graph),
         )
         .expect("a schema pattern must not make the query unscopable");
 

@@ -151,6 +151,7 @@ pub fn sparql_execute(
     schema_view: &SchemaView,
     format: &str,
     limits: ExecuteLimits,
+    schema_graph_iri: Option<&str>,
 ) -> Result<String, ExecuteError> {
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
@@ -206,8 +207,16 @@ pub fn sparql_execute(
     // graph is unreachable without a `GRAPH` clause, so for an instance query
     // the work would be pure waste. It also means this feature adds exactly
     // zero cost to every request that existed before it.
-    if crate::sparql_schema_graph::query_reads_named_graphs(query_str) {
-        let schema_graph = crate::sparql_schema_graph::SchemaGraph::build(schema_view);
+    //
+    // Which graph it goes in is the caller's, threaded down from the active
+    // datamodel's configuration: `None` means this datamodel serves no schema
+    // graph, and then there is nothing to insert.
+    if let Some(schema_graph_iri) = schema_graph_iri
+        && crate::sparql_graph_clauses::query_reads_named_graphs(query_str)
+    {
+        let schema_graph =
+            crate::sparql_schema_graph::SchemaGraph::build(schema_view, schema_graph_iri)
+                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
         for quad in &schema_graph.quads {
             store
                 .insert(quad)
@@ -394,6 +403,7 @@ classes:
             &sv,
             "json",
             ExecuteLimits::default(),
+            None,
         )
         .unwrap();
 
@@ -416,6 +426,7 @@ classes:
             &sv,
             "json",
             ExecuteLimits::default(),
+            None,
         )
         .unwrap();
 
@@ -435,6 +446,7 @@ classes:
             &sv,
             "json",
             ExecuteLimits::default(),
+            None,
         )
         .unwrap();
 
@@ -457,6 +469,7 @@ classes:
                 max_triples: 500_000,
                 max_result_rows: 1,
             },
+            None,
         );
 
         assert!(matches!(
@@ -480,6 +493,7 @@ classes:
                 max_triples: 1,
                 max_result_rows: 10_000,
             },
+            None,
         );
 
         assert!(matches!(
@@ -501,6 +515,7 @@ classes:
             &sv,
             "turtle",
             ExecuteLimits::default(),
+            None,
         )
         .unwrap();
 
@@ -621,6 +636,7 @@ classes:
             sv,
             "json",
             super::ExecuteLimits::default(),
+            None,
         )
         .expect("query executes");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -770,7 +786,10 @@ classes:
 #[cfg(all(test, feature = "sparql-endpoint"))]
 mod schema_graph_tests {
     use super::*;
-    use crate::sparql_schema_graph::SCHEMA_GRAPH_IRI;
+    /// What the asset360 datamodel's config sets `schema_graph_iri` to.
+    /// A test value: production reads it from
+    /// `asset360_model/datamodels/asset360.yaml`.
+    const SCHEMA_GRAPH_IRI: &str = "https://data.infrabel.be/asset360/schema";
     use linkml_runtime::load_json_str;
     use linkml_schemaview::identifier::Identifier;
 
@@ -844,8 +863,15 @@ classes:
 
     fn run(sv: &SchemaView, instances: &[LinkMLInstance], query: &str) -> serde_json::Value {
         let refs: Vec<&LinkMLInstance> = instances.iter().collect();
-        let raw = sparql_execute(query, &refs, sv, "json", ExecuteLimits::default())
-            .unwrap_or_else(|err| panic!("query failed: {err}\n{query}"));
+        let raw = sparql_execute(
+            query,
+            &refs,
+            sv,
+            "json",
+            ExecuteLimits::default(),
+            Some(SCHEMA_GRAPH_IRI),
+        )
+        .unwrap_or_else(|err| panic!("query failed: {err}\n{query}"));
         serde_json::from_str(&raw).unwrap()
     }
 
@@ -941,11 +967,24 @@ classes:
 
         for (query, forced) in &cases {
             let query = query.as_str();
-            let with_schema = sparql_execute(query, &refs, &sv, "json", ExecuteLimits::default())
-                .unwrap_or_else(|err| panic!("{query}: {err}"));
-            let with_schema_loaded =
-                sparql_execute(forced, &refs, &sv, "json", ExecuteLimits::default())
-                    .unwrap_or_else(|err| panic!("{forced}: {err}"));
+            let with_schema = sparql_execute(
+                query,
+                &refs,
+                &sv,
+                "json",
+                ExecuteLimits::default(),
+                Some(SCHEMA_GRAPH_IRI),
+            )
+            .unwrap_or_else(|err| panic!("{query}: {err}"));
+            let with_schema_loaded = sparql_execute(
+                forced,
+                &refs,
+                &sv,
+                "json",
+                ExecuteLimits::default(),
+                Some(SCHEMA_GRAPH_IRI),
+            )
+            .unwrap_or_else(|err| panic!("{forced}: {err}"));
 
             // The same query against a store holding instance data only.
             let store = Store::new().unwrap();
