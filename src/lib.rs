@@ -1570,6 +1570,16 @@ impl JoinEdge {
         &self.inner.right_slot
     }
 
+    /// Whether ``right_slot`` holds a *collection* of identifiers.
+    ///
+    /// A renderer that ignores this emits ``object_data->>'slot' = uri``,
+    /// which compares the array's own text and matches nothing — an empty
+    /// join, with no error to distinguish it from "no such data".
+    #[getter]
+    fn right_multivalued(&self) -> bool {
+        self.inner.right_multivalued
+    }
+
     /// Join type: ``"inner"`` or ``"left"``.
     #[getter]
     fn join_type(&self) -> &str {
@@ -1581,10 +1591,11 @@ impl JoinEdge {
 
     fn __repr__(&self) -> String {
         format!(
-            "JoinEdge(left={:?}, right={:?}, slot={:?}, type={:?})",
+            "JoinEdge(left={:?}, right={:?}, slot={:?}, multivalued={:?}, type={:?})",
             self.inner.left,
             self.inner.right,
             self.inner.right_slot,
+            self.inner.right_multivalued,
             self.join_type()
         )
     }
@@ -2358,6 +2369,27 @@ impl PlanOp {
         match &self.inner.op {
             Op::Join { right_slot, .. } => Some(right_slot.clone()),
             _ => None,
+        }
+    }
+
+    /// For ``"join"``: whether ``right_slot`` holds a *collection* of
+    /// identifiers rather than one.
+    ///
+    /// The join's counterpart to ``reading`` on a filter, and the same failure
+    /// mode: a renderer that ignores it writes
+    /// ``right.object_data->>'slot' = left.asset360_uri``, which compares the
+    /// array's own text — ``["…/Ports/1", "…/Ports/2"]`` — against an
+    /// identifier and matches nothing. The join is then empty, with no error
+    /// to tell a caller apart from "no such data". A collection needs a
+    /// containment test instead.
+    #[getter]
+    fn right_multivalued(&self) -> bool {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join {
+                right_multivalued, ..
+            } => *right_multivalued,
+            _ => false,
         }
     }
 

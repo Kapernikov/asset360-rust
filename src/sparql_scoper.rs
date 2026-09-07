@@ -723,6 +723,12 @@ pub struct Star {
 /// JOIN goldenrecords t1
 ///   ON t1.object_data->>'right_slot' = t0.asset360_uri
 /// ```
+///
+/// — but only when the slot is single-valued. A *multivalued* reference holds
+/// a JSON **array** of identifiers, and `->>` on an array yields the array's
+/// own text (`["…/Ports/1", "…/Ports/2"]`), which equals no identifier — so
+/// that ON clause matches nothing and the join is silently empty. Which of the
+/// two it is, is what [`JoinEdge::right_multivalued`] says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinEdge {
     /// Variable of the referenced star (the join target).
@@ -734,6 +740,16 @@ pub struct JoinEdge {
     /// The slot on the right star whose value equals left's `asset360_uri`.
     /// E.g. `"belongsToTunnelComplex"`.
     pub right_slot: String,
+
+    /// Whether `right_slot` holds a *collection* of identifiers rather than
+    /// one.
+    ///
+    /// Stated here for the reason [`Star::multivalued_fields`] and
+    /// `PlanOp::reading` are: a renderer that has to fetch this fact from the
+    /// schema is a renderer that can forget to fetch it, and the failure mode
+    /// when it forgets is an equality against an array's text — no error, no
+    /// rows, and a join that reports "no such data" for data that is there.
+    pub right_multivalued: bool,
 
     /// Join type.
     pub join_type: JoinType,
@@ -1510,14 +1526,16 @@ pub fn scope_parsed_with_schema_graph(
                             slot_name.clone(),
                         ))
                     })
-                    .is_some_and(|slot| {
+                    .filter(|slot| {
                         slot.determine_slot_inline_mode()
                             == linkml_schemaview::slotview::SlotInlineMode::Reference
                     });
-                if !stores_a_reference {
+                let Some(referenced_slot) = referenced_slot else {
                     record_loss(Inexact::TypedNestedStructure);
                     continue;
-                }
+                };
+                let right_multivalued = referenced_slot.determine_slot_container_mode()
+                    != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
                 let slot_d = *builder.slot_depth.get(slot_name).unwrap_or(&0);
                 let left_d = *star_depths.get(obj_var).unwrap_or(&0);
                 let right_d = *star_depths.get(&builder.variable).unwrap_or(&0);
@@ -1530,6 +1548,7 @@ pub fn scope_parsed_with_schema_graph(
                     left: obj_var.clone(),
                     right: builder.variable.clone(),
                     right_slot: slot_name.clone(),
+                    right_multivalued,
                     join_type,
                 });
             }
@@ -4298,10 +4317,46 @@ classes:
         assert_eq!(join.left, "complex");
         assert_eq!(join.right, "component");
         assert_eq!(join.right_slot, "belongsToTunnelComplex");
+        assert!(
+            !join.right_multivalued,
+            "belongsToTunnelComplex holds one identifier"
+        );
         assert_eq!(join.join_type, JoinType::Inner);
 
         // Multi-type join → no SQL LIMIT pushdown
         assert_eq!(plan.sql_limit, None);
+    }
+
+    /// A join across a *multivalued* reference says so, and the renderer needs
+    /// it to.
+    ///
+    /// `groupsLines` holds an array of identifiers, so
+    /// `object_data->>'groupsLines' = uri` compares the array's own text —
+    /// `["…/Line/1", "…/Line/2"]` — and matches nothing, for a record whose
+    /// data is there. That is a join that answers *empty* rather than
+    /// erroring, which a caller cannot tell from "no such data": the worst
+    /// available failure. The renderer avoids it only by being told, so the
+    /// edge carries the fact.
+    #[test]
+    fn a_multivalued_reference_edge_says_it_is_multivalued() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?g ?l ?ln WHERE { \
+               ?g a asset360:LineGroup ; asset360:groupsLines ?l . \
+               ?l a asset360:Line ; asset360:hasName ?ln . \
+             }",
+            &sv,
+        )
+        .unwrap();
+
+        let joins = all_joins(&plan);
+        assert_eq!(joins.len(), 1, "{joins:?}");
+        let join = joins[0];
+        assert_eq!(join.left, "l");
+        assert_eq!(join.right, "g");
+        assert_eq!(join.right_slot, "groupsLines");
+        assert!(join.right_multivalued);
     }
 
     // ---- Reverse direction join ----

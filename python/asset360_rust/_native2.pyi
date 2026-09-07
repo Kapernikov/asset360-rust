@@ -3050,6 +3050,15 @@ class JoinEdge:
         Slot on the right star whose value = left's ``asset360_uri``.
         """
     @property
+    def right_multivalued(self) -> builtins.bool:
+        r"""
+        Whether ``right_slot`` holds a *collection* of identifiers.
+        
+        A renderer that ignores this emits ``object_data->>'slot' = uri``,
+        which compares the array's own text and matches nothing — an empty
+        join, with no error to distinguish it from "no such data".
+        """
+    @property
     def join_type(self) -> builtins.str:
         r"""
         Join type: ``"inner"`` or ``"left"``.
@@ -3813,6 +3822,20 @@ class PlanOp:
         r"""
         For ``"join"``: the slot on the right input whose value is the left
         row's ``asset360_uri``.
+        """
+    @property
+    def right_multivalued(self) -> builtins.bool:
+        r"""
+        For ``"join"``: whether ``right_slot`` holds a *collection* of
+        identifiers rather than one.
+        
+        The join's counterpart to ``reading`` on a filter, and the same failure
+        mode: a renderer that ignores it writes
+        ``right.object_data->>'slot' = left.asset360_uri``, which compares the
+        array's own text — ``["…/Ports/1", "…/Ports/2"]`` — against an
+        identifier and matches nothing. The join is then empty, with no error
+        to tell a caller apart from "no such data". A collection needs a
+        containment test instead.
         """
     @property
     def join_stars(self) -> builtins.list[builtins.str]:
@@ -6547,7 +6570,7 @@ def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def py_plan_query_refined(query:builtins.str, schema_view:SchemaView) -> ExecutionPlan:
+def py_plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]) -> ExecutionPlan:
     r"""
     Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
     
@@ -6603,7 +6626,7 @@ def py_refined_plan_text(query:builtins.str, schema_view:SchemaView) -> builtins
         ValueError: the query does not parse or cannot be represented.
     """
 
-def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int) -> builtins.str:
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int, schema_graph_iri:typing.Optional[builtins.str]) -> builtins.str:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
     
@@ -6619,6 +6642,12 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
         max_triples: Maximum triples in the store (default 500,000).
         max_result_rows: Maximum result rows (default 10,000).
+        schema_graph_iri: The named graph to serve the active datamodel's
+            schema in — ``asset360_model.datamodel_config.get_schema_graph_iri()``.
+            ``None`` means this datamodel serves no schema graph, and then none
+            is built. There is deliberately no default: the correct IRI depends
+            on which datamodel is deployed, and guessing would put an
+            infrabel-named graph into an unrelated deployment.
     
     Returns:
         JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
@@ -6640,7 +6669,52 @@ def sparql_inexact_reasons() -> builtins.list[builtins.str]:
     that could.
     """
 
-def sparql_scope(query:builtins.str, schema_view:SchemaView) -> QueryPlan:
+def sparql_reads_only_the_schema_graph(query:builtins.str, schema_graph_iri:typing.Optional[builtins.str]) -> builtins.bool:
+    r"""
+    Whether every triple pattern in the query reads the schema graph.
+    
+    Such a query asks about the datamodel and about no golden record, so the
+    scoper refuses it as unscoped — correctly, since there is nothing to fetch.
+    The endpoint uses this to tell that case apart from a query with a genuinely
+    missing scope, and answers it from the schema graph with no instances.
+    
+    Args:
+        query: SPARQL query string.
+        schema_graph_iri: The named graph the active datamodel serves its
+            schema in, or ``None`` when it serves none — in which case no
+            query reads only it.
+    """
+
+def sparql_schema_graph_ntriples(schema_view:SchemaView, schema_graph_iri:builtins.str) -> builtins.str:
+    r"""
+    The datamodel's schema graph, as N-Triples.
+    
+    The same triples ``sparql_execute`` loads into the schema named graph.
+    Exposed for tests and for inspecting what a client can discover.
+    
+    Args:
+        schema_view: The LinkML schema.
+        schema_graph_iri: The named graph to put them in — see
+            ``sparql_execute``. Only the graph name depends on it; the triples
+            are the same either way.
+    
+    Raises:
+        ValueError: ``schema_graph_iri`` is not an absolute IRI.
+    """
+
+def sparql_schema_graph_skipped(schema_view:SchemaView, schema_graph_iri:builtins.str) -> builtins.list[builtins.str]:
+    r"""
+    Schema terms left out of the graph because their IRI was not absolute.
+    
+    Each entry names what was dropped and the offending CURIE. A non-empty list
+    means a prefix the schema's converter never saw — a schema defect worth
+    reporting, not a query failure, so the graph is served without them.
+    
+    Raises:
+        ValueError: ``schema_graph_iri`` is not an absolute IRI.
+    """
+
+def sparql_scope(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]) -> QueryPlan:
     r"""
     Analyse a SPARQL query and produce a structured fetch plan.
     
