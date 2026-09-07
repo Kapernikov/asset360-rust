@@ -199,9 +199,14 @@ fn into_oxigraph_term(term: oxrdf::Term) -> oxigraph::model::Term {
 mod tests {
     use super::*;
     use linkml_meta::SchemaDefinition;
-    use linkml_runtime::schema_rdf::{OWL_CLASS, RDF_TYPE, RDFS_LABEL, SKOS_IN_SCHEME};
+    use linkml_runtime::schema_rdf::{
+        OWL_ALL_VALUES_FROM, OWL_CLASS, OWL_MAX_CARDINALITY, OWL_MIN_CARDINALITY, OWL_ON_PROPERTY,
+        OWL_RESTRICTION, RDF_TYPE, RDFS_LABEL, RDFS_SUBCLASS_OF, SKOS_IN_SCHEME, XSD_INTEGER,
+    };
     use linkml_schemaview::identifier::Identifier;
-    use oxigraph::model::Term;
+    use oxigraph::model::{Subject, Term};
+    use oxigraph::sparql::QueryResults;
+    use oxigraph::store::Store;
     use std::path::Path;
 
     /// What the asset360 datamodel's config sets `schema_graph_iri` to. A test
@@ -236,7 +241,251 @@ mod tests {
     #[test]
     fn the_fixture_quad_count_is_pinned() {
         let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert_eq!(graph.quads.len(), 1417);
+        assert_eq!(graph.quads.len(), 5173);
+    }
+
+    /// The number above is not a number to be re-pinned when it moves; it has
+    /// to *add up*. This is the arithmetic, so a future change that moves the
+    /// total has to explain itself rather than being blessed.
+    ///
+    /// Upstream emits, per (class, slot) pair, one `owl:minCardinality`
+    /// restriction always, one `owl:maxCardinality` restriction when the slot
+    /// is single-valued, and one `owl:allValuesFrom` restriction when the range
+    /// resolves to exactly one class. Each restriction is four quads: its
+    /// `rdf:type`, its `owl:onProperty`, its constraining predicate, and the
+    /// `rdfs:subClassOf` that hangs it off the class.
+    #[test]
+    fn the_quad_count_reconciles_with_the_restrictions() {
+        let sv = asset360_schema_view();
+        let graph = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH).unwrap();
+
+        let count = |predicate: &str| {
+            graph
+                .quads
+                .iter()
+                .filter(|q| q.predicate.as_str() == predicate)
+                .count()
+        };
+        let pairs: usize = sv
+            .class_views()
+            .unwrap()
+            .iter()
+            .map(|cv| cv.slots().len())
+            .sum();
+
+        // One per pair, with an explicit 0 where the slot is not required —
+        // which is what `gen-owl` does, so it is what upstream does.
+        assert_eq!(
+            count(OWL_MIN_CARDINALITY),
+            pairs,
+            "one min per (class, slot)"
+        );
+
+        let restrictions =
+            count(OWL_MIN_CARDINALITY) + count(OWL_MAX_CARDINALITY) + count(OWL_ALL_VALUES_FROM);
+        assert_eq!(
+            count(OWL_ON_PROPERTY),
+            restrictions,
+            "every restriction carries exactly one owl:onProperty"
+        );
+
+        let typed_restrictions = graph
+            .quads
+            .iter()
+            .filter(|q| {
+                q.predicate.as_str() == RDF_TYPE
+                    && q.object.to_string() == format!("<{OWL_RESTRICTION}>")
+            })
+            .count();
+        assert_eq!(typed_restrictions, restrictions);
+
+        // 1417 was the count before per-class cardinality and range existed.
+        // 5173 - 1417 = 3756 = 4 x 939 restrictions, exactly.
+        assert_eq!(graph.quads.len(), 1417 + 4 * restrictions);
+    }
+
+    /// The unrolled form is the point: upstream matches `gen-owl`'s `simplify`
+    /// default and hangs each restriction off the class with its own
+    /// `rdfs:subClassOf`, rather than leaving it inside an `owl:intersectionOf`
+    /// list. That is what makes this query one hop plus one blank node instead
+    /// of an `rdf:first`/`rdf:rest` walk — so it is asserted through a real
+    /// SPARQL engine, on the shape a client would actually write.
+    ///
+    /// Three real fixture slots, one for each shape:
+    ///
+    /// * `Signal.NationalUniqueID` — a single-valued attribute, so
+    ///   `maxCardinality 1`. (No `allValuesFrom`: its range is `string`, and
+    ///   upstream resolves a slot's range through the same datatype IRI the
+    ///   instance writer stamps, which for a plain literal is nothing. That is
+    ///   pre-existing behaviour, visible already in `schema:rangeIncludes`.)
+    /// * `BaliseGroup.balises` — `multivalued: true` on the class-scoped
+    ///   `attributes` entry, so no cap at all, and `allValuesFrom` the
+    ///   fixture's `Balise` class.
+    /// * `Asset.externalReferences` — `multivalued: true` on the
+    ///   *schema-level* slot the class merely references, which is the
+    ///   `top_slot` half of `gen-owl`'s disjunction.
+    ///
+    /// Nothing in this fixture is `required: true`, so every `minCardinality`
+    /// here is the explicit `0` that `gen-owl` emits; `min 1` is exercised by
+    /// [`a_required_slot_reads_back_as_min_cardinality_one`].
+    #[test]
+    fn cardinality_is_queryable_in_the_unrolled_form() {
+        let sv = asset360_schema_view();
+        let store = store_of(&sv);
+        let one = format!("\"1\"^^<{XSD_INTEGER}>");
+        let zero = format!("\"0\"^^<{XSD_INTEGER}>");
+
+        assert_eq!(
+            bounds(
+                &sv,
+                &store,
+                "Signal",
+                "NationalUniqueID",
+                OWL_MAX_CARDINALITY
+            ),
+            vec![one],
+            "a single-valued attribute is capped at one"
+        );
+        assert_eq!(
+            bounds(
+                &sv,
+                &store,
+                "Signal",
+                "NationalUniqueID",
+                OWL_MIN_CARDINALITY
+            ),
+            vec![zero.clone()],
+        );
+        assert!(
+            bounds(&sv, &store, "BaliseGroup", "balises", OWL_MAX_CARDINALITY).is_empty(),
+            "balises is multivalued on the attribute and must not be capped"
+        );
+        assert_eq!(
+            bounds(&sv, &store, "BaliseGroup", "balises", OWL_MIN_CARDINALITY),
+            vec![zero.clone()],
+        );
+        assert_eq!(
+            bounds(&sv, &store, "BaliseGroup", "balises", OWL_ALL_VALUES_FROM),
+            vec!["<https://data.infrabel.be/asset360/Balise>".to_owned()],
+            "the per-class range must be readable through the same shape"
+        );
+
+        assert!(
+            bounds(
+                &sv,
+                &store,
+                "Asset",
+                "externalReferences",
+                OWL_MAX_CARDINALITY
+            )
+            .is_empty(),
+            "externalReferences is multivalued on the schema-level slot, which \
+             gen-owl's `slot.multivalued or top_slot.multivalued` also honours"
+        );
+        assert_eq!(
+            bounds(
+                &sv,
+                &store,
+                "Asset",
+                "externalReferences",
+                OWL_MIN_CARDINALITY
+            ),
+            vec![zero],
+        );
+    }
+
+    /// The fixture declares nothing `required`, so `min 1` gets its own
+    /// schema — small, but a real one, refining an inherited slot through
+    /// `slot_usage` exactly as `gen-owl`'s `slot.required or top_slot.required`
+    /// disjunction is meant to catch. The parent class shares the slot and is
+    /// *not* required, which is what makes the answer per-class.
+    #[test]
+    fn a_required_slot_reads_back_as_min_cardinality_one() {
+        let yaml = r#"
+id: https://example.org/cardinality
+name: cardinality
+prefixes:
+  ex: https://example.org/cardinality/
+default_prefix: ex
+default_range: string
+slots:
+  code:
+    range: string
+classes:
+  Base:
+    slots:
+      - code
+  Refined:
+    is_a: Base
+    slot_usage:
+      code:
+        required: true
+"#;
+        let deser = serde_yml::Deserializer::from_str(yaml);
+        let schema: SchemaDefinition = serde_path_to_error::deserialize(deser).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+
+        let store = store_of(&sv);
+        assert_eq!(
+            bounds(&sv, &store, "Refined", "code", OWL_MIN_CARDINALITY),
+            vec![format!("\"1\"^^<{XSD_INTEGER}>")],
+            "slot_usage required: true must read back as owl:minCardinality 1"
+        );
+        assert_eq!(
+            bounds(&sv, &store, "Base", "code", OWL_MIN_CARDINALITY),
+            vec![format!("\"0\"^^<{XSD_INTEGER}>")],
+            "the same slot on the parent is optional, so the answer is per-class"
+        );
+    }
+
+    /// The schema graph in an oxigraph store, ready to be queried.
+    fn store_of(sv: &SchemaView) -> Store {
+        let graph = SchemaGraph::build(sv, ASSET360_SCHEMA_GRAPH).unwrap();
+        let store = Store::new().unwrap();
+        for quad in &graph.quads {
+            store.insert(quad).unwrap();
+        }
+        store
+    }
+
+    /// Ask the store, through a real SPARQL engine and in the one-hop-plus-one
+    /// blank-node shape a client would write, for the values `predicate` takes
+    /// on the restriction that (`class`, `slot`) carries.
+    fn bounds(
+        sv: &SchemaView,
+        store: &Store,
+        class: &str,
+        slot: &str,
+        predicate: &str,
+    ) -> Vec<String> {
+        let conv = sv.converter();
+        let cv = sv
+            .class_views()
+            .unwrap()
+            .into_iter()
+            .find(|cv| cv.name() == class)
+            .unwrap_or_else(|| panic!("no class {class}"));
+        let class_iri = cv.get_uri(&conv, false, true).unwrap().to_string();
+        let slot_view = cv
+            .slots()
+            .iter()
+            .find(|s| s.name == slot)
+            .unwrap_or_else(|| panic!("{class} has no slot {slot}"))
+            .clone();
+        let slot_iri = slot_view.canonical_uri().to_uri(&conv).unwrap().0;
+
+        let query = format!(
+            "SELECT ?n WHERE {{ GRAPH <{ASSET360_SCHEMA_GRAPH}> {{ \
+             <{class_iri}> <{RDFS_SUBCLASS_OF}> [ <{OWL_ON_PROPERTY}> <{slot_iri}> ; \
+             <{predicate}> ?n ] }} }}"
+        );
+        match store.query(&query).unwrap() {
+            QueryResults::Solutions(solutions) => solutions
+                .map(|s| s.unwrap().get("n").unwrap().to_string())
+                .collect(),
+            _ => panic!("a SELECT must return solutions"),
+        }
     }
 
     #[test]
@@ -281,8 +530,12 @@ mod tests {
             // `NamedNode::new` on the way in already rejected relative IRIs;
             // re-check here so the invariant is asserted on the output, not on
             // the code path that produced it.
+            // Blank nodes are exempt: a restriction has no IRI by design.
             for iri in [
-                Some(quad.subject.to_string()),
+                match &quad.subject {
+                    Subject::NamedNode(node) => Some(node.to_string()),
+                    _ => None,
+                },
                 Some(quad.predicate.to_string()),
                 match &quad.object {
                     Term::NamedNode(node) => Some(node.to_string()),
