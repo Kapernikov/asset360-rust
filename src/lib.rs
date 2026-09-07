@@ -15,7 +15,7 @@ use linkml_meta::Annotation;
 use linkml_runtime::{LinkMLInstance, NodeId, diff::Delta};
 #[cfg(feature = "python-bindings")]
 use linkml_runtime_python::{
-    PyClassView, PyDelta, PyLinkMLInstance, PySchemaView, node_map_into_pydict,
+    PyClassView, PyDelta, PyLinkMLInstance, PySchemaView, PyValidationResult, node_map_into_pydict,
 };
 #[cfg(feature = "python-bindings")]
 use linkml_schemaview::classview::ClassView;
@@ -83,6 +83,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(format_blame_map_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_blame_info_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_foreign_references_py, m)?)?;
+    m.add_function(wrap_pyfunction!(load_json_batch, m)?)?;
     m.add_class::<PyForeignReference>()?;
     m.add_class::<PyConstraintSet>()?;
     #[cfg(feature = "sparql-endpoint")]
@@ -2962,6 +2963,72 @@ fn sparql_scope(
         // fifty lines apart that stayed identical by luck.
         Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e.to_string())),
     }
+}
+
+/// What ``load_json`` hands back for one document: the instance if the loader
+/// could represent it, and the *whole* validation-results list — all four
+/// severities, unfiltered, because only the caller knows which of them it
+/// treats as blocking.
+#[cfg(feature = "python-bindings")]
+type BoxedDocument = (Option<PyLinkMLInstance>, Vec<Py<PyValidationResult>>);
+
+#[cfg(feature = "python-bindings")]
+#[pyfunction]
+#[pyo3(signature = (sources, sv, class_view))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// Box a whole batch of JSON documents of one class in a single crossing.
+///
+/// Semantically identical to calling ``asset360_rust.load_json`` once per
+/// element and collecting the pairs: the return value is a list of
+/// ``(instance_or_None, validation_results)`` in input order, and the
+/// validation results are the *same single list of four severities* that
+/// ``load_json`` returns. Callers must keep splitting it — ``fatal``/``error``
+/// block, ``warning``/``info`` are advisory (see
+/// ``asset360_model.runtime.split_validation_results``); nothing here narrows
+/// the list, so treating the whole of it as fatal is exactly as wrong as it
+/// was before.
+///
+/// Why it exists: ``load_json`` rebuilds the schema's CURIE ``Converter`` from
+/// every schema definition on every call (``SchemaView::converter``), so a
+/// per-record loop over N records pays that build N times. Boxing 2553 SPARQL
+/// records cost 451 ms of which the overwhelming majority was that rebuild.
+/// This entry point resolves the schema, the class and the converter once and
+/// then loops in Rust.
+///
+/// Error behaviour is ``load_json``'s, unchanged: a document that is not
+/// parseable JSON raises, it does not turn into a ``None`` entry. Only a
+/// document the loader can parse but not represent as the class yields
+/// ``(None, results)``. A raise abandons the batch, which is the same
+/// observable outcome the per-record loop had — the request fails.
+fn load_json_batch(
+    py: Python<'_>,
+    sources: Vec<String>,
+    sv: Py<PySchemaView>,
+    class_view: Py<PyClassView>,
+) -> PyResult<Vec<BoxedDocument>> {
+    let bound_sv = sv.bind(py);
+    let sv_ref = bound_sv.borrow();
+    let rust_sv = sv_ref.as_rust();
+    let conv = rust_sv.converter();
+    let class_bound = class_view.bind(py);
+    let class_ref = class_bound.borrow();
+    let class = class_ref.as_rust();
+
+    let mut out = Vec::with_capacity(sources.len());
+    for text in &sources {
+        let outcome = linkml_runtime::load_json_str(text, rust_sv, class, &conv)
+            .map_err(|e| pyo3::exceptions::PyException::new_err(e.to_string()))?;
+        let issues = outcome
+            .validation_issues
+            .into_iter()
+            .map(|diag| Py::new(py, PyValidationResult::from(diag)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let instance = outcome
+            .instance
+            .map(|value| PyLinkMLInstance::new(value, sv.clone_ref(py)));
+        out.push((instance, issues));
+    }
+    Ok(out)
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
