@@ -4113,8 +4113,11 @@ class PushdownMeasure:
     @property
     def distinct(self) -> builtins.bool:
         r"""
-        ``True`` for ``COUNT(DISTINCT ...)``. Always ``False`` for the other
-        functions, where SPARQL has no DISTINCT form this subset accepts.
+        ``True`` for ``COUNT(DISTINCT ...)``, ``SUM(DISTINCT ...)`` and
+        ``AVG(DISTINCT ...)``.
+        
+        Always ``False`` for ``MIN`` and ``MAX``, where it is a no-op: the
+        extreme of a multiset is the extreme of its distinct values.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -6569,6 +6572,29 @@ def load_yaml(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[t
 def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
+
+def py_naive_plan_text(query:builtins.str) -> builtins.str:
+    r"""
+    The plan the refinement pipeline starts from: every node the engine's.
+    
+    The counterpart to :func:`refined_plan_text`. A refined plan alone shows
+    where the work ended up, not what moved -- a node that was always going to
+    be the engine's reads the same as one a rule declined to move. Printing both
+    makes the difference the pipeline made legible.
+    
+    Takes no schema, unlike :func:`refined_plan_text`: the naive plan is a
+    transcription of the query's own algebra and depends on nothing about the
+    data. That is the property the obligation ledger rests on.
+    
+    Args:
+        query: SPARQL query string.
+    
+    Returns:
+        str: the plan, one line per node, with the obligation ledger.
+    
+    Raises:
+        ValueError: the query does not parse or cannot be represented.
+    """
 
 def py_plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]) -> ExecutionPlan:
     r"""

@@ -91,6 +91,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sparql_inexact_reasons, m)?)?;
         m.add_function(wrap_pyfunction!(py_plan_query_refined, m)?)?;
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
+        m.add_function(wrap_pyfunction!(py_naive_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_ntriples, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_skipped, m)?)?;
@@ -2840,6 +2841,33 @@ fn py_plan_query_refined(
     crate::sparql_plan::plan_query_refined_with_schema_graph(query, sv, schema_graph_iri.as_deref())
         .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[pyfunction]
+#[pyo3(name = "naive_plan_text")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+/// The plan the refinement pipeline starts from: every node the engine's.
+///
+/// The counterpart to :func:`refined_plan_text`. A refined plan alone shows
+/// where the work ended up, not what moved -- a node that was always going to
+/// be the engine's reads the same as one a rule declined to move. Printing both
+/// makes the difference the pipeline made legible.
+///
+/// Takes no schema, unlike :func:`refined_plan_text`: the naive plan is a
+/// transcription of the query's own algebra and depends on nothing about the
+/// data. That is the property the obligation ledger rests on.
+///
+/// Args:
+///     query: SPARQL query string.
+///
+/// Returns:
+///     str: the plan, one line per node, with the obligation ledger.
+///
+/// Raises:
+///     ValueError: the query does not parse or cannot be represented.
+fn py_naive_plan_text(query: &str) -> PyResult<String> {
+    crate::sparql_plan::naive_plan_text(query).map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]

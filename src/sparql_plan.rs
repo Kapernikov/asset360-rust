@@ -880,6 +880,23 @@ impl Refinement {
         }
     }
 }
+/// The plan the refinement pipeline *starts* from: every node the engine's.
+///
+/// Diagnostics, and the counterpart to [`refined_plan_text`]. Reading a refined
+/// plan alone shows where the work ended up and not what moved: a node that was
+/// always going to be the engine's reads the same as one a rule declined to
+/// move. Printing both makes the difference the pipeline actually made legible,
+/// which is the whole claim of the design.
+///
+/// Takes no schema: the naive plan is a transcription of the query's own
+/// algebra, and nothing about it depends on what the data looks like. That is
+/// the property the ledger rests on -- the obligations are read off the query,
+/// so a rule can only ever discharge them, never invent one.
+pub fn naive_plan_text(query: &str) -> Result<String, String> {
+    crate::sparql_refine::naive_plan_of(query)
+        .map(|plan| plan.to_string())
+        .map_err(|e| e.to_string())
+}
 
 /// The refined plan for a query, as text.
 ///
@@ -2090,6 +2107,45 @@ mod tests {
         let mut doubled = balanced.clone();
         doubled.residual = vec![0, 1];
         assert_eq!(doubled.ledger_balances().unwrap_err().duplicated, vec![0]);
+    }
+
+    /// The naive text and the refined text must *differ* for a query the
+    /// pipeline actually improves, and both must carry the same obligations.
+    ///
+    /// This is the claim of the design stated as an assertion: refinement moves
+    /// work without changing what the query demands. A naive plan that already
+    /// read as SQL, or a refined plan that had lost an obligation, would both
+    /// pass a test that only checked one of the two strings.
+    #[test]
+    fn the_naive_text_shows_what_refinement_moved() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?kind (COUNT(*) AS ?n) WHERE {{ \
+             ?s a asset360:Signal ; asset360:kind ?kind }} GROUP BY ?kind"
+        );
+
+        let naive = naive_plan_text(&query).expect("the naive plan is a transcription");
+        let refined = refined_plan_text(&query, &sv).expect("this shape refines");
+
+        assert_ne!(naive, refined, "refinement moved nothing");
+        // The naive plan is the engine's throughout; the refined one is not.
+        assert!(
+            naive.contains("[E]"),
+            "naive plan should be all engine:\n{naive}"
+        );
+        assert!(
+            !naive.contains("[S]"),
+            "naive plan should have no SQL:\n{naive}"
+        );
+        assert!(
+            refined.contains("[S]"),
+            "refined plan should reach SQL:\n{refined}"
+        );
+        // Same demands, before and after.
+        for obligation in ["group", "aggregate"] {
+            assert!(naive.contains(obligation), "naive lost {obligation}");
+            assert!(refined.contains(obligation), "refined lost {obligation}");
+        }
     }
 
     /// The plan prints completely: an obligation that is not in the string is
