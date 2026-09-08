@@ -2295,7 +2295,7 @@ impl Builder<'_> {
                 let right = self.pattern(right, false);
                 let vars: BTreeSet<String> =
                     self.vars[left].union(&self.vars[right]).cloned().collect();
-                self.push(
+                let node = self.push(
                     PlanOp::LeftJoin {
                         left,
                         right,
@@ -2304,7 +2304,14 @@ impl Builder<'_> {
                     },
                     claims,
                     vars,
-                )
+                );
+                // An `EXISTS` in the lifted condition reads records too, and
+                // the order — left, right, then the condition — is the one
+                // the obligation enumeration walks.
+                match expression {
+                    Some(expression) => self.read_exists_blocks(expression, node),
+                    None => node,
+                }
             }
             GraphPattern::Union { left, right } => {
                 let left = self.pattern(left, false);
@@ -2337,6 +2344,7 @@ impl Builder<'_> {
                     }));
                 }
                 let mut input = self.pattern(inner, on_spine);
+                input = self.read_exists_blocks(expr, input);
                 let vars = self.vars[input].clone();
                 // First conjunct nearest the input, so the plan reads in the
                 // order the query wrote it.
@@ -2351,6 +2359,7 @@ impl Builder<'_> {
                 expression,
             } => {
                 let input = self.pattern(inner, on_spine);
+                let input = self.read_exists_blocks(expression, input);
                 let mut vars = self.vars[input].clone();
                 vars.insert(variable.as_str().to_owned());
                 self.push(
@@ -2529,6 +2538,42 @@ impl Builder<'_> {
     }
 
     /// One match per triple pattern, joined left-deep.
+    /// Build every `EXISTS` block a condition holds, as a left-join side.
+    ///
+    /// The condition itself stays where it is — an opaque expression the
+    /// engine evaluates — and this is only about the records it reads: they
+    /// have to be in the fetch, or the engine evaluates `NOT EXISTS` against
+    /// a class with nothing in it and reports every row as lacking. A *left*
+    /// join because the block is not a constraint on the rows the query
+    /// selects: `NOT EXISTS` keeps exactly the rows it does not match.
+    ///
+    /// The blocks come from [`crate::sparql_scoper::exists_patterns_of`], the
+    /// same walk in the same order the obligation enumeration used, so each
+    /// triple inside is claimed by the `Match` node built from it.
+    fn read_exists_blocks(&mut self, expr: &Expression, input: NodeId) -> NodeId {
+        let mut blocks = Vec::new();
+        crate::sparql_scoper::exists_patterns_of(expr, &mut blocks);
+        let mut current = input;
+        for block in blocks {
+            let right = self.pattern(block, false);
+            let vars: BTreeSet<String> = self.vars[current]
+                .union(&self.vars[right])
+                .cloned()
+                .collect();
+            current = self.push(
+                PlanOp::LeftJoin {
+                    left: current,
+                    right,
+                    reference: None,
+                    condition: None,
+                },
+                Vec::new(),
+                vars,
+            );
+        }
+        current
+    }
+
     fn bgp(&mut self, patterns: &[TriplePattern]) -> NodeId {
         let mut current: Option<NodeId> = None;
         for pattern in patterns {

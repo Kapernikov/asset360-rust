@@ -2155,6 +2155,44 @@ mod tests {
         }
     }
 
+    /// The records a `NOT EXISTS` asks about are in the fetch, and the filter
+    /// itself is the engine's.
+    ///
+    /// The bug this pins: the walk that enumerates triples skipped the filter
+    /// *expression*, so the pattern inside was scoped away -- no scan, no
+    /// records fetched -- and oxigraph evaluated `NOT EXISTS` against a class
+    /// with nothing in it. Every row came back as lacking a component, which
+    /// is a wrong answer with a balanced ledger and nothing in the plan to
+    /// say so.
+    #[test]
+    fn a_not_exists_block_is_fetched_and_left_to_the_engine() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?complex WHERE {{ ?complex a asset360:TunnelComplex . \
+             FILTER NOT EXISTS {{ ?component a asset360:CivilEngineeringAsset ; \
+             asset360:belongsToTunnelComplex ?complex }} }}"
+        );
+        let plan = plan_query_refined(&query, &sv).unwrap();
+        let printed = plan.to_string();
+
+        // The class the filter asks about is scanned, and scanned optionally:
+        // a complex with no component is exactly what the query selects, so
+        // the join must not delete it.
+        assert!(
+            printed.contains("scan      asset360:CivilEngineeringAsset"),
+            "the NOT EXISTS class is not fetched:\n{printed}"
+        );
+        assert!(
+            printed.contains("as ?component   optional"),
+            "the NOT EXISTS scan must be optional:\n{printed}"
+        );
+        assert!(printed.contains("left"), "{printed}");
+        // The filter stays with the engine, and every triple inside it is
+        // claimed by exactly one node.
+        assert!(printed.contains("pass 1  ENGINE"), "{printed}");
+        plan.ledger_balances().unwrap();
+    }
+
     /// The plan prints completely: an obligation that is not in the string is
     /// not in the plan, so a reader can audit the ledger by eye.
     #[test]

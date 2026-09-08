@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use spargebra::algebra::{Expression, GraphPattern};
+use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use spargebra::{Query, SparqlParser};
 
@@ -1596,8 +1596,8 @@ pub fn scope_parsed_with_schema_graph(
         for s in &stars {
             if s.is_optional && !reachable.contains(s.variable.as_str()) {
                 return Err(ScopeError::UnsupportedConstruct(format!(
-                    "OPTIONAL block introduces ?{} which shares no variable with the mandatory pattern; \
-                     disconnected OPTIONAL is not supported yet",
+                    "an OPTIONAL or EXISTS block introduces ?{} which shares no variable with the \
+                     mandatory pattern; a disconnected block is not supported yet",
                     s.variable
                 )));
             }
@@ -2030,21 +2030,69 @@ pub(crate) fn tag_triples_by_depth<'a>(
             tag_triples_by_depth(left, depth, out)?;
             tag_triples_by_depth(right, depth, out)
         }
-        GraphPattern::LeftJoin { left, right, .. } => {
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
             // Left side stays at the current depth — it's the mandatory
             // pattern from the point of view of this OPTIONAL.
             tag_triples_by_depth(left, depth, out)?;
             // Right side is one level deeper — it's inside the OPTIONAL.
-            tag_triples_by_depth(right, depth + 1, out)
+            tag_triples_by_depth(right, depth + 1, out)?;
+            // The condition spargebra lifted out of `OPTIONAL { ... FILTER }`,
+            // which may hold an `EXISTS` like any other filter. Read last, so
+            // the order is the one the obligation enumeration and the plan
+            // builder both walk: left, right, then the condition.
+            match expression {
+                Some(expression) => read_exists_patterns(expression, depth, out),
+                None => Ok(()),
+            }
         }
-        GraphPattern::Filter { inner, .. }
-        | GraphPattern::Extend { inner, .. }
-        | GraphPattern::OrderBy { inner, .. }
-        | GraphPattern::Project { inner, .. }
+        // An expression is part of the query, and an `EXISTS` inside one reads
+        // records like any triple pattern does. The three arms below are the
+        // positions where those records are read into the fetch; the two after
+        // them are the positions where they are refused. Skipping the
+        // expression — which is what every one of these arms used to do — left
+        // `FILTER NOT EXISTS { ?seg a :TunnelSegment }` fetching no segment at
+        // all, so the filter held for every row and the endpoint answered a
+        // different question without saying so.
+        GraphPattern::Filter { expr, inner } => {
+            tag_triples_by_depth(inner, depth, out)?;
+            read_exists_patterns(expr, depth, out)
+        }
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => {
+            tag_triples_by_depth(inner, depth, out)?;
+            read_exists_patterns(expression, depth, out)
+        }
+        // `ORDER BY EXISTS { ... }` and `SUM(?x + EXISTS { ... })` are read by
+        // nothing here: the ordering and the aggregate are computed over rows
+        // the fetch produced, and there is no node that would claim the
+        // pattern's triples. Refused rather than fetched-and-hoped, which is
+        // the shape of the bug this walk is being fixed for.
+        GraphPattern::OrderBy { inner, expression } => {
+            for term in expression {
+                let (OrderExpression::Asc(expr) | OrderExpression::Desc(expr)) = term;
+                refuse_exists_patterns(expr, "an ORDER BY expression")?;
+            }
+            tag_triples_by_depth(inner, depth, out)
+        }
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            for (_, aggregate) in aggregates {
+                if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
+                    refuse_exists_patterns(expr, "an aggregate's argument")?;
+                }
+            }
+            tag_triples_by_depth(inner, depth, out)
+        }
+        GraphPattern::Project { inner, .. }
         | GraphPattern::Distinct { inner }
         | GraphPattern::Reduced { inner }
         | GraphPattern::Slice { inner, .. }
-        | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => tag_triples_by_depth(inner, depth, out),
         GraphPattern::Values { .. } => Ok(()),
@@ -2057,6 +2105,94 @@ pub(crate) fn tag_triples_by_depth<'a>(
         GraphPattern::Path { .. } => Err(ScopeError::UnsupportedConstruct(
             "SPARQL property paths are not supported; use explicit triple patterns".into(),
         )),
+    }
+}
+
+/// Read every `EXISTS` block this expression holds into the fetch.
+///
+/// One level deeper than the expression's own pattern, and that is the whole
+/// point: the block is not a constraint on the rows the query selects. A
+/// complex with no segment is exactly what `FILTER NOT EXISTS { ?seg
+/// :belongsTo ?complex }` keeps, so its star is optional — the fetch left-joins
+/// it and pushes nothing from inside it as a condition — and the engine, which
+/// re-runs the whole query over the fetched instances, has the segments it
+/// needs to answer.
+fn read_exists_patterns<'a>(
+    expr: &'a Expression,
+    depth: usize,
+    out: &mut Vec<(&'a TriplePattern, usize)>,
+) -> Result<(), ScopeError> {
+    let mut patterns = Vec::new();
+    exists_patterns_of(expr, &mut patterns);
+    for pattern in patterns {
+        tag_triples_by_depth(pattern, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+/// Refuse an `EXISTS` in an expression position nothing reads it from.
+///
+/// The alternative is what this module did before: walk past it, fetch none of
+/// the records it names, and let the engine evaluate it against an empty class
+/// — a wrong answer with nothing in the plan to say so.
+fn refuse_exists_patterns(expr: &Expression, position: &'static str) -> Result<(), ScopeError> {
+    let mut patterns = Vec::new();
+    exists_patterns_of(expr, &mut patterns);
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    Err(ScopeError::UnsupportedConstruct(format!(
+        "EXISTS in {position} is not supported; move it into a FILTER, or bind \
+         it with BIND(EXISTS {{ ... }} AS ?flag) first"
+    )))
+}
+
+/// Every `EXISTS` block an expression holds, in the order it writes them.
+///
+/// Exhaustive over [`Expression`] on purpose — no `_` arm — so a spargebra
+/// release that adds a variant is a compile error here rather than one more
+/// position where a pattern is silently not fetched.
+pub(crate) fn exists_patterns_of<'a>(expr: &'a Expression, out: &mut Vec<&'a GraphPattern>) {
+    match expr {
+        Expression::Exists(pattern) => out.push(pattern),
+        Expression::Or(left, right)
+        | Expression::And(left, right)
+        | Expression::Equal(left, right)
+        | Expression::SameTerm(left, right)
+        | Expression::Greater(left, right)
+        | Expression::GreaterOrEqual(left, right)
+        | Expression::Less(left, right)
+        | Expression::LessOrEqual(left, right)
+        | Expression::Add(left, right)
+        | Expression::Subtract(left, right)
+        | Expression::Multiply(left, right)
+        | Expression::Divide(left, right) => {
+            exists_patterns_of(left, out);
+            exists_patterns_of(right, out);
+        }
+        Expression::In(value, candidates) => {
+            exists_patterns_of(value, out);
+            for candidate in candidates {
+                exists_patterns_of(candidate, out);
+            }
+        }
+        Expression::UnaryPlus(inner) | Expression::UnaryMinus(inner) | Expression::Not(inner) => {
+            exists_patterns_of(inner, out)
+        }
+        Expression::If(condition, then, otherwise) => {
+            exists_patterns_of(condition, out);
+            exists_patterns_of(then, out);
+            exists_patterns_of(otherwise, out);
+        }
+        Expression::Coalesce(parts) | Expression::FunctionCall(_, parts) => {
+            for part in parts {
+                exists_patterns_of(part, out);
+            }
+        }
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => {}
     }
 }
 
@@ -4293,6 +4429,62 @@ classes:
         )
         .unwrap();
         assert_eq!(plan.sql_limit, Some(10));
+    }
+
+    #[test]
+    fn a_not_exists_pattern_is_read_into_the_fetch() {
+        // The engine answers `NOT EXISTS` from the fetched instances, so the
+        // records the pattern asks about have to be in the fetch. Scoped away,
+        // the filter sees an empty class and holds for every row.
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?complex WHERE { ?complex a asset360:TunnelComplex . \
+             FILTER NOT EXISTS { ?component a asset360:CivilEngineeringAsset ; \
+             asset360:belongsToTunnelComplex ?complex } }",
+            &sv,
+        )
+        .unwrap();
+
+        let star = find_star(&plan, "component");
+        assert_eq!(
+            star.class_uri,
+            "https://data.infrabel.be/asset360/CivilEngineeringAsset"
+        );
+        // Not a constraint on the outer rows: a complex with no component is
+        // exactly what the query selects, so the fetch must keep it.
+        assert!(star.is_optional);
+        assert_ne!(plan.inexact, None);
+    }
+
+    #[test]
+    fn an_exists_the_fetch_cannot_read_is_refused_rather_than_skipped() {
+        // The second half of the same bug. A pattern nothing reads into the
+        // fetch must refuse the query, because the alternative is what this
+        // walk used to do: skip it, fetch none of the records it names, and
+        // let the engine evaluate it against an empty class.
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for query in [
+            // Ordered by a pattern, which is computed over rows the fetch
+            // already produced.
+            "SELECT ?s WHERE { ?s a asset360:Signal } \
+             ORDER BY (EXISTS { ?s asset360:belongsToLine ?l })",
+            // Aggregated over one, same reason.
+            "SELECT (SUM(IF(EXISTS { ?s asset360:belongsToLine ?l }, 1, 0)) AS ?n) \
+             WHERE { ?s a asset360:Signal }",
+        ] {
+            let error = sparql_scope(&format!("{prefix}{query}"), &sv)
+                .expect_err("should refuse rather than answer: {query}");
+            let ScopeError::UnsupportedConstruct(message) = &error else {
+                panic!("expected an unsupported-construct refusal, got {error:?}");
+            };
+            assert!(
+                message.contains("EXISTS"),
+                "the refusal should name the construct: {message}"
+            );
+        }
     }
 
     // ---- Two-type inner join ----
