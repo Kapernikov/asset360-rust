@@ -19,9 +19,11 @@
 //! of band. See [`crate::sparql_schema_graph`] for what it holds and why it is
 //! a *named* graph. It is built only for a query that carries a `GRAPH` clause
 //! — nothing else can read it — so an instance query pays nothing for it. A
-//! query that does read it pays the build every time: ~3,200 quads and ~80 ms
-//! against the live asset360 schema, which is where a cache keyed on the
-//! schema view would go if discovery queries ever become frequent.
+//! query that does read it pays the build every time: ~11,500 quads and
+//! ~80-100 ms against the live asset360 schema (the count is pinned by
+//! `test_the_graph_size_is_pinned` in the consolidator-server suite), which is
+//! where a cache keyed on the schema view would go if discovery queries ever
+//! become frequent.
 
 #[cfg(feature = "sparql-endpoint")]
 use oxigraph::io::RdfFormat;

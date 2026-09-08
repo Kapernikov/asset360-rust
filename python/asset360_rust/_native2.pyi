@@ -2681,19 +2681,18 @@ class ExecutionPlan:
     @property
     def refinement(self) -> builtins.str:
         r"""
-        Where these operators came from: ``"not_attempted"``, ``"used"``,
-        ``"used_alone"`` or ``"fallback"``.
-        
-        ``"not_attempted"`` for a plan from :func:`plan_query`, which does not
-        refine. The rest only come from :func:`plan_query_refined`.
+        Where these operators came from: ``"used"``, ``"used_alone"`` or
+        ``"fallback"``. Every plan comes from :func:`plan_query_refined`, the
+        only planner, so these three are the whole vocabulary.
         
         ``"used"`` and ``"used_alone"`` are different risks and read
-        differently on purpose. ``"used"`` is a *substitution*: the single-pass
-        planner had a plan, and the refined statement was shown to read no more
-        rows and leave no more work to the engine. ``"used_alone"`` is a
-        *capability*: that planner refuses the query outright, so nothing was
-        compared — the plan was admitted because it answers the whole question
-        in SQL by construction, and ``refinement_note`` says what was refused.
+        differently on purpose. ``"used"`` is a *fetch*: the statement narrows
+        the rows and the engine finishes the query over them, with
+        ``refinement_note`` saying what it left for the engine.
+        ``"used_alone"`` is a *capability*: the statement answers the whole
+        query in SQL, admitted on the plan's own soundness — every node in SQL,
+        every obligation discharged, the residual empty — and
+        ``refinement_note`` says on what grounds.
         """
     @property
     def refinement_reason(self) -> typing.Optional[builtins.str]:
@@ -3749,6 +3748,21 @@ class PlanOp:
     def optional_slots(self) -> builtins.list[builtins.str]:
         r"""
         For ``"scan"``: slots that may be absent, so no existence check.
+        """
+    @property
+    def retrieval(self) -> typing.Optional[builtins.list[builtins.str]]:
+        r"""
+        What the fetch must retrieve for a scan's records.
+        
+        ``None`` means the whole stored record — the answer for every shape
+        whose reachable slots the planner could not enumerate, and for every
+        node that is not a scan. A list means those top-level slots and nothing
+        else; the identifier and the type designator are always in it.
+        
+        A renderer that does not read this getter fetches whole records, which
+        is what it did before the field existed. That is the direction the
+        default has to point: projecting away a slot the query can still reach
+        answers with missing rows and no error.
         """
     @property
     def is_optional(self) -> builtins.bool:
@@ -6428,7 +6442,7 @@ class UnitOfMeasure:
 
 class ValidationResult:
     @property
-    def r#type(self) -> builtins.str: ...
+    def type(self) -> builtins.str: ...
     @property
     def severity(self) -> builtins.str: ...
     @property
@@ -6567,13 +6581,39 @@ def lint_instance_identity(instance:LinkMLInstance) -> builtins.list[ValidationR
 
 def load_json(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[typing.Optional[LinkMLInstance], builtins.list[ValidationResult]]: ...
 
+def load_json_batch(sources:typing.Sequence[builtins.str], sv:SchemaView, class_view:ClassView) -> builtins.list[tuple[typing.Optional[LinkMLInstance], builtins.list[ValidationResult]]]:
+    r"""
+    Box a whole batch of JSON documents of one class in a single crossing.
+    
+    Semantically identical to calling ``asset360_rust.load_json`` once per
+    element and collecting the pairs: the return value is a list of
+    ``(instance_or_None, validation_results)`` in input order, and the
+    validation results are the *same single list of four severities* that
+    ``load_json`` returns. Callers must keep splitting it — ``fatal``/``error``
+    block, ``warning``/``info`` are advisory (see
+    ``asset360_model.runtime.split_validation_results``); nothing here narrows
+    the list, so treating the whole of it as fatal is exactly as wrong as it
+    was before.
+    
+    Why it exists: ``load_json`` rebuilds the schema's CURIE ``Converter`` from
+    every schema definition on every call (``SchemaView::converter``), so a
+    per-record loop over N records pays that build N times. Boxing 2553 SPARQL
+    records cost 451 ms of which the overwhelming majority was that rebuild.
+    This entry point resolves the schema, the class and the converter once and
+    then loops in Rust.
+    
+    Error behaviour is ``load_json``'s, unchanged: a document that is not
+    parseable JSON raises, it does not turn into a ``None`` entry. Only a
+    document the loader can parse but not represent as the class yields
+    ``(None, results)``. A raise abandons the batch, which is the same
+    observable outcome the per-record loop had — the request fails.
+    """
+
 def load_yaml(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[typing.Optional[LinkMLInstance], builtins.list[ValidationResult]]: ...
 
 def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
-def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
-
-def py_naive_plan_text(query:builtins.str) -> builtins.str:
+def naive_plan_text(query:builtins.str) -> builtins.str:
     r"""
     The plan the refinement pipeline starts from: every node the engine's.
     
@@ -6596,13 +6636,15 @@ def py_naive_plan_text(query:builtins.str) -> builtins.str:
         ValueError: the query does not parse or cannot be represented.
     """
 
-def py_plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]) -> ExecutionPlan:
+def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
+
+def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None) -> ExecutionPlan:
     r"""
     Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
     
     The only planner. A naive plan of the whole query is refined by rules to a
     fixpoint and lowered into the operators the caller renders. There used to
-    be a second one — :func:`plan_query`, a single-pass analysis — and a
+    be a second one — a single-pass analysis, exposed as ``plan_query`` — and a
     runtime gate that ran both and compared them; both are gone.
     
     ``refinement`` says how to run it:
@@ -6631,7 +6673,7 @@ def py_plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_gra
             scoped at all.
     """
 
-def py_refined_plan_text(query:builtins.str, schema_view:SchemaView) -> builtins.str:
+def refined_plan_text(query:builtins.str, schema_view:SchemaView) -> builtins.str:
     r"""
     The refined plan for a query, as the text the Rust tests print.
     
@@ -6652,7 +6694,7 @@ def py_refined_plan_text(query:builtins.str, schema_view:SchemaView) -> builtins
         ValueError: the query does not parse or cannot be represented.
     """
 
-def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str, max_triples:builtins.int, max_result_rows:builtins.int, schema_graph_iri:typing.Optional[builtins.str]) -> builtins.str:
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str='json', max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None) -> builtins.str:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
     
@@ -6695,7 +6737,7 @@ def sparql_inexact_reasons() -> builtins.list[builtins.str]:
     that could.
     """
 
-def sparql_reads_only_the_schema_graph(query:builtins.str, schema_graph_iri:typing.Optional[builtins.str]) -> builtins.bool:
+def sparql_reads_only_the_schema_graph(query:builtins.str, schema_graph_iri:typing.Optional[builtins.str]=None) -> builtins.bool:
     r"""
     Whether every triple pattern in the query reads the schema graph.
     
@@ -6740,7 +6782,7 @@ def sparql_schema_graph_skipped(schema_view:SchemaView, schema_graph_iri:builtin
         ValueError: ``schema_graph_iri`` is not an absolute IRI.
     """
 
-def sparql_scope(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]) -> QueryPlan:
+def sparql_scope(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None) -> QueryPlan:
     r"""
     Analyse a SPARQL query and produce a structured fetch plan.
     

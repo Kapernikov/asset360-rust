@@ -1,11 +1,11 @@
 //! The naive plan: the query, faithfully, with nothing pushed down.
 //!
-//! [`crate::sparql_plan::plan_query`] decides pushdown once, for the query as
-//! a whole: `analyse_pushdown` answers eligible or blocked, and one filter it
-//! cannot express in SQL costs the entire grouping. That cliff is a property
-//! of *when* the decision is made. A planner that starts from "the engine does
-//! everything" and moves work down one step at a time ends wherever it runs
-//! out of rules, which is partial pushdown by construction.
+//! The single-pass planner this replaced decided pushdown once, for the query
+//! as a whole: `analyse_pushdown` answered eligible or blocked, and one filter
+//! it could not express in SQL cost the entire grouping. That cliff is a
+//! property of *when* the decision is made. A planner that starts from "the
+//! engine does everything" and moves work down one step at a time ends
+//! wherever it runs out of rules, which is partial pushdown by construction.
 //!
 //! This module is the starting point of that: the algebra as the query wrote
 //! it, every node tagged [`Executor::Engine`], nothing folded. Three things
@@ -32,12 +32,17 @@
 //! # Why this is a second artifact rather than a change to `ExecutionPlan`
 //!
 //! An [`crate::sparql_plan::ExecutionPlan`] is passes made of operators, and
-//! it is what `views.py` and `sql_builder.py` read today. Refinement replaces
-//! that shape with one tree cut by a frontier, which is stage 3 of the plan in
-//! `28d-plan-refinement.md`. Until the rules can carry a query as far as the
-//! single-pass analysis does, two artifacts is the only way to add the
-//! machinery without changing an answer: nothing here is reachable from
-//! `plan_query`.
+//! it is what `views.py` and `sql_builder.py` read. Refinement works in a
+//! different shape — one tree cut by a frontier — and
+//! [`crate::sparql_plan::plan_query_refined`] *lowers* the refined tree into
+//! those operators, so the two artifacts stay separate: this module's [`Plan`]
+//! is what the rules rewrite, an `ExecutionPlan` is what the callers render.
+//!
+//! Historically this separation also bought safety. While a second, single-pass
+//! planner still existed, nothing here was reachable from it, so the machinery
+//! could be added without changing an answer. That planner is gone and
+//! refinement is the only one; the split now survives only because it is the
+//! rules' shape versus the renderers'.
 //!
 //! # The invariants
 //!

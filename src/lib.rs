@@ -1257,8 +1257,8 @@ impl PyConstraintSet {
 // ---- SPARQL endpoint PyO3 bindings ----
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
 ///
@@ -1371,8 +1371,8 @@ impl FilterCondition {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// A star in the query plan — one LinkML class with its constraints.
 ///
@@ -1539,8 +1539,8 @@ impl Star {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// A join between two stars, pushable to a SQL JOIN.
 ///
@@ -1604,8 +1604,8 @@ impl JoinEdge {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// One node in the query plan algebra tree.
 ///
@@ -1689,8 +1689,8 @@ impl PlanNode {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// Structured plan for fetching data from PostgreSQL.
 ///
@@ -1847,8 +1847,8 @@ impl QueryPlan {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// One projected value in a pushdown solution: which slot of which star it
 /// reads, and where that sits in the schema.
@@ -1971,8 +1971,8 @@ impl PushdownBinding {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// One aggregate in the SELECT list.
 pub struct PushdownMeasure {
@@ -2045,8 +2045,8 @@ impl PushdownMeasure {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// One ``HAVING`` comparison: a column of the grouped result against a
 /// constant.
@@ -2113,8 +2113,8 @@ impl PushdownHaving {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// One ``ORDER BY`` term.
 ///
@@ -2169,8 +2169,8 @@ impl PushdownOrder {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// One operator of a database pass: a scan, a filter, a join, an unnest, a
 /// grouping, a sort, a distinct, a slice, or a projection.
@@ -2571,8 +2571,8 @@ impl PlanOp {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// One step of an execution plan.
 pub struct PlanPass {
@@ -2661,8 +2661,8 @@ impl PlanPass {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyclass]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
 #[derive(Clone)]
 /// What answering a query takes: the obligations it imposes, the passes that
 /// discharge them, and anything left over.
@@ -2711,19 +2711,18 @@ impl ExecutionPlan {
             .collect()
     }
 
-    /// Where these operators came from: ``"not_attempted"``, ``"used"``,
-    /// ``"used_alone"`` or ``"fallback"``.
-    ///
-    /// ``"not_attempted"`` for a plan from :func:`plan_query`, which does not
-    /// refine. The rest only come from :func:`plan_query_refined`.
+    /// Where these operators came from: ``"used"``, ``"used_alone"`` or
+    /// ``"fallback"``. Every plan comes from :func:`plan_query_refined`, the
+    /// only planner, so these three are the whole vocabulary.
     ///
     /// ``"used"`` and ``"used_alone"`` are different risks and read
-    /// differently on purpose. ``"used"`` is a *substitution*: the single-pass
-    /// planner had a plan, and the refined statement was shown to read no more
-    /// rows and leave no more work to the engine. ``"used_alone"`` is a
-    /// *capability*: that planner refuses the query outright, so nothing was
-    /// compared — the plan was admitted because it answers the whole question
-    /// in SQL by construction, and ``refinement_note`` says what was refused.
+    /// differently on purpose. ``"used"`` is a *fetch*: the statement narrows
+    /// the rows and the engine finishes the query over them, with
+    /// ``refinement_note`` saying what it left for the engine.
+    /// ``"used_alone"`` is a *capability*: the statement answers the whole
+    /// query in SQL, admitted on the plan's own soundness — every node in SQL,
+    /// every obligation discharged, the residual empty — and
+    /// ``refinement_note`` says on what grounds.
     #[getter]
     fn refinement(&self) -> &'static str {
         self.inner.refinement.as_str()
@@ -2815,15 +2814,15 @@ impl ExecutionPlan {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "plan_query_refined")]
 #[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
 ///
 /// The only planner. A naive plan of the whole query is refined by rules to a
 /// fixpoint and lowered into the operators the caller renders. There used to
-/// be a second one — :func:`plan_query`, a single-pass analysis — and a
+/// be a second one — a single-pass analysis, exposed as ``plan_query`` — and a
 /// runtime gate that ran both and compared them; both are gone.
 ///
 /// ``refinement`` says how to run it:
@@ -2866,9 +2865,9 @@ fn py_plan_query_refined(
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "naive_plan_text")]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// The plan the refinement pipeline starts from: every node the engine's.
 ///
 /// The counterpart to :func:`refined_plan_text`. A refined plan alone shows
@@ -2893,9 +2892,9 @@ fn py_naive_plan_text(query: &str) -> PyResult<String> {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "refined_plan_text")]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// The refined plan for a query, as the text the Rust tests print.
 ///
 /// Diagnostics, and the one thing the `ExecutionPlan` artifact cannot show: on
@@ -2926,8 +2925,8 @@ fn py_refined_plan_text(
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyfunction]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
 /// Every value :attr:`QueryPlan.inexact_reason` can take, in the planner's own
 /// order.
 ///
@@ -2944,9 +2943,9 @@ fn sparql_inexact_reasons() -> Vec<&'static str> {
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Analyse a SPARQL query and produce a structured fetch plan.
 ///
 /// Decomposes the query into stars (one per ``rdf:type``), detects
@@ -2994,9 +2993,9 @@ fn sparql_scope(
 type BoxedDocument = (Option<PyLinkMLInstance>, Vec<Py<PyValidationResult>>);
 
 #[cfg(feature = "python-bindings")]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (sources, sv, class_view))]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Box a whole batch of JSON documents of one class in a single crossing.
 ///
 /// Semantically identical to calling ``asset360_rust.load_json`` once per
@@ -3053,9 +3052,9 @@ fn load_json_batch(
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None))]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Execute a SPARQL query against a list of LinkML instances.
 ///
 /// Converts each instance to RDF, loads into an in-memory store (with
@@ -3138,8 +3137,8 @@ fn sparql_execute(
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyfunction]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
 /// The datamodel's schema graph, as N-Triples.
 ///
 /// The same triples ``sparql_execute`` loads into the schema named graph.
@@ -3166,8 +3165,8 @@ fn sparql_schema_graph_ntriples(
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-#[pyfunction]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
 /// Schema terms left out of the graph because their IRI was not absolute.
 ///
 /// Each entry names what was dropped and the offending CURIE. A non-empty list
@@ -3189,9 +3188,9 @@ fn sparql_schema_graph_skipped(
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (query, schema_graph_iri=None))]
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 /// Whether every triple pattern in the query reads the schema graph.
 ///
 /// Such a query asks about the datamodel and about no golden record, so the
