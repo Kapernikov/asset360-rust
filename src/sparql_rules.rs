@@ -2984,10 +2984,47 @@ impl PushNotExists<'_> {
         };
         let (holder, slot) =
             PushReferenceJoin::new(self.schema).foreign_key_on(plan, right, referenced)?;
+        // `FILTER NOT EXISTS { ?c :refersTo ?c }` is a star referring to
+        // itself, so the block scans the variable the outer pattern already
+        // scans. Two scans of one variable is not a shape the renderer reads —
+        // it keys stars by variable, and the negated one is meant to *leave*
+        // that list — so the negation stays with the engine.
+        if holder == *referenced {
+            return None;
+        }
+        // The correlated row must be a row the statement has: a star an
+        // `OPTIONAL` introduces may be unmatched, and the renderer states such
+        // a star's conditions in the `ON` of the edge that introduces it —
+        // where a negation would decide whether the star *matched* rather than
+        // whether the solution holds. The renderer refuses that placement; the
+        // rule is what keeps it from arising.
+        if self.introduced_optionally(plan, referenced) {
+            return None;
+        }
         Some(ReferenceEdge {
             referenced: referenced.clone(),
             holder,
             slot,
+        })
+    }
+}
+
+impl PushNotExists<'_> {
+    /// Whether an `OPTIONAL` introduces this star, so its row may be
+    /// unmatched.
+    fn introduced_optionally(&self, plan: &Plan, star_var: &str) -> bool {
+        let scans: Vec<NodeId> = plan
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(id, node)| match &node.op {
+                PlanOp::Scan { star_var: scan, .. } if scan == star_var => Some(id),
+                _ => None,
+            })
+            .collect();
+        plan.nodes.iter().any(|node| {
+            matches!(&node.op, PlanOp::LeftJoin { right, .. }
+                if scans.iter().any(|scan| *scan == *right || plan.feeds(*scan, *right)))
         })
     }
 }
@@ -4294,6 +4331,30 @@ mod tests {
         // The filter obligation goes with it: the statement applies the
         // negation, so nobody else has to.
         assert!(!plan.nodes[anti].discharges.is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// A negation correlated on a star an `OPTIONAL` introduces is not
+    /// pushed: that row may be unmatched, and the renderer states such a
+    /// star's conditions in the `ON` of the edge that introduces it -- where a
+    /// negation would decide whether the star *matched* rather than whether
+    /// the solution holds. The renderer refuses that placement; this is the
+    /// rule that keeps it from arising.
+    #[test]
+    fn a_not_exists_on_an_optional_star_is_not_pushed() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?comp WHERE { ?comp a asset360:CivilEngineeringAsset . \
+             OPTIONAL { ?c a asset360:TunnelComplex . \
+             ?comp asset360:belongsToTunnelComplex ?c } \
+             FILTER NOT EXISTS { ?other a asset360:CivilEngineeringAsset ; \
+             asset360:belongsToTunnelComplex ?c } }",
+            &schema,
+            false,
+        );
+
+        let anti = plan.find("antijoin")[0];
+        assert_eq!(plan.nodes[anti].executor, Executor::Engine, "{plan}");
         println!("{plan}");
     }
 
