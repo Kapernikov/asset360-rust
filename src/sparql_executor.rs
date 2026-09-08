@@ -351,7 +351,8 @@ pub fn sparql_execute(
                 )
                 .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
             }
-            let body = String::from_utf8(buf).map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+            let body =
+                String::from_utf8(buf).map_err(|e| ExecuteError::QueryError(e.to_string()))?;
             Ok(SparqlAnswer::graph(body))
         }
     }

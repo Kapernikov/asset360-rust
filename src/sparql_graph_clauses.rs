@@ -35,8 +35,8 @@
 /// *possibly* reading it, so the schema graph is built and oxigraph is left to
 /// report the real parse error rather than this function inventing one.
 pub fn query_reads_named_graphs(query: &str) -> bool {
-    use spargebra::algebra::GraphPattern;
     use spargebra::Query;
+    use spargebra::algebra::GraphPattern;
 
     fn walk(pattern: &GraphPattern) -> bool {
         match pattern {
@@ -88,9 +88,9 @@ pub fn query_reads_named_graphs(query: &str) -> bool {
 /// A query that does not parse is not schema-only: the real parse error must
 /// surface, not be turned into an empty answer.
 pub fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
+    use spargebra::Query;
     use spargebra::algebra::GraphPattern;
     use spargebra::term::NamedNodePattern;
-    use spargebra::Query;
 
     let Some(schema_graph_iri) = schema_graph_iri else {
         return false;
