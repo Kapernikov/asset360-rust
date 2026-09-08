@@ -1016,6 +1016,34 @@ pub fn lower_refined(
                     discharges: node.discharges.clone(),
                 });
             }
+            RefinedOp::AntiJoin {
+                left,
+                right,
+                reference,
+            } => {
+                let Some(edge) = reference else {
+                    // An anti-join no rule pushed has no correlation to
+                    // render. Refused rather than rendered as a join, which
+                    // would turn "rows without a match" into "rows with one".
+                    return Err(LoweringRefusal::Unrenderable { node: id });
+                };
+                nodes.push(OpNode {
+                    op: Op::Join {
+                        left: remap[left],
+                        right: remap[right],
+                        left_star: edge.referenced.clone(),
+                        right_star: edge.holder.clone(),
+                        right_slot: edge.slot.clone(),
+                        // Single-valued for the reason the two joins below
+                        // give: `foreign_key_on` only takes a single-valued
+                        // reference slot, and `reference_joins_agree` refuses
+                        // a recorded edge that is not one.
+                        right_multivalued: false,
+                        kind: JoinType::Anti,
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
             RefinedOp::Join {
                 left,
                 right,

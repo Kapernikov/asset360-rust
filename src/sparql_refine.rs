@@ -949,6 +949,29 @@ pub enum PlanOp {
         /// claims is what makes losing it visible.
         condition: Option<Expr>,
     },
+    /// `FILTER NOT EXISTS { ... }`: rows of `left` with no solution in
+    /// `right`.
+    ///
+    /// A node rather than an opaque condition above a left join, because the
+    /// negation is the whole question and a plan that cannot see it cannot
+    /// push it. It binds `left`'s variables only — `NOT EXISTS` tests, it does
+    /// not bind — and it claims the filter obligation the block raised.
+    ///
+    /// **Why this may narrow the fetch, where a positive `EXISTS` may not.**
+    /// The engine re-runs the whole query over the fetched instances. Pushing
+    /// this leaves the fetch holding exactly the rows with no match, and no
+    /// record of the right side at all — over which `NOT EXISTS` holds
+    /// vacuously, which is the same answer the anti-join computed. A pushed
+    /// `EXISTS` would leave the fetch holding rows whose matches are *not*
+    /// fetched, over which `EXISTS` is vacuously false: every row would be
+    /// dropped. So the negation pushes and the positive one does not.
+    AntiJoin {
+        left: NodeId,
+        right: NodeId,
+        /// The reference edge the negation correlates on, once a rule has
+        /// pushed it. Same field and same reason as [`PlanOp::LeftJoin`]'s.
+        reference: Option<ReferenceEdge>,
+    },
     Union {
         left: NodeId,
         right: NodeId,
@@ -1100,6 +1123,7 @@ impl PlanOp {
             Self::Scan { .. } => Vec::new(),
             Self::Join { left, right, .. }
             | Self::LeftJoin { left, right, .. }
+            | Self::AntiJoin { left, right, .. }
             | Self::Union { left, right }
             | Self::Minus { left, right } => vec![*left, *right],
             Self::Filter { input, .. }
@@ -1132,6 +1156,7 @@ impl PlanOp {
             | Self::Scan { .. } => {}
             Self::Join { left, right, .. }
             | Self::LeftJoin { left, right, .. }
+            | Self::AntiJoin { left, right, .. }
             | Self::Union { left, right }
             | Self::Minus { left, right } => {
                 *left = remap(*left);
@@ -1165,6 +1190,7 @@ impl PlanOp {
             Self::Values { .. } => "values",
             Self::Join { .. } => "join",
             Self::LeftJoin { .. } => "leftjoin",
+            Self::AntiJoin { .. } => "antijoin",
             Self::Union { .. } => "union",
             Self::Minus { .. } => "minus",
             Self::Filter { .. } => "filter",
@@ -1931,6 +1957,17 @@ impl PlanOp {
                     None => format!("n{left}, n{right}{edge}"),
                 }
             }
+            PlanOp::AntiJoin {
+                left,
+                right,
+                reference,
+            } => {
+                let edge = match reference {
+                    Some(edge) => format!("  via ?{}.{}", edge.holder, edge.slot),
+                    None => String::new(),
+                };
+                format!("n{left} without n{right}{edge}")
+            }
             PlanOp::Union { left, right } | PlanOp::Minus { left, right } => {
                 format!("n{left}, n{right}")
             }
@@ -2295,7 +2332,7 @@ impl Builder<'_> {
                 let right = self.pattern(right, false);
                 let vars: BTreeSet<String> =
                     self.vars[left].union(&self.vars[right]).cloned().collect();
-                self.push(
+                let node = self.push(
                     PlanOp::LeftJoin {
                         left,
                         right,
@@ -2304,7 +2341,14 @@ impl Builder<'_> {
                     },
                     claims,
                     vars,
-                )
+                );
+                // An `EXISTS` in the lifted condition reads records too, and
+                // the order — left, right, then the condition — is the one
+                // the obligation enumeration walks.
+                match expression {
+                    Some(expression) => self.read_exists_blocks(expression, node),
+                    None => node,
+                }
             }
             GraphPattern::Union { left, right } => {
                 let left = self.pattern(left, false);
@@ -2326,7 +2370,15 @@ impl Builder<'_> {
                 // "^A"))` becomes a comparison a rule can push and a regex it
                 // declines, and the claim moves with the node instead of
                 // having to be split.
-                let conjuncts = conjuncts_of(Expr::from(expr));
+                // Conjuncts as spargebra wrote them, because one of them may be
+                // a `NOT EXISTS` and that is a *pattern* rather than a value
+                // test: the block it negates becomes nodes, so the same
+                // flattening has to serve both. It is
+                // `sparql_plan::flatten_conjunction`, the one the enumeration
+                // counts obligations with, for the reason `conjuncts_of`
+                // documents — a disagreement about how many conjuncts a filter
+                // has leaves an obligation unclaimed.
+                let conjuncts = crate::sparql_plan::flatten_conjunction_of(expr);
                 // Claimed before descending, because that is the order the
                 // enumeration pushes them: a filter's obligations come before
                 // anything under it.
@@ -2337,11 +2389,42 @@ impl Builder<'_> {
                     }));
                 }
                 let mut input = self.pattern(inner, on_spine);
-                let vars = self.vars[input].clone();
                 // First conjunct nearest the input, so the plan reads in the
                 // order the query wrote it.
-                for (condition, claim) in conjuncts.into_iter().zip(claims) {
-                    input = self.push(PlanOp::Filter { input, condition }, claim, vars.clone());
+                for (conjunct, claim) in conjuncts.into_iter().zip(claims) {
+                    input = match negated_exists(conjunct) {
+                        // The negation as a node: an anti-join over the block,
+                        // which a rule can push into the statement. The block
+                        // is built first, so its triples are claimed in the
+                        // order the enumeration walked them.
+                        Some(block) => {
+                            let right = self.pattern(block, false);
+                            // An anti-join binds nothing new: `NOT EXISTS`
+                            // tests the left row and drops it or keeps it.
+                            let vars = self.vars[input].clone();
+                            self.push(
+                                PlanOp::AntiJoin {
+                                    left: input,
+                                    right,
+                                    reference: None,
+                                },
+                                claim,
+                                vars,
+                            )
+                        }
+                        None => {
+                            let input = self.read_exists_blocks(conjunct, input);
+                            let vars = self.vars[input].clone();
+                            self.push(
+                                PlanOp::Filter {
+                                    input,
+                                    condition: Expr::from(conjunct),
+                                },
+                                claim,
+                                vars,
+                            )
+                        }
+                    };
                 }
                 input
             }
@@ -2351,6 +2434,7 @@ impl Builder<'_> {
                 expression,
             } => {
                 let input = self.pattern(inner, on_spine);
+                let input = self.read_exists_blocks(expression, input);
                 let mut vars = self.vars[input].clone();
                 vars.insert(variable.as_str().to_owned());
                 self.push(
@@ -2529,6 +2613,42 @@ impl Builder<'_> {
     }
 
     /// One match per triple pattern, joined left-deep.
+    /// Build every `EXISTS` block a condition holds, as a left-join side.
+    ///
+    /// The condition itself stays where it is — an opaque expression the
+    /// engine evaluates — and this is only about the records it reads: they
+    /// have to be in the fetch, or the engine evaluates `NOT EXISTS` against
+    /// a class with nothing in it and reports every row as lacking. A *left*
+    /// join because the block is not a constraint on the rows the query
+    /// selects: `NOT EXISTS` keeps exactly the rows it does not match.
+    ///
+    /// The blocks come from [`crate::sparql_scoper::exists_patterns_of`], the
+    /// same walk in the same order the obligation enumeration used, so each
+    /// triple inside is claimed by the `Match` node built from it.
+    fn read_exists_blocks(&mut self, expr: &Expression, input: NodeId) -> NodeId {
+        let mut blocks = Vec::new();
+        crate::sparql_scoper::exists_patterns_of(expr, &mut blocks);
+        let mut current = input;
+        for block in blocks {
+            let right = self.pattern(block, false);
+            let vars: BTreeSet<String> = self.vars[current]
+                .union(&self.vars[right])
+                .cloned()
+                .collect();
+            current = self.push(
+                PlanOp::LeftJoin {
+                    left: current,
+                    right,
+                    reference: None,
+                    condition: None,
+                },
+                Vec::new(),
+                vars,
+            );
+        }
+        current
+    }
+
     fn bgp(&mut self, patterns: &[TriplePattern]) -> NodeId {
         let mut current: Option<NodeId> = None;
         for pattern in patterns {
@@ -2572,6 +2692,23 @@ impl Builder<'_> {
             Vec::new(),
             vars,
         )
+    }
+}
+
+/// The block a conjunct negates, when the conjunct is exactly `NOT EXISTS`.
+///
+/// Exactly: `!EXISTS { ... }` and nothing else. `!(EXISTS { ... } && ?x > 3)`
+/// is a negated conjunction whose rows are not the anti-join's, and
+/// `EXISTS { ... }` on its own is the positive form, which does not push (see
+/// [`PlanOp::AntiJoin`]). Both keep the opaque-filter path, which is correct
+/// and slower.
+fn negated_exists(expr: &Expression) -> Option<&GraphPattern> {
+    match expr {
+        Expression::Not(inner) => match inner.as_ref() {
+            Expression::Exists(block) => Some(block),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
