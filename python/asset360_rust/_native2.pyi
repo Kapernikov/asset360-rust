@@ -6694,7 +6694,7 @@ def refined_plan_text(query:builtins.str, schema_view:SchemaView) -> builtins.st
         ValueError: the query does not parse or cannot be represented.
     """
 
-def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, format:builtins.str='json', max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None) -> builtins.str:
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None) -> tuple[builtins.str, builtins.str]:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
     

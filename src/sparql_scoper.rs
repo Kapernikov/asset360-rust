@@ -955,7 +955,22 @@ pub fn sparql_scope_with_schema_graph(
 /// the endpoint's contract rather than a convenience: a query that omits
 /// `PREFIX asset360:` parses here and nowhere else. Two entry points with two
 /// parsers would accept two different languages — one would scope a query the
-/// other rejects as a syntax error.
+/// other rejects as a syntax error. That is not hypothetical: the executor and
+/// [`crate::sparql_graph_clauses`] each parsed with a bare parser, so the
+/// canonical `?s rdf:type <Class>` planned here and then failed to execute,
+/// and a schema-graph discovery query was refused as *unscoped* because it did
+/// not parse there.
+///
+/// The set is the four W3C vocabularies every SPARQL engine pre-registers plus
+/// the two the datamodel's own schema graph is written in — `skos` for enum
+/// values (`skos:notation`, `skos:inScheme`) and `schema` for slot domains
+/// (`schema:domainIncludes`). Without those, the only way to write a discovery
+/// query is with declarations that the query it is discovering *for* does not
+/// need, which is a difference no caller can be expected to guess.
+///
+/// These are defaults, not overrides: a query that declares a label itself wins
+/// (the parser's in-query declaration overwrites the seeded one), so a caller
+/// who binds `rdf:` to something else gets the query they wrote.
 pub fn sparql_parser() -> SparqlParser {
     SparqlParser::new()
         .with_prefix("asset360", "https://data.infrabel.be/asset360/")
@@ -964,7 +979,13 @@ pub fn sparql_parser() -> SparqlParser {
         .expect("hardcoded prefix")
         .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#")
         .expect("hardcoded prefix")
+        .with_prefix("owl", "http://www.w3.org/2002/07/owl#")
+        .expect("hardcoded prefix")
         .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#")
+        .expect("hardcoded prefix")
+        .with_prefix("skos", "http://www.w3.org/2004/02/skos/core#")
+        .expect("hardcoded prefix")
+        .with_prefix("schema", "https://schema.org/")
         .expect("hardcoded prefix")
 }
 

@@ -3054,7 +3054,7 @@ fn load_json_batch(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, instances, schema_view, format="json", max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None))]
+#[pyo3(signature = (query, instances, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None))]
 /// Execute a SPARQL query against a list of LinkML instances.
 ///
 /// Converts each instance to RDF, loads into an in-memory store (with
@@ -3091,11 +3091,10 @@ fn sparql_execute(
     query: &str,
     instances: Vec<Py<PyLinkMLInstance>>,
     schema_view: Py<PySchemaView>,
-    format: &str,
     max_triples: usize,
     max_result_rows: usize,
     schema_graph_iri: Option<String>,
-) -> PyResult<String> {
+) -> PyResult<(String, String)> {
     let bound_sv = schema_view.bind(py);
     let sv_ref = bound_sv.borrow();
     let sv = sv_ref.as_rust();
@@ -3108,14 +3107,18 @@ fn sparql_execute(
         query,
         &instance_refs,
         sv,
-        format,
         crate::sparql_executor::ExecuteLimits {
             max_triples,
             max_result_rows,
         },
         schema_graph_iri.as_deref(),
     ) {
-        Ok(result) => Ok(result),
+        // `(content_type, body)`: the serialisation belongs to the query's form,
+        // and the form is something this function has already parsed. A caller
+        // asked to name the format can contradict the query — and the caller
+        // that did, reading the form off the raw string, turned every prefixed
+        // CONSTRUCT into a 500.
+        Ok(answer) => Ok((answer.content_type, answer.body)),
         Err(crate::sparql_executor::ExecuteError::ConversionError {
             object_uri,
             message,

@@ -13,6 +13,14 @@
 //! The schema graph's IRI is a parameter, never a constant: see
 //! [`crate::sparql_schema_graph`] for why. `None` means the active datamodel
 //! configures no schema graph, in which case no query can be reading it.
+//!
+//! Both parse with [`crate::sparql_scoper::sparql_parser`], the parser the
+//! endpoint's other entry points use. A bare `SparqlParser::new()` here knew
+//! none of the pre-registered vocabularies, so `GRAPH <…> { ?c rdfs:label ?l }`
+//! — a datamodel-discovery query, written the only way it can be written —
+//! did not parse, both functions took their "does not parse" branch, and the
+//! query came back refused as *unscoped*: a parse failure reported as a
+//! question about scope.
 
 /// Whether a query could observe a named graph at all.
 ///
@@ -28,7 +36,7 @@
 /// report the real parse error rather than this function inventing one.
 pub fn query_reads_named_graphs(query: &str) -> bool {
     use spargebra::algebra::GraphPattern;
-    use spargebra::{Query, SparqlParser};
+    use spargebra::Query;
 
     fn walk(pattern: &GraphPattern) -> bool {
         match pattern {
@@ -52,7 +60,7 @@ pub fn query_reads_named_graphs(query: &str) -> bool {
         }
     }
 
-    let Ok(parsed) = SparqlParser::new().parse_query(query) else {
+    let Ok(parsed) = crate::sparql_scoper::sparql_parser().parse_query(query) else {
         return true;
     };
     let pattern = match &parsed {
@@ -82,7 +90,7 @@ pub fn query_reads_named_graphs(query: &str) -> bool {
 pub fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
     use spargebra::algebra::GraphPattern;
     use spargebra::term::NamedNodePattern;
-    use spargebra::{Query, SparqlParser};
+    use spargebra::Query;
 
     let Some(schema_graph_iri) = schema_graph_iri else {
         return false;
@@ -153,7 +161,7 @@ pub fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) 
         }
     }
 
-    let Ok(parsed) = SparqlParser::new().parse_query(query) else {
+    let Ok(parsed) = crate::sparql_scoper::sparql_parser().parse_query(query) else {
         return false;
     };
     let pattern = match &parsed {
@@ -198,6 +206,21 @@ mod tests {
         // An unparseable query is treated as possibly reading it, so oxigraph
         // reports the real parse error rather than this function inventing one.
         assert!(query_reads_named_graphs("SELECT ?s WHERE {"));
+    }
+
+    #[test]
+    fn a_discovery_query_parses_with_the_endpoint_s_prefixes() {
+        // The only way to write a schema-graph query is with the standard
+        // vocabularies, and this module used to parse with a bare parser that
+        // knew none of them. Both functions then took their "does not parse"
+        // branch: the schema graph was built for nothing, and the query was
+        // refused as *unscoped* — a parse failure reported as a question about
+        // scope, on the one query shape the schema graph exists to serve.
+        let query = format!(
+            "SELECT ?l WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c a owl:Class ; rdfs:label ?l }} }}"
+        );
+        assert!(query_reads_named_graphs(&query));
+        assert!(reads_only_the_schema_graph(&query, Some(SCHEMA_GRAPH)));
     }
 
     #[test]
