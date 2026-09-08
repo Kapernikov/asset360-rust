@@ -810,7 +810,7 @@ dependencies = [
 [[package]]
 name = "linkml_meta"
 version = "0.0.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#49ce5ad287fcba9f6ddb4f4215d80cc29d966668"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#afccd06c7fe71f836739481f4d576a306f1668e4"
 dependencies = [
  "chrono",
  "merge",
@@ -825,7 +825,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#49ce5ad287fcba9f6ddb4f4215d80cc29d966668"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#afccd06c7fe71f836739481f4d576a306f1668e4"
 dependencies = [
  "linkml_meta",
  "once_cell",
@@ -846,7 +846,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime_python"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#49ce5ad287fcba9f6ddb4f4215d80cc29d966668"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#afccd06c7fe71f836739481f4d576a306f1668e4"
 dependencies = [
  "linkml_meta",
  "linkml_runtime",
@@ -1841,7 +1841,7 @@ dependencies = [
 [[package]]
 name = "schemaview"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core#49ce5ad287fcba9f6ddb4f4215d80cc29d966668"
+source = "git+https://github.com/Kapernikov/rust-linkml-core#afccd06c7fe71f836739481f4d576a306f1668e4"
 dependencies = [
  "arc-swap",
  "curies",
@@ -2330,7 +2330,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
