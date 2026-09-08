@@ -128,3 +128,77 @@ fn gen_stub_attributes_precede_the_pyo3_attributes() {
         offenders.join("\n"),
     );
 }
+
+/// Every `@x.setter` must directly follow the `@property def x` it completes.
+///
+/// `pyo3-stub-gen` renders all of a class's getters and then all of its
+/// setters, which Python's property protocol does not accept: a detached
+/// `@x.setter` re-binds the name instead of completing the property, and mypy
+/// reports every settable PyO3 attribute as **read-only** — it rejected
+/// `obj.attr = value` in consumer code that runs fine. It also produced 3719 of
+/// the 3742 errors mypy found inside the stub (one `no-redef` /
+/// `untyped-decorator` / `attr-defined` triple per setter).
+///
+/// `stub_gen` reorders the blocks; this asserts the result, using Python's own
+/// `ast` rather than the same logic that did the reordering. The failure is
+/// invisible to a plain parse — the file stays valid Python, it just describes
+/// an API that is read-only and is not.
+#[test]
+fn committed_python_stubs_attach_every_setter_to_its_property() {
+    let stub = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/python/asset360_rust/_native2.pyi"
+    );
+
+    let audit = r#"
+import ast, sys
+
+detached = []
+total = 0
+
+def audit(body, where):
+    global total
+    previous = None
+    for statement in body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            decorators = [ast.unparse(d) for d in statement.decorator_list]
+            setters = [d for d in decorators if d.endswith(".setter")]
+            if setters:
+                total += 1
+                owner = setters[0][: -len(".setter")]
+                if previous != (owner, True):
+                    detached.append(f"{where}.{statement.name} (line {statement.lineno})")
+            previous = (statement.name, "property" in decorators)
+        elif isinstance(statement, ast.ClassDef):
+            audit(statement.body, statement.name)
+            previous = None
+        else:
+            previous = None
+
+tree = ast.parse(open(sys.argv[1]).read(), sys.argv[1])
+for statement in tree.body:
+    if isinstance(statement, ast.ClassDef):
+        audit(statement.body, statement.name)
+
+if detached:
+    print(f"{len(detached)} of {total} setters are detached from their property:")
+    for entry in detached[:20]:
+        print("  -", entry)
+    sys.exit(1)
+print(f"all {total} setters directly follow their @property")
+"#;
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(audit)
+        .arg(stub)
+        .output()
+        .expect("failed to run python3 to audit the stub's properties");
+
+    assert!(
+        output.status.success(),
+        "{stub} describes settable attributes as read-only.\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
