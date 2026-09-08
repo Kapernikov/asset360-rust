@@ -117,6 +117,43 @@ impl Default for ExecuteLimits {
     }
 }
 
+/// What a query answered, and how it is serialised.
+///
+/// The content type is the executor's to state because the *result type* is:
+/// `SELECT`/`ASK` can only be SPARQL results, a `CONSTRUCT`/`DESCRIBE` graph
+/// can only be RDF. A caller that had to work it out for itself would be
+/// re-deriving what oxigraph already told this function.
+///
+/// The graph body is N-Triples, which is a subset of Turtle — hence the Turtle
+/// content type, which is what an HTTP client is served and what parses.
+#[cfg(feature = "sparql-endpoint")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparqlAnswer {
+    /// The MIME type of `body`.
+    pub content_type: String,
+    /// The serialised answer.
+    pub body: String,
+}
+
+#[cfg(feature = "sparql-endpoint")]
+impl SparqlAnswer {
+    /// SELECT or ASK: SPARQL Query Results JSON.
+    pub fn solutions(body: String) -> Self {
+        Self {
+            content_type: "application/sparql-results+json".to_owned(),
+            body,
+        }
+    }
+
+    /// CONSTRUCT or DESCRIBE: an RDF graph.
+    pub fn graph(body: String) -> Self {
+        Self {
+            content_type: "text/turtle".to_owned(),
+            body,
+        }
+    }
+}
+
 /// Execute a SPARQL query against a set of LinkML instances.
 ///
 /// This is the main entry point for query execution. The caller (Django view)
@@ -130,13 +167,23 @@ impl Default for ExecuteLimits {
 ///   converted to RDF triples via `as_turtle()` and loaded into an ephemeral
 ///   in-memory Oxigraph store.
 /// * `schema_view` — Used for Turtle serialisation of instances.
-/// * `format` — Output serialisation format:
-///   - `"json"` → SPARQL JSON Results (`application/sparql-results+json`)
-///     for SELECT and ASK queries.
-///   - `"turtle"` or `"text/turtle"` → N-Triples output for CONSTRUCT and
-///     DESCRIBE queries.
 /// * `limits` — Resource limits (max triples, max result rows) to prevent
 ///   denial-of-service from expensive queries.
+///
+/// # The serialisation is not a parameter
+///
+/// It used to be, and the caller could contradict the query: a `CONSTRUCT`
+/// with `format = "json"` reached the `Graph` arm below and failed with
+/// `Unsupported format for graph results: json`. The caller had to read the
+/// query's form to avoid that, which meant a second, cruder parser on the
+/// other side of the FFI boundary — and the consolidator-server one read
+/// `query.strip().upper().startswith("CONSTRUCT")`, so every `CONSTRUCT`
+/// behind a `PREFIX` line — nearly all of them — answered 500.
+///
+/// Nothing was gained for it: oxigraph hands back `QueryResults::{Solutions,
+/// Boolean, Graph}`, so the *result type* already says which serialisation is
+/// possible, and the two non-graph arms ignored `format` entirely. The answer
+/// therefore carries its own content type.
 ///
 /// # Errors
 ///
@@ -151,10 +198,9 @@ pub fn sparql_execute(
     query_str: &str,
     instances: &[&LinkMLInstance],
     schema_view: &SchemaView,
-    format: &str,
     limits: ExecuteLimits,
     schema_graph_iri: Option<&str>,
-) -> Result<String, ExecuteError> {
+) -> Result<SparqlAnswer, ExecuteError> {
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
     // Load instance data
@@ -226,9 +272,28 @@ pub fn sparql_execute(
         }
     }
 
-    // Execute query
+    // Parse with the parser the rest of the endpoint uses
+    // ([`crate::sparql_scoper::sparql_parser`]) and execute *that*, rather than
+    // handing oxigraph the string to parse again with a bare parser of its own.
+    //
+    // Two entry points with two parsers accept two different languages, which
+    // is the bug this fixes: the scoper pre-registers `rdf`, `rdfs` and `xsd`,
+    // so it planned `?s rdf:type <Class>` — the canonical scoped pattern — and
+    // oxigraph then refused the same string as a syntax error, reported as a
+    // 500 naming no prefix. `parse_query` also rejects a SPARQL Update by name
+    // instead of leaving the engine to fail on it.
+    //
+    // The parsed algebra cannot be handed to oxigraph directly: oxigraph 0.4
+    // pins `spargebra =0.3.5` and this crate parses with 0.4, so the two
+    // `Query` types are unrelated and no `From` exists between them. What
+    // crosses instead is the parsed query *rendered back to SPARQL*, in which
+    // every prefixed name has become an absolute IRI — so oxigraph's own bare
+    // parser has no prefix left to resolve, and cannot disagree with ours about
+    // what the query says.
+    let parsed = crate::sparql_scoper::parse_query(query_str)
+        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
     let results = store
-        .query(query_str)
+        .query(parsed.to_string().as_str())
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
     // Serialize results
@@ -264,31 +329,31 @@ pub fn sparql_execute(
                 "head": { "vars": vars },
                 "results": { "bindings": bindings }
             });
-            serde_json::to_string(&result).map_err(|e| ExecuteError::QueryError(e.to_string()))
+            let body = serde_json::to_string(&result)
+                .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+            Ok(SparqlAnswer::solutions(body))
         }
         QueryResults::Boolean(b) => {
             let result = serde_json::json!({ "boolean": b });
-            serde_json::to_string(&result).map_err(|e| ExecuteError::QueryError(e.to_string()))
+            let body = serde_json::to_string(&result)
+                .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+            Ok(SparqlAnswer::solutions(body))
         }
         QueryResults::Graph(triples) => {
-            if format == "turtle" || format == "text/turtle" {
-                let mut buf = Vec::new();
-                for triple in triples {
-                    let triple = triple.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-                    use std::io::Write;
-                    writeln!(
-                        buf,
-                        "{} {} {} .",
-                        triple.subject, triple.predicate, triple.object
-                    )
-                    .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-                }
-                String::from_utf8(buf).map_err(|e| ExecuteError::QueryError(e.to_string()))
-            } else {
-                Err(ExecuteError::QueryError(format!(
-                    "Unsupported format for graph results: {format}"
-                )))
+            let mut buf = Vec::new();
+            for triple in triples {
+                let triple = triple.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+                use std::io::Write;
+                writeln!(
+                    buf,
+                    "{} {} {} .",
+                    triple.subject, triple.predicate, triple.object
+                )
+                .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
             }
+            let body =
+                String::from_utf8(buf).map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+            Ok(SparqlAnswer::graph(body))
         }
     }
 }
@@ -403,13 +468,12 @@ classes:
              SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name } ORDER BY ?name",
             &refs,
             &sv,
-            "json",
             ExecuteLimits::default(),
             None,
         )
         .unwrap();
 
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.body).unwrap();
         let bindings = parsed["results"]["bindings"].as_array().unwrap();
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[0]["name"]["value"], "BX517");
@@ -426,13 +490,12 @@ classes:
              ASK { ?s a asset360:Signal ; asset360:name \"BX517\" }",
             &refs,
             &sv,
-            "json",
             ExecuteLimits::default(),
             None,
         )
         .unwrap();
 
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.body).unwrap();
         assert_eq!(parsed["boolean"], true);
     }
 
@@ -446,13 +509,12 @@ classes:
              ASK { ?s a asset360:Signal ; asset360:name \"NONEXISTENT\" }",
             &refs,
             &sv,
-            "json",
             ExecuteLimits::default(),
             None,
         )
         .unwrap();
 
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.body).unwrap();
         assert_eq!(parsed["boolean"], false);
     }
 
@@ -466,7 +528,6 @@ classes:
              SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
             &refs,
             &sv,
-            "json",
             ExecuteLimits {
                 max_triples: 500_000,
                 max_result_rows: 1,
@@ -490,7 +551,6 @@ classes:
              SELECT ?s WHERE { ?s a asset360:Signal }",
             &refs,
             &sv,
-            "json",
             ExecuteLimits {
                 max_triples: 1,
                 max_result_rows: 10_000,
@@ -515,14 +575,86 @@ classes:
              WHERE { ?s a asset360:Signal ; asset360:name ?n }",
             &refs,
             &sv,
-            "turtle",
             ExecuteLimits::default(),
             None,
         )
         .unwrap();
 
-        assert!(result.contains("BX517"), "Should contain signal name");
-        assert!(result.contains("Signal"), "Should contain type");
+        assert!(result.body.contains("BX517"), "Should contain signal name");
+        assert!(result.body.contains("Signal"), "Should contain type");
+        // The form decides the serialisation, and the form is parsed here — a
+        // caller cannot ask for a graph as SPARQL-results JSON any more.
+        assert_eq!(result.content_type, "text/turtle");
+    }
+
+    #[test]
+    fn a_query_may_use_a_preregistered_prefix_it_did_not_declare() {
+        // `?s rdf:type <Class>` is the canonical scoped pattern, and the
+        // scoper's own refusal message asks for it. It used to reach oxigraph
+        // as an unparsed string, whose parser knows no prefix it was not
+        // handed, so the endpoint planned the query and then failed to execute
+        // it — a syntax error naming no prefix, served as a 500.
+        let sv = test_schema_view();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let result = sparql_execute(
+            "PREFIX p: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s rdf:type p:Signal }",
+            &refs,
+            &sv,
+            ExecuteLimits::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.content_type, "application/sparql-results+json");
+        let parsed: serde_json::Value = serde_json::from_str(&result.body).unwrap();
+        assert_eq!(parsed["results"]["bindings"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_query_keeps_its_own_binding_of_a_preregistered_prefix() {
+        // The pre-registered prefixes are defaults, not overrides: a query that
+        // binds `rdf:` itself means what it says, and here that is a predicate
+        // nothing in the store carries. Answering it as though it said
+        // `rdf:type` would be a wrong answer rather than an empty one.
+        let sv = test_schema_view();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let result = sparql_execute(
+            "PREFIX rdf: <urn:not-rdf#> \
+             PREFIX p: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s rdf:type p:Signal }",
+            &refs,
+            &sv,
+            ExecuteLimits::default(),
+            None,
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result.body).unwrap();
+        assert!(parsed["results"]["bindings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_update_is_rejected_by_the_engine_leg_too() {
+        // Both legs parse with `sparql_scoper::parse_query`, so neither can be
+        // the one that executes a mutation.
+        let sv = test_schema_view();
+        let result = sparql_execute(
+            "PREFIX p: <https://data.infrabel.be/asset360/> \
+             INSERT DATA { <urn:a> p:name \"x\" }",
+            &[],
+            &sv,
+            ExecuteLimits::default(),
+            None,
+        );
+
+        let message = match result {
+            Err(ExecuteError::QueryError(message)) => message,
+            other => panic!("expected a query error, got {other:?}"),
+        };
+        assert!(message.contains("read-only"), "{message}");
     }
 }
 
@@ -636,12 +768,11 @@ classes:
             &format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; {triple} }}"),
             &refs,
             sv,
-            "json",
             super::ExecuteLimits::default(),
             None,
         )
         .expect("query executes");
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json.body).unwrap();
         !parsed["results"]["bindings"].as_array().unwrap().is_empty()
     }
 
@@ -869,12 +1000,11 @@ classes:
             query,
             &refs,
             sv,
-            "json",
             ExecuteLimits::default(),
             Some(SCHEMA_GRAPH_IRI),
         )
         .unwrap_or_else(|err| panic!("query failed: {err}\n{query}"));
-        serde_json::from_str(&raw).unwrap()
+        serde_json::from_str(&raw.body).unwrap()
     }
 
     /// The question that motivated the feature: an enum value comes back as an
@@ -973,7 +1103,6 @@ classes:
                 query,
                 &refs,
                 &sv,
-                "json",
                 ExecuteLimits::default(),
                 Some(SCHEMA_GRAPH_IRI),
             )
@@ -982,7 +1111,6 @@ classes:
                 forced,
                 &refs,
                 &sv,
-                "json",
                 ExecuteLimits::default(),
                 Some(SCHEMA_GRAPH_IRI),
             )
@@ -1031,9 +1159,9 @@ classes:
                 _ => panic!("expected solutions for {query}"),
             };
 
-            let with_schema: serde_json::Value = serde_json::from_str(&with_schema).unwrap();
+            let with_schema: serde_json::Value = serde_json::from_str(&with_schema.body).unwrap();
             let with_schema_loaded: serde_json::Value =
-                serde_json::from_str(&with_schema_loaded).unwrap();
+                serde_json::from_str(&with_schema_loaded.body).unwrap();
             assert_eq!(
                 with_schema, baseline,
                 "the schema graph changed a default-graph answer: {query}"
