@@ -1582,12 +1582,13 @@ impl JoinEdge {
         self.inner.right_multivalued
     }
 
-    /// Join type: ``"inner"`` or ``"left"``.
+    /// Join type: ``"inner"``, ``"left"`` or ``"anti"``.
     #[getter]
     fn join_type(&self) -> &str {
         match self.inner.join_type {
             crate::sparql_scoper::JoinType::Inner => "inner",
             crate::sparql_scoper::JoinType::Left => "left",
+            crate::sparql_scoper::JoinType::Anti => "anti",
         }
     }
 
@@ -2440,7 +2441,7 @@ impl PlanOp {
         }
     }
 
-    /// For ``"join"``: ``"inner"`` or ``"left"``.
+    /// For ``"join"``: ``"inner"``, ``"left"`` or ``"anti"``.
     #[getter]
     fn join_kind(&self) -> Option<&'static str> {
         use crate::sparql_ops::Op;
@@ -2448,6 +2449,7 @@ impl PlanOp {
             Op::Join { kind, .. } => Some(match kind {
                 crate::sparql_scoper::JoinType::Inner => "inner",
                 crate::sparql_scoper::JoinType::Left => "left",
+                crate::sparql_scoper::JoinType::Anti => "anti",
             }),
             _ => None,
         }

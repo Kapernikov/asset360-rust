@@ -3060,7 +3060,7 @@ class JoinEdge:
     @property
     def join_type(self) -> builtins.str:
         r"""
-        Join type: ``"inner"`` or ``"left"``.
+        Join type: ``"inner"``, ``"left"`` or ``"anti"``.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -3861,7 +3861,7 @@ class PlanOp:
     @property
     def join_kind(self) -> typing.Optional[builtins.str]:
         r"""
-        For ``"join"``: ``"inner"`` or ``"left"``.
+        For ``"join"``: ``"inner"``, ``"left"`` or ``"anti"``.
         """
     @property
     def bindings(self) -> builtins.list[PushdownBinding]:

@@ -50,6 +50,7 @@
 //! [`PushComparisonFilter`] sinks the pushable one below -- see
 //! [`landing_site`] for the argument and the cases that stop it.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
@@ -2861,6 +2862,163 @@ impl PushLeftJoin<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Push a NOT EXISTS
+// ---------------------------------------------------------------------------
+
+/// `FILTER NOT EXISTS { ?x a :Class ; :ref ?outer }` becomes a correlated
+/// `NOT EXISTS` in the statement, so the rows the query excludes never leave
+/// the database.
+///
+/// Without it the negation costs two full reads and an engine pass: the fetch
+/// reads every record of both classes -- the block's records are fetched
+/// precisely so the engine can find that they exist -- and the answer is
+/// whatever is left. With it the statement asks the question Postgres is good
+/// at, against the reference slot's index.
+///
+/// **Why the narrowed fetch still answers.** The engine re-runs the whole
+/// original query over the fetched instances. This narrowing leaves the fetch
+/// holding exactly the left rows with no match, and no record of the negated
+/// class at all -- over which `NOT EXISTS` holds vacuously, which is the
+/// answer the anti-join computed. The vacuity is *why the negation pushes and
+/// a positive `EXISTS` does not*: pushing `EXISTS` would keep rows whose
+/// matches are not fetched, and the engine would then drop every one of them.
+/// See [`crate::sparql_refine::PlanOp::AntiJoin`].
+///
+/// What it accepts:
+///
+/// * **A block that is exactly one scan.** One class, its existence checks,
+///   and the correlation. A block with a filter, a fan-out or a second star
+///   inside it is a subquery with a body, which the renderer's correlated
+///   `NOT EXISTS` does not carry.
+/// * **The block's star holding the foreign key**, single-valued, a column of
+///   the record -- the same edge [`PushReferenceJoin`] takes, found by the
+///   same function, so the two cannot disagree about what a reference is.
+///   "Complexes with no segment" is that shape.
+///
+/// What it declines, each with the reason:
+///
+/// * **The *outer* row holding the key** ("records whose reference points at
+///   nothing"). The renderer's subquery correlates on the block star's own
+///   slot, and inverting the direction is a second rendering rather than the
+///   same one read backwards.
+/// * **More than one variable shared with the outside.** One edge expresses
+///   one correlation; a second one would go unstated, and an unstated
+///   constraint on a *narrowing* deletes rows the query keeps.
+/// * **A block another node reads.** Then the scan is not the subquery's
+///   alone.
+/// * **A side that is not already SQL.** The frontier is a cut.
+///
+/// A declined anti-join stays with the engine, where the fetch reads both
+/// classes and the answer is still right -- that is the correctness fix this
+/// rule sits on top of, not something it has to preserve by hand.
+pub struct PushNotExists<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> PushNotExists<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for PushNotExists<'_> {
+    fn name(&self) -> &'static str {
+        "push_not_exists"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::AntiJoin { left, right, .. } = &plan.nodes[id].op else {
+                continue;
+            };
+            let (left, right) = (*left, *right);
+            if plan.nodes[left].executor != Executor::Sql
+                || plan.nodes[right].executor != Executor::Sql
+            {
+                continue;
+            }
+            // The block is the subquery, so nothing else may read it and
+            // nothing else may be in it: `right` is one scan, and it is the
+            // whole negated side.
+            if !matches!(plan.nodes[right].op, PlanOp::Scan { .. }) {
+                continue;
+            }
+            if plan
+                .nodes
+                .iter()
+                .enumerate()
+                .any(|(other, node)| other != id && node.op.inputs().contains(&right))
+            {
+                continue;
+            }
+            let Some(edge) = self.correlation(plan, left, right) else {
+                continue;
+            };
+            plan.nodes[id].executor = Executor::Sql;
+            if let PlanOp::AntiJoin { reference, .. } = &mut plan.nodes[id].op {
+                *reference = Some(edge);
+            }
+            return true;
+        }
+        false
+    }
+}
+
+impl PushNotExists<'_> {
+    /// The one reference edge the negation correlates on, or `None`.
+    ///
+    /// The block star has to hold the key, and the only variable it shares
+    /// with the outside has to be the one it holds it to. A second shared
+    /// variable is a second correlation, and this edge states one.
+    fn correlation(&self, plan: &Plan, left: NodeId, right: NodeId) -> Option<ReferenceEdge> {
+        let outside = variables_bound_by(plan, left);
+        let shared: Vec<String> = variables_bound_by(plan, right)
+            .into_iter()
+            .filter(|var| outside.contains(var))
+            .collect();
+        let [referenced] = shared.as_slice() else {
+            return None;
+        };
+        let (holder, slot) =
+            PushReferenceJoin::new(self.schema).foreign_key_on(plan, right, referenced)?;
+        Some(ReferenceEdge {
+            referenced: referenced.clone(),
+            holder,
+            slot,
+        })
+    }
+}
+
+/// Every variable the SQL nodes feeding `side` bind, `side` itself included.
+///
+/// A star's own variable and the variables its slots read into. Enough to say
+/// which variables two sides of a join share, which is all the caller asks.
+fn variables_bound_by(plan: &Plan, side: NodeId) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (id, node) in plan.nodes.iter().enumerate() {
+        if node.executor != Executor::Sql || !(id == side || plan.feeds(id, side)) {
+            continue;
+        }
+        match &node.op {
+            PlanOp::Scan {
+                star_var, slots, ..
+            } => {
+                out.insert(star_var.clone());
+                out.extend(slots.iter().filter_map(|slot| slot.var.clone()));
+            }
+            PlanOp::Unnest { var, .. } => {
+                out.insert(var.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Push a grouping
 // ---------------------------------------------------------------------------
 
@@ -3475,6 +3633,7 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
         Box::new(PushComparisonFilter::new(schema)),
         Box::new(PushReferenceJoin::new(schema)),
         Box::new(PushLeftJoin::new(schema)),
+        Box::new(PushNotExists::new(schema)),
         Box::new(NarrowByAKeptHop::new(schema)),
         Box::new(PushGrouping::new(schema)),
     ]
@@ -4103,6 +4262,64 @@ mod tests {
             assert_eq!(plan.nodes[input].executor, Executor::Sql, "{plan}");
         }
         assert!(plan.find("join").is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// The shape the reported bug was filed against: "complexes with no
+    /// component". The negation becomes the statement's, correlated on the
+    /// component's own reference slot.
+    #[test]
+    fn a_not_exists_on_a_reference_is_pushed() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?complex WHERE { ?complex a asset360:TunnelComplex . \
+             FILTER NOT EXISTS { ?component a asset360:CivilEngineeringAsset ; \
+             asset360:belongsToTunnelComplex ?complex } }",
+            &schema,
+            false,
+        );
+
+        let anti = plan.find("antijoin")[0];
+        assert_eq!(plan.nodes[anti].executor, Executor::Sql, "{plan}");
+        let PlanOp::AntiJoin {
+            reference: Some(edge),
+            ..
+        } = &plan.nodes[anti].op
+        else {
+            panic!("the pushed anti-join must record its correlation:\n{plan}");
+        };
+        assert_eq!(edge.holder, "component", "{plan}");
+        assert_eq!(edge.slot, "belongsToTunnelComplex", "{plan}");
+        assert_eq!(edge.referenced, "complex", "{plan}");
+        // The filter obligation goes with it: the statement applies the
+        // negation, so nobody else has to.
+        assert!(!plan.nodes[anti].discharges.is_empty(), "{plan}");
+        println!("{plan}");
+    }
+
+    /// A block with a body of its own is not a correlated `NOT EXISTS` this
+    /// renderer can write, and the rule declines rather than rendering a
+    /// weaker one -- a narrowing that drops a condition deletes rows the
+    /// query keeps.
+    ///
+    /// Declining is not a wrong answer: the block's records are still
+    /// fetched, and the engine still applies the filter.
+    #[test]
+    fn a_not_exists_with_a_second_correlation_is_not_pushed() {
+        let schema = test_schema_view();
+        // Two variables shared with the outside, so one edge cannot state the
+        // correlation.
+        let plan = refined(
+            "SELECT ?complex WHERE { ?complex a asset360:TunnelComplex . \
+             ?other a asset360:TunnelComplex ; asset360:hasName ?nm . \
+             FILTER NOT EXISTS { ?component a asset360:CivilEngineeringAsset ; \
+             asset360:belongsToTunnelComplex ?complex ; asset360:hasName ?nm } }",
+            &schema,
+            false,
+        );
+
+        let anti = plan.find("antijoin")[0];
+        assert_eq!(plan.nodes[anti].executor, Executor::Engine, "{plan}");
         println!("{plan}");
     }
 

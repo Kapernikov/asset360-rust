@@ -505,6 +505,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 match kind {
                     crate::sparql_scoper::JoinType::Inner => "",
                     crate::sparql_scoper::JoinType::Left => "   left",
+                    crate::sparql_scoper::JoinType::Anti => "   anti",
                 }
             )?,
             Op::Group {
@@ -756,6 +757,19 @@ fn push_filter_obligations(expr: &spargebra::algebra::Expression, out: &mut Vec<
             detail: format!("{conjunct}"),
         });
     }
+}
+
+/// The top-level conjuncts of an expression, in the order it wrote them.
+///
+/// The obligation count and the plan builder read the same function, because
+/// they have to agree on how many conjuncts a `FILTER` has: one obligation per
+/// conjunct, one node per conjunct.
+pub(crate) fn flatten_conjunction_of(
+    expr: &spargebra::algebra::Expression,
+) -> Vec<&spargebra::algebra::Expression> {
+    let mut out = Vec::new();
+    flatten_conjunction(expr, &mut out);
+    out
 }
 
 fn flatten_conjunction<'e>(
@@ -2155,17 +2169,10 @@ mod tests {
         }
     }
 
-    /// The records a `NOT EXISTS` asks about are in the fetch, and the filter
-    /// itself is the engine's.
-    ///
-    /// The bug this pins: the walk that enumerates triples skipped the filter
-    /// *expression*, so the pattern inside was scoped away -- no scan, no
-    /// records fetched -- and oxigraph evaluated `NOT EXISTS` against a class
-    /// with nothing in it. Every row came back as lacking a component, which
-    /// is a wrong answer with a balanced ledger and nothing in the plan to
-    /// say so.
+    /// A `NOT EXISTS` the statement can express becomes a correlated
+    /// anti-join, and the rows the query excludes never leave the database.
     #[test]
-    fn a_not_exists_block_is_fetched_and_left_to_the_engine() {
+    fn a_not_exists_block_becomes_an_anti_join() {
         let sv = test_schema_view();
         let query = format!(
             "{PREFIX}SELECT ?complex WHERE {{ ?complex a asset360:TunnelComplex . \
@@ -2175,20 +2182,59 @@ mod tests {
         let plan = plan_query_refined(&query, &sv).unwrap();
         let printed = plan.to_string();
 
-        // The class the filter asks about is scanned, and scanned optionally:
-        // a complex with no component is exactly what the query selects, so
-        // the join must not delete it.
         assert!(
-            printed.contains("scan      asset360:CivilEngineeringAsset"),
+            printed.contains("?component.belongsToTunnelComplex = ?complex   anti"),
+            "the negation should be an anti-join:\n{printed}"
+        );
+        // And it is the statement that applies it: the filter obligation is
+        // claimed by the SQL pass rather than left for the engine.
+        let sql_claims = match &plan.passes[0].kind {
+            PassKind::Sql(_) => plan.passes[0].discharges.clone(),
+            PassKind::Engine(_) => panic!("pass 0 should be the statement:\n{printed}"),
+        };
+        assert_eq!(
+            sql_claims.len(),
+            plan.obligations.len(),
+            "every obligation should be in SQL:\n{printed}"
+        );
+        plan.ledger_balances().unwrap();
+    }
+
+    /// The records a `NOT EXISTS` asks about are in the fetch even when the
+    /// statement cannot express the negation.
+    ///
+    /// The bug this pins: the walk that enumerates triples skipped the filter
+    /// *expression*, so the pattern inside was scoped away -- no scan, no
+    /// records fetched -- and oxigraph evaluated `NOT EXISTS` against a class
+    /// with nothing in it. Every row came back as lacking a component, which
+    /// is a wrong answer with a balanced ledger and nothing in the plan to
+    /// say so.
+    ///
+    /// `groupsLines` is a *multivalued* reference, which no rule pushes as an
+    /// edge, so this is the declining path: a left-joined fetch of both
+    /// classes and the filter left to the engine.
+    #[test]
+    fn a_not_exists_block_the_statement_declines_is_still_fetched() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?l WHERE {{ ?l a asset360:Line . \
+             FILTER NOT EXISTS {{ ?g a asset360:LineGroup ; \
+             asset360:groupsLines ?l }} }}"
+        );
+        let plan = plan_query_refined(&query, &sv).unwrap();
+        let printed = plan.to_string();
+
+        // The class the filter asks about is fetched, and fetched optionally:
+        // a line in no group is exactly what the query selects, so the join
+        // must not delete it.
+        assert!(
+            printed.contains("scan      asset360:LineGroup"),
             "the NOT EXISTS class is not fetched:\n{printed}"
         );
         assert!(
-            printed.contains("as ?component   optional"),
+            printed.contains("as ?g   optional"),
             "the NOT EXISTS scan must be optional:\n{printed}"
         );
-        assert!(printed.contains("left"), "{printed}");
-        // The filter stays with the engine, and every triple inside it is
-        // claimed by exactly one node.
         assert!(printed.contains("pass 1  ENGINE"), "{printed}");
         plan.ledger_balances().unwrap();
     }

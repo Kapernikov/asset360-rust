@@ -763,6 +763,12 @@ pub enum JoinType {
     /// SQL LEFT JOIN — left side always present, right may be NULL.
     /// Future: used for SPARQL OPTIONAL patterns.
     Left,
+    /// An anti-join: rows of the left with *no* matching row on the right,
+    /// which is what `FILTER NOT EXISTS { ... }` asks for. Rendered as a
+    /// correlated `NOT EXISTS` rather than as a `JOIN` clause, so the right
+    /// side contributes no columns and no records — there are none to
+    /// contribute.
+    Anti,
 }
 
 /// A condition on a value *inside* a record's JSON, rather than on a column of
