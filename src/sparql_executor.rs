@@ -284,12 +284,12 @@ pub fn sparql_execute(
     // instead of leaving the engine to fail on it.
     //
     // The parsed algebra goes to oxigraph as-is. oxigraph 0.5 pins the same
-    // `spargebra 0.4.7` this crate parses with, so the two `Query` types are
-    // one type and `From<spargebra::Query>` applies. Until 0.5 they were
-    // unrelated (oxigraph 0.4 pinned `spargebra =0.3.5`), and what crossed
-    // instead was the query *rendered back to SPARQL* for oxigraph's own
-    // parser to read again — a round trip whose only job was to bridge two
-    // versions of one crate.
+    // `spargebra 0.4.7` this crate parses with, so its `Query` wrapper wraps
+    // *this crate's* `spargebra::Query`, and the `From<spargebra::Query>` impl
+    // therefore applies. Until 0.5 they were unrelated (oxigraph 0.4 pinned
+    // `spargebra =0.3.5`), and what crossed instead was the query *rendered
+    // back to SPARQL* for oxigraph's own parser to read again — a round trip
+    // whose only job was to bridge two versions of one crate.
     let parsed = crate::sparql_scoper::parse_query(query_str)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
     let results = oxigraph::sparql::SparqlEvaluator::new()
