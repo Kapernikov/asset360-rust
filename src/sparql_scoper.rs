@@ -2106,7 +2106,8 @@ pub(crate) fn tag_triples_by_depth<'a>(
             "UNION is not supported yet; issue separate queries and merge client-side".into(),
         )),
         GraphPattern::Lateral { .. } => Err(ScopeError::UnsupportedConstruct(
-            "LATERAL is not supported yet".into(),
+            "LATERAL is not supported; it is a SPARQL extension this endpoint does not serve"
+                .into(),
         )),
         GraphPattern::Minus { .. } => Err(ScopeError::UnsupportedConstruct(
             "MINUS is not supported yet".into(),
@@ -4989,6 +4990,20 @@ classes:
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("MINUS")),
             "expected UnsupportedConstruct with MINUS, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_lateral_rejected() {
+        let sv = test_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { ?s a asset360:Signal . LATERAL { ?s asset360:name ?n } }",
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("LATERAL")),
+            "expected UnsupportedConstruct with LATERAL, got {result:?}"
         );
     }
 

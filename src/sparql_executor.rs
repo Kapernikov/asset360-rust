@@ -283,13 +283,16 @@ pub fn sparql_execute(
     // 500 naming no prefix. `parse_query` also rejects a SPARQL Update by name
     // instead of leaving the engine to fail on it.
     //
-    // The parsed algebra cannot be handed to oxigraph directly: oxigraph 0.4
-    // pins `spargebra =0.3.5` and this crate parses with 0.4, so the two
-    // `Query` types are unrelated and no `From` exists between them. What
-    // crosses instead is the parsed query *rendered back to SPARQL*, in which
-    // every prefixed name has become an absolute IRI — so oxigraph's own bare
-    // parser has no prefix left to resolve, and cannot disagree with ours about
-    // what the query says.
+    // The parsed algebra is not handed to oxigraph directly — even though
+    // `impl From<spargebra::Query> for oxigraph::sparql::Query` exists and
+    // would compile, since this crate and oxigraph now share the same
+    // `spargebra` 0.4.7. What crosses instead is the parsed query *rendered
+    // back to SPARQL*, in which every prefixed name has become an absolute
+    // IRI — so oxigraph's own bare parser has no prefix left to resolve, and
+    // cannot disagree with ours about what the query says. That
+    // prefix-flattening is the round trip's only remaining justification;
+    // whether it is still worth paying for is Task 2's call, not a technical
+    // impossibility.
     let parsed = crate::sparql_scoper::parse_query(query_str)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
     // `Store::query`/`Store::query_opt` and `oxigraph::sparql::Query` are all
