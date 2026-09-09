@@ -1184,7 +1184,7 @@ classes:
                     .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
                     .unwrap();
             }
-            let baseline = match oxigraph::sparql::SparqlEvaluator::new()
+            let baseline = match super::geosparql_evaluator()
                 .for_query(query.parse::<spargebra::Query>().unwrap())
                 .on_store(&store)
                 .execute()
@@ -1369,6 +1369,51 @@ classes:
         .unwrap()
         .into_instance_tolerate_errors()
         .unwrap()
+    }
+
+    /// The `asWKT` slot must triplify as a `geo:wktLiteral`, not a plain
+    /// `xsd:string`.
+    ///
+    /// `sf_intersects_selects_by_geometry` proves this only by inference: if
+    /// the datatype were wrong, `spargeo`'s `extract_argument` would return
+    /// `None`, the filter would be false for every row, and that test would
+    /// fail with an empty match set. That failure would look identical to a
+    /// real geometry-semantics bug, so pin the datatype directly where the
+    /// next reader will look.
+    #[test]
+    fn as_wkt_triplifies_as_geo_wkt_literal() {
+        use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
+
+        let sv = schema();
+        let instance = zone(
+            &sv,
+            "https://data.infrabel.be/asset360/zone/in",
+            "POINT(4.35 50.85)",
+        );
+        let conv = sv.converter();
+        let primary = sv.primary_schema().unwrap();
+        let turtle = turtle_to_string(
+            &instance,
+            &sv,
+            &primary,
+            &conv,
+            TurtleOptions { skolem: false },
+        )
+        .unwrap();
+
+        // The datatype comes out prefixed (`^^geo:wktLiteral`), not as the
+        // bare IRI, so pin both halves: the `geo:` prefix resolves to the
+        // GeoSPARQL namespace, and the literal is typed with it.
+        assert!(
+            turtle.contains("@prefix geo: <http://www.opengis.net/ont/geosparql#>"),
+            "expected the geo: prefix to resolve to the GeoSPARQL namespace. Got:\n{turtle}"
+        );
+        assert!(
+            turtle.contains("^^geo:wktLiteral"),
+            "asWKT must serialise with the geo:wktLiteral datatype — spargeo \
+             silently returns no rows (not an error) for any other datatype, \
+             which is what MR 3's pushdown approach depends on. Got:\n{turtle}"
+        );
     }
 
     /// A point inside the box matches, a point outside it does not, and a
