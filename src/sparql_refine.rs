@@ -2137,11 +2137,13 @@ pub fn naive_plan_of(query_str: &str) -> Result<Plan, RefineError> {
 /// endpoint does when nothing is pushed.
 ///
 /// One consequence of reusing that enumeration, and it is its property rather
-/// than this builder's: `UNION`, `MINUS` and property paths are refused,
-/// because `tag_triples_by_depth` refuses them. [`PlanOp::Union`],
+/// than this builder's: `UNION`, `MINUS`, property paths, and `LATERAL` are
+/// refused, because `tag_triples_by_depth` refuses them. [`PlanOp::Union`],
 /// [`PlanOp::Minus`] and [`PlanOp::Path`] exist so that lifting the refusal is
 /// a change to obligation enumeration and not a change to the plan shape, but
-/// no query reaches them through this function yet.
+/// no query reaches them through this function yet. `LATERAL` differs from
+/// the other three: there is no `PlanOp::Lateral` placeholder, because it is
+/// refused permanently rather than pending support.
 ///
 /// The plan is checked before it is returned, in every build rather than
 /// behind a debug assertion. The builder's one assumption is that the

@@ -2019,7 +2019,11 @@ fn resolve_star_class(
 /// `OPTIONAL { ... }` blocks.
 ///
 /// Along the way, unsupported constructs (`UNION`, `MINUS`, property
-/// paths) are rejected with [`ScopeError::UnsupportedConstruct`].
+/// paths, `LATERAL`) are rejected with [`ScopeError::UnsupportedConstruct`].
+///
+/// The match on [`GraphPattern`] below is exhaustive on purpose — no `_`
+/// arm — so a spargebra release that adds a variant is a compile error here
+/// rather than one more construct that is silently accepted and dropped.
 pub(crate) fn tag_triples_by_depth<'a>(
     pattern: &'a GraphPattern,
     depth: usize,

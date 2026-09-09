@@ -29,7 +29,13 @@ getrandom = { version = "0.2", optional = true, features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", optional = true, features = ["wasm_js"] }
 oxttl = { version = "0.2", optional = true }
 oxrdf = { version = "0.3", optional = true }
-spargebra = "0.4"
+# sep-0006 gates spargebra's `GraphPattern::Lateral` variant, which we match on
+# exhaustively (and refuse) across sparql_scoper.rs/sparql_refine.rs/sparql_ops.rs/
+# sparql_graph_clauses.rs/scope_predicate.rs. Pin it explicitly rather than relying
+# on incidental unification with oxigraph (only pulled in by the sparql-endpoint
+# feature) — without this pin, feature sets that drop sparql-endpoint (e.g. wasm)
+# lose the variant and every match arm referencing it fails to compile.
+spargebra = { version = "0.4", features = ["sep-0006"] }
 oxigraph = { version = "0.5.11", optional = true, default-features = false }
 spargeo = { version = "0.5.6", optional = true }
 
@@ -51,7 +57,7 @@ stubgen = [
     "linkml_meta/stubgen"
 ]
 shacl-parser = ["dep:oxttl", "dep:oxrdf"]
-sparql-endpoint = ["shacl-parser", "dep:oxigraph", "dep:oxrdf", "dep:spargeo"]
+sparql-endpoint = ["shacl-parser", "dep:oxigraph", "dep:spargeo"]
 wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys", "dep:getrandom", "dep:getrandom_03"]
 minijinja-wasm = [
     "wasm-bindings",

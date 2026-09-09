@@ -689,6 +689,13 @@ classes:
 ///
 /// It deliberately does not care *which* refusal an inexact plan gives. A
 /// refusal is always safe; claiming exactness and being wrong is not.
+///
+/// This module also hosts one test that is not about pushdown at all —
+/// `a_prefixed_query_executes_and_keeps_language_tags`, a regression guard for
+/// the executor's query hand-off. It lives here rather than in `mod tests`
+/// because it needs this module's `schema()`/`instance()`/`PREFIX` fixtures,
+/// which are nontrivial enough that duplicating or importing them was worse
+/// than the mislabeling.
 #[cfg(all(test, feature = "sparql-endpoint"))]
 mod pushed_filters_match_sparql {
     use crate::sparql_scoper::{FilterCondition, sparql_scope};
