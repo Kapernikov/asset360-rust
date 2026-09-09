@@ -283,30 +283,17 @@ pub fn sparql_execute(
     // 500 naming no prefix. `parse_query` also rejects a SPARQL Update by name
     // instead of leaving the engine to fail on it.
     //
-    // The parsed algebra is not handed to oxigraph directly — even though
-    // `impl From<spargebra::Query> for oxigraph::sparql::Query` exists and
-    // would compile, since this crate and oxigraph now share the same
-    // `spargebra` 0.4.7. What crosses instead is the parsed query *rendered
-    // back to SPARQL*, in which every prefixed name has become an absolute
-    // IRI — so oxigraph's own bare parser has no prefix left to resolve, and
-    // cannot disagree with ours about what the query says. That
-    // prefix-flattening is the round trip's only remaining justification;
-    // whether it is still worth paying for is Task 2's call, not a technical
-    // impossibility.
+    // The parsed algebra goes to oxigraph as-is. oxigraph 0.5 pins the same
+    // `spargebra 0.4.7` this crate parses with, so the two `Query` types are
+    // one type and `From<spargebra::Query>` applies. Until 0.5 they were
+    // unrelated (oxigraph 0.4 pinned `spargebra =0.3.5`), and what crossed
+    // instead was the query *rendered back to SPARQL* for oxigraph's own
+    // parser to read again — a round trip whose only job was to bridge two
+    // versions of one crate.
     let parsed = crate::sparql_scoper::parse_query(query_str)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-    // `Store::query`/`Store::query_opt` and `oxigraph::sparql::Query` are all
-    // deprecated in 0.5 in favour of the `SparqlEvaluator` builder, so the
-    // string is re-parsed with spargebra's own (non-deprecated) `FromStr`
-    // rather than oxigraph's deprecated wrapper. This is the same parse
-    // oxigraph's `Query::parse` performed internally; only the spelling
-    // changes, not the round trip through a freshly-parsed string.
-    let reparsed: spargebra::Query = parsed
-        .to_string()
-        .parse()
-        .map_err(|e: spargebra::SparqlSyntaxError| ExecuteError::QueryError(e.to_string()))?;
     let results = oxigraph::sparql::SparqlEvaluator::new()
-        .for_query(reparsed)
+        .for_query(parsed)
         .on_store(&store)
         .execute()
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
@@ -919,6 +906,38 @@ classes:
                 "exact, but nothing pushed for {triple}"
             );
         }
+    }
+
+    /// A prefixed query executes, and a language-tagged literal keeps its tag.
+    ///
+    /// The executor hands oxigraph the parsed algebra, not a re-rendered
+    /// string. This is the property that hand-off must preserve: the crate's
+    /// own parser resolves the prefixes, and nothing downstream re-parses.
+    #[test]
+    fn a_prefixed_query_executes_and_keeps_language_tags() {
+        let sv = schema();
+        let inst = instance(&sv);
+        let refs = vec![&inst];
+
+        let answer = super::sparql_execute(
+            &format!(
+                "{PREFIX}SELECT ?d WHERE {{ ?s a asset360:Signal ; asset360:description ?d }}"
+            ),
+            &refs,
+            &sv,
+            super::ExecuteLimits::default(),
+            None,
+        )
+        .expect("query executes");
+
+        let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        let bindings = parsed["results"]["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 1, "one signal, one description");
+        assert_eq!(bindings[0]["d"]["value"], "hello");
+        assert_eq!(
+            bindings[0]["d"]["xml:lang"], "en",
+            "the schema declares in_language: en, so the tag must survive"
+        );
     }
 }
 
