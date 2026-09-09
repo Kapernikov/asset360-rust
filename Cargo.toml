@@ -30,7 +30,7 @@ getrandom_03 = { package = "getrandom", version = "0.3", optional = true, featur
 oxttl = { version = "0.2", optional = true }
 oxrdf = { version = "0.3", optional = true }
 spargebra = "0.4"
-oxigraph = { version = "0.4", optional = true, default-features = false }
+oxigraph = { version = "0.5.11", optional = true, default-features = false }
 
 [features]
 default = ["stubgen"]

@@ -2357,6 +2357,16 @@ impl Builder<'_> {
                     self.vars[left].union(&self.vars[right]).cloned().collect();
                 self.push(PlanOp::Union { left, right }, Vec::new(), vars)
             }
+            // Refused during obligation enumeration, by
+            // `tag_triples_by_depth` — the same thing that keeps the `Union`
+            // arm above unreached. There is deliberately no `PlanOp::Lateral`:
+            // the placeholder variants exist for constructs we mean to support
+            // later, and LATERAL is not one. If this ever fires, the refusal
+            // and this builder have stopped agreeing about the query, which is
+            // a defect to fix rather than a plan to build.
+            GraphPattern::Lateral { .. } => unreachable!(
+                "LATERAL reached the plan builder; tag_triples_by_depth must refuse it first"
+            ),
             GraphPattern::Minus { left, right } => {
                 let left = self.pattern(left, false);
                 let right = self.pattern(right, false);

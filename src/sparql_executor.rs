@@ -292,8 +292,20 @@ pub fn sparql_execute(
     // what the query says.
     let parsed = crate::sparql_scoper::parse_query(query_str)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-    let results = store
-        .query(parsed.to_string().as_str())
+    // `Store::query`/`Store::query_opt` and `oxigraph::sparql::Query` are all
+    // deprecated in 0.5 in favour of the `SparqlEvaluator` builder, so the
+    // string is re-parsed with spargebra's own (non-deprecated) `FromStr`
+    // rather than oxigraph's deprecated wrapper. This is the same parse
+    // oxigraph's `Query::parse` performed internally; only the spelling
+    // changes, not the round trip through a freshly-parsed string.
+    let reparsed: spargebra::Query = parsed
+        .to_string()
+        .parse()
+        .map_err(|e: spargebra::SparqlSyntaxError| ExecuteError::QueryError(e.to_string()))?;
+    let results = oxigraph::sparql::SparqlEvaluator::new()
+        .for_query(reparsed)
+        .on_store(&store)
+        .execute()
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
     // Serialize results
@@ -385,10 +397,6 @@ fn term_to_json(term: &oxigraph::model::Term) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
-        Term::Triple(_) => serde_json::json!({
-            "type": "triple",
-            "value": term.to_string()
-        }),
     }
 }
 
@@ -1133,7 +1141,12 @@ classes:
                     .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
                     .unwrap();
             }
-            let baseline = match store.query(query).unwrap() {
+            let baseline = match oxigraph::sparql::SparqlEvaluator::new()
+                .for_query(query.parse::<spargebra::Query>().unwrap())
+                .on_store(&store)
+                .execute()
+                .unwrap()
+            {
                 QueryResults::Solutions(solutions) => {
                     let vars: Vec<String> = solutions
                         .variables()

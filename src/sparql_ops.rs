@@ -2870,6 +2870,7 @@ pub fn observable_slots(
             GraphPattern::Path { .. } => Err(NotEnumerable::PropertyPath),
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
             | GraphPattern::Minus { left, right }
             | GraphPattern::LeftJoin { left, right, .. } => {
                 walk(left, schema, found)?;

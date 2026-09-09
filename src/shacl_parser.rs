@@ -905,6 +905,7 @@ fn collect_extend_iris(pattern: &spargebra::algebra::GraphPattern, fields: &mut 
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
+        | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => {
             collect_extend_iris(left, fields);
             collect_extend_iris(right, fields);

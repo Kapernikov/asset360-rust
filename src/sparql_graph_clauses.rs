@@ -43,6 +43,7 @@ pub fn query_reads_named_graphs(query: &str) -> bool {
             GraphPattern::Graph { .. } => true,
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
             | GraphPattern::Minus { left, right } => walk(left) || walk(right),
             GraphPattern::LeftJoin { left, right, .. } => walk(left) || walk(right),
             GraphPattern::Filter { inner, .. }
@@ -138,6 +139,7 @@ pub fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) 
             ),
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
             | GraphPattern::Minus { left, right } => {
                 walk(left, inside, total, in_graph, is_schema_graph);
                 walk(right, inside, total, in_graph, is_schema_graph);

@@ -204,7 +204,7 @@ mod tests {
         OWL_RESTRICTION, RDF_TYPE, RDFS_LABEL, RDFS_SUBCLASS_OF, SKOS_IN_SCHEME, XSD_INTEGER,
     };
     use linkml_schemaview::identifier::Identifier;
-    use oxigraph::model::{Subject, Term};
+    use oxigraph::model::{NamedOrBlankNode, Term};
     use oxigraph::sparql::QueryResults;
     use oxigraph::store::Store;
     use std::path::Path;
@@ -480,7 +480,12 @@ classes:
              <{class_iri}> <{RDFS_SUBCLASS_OF}> [ <{OWL_ON_PROPERTY}> <{slot_iri}> ; \
              <{predicate}> ?n ] }} }}"
         );
-        match store.query(&query).unwrap() {
+        match oxigraph::sparql::SparqlEvaluator::new()
+            .for_query(query.parse::<spargebra::Query>().unwrap())
+            .on_store(store)
+            .execute()
+            .unwrap()
+        {
             QueryResults::Solutions(solutions) => solutions
                 .map(|s| s.unwrap().get("n").unwrap().to_string())
                 .collect(),
@@ -533,7 +538,7 @@ classes:
             // Blank nodes are exempt: a restriction has no IRI by design.
             for iri in [
                 match &quad.subject {
-                    Subject::NamedNode(node) => Some(node.to_string()),
+                    NamedOrBlankNode::NamedNode(node) => Some(node.to_string()),
                     _ => None,
                 },
                 Some(quad.predicate.to_string()),
