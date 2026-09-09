@@ -31,6 +31,7 @@ oxttl = { version = "0.2", optional = true }
 oxrdf = { version = "0.3", optional = true }
 spargebra = "0.4"
 oxigraph = { version = "0.5.11", optional = true, default-features = false }
+spargeo = { version = "0.5.6", optional = true }
 
 [features]
 default = ["stubgen"]
@@ -50,7 +51,7 @@ stubgen = [
     "linkml_meta/stubgen"
 ]
 shacl-parser = ["dep:oxttl", "dep:oxrdf"]
-sparql-endpoint = ["shacl-parser", "dep:oxigraph", "dep:oxrdf"]
+sparql-endpoint = ["shacl-parser", "dep:oxigraph", "dep:oxrdf", "dep:spargeo"]
 wasm-bindings = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:js-sys", "dep:getrandom", "dep:getrandom_03"]
 minijinja-wasm = [
     "wasm-bindings",
