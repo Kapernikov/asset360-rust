@@ -2019,7 +2019,11 @@ fn resolve_star_class(
 /// `OPTIONAL { ... }` blocks.
 ///
 /// Along the way, unsupported constructs (`UNION`, `MINUS`, property
-/// paths) are rejected with [`ScopeError::UnsupportedConstruct`].
+/// paths, `LATERAL`) are rejected with [`ScopeError::UnsupportedConstruct`].
+///
+/// The match on [`GraphPattern`] below is exhaustive on purpose — no `_`
+/// arm — so a spargebra release that adds a variant is a compile error here
+/// rather than one more construct that is silently accepted and dropped.
 pub(crate) fn tag_triples_by_depth<'a>(
     pattern: &'a GraphPattern,
     depth: usize,
@@ -2104,6 +2108,10 @@ pub(crate) fn tag_triples_by_depth<'a>(
         GraphPattern::Values { .. } => Ok(()),
         GraphPattern::Union { .. } => Err(ScopeError::UnsupportedConstruct(
             "UNION is not supported yet; issue separate queries and merge client-side".into(),
+        )),
+        GraphPattern::Lateral { .. } => Err(ScopeError::UnsupportedConstruct(
+            "LATERAL is not supported; it is a SPARQL extension this endpoint does not serve"
+                .into(),
         )),
         GraphPattern::Minus { .. } => Err(ScopeError::UnsupportedConstruct(
             "MINUS is not supported yet".into(),
@@ -2247,6 +2255,7 @@ fn triples_in_the_schema_graph(
             }
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
             | GraphPattern::Minus { left, right } => {
                 walk(left, inside, out, is_schema_graph);
                 walk(right, inside, out, is_schema_graph);
@@ -2348,6 +2357,7 @@ fn collect_filter_conditions(
         }
         GraphPattern::Join { left, right }
         | GraphPattern::Union { left, right }
+        | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => {
             collect_filter_conditions(left, depth, var_to_field, star_filters).or(
                 collect_filter_conditions(right, depth, var_to_field, star_filters),
@@ -2389,6 +2399,7 @@ fn contains_group(pattern: &GraphPattern) -> bool {
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
+        | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => contains_group(left) || contains_group(right),
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
     }
@@ -2835,6 +2846,7 @@ fn collect_values_filters(
         }
         GraphPattern::Join { left, right }
         | GraphPattern::Union { left, right }
+        | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => {
             collect_values_filters(left, depth, var_to_field, star_filters).or(
                 collect_values_filters(right, depth, var_to_field, star_filters),
@@ -2880,6 +2892,7 @@ fn contains_subquery(pattern: &GraphPattern) -> bool {
             GraphPattern::Join { left, right }
             | GraphPattern::LeftJoin { left, right, .. }
             | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
             | GraphPattern::Minus { left, right } => walk(left, inside) || walk(right, inside),
             GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
                 false
@@ -2953,6 +2966,7 @@ fn pushable_limit(pattern: &GraphPattern) -> Option<usize> {
         GraphPattern::Join { .. }
         | GraphPattern::LeftJoin { .. }
         | GraphPattern::Union { .. }
+        | GraphPattern::Lateral { .. }
         | GraphPattern::Minus { .. }
         | GraphPattern::Bgp { .. }
         | GraphPattern::Path { .. }
@@ -3218,6 +3232,7 @@ fn contains_foreign_scope(pattern: &GraphPattern) -> Option<Inexact> {
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
+        | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => {
             contains_foreign_scope(left).or(contains_foreign_scope(right))
         }
@@ -3254,6 +3269,7 @@ fn blocks_limit_push(pattern: &GraphPattern) -> bool {
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
+        | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => {
             blocks_limit_push(left) || blocks_limit_push(right)
         }
@@ -4978,6 +4994,20 @@ classes:
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("MINUS")),
             "expected UnsupportedConstruct with MINUS, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_lateral_rejected() {
+        let sv = test_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { ?s a asset360:Signal . LATERAL { ?s asset360:name ?n } }",
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("LATERAL")),
+            "expected UnsupportedConstruct with LATERAL, got {result:?}"
         );
     }
 

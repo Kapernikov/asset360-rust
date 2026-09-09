@@ -64,3 +64,14 @@ communication: assertive and informal. be a good sparring partner. disagree with
 - the upstream code has specific instructions for quality and testing. so when the code has been written, ask the user to finish the process in a separate openAI codex session in the upstream codebase.
   you can provide the user with the prompt he should use in this new session so he's able to start quickly. in this new session, things like running tests, pre-commit (clippy and ...) branch and commit will be done.
   these instructions need to have a bit of a "why" explainer too because they will be for a fresh codex session that doesn't know what was our intent with the change and why we did things the way we did.
+
+## SPARQL engine dependencies
+- oxigraph 0.5.x pins `spargebra 0.4.7` and `oxrdf 0.3.4`, the same versions
+  this crate depends on directly. So the parsed algebra goes to oxigraph
+  as-is (`From<spargebra::Query>`), and upstream's terms need no re-typing.
+  Do not reintroduce a string round trip or a term conversion.
+- GeoSPARQL functions come from the `spargeo` crate, not oxigraph, and are
+  registered on the evaluator. They read geometry **only** from literals
+  typed `geo:wktLiteral` / `geo:geoJSONLiteral` in CRS84 — a plain
+  `xsd:string` makes the function return unbound and the filter silently
+  false.

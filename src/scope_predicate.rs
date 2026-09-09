@@ -166,6 +166,7 @@ fn collect_bgp_triples<'a>(
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
+        | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => {
             collect_bgp_triples(left, triples);
             collect_bgp_triples(right, triples);

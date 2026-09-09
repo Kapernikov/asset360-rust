@@ -154,6 +154,27 @@ impl SparqlAnswer {
     }
 }
 
+/// An evaluator carrying the GeoSPARQL functions.
+///
+/// oxigraph ships no geometry support; the functions live in `spargeo`, which
+/// exports them as `(name, fn(&[Term]) -> Option<Term>)` pairs — exactly what
+/// `with_custom_function` takes. Registering all of them rather than a chosen
+/// few means the engine's vocabulary does not have to be kept in step by hand
+/// with whatever the pushdown learns to lift.
+///
+/// A geometry argument is only read from a literal typed `geo:wktLiteral` or
+/// `geo:geoJSONLiteral`, and only in CRS84. A plain string yields no geometry,
+/// so the function returns unbound and the filter is false — silently. That is
+/// the failure mode to watch for when a geo query matches nothing.
+#[cfg(feature = "sparql-endpoint")]
+fn geosparql_evaluator() -> oxigraph::sparql::SparqlEvaluator {
+    let mut evaluator = oxigraph::sparql::SparqlEvaluator::new();
+    for (name, function) in spargeo::GEOSPARQL_EXTENSION_FUNCTIONS {
+        evaluator = evaluator.with_custom_function(name.into_owned(), function);
+    }
+    evaluator
+}
+
 /// Execute a SPARQL query against a set of LinkML instances.
 ///
 /// This is the main entry point for query execution. The caller (Django view)
@@ -283,17 +304,19 @@ pub fn sparql_execute(
     // 500 naming no prefix. `parse_query` also rejects a SPARQL Update by name
     // instead of leaving the engine to fail on it.
     //
-    // The parsed algebra cannot be handed to oxigraph directly: oxigraph 0.4
-    // pins `spargebra =0.3.5` and this crate parses with 0.4, so the two
-    // `Query` types are unrelated and no `From` exists between them. What
-    // crosses instead is the parsed query *rendered back to SPARQL*, in which
-    // every prefixed name has become an absolute IRI — so oxigraph's own bare
-    // parser has no prefix left to resolve, and cannot disagree with ours about
-    // what the query says.
+    // The parsed algebra goes to oxigraph as-is. oxigraph 0.5 pins the same
+    // `spargebra 0.4.7` this crate parses with, so its `Query` wrapper wraps
+    // *this crate's* `spargebra::Query`, and the `From<spargebra::Query>` impl
+    // therefore applies. Until 0.5 they were unrelated (oxigraph 0.4 pinned
+    // `spargebra =0.3.5`), and what crossed instead was the query *rendered
+    // back to SPARQL* for oxigraph's own parser to read again — a round trip
+    // whose only job was to bridge two versions of one crate.
     let parsed = crate::sparql_scoper::parse_query(query_str)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-    let results = store
-        .query(parsed.to_string().as_str())
+    let results = geosparql_evaluator()
+        .for_query(parsed)
+        .on_store(&store)
+        .execute()
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
     // Serialize results
@@ -385,10 +408,6 @@ fn term_to_json(term: &oxigraph::model::Term) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
-        Term::Triple(_) => serde_json::json!({
-            "type": "triple",
-            "value": term.to_string()
-        }),
     }
 }
 
@@ -670,6 +689,13 @@ classes:
 ///
 /// It deliberately does not care *which* refusal an inexact plan gives. A
 /// refusal is always safe; claiming exactness and being wrong is not.
+///
+/// This module also hosts one test that is not about pushdown at all —
+/// `a_prefixed_query_executes_and_keeps_language_tags`, a regression guard for
+/// the executor's query hand-off. It lives here rather than in `mod tests`
+/// because it needs this module's `schema()`/`instance()`/`PREFIX` fixtures,
+/// which are nontrivial enough that duplicating or importing them was worse
+/// than the mislabeling.
 #[cfg(all(test, feature = "sparql-endpoint"))]
 mod pushed_filters_match_sparql {
     use crate::sparql_scoper::{FilterCondition, sparql_scope};
@@ -909,6 +935,38 @@ classes:
             );
         }
     }
+
+    /// A prefixed query executes, and a language-tagged literal keeps its tag.
+    ///
+    /// The executor hands oxigraph the parsed algebra, not a re-rendered
+    /// string. This is the property that hand-off must preserve: the crate's
+    /// own parser resolves the prefixes, and nothing downstream re-parses.
+    #[test]
+    fn a_prefixed_query_executes_and_keeps_language_tags() {
+        let sv = schema();
+        let inst = instance(&sv);
+        let refs = vec![&inst];
+
+        let answer = super::sparql_execute(
+            &format!(
+                "{PREFIX}SELECT ?d WHERE {{ ?s a asset360:Signal ; asset360:description ?d }}"
+            ),
+            &refs,
+            &sv,
+            super::ExecuteLimits::default(),
+            None,
+        )
+        .expect("query executes");
+
+        let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        let bindings = parsed["results"]["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 1, "one signal, one description");
+        assert_eq!(bindings[0]["d"]["value"], "hello");
+        assert_eq!(
+            bindings[0]["d"]["xml:lang"], "en",
+            "the schema declares in_language: en, so the tag must survive"
+        );
+    }
 }
 
 /// The schema named graph, seen from the query engine.
@@ -1133,7 +1191,12 @@ classes:
                     .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
                     .unwrap();
             }
-            let baseline = match store.query(query).unwrap() {
+            let baseline = match super::geosparql_evaluator()
+                .for_query(query.parse::<spargebra::Query>().unwrap())
+                .on_store(&store)
+                .execute()
+                .unwrap()
+            {
                 QueryResults::Solutions(solutions) => {
                     let vars: Vec<String> = solutions
                         .variables()
@@ -1239,5 +1302,183 @@ classes:
                 "an rdfs:label was visible outside the schema graph: {answer}"
             );
         }
+    }
+}
+
+/// GeoSPARQL functions answer over instance data.
+///
+/// The statement route serves only a query it can answer whole; a geometry
+/// filter mixed with anything unpushable falls to this engine. If the engine
+/// cannot evaluate `geof:sfIntersects`, the two routes answer *differently*
+/// rather than at different speeds.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod geosparql_is_available {
+    use linkml_runtime::{LinkMLInstance, load_json_str};
+    use linkml_schemaview::identifier::Identifier;
+    use linkml_schemaview::schemaview::SchemaView;
+
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                          PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
+                          PREFIX geof: <http://www.opengis.net/def/function/geosparql/> ";
+
+    fn schema() -> SchemaView {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+        let yaml = r#"
+id: https://data.infrabel.be/asset360
+name: asset360
+prefixes:
+  asset360:
+    prefix_reference: https://data.infrabel.be/asset360/
+  geo:
+    prefix_reference: http://www.opengis.net/ont/geosparql#
+  linkml:
+    prefix_reference: https://w3id.org/linkml/
+  xsd:
+    prefix_reference: http://www.w3.org/2001/XMLSchema#
+default_prefix: asset360
+default_range: string
+types:
+  string:
+    uri: xsd:string
+    base: str
+  wktLiteral:
+    uri: geo:wktLiteral
+    base: str
+classes:
+  Zone:
+    class_uri: asset360:Zone
+    attributes:
+      asset360_uri:
+        identifier: true
+      asWKT:
+        range: wktLiteral
+"#;
+        let schema: SchemaDefinition = p2e::deserialize(yml::Deserializer::from_str(yaml)).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        sv
+    }
+
+    fn zone(sv: &SchemaView, uri: &str, wkt: &str) -> LinkMLInstance {
+        let conv = sv.converter();
+        let cv = sv
+            .get_class(&Identifier::new("Zone"), &conv)
+            .unwrap()
+            .unwrap();
+        load_json_str(
+            &format!(r#"{{"asset360_uri": "{uri}", "asWKT": "{wkt}"}}"#),
+            sv,
+            &cv,
+            &conv,
+        )
+        .unwrap()
+        .into_instance_tolerate_errors()
+        .unwrap()
+    }
+
+    /// The `asWKT` slot must triplify as a `geo:wktLiteral`, not a plain
+    /// `xsd:string`.
+    ///
+    /// `sf_intersects_selects_by_geometry` proves this only by inference: if
+    /// the datatype were wrong, `spargeo`'s `extract_argument` would return
+    /// `None`, the filter would be false for every row, and that test would
+    /// fail with an empty match set. That failure would look identical to a
+    /// real geometry-semantics bug, so pin the datatype directly where the
+    /// next reader will look.
+    #[test]
+    fn as_wkt_triplifies_as_geo_wkt_literal() {
+        use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
+
+        let sv = schema();
+        let instance = zone(
+            &sv,
+            "https://data.infrabel.be/asset360/zone/in",
+            "POINT(4.35 50.85)",
+        );
+        let conv = sv.converter();
+        let primary = sv.primary_schema().unwrap();
+        let turtle = turtle_to_string(
+            &instance,
+            &sv,
+            &primary,
+            &conv,
+            TurtleOptions { skolem: false },
+        )
+        .unwrap();
+
+        // The serialiser may write the datatype either prefixed
+        // (`^^geo:wktLiteral`, with a `geo:` prefix bound to the GeoSPARQL
+        // namespace) or as a full IRI (`^^<http://www.opengis.net/ont/geosparql#wktLiteral>`).
+        // Both spellings name the same datatype, so accept either — a purely
+        // cosmetic serialiser change (prefix spacing/ordering, or switching
+        // to full IRIs) must not fail this test, only a wrong datatype may.
+        let prefixed = turtle.contains("@prefix geo: <http://www.opengis.net/ont/geosparql#>")
+            && turtle.contains("^^geo:wktLiteral");
+        let full_iri = turtle.contains("^^<http://www.opengis.net/ont/geosparql#wktLiteral>");
+        assert!(
+            prefixed || full_iri,
+            "asWKT must serialise with the geo:wktLiteral datatype (prefixed \
+             or as a full IRI) — spargeo silently returns no rows (not an \
+             error) for any other datatype, which is what MR 3's pushdown \
+             approach depends on. Got:\n{turtle}"
+        );
+    }
+
+    /// A point inside the box matches, a point outside it does not, and a
+    /// linestring crossing the boundary does.
+    #[test]
+    fn sf_intersects_selects_by_geometry() {
+        let sv = schema();
+        let inside = zone(
+            &sv,
+            "https://data.infrabel.be/asset360/zone/in",
+            "POINT(4.35 50.85)",
+        );
+        let outside = zone(
+            &sv,
+            "https://data.infrabel.be/asset360/zone/out",
+            "POINT(9.99 20.0)",
+        );
+        let crossing = zone(
+            &sv,
+            "https://data.infrabel.be/asset360/zone/line",
+            "LINESTRING(4.1 50.1, 4.9 50.9)",
+        );
+        let refs = vec![&inside, &outside, &crossing];
+
+        let answer = super::sparql_execute(
+            &format!(
+                r#"{PREFIX}SELECT ?s WHERE {{
+                     ?s a asset360:Zone ; asset360:asWKT ?wkt .
+                     FILTER(geof:sfIntersects(?wkt,
+                       "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))"^^geo:wktLiteral))
+                   }}"#
+            ),
+            &refs,
+            &sv,
+            super::ExecuteLimits::default(),
+            None,
+        )
+        .expect("query executes");
+
+        let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        let mut matched: Vec<String> = parsed["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["s"]["value"].as_str().unwrap().to_owned())
+            .collect();
+        matched.sort();
+
+        assert_eq!(
+            matched,
+            vec![
+                "https://data.infrabel.be/asset360/zone/in".to_owned(),
+                "https://data.infrabel.be/asset360/zone/line".to_owned(),
+            ],
+            "the inside point and the crossing line intersect the box; the outside point does not"
+        );
     }
 }
