@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn the_fixture_quad_count_is_pinned() {
         let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert_eq!(graph.quads.len(), 5173);
+        assert_eq!(graph.quads.len(), 5353);
     }
 
     /// The number above is not a number to be re-pinned when it moves; it has
@@ -299,9 +299,14 @@ mod tests {
             .count();
         assert_eq!(typed_restrictions, restrictions);
 
-        // 1417 was the count before per-class cardinality and range existed.
-        // 5173 - 1417 = 3756 = 4 x 939 restrictions, exactly.
-        assert_eq!(graph.quads.len(), 1417 + 4 * restrictions);
+        // 1417 was the count before per-class cardinality and range existed;
+        // 1453 since the fixture gained the keyed inlined lists the
+        // foreign-reference walker is tested against (`TunnelComplex`,
+        // `AccessibleTrack`, `CoveredSection.hasSequenceNumber`, and the `id`
+        // that makes `Track` referenceable at all) — 36 more quads, and 36
+        // more restrictions with them.
+        // 5353 - 1453 = 3900 = 4 x 975 restrictions, exactly.
+        assert_eq!(graph.quads.len(), 1453 + 4 * restrictions);
     }
 
     /// The unrolled form is the point: upstream matches `gen-owl`'s `simplify`

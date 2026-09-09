@@ -1,4 +1,4 @@
-use linkml_runtime::LinkMLInstance;
+use linkml_runtime::{LinkMLInstance, list_path_segments};
 use linkml_schemaview::schemaview::{ClassView, SlotInlineMode, SlotView};
 use serde::Serialize;
 
@@ -113,7 +113,8 @@ fn matches_filter(instance: &LinkMLInstance, also_include_id_slots: bool) -> boo
 ///
 /// This mirrors the Python `get_rust_slot_paths_satisfying` function:
 /// - For Object/Mapping: iterate keys, check filter on child. If match, collect; else recurse.
-/// - For List (no keys): iterate indexed values, recurse into each.
+/// - For List: iterate values, addressing each by the segment the engine
+///   resolves for it, and recurse into each.
 /// - Scalar/Null: leaf nodes, nothing to iterate.
 ///
 /// Uses a mutable path stack to avoid allocating a new Vec on every recursion level.
@@ -136,8 +137,25 @@ fn collect_matching_paths<'a>(
             }
         }
         LinkMLInstance::List { values, .. } => {
-            for (ix, child) in values.iter().enumerate() {
-                path.push(ix.to_string());
+            // `list_path_segments` is the one rule for naming an element of a
+            // list: its identity label where the list has element identity, its
+            // position otherwise. The paths collected here become delta paths
+            // (the consolidator rewrites source URIs to golden-record URIs
+            // through them), and `patch` addresses a keyed list by label ONLY.
+            //
+            // Positional segments are not merely unappliable there: label space
+            // and position space overlap — covered sections are numbered from 1
+            // and positions count from 0 — so position "k" hits the row
+            // labelled `k`, one row earlier, and the rewrite lands on the wrong
+            // row and is reported as a successful update.
+            let segments = list_path_segments(values);
+            // `zip` would stop at the shorter side and drop the trailing
+            // elements' references without a word — the same silent-wrong
+            // failure this walk is being fixed for. The lengths agree by
+            // construction; say so, so a future change cannot quietly break it.
+            debug_assert_eq!(segments.len(), values.len());
+            for (segment, child) in segments.into_iter().zip(values) {
+                path.push(segment);
                 collect_matching_paths(child, also_include_id_slots, path, result);
                 path.pop();
             }
@@ -203,10 +221,16 @@ fn transform_refs(ref_slot_paths: Vec<(Vec<String>, &LinkMLInstance)>) -> Vec<Fo
 
             if is_multivalued {
                 if let LinkMLInstance::List { values, .. } = instance {
-                    for (ix, child) in values.iter().enumerate() {
+                    // Same rule as the walk above. These elements are the bare
+                    // references of a multivalued reference slot, which carry no
+                    // identity label of their own, so this resolves to their
+                    // positions — but by asking rather than by assuming.
+                    let segments = list_path_segments(values);
+                    debug_assert_eq!(segments.len(), values.len());
+                    for (segment, child) in segments.into_iter().zip(values) {
                         if let Some(uri) = instance_uri_string(child) {
                             let mut child_path = path.clone();
-                            child_path.push(ix.to_string());
+                            child_path.push(segment);
                             result.push(ForeignReference {
                                 uri,
                                 object_type: range.to_string(),
@@ -361,6 +385,144 @@ signalType: "HOME"
             id_ref.is_some(),
             "expected a primary (ID) reference, got: {:?}",
             refs_with_id
+        );
+    }
+
+    /// A reference inside a keyed inlined list has to be addressed the way the
+    /// rest of the engine addresses rows of such a list: by the row's identity
+    /// label, which is what `diff()` emits and the only thing
+    /// `resolve_list_segment` accepts there.
+    ///
+    /// Emitting the row's list position instead is not a clean miss. Covered
+    /// sections are numbered from 1 and positions count from 0, so the two
+    /// spaces overlap: position "0" matches no label and the row silently keeps
+    /// its source URI, while position "k" matches the *label* k — the row one
+    /// place earlier — and the rewrite lands on the wrong row, reported as a
+    /// successful update.
+    ///
+    /// `AccessibleTrack` is here because it fails differently: its identity is
+    /// the composite `unique_keys` (`belongsToTrack`, `isDirect`), so no label
+    /// is a number, nothing aliases, and both rows just keep their source URIs.
+    /// Its label also *contains* the reference being rewritten, so the path has
+    /// to come from the pre-patch state.
+    #[test]
+    fn test_references_in_keyed_inlined_lists_address_their_own_row() {
+        use linkml_runtime::{Delta, DeltaOp, PatchOptions, patch};
+
+        const AAA: &str = "https://data.infrabel.be/ramses/track/AAA";
+        const BBB: &str = "https://data.infrabel.be/ramses/track/BBB";
+        const CCC: &str = "https://data.infrabel.be/ramses/track/CCC";
+        const DDD: &str = "https://data.infrabel.be/ramses/track/DDD";
+
+        // What the consolidator's `changesets_idmapping` lookup would return:
+        // the source URI a change refers to, mapped to the golden record's URI.
+        let golden = |source: &str| {
+            let code = source.rsplit('/').next().unwrap().to_ascii_lowercase();
+            format!("https://data.infrabel.be/data/Tracks/{code}")
+        };
+
+        let sv = load_test_schema();
+        let conv = sv.converter_for_primary_schema().unwrap();
+        let class = sv
+            .get_class(&Identifier::new("TunnelComplex"), &conv)
+            .unwrap()
+            .unwrap();
+
+        let data = format!(
+            r#"
+id: "urn:tunnel:1"
+hasCoveredSection:
+  - hasSequenceNumber: 1
+    belongsToTrack: "{AAA}"
+  - hasSequenceNumber: 2
+    belongsToTrack: "{BBB}"
+hasAccessibleTracks:
+  - belongsToTrack: "{CCC}"
+    isDirect: true
+  - belongsToTrack: "{DDD}"
+    isDirect: false
+"#
+        );
+        let value = linkml_runtime::load_yaml_str(&data, &sv, &class, &conv)
+            .unwrap()
+            .into_instance_tolerate_errors()
+            .unwrap();
+
+        let refs = get_foreign_references(&value, false);
+        let mut found: Vec<&str> = refs.iter().map(|r| r.uri.as_str()).collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            vec![AAA, BBB, CCC, DDD],
+            "expected one reference per row of both keyed lists, got: {refs:?}"
+        );
+
+        // Every path emitted must lead back to the reference it describes:
+        // `navigate_path` resolves list segments through the same rule `patch`
+        // applies, so a path that does not navigate is a delta that cannot land.
+        for r in &refs {
+            let landed = value.navigate_path(&r.slot_path);
+            assert_eq!(
+                landed.and_then(instance_uri_string).as_deref(),
+                Some(r.uri.as_str()),
+                "path {:?} does not address the reference {} it was emitted for",
+                r.slot_path,
+                r.uri
+            );
+        }
+
+        // And the whole point of the paths: publishing the rewrite must move
+        // each row's own reference, the way `replace_source_uris_for_change` does.
+        let deltas: Vec<Delta> = refs
+            .iter()
+            .map(|r| Delta {
+                path: r.slot_path.clone(),
+                op: DeltaOp::Update,
+                old: Some(serde_json::Value::String(r.uri.clone())),
+                new: Some(serde_json::Value::String(golden(&r.uri))),
+            })
+            .collect();
+        let (patched, trace) = patch(&value, &deltas, PatchOptions::default()).unwrap();
+        assert!(
+            trace.failed.is_empty(),
+            "patch refused to address: {:?}",
+            trace.failed
+        );
+
+        let json = patched.to_json();
+        let rows = |slot: &str| -> Vec<(String, String)> {
+            json[slot]
+                .as_array()
+                .unwrap_or_else(|| panic!("{slot} should be a list, got {}", json[slot]))
+                .iter()
+                .map(|row| {
+                    (
+                        row.get("hasSequenceNumber")
+                            .or_else(|| row.get("isDirect"))
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                        row["belongsToTrack"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            rows("hasCoveredSection"),
+            vec![
+                ("1".to_string(), golden(AAA)),
+                ("2".to_string(), golden(BBB)),
+            ]
+        );
+        assert_eq!(
+            rows("hasAccessibleTracks"),
+            vec![
+                ("true".to_string(), golden(CCC)),
+                ("false".to_string(), golden(DDD)),
+            ]
         );
     }
 

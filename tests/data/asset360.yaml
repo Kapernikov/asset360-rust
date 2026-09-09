@@ -209,6 +209,7 @@ classes:
         annotations:
           data.infrabel.be/linkml/asset360id: true
     slots:
+      - id
       - typeURI
     attributes:
       refersToLine:
@@ -219,12 +220,50 @@ classes:
     annotations:
       data.infrabel.be/asset360/managed: true
     attributes:
+      hasSequenceNumber:
+        range: integer
+        key: true
       belongsToTrack:
         range: Track
         inlined: false
       belongsToLine:
         range: Line
         inlined: false
+
+  AccessibleTrack:
+    description: >-
+      Identity is the composite unique key, and one of its components is the
+      reference itself: the identity label is not a number, so nothing aliases
+      a list position.
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    unique_keys:
+      track_and_direction:
+        unique_key_slots:
+          - belongsToTrack
+          - isDirect
+    attributes:
+      belongsToTrack:
+        range: Track
+        inlined: false
+      isDirect:
+        range: boolean
+
+  TunnelComplex:
+    annotations:
+      data.infrabel.be/asset360/managed: true
+    is_a: Asset
+    attributes:
+      hasCoveredSection:
+        range: CoveredSection
+        multivalued: true
+        inlined: true
+        inlined_as_list: true
+      hasAccessibleTracks:
+        range: AccessibleTrack
+        multivalued: true
+        inlined: true
+        inlined_as_list: true
 
   Signal:
     annotations:
