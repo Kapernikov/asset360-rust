@@ -127,15 +127,17 @@ fn test_apply_multiple_stages_preserves_blame_history() {
         });
     assert_eq!(role_meta.change_id, 2);
 
+    // `Task` is keyed by `id`, so a task is addressed by its key — the same
+    // segment `diff` emits for it, and the only one `patch` resolves.
     let task_title_meta = path_meta
         .remove(&vec![
             "tasks".to_string(),
-            "1".to_string(),
+            "T-2".to_string(),
             "title".to_string(),
         ])
         .unwrap_or_else(|| {
             panic!(
-                "tasks[1].title blame present
+                "tasks.T-2.title blame present
 {blame_dump}"
             )
         });
@@ -154,12 +156,12 @@ fn test_apply_multiple_stages_preserves_blame_history() {
     let task_status_meta = path_meta
         .remove(&vec![
             "tasks".to_string(),
-            "0".to_string(),
+            "T-1".to_string(),
             "status".to_string(),
         ])
         .unwrap_or_else(|| {
             panic!(
-                "tasks[0].status blame present
+                "tasks.T-1.status blame present
 {blame_dump}"
             )
         });
