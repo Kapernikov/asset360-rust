@@ -1401,18 +1401,21 @@ classes:
         )
         .unwrap();
 
-        // The datatype comes out prefixed (`^^geo:wktLiteral`), not as the
-        // bare IRI, so pin both halves: the `geo:` prefix resolves to the
-        // GeoSPARQL namespace, and the literal is typed with it.
+        // The serialiser may write the datatype either prefixed
+        // (`^^geo:wktLiteral`, with a `geo:` prefix bound to the GeoSPARQL
+        // namespace) or as a full IRI (`^^<http://www.opengis.net/ont/geosparql#wktLiteral>`).
+        // Both spellings name the same datatype, so accept either — a purely
+        // cosmetic serialiser change (prefix spacing/ordering, or switching
+        // to full IRIs) must not fail this test, only a wrong datatype may.
+        let prefixed = turtle.contains("@prefix geo: <http://www.opengis.net/ont/geosparql#>")
+            && turtle.contains("^^geo:wktLiteral");
+        let full_iri = turtle.contains("^^<http://www.opengis.net/ont/geosparql#wktLiteral>");
         assert!(
-            turtle.contains("@prefix geo: <http://www.opengis.net/ont/geosparql#>"),
-            "expected the geo: prefix to resolve to the GeoSPARQL namespace. Got:\n{turtle}"
-        );
-        assert!(
-            turtle.contains("^^geo:wktLiteral"),
-            "asWKT must serialise with the geo:wktLiteral datatype — spargeo \
-             silently returns no rows (not an error) for any other datatype, \
-             which is what MR 3's pushdown approach depends on. Got:\n{turtle}"
+            prefixed || full_iri,
+            "asWKT must serialise with the geo:wktLiteral datatype (prefixed \
+             or as a full IRI) — spargeo silently returns no rows (not an \
+             error) for any other datatype, which is what MR 3's pushdown \
+             approach depends on. Got:\n{turtle}"
         );
     }
 
