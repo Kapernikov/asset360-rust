@@ -114,14 +114,7 @@ impl SchemaGraph {
             quads: built
                 .triples
                 .into_iter()
-                .map(|t| {
-                    Quad::new(
-                        into_oxigraph_subject(t.subject),
-                        NamedNode::new_unchecked(t.predicate.into_string()),
-                        into_oxigraph_term(t.object),
-                        graph.clone(),
-                    )
-                })
+                .map(|t| Quad::new(t.subject, t.predicate, t.object, graph.clone()))
                 .collect(),
             skipped: built.skipped,
         })
@@ -142,56 +135,6 @@ impl SchemaGraph {
             out.push_str(" .\n");
         }
         out
-    }
-}
-
-/// oxigraph 0.4 vendors oxrdf **0.2**, while `linkml_runtime` — and this crate's
-/// SHACL parser — are on oxrdf **0.3**. They are the same data model but
-/// different Rust types, so the triples upstream hands back have to be
-/// re-typed on the way into the store. Nothing is reinterpreted here: an IRI
-/// stays that IRI (already validated absolute upstream, hence
-/// `new_unchecked`), a literal keeps its lexical form, language tag and
-/// datatype, a blank node keeps its id. The match is exhaustive, so a term
-/// shape neither side handles is a compile error rather than a silently
-/// dropped triple.
-///
-/// When the two crates converge on one oxrdf version this whole function
-/// disappears.
-#[cfg(feature = "sparql-endpoint")]
-fn into_oxigraph_subject(subject: oxrdf::NamedOrBlankNode) -> oxigraph::model::NamedOrBlankNode {
-    match subject {
-        oxrdf::NamedOrBlankNode::NamedNode(node) => oxigraph::model::NamedOrBlankNode::NamedNode(
-            NamedNode::new_unchecked(node.into_string()),
-        ),
-        oxrdf::NamedOrBlankNode::BlankNode(node) => oxigraph::model::NamedOrBlankNode::BlankNode(
-            oxigraph::model::BlankNode::new_unchecked(node.into_string()),
-        ),
-    }
-}
-
-/// See [`into_oxigraph_subject`].
-#[cfg(feature = "sparql-endpoint")]
-fn into_oxigraph_term(term: oxrdf::Term) -> oxigraph::model::Term {
-    use oxigraph::model::{Literal as OxiLiteral, Term as OxiTerm};
-
-    match term {
-        oxrdf::Term::NamedNode(node) => {
-            OxiTerm::NamedNode(NamedNode::new_unchecked(node.into_string()))
-        }
-        oxrdf::Term::BlankNode(node) => OxiTerm::BlankNode(
-            oxigraph::model::BlankNode::new_unchecked(node.into_string()),
-        ),
-        oxrdf::Term::Literal(literal) => {
-            let language = literal.language().map(str::to_owned);
-            let datatype = literal.datatype().as_str().to_owned();
-            let value = literal.destruct().0;
-            OxiTerm::Literal(match language {
-                Some(language) => {
-                    OxiLiteral::new_language_tagged_literal_unchecked(value, language)
-                }
-                None => OxiLiteral::new_typed_literal(value, NamedNode::new_unchecked(datatype)),
-            })
-        }
     }
 }
 
