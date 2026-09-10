@@ -698,7 +698,7 @@ classes:
 /// than the mislabeling.
 #[cfg(all(test, feature = "sparql-endpoint"))]
 mod pushed_filters_match_sparql {
-    use crate::sparql_scoper::{FilterCondition, sparql_scope};
+    use crate::sparql_scoper::{FilterCondition, LikeAnchor, sparql_scope};
     use linkml_runtime::{LinkMLInstance, load_json_str};
     use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::schemaview::SchemaView;
@@ -829,6 +829,22 @@ classes:
                     _ => *s <= value.as_str(),
                 })
             }
+            FilterCondition::Like {
+                value,
+                anchor,
+                case_insensitive,
+            } => stored.iter().any(|s| {
+                let (haystack, needle) = if *case_insensitive {
+                    (s.to_lowercase(), value.to_lowercase())
+                } else {
+                    (s.to_string(), value.clone())
+                };
+                match anchor {
+                    LikeAnchor::Prefix => haystack.starts_with(&needle),
+                    LikeAnchor::Suffix => haystack.ends_with(&needle),
+                    LikeAnchor::Anywhere => haystack.contains(&needle),
+                }
+            }),
         })
     }
 

@@ -813,6 +813,25 @@ pub enum FilterCondition {
     /// codepoint collation. The slot's term descriptor says which, so this
     /// carries only the operator and the value.
     Cmp { op: CmpOp, value: String },
+    /// A substring match lifted from `STRSTARTS` / `STRENDS` / `CONTAINS`.
+    ///
+    /// Carries the value the query wrote, *unescaped*: `%` and `_` are
+    /// metacharacters of the renderer's `LIKE`, not of SPARQL, so escaping
+    /// them is the renderer's convention and a pre-built pattern would hide
+    /// the difference between a wildcard and a user searching for `50%`.
+    Like {
+        value: String,
+        anchor: LikeAnchor,
+        /// The query wrapped the *column* in `LCASE(...)`. The renderer emits
+        /// `ILIKE`.
+        ///
+        /// Load-bearing and silent when wrong: the engine leg folds case and
+        /// SQL's `LIKE` does not, so the two routes answer different row sets
+        /// and neither reports anything. `LCASE` on the *constant* is a
+        /// different question and does not set this — see
+        /// `lcase_on_the_constant_does_not_become_case_insensitive`.
+        case_insensitive: bool,
+    },
 }
 
 impl std::fmt::Display for FilterCondition {
@@ -831,6 +850,41 @@ impl std::fmt::Display for FilterCondition {
                     .join(", ")
             ),
             Self::Cmp { op, value } => write!(f, "{} '{value}'", op.as_sql()),
+            Self::Like {
+                value,
+                anchor,
+                case_insensitive,
+            } => {
+                let op = if *case_insensitive { "ILIKE" } else { "LIKE" };
+                let pattern = match anchor {
+                    LikeAnchor::Prefix => format!("{value}%"),
+                    LikeAnchor::Suffix => format!("%{value}"),
+                    LikeAnchor::Anywhere => format!("%{value}%"),
+                };
+                write!(f, "{op} '{pattern}'")
+            }
+        }
+    }
+}
+
+/// Where a [`FilterCondition::Like`] puts its wildcards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LikeAnchor {
+    /// `STRSTARTS` — `LIKE 'value%'`.
+    Prefix,
+    /// `STRENDS` — `LIKE '%value'`.
+    Suffix,
+    /// `CONTAINS` — `LIKE '%value%'`.
+    Anywhere,
+}
+
+impl LikeAnchor {
+    /// The operator name the PyO3 boundary carries, without the case prefix.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefix => "startswith",
+            Self::Suffix => "endswith",
+            Self::Anywhere => "contains",
         }
     }
 }
@@ -1417,6 +1471,10 @@ pub fn scope_parsed_with_schema_graph(
                         FilterCondition::Eq(v) => identifier_values.push(v),
                         FilterCondition::In(vs) => identifier_values.extend(vs),
                         cmp @ FilterCondition::Cmp { .. } => kept.push(cmp),
+                        // A substring match is not a finite value list either
+                        // — same reasoning as `Cmp` — so it stays a filter
+                        // and the renderer targets `asset360_uri` with LIKE.
+                        like @ FilterCondition::Like { .. } => kept.push(like),
                     }
                 }
                 if !kept.is_empty() {
@@ -1724,6 +1782,12 @@ pub fn scope_parsed_with_schema_graph(
                             // no value list to hoist, so it stays a filter.
                             cmp @ FilterCondition::Cmp { .. } => {
                                 star.filters.entry(slot.clone()).or_default().push(cmp);
+                            }
+                            // Same reasoning: a substring match has no value
+                            // list to hoist onto `identifier_values`, so it
+                            // stays a filter against `asset360_uri`.
+                            like @ FilterCondition::Like { .. } => {
+                                star.filters.entry(slot.clone()).or_default().push(like);
                             }
                         }
                     }
@@ -2519,10 +2583,89 @@ fn extract_equality_from_expr(
             let r = extract_equality_from_expr(right, var_to_field, star_filters);
             l & r
         }
+        // The substring functions. `STRSTARTS(?nm, "BX")` narrows the fetch
+        // the way `LIKE 'BX%'` does, and until now fell to the arm below —
+        // correct, because the engine re-applied it, and unusable on a large
+        // class, because nothing narrowed the fetch and the triple limit
+        // bounds it.
+        Expression::FunctionCall(function, args) => {
+            let anchor = match function {
+                spargebra::algebra::Function::StrStarts => LikeAnchor::Prefix,
+                spargebra::algebra::Function::StrEnds => LikeAnchor::Suffix,
+                spargebra::algebra::Function::Contains => LikeAnchor::Anywhere,
+                // Every other call — REGEX, arithmetic, a custom function —
+                // is left to oxigraph, as before. `geof:sfIntersects` is
+                // handled in `lift_intersects`, called below.
+                _ => return lift_intersects(function, args, var_to_field, star_filters),
+            };
+            let [haystack, needle] = args.as_slice() else {
+                return false;
+            };
+            // `LCASE(?nm)` folds the column; a bare `?nm` does not. Anything
+            // else in the haystack position is not a column.
+            let (haystack, case_insensitive) = match haystack {
+                Expression::FunctionCall(spargebra::algebra::Function::LCase, inner) => {
+                    match inner.as_slice() {
+                        [only] => (only, true),
+                        _ => return false,
+                    }
+                }
+                other => (other, false),
+            };
+            let Expression::Variable(var) = haystack else {
+                return false;
+            };
+            let Some((star_var, path, form)) = var_to_field.get(var.as_str()) else {
+                return false;
+            };
+            let Expression::Literal(literal) = needle else {
+                return false;
+            };
+            // Only a plain literal, and only on a column whose stored term is
+            // its own text. `literal_pushable` is the same gate `=` and `IN`
+            // apply through `constant_texts` — it destructures
+            // `PushForm::Literal` and returns `false` for anything else, so an
+            // `Enum` column (which stores a code and translates backwards
+            // through its meanings, where a substring of a *label* matches no
+            // code), an `Iri` column and a `Tagged` one are all refused here
+            // the same way. `constant_texts` itself cannot be reused: it
+            // returns the *codes* an equal constant selects, and a substring
+            // is not a term to translate — there is no `PushForm::Text`
+            // variant to name instead, so the existing gate is reused
+            // directly rather than duplicated.
+            if !literal_pushable(literal, form) {
+                return false;
+            }
+            star_filters
+                .entry(star_var.clone())
+                .or_default()
+                .entry(path.clone())
+                .or_default()
+                .push(FilterCondition::Like {
+                    value: literal.value().to_owned(),
+                    anchor,
+                    case_insensitive,
+                });
+            true
+        }
         // Everything else — `!=`, `||`, `!`, REGEX, BOUND, arithmetic — is left
         // to oxigraph, and the plan is no longer a complete description.
         _ => false,
     }
+}
+
+/// Lift `geof:sfIntersects` onto a slot with a broken-out geometry column.
+///
+/// A stub until the registry exists — see `sparql_columns.rs`. Returning
+/// `false` is the honest answer meanwhile: the plan says it is not a complete
+/// description and the engine finishes the query.
+fn lift_intersects(
+    _function: &spargebra::algebra::Function,
+    _args: &[Expression],
+    _var_to_field: &ValueColumns,
+    _star_filters: &mut StarFilters,
+) -> bool {
+    false
 }
 
 /// How a value at the end of a path compares, or `None` when it cannot be
@@ -3287,6 +3430,8 @@ fn blocks_limit_push(pattern: &GraphPattern) -> bool {
 pub(crate) mod tests {
     use super::*;
 
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
     /// Small hand-written schema shared with the pushdown analyser's tests.
     pub(crate) fn test_schema_view() -> SchemaView {
         use linkml_meta::SchemaDefinition;
@@ -3634,6 +3779,95 @@ classes:
         let star = find_star(&plan, "s");
         let conds = star.filters.get("length").expect("length filter");
         assert_eq!(conds.len(), 2, "both bounds should be pushed: {conds:?}");
+    }
+
+    /// The three substring functions lift, and the `LCASE` wrapper the UI's
+    /// `IContains`/`IStartsWith` operators produce is recognised rather than
+    /// dropped.
+    ///
+    /// Dropping it is the asymmetric failure the differential oracle exists for:
+    /// the engine leg folds case and a `LIKE` does not, so the two routes answer
+    /// different row sets with nothing to say so.
+    #[test]
+    fn substring_filters_lift_with_their_case_folding() {
+        let lifted = |query: &str| -> Vec<FilterCondition> {
+            let scope =
+                sparql_scope(&format!("{PREFIX}{query}"), &test_schema_view()).expect("scopes");
+            all_stars(&scope)
+                .iter()
+                .flat_map(|star| star.filters.values())
+                .flatten()
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(
+            lifted(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(STRSTARTS(?nm, \"BX\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "BX".to_owned(),
+                anchor: LikeAnchor::Prefix,
+                case_insensitive: false,
+            }],
+        );
+        assert_eq!(
+            lifted(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(STRENDS(?nm, \"17\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "17".to_owned(),
+                anchor: LikeAnchor::Suffix,
+                case_insensitive: false,
+            }],
+        );
+        assert_eq!(
+            lifted(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(CONTAINS(?nm, \"X5\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "X5".to_owned(),
+                anchor: LikeAnchor::Anywhere,
+                case_insensitive: false,
+            }],
+        );
+        // `CONTAINS(LCASE(?nm), "x5")` is the idiomatic case-insensitive
+        // spelling, and the only one the UI produces.
+        assert_eq!(
+            lifted(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(CONTAINS(LCASE(?nm), \"x5\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "x5".to_owned(),
+                anchor: LikeAnchor::Anywhere,
+                case_insensitive: true,
+            }],
+        );
+    }
+
+    /// `LCASE` on the *needle* is not the same question, and must not lift.
+    ///
+    /// `CONTAINS(?nm, LCASE("X5"))` folds the constant, not the column, so a
+    /// case-sensitive comparison against a lowered constant is what it asks. An
+    /// `ILIKE` there would match rows the engine excludes.
+    #[test]
+    fn lcase_on_the_constant_does_not_become_case_insensitive() {
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(CONTAINS(?nm, LCASE(\"X5\"))) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope).iter().all(|star| star.filters.is_empty()),
+            "a folded constant is not a folded column"
+        );
     }
 
     /// LIMIT must NOT be pushed into the object fetch when an operator has to

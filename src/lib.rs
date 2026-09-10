@@ -1366,6 +1366,25 @@ impl FilterCondition {
                 operator: op.as_str().to_owned(),
                 values: vec![value.clone()],
             },
+            // `LikeAnchor::as_str` deliberately omits the case prefix (see
+            // its doc comment) so this boundary can add it: `icontains` /
+            // `istartswith` / `iendswith` for the `LCASE`-wrapped column,
+            // matching the UI's `IContains`/`IStartsWith` operator names.
+            // The full PyO3 surface for this (parsing it back, exposing
+            // `anchor`/`case_insensitive` as their own fields) is Task 7 —
+            // this only has to carry the value through today.
+            crate::sparql_scoper::FilterCondition::Like {
+                value,
+                anchor,
+                case_insensitive,
+            } => Self {
+                operator: if *case_insensitive {
+                    format!("i{}", anchor.as_str())
+                } else {
+                    anchor.as_str().to_owned()
+                },
+                values: vec![value.clone()],
+            },
         }
     }
 }

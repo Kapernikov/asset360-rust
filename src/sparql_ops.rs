@@ -939,7 +939,12 @@ pub fn lower_refined(
                                 // An ordering comparison on an identifier is
                                 // not a set of values, so it stays a filter --
                                 // the renderer collates the column itself.
-                                FilterCondition::Cmp { .. } => {
+                                FilterCondition::Cmp { .. }
+                                // Same reasoning: a substring match has no
+                                // finite value list to hoist onto
+                                // `identifier_values`, so it stays a filter
+                                // against the indexed column too.
+                                | FilterCondition::Like { .. } => {
                                     push_filter(
                                         &mut nodes,
                                         input,
