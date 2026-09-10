@@ -1393,6 +1393,13 @@ impl FilterCondition {
                 operator: "ne".to_owned(),
                 values: vec![value.clone()],
             },
+            // No value: absence is not a comparison. Operator string per
+            // the brief; Task 8 owns confirming the vocabulary against the
+            // Python consumer.
+            crate::sparql_scoper::FilterCondition::NotBound => Self {
+                operator: "not_bound".to_owned(),
+                values: vec![],
+            },
         }
     }
 }

@@ -840,6 +840,17 @@ pub enum FilterCondition {
     /// `OPTIONAL` exists to keep. A separate arm makes the renderer state
     /// the asymmetry instead of inheriting a rendering that ignores it.
     Ne(String),
+    /// `OPTIONAL { ?s :slot ?x } FILTER(!bound(?x))` — the slot is absent.
+    ///
+    /// Rendered as the negation of the presence check the builder
+    /// deliberately skips for an optional field. No value: absence is not a
+    /// comparison.
+    ///
+    /// Only ever pushed for a one-hop *optional* slot. A required slot
+    /// already carries the positive check, so `!bound` on it selects nothing
+    /// — which the plan cannot say — and a nested path's absence is a
+    /// different predicate from a missing key.
+    NotBound,
 }
 
 impl std::fmt::Display for FilterCondition {
@@ -872,6 +883,7 @@ impl std::fmt::Display for FilterCondition {
                 write!(f, "{op} '{pattern}'")
             }
             Self::Ne(value) => write!(f, "IS NOT NULL AND <> '{value}'"),
+            Self::NotBound => write!(f, "IS NOT PRESENT"),
         }
     }
 }
@@ -1491,6 +1503,15 @@ pub fn scope_parsed_with_schema_graph(
                         // hoist, so it stays a filter and the renderer's null
                         // test runs against `asset360_uri` itself.
                         ne @ FilterCondition::Ne(_) => kept.push(ne),
+                        // `inline_filters` here holds constants seeded from
+                        // triple patterns (Phase 1), never a `!bound` --
+                        // that only ever comes from `FILTER` and lands in
+                        // `star_filters`, handled separately below. Kept
+                        // rather than dropped anyway, on the same "no value
+                        // list to hoist" reasoning as `Ne`, so the match
+                        // stays exhaustive without asserting unreachability
+                        // it cannot prove.
+                        nb @ FilterCondition::NotBound => kept.push(nb),
                     }
                 }
                 if !kept.is_empty() {
@@ -1760,7 +1781,24 @@ pub fn scope_parsed_with_schema_graph(
         carried_constants.insert(constant.nested_var.clone());
     }
 
-    if let Some(cause) = collect_filter_conditions(pattern, 0, &var_to_field, &mut star_filters) {
+    // Star variable → its optional slots, for `!bound`'s liftability gate:
+    // a required slot already carries the positive existence check, so
+    // `!bound` on it is unsatisfiable and cannot become a pushed condition.
+    // Built from `stars` (populated above, in Phase 1) rather than from
+    // `star_filters` itself -- `extract_equality_from_expr` only ever sees
+    // the latter, and it does not carry optionality.
+    let optional_fields: HashMap<String, Vec<String>> = stars
+        .iter()
+        .map(|star| (star.variable.clone(), star.optional_fields.clone()))
+        .collect();
+
+    if let Some(cause) = collect_filter_conditions(
+        pattern,
+        0,
+        &var_to_field,
+        &mut star_filters,
+        &optional_fields,
+    ) {
         record_loss(cause);
     }
     if let Some(cause) = collect_values_filters(pattern, 0, &var_to_field, &mut star_filters) {
@@ -1810,6 +1848,15 @@ pub fn scope_parsed_with_schema_graph(
                             // null test runs against `asset360_uri`.
                             ne @ FilterCondition::Ne(_) => {
                                 star.filters.entry(slot.clone()).or_default().push(ne);
+                            }
+                            // `!bound` cannot actually reach here either:
+                            // its gate requires the slot to be in
+                            // `optional_fields`, and the identifier slot is
+                            // never optional. Handled the same way as `Ne`
+                            // regardless, for the same "no value list"
+                            // reasoning.
+                            nb @ FilterCondition::NotBound => {
+                                star.filters.entry(slot.clone()).or_default().push(nb);
                             }
                         }
                     }
@@ -2383,6 +2430,7 @@ fn collect_filter_conditions(
     depth: usize,
     var_to_field: &ValueColumns,
     star_filters: &mut StarFilters,
+    optional_fields: &HashMap<String, Vec<String>>,
 ) -> Option<Inexact> {
     match pattern {
         GraphPattern::Filter { expr, inner } => {
@@ -2406,10 +2454,10 @@ fn collect_filter_conditions(
                 // key, keeping records with *some* element past the bound still
                 // leaves the record's other elements as groups, which only the
                 // `HAVING` removes.
-                extract_equality_from_expr(expr, var_to_field, star_filters);
+                extract_equality_from_expr(expr, var_to_field, star_filters, optional_fields);
                 None
             } else if depth == 0 {
-                if extract_equality_from_expr(expr, var_to_field, star_filters) {
+                if extract_equality_from_expr(expr, var_to_field, star_filters, optional_fields) {
                     None
                 } else {
                     Some(Inexact::FilterExpression)
@@ -2423,6 +2471,7 @@ fn collect_filter_conditions(
                 depth,
                 var_to_field,
                 star_filters,
+                optional_fields,
             ))
         }
         GraphPattern::LeftJoin {
@@ -2430,8 +2479,15 @@ fn collect_filter_conditions(
             right,
             expression,
         } => {
-            let l = collect_filter_conditions(left, depth, var_to_field, star_filters);
-            let r = collect_filter_conditions(right, depth + 1, var_to_field, star_filters);
+            let l =
+                collect_filter_conditions(left, depth, var_to_field, star_filters, optional_fields);
+            let r = collect_filter_conditions(
+                right,
+                depth + 1,
+                var_to_field,
+                star_filters,
+                optional_fields,
+            );
             // `OPTIONAL { ... FILTER(...) }` does not leave a Filter node:
             // spargebra lifts the condition into the LeftJoin itself. It is not
             // pushable — it decides whether the optional side *matched*, so
@@ -2445,8 +2501,14 @@ fn collect_filter_conditions(
         | GraphPattern::Union { left, right }
         | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => {
-            collect_filter_conditions(left, depth, var_to_field, star_filters).or(
-                collect_filter_conditions(right, depth, var_to_field, star_filters),
+            collect_filter_conditions(left, depth, var_to_field, star_filters, optional_fields).or(
+                collect_filter_conditions(
+                    right,
+                    depth,
+                    var_to_field,
+                    star_filters,
+                    optional_fields,
+                ),
             )
         }
         GraphPattern::Extend { inner, .. }
@@ -2458,7 +2520,7 @@ fn collect_filter_conditions(
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => {
-            collect_filter_conditions(inner, depth, var_to_field, star_filters)
+            collect_filter_conditions(inner, depth, var_to_field, star_filters, optional_fields)
         }
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => None,
     }
@@ -2500,6 +2562,7 @@ fn extract_equality_from_expr(
     expr: &Expression,
     var_to_field: &ValueColumns,
     star_filters: &mut StarFilters,
+    optional_fields: &HashMap<String, Vec<String>>,
 ) -> bool {
     match expr {
         Expression::Equal(left, right) => {
@@ -2544,8 +2607,46 @@ fn extract_equality_from_expr(
                     .push(FilterCondition::Ne(only));
                 true
             }
-            // Every other negation — `!bound`, `!CONTAINS`, `!(A && B)` — is
-            // left to oxigraph. `!bound` gets its own arm in a later task.
+            // `FILTER(!bound(?x))` — the slot ?x resolves to was never read.
+            // Rendered as the negation of the presence check the builder
+            // already skips for an optional field, so the gate below is not
+            // about whether the check is *expressible* (it always is) but
+            // whether pushing it is *sound*.
+            Expression::Bound(var) => {
+                let Some((star_var, path, _form)) = var_to_field.get(var.as_str()) else {
+                    return false;
+                };
+                if path.len() != 1 {
+                    // A nested path's absence is "the key at this step is
+                    // missing", which is a different predicate from "the
+                    // leaf value is absent" — no `FilterCondition` arm
+                    // renders it, and the renderer only ever walks a
+                    // multi-hop path with `->>`.
+                    return false;
+                }
+                // A required slot already carries the positive existence
+                // check (`object_data ? 'field'`), so on that slot `!bound`
+                // is unsatisfiable and the query selects nothing — which the
+                // plan has no way to state. Checked against `optional_fields`
+                // rather than assumed: an unknown star must decline too, or
+                // a star nobody can resolve would silently lift a presence
+                // check for it.
+                let is_optional = optional_fields
+                    .get(star_var)
+                    .is_some_and(|fields| fields.contains(&path[0]));
+                if !is_optional {
+                    return false;
+                }
+                star_filters
+                    .entry(star_var.clone())
+                    .or_default()
+                    .entry(path.clone())
+                    .or_default()
+                    .push(FilterCondition::NotBound);
+                true
+            }
+            // Every other negation — `!CONTAINS`, `!(A && B)` — is left to
+            // oxigraph.
             _ => false,
         },
         Expression::Greater(left, right)
@@ -2630,8 +2731,8 @@ fn extract_equality_from_expr(
             // Both halves must land: `A && B` with B dropped is a weaker
             // filter, which over-fetches — safe for a prefetch, wrong for an
             // exact plan, and the caller can only tell if it hears about it.
-            let l = extract_equality_from_expr(left, var_to_field, star_filters);
-            let r = extract_equality_from_expr(right, var_to_field, star_filters);
+            let l = extract_equality_from_expr(left, var_to_field, star_filters, optional_fields);
+            let r = extract_equality_from_expr(right, var_to_field, star_filters, optional_fields);
             l & r
         }
         // The substring functions. `STRSTARTS(?nm, "BX")` narrows the fetch
@@ -2647,7 +2748,15 @@ fn extract_equality_from_expr(
                 // Every other call — REGEX, arithmetic, a custom function —
                 // is left to oxigraph, as before. `geof:sfIntersects` is
                 // handled in `lift_intersects`, called below.
-                _ => return lift_intersects(function, args, var_to_field, star_filters),
+                _ => {
+                    return lift_intersects(
+                        function,
+                        args,
+                        var_to_field,
+                        star_filters,
+                        optional_fields,
+                    );
+                }
             };
             let [haystack, needle] = args.as_slice() else {
                 return false;
@@ -2716,6 +2825,7 @@ fn lift_intersects(
     _args: &[Expression],
     _var_to_field: &ValueColumns,
     _star_filters: &mut StarFilters,
+    _optional_fields: &HashMap<String, Vec<String>>,
 ) -> bool {
     false
 }
@@ -4035,6 +4145,49 @@ classes:
         )
         .expect("scopes");
         assert_eq!(plan.sql_limit, Some(10));
+    }
+
+    /// `OPTIONAL { ... } FILTER(!bound(?x))` lifts to a presence check.
+    ///
+    /// The one thing the builder deliberately skips for an optional field —
+    /// `object_data ? 'field'` — is precisely what this asks for, negated.
+    #[test]
+    fn unbound_on_an_optional_slot_lifts() {
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:name ?nm }} FILTER(!bound(?nm)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        let conditions: Vec<_> = all_stars(&plan)
+            .into_iter()
+            .flat_map(|star| star.filters.values())
+            .flatten()
+            .cloned()
+            .collect();
+        assert_eq!(conditions, vec![FilterCondition::NotBound]);
+    }
+
+    /// `!bound` on a *required* slot does not lift.
+    ///
+    /// The star already carries an existence check for it, so the query
+    /// selects nothing — and "nothing" is not a condition the plan can
+    /// state. Lifting a presence check here would render a contradiction and
+    /// answer zero rows for the right reason by accident; leaving it to the
+    /// engine answers zero rows for the reason the query gives.
+    #[test]
+    fn unbound_on_a_required_slot_does_not_lift() {
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(!bound(?nm)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(all_stars(&plan).iter().all(|star| star.filters.is_empty()));
     }
 
     /// LIMIT must NOT be pushed into the object fetch when an operator has to

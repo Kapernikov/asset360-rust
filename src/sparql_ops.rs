@@ -949,7 +949,16 @@ pub fn lower_refined(
                                 // value" is not a value list either, and the
                                 // renderer's null test has to run against the
                                 // indexed column itself.
-                                | FilterCondition::Ne(_) => {
+                                | FilterCondition::Ne(_)
+                                // `!bound` never actually reaches here: the
+                                // gate that lifts it requires the slot to be
+                                // in `optional_fields`, and the identifier
+                                // slot is never optional (see `Star`'s doc
+                                // comment -- its existence is structural).
+                                // Handled the same way as the others anyway,
+                                // since "no value list to hoist" is just as
+                                // true of absence as of any other condition.
+                                | FilterCondition::NotBound => {
                                     push_filter(
                                         &mut nodes,
                                         input,
