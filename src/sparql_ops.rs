@@ -1055,7 +1055,19 @@ pub fn lower_refined(
                                 // Handled the same way as the others anyway,
                                 // since "no value list to hoist" is just as
                                 // true of absence as of any other condition.
-                                | FilterCondition::NotBound => {
+                                | FilterCondition::NotBound
+                                // A geometry predicate never reaches here
+                                // either, and not only for the "no value
+                                // list" reason the others give: this branch
+                                // only fires when `condition.slot_path` is
+                                // exactly the identifier slot (checked
+                                // above), and the geometry registry's tail
+                                // is two segments, so it never equals a
+                                // single identifier slot. Handled the same
+                                // way regardless, so the match stays
+                                // exhaustive without asserting a stronger
+                                // unreachability claim than the code proves.
+                                | FilterCondition::Intersects { .. } => {
                                     push_filter(
                                         &mut nodes,
                                         input,

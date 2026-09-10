@@ -783,6 +783,42 @@ impl Expr {
                 // declines.
                 _ => None,
             },
+            // `geof:sfIntersects`, the same shape and the same two-refusal
+            // literal check `sparql_scoper::lift_intersects` applies for the
+            // fetch (`intersects_wkt_from_literal`): a constant not typed
+            // exactly `wktLiteral`, or one under a CRS other than CRS84,
+            // declines rather than lifting a statement the engine would
+            // answer differently. The one thing this route checks that the
+            // fetch-side lift does not need repeated here is the registry
+            // gate (`crate::sparql_columns::broken_out_column`) -- that one
+            // lives in `constants_are_the_columns_terms`, the only place in
+            // this file with a schema and a `class_of_star` map to ask it
+            // through. Re-running the literal check here (rather than
+            // trusting that gate alone) also means a direct,
+            // `to_sql`-bypassing call to this `_unchecked` method -- as the
+            // tests below make -- cannot mint an `Intersects` condition from
+            // a constant `spargeo` would read as unbound.
+            Self::Function { name, args } if is_sf_intersects(name) => {
+                let [
+                    Self::Slot {
+                        star_var,
+                        slot_path,
+                        reading,
+                        ..
+                    },
+                    Self::Literal(Term::Literal(literal)),
+                ] = args.as_slice()
+                else {
+                    return None;
+                };
+                let wkt = crate::sparql_scoper::intersects_wkt_from_literal(literal)?;
+                Some(vec![SqlCondition {
+                    star_var: star_var.clone(),
+                    slot_path: slot_path.clone(),
+                    condition: FilterCondition::Intersects { wkt },
+                    reading: *reading,
+                }])
+            }
             // The three substring predicates, `STRSTARTS`/`STRENDS`/`CONTAINS`,
             // the same shape as `sparql_scoper::extract_equality_from_expr`
             // lifts for the fetch. `LCASE` on the haystack folds the column
@@ -1034,7 +1070,37 @@ impl Expr {
             Self::And(parts) | Self::Or(parts) => parts
                 .iter()
                 .all(|part| part.constants_are_the_columns_terms(schema, class_of_star)),
-            // The substring predicates are the one `Function` shape
+            // `geof:sfIntersects` is the one `Function` shape besides the
+            // substring predicates that `sql_shape_unchecked` turns into a
+            // condition, and it is walked here for the same reason: this is
+            // the only place in this file with both a schema and the
+            // `class_of_star` map the registry needs. Unlike the substring
+            // arm below, this checks two different things at once, both
+            // load-bearing: the registry (`broken_out_column`) says the slot
+            // has a column to push against at all, and
+            // `intersects_wkt_from_literal` says the constant is one
+            // `spargeo` reads a geometry from. Miss this arm and
+            // `sql_shape_unchecked`'s own `is_sf_intersects` branch would be
+            // the only gate left on `to_sql`'s route -- which does re-check
+            // the literal, but has no schema to ask the registry through, so
+            // a geometry filter on a plain string slot would narrow a fetch
+            // that reaches a statement naming a column that was never there.
+            Self::Function { name, args } if is_sf_intersects(name) => match args.as_slice() {
+                [
+                    Self::Slot {
+                        star_var,
+                        slot_path,
+                        ..
+                    },
+                    Self::Literal(Term::Literal(literal)),
+                ] => {
+                    class_of_star.get(star_var).is_some_and(|class_uri| {
+                        crate::sparql_columns::broken_out_column(class_uri, slot_path).is_some()
+                    }) && crate::sparql_scoper::intersects_wkt_from_literal(literal).is_some()
+                }
+                _ => true,
+            },
+            // The substring predicates are the one other `Function` shape
             // `sql_shape_unchecked` turns into a condition, so it is the one
             // walked here -- everything else declines there regardless of
             // what this reports. An enum column stores a code and translates
@@ -1120,6 +1186,22 @@ fn like_anchor(name: &str) -> Option<LikeAnchor> {
         "CONTAINS" => Some(LikeAnchor::Anywhere),
         _ => None,
     }
+}
+
+/// Whether a `Function`-shaped expression's name is `geof:sfIntersects`.
+///
+/// `name` here is `function.to_string()` (see `like_anchor`'s doc comment for
+/// why), and `spargebra::algebra::Function::Custom`'s `Display` forwards to
+/// `NamedNode`'s, which wraps the IRI in angle brackets -- confirmed by
+/// printing one rather than assumed. `sparql_scoper::SF_INTERSECTS_IRI` is
+/// the bare IRI the scoper matches on `Function::Custom`'s `NamedNode`
+/// directly, before it is ever stringified; stripping the brackets here
+/// keeps the one IRI literal the source of truth for both routes instead of
+/// a second copy that could drift out of sync with it.
+fn is_sf_intersects(name: &str) -> bool {
+    name.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        == Some(crate::sparql_scoper::SF_INTERSECTS_IRI)
 }
 
 /// Peels an `LCASE(...)` wrapper off a substring function's haystack
@@ -3879,6 +3961,141 @@ mod tests {
         assert!(members.to_sql(&schema, &tunnel_star()).is_some());
     }
 
+    /// The class scanned as `s` in these tests carries a slot the registry
+    /// claims a broken-out geometry column for: `PostalCode.hasGeometry ->
+    /// Geometry.asWKT`. Same fixture the scoper's own
+    /// `sf_intersects_lifts_on_a_geometry_slot` uses.
+    fn postal_code_star() -> HashMap<String, String> {
+        HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/PostalCode".to_owned(),
+        )])
+    }
+
+    fn geometry_slot() -> Expr {
+        Expr::Slot {
+            star_var: "s".to_owned(),
+            slot_path: vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+            reading: SlotReading::Column,
+            presence: SlotPresence::Required,
+        }
+    }
+
+    fn sf_intersects(literal: Literal) -> Expr {
+        Expr::Function {
+            name: "<http://www.opengis.net/def/function/geosparql/sfIntersects>".to_owned(),
+            args: vec![geometry_slot(), Expr::Literal(literal.into())],
+        }
+    }
+
+    fn wkt_literal_datatype() -> NamedNode {
+        NamedNode::new_unchecked(crate::sparql_scoper::WKT_LITERAL_IRI)
+    }
+
+    fn geojson_literal_datatype() -> NamedNode {
+        NamedNode::new_unchecked("http://www.opengis.net/ont/geosparql#geoJSONLiteral")
+    }
+
+    /// `geof:sfIntersects` on a slot the registry claims lifts, through the
+    /// statement route (`to_sql`), not just `sql_shape_unchecked` --
+    /// Finding F1 from earlier tasks: the two are independent, and a
+    /// pushdown that only reaches the fetch-side lift never reaches a
+    /// statement.
+    #[test]
+    fn sf_intersects_lifts_through_to_sql() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+        let expr = sf_intersects(Literal::new_typed_literal(box_wkt, wkt_literal_datatype()));
+        assert_eq!(
+            expr.to_sql(&schema, &postal_code_star()),
+            Some(vec![SqlCondition {
+                star_var: "s".to_owned(),
+                slot_path: vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+                condition: FilterCondition::Intersects {
+                    wkt: box_wkt.to_owned()
+                },
+                reading: SlotReading::Column,
+            }])
+        );
+        // A CRS84 prefix is accepted and stripped -- the SQL side takes a
+        // bare WKT, same as the scoper's fetch-side lift.
+        let prefixed = format!("<http://www.opengis.net/def/crs/OGC/1.3/CRS84> {box_wkt}");
+        let expr = sf_intersects(Literal::new_typed_literal(prefixed, wkt_literal_datatype()));
+        assert_eq!(
+            expr.to_sql(&schema, &postal_code_star()),
+            Some(vec![SqlCondition {
+                star_var: "s".to_owned(),
+                slot_path: vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+                condition: FilterCondition::Intersects {
+                    wkt: box_wkt.to_owned()
+                },
+                reading: SlotReading::Column,
+            }])
+        );
+    }
+
+    /// The three refusals, through `to_sql`: a plain string, a
+    /// `geoJSONLiteral`, and a non-CRS84 prefix all decline -- each because
+    /// lifting it would have the statement answer rows the engine leg
+    /// answers none for (see `FilterCondition::Intersects`'s doc comment).
+    #[test]
+    fn sf_intersects_declines_through_to_sql() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+
+        let plain_string = sf_intersects(Literal::new_simple_literal(box_wkt));
+        assert_eq!(plain_string.to_sql(&schema, &postal_code_star()), None);
+
+        let geojson = sf_intersects(Literal::new_typed_literal(
+            r#"{"type":"Point","coordinates":[1,2]}"#,
+            geojson_literal_datatype(),
+        ));
+        assert_eq!(geojson.to_sql(&schema, &postal_code_star()), None);
+
+        let other_crs = sf_intersects(Literal::new_typed_literal(
+            format!("<http://www.opengis.net/def/crs/EPSG/0/31370> {box_wkt}"),
+            wkt_literal_datatype(),
+        ));
+        assert_eq!(other_crs.to_sql(&schema, &postal_code_star()), None);
+    }
+
+    /// The registry gate, isolated from the literal gates the test above
+    /// isolates: the same function, over the *same valid* `wktLiteral`
+    /// constant, does not lift when the slot is an ordinary string the
+    /// registry claims no column for (`TunnelComplex.hasName`).
+    ///
+    /// This is also the gate-bypass evidence for `constants_are_the_columns_terms`'s
+    /// own `is_sf_intersects` arm: `sql_shape_unchecked` alone (no schema, no
+    /// registry) *would* build a condition here -- it only checks the
+    /// literal, not whether the slot has a column at all -- so `to_sql`
+    /// disagreeing with it pins that the registry gate is actually being
+    /// asked, not skipped.
+    #[test]
+    fn sf_intersects_on_a_slot_the_registry_does_not_claim_does_not_lift_via_to_sql() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let expr = Expr::Function {
+            name: "<http://www.opengis.net/def/function/geosparql/sfIntersects>".to_owned(),
+            args: vec![
+                Expr::Slot {
+                    star_var: "s".to_owned(),
+                    slot_path: vec!["hasName".to_owned()],
+                    reading: SlotReading::Column,
+                    presence: SlotPresence::Required,
+                },
+                Expr::Literal(
+                    Literal::new_typed_literal("POINT(1 2)", wkt_literal_datatype()).into(),
+                ),
+            ],
+        };
+        assert_eq!(expr.to_sql(&schema, &tunnel_star()), None);
+        // The bypass: with no schema to ask the registry through,
+        // `sql_shape_unchecked` alone builds a condition anyway -- proving
+        // the registry gate lives in `constants_are_the_columns_terms`, not
+        // here, and that `to_sql`'s refusal above is that gate firing and
+        // not a coincidence of the literal check.
+        assert!(expr.sql_shape_unchecked().is_some());
+    }
+
     // -----------------------------------------------------------------------
     // `to_sql_tree`: the within-star disjunction
     // -----------------------------------------------------------------------
@@ -3980,6 +4197,46 @@ mod tests {
             "the fast path renders it as two conditions"
         );
         assert_eq!(conjunction.to_sql_tree(&schema, &signal_star()), None);
+    }
+
+    /// A `geof:sfIntersects` leaf flows through `to_sql_tree`'s disjunction
+    /// walk exactly like any other leaf shape: `tree_shape_unchecked`'s
+    /// non-connective arm calls the same `sql_shape_unchecked` the fast path
+    /// uses (Task 5's doc comment on that arm says a new `Expr` shape is a
+    /// compile error there, not a silent skip -- confirmed here, not just
+    /// read), and the `numeric` flag it computes from `numeric_at_path`
+    /// correctly reads `false`: WKT text is not a numeric column, so the
+    /// leaf renders as a plain text comparison, not a cast one.
+    #[test]
+    fn a_geometry_leaf_flows_through_the_condition_tree_walk() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+        let intersects = sf_intersects(Literal::new_typed_literal(box_wkt, wkt_literal_datatype()));
+        // A different leaf on the same star -- a plain text equality on the
+        // same slot's own path, not a geometry predicate -- so the tree has
+        // two distinct, independently pushable leaves to walk.
+        let other = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(geometry_slot()),
+            right: Box::new(Expr::Literal(Literal::new_simple_literal("ignored").into())),
+        };
+        let tree = Expr::Or(vec![intersects, other])
+            .to_sql_tree(&schema, &postal_code_star())
+            .expect("a disjunction of two pushable leaves on one star lifts");
+        let leaves = tree.leaves();
+        assert_eq!(leaves.len(), 2);
+        let geometry_leaf = leaves
+            .iter()
+            .find(|leaf| matches!(leaf.condition.condition, FilterCondition::Intersects { .. }))
+            .expect("the geometry leaf is present, not silently dropped");
+        assert!(
+            !geometry_leaf.numeric,
+            "a WKT string is not a numeric column"
+        );
+        assert_eq!(
+            geometry_leaf.condition.slot_path,
+            vec!["hasGeometry".to_owned(), "asWKT".to_owned()]
+        );
     }
 
     /// **`Not` is representable and never produced**, and the walks must still

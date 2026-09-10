@@ -1401,6 +1401,16 @@ impl FilterCondition {
                 operator: "not_bound".to_owned(),
                 values: vec![],
             },
+            // Not one of the ordering operators either, and not a text
+            // comparison at all -- `values[0]` carries the WKT body
+            // (CRS-stripped, per `intersects_wkt_from_literal`), which the
+            // renderer hands to PostGIS's geometry constructor rather than
+            // comparing as JSONB text. Operator string per the brief; Task 8
+            // owns confirming the vocabulary against the Python consumer.
+            crate::sparql_scoper::FilterCondition::Intersects { wkt } => Self {
+                operator: "intersects".to_owned(),
+                values: vec![wkt.clone()],
+            },
         }
     }
 }

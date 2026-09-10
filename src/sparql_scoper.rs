@@ -851,6 +851,19 @@ pub enum FilterCondition {
     /// — which the plan cannot say — and a nested path's absence is a
     /// different predicate from a missing key.
     NotBound,
+    /// `FILTER(geof:sfIntersects(?wkt, "..."^^geo:wktLiteral))` on a slot the
+    /// broken-out column registry claims.
+    ///
+    /// The WKT body, with a CRS84 prefix stripped. Only CRS84 lifts: `spargeo`
+    /// reads a geometry only from a `wktLiteral`/`geoJSONLiteral` in CRS84
+    /// and returns unbound otherwise, which makes the FILTER silently false —
+    /// so a lifted non-CRS84 geometry would answer rows on the statement
+    /// route where the engine answers none.
+    ///
+    /// `geof:area` and `geof:distance` are deliberately not here: they are
+    /// geodesic in `spargeo` and planar in PostGIS on `geometry(4326)`, so the
+    /// two routes would not agree. Topological predicates do.
+    Intersects { wkt: String },
 }
 
 impl std::fmt::Display for FilterCondition {
@@ -884,8 +897,59 @@ impl std::fmt::Display for FilterCondition {
             }
             Self::Ne(value) => write!(f, "IS NOT NULL AND <> '{value}'"),
             Self::NotBound => write!(f, "IS NOT PRESENT"),
+            Self::Intersects { wkt } => write!(f, "INTERSECTS '{wkt}'"),
         }
     }
+}
+
+/// The IRI `geof:sfIntersects` parses to, confirmed by printing a parse of
+/// `FILTER(geof:sfIntersects(...))` rather than assumed: it arrives as
+/// `Function::Custom(NamedNode { iri: .. })`, and this is that IRI's text.
+pub(crate) const SF_INTERSECTS_IRI: &str =
+    "http://www.opengis.net/def/function/geosparql/sfIntersects";
+
+/// The GeoSPARQL datatype `geo:wktLiteral`. `spargeo` reads a geometry only
+/// from a literal typed exactly this or `geo:geoJSONLiteral`
+/// (`parse.rs::extract_argument`); anything else — an `xsd:string`, most
+/// obviously — makes the function return unbound, so
+/// `FILTER(geof:sfIntersects(...))` is silently false there. Lifting a
+/// non-`wktLiteral` constant would answer rows on the statement route where
+/// the engine answers none — the quietest possible route disagreement.
+pub(crate) const WKT_LITERAL_IRI: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
+
+/// The only coordinate reference system `spargeo` accepts a leading `<uri>`
+/// prefix for (`parse.rs::parse_wkt_literal`); any other CRS makes it return
+/// `None`. PostGIS transformed the stored value to 4326 on ingest and would
+/// happily match a different CRS's numbers as if they were already in it, so
+/// lifting one here would make the two routes disagree.
+const CRS84_URI: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+
+/// The WKT body a `geof:sfIntersects` constant lifts as, or `None` for either
+/// of the two literal-shaped refusals `spargeo`'s own parser enforces
+/// (`parse.rs::extract_argument`, `parse_wkt_literal`): not typed exactly
+/// `wktLiteral` (this also catches `geoJSONLiteral`, representable in
+/// principle via `ST_GeomFromGeoJSON` but out of scope here — declining
+/// leaves the engine answering it correctly), or prefixed with a CRS other
+/// than CRS84.
+///
+/// Mirrors `parse_wkt_literal`'s trim-then-strip-prefix exactly, short of the
+/// final `Geometry::try_from_wkt_str` — SQL, not this crate, is what
+/// validates the WKT syntax itself. The returned body is therefore
+/// CRS-stripped and trimmed, never re-validated as parseable WKT; the Python
+/// renderer consumes it verbatim.
+pub(crate) fn intersects_wkt_from_literal(literal: &spargebra::term::Literal) -> Option<String> {
+    if literal.datatype().as_str() != WKT_LITERAL_IRI {
+        return None;
+    }
+    let mut value = literal.value().trim();
+    if let Some(rest) = value.strip_prefix('<') {
+        let (system, rest) = rest.split_once('>').unwrap_or((rest, ""));
+        if system != CRS84_URI {
+            return None;
+        }
+        value = rest.trim_start();
+    }
+    Some(value.to_owned())
 }
 
 /// Where a [`FilterCondition::Like`] puts its wildcards.
@@ -1512,6 +1576,16 @@ pub fn scope_parsed_with_schema_graph(
                         // stays exhaustive without asserting unreachability
                         // it cannot prove.
                         nb @ FilterCondition::NotBound => kept.push(nb),
+                        // Same reasoning again, and doubly unreachable: a
+                        // geometry predicate has no value list to hoist
+                        // either, and `inline_filters` never carries one
+                        // regardless -- `lift_intersects` only ever writes
+                        // into `star_filters` (see its own doc comment),
+                        // and the identifier slot this branch is keyed on is
+                        // never geometry-typed. Kept for the same "match
+                        // stays exhaustive without asserting unreachability
+                        // it cannot prove" reason as `NotBound`.
+                        geo @ FilterCondition::Intersects { .. } => kept.push(geo),
                     }
                 }
                 if !kept.is_empty() {
@@ -1857,6 +1931,18 @@ pub fn scope_parsed_with_schema_graph(
                             // reasoning.
                             nb @ FilterCondition::NotBound => {
                                 star.filters.entry(slot.clone()).or_default().push(nb);
+                            }
+                            // Unreachable in truth, and not just by the
+                            // "no value list" reasoning the other arms give:
+                            // this branch only ever sees a *single*-slot
+                            // path (`<[String; 1]>::try_from(path)`, above),
+                            // and the registry never claims one -- its tail
+                            // is two segments (`sparql_columns.rs`). Handled
+                            // the same way anyway, so the match stays
+                            // exhaustive without asserting a stronger
+                            // unreachability claim than the code proves.
+                            geo @ FilterCondition::Intersects { .. } => {
+                                star.filters.entry(slot.clone()).or_default().push(geo);
                             }
                         }
                     }
@@ -2817,17 +2903,65 @@ fn extract_equality_from_expr(
 
 /// Lift `geof:sfIntersects` onto a slot with a broken-out geometry column.
 ///
-/// A stub until the registry exists — see `sparql_columns.rs`. Returning
-/// `false` is the honest answer meanwhile: the plan says it is not a complete
-/// description and the engine finishes the query.
+/// Four gates, each declining rather than approximating: the function has to
+/// be `geof:sfIntersects` itself (`geof:area`/`geof:distance` and the other
+/// 41 GeoSPARQL functions are geodesic in `spargeo` and planar in PostGIS on
+/// `geometry(4326)`, so only a topological predicate agrees between the two
+/// routes); the first argument has to resolve, through `var_to_field`, to a
+/// slot path the [`crate::sparql_columns`] registry claims a column for; the
+/// second has to be a literal [`intersects_wkt_from_literal`] accepts (typed
+/// `wktLiteral` in CRS84 — see its doc comment for the two ways a literal
+/// refuses).
+///
+/// `optional_fields` is unused: unlike `!bound`, a geometry predicate over an
+/// absent optional slot is not a presence check with a different rendering —
+/// it is an ordinary comparison that the slot's own presence in the row
+/// (`?g asset360:asWKT ?w`, a required triple pattern of the FILTER's own
+/// variable) already has to satisfy for `?w` to be bound at all, the same as
+/// every other arm above this one in `extract_equality_from_expr` that does
+/// not consult it.
 fn lift_intersects(
-    _function: &spargebra::algebra::Function,
-    _args: &[Expression],
-    _var_to_field: &ValueColumns,
-    _star_filters: &mut StarFilters,
+    function: &spargebra::algebra::Function,
+    args: &[Expression],
+    var_to_field: &ValueColumns,
+    star_filters: &mut StarFilters,
     _optional_fields: &HashMap<String, Vec<String>>,
 ) -> bool {
-    false
+    let spargebra::algebra::Function::Custom(node) = function else {
+        return false;
+    };
+    if node.as_str() != SF_INTERSECTS_IRI {
+        return false;
+    }
+    let [Expression::Variable(var), Expression::Literal(literal)] = args else {
+        return false;
+    };
+    let Some((star_var, path, _form)) = var_to_field.get(var.as_str()) else {
+        return false;
+    };
+    // The registry is keyed on `(class_uri, slot_path)`, but no `var_to_class`
+    // map reaches this function — `extract_equality_from_expr`'s signature
+    // (fixed by Task 1) carries only `var_to_field`. Today's registry gate on
+    // `class_uri` is documented (`sparql_columns.rs`) as "non-empty", not
+    // "this class": `star_var` (a SPARQL variable name, always non-empty) is
+    // passed to satisfy that gate as it exists today, not to name a real
+    // class. If the registry ever grows a real per-class check, this call
+    // site needs a real `class_uri` threaded in — this is not that.
+    let Some(crate::sparql_columns::BrokenOutColumn::Geometry) =
+        crate::sparql_columns::broken_out_column(star_var.as_str(), path)
+    else {
+        return false;
+    };
+    let Some(wkt) = intersects_wkt_from_literal(literal) else {
+        return false;
+    };
+    star_filters
+        .entry(star_var.clone())
+        .or_default()
+        .entry(path.clone())
+        .or_default()
+        .push(FilterCondition::Intersects { wkt });
+    true
 }
 
 /// How a value at the end of a path compares, or `None` when it cannot be
@@ -3759,6 +3893,25 @@ classes:
       groupsLines:
         range: Line
         multivalued: true
+  # Backs the `geof:sfIntersects` lift tests. The path tail
+  # `[hasGeometry, asWKT]` is exactly what `sparql_columns::broken_out_column`
+  # keys on, so `PostalCode` is the class the registry claims a column for;
+  # `Geometry` is a separate inlined class rather than an attribute on
+  # `PostalCode` directly, matching how the real `postalcode.yaml` spells it
+  # (see `sparql_columns.rs`'s module doc).
+  PostalCode:
+    class_uri: asset360:PostalCode
+    attributes:
+      asset360_uri:
+        identifier: true
+      hasGeometry:
+        range: Geometry
+        inlined: true
+  Geometry:
+    class_uri: asset360:Geometry
+    attributes:
+      asWKT:
+        range: string
 "#;
         let schema: SchemaDefinition =
             p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
@@ -4222,6 +4375,153 @@ classes:
             })
             .collect();
         assert!(conditions.is_empty());
+    }
+
+    /// `geof:sfIntersects` over a slot with a broken-out geometry column
+    /// lifts.
+    #[test]
+    fn sf_intersects_lifts_on_a_geometry_slot() {
+        const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                            PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
+        let path_conditions = |query: &str| -> Vec<FilterCondition> {
+            let scope = sparql_scope(&format!("{PREFIX}{GEOF}{query}"), &test_schema_view())
+                .expect("scopes");
+            scope
+                .root
+                .all_stars()
+                .iter()
+                .flat_map(|star| star.path_filters.iter())
+                .flat_map(|filter| filter.conditions.iter())
+                .cloned()
+                .collect()
+        };
+
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+        assert_eq!(
+            path_conditions(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:PostalCode ; asset360:hasGeometry ?g . \
+                 ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \"{box_wkt}\"^^geo:wktLiteral)) }}"
+            )),
+            vec![FilterCondition::Intersects {
+                wkt: box_wkt.to_owned()
+            }],
+        );
+        // A CRS84 prefix is accepted and stripped; the SQL side takes a bare
+        // WKT.
+        assert_eq!(
+            path_conditions(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:PostalCode ; asset360:hasGeometry ?g . \
+                 ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \
+                 \"<http://www.opengis.net/def/crs/OGC/1.3/CRS84> {box_wkt}\"^^geo:wktLiteral)) }}"
+            )),
+            vec![FilterCondition::Intersects {
+                wkt: box_wkt.to_owned()
+            }],
+        );
+        // An xsd:string makes spargeo return unbound, so the engine answers
+        // no rows. Lifting it would make SQL answer rows instead -- the
+        // quietest possible route disagreement.
+        assert!(
+            path_conditions(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:PostalCode ; asset360:hasGeometry ?g . \
+                 ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \"{box_wkt}\")) }}"
+            ))
+            .is_empty(),
+        );
+        // A different CRS is rejected by spargeo, so it must not lift
+        // either.
+        assert!(
+            path_conditions(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:PostalCode ; asset360:hasGeometry ?g . \
+                 ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \
+                 \"<http://www.opengis.net/def/crs/EPSG/0/31370> {box_wkt}\"^^geo:wktLiteral)) }}"
+            ))
+            .is_empty(),
+        );
+    }
+
+    /// A `geoJSONLiteral` constant declines even though the shape is
+    /// otherwise identical to a lifting `wktLiteral` call. `spargeo` reads a
+    /// geometry from `geoJSONLiteral` too (`parse.rs::extract_argument`), so
+    /// this is not the "unbound" gate above -- it is deliberately out of
+    /// scope, so the fetch must not narrow on the strength of a datatype
+    /// this task never validates against `ST_GeomFromGeoJSON`.
+    #[test]
+    fn sf_intersects_on_a_geojson_literal_does_not_lift() {
+        const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                            PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}{GEOF}SELECT ?s WHERE {{ ?s a asset360:PostalCode ; \
+                 asset360:hasGeometry ?g . ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \
+                 \"{{\\\"type\\\":\\\"Point\\\",\\\"coordinates\\\":[1,2]}}\"^^geo:geoJSONLiteral)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope)
+                .iter()
+                .flat_map(|star| star.path_filters.iter())
+                .all(|filter| filter.conditions.is_empty()),
+        );
+    }
+
+    /// `geof:sfIntersects` on a slot the registry does not claim a column
+    /// for does not lift, even though the function, the constant and its
+    /// datatype are all exactly the ones that lift on `PostalCode`.
+    ///
+    /// Isolates the registry gate from the literal-validity gates the other
+    /// tests here isolate: `TunnelComplex.hasName` is an ordinary string
+    /// slot, and `sparql_columns::broken_out_column` claims no column for
+    /// it.
+    #[test]
+    fn sf_intersects_on_a_slot_the_registry_does_not_claim_does_not_lift() {
+        const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                            PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}{GEOF}SELECT ?s WHERE {{ ?s a asset360:TunnelComplex ; \
+                 asset360:hasName ?w . \
+                 FILTER(geof:sfIntersects(?w, \"POINT(1 2)\"^^geo:wktLiteral)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope)
+                .iter()
+                .all(|star| star.filters.is_empty() && star.path_filters.is_empty()),
+        );
+    }
+
+    /// A different custom function, over the same slot and the same
+    /// `wktLiteral` constant, does not lift: `geof:sfIntersects` is the only
+    /// spelling this task recognises.
+    #[test]
+    fn a_different_function_name_does_not_lift() {
+        const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                            PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}{GEOF}SELECT ?s WHERE {{ ?s a asset360:PostalCode ; \
+                 asset360:hasGeometry ?g . ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfWithin(?w, \"POINT(1 2)\"^^geo:wktLiteral)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope)
+                .iter()
+                .flat_map(|star| star.path_filters.iter())
+                .all(|filter| filter.conditions.is_empty()),
+        );
     }
 
     /// LIMIT must NOT be pushed into the object fetch when an operator has to
