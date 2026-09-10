@@ -3528,6 +3528,17 @@ enums:
         meaning: eul:GSA
       KSS: {}
       REP_H_D: {}
+  # A second, additive enum — not a change to `SignalKind` — purely so a
+  # `!=` FILTER can be given a constant that selects more than one code.
+  # `AMB1` and `AMB2` deliberately share a `meaning`: `<eul:Amb>` translates
+  # backwards to both, which is exactly the case the `Ne` arm must decline
+  # rather than approximate as a single `<>`.
+  AmbiguousKind:
+    permissible_values:
+      AMB1:
+        meaning: eul:Amb
+      AMB2:
+        meaning: eul:Amb
 
 classes:
   Document:
@@ -3569,6 +3580,12 @@ classes:
         multivalued: true
       kind:
         range: SignalKind
+      # Additive-only slot, paired with `AmbiguousKind` above — exists only
+      # so a test can put a shared-meaning constant on the right-hand side
+      # of `!=` without touching `kind`/`SignalKind`, which ~30 other tests
+      # in this module depend on.
+      ambiguousKind:
+        range: AmbiguousKind
       documents:
         range: Document
         multivalued: true
@@ -3971,6 +3988,30 @@ classes:
             .cloned()
             .collect();
         assert_eq!(conditions, vec![FilterCondition::Ne("BX517".to_owned())]);
+    }
+
+    /// `!=` against a constant that selects more than one code does not lift.
+    ///
+    /// `AmbiguousKind`'s `AMB1` and `AMB2` share one `meaning`, so
+    /// `<eul:Amb>` translates backwards to both codes: "not any of these" is
+    /// not one condition — it would need `NOT IN`, which no `FilterCondition`
+    /// arm renders. The failure mode if this ever regresses is silent wrong
+    /// narrowing: approximating it as a single `<>` against one of the two
+    /// codes would exclude rows the query keeps.
+    #[test]
+    fn inequality_against_a_multi_code_enum_constant_does_not_lift() {
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:ambiguousKind ?k . \
+                 FILTER(?k != <http://ontorail.org/src/Eulynx/Amb>) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope).iter().all(|star| star.filters.is_empty()),
+            "a constant selecting several codes must not become a single pushed Ne"
+        );
     }
 
     /// Once `!=` lifts, a `FILTER(?nm != "x")` no longer forces the fetch to
