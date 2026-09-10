@@ -290,6 +290,24 @@ pub enum Expr {
         /// [`SlotReading`]; without it the address is ambiguous on any
         /// multivalued slot.
         reading: SlotReading,
+        /// Whether the scan that reads this slot requires the value or only
+        /// allows it. See [`SlotPresence`].
+        ///
+        /// Carried the same way `reading` already is, rather than re-derived
+        /// from the plan when a rule needs it: the fact lives on the
+        /// [`ScanSlot`] a scan reads, and `sparql_rules::Visible::collect`
+        /// already visits every such slot while building a
+        /// `sparql_rules::SlotBinding` -- it used to read `slot.presence` and
+        /// then drop it. A `!bound` filter is sound to push only on an
+        /// `Optional` slot (a `Required` one's scan already enforces
+        /// existence, so `!bound` on it is unsatisfiable and the plan has no
+        /// way to state that), and that question is asked once a variable has
+        /// already become a slot -- inside [`Expr::to_sql`], which does not
+        /// see the scan, only the expression. Riding along on `Expr::Slot` is
+        /// what makes the fact available there without widening `to_sql`'s
+        /// own signature, the way `numeric` and `right_multivalued` already
+        /// ride on other join and scan facts elsewhere in this crate.
+        presence: SlotPresence,
     },
     Compare {
         op: CompareOp,
@@ -446,6 +464,7 @@ impl Expr {
                     star_var,
                     slot_path,
                     reading,
+                    ..
                 } = slot
                 else {
                     return None;
@@ -462,6 +481,7 @@ impl Expr {
                     star_var,
                     slot_path,
                     reading,
+                    ..
                 } = value.as_ref()
                 else {
                     return None;
@@ -500,6 +520,7 @@ impl Expr {
                         star_var,
                         slot_path,
                         reading,
+                        ..
                     } = slot
                     else {
                         return None;
@@ -511,10 +532,78 @@ impl Expr {
                         reading: *reading,
                     }])
                 }
-                // Every other negation -- `!BOUND`, `!CONTAINS`, `!(A && B)`
-                // -- declines. See the doc comment above the `Function` arm
-                // for why `!BOUND` in particular stays declined rather than
-                // gaining a presence-aware arm here.
+                // `!bound(?v)`, once `?v` has resolved to a slot. Sound only
+                // under the same two preconditions the scoper's identical
+                // lift applies (see `extract_equality_from_expr`'s
+                // `Expression::Bound` arm):
+                //
+                // * **one hop.** A nested path's absence is "the key at this
+                //   step is missing", a different predicate from "the leaf
+                //   value is absent" -- no `FilterCondition` arm renders that,
+                //   and the renderer only ever walks a multi-hop path with
+                //   `->>`.
+                // * **optional.** A `Required` slot's scan already enforces
+                //   existence (`object_data ? 'field'`), so `!bound` on it is
+                //   unsatisfiable and the plan has no way to state "selects
+                //   nothing" as a condition.
+                //
+                // The scoper reads these off a query-syntax fact
+                // (`optional_fields`, built from each triple's `OPTIONAL`
+                // nesting depth). This route reads the same distinction off
+                // `Expr::Slot::presence`, which travels with the slot itself
+                // rather than needing a separate map -- see that field's doc
+                // comment for why carrying it there, rather than widening
+                // `to_sql`'s signature, was the right fix once the earlier
+                // draft of this comment (which declined `!bound` altogether,
+                // reasoning that the fact was not reachable here) turned out
+                // to have the wrong premise: `Visible::collect` had the fact
+                // in scope the whole time and was dropping it on the floor
+                // building `SlotBinding`.
+                //
+                // A **third** scoper precondition -- "resolvable", i.e. the
+                // variable names a slot at all -- has no separate check here:
+                // it is what the `let [Self::Slot { .. }] = args.as_slice()`
+                // pattern below already asks, since an unresolved variable is
+                // still `Expr::Var` at this point and simply fails to match.
+                //
+                // A **fourth** thing the scoper computes explicitly --
+                // "depth 0", i.e. whether the read sits inside an `OPTIONAL`
+                // at all -- has no separate check here either, and not by
+                // oversight: `SlotPresence` is not a per-triple depth count
+                // to be compared against zero, it is the *destination* fact
+                // depth-counting exists to produce -- the plan's own,
+                // already-resolved answer to "does this scan's read of this
+                // slot require the value or only allow it", set once by
+                // whichever rule folded the `OPTIONAL` (or its absence) into
+                // the scan. By the time a `ScanSlot` exists at all, its
+                // `presence` already accounts for every `OPTIONAL` the query
+                // wrote around it; there is no further depth for this
+                // function to re-derive.
+                Self::Function { name, args } if name == "BOUND" => {
+                    let [
+                        Self::Slot {
+                            star_var,
+                            slot_path,
+                            reading,
+                            presence,
+                        },
+                    ] = args.as_slice()
+                    else {
+                        return None;
+                    };
+                    if slot_path.len() != 1 || *presence != SlotPresence::Optional {
+                        return None;
+                    }
+                    Some(vec![SqlCondition {
+                        star_var: star_var.clone(),
+                        slot_path: slot_path.clone(),
+                        condition: FilterCondition::NotBound,
+                        reading: *reading,
+                    }])
+                }
+                // Every other negation -- `!CONTAINS`, `!(A && B)`, `!BOUND`
+                // of anything but a resolved single-hop optional slot --
+                // declines.
                 _ => None,
             },
             // The three substring predicates, `STRSTARTS`/`STRENDS`/`CONTAINS`,
@@ -524,27 +613,6 @@ impl Expr {
             // different question (it folds the constant, not the column) and
             // is not unwrapped -- `peel_lcase` only ever looks at the
             // haystack position.
-            //
-            // `Expr::Not(Function { name: "BOUND", .. })` -- SPARQL's
-            // `!bound(?v)` -- is deliberately *not* an arm here. The scoper's
-            // fetch-narrowing lift of the same predicate (Task 3) needed to
-            // know whether the slot is optional, because a required slot's
-            // scan already enforces existence and `!bound` on it has no
-            // representable answer. That fact -- [`SlotPresence`] on the
-            // [`ScanSlot`] a scan reads -- is available on a [`PlanOp::Scan`],
-            // but `Expr::Slot` does not carry it and neither does this
-            // function's signature: `sql_shape_unchecked` and
-            // [`Expr::to_sql`] take only `schema` and `class_of_star`, both
-            // schema-shaped facts, and presence is not one -- it depends on
-            // which `OPTIONAL` block the query put the read in, which the
-            // schema cannot say. Threading it through would mean widening
-            // `Visible`, `SlotBinding` and `to_sql`'s own signature, which is
-            // restructuring the refinement pipeline rather than teaching this
-            // function a shape, so `!bound` stays declined on this route. The
-            // asymmetry is deliberate: Task 3's fetch-narrowing lift is what
-            // a `!bound` filter gets today, and the engine still answers it
-            // correctly over that narrowed fetch -- it merely does not reach
-            // a statement.
             Self::Function { name, args } => {
                 let anchor = like_anchor(name)?;
                 let [haystack, needle] = args.as_slice() else {
@@ -555,6 +623,7 @@ impl Expr {
                     star_var,
                     slot_path,
                     reading,
+                    ..
                 } = haystack
                 else {
                     return None;
@@ -691,7 +760,12 @@ impl Expr {
             // `sql_shape_unchecked`'s `Not` arm -- and the term check the
             // inner `Compare` runs does not read `op`, so recursing here asks
             // the right question for `!=` too: the enum-code gate on `= "x"`
-            // and on `!= "x"` is the same gate.
+            // and on `!= "x"` is the same gate. `!bound` is also `Not(...)`
+            // (a negated `Function { name: "BOUND", .. }`), and it compares
+            // against no constant at all, so recursing into the `Function`
+            // arm above correctly reports `true` for it (`like_anchor`
+            // returns `None` for `"BOUND"`) -- there is nothing here for a
+            // term check to gate.
             Self::Not(inner) => inner.constants_are_the_columns_terms(schema, class_of_star),
             Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::Opaque(_) => true,
         }
@@ -805,6 +879,7 @@ impl fmt::Display for Expr {
                 star_var,
                 slot_path,
                 reading,
+                ..
             } => write!(f, "?{star_var}.{}{reading}", slot_path.join(".")),
             Self::Compare { op, left, right } => {
                 write!(f, "({left} {} {right})", op.as_str())
@@ -3390,6 +3465,7 @@ mod tests {
             star_var: "s".to_owned(),
             slot_path: vec!["hasName".to_owned()],
             reading: SlotReading::Column,
+            presence: SlotPresence::Required,
         };
         let value = Expr::Literal(Literal::new_simple_literal("A").into());
 
@@ -3476,6 +3552,7 @@ mod tests {
                 star_var: "s".to_owned(),
                 slot_path: vec!["hasName".to_owned()],
                 reading: SlotReading::Column,
+                presence: SlotPresence::Required,
             }),
             candidates: vec![
                 Expr::Literal(Literal::new_simple_literal("A").into()),
@@ -3518,6 +3595,7 @@ mod tests {
                 star_var: "s".to_owned(),
                 slot_path: vec![slot.to_owned()],
                 reading: SlotReading::Column,
+                presence: SlotPresence::Required,
             }),
             right: Box::new(Expr::Literal(term)),
         };
@@ -3753,6 +3831,146 @@ mod tests {
             ),
             vec![FilterCondition::Ne("BX517".to_owned())],
         );
+        // `!bound` on a genuinely optional one-hop slot is the one case this
+        // route actually reaches from a real parsed query: the fold-tests
+        // below (`not_bound_declines_on_a_required_slot`,
+        // `not_bound_declines_on_a_multi_hop_path`) had to be built by hand
+        // because a *declining* filter never gets its `Var` substituted to a
+        // `Slot` (see `to_sql_declines_a_substring_against_an_enum_column`'s
+        // doc comment for why), but this one pushes, so pulling it from a
+        // real refined plan demonstrates the whole path end to end.
+        assert_eq!(
+            conditions(
+                "SELECT ?s WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:name ?nm } FILTER(!BOUND(?nm)) }"
+            ),
+            vec![FilterCondition::NotBound],
+        );
+    }
+
+    /// `!bound` on a *required* slot does not lift, on the refined route the
+    /// same way it does not on the scoper's (see
+    /// `sparql_scoper::tests::unbound_on_a_required_slot_does_not_lift`).
+    ///
+    /// The scan already carries an existence check for it, so the query
+    /// selects nothing -- and "nothing" is not a condition `to_sql` can
+    /// state. Built by hand rather than pulled from a refined plan, for the
+    /// same reason `to_sql_declines_a_substring_against_an_enum_column` is:
+    /// a query written as `?s asset360:name ?nm . FILTER(!BOUND(?nm))` never
+    /// gets `?nm` substituted to a `Slot` at all (`PushComparisonFilter`
+    /// only commits the rewrite together with a successful push), so pulling
+    /// the filter out of that plan would decline for the unrelated "variable
+    /// is not a column" reason and not isolate this gate.
+    #[test]
+    fn not_bound_declines_on_a_required_slot() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let signal = HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )]);
+        let expr = Expr::Not(Box::new(Expr::Function {
+            name: "BOUND".to_owned(),
+            args: vec![Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                reading: SlotReading::Column,
+                presence: SlotPresence::Required,
+            }],
+        }));
+        assert_eq!(expr.to_sql(&schema, &signal), None, "{expr}");
+
+        // Load-bearing: with only the presence check in place (one hop,
+        // required), the shape is otherwise exactly the one that lifts --
+        // see `not_bound_lifts_on_an_optional_one_hop_slot` below for the
+        // `Optional` counterpart of this same expression.
+        assert!(
+            expr.sql_shape_unchecked().is_none(),
+            "the presence gate itself must refuse this, not just the shape: {expr}"
+        );
+    }
+
+    /// `!bound` on a *multi-hop* path does not lift, regardless of whether
+    /// the slot is optional -- mirroring
+    /// `sparql_scoper::tests::unbound_on_a_two_hop_path_does_not_lift`, whose
+    /// own comment records that its query-derived example cannot isolate the
+    /// one-hop gate from the optional gate (a mandatory root cannot carry an
+    /// optional two-hop leaf in that schema, so both gates would decline it
+    /// there regardless).
+    ///
+    /// Built by hand rather than pulled from a plan, for two independent
+    /// reasons: the general one (a declining filter never gets substituted,
+    /// as above), and a second, refined-route-specific one found while
+    /// writing this test -- a `FILTER(!BOUND(?lon))` over a nested
+    /// `OPTIONAL { ?s asset360:location ?loc . ?loc asset360:longitude ?lon }`
+    /// does not even fold into a `PlanOp::Scan` on this route today (checked
+    /// empirically: the plan keeps `?s asset360:location ?loc` and `?loc
+    /// asset360:longitude ?lon` as two separate `Engine` matches under a
+    /// `leftjoin`, never a scan slot), so `?lon` stays unresolved and there
+    /// is no query this route can parse today that reaches a two-hop
+    /// `Expr::Slot` with `presence: Optional` at all. Building the shape by
+    /// hand is not fabricating unreachable state to fake precision: the gate
+    /// itself is exercised on the same `Expr::Slot` shape a future rule could
+    /// legitimately produce (nothing in `Expr::Slot`'s own definition forbids
+    /// a multi-hop, optional address), only today's rule set does not reach
+    /// it from a query yet.
+    #[test]
+    fn not_bound_declines_on_a_multi_hop_path() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let signal = HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )]);
+        let expr = Expr::Not(Box::new(Expr::Function {
+            name: "BOUND".to_owned(),
+            args: vec![Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec!["location".to_owned(), "longitude".to_owned()],
+                reading: SlotReading::Column,
+                // Optional on purpose: with the one-hop gate the only one
+                // that can refuse this, a failure to refuse would prove the
+                // gate un-isolated from the presence check rather than
+                // merely untested.
+                presence: SlotPresence::Optional,
+            }],
+        }));
+        assert_eq!(expr.to_sql(&schema, &signal), None, "{expr}");
+        assert!(
+            expr.sql_shape_unchecked().is_none(),
+            "the one-hop gate itself must refuse this, not just the shape: {expr}"
+        );
+    }
+
+    /// The `Optional` counterpart of `not_bound_declines_on_a_required_slot`:
+    /// the identical one-hop shape, differing only in `presence`, lifts.
+    /// Read the two together -- each changes exactly one gate from the
+    /// other, so between them they show the presence check is neither always
+    /// satisfied nor always refused by this shape.
+    #[test]
+    fn not_bound_lifts_on_an_optional_one_hop_slot() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let signal = HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )]);
+        let expr = Expr::Not(Box::new(Expr::Function {
+            name: "BOUND".to_owned(),
+            args: vec![Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                reading: SlotReading::Column,
+                presence: SlotPresence::Optional,
+            }],
+        }));
+        assert_eq!(
+            expr.to_sql(&schema, &signal),
+            Some(vec![SqlCondition {
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                condition: FilterCondition::NotBound,
+                reading: SlotReading::Column,
+            }]),
+            "{expr}"
+        );
     }
 
     /// The enum-column term gate, walked through
@@ -3782,6 +4000,7 @@ mod tests {
                     star_var: "s".to_owned(),
                     slot_path: vec!["kind".to_owned()],
                     reading: SlotReading::Column,
+                    presence: SlotPresence::Required,
                 },
                 Expr::Literal(Literal::new_simple_literal("GS").into()),
             ],

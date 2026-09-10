@@ -604,6 +604,13 @@ struct SlotBinding {
     /// [`PlanOp::Unnest`] is below the node being asked -- the variable then
     /// stands for one element, which is what SPARQL bound it to.
     reading: SlotReading,
+    /// The [`ScanSlot`] this variable was read from requires the value or
+    /// only allows it. Copied straight off that `ScanSlot` -- `collect`
+    /// already visits it to learn `reading` -- rather than looked up again
+    /// later: a rule asking "is this slot optional" would otherwise have to
+    /// walk back down to the scan a second time, and a fact fetched twice is
+    /// a fact that can disagree with itself.
+    presence: SlotPresence,
 }
 
 /// The variables the `Sql` scans feeding a node have bound, and what to.
@@ -706,6 +713,7 @@ impl Visible {
                     star_var: star_var.clone(),
                     path: slot.path.clone(),
                     reading,
+                    presence: slot.presence,
                 };
                 match slots.entry(bound) {
                     Entry::Vacant(entry) => {
@@ -1095,6 +1103,7 @@ fn sinkable(visible: &Visible, condition: &Expr) -> Option<Expr> {
             star_var: binding.star_var.clone(),
             slot_path: binding.path.clone(),
             reading: binding.reading,
+            presence: binding.presence,
         },
     ))
 }
@@ -1562,6 +1571,12 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
                 star_var: site.star_var.clone(),
                 slot_path,
                 reading,
+                // This rule always adds the existence half itself, a few
+                // lines below in `apply`, as `SlotPresence::Required` -- `?s
+                // :name "BX517"` asserts the slot is there as well as what it
+                // holds, not merely that it might be. The condition built
+                // here has to say the same thing about the same read.
+                presence: SlotPresence::Required,
             }),
             right: Box::new(Expr::Literal(term.clone())),
         };
@@ -2231,6 +2246,7 @@ impl Rule for ValuesBecomesFilter<'_> {
                     star_var: binding.star_var.clone(),
                     slot_path: binding.path.clone(),
                     reading: binding.reading,
+                    presence: binding.presence,
                 }),
                 candidates: terms.into_iter().map(Expr::Literal).collect(),
             };
@@ -2494,6 +2510,7 @@ fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
                 star_var: binding.star_var.clone(),
                 slot_path: binding.path.clone(),
                 reading: binding.reading,
+                presence: binding.presence,
             }
         }
         Expr::Literal(term) => Expr::Literal(term.clone()),
