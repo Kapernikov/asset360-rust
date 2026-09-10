@@ -944,7 +944,12 @@ pub fn lower_refined(
                                 // finite value list to hoist onto
                                 // `identifier_values`, so it stays a filter
                                 // against the indexed column too.
-                                | FilterCondition::Like { .. } => {
+                                | FilterCondition::Like { .. }
+                                // `!=` is the same shape again: "not this one
+                                // value" is not a value list either, and the
+                                // renderer's null test has to run against the
+                                // indexed column itself.
+                                | FilterCondition::Ne(_) => {
                                     push_filter(
                                         &mut nodes,
                                         input,

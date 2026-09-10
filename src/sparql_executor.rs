@@ -845,6 +845,9 @@ classes:
                     LikeAnchor::Anywhere => haystack.contains(&needle),
                 }
             }),
+            // `IS NOT NULL AND <>`: absent from `stored` fails the null test,
+            // same as it would in SQL.
+            FilterCondition::Ne(value) => stored.first().is_some_and(|s| *s != value.as_str()),
         })
     }
 

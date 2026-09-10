@@ -832,6 +832,14 @@ pub enum FilterCondition {
         /// `lcase_on_the_constant_does_not_become_case_insensitive`.
         case_insensitive: bool,
     },
+    /// `FILTER(?v != "x")` — `expr IS NOT NULL AND expr <> 'x'`.
+    ///
+    /// Not a fifth [`CmpOp`], and the null test in that rendering is why.
+    /// SPARQL's inequality is false for an unbound variable where SQL's `<>`
+    /// on NULL is unknown, so a bare `<>` drops exactly the rows an
+    /// `OPTIONAL` exists to keep. A separate arm makes the renderer state
+    /// the asymmetry instead of inheriting a rendering that ignores it.
+    Ne(String),
 }
 
 impl std::fmt::Display for FilterCondition {
@@ -863,6 +871,7 @@ impl std::fmt::Display for FilterCondition {
                 };
                 write!(f, "{op} '{pattern}'")
             }
+            Self::Ne(value) => write!(f, "IS NOT NULL AND <> '{value}'"),
         }
     }
 }
@@ -891,9 +900,12 @@ impl LikeAnchor {
 
 /// Ordering operators liftable from a `FILTER` into SQL.
 ///
-/// Deliberately not `!=`: SPARQL's inequality is false for an *unbound*
-/// variable, where SQL's `<>` on NULL is unknown and would drop rows the
-/// query keeps. Equality is already covered by [`FilterCondition::Eq`].
+/// `!=` is not a fifth variant here, even though it lifts: it needs
+/// `expr IS NOT NULL AND expr <> 'x'`, and no ordering comparison needs that
+/// null test — SPARQL's inequality is false for an *unbound* variable, where
+/// SQL's bare `<>` on NULL is unknown and would drop rows the query keeps. See
+/// [`FilterCondition::Ne`] for that separate arm; equality is
+/// [`FilterCondition::Eq`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
     Gt,
@@ -1475,6 +1487,10 @@ pub fn scope_parsed_with_schema_graph(
                         // — same reasoning as `Cmp` — so it stays a filter
                         // and the renderer targets `asset360_uri` with LIKE.
                         like @ FilterCondition::Like { .. } => kept.push(like),
+                        // Nor is `!=`: "not this one value" has no list to
+                        // hoist, so it stays a filter and the renderer's null
+                        // test runs against `asset360_uri` itself.
+                        ne @ FilterCondition::Ne(_) => kept.push(ne),
                     }
                 }
                 if !kept.is_empty() {
@@ -1788,6 +1804,12 @@ pub fn scope_parsed_with_schema_graph(
                             // stays a filter against `asset360_uri`.
                             like @ FilterCondition::Like { .. } => {
                                 star.filters.entry(slot.clone()).or_default().push(like);
+                            }
+                            // Same reasoning again: `!=` has no value list
+                            // either, so it stays a filter and the renderer's
+                            // null test runs against `asset360_uri`.
+                            ne @ FilterCondition::Ne(_) => {
+                                star.filters.entry(slot.clone()).or_default().push(ne);
                             }
                         }
                     }
@@ -2497,6 +2519,35 @@ fn extract_equality_from_expr(
                 false
             }
         }
+        Expression::Not(inner) => match inner.as_ref() {
+            // `FILTER(?v != "x")` — spargebra 0.4 spells it `Not(Equal(..))`,
+            // not a dedicated `NotEqual` variant (confirmed by reading
+            // `spargebra::algebra::Expression`, which has no such variant).
+            Expression::Equal(left, right) => {
+                let Some((star_var, field, texts)) = match_var_constant(left, right, var_to_field)
+                    .or_else(|| match_var_constant(right, left, var_to_field))
+                else {
+                    return false;
+                };
+                // An enum constant can select several codes, and "not any of
+                // these" is not one condition — it would need `NOT IN`, which
+                // no `FilterCondition` arm renders. Left to the engine rather
+                // than approximated as a single `<>`.
+                let Ok([only]) = <[String; 1]>::try_from(texts) else {
+                    return false;
+                };
+                star_filters
+                    .entry(star_var)
+                    .or_default()
+                    .entry(field)
+                    .or_default()
+                    .push(FilterCondition::Ne(only));
+                true
+            }
+            // Every other negation — `!bound`, `!CONTAINS`, `!(A && B)` — is
+            // left to oxigraph. `!bound` gets its own arm in a later task.
+            _ => false,
+        },
         Expression::Greater(left, right)
         | Expression::GreaterOrEqual(left, right)
         | Expression::Less(left, right)
@@ -2648,8 +2699,9 @@ fn extract_equality_from_expr(
                 });
             true
         }
-        // Everything else — `!=`, `||`, `!`, REGEX, BOUND, arithmetic — is left
-        // to oxigraph, and the plan is no longer a complete description.
+        // Everything else — `||`, other negations, REGEX, BOUND, arithmetic —
+        // is left to oxigraph, and the plan is no longer a complete
+        // description. `!=` is handled above, in `Expression::Not`.
         _ => false,
     }
 }
@@ -3896,6 +3948,54 @@ classes:
         );
     }
 
+    /// `!=` lifts as its own arm, not as a fifth ordering comparison.
+    ///
+    /// The two differ in exactly the rows an OPTIONAL keeps: SPARQL's inequality
+    /// is false for an unbound variable, SQL's `<>` on NULL is unknown. `Ne` is
+    /// separate so the renderer is *made* to state the null test rather than
+    /// inheriting `Cmp`'s rendering, which would drop those rows silently.
+    #[test]
+    fn inequality_lifts_as_its_own_arm() {
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm != \"BX517\") }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        let conditions: Vec<_> = all_stars(&scope)
+            .iter()
+            .flat_map(|star| star.filters.values())
+            .flatten()
+            .cloned()
+            .collect();
+        assert_eq!(conditions, vec![FilterCondition::Ne("BX517".to_owned())]);
+    }
+
+    /// Once `!=` lifts, a `FILTER(?nm != "x")` no longer forces the fetch to
+    /// be inexact, so a `LIMIT` alongside it is safe to push too.
+    ///
+    /// This used to be one of `test_limit_not_pushed_past_holistic_modifiers`'s
+    /// "dropped" cases (`sql_limit` had to be `None`): before this task,
+    /// `!=` fell to the catch-all, the fetch returned an arbitrary row set,
+    /// and pushing the `LIMIT` into it could silently answer fewer rows than
+    /// the query asked for. Pinning the opposite here is the direct evidence
+    /// that the arm actually lifts, not just that it produces a
+    /// `FilterCondition::Ne` in isolation.
+    #[test]
+    fn inequality_filter_does_not_block_limit_pushdown() {
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm != \"BX517\") }} LIMIT 10"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert_eq!(plan.sql_limit, Some(10));
+    }
+
     /// LIMIT must NOT be pushed into the object fetch when an operator has to
     /// see every solution first: the fetch would feed the aggregate / sort /
     /// dedup an arbitrary subset and return a plausible wrong answer with no
@@ -3932,11 +4032,6 @@ classes:
                 "dropped REGEX filter",
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(REGEX(?nm, \"^BX\")) } LIMIT 10",
-            ),
-            (
-                "dropped != filter",
-                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-                 FILTER(?nm != \"BX517\") } LIMIT 10",
             ),
             (
                 "unknown predicate",

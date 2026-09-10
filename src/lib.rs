@@ -1385,6 +1385,14 @@ impl FilterCondition {
                 },
                 values: vec![value.clone()],
             },
+            // Not one of the ordering operators `op.as_str()` names — the
+            // renderer's null test has no ordering equivalent — so this
+            // boundary gives it its own operator string. Task 8 owns
+            // confirming this vocabulary against the Python consumer.
+            crate::sparql_scoper::FilterCondition::Ne(value) => Self {
+                operator: "ne".to_owned(),
+                values: vec![value.clone()],
+            },
         }
     }
 }
