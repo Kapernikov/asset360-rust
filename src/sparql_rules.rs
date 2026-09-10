@@ -2328,7 +2328,26 @@ impl<'s> PushComparisonFilter<'s> {
         // `to_sql` accepts, not a constant of this rule. It is also where the
         // constant-is-the-column's-term half is asked, which is why it takes
         // the schema and the classes the scans below were scanned as.
-        resolved.to_sql(self.schema, &visible.class_of_star)?;
+        // Two entry points, and a condition either one accepts is pushable.
+        // `to_sql` is the conjunctive fast path; `to_sql_tree` is the
+        // within-star disjunction, which `to_sql` declines by construction
+        // and which had no representation at all until
+        // `crate::sparql_refine::ConditionTree` -- so `FILTER(A || B)` was
+        // accepted, scoped, and never lifted, which the triple limit turns
+        // into a failed query rather than a slow one. Asked here rather than
+        // in a rule of its own: which slot binds `?nm` and whether the
+        // landing site runs in SQL are the same questions with the same
+        // answers, and a second rule asking them is a second rule to keep in
+        // agreement with this one.
+        if resolved
+            .to_sql(self.schema, &visible.class_of_star)
+            .is_none()
+            && resolved
+                .to_sql_tree(self.schema, &visible.class_of_star)
+                .is_none()
+        {
+            return None;
+        }
         Some(resolved)
     }
 }

@@ -3694,8 +3694,8 @@ class PlanNode:
 
 class PlanOp:
     r"""
-    One operator of a database pass: a scan, a filter, a join, an unnest, a
-    grouping, a sort, a distinct, a slice, or a projection.
+    One operator of a database pass: a scan, a filter, a filter tree, a join,
+    an unnest, a grouping, a sort, a distinct, a slice, or a projection.
     
     Read ``kind`` first and refuse a value you do not know: skipping an operator
     you cannot render answers a different question, which is the failure the
@@ -3706,8 +3706,17 @@ class PlanOp:
     @property
     def kind(self) -> builtins.str:
         r"""
-        ``"scan"``, ``"unnest"``, ``"filter"``, ``"join"``, ``"group"``,
-        ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+        ``"scan"``, ``"unnest"``, ``"filter"``, ``"filter_tree"``, ``"join"``,
+        ``"group"``, ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+        
+        ``"filter_tree"`` is a within-star condition whose shape is a tree
+        rather than a conjunction -- what ``FILTER(A || B)`` lowers to. Its
+        tree is **not readable through this class yet**, so a renderer must
+        refuse the kind rather than render what it can see of it: the star and
+        the enforcement without the condition would narrow to every record of
+        the star. Refusing is the designed outcome for an unknown kind, which
+        is why the operator is a kind of its own rather than a wider
+        ``"filter"``.
         """
     @property
     def inputs(self) -> builtins.list[builtins.int]:
@@ -3725,7 +3734,7 @@ class PlanOp:
     def star_var(self) -> typing.Optional[builtins.str]:
         r"""
         The star this operator works on, for the kinds that name one: scan,
-        unnest, filter.
+        unnest, filter, filter tree.
         """
     @property
     def class_uri(self) -> typing.Optional[builtins.str]:
@@ -3791,7 +3800,7 @@ class PlanOp:
     @property
     def enforcement(self) -> typing.Optional[builtins.str]:
         r"""
-        For ``"filter"``: ``"enforces"`` when this operator decides the
+        For ``"filter"`` and ``"filter_tree"``: ``"enforces"`` when this operator decides the
         obligation, ``"narrows"`` when it only reduces rows and a later pass
         decides.
         
@@ -3818,7 +3827,7 @@ class PlanOp:
     @property
     def optional_side(self) -> builtins.bool:
         r"""
-        For ``"filter"``: whether the condition is on the *optional* side of a
+        For ``"filter"`` and ``"filter_tree"``: whether the condition is on the *optional* side of a
         left join, so it must not eliminate an unmatched row.
         
         The single most common way a left-join translation is wrong: in a plain

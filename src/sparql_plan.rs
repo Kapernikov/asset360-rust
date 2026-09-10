@@ -490,6 +490,21 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                     Enforcement::Narrows => "   narrows",
                 }
             )?,
+            // Printed with the same `filter` lead-in as a single condition,
+            // because it *is* one filter -- what differs is that its shape is
+            // a tree, and the tree's own `Display` shows the connectives. A
+            // printout that hid them would hide the one thing worth reading
+            // here: which branches a disjunction lifted.
+            Op::FilterTree {
+                tree, enforcement, ..
+            } => writeln!(
+                f,
+                "      filter    {tree}{}",
+                match enforcement {
+                    Enforcement::Enforces => "",
+                    Enforcement::Narrows => "   narrows",
+                }
+            )?,
             Op::Unnest { slot_path, .. } => writeln!(f, "      unnest    {}", slot_path.join("."))?,
             Op::Join {
                 left_star,

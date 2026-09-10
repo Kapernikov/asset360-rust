@@ -2207,8 +2207,8 @@ impl PushdownOrder {
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass]
 #[derive(Clone)]
-/// One operator of a database pass: a scan, a filter, a join, an unnest, a
-/// grouping, a sort, a distinct, a slice, or a projection.
+/// One operator of a database pass: a scan, a filter, a filter tree, a join,
+/// an unnest, a grouping, a sort, a distinct, a slice, or a projection.
 ///
 /// Read ``kind`` first and refuse a value you do not know: skipping an operator
 /// you cannot render answers a different question, which is the failure the
@@ -2223,8 +2223,17 @@ pub struct PlanOp {
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl PlanOp {
-    /// ``"scan"``, ``"unnest"``, ``"filter"``, ``"join"``, ``"group"``,
-    /// ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+    /// ``"scan"``, ``"unnest"``, ``"filter"``, ``"filter_tree"``, ``"join"``,
+    /// ``"group"``, ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+    ///
+    /// ``"filter_tree"`` is a within-star condition whose shape is a tree
+    /// rather than a conjunction -- what ``FILTER(A || B)`` lowers to. Its
+    /// tree is **not readable through this class yet**, so a renderer must
+    /// refuse the kind rather than render what it can see of it: the star and
+    /// the enforcement without the condition would narrow to every record of
+    /// the star. Refusing is the designed outcome for an unknown kind, which
+    /// is why the operator is a kind of its own rather than a wider
+    /// ``"filter"``.
     #[getter]
     fn kind(&self) -> &'static str {
         self.inner.op.kind()
@@ -2245,14 +2254,18 @@ impl PlanOp {
     }
 
     /// The star this operator works on, for the kinds that name one: scan,
-    /// unnest, filter.
+    /// unnest, filter, filter tree.
     #[getter]
     fn star_var(&self) -> Option<String> {
         use crate::sparql_ops::Op;
         match &self.inner.op {
             Op::Scan { star_var, .. }
             | Op::Unnest { star_var, .. }
-            | Op::Filter { star_var, .. } => Some(star_var.clone()),
+            | Op::Filter { star_var, .. }
+            // Every leaf of a tree names this same star -- that is the
+            // boundary of what a tree may lift -- so the answer is as
+            // definite here as for a single condition.
+            | Op::FilterTree { star_var, .. } => Some(star_var.clone()),
             _ => None,
         }
     }
@@ -2366,7 +2379,7 @@ impl PlanOp {
         }
     }
 
-    /// For ``"filter"``: ``"enforces"`` when this operator decides the
+    /// For ``"filter"`` and ``"filter_tree"``: ``"enforces"`` when this operator decides the
     /// obligation, ``"narrows"`` when it only reduces rows and a later pass
     /// decides.
     ///
@@ -2376,10 +2389,12 @@ impl PlanOp {
     fn enforcement(&self) -> Option<&'static str> {
         use crate::sparql_ops::{Enforcement, Op};
         match &self.inner.op {
-            Op::Filter { enforcement, .. } => Some(match enforcement {
-                Enforcement::Enforces => "enforces",
-                Enforcement::Narrows => "narrows",
-            }),
+            Op::Filter { enforcement, .. } | Op::FilterTree { enforcement, .. } => {
+                Some(match enforcement {
+                    Enforcement::Enforces => "enforces",
+                    Enforcement::Narrows => "narrows",
+                })
+            }
             _ => None,
         }
     }
@@ -2406,7 +2421,7 @@ impl PlanOp {
         }
     }
 
-    /// For ``"filter"``: whether the condition is on the *optional* side of a
+    /// For ``"filter"`` and ``"filter_tree"``: whether the condition is on the *optional* side of a
     /// left join, so it must not eliminate an unmatched row.
     ///
     /// The single most common way a left-join translation is wrong: in a plain
@@ -2422,7 +2437,9 @@ impl PlanOp {
     fn optional_side(&self) -> bool {
         use crate::sparql_ops::Op;
         match &self.inner.op {
-            Op::Filter { optional_side, .. } => *optional_side,
+            Op::Filter { optional_side, .. } | Op::FilterTree { optional_side, .. } => {
+                *optional_side
+            }
             _ => false,
         }
     }

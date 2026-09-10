@@ -38,6 +38,7 @@ use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_plan::ObligationId;
 use crate::sparql_pushdown::{BindingSpec, HavingTerm, MeasureSpec, OrderTerm};
+use crate::sparql_refine::{ConditionLeaf, ConditionTree};
 use crate::sparql_scoper::{FilterCondition, JoinType};
 
 /// Index into an [`OpTree`]'s node list. Nodes refer to their inputs by index,
@@ -202,6 +203,44 @@ pub enum Op {
         /// to prevent.
         numeric: bool,
     },
+    /// A condition on one star whose shape is a *tree*: the within-star
+    /// disjunction a [`Op::Filter`] list cannot express.
+    ///
+    /// A separate operator kind rather than a wider `Op::Filter`, for the
+    /// reason the whole plan is shaped around: a consumer that does not
+    /// recognise a kind **refuses**, and a dropped disjunction would otherwise
+    /// become a plausible handful of arbitrary rows. Filters are read as an
+    /// implicitly conjunctive list -- by the fetch narrowing and by star-data
+    /// as well as by the statement renderer -- so widening that list's type
+    /// would make every one of those consumers responsible for a shape it
+    /// cannot render, silently.
+    ///
+    /// **One star, and refused across stars.** The branches of a disjunction
+    /// spanning two stars only separate after the join, so neither star's
+    /// fetch can be narrowed by it: rendering one side answers a different
+    /// question and rendering both as a conjunction a narrower one. Such a
+    /// filter stays with the engine. See [`ConditionTree::star`], which is
+    /// both the gate and the source of this field, so the two cannot disagree.
+    ///
+    /// **Known remaining hole, recorded on purpose.** The advanced-filter UI
+    /// can build an OR tree across *linked* fields, and that still does not
+    /// lift. Closing it needs a shape that narrows two fetches jointly, which
+    /// is not this operator.
+    ///
+    /// `numeric` and `reading` ride on each [`ConditionLeaf`] rather than on
+    /// the operator: `?nm = "BX517" || ?len > 10` is one operator whose
+    /// branches disagree about both.
+    FilterTree {
+        input: OpId,
+        /// The star every leaf names.
+        star_var: String,
+        tree: ConditionTree,
+        enforcement: Enforcement,
+        /// Whether the tree sits on the *optional* side of a left join, with
+        /// the same meaning and the same wrong answer as
+        /// [`Op::Filter::optional_side`].
+        optional_side: bool,
+    },
     /// A reference between two stars: the right side holds the foreign key.
     Join {
         left: OpId,
@@ -271,6 +310,7 @@ impl Op {
             Self::Scan { .. } => Vec::new(),
             Self::Unnest { input, .. }
             | Self::Filter { input, .. }
+            | Self::FilterTree { input, .. }
             | Self::Group { input, .. }
             | Self::Sort { input, .. }
             | Self::Distinct { input }
@@ -287,6 +327,7 @@ impl Op {
             Self::Scan { .. } => "scan",
             Self::Unnest { .. } => "unnest",
             Self::Filter { .. } => "filter",
+            Self::FilterTree { .. } => "filter_tree",
             Self::Join { .. } => "join",
             Self::Group { .. } => "group",
             Self::Sort { .. } => "sort",
@@ -900,8 +941,64 @@ pub fn lower_refined(
                 });
             }
             RefinedOp::Filter { condition, .. } => {
-                let Some(conditions) = condition.to_sql(schema, &classes) else {
-                    return Err(LoweringRefusal::Unrenderable { node: id });
+                let conditions = match condition.to_sql(schema, &classes) {
+                    Some(conditions) => conditions,
+                    // A shape the conjunctive list cannot hold, which is
+                    // today exactly the within-star disjunction: one operator
+                    // carrying the whole tree, or nothing at all. Asked only
+                    // *after* `to_sql` declined, so a pure conjunction keeps
+                    // its chain of `filter` operators and no shape in the
+                    // corpus changes route -- `to_sql_tree` declines an
+                    // expression with no `Or` in it for the same reason, and
+                    // the two halves of that guarantee are deliberately
+                    // redundant.
+                    None => {
+                        let Some(tree) = condition.to_sql_tree(schema, &classes) else {
+                            return Err(LoweringRefusal::Unrenderable { node: id });
+                        };
+                        let input = remap[&node.op.inputs()[0]];
+                        // The one fact the lowering rather than the expression
+                        // decides, applied per leaf through the same function
+                        // `push_filter` applies to a single condition.
+                        let tree = tree.map_leaves(&|leaf| ConditionLeaf {
+                            condition: crate::sparql_refine::SqlCondition {
+                                reading: reading_for_enforcement(
+                                    enforcement,
+                                    leaf.condition.reading,
+                                ),
+                                ..leaf.condition.clone()
+                            },
+                            ..*leaf
+                        });
+                        // Guaranteed by `to_sql_tree`, which declines a tree
+                        // whose leaves name several stars; read back rather than
+                        // re-derived so the operator and its tree cannot come to
+                        // disagree about which star this narrows.
+                        let Some(star_var) = tree.star().map(str::to_owned) else {
+                            return Err(LoweringRefusal::Unrenderable { node: id });
+                        };
+                        // A leaf on the identifier slot is **not** hoisted onto
+                        // the scan the way a single `Eq` is. `identifier_values`
+                        // is a list of values the row must be one of, which is a
+                        // conjunct of the statement: hoisting one branch of a
+                        // disjunction there would apply it to every row and
+                        // answer a narrower question than the query asked. It
+                        // stays a leaf, rendered against the indexed column by
+                        // its path -- the same thing already happens to a `Cmp`
+                        // or a `Like` on an identifier.
+                        nodes.push(OpNode {
+                            op: Op::FilterTree {
+                                input,
+                                star_var,
+                                tree,
+                                enforcement,
+                                optional_side: optional_nodes.contains(&id),
+                            },
+                            discharges: node.discharges.clone(),
+                        });
+                        remap.insert(id, nodes.len() - 1);
+                        continue;
+                    }
                 };
                 let mut input = remap[&node.op.inputs()[0]];
                 // One node per condition, with the claim on the last of them:
@@ -1476,6 +1573,34 @@ fn claims_are_backed_by_rendered_work(
                     });
                 }
             }
+            // **The same two checks the arm above makes, per leaf.** A tree
+            // hides a leaf behind a
+            // connective, so a check that looked only at the operator
+            // would let the array-text bug through one level down: a branch on a
+            // collection rendered as an equality on the array's own text
+            // matches nothing, and inside a disjunction that silently narrows
+            // the answer to the *other* branch. `ConditionTree::leaves` is
+            // the walk, so a future node kind cannot be skipped here either.
+            Op::FilterTree { tree, .. } => {
+                for leaf in tree.leaves() {
+                    let condition = &leaf.condition;
+                    let Some(class_uri) = class_of_star.get(condition.star_var.as_str()) else {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    };
+                    if condition.reading == SlotReading::Column
+                        && crate::sparql_pushdown::path_multiplies(
+                            schema,
+                            class_uri,
+                            &condition.slot_path,
+                        )
+                    {
+                        return Err(LoweringRefusal::ConditionReadsACollection {
+                            node: id,
+                            slot: condition.slot_path.join("."),
+                        });
+                    }
+                }
+            }
             _ => continue,
         }
     }
@@ -1756,6 +1881,29 @@ struct FilterFacts<'a> {
     optional_side: bool,
 }
 
+/// Which value at an address a condition may name, given what the pass owes.
+///
+/// A condition on the element an unnest bound cannot name that element where
+/// the unnest was dropped, so it becomes the containment test that *narrows*
+/// to the same records -- one row per record instead of one per matching
+/// value, which is the shape a fetch wants and the shape today's star renders.
+/// Sound only in the narrowing direction: a pass that answers alone keeps its
+/// fan-out and its element condition, because "some element matches" counts a
+/// record once where SPARQL counts its matching values.
+///
+/// One function because two operator kinds apply it -- a [`Op::Filter`]'s
+/// single condition and every leaf of a [`Op::FilterTree`] -- and a rule
+/// applied from two places is a rule that comes to be applied two ways.
+/// Relaxing a leaf this way is sound inside a tree only because `All` and
+/// `Any` are monotone in their branches; see [`ConditionTree`]'s note on
+/// `Not`.
+fn reading_for_enforcement(enforcement: Enforcement, reading: SlotReading) -> SlotReading {
+    match (enforcement, reading) {
+        (Enforcement::Narrows, SlotReading::BoundElement) => SlotReading::AnyElement,
+        (_, reading) => reading,
+    }
+}
+
 fn push_filter(
     nodes: &mut Vec<OpNode>,
     input: OpId,
@@ -1776,18 +1924,7 @@ fn push_filter(
     let numeric = class_uri.is_some_and(|class_uri| {
         crate::sparql_scoper::numeric_at_path(schema, class_uri, &condition.slot_path)
     });
-    // A condition on the element an unnest bound cannot name that element
-    // where the unnest was dropped, so it becomes the containment test that
-    // *narrows* to the same records -- one row per record instead of one per
-    // matching value, which is the shape a fetch wants and the shape today's
-    // star renders. Sound only in the narrowing direction: a pass that
-    // answers alone keeps its fan-out and its element condition, because
-    // "some element matches" counts a record once where SPARQL counts its
-    // matching values.
-    let reading = match (enforcement, condition.reading) {
-        (Enforcement::Narrows, SlotReading::BoundElement) => SlotReading::AnyElement,
-        (_, reading) => reading,
-    };
+    let reading = reading_for_enforcement(enforcement, condition.reading);
     nodes.push(OpNode {
         op: Op::Filter {
             input,
@@ -2738,6 +2875,306 @@ mod tests {
         for input in inputs {
             assert_eq!(ops.nodes[input].op.kind(), "scan");
         }
+    }
+    // -----------------------------------------------------------------------
+    // A within-star disjunction: `Op::FilterTree`
+    // -----------------------------------------------------------------------
+
+    /// Every `filter_tree` operator a query lowers to, as (star, tree).
+    fn filter_trees(query: &str) -> Vec<(String, crate::sparql_refine::ConditionTree)> {
+        sql_passes(query)
+            .into_iter()
+            .flat_map(|(_, tree)| tree.nodes)
+            .filter_map(|node| match node.op {
+                Op::FilterTree { tree, star_var, .. } => Some((star_var, tree)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `FILTER(?a = 1 || ?b = 2)` on one star becomes one `filter_tree`
+    /// operator, and `filters` stays the conjunctive fast path.
+    #[test]
+    fn a_within_star_disjunction_becomes_a_filter_tree() {
+        let trees = filter_trees(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:length ?len . FILTER(?nm = \"BX517\" || ?len > 10) }",
+        );
+
+        assert_eq!(trees.len(), 1, "one operator for the whole disjunction");
+        let (star_var, tree) = &trees[0];
+        assert_eq!(star_var, "s");
+        let crate::sparql_refine::ConditionTree::Any(branches) = tree else {
+            panic!("a disjunction lowers as Any, got {tree:?}");
+        };
+        assert_eq!(branches.len(), 2);
+        // `numeric` rides on the *leaf*, and this is why: one operator whose
+        // two branches disagree about it. A per-operator flag would compare
+        // one of the two as the wrong type, and comparing a number as text
+        // makes `'9' >= '10'` true.
+        assert_eq!(
+            tree.leaves()
+                .into_iter()
+                .map(|leaf| (leaf.condition.slot_path.join("."), leaf.numeric))
+                .collect::<Vec<_>>(),
+            vec![("name".to_owned(), false), ("length".to_owned(), true)],
+        );
+    }
+
+    /// A disjunction across two stars is refused, not approximated.
+    ///
+    /// The branches only separate after the join, so neither star's fetch can
+    /// be narrowed by it. Rendering one side would answer a different
+    /// question; rendering both as a conjunction would answer a narrower one.
+    #[test]
+    fn a_cross_star_disjunction_does_not_lift() {
+        assert!(
+            filter_trees(
+                "SELECT ?s ?c WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 ?c a asset360:TunnelComplex ; asset360:hasName ?cn . \
+                 FILTER(?nm = \"BX517\" || ?cn = \"Shared\") }",
+            )
+            .is_empty(),
+            "a cross-star OR stays with the engine"
+        );
+
+        // The same gate on the shape that reaches it with *both* stars
+        // scanned in one statement: a reference join, so the two scans are
+        // one island and every leaf resolves to a real column. Only the
+        // same-star check stands between this and a lifted disjunction.
+        let joined = "SELECT ?a ?c WHERE { \
+             ?a a asset360:CivilEngineeringAsset ; asset360:hasName ?an ; \
+             asset360:belongsToTunnelComplex ?c . \
+             ?c a asset360:TunnelComplex ; asset360:hasName ?cn . \
+             FILTER(?an = \"Bridge\" || ?cn = \"Shared\") }";
+        assert_eq!(
+            sql_passes(joined)
+                .iter()
+                .flat_map(|(_, tree)| tree.find("scan"))
+                .count(),
+            2,
+            "both stars are scanned in one statement"
+        );
+        assert!(
+            filter_trees(joined).is_empty(),
+            "a cross-star OR over a join stays with the engine too"
+        );
+    }
+
+    /// A pure conjunction does not change route: it stays a chain of `filter`
+    /// operators over the conjunctive `filters` fast path, and no tree is
+    /// built for it.
+    ///
+    /// The tree is a *separate* entry point for that reason. If
+    /// `to_sql_tree` accepted an `And` of leaves with no `Or` anywhere, every
+    /// conjunction in the corpus would start lowering as one opaque operator
+    /// that only a tree-aware renderer can read -- a route change bought with
+    /// nothing.
+    #[test]
+    fn a_pure_conjunction_stays_on_the_filters_fast_path() {
+        let query = "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+                     asset360:length ?len . FILTER(?nm = \"BX517\" && ?len > 10) }";
+        assert!(
+            filter_trees(query).is_empty(),
+            "a conjunction is not a tree"
+        );
+        let filters: usize = sql_passes(query)
+            .iter()
+            .map(|(_, tree)| tree.find("filter").len())
+            .sum();
+        assert_eq!(filters, 2, "one filter operator per conjunct");
+    }
+
+    /// A branch whose constant is not the term its column's values render as
+    /// declines the *whole* tree, the same way it declines a single
+    /// condition.
+    ///
+    /// `kind` is an enum column: it stores `GSA` and renders as `eul:GSA`, so
+    /// `= "GSA"` matches no stored value. Pushing it as one branch of a
+    /// disjunction is worse than pushing it alone -- the branch is dead, so
+    /// the disjunction silently narrows to the *other* branch and answers a
+    /// different question. The tree entry point therefore asks
+    /// `constants_are_the_columns_terms` first, exactly as `to_sql` does.
+    #[test]
+    fn a_branch_whose_constant_is_not_the_columns_term_does_not_lift() {
+        assert!(
+            filter_trees(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+                 asset360:kind ?k . FILTER(?nm = \"BX517\" || ?k = \"GSA\") }",
+            )
+            .is_empty(),
+            "a dead branch would narrow to the other one"
+        );
+    }
+
+    /// A leaf on the identifier slot stays in the tree instead of being
+    /// hoisted onto the scan.
+    ///
+    /// `Op::Scan::identifier_values` is a list of values the row must be one
+    /// of, which is a *conjunct* of the statement: hoisting one branch of a
+    /// disjunction there would apply it to every row and answer a narrower
+    /// question than the query asked. So the leaf stays, rendered against the
+    /// indexed column by its path -- the same thing already happens to a
+    /// `Cmp` or a `Like` on an identifier.
+    #[test]
+    fn an_identifier_leaf_is_not_hoisted_out_of_a_tree() {
+        let query = "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri ?u ; \
+                     asset360:name ?nm . FILTER(?u = \"u-1\" || ?nm = \"BX517\") }";
+        let trees = filter_trees(query);
+        assert_eq!(trees.len(), 1);
+        assert_eq!(
+            trees[0]
+                .1
+                .leaves()
+                .into_iter()
+                .map(|leaf| leaf.condition.slot_path.join("."))
+                .collect::<Vec<_>>(),
+            vec!["asset360_uri".to_owned(), "name".to_owned()],
+        );
+        for (_, tree) in sql_passes(query) {
+            for node in &tree.nodes {
+                if let Op::Scan {
+                    identifier_values, ..
+                } = &node.op
+                {
+                    assert!(
+                        identifier_values.is_empty(),
+                        "one branch of a disjunction is not a value the row must have"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A disjunction is all-or-nothing: one branch nothing renders declines
+    /// the whole tree.
+    ///
+    /// The asymmetry with a conjunction, and the reason the tree cannot be
+    /// partial. Dropping an unrenderable conjunct leaves a condition that
+    /// still selects a superset; dropping a *branch* narrows the answer to the
+    /// remaining branches, which is a different question. `REGEX` is the
+    /// branch nothing renders here.
+    #[test]
+    fn a_branch_nothing_renders_declines_the_whole_tree() {
+        assert!(
+            filter_trees(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm = \"BX517\" || REGEX(?nm, \"^A\")) }",
+            )
+            .is_empty(),
+            "half a disjunction answers a different question"
+        );
+    }
+
+    /// A negated disjunction does not lift, and `ConditionTree::Not` is never
+    /// produced.
+    ///
+    /// Both halves of the reasoning are on [`ConditionTree`]: SQL's
+    /// three-valued logic makes `NOT (col = 'x')` *unknown* rather than true
+    /// where the column is NULL, so a negated subtree drops exactly the rows a
+    /// narrowing fetch has to keep -- the debt `FilterCondition::Ne` pays with
+    /// an explicit `IS NOT NULL` and a bare `Not` node cannot state. Negation
+    /// reaches SQL as a *leaf* instead, whose renderer knows what it owes.
+    #[test]
+    fn a_negated_disjunction_does_not_lift() {
+        assert!(
+            filter_trees(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+                 asset360:length ?len . FILTER(!(?nm = \"BX517\" || ?len > 10)) }",
+            )
+            .is_empty(),
+            "a negated subtree is not a narrowing"
+        );
+        // ...while a negation the renderer knows what it owes -- `!=`, one
+        // `FilterCondition` arm -- is a leaf of a tree like any other.
+        let trees = filter_trees(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:length ?len . FILTER(?nm != \"BX517\" || ?len > 10) }",
+        );
+        assert_eq!(trees.len(), 1);
+        let conditions: Vec<&FilterCondition> = trees[0]
+            .1
+            .leaves()
+            .into_iter()
+            .map(|leaf| &leaf.condition.condition)
+            .collect();
+        assert!(
+            matches!(
+                conditions.as_slice(),
+                [FilterCondition::Ne(_), FilterCondition::Cmp { .. }]
+            ),
+            "{conditions:?}"
+        );
+    }
+
+    /// A narrowing pass drops the fan-out, so a leaf naming the element it
+    /// bound weakens to the containment test -- per leaf, the same decision
+    /// `push_filter` makes for a single condition.
+    #[test]
+    fn a_narrowing_filter_tree_reads_the_record_and_not_the_element() {
+        let trees = filter_trees(
+            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             FILTER(?k = \"m\" || ?k = \"n\") }",
+        );
+        assert_eq!(trees.len(), 1);
+        let readings: Vec<SlotReading> = trees[0]
+            .1
+            .leaves()
+            .into_iter()
+            .map(|leaf| leaf.condition.reading)
+            .collect();
+        assert_eq!(
+            readings,
+            vec![SlotReading::AnyElement, SlotReading::AnyElement],
+            "a dropped fan-out leaves no element for a leaf to name"
+        );
+    }
+
+    /// **The claims-backed-by-rendered-work clause, one level down.** A leaf
+    /// reading a collection as a column compares the array's own text and
+    /// matches nothing -- the one defect this pipeline shipped, and a tree
+    /// hides it behind a connective unless the check walks every leaf.
+    ///
+    /// Sabotaged on a plan the rules actually built, the way
+    /// `a_claim_needs_the_work_behind_it` sabotages the single-condition form:
+    /// the rules resolve `?k` on a multivalued slot to
+    /// [`SlotReading::BoundElement`], so `Column` is not reachable from a
+    /// query and is set here by hand.
+    #[test]
+    fn a_filter_tree_leaf_may_not_read_a_collection_as_a_column() {
+        use crate::sparql_refine::{
+            Expr as RefinedExpr, PlanOp as RefinedOp, SlotReading as Reading,
+        };
+
+        let sv = test_schema_view();
+        let query = "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+                     FILTER(?k = \"m\" || ?k = \"n\") }";
+        let mut plan = refined_plan(query, &sv);
+        let tree = lower_refined(&plan, &sv, None).expect("as built, it lowers");
+        assert_eq!(
+            tree.find("filter_tree").len(),
+            1,
+            "the tree is what lowered"
+        );
+
+        let filter = plan.find("filter")[0];
+        if let RefinedOp::Filter { condition, .. } = &mut plan.nodes[filter].op
+            && let RefinedExpr::Or(branches) = condition
+        {
+            for branch in branches {
+                if let RefinedExpr::Compare { left, .. } = branch
+                    && let RefinedExpr::Slot { reading, .. } = left.as_mut()
+                {
+                    *reading = Reading::Column;
+                }
+            }
+        }
+        let refusal = lower_refined(&plan, &sv, None)
+            .expect_err("a column reading of a collection must not render");
+        assert!(
+            matches!(refusal, LoweringRefusal::ConditionReadsACollection { .. }),
+            "{refusal}"
+        );
     }
 }
 

@@ -361,6 +361,183 @@ pub struct SqlCondition {
     pub reading: SlotReading,
 }
 
+/// A condition SQL can ask whose shape is a *tree* rather than a conjunction.
+///
+/// The representation `FILTER(A || B)` needed and did not have. Every
+/// [`SqlCondition`] a filter operator carries is implicitly one conjunct of an
+/// implicitly conjunctive list -- `_OpScan.filters` on the Python side is
+/// `slot -> [conditions]` -- so a disjunction had nowhere to go: it was
+/// accepted, scoped, and never lifted. That is not a slow query but a failed
+/// one, because a filter that does not narrow makes the fetch read the whole
+/// class and the engine leg is bounded by `TripleLimitExceeded`.
+///
+/// **A contract, not an internal detail.** A PyO3 class mirrors it and
+/// `sql_builder.py` renders it, so the shape is read in two other repos.
+/// Three things about it are load-bearing:
+///
+/// * **The leaf is an [`SqlCondition`] plus the physical facts a renderer
+///   needs**, rather than a slot path and an operator string. One shape for
+///   "a condition SQL can ask" means a leaf cannot drift from what
+///   [`Expr::to_sql`] produces -- and `numeric` rides on the *leaf* because
+///   `?nm = "BX517" || ?len > 10` is one operator whose two branches disagree
+///   about it. A per-operator flag would cast one of them wrong, and
+///   comparing a number as text makes `'9' >= '10'` true.
+/// * **`All` and `Any` are n-ary and never empty.** `Any([])` is `FALSE`: a
+///   pushed condition that selects *nothing* makes the engine re-run the query
+///   over no records and answer empty to a query that has an answer, which is
+///   the one direction a pushed condition is not free in. `to_sql_tree`
+///   declines an empty branch list rather than emitting one.
+/// * **A consumer must refuse a node it does not know.** There is no
+///   "unknown condition" node and no wildcard in the walks below, so a new
+///   [`FilterCondition`] arm or a new node kind is a compile error at every
+///   consumer in this crate rather than a branch silently skipped -- and a
+///   silently skipped branch of a disjunction narrows the answer to the other
+///   branch.
+///
+/// **`Not` is representable and is not produced today**, deliberately. SQL's
+/// three-valued logic makes `NOT (col = 'x')` *unknown* rather than true where
+/// the column is NULL, so a negated subtree drops exactly the rows a narrowing
+/// fetch has to keep -- the same debt [`FilterCondition::Ne`] pays with an
+/// explicit `IS NOT NULL`, which a renderer reading a bare `Not` has no way to
+/// know it owes. Negation therefore reaches SQL as a *leaf* (`Ne`,
+/// `NotBound`), whose renderer knows what it owes. The second reason is the
+/// reading weakening a narrowing pass applies (see
+/// `sparql_ops::reading_for_enforcement`): relaxing a leaf from "the element
+/// this row bound" to "some element of the array" only relaxes the whole
+/// condition under monotone connectives, and `Not` is not one. A producer of
+/// `Not` owes an answer to both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionTree {
+    /// Every branch holds. Non-empty.
+    All(Vec<ConditionTree>),
+    /// Some branch holds. Non-empty -- see the type's doc comment.
+    Any(Vec<ConditionTree>),
+    /// The branch does not hold. Never produced by [`Expr::to_sql_tree`]; see
+    /// the type's doc comment for the two things a producer owes first.
+    Not(Box<ConditionTree>),
+    Leaf(ConditionLeaf),
+}
+
+/// One condition at the bottom of a [`ConditionTree`], with the physical facts
+/// the address does not carry.
+///
+/// `numeric` is here rather than on the operator because the branches of one
+/// disjunction name different slots: see [`ConditionTree`]'s doc comment.
+/// `reading` is already inside the [`SqlCondition`], for the same reason it is
+/// there for a single filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionLeaf {
+    pub condition: SqlCondition,
+    /// Whether the value compares as a number rather than as text.
+    ///
+    /// Resolved where the schema is -- [`Expr::to_sql_tree`] -- through the
+    /// same `numeric_at_path` a single filter's lowering asks, so the two
+    /// cannot disagree about a column.
+    pub numeric: bool,
+}
+
+impl ConditionTree {
+    /// Every leaf, left to right.
+    ///
+    /// The walk every consumer of the tree needs and the reason `Not` is a
+    /// node rather than a flag: a check that has to hold of each leaf --
+    /// "its star is scanned", "it does not read a collection as a column" --
+    /// asks it here rather than re-implementing the recursion, and cannot
+    /// therefore forget a branch.
+    pub fn leaves(&self) -> Vec<&ConditionLeaf> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a ConditionLeaf>) {
+        match self {
+            Self::All(branches) | Self::Any(branches) => {
+                for branch in branches {
+                    branch.collect_leaves(out);
+                }
+            }
+            Self::Not(inner) => inner.collect_leaves(out),
+            Self::Leaf(leaf) => out.push(leaf),
+        }
+    }
+
+    /// The one star every leaf names, or `None` when the leaves name several
+    /// (or none at all).
+    ///
+    /// **The boundary of what a tree may lift, and it is a hard refusal.** A
+    /// disjunction spanning two stars cannot narrow either star's fetch
+    /// independently: the branches only separate after the join, so rendering
+    /// one side would answer a different question and rendering both as a
+    /// conjunction a narrower one. Such a filter stays unlifted and the engine
+    /// finishes it.
+    ///
+    /// One function rather than a check in `to_sql_tree` and a second
+    /// derivation where the operator names its star: a derivation performed
+    /// twice is how an operator comes to disagree with the tree it carries.
+    pub fn star(&self) -> Option<&str> {
+        let leaves = self.leaves();
+        let (first, rest) = leaves.split_first()?;
+        let star = first.condition.star_var.as_str();
+        rest.iter()
+            .all(|leaf| leaf.condition.star_var == star)
+            .then_some(star)
+    }
+
+    /// The same tree with every leaf rewritten.
+    ///
+    /// For the one physical fact the lowering rather than the expression
+    /// decides: whether a narrowing pass, having dropped the fan-out, still
+    /// has an element for a leaf to name. Sound only because `All` and `Any`
+    /// are monotone in their branches -- see this type's note on `Not`.
+    pub fn map_leaves(&self, rewrite: &impl Fn(&ConditionLeaf) -> ConditionLeaf) -> Self {
+        let branches = |branches: &[Self]| -> Vec<Self> {
+            branches
+                .iter()
+                .map(|branch| branch.map_leaves(rewrite))
+                .collect()
+        };
+        match self {
+            Self::All(parts) => Self::All(branches(parts)),
+            Self::Any(parts) => Self::Any(branches(parts)),
+            Self::Not(inner) => Self::Not(Box::new(inner.map_leaves(rewrite))),
+            Self::Leaf(leaf) => Self::Leaf(rewrite(leaf)),
+        }
+    }
+}
+
+impl fmt::Display for ConditionTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let joined = |f: &mut fmt::Formatter<'_>, branches: &[Self], sep: &str| -> fmt::Result {
+            f.write_str("(")?;
+            for (index, branch) in branches.iter().enumerate() {
+                if index > 0 {
+                    write!(f, " {sep} ")?;
+                }
+                write!(f, "{branch}")?;
+            }
+            f.write_str(")")
+        };
+        match self {
+            Self::All(branches) => joined(f, branches, "AND"),
+            Self::Any(branches) => joined(f, branches, "OR"),
+            Self::Not(inner) => write!(f, "NOT {inner}"),
+            // Both physical facts the leaf carries are printed, the way the
+            // single-condition line prints them: a printout that hid them
+            // would hide what a renderer depends on, and inside a tree they
+            // differ from branch to branch.
+            Self::Leaf(leaf) => write!(
+                f,
+                "{}{}{} {}",
+                leaf.condition.slot_path.join("."),
+                leaf.condition.reading,
+                if leaf.numeric { "[num]" } else { "" },
+                leaf.condition.condition
+            ),
+        }
+    }
+}
+
 impl Expr {
     /// The conditions this expression *has the shape of*, without asking
     /// whether they mean what the query means.
@@ -677,6 +854,134 @@ impl Expr {
             return None;
         }
         self.sql_shape_unchecked()
+    }
+
+    /// The [`ConditionTree`] this expression is worth in SQL, or `None` when
+    /// SQL cannot ask the same question.
+    ///
+    /// A **separate entry point** from [`Expr::to_sql`], and that is the
+    /// design rather than an accident:
+    ///
+    /// * it returns `None` when there is no `Or` anywhere, so a pure
+    ///   conjunction stays on the conjunctive fast path and **no shape in the
+    ///   corpus changes route**. `filters` is read by the fetch narrowing and
+    ///   by star-data as well as by the statement renderer; a conjunction that
+    ///   started arriving as one opaque tree would need every one of those
+    ///   consumers to learn the tree for nothing gained.
+    /// * `sql_shape_unchecked`'s `Or` arm keeps declining for the same reason.
+    ///
+    /// It asks the *same first half* [`Expr::to_sql`] asks --
+    /// [`Expr::constants_are_the_columns_terms`] -- before shaping anything,
+    /// and the reason is sharper here than there. A pushed condition is free
+    /// only while it selects a superset; one selecting *nothing* makes the
+    /// engine re-run the query over no records and answer empty. In a
+    /// disjunction a dead branch does not merely fail to narrow, it narrows to
+    /// the *other* branch: `FILTER(?nm = "BX517" || ?kind = "GSA")` on an enum
+    /// column that stores `GSA` and renders as `eul:GSA` would answer
+    /// "the ones called BX517", which is a different question. So a tree shape
+    /// this check does not walk is that bug reintroduced.
+    ///
+    /// Declines, each with what it prevents:
+    ///
+    /// * **any leaf declines** -- a disjunction is all-or-nothing, since
+    ///   dropping one branch narrows the answer to the rest;
+    /// * **the leaves name more than one star** -- see [`ConditionTree::star`];
+    /// * **no `Or` anywhere** -- the fast path above;
+    /// * **an empty `All` or `Any`** -- `Any([])` is `FALSE`, which selects
+    ///   nothing. Not reachable from a parsed query (`flatten_or` builds at
+    ///   least two branches), and refused rather than trusted to stay
+    ///   unreachable.
+    pub fn to_sql_tree(
+        &self,
+        schema: &SchemaView,
+        class_of_star: &HashMap<String, String>,
+    ) -> Option<ConditionTree> {
+        if !self.constants_are_the_columns_terms(schema, class_of_star) {
+            return None;
+        }
+        if !self.contains_disjunction() {
+            return None;
+        }
+        let tree = self.tree_shape_unchecked(schema, class_of_star)?;
+        tree.star()?;
+        Some(tree)
+    }
+
+    /// Whether an `Or` appears anywhere in this expression.
+    ///
+    /// The gate that keeps the conjunctive fast path exactly as it was: only a
+    /// shape that has no representation as a list of conjuncts takes the tree
+    /// route. Walks the connectives only -- an `Or` buried inside a
+    /// [`Expr::Function`]'s arguments is inside a shape that declines
+    /// regardless, and inside an [`Expr::Opaque`] there is no expression to
+    /// walk.
+    fn contains_disjunction(&self) -> bool {
+        match self {
+            Self::Or(_) => true,
+            Self::And(parts) => parts.iter().any(Self::contains_disjunction),
+            Self::Not(inner) => inner.contains_disjunction(),
+            Self::Compare { .. }
+            | Self::In { .. }
+            | Self::Var(_)
+            | Self::Literal(_)
+            | Self::Slot { .. }
+            | Self::Function { .. }
+            | Self::Opaque(_) => false,
+        }
+    }
+
+    /// The tree this expression has the *shape* of, with the physical facts
+    /// filled in.
+    ///
+    /// The counterpart of [`Expr::sql_shape_unchecked`], and it delegates to
+    /// it at every leaf rather than re-deriving one: a leaf that could drift
+    /// from what `to_sql` produces is a leaf a renderer would render
+    /// differently from the same condition written without an `Or` around it.
+    /// Every shape that is not a connective therefore has to produce **exactly
+    /// one** condition to be a leaf -- an arm that produced several would be a
+    /// hidden conjunction, and this declines it rather than guessing which
+    /// connective it meant.
+    ///
+    /// Takes the schema for one fact only: `numeric`, which is a property of
+    /// the column and not of the condition, resolved through the same
+    /// `numeric_at_path` a single filter's lowering asks.
+    fn tree_shape_unchecked(
+        &self,
+        schema: &SchemaView,
+        class_of_star: &HashMap<String, String>,
+    ) -> Option<ConditionTree> {
+        let branches = |parts: &[Self]| -> Option<Vec<ConditionTree>> {
+            if parts.is_empty() {
+                // `Any([])` selects nothing; see `to_sql_tree`.
+                return None;
+            }
+            parts
+                .iter()
+                .map(|part| part.tree_shape_unchecked(schema, class_of_star))
+                .collect()
+        };
+        match self {
+            Self::Or(parts) => Some(ConditionTree::Any(branches(parts)?)),
+            Self::And(parts) => Some(ConditionTree::All(branches(parts)?)),
+            // The one wildcard, and it is not a hole: everything it catches
+            // is handed to `sql_shape_unchecked`, which *is* exhaustive over
+            // `Expr`, so a new variant is a compile error there rather than a
+            // leaf silently invented here.
+            other => {
+                let conditions = other.sql_shape_unchecked()?;
+                let [condition] = <[SqlCondition; 1]>::try_from(conditions).ok()?;
+                let numeric = class_of_star
+                    .get(&condition.star_var)
+                    .is_some_and(|class_uri| {
+                        crate::sparql_scoper::numeric_at_path(
+                            schema,
+                            class_uri,
+                            &condition.slot_path,
+                        )
+                    });
+                Some(ConditionTree::Leaf(ConditionLeaf { condition, numeric }))
+            }
+        }
     }
 
     /// Whether every constant this expression compares against a slot is the
@@ -3572,6 +3877,149 @@ mod tests {
         // terms a string column's values render as.
         let schema = crate::sparql_scoper::tests::test_schema_view();
         assert!(members.to_sql(&schema, &tunnel_star()).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // `to_sql_tree`: the within-star disjunction
+    // -----------------------------------------------------------------------
+
+    fn signal_star() -> HashMap<String, String> {
+        HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )])
+    }
+
+    /// An equality on one slot of `?s`, as a rule would have resolved it.
+    fn slot_equals(star_var: &str, slot: &str, value: &str) -> Expr {
+        Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Slot {
+                star_var: star_var.to_owned(),
+                slot_path: vec![slot.to_owned()],
+                reading: SlotReading::Column,
+                presence: SlotPresence::Required,
+            }),
+            right: Box::new(Expr::Literal(Literal::new_simple_literal(value).into())),
+        }
+    }
+
+    /// `Any([])` is `FALSE`, and a pushed condition selecting *nothing* is the
+    /// one direction a pushed condition is not free in: the engine re-runs the
+    /// query over no records and answers empty to a query that has an answer.
+    ///
+    /// Not reachable from a parsed query -- `flatten_or` builds at least two
+    /// branches -- so the expression is built by hand, which is also the
+    /// point: the shape is a legal value of the type and the refusal is the
+    /// type's, not the parser's.
+    ///
+    /// The **nested** case is the one only this gate catches. An empty
+    /// disjunction at the top has no leaves at all, so
+    /// [`ConditionTree::star`] declines it as well; one buried in a
+    /// conjunction leaves the other branch's leaf naming a perfectly good
+    /// star, and a tree that passes every other check while selecting nothing
+    /// is exactly the empty answer to an answerable query.
+    #[test]
+    fn to_sql_tree_declines_an_empty_disjunction() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        assert_eq!(
+            Expr::And(vec![
+                slot_equals("s", "name", "BX517"),
+                Expr::Or(Vec::new()),
+            ])
+            .to_sql_tree(&schema, &signal_star()),
+            None,
+            "a nested FALSE makes the whole conjunction select nothing"
+        );
+        assert_eq!(
+            Expr::Or(Vec::new()).to_sql_tree(&schema, &signal_star()),
+            None
+        );
+        // And the emptiness is what it declined, not the shape: the same
+        // disjunction with two pushable branches lifts.
+        assert!(
+            Expr::Or(vec![
+                slot_equals("s", "name", "BX517"),
+                slot_equals("s", "name", "BX518"),
+            ])
+            .to_sql_tree(&schema, &signal_star())
+            .is_some()
+        );
+    }
+
+    /// A pure conjunction stays on the [`Expr::to_sql`] fast path: the tree
+    /// entry point declines it outright.
+    ///
+    /// Asked of the function rather than of a query because the fast path is
+    /// protected twice over -- `lower_refined` and `PushComparisonFilter` both
+    /// ask `to_sql` *first*, so a route change would need this gate and that
+    /// ordering to fail together. This is the half that can be isolated: with
+    /// no `Or` anywhere there is nothing a tree says that a list of conjuncts
+    /// does not, and `filters` is read by the fetch narrowing and by star-data
+    /// as well as by the statement renderer -- every one of which would have
+    /// to learn the tree for nothing gained.
+    #[test]
+    fn to_sql_tree_declines_a_pure_conjunction() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let above = Expr::Compare {
+            op: CompareOp::Gt,
+            left: Box::new(Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                reading: SlotReading::Column,
+                presence: SlotPresence::Required,
+            }),
+            right: Box::new(Expr::Literal(Literal::new_simple_literal("A").into())),
+        };
+        let conjunction = Expr::And(vec![slot_equals("s", "name", "BX517"), above]);
+        assert_eq!(
+            conjunction
+                .to_sql(&schema, &signal_star())
+                .map(|conditions| conditions.len()),
+            Some(2),
+            "the fast path renders it as two conditions"
+        );
+        assert_eq!(conjunction.to_sql_tree(&schema, &signal_star()), None);
+    }
+
+    /// **`Not` is representable and never produced**, and the walks must still
+    /// descend into one.
+    ///
+    /// The reasons `to_sql_tree` does not build a `Not` are on
+    /// [`ConditionTree`]: SQL's three-valued logic makes a negated subtree
+    /// *unknown* rather than true over a NULL column, and the reading
+    /// weakening a narrowing pass applies is only sound under monotone
+    /// connectives. So this tree cannot be manufactured from a query today and
+    /// is built by hand -- what it pins is that a leaf under a `Not` is not
+    /// invisible: [`ConditionTree::leaves`] is the walk every per-leaf check
+    /// uses, so a blind spot here would be a blind spot in the same-star gate
+    /// and in `claims_are_backed_by_rendered_work` at once.
+    #[test]
+    fn a_leaf_under_a_negation_is_still_walked() {
+        let leaf = |star_var: &str, slot: &str| {
+            ConditionTree::Leaf(ConditionLeaf {
+                condition: SqlCondition {
+                    star_var: star_var.to_owned(),
+                    slot_path: vec![slot.to_owned()],
+                    condition: FilterCondition::Eq("BX517".to_owned()),
+                    reading: SlotReading::Column,
+                },
+                numeric: false,
+            })
+        };
+        let negated = |inner: ConditionTree| ConditionTree::Not(Box::new(inner));
+
+        let one_star = ConditionTree::Any(vec![leaf("s", "name"), negated(leaf("s", "length"))]);
+        assert_eq!(
+            one_star.leaves().len(),
+            2,
+            "the negated branch is a leaf too"
+        );
+        assert_eq!(one_star.star(), Some("s"));
+
+        // A second star hidden under a negation is still a second star.
+        let two_stars = ConditionTree::Any(vec![leaf("s", "name"), negated(leaf("c", "hasName"))]);
+        assert_eq!(two_stars.star(), None);
     }
 
     /// The other half of the public entry, and the reason it is the only one:
