@@ -38,6 +38,7 @@ pub mod predicate;
 pub mod scope_predicate;
 pub mod shacl_ast;
 
+pub mod sparql_columns;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
 pub mod sparql_graph_clauses;
