@@ -3870,6 +3870,32 @@ classes:
         );
     }
 
+    /// A substring never lifts onto an enum column.
+    ///
+    /// An enum column stores a *code* and translates backwards through its
+    /// meanings — `kind` stores `GSA` or `KSS`, never a label — so a substring
+    /// of a label matches no code and `object_data->>'kind' LIKE '%GS%'` would
+    /// select nothing. If this gate is ever dropped (in `literal_pushable` or
+    /// in the `FunctionCall` arm), the statement route silently starts
+    /// answering an empty (or wrong) result while the engine leg still
+    /// answers real rows — the asymmetric, unreported disagreement between
+    /// the two routes this whole feature exists to prevent.
+    #[test]
+    fn substring_does_not_lift_onto_an_enum_column() {
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
+                 FILTER(CONTAINS(?k, \"GS\")) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope).iter().all(|star| star.filters.is_empty()),
+            "a substring on an enum column must not become a pushed LIKE"
+        );
+    }
+
     /// LIMIT must NOT be pushed into the object fetch when an operator has to
     /// see every solution first: the fetch would feed the aggregate / sort /
     /// dedup an arbitrary subset and return a plausible wrong answer with no
