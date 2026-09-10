@@ -2249,17 +2249,18 @@ impl PushdownOrder {
     }
 }
 
-/// Does `(star_var, slot_path)` have a broken-out physical column, using the
-/// star variable as the registry's `class_uri` argument?
+/// The column *family* name a resolved [`crate::sparql_columns::BrokenOutColumn`]
+/// crosses the PyO3 boundary as.
 ///
-/// The one place this substitution is made, so both `PlanOp::broken_out_column`
-/// and `FilterNode::broken_out_column` share it rather than drifting apart.
-/// See the doc comment on `PlanOp::broken_out_column` for why the
-/// substitution is sound today and what would have to change for it to stop
-/// being sound.
+/// The one conversion point, so `PlanOp::broken_out_column` and
+/// `FilterNode::broken_out_column` -- which read an *already-resolved*
+/// `Option<BrokenOutColumn>` carried on the op or the leaf, never re-derive
+/// one -- cannot drift apart on how they spell it.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-fn broken_out_column_by_star(star_var: &str, slot_path: &[String]) -> Option<&'static str> {
-    crate::sparql_columns::broken_out_column(star_var, slot_path).map(|column| column.as_str())
+fn broken_out_column_name(
+    resolved: Option<crate::sparql_columns::BrokenOutColumn>,
+) -> Option<&'static str> {
+    resolved.map(|column| column.as_str())
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -2269,22 +2270,21 @@ fn broken_out_column_by_star(star_var: &str, slot_path: &[String]) -> Option<&'s
 /// Does `(class_uri, slot_path)` have an indexed physical column behind it?
 ///
 /// The direct PyO3 wrapper around `sparql_columns::broken_out_column`, for a
-/// consumer that has a real class URI in hand -- typically resolved from a
-/// ``"scan"`` operator's own ``class_uri`` by matching ``star_var``. Returns
-/// the column *family* name (``"geometry"`` today), not a concrete column:
-/// which of several physical columns is populated depends on facts this
-/// crate does not have, so the consumer maps the family name to its own
-/// columns. A `Some` return means "there is a column to consult", not "this
-/// row's column was populated from this slot" -- see the Rust module's doc
-/// comment (`sparql_columns.rs`) for why that second question is answered in
-/// SQL, not here.
+/// consumer that has a real class URI in hand -- typically a ``"scan"``
+/// operator's own ``class_uri``. Returns the column *family* name
+/// (``"geometry"`` today), not a concrete column: which of several physical
+/// columns is populated depends on facts this crate does not have, so the
+/// consumer maps the family name to its own columns. A `Some` return means
+/// "there is a column to consult", not "this row's column was populated from
+/// this slot" -- see the Rust module's doc comment (`sparql_columns.rs`) for
+/// why that second question is answered in SQL, not here.
 ///
 /// `PlanOp.broken_out_column` and `FilterNode.broken_out_column` answer the
-/// same question for a filter already reached through a plan, standing in a
-/// real class URI with the star's own variable name (see those getters'
-/// doc comments for why that substitution is sound today). Call this
-/// function directly only when a real class URI is available and those
-/// getters are not what is being asked.
+/// same question for a filter already reached through a plan; they read a
+/// resolution the planner already made against the star's *real* class URI
+/// at the point the operator was built, rather than calling this function
+/// with a substitute. Call this function directly when a real class URI is
+/// available from elsewhere and there is no plan operator to ask.
 fn py_broken_out_column(class_uri: &str, slot_path: Vec<String>) -> Option<&'static str> {
     crate::sparql_columns::broken_out_column(class_uri, &slot_path).map(|column| column.as_str())
 }
@@ -2413,15 +2413,17 @@ impl FilterNode {
     }
 
     /// For ``"leaf"``: the broken-out-column family name, same meaning as
-    /// [`PlanOp::broken_out_column`] and the same `star_var`-for-`class_uri`
-    /// substitution, documented there.
+    /// [`PlanOp::broken_out_column`].
+    ///
+    /// Reads a resolution [`Expr::to_sql_tree`] already made against the
+    /// leaf's *real* class URI (`tree_shape_unchecked`'s `class_of_star`
+    /// lookup, the same map `numeric` is resolved from) -- it is not
+    /// re-derived here from `star_var` or anything else on this leaf.
     #[getter]
     fn broken_out_column(&self) -> Option<&'static str> {
         use crate::sparql_refine::ConditionTree;
         match &self.inner {
-            ConditionTree::Leaf(leaf) => {
-                broken_out_column_by_star(&leaf.condition.star_var, &leaf.condition.slot_path)
-            }
+            ConditionTree::Leaf(leaf) => broken_out_column_name(leaf.broken_out_column),
             _ => None,
         }
     }
@@ -2664,27 +2666,24 @@ impl PlanOp {
     /// column came from this slot" -- see the registry's module doc for why
     /// that second question is answered in SQL, not here.
     ///
-    /// **The registry is keyed on the real class URI, and `Op::Filter` does
-    /// not carry one.** Only the star's `Op::Scan` does, and a `PlanOp`
-    /// cannot see its sibling nodes. This getter uses `star_var` in its
-    /// place, mirroring the identical substitution the planner itself makes
-    /// at `sparql_scoper.rs`'s `lift_intersects` call site: the registry's
-    /// own gate today only checks non-emptiness (see
-    /// `sparql_columns::broken_out_column`'s module doc), and a SPARQL
-    /// variable name is as reliably non-empty as a class URI. If the
-    /// registry ever grows a real per-class check, this is the accessor that
-    /// would need a genuine class URI threaded onto the operator -- today it
-    /// is not one, so this substitution cannot yet be told apart from the
-    /// real thing by any test that only observes this getter's output.
+    /// Reads a resolution `push_filter` already made against the star's
+    /// *real* class URI (`FilterFacts::class_uri`, the same value `numeric`
+    /// is resolved from) at the point this operator was built -- not
+    /// re-derived here from `star_var` or anything else on this node. An
+    /// earlier draft of this getter did make that substitution; it was
+    /// flagged in review as silently wrong the moment the registry grows a
+    /// real per-class check, with no test able to catch it while the
+    /// registry stays blind to the difference (see `sparql_columns.rs`'s
+    /// module doc). Carrying the resolved answer, the way `reading`,
+    /// `numeric` and `right_multivalued` already are, removes the
+    /// possibility rather than documenting around it.
     #[getter]
     fn broken_out_column(&self) -> Option<&'static str> {
         use crate::sparql_ops::Op;
         match &self.inner.op {
             Op::Filter {
-                star_var,
-                slot_path,
-                ..
-            } => broken_out_column_by_star(star_var, slot_path),
+                broken_out_column, ..
+            } => broken_out_column_name(*broken_out_column),
             _ => None,
         }
     }

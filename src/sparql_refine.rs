@@ -434,6 +434,20 @@ pub struct ConditionLeaf {
     /// same `numeric_at_path` a single filter's lowering asks, so the two
     /// cannot disagree about a column.
     pub numeric: bool,
+    /// Whether this leaf's slot has an indexed physical column behind it,
+    /// resolved against the *real* class URI at the same point `numeric` is.
+    ///
+    /// A leaf, not the whole tree, because branches of one disjunction can
+    /// name different slots -- `?nm = "BX517" || geof:sfIntersects(?w, ...)`
+    /// is one operator whose branches disagree about this exactly the way
+    /// they disagree about `numeric`. Resolved here (`tree_shape_unchecked`,
+    /// which already has `class_of_star` in scope to compute `numeric`)
+    /// rather than downstream from `star_var`, because a resolution carried
+    /// on the leaf is a fact a later consumer reads rather than re-derives
+    /// from a value that is not what the registry's parameter name promises
+    /// -- see the PyO3 boundary's fix history for what re-deriving it from
+    /// `star_var` cost.
+    pub broken_out_column: Option<crate::sparql_columns::BrokenOutColumn>,
 }
 
 impl ConditionTree {
@@ -1006,16 +1020,18 @@ impl Expr {
             other => {
                 let conditions = other.sql_shape_unchecked()?;
                 let [condition] = <[SqlCondition; 1]>::try_from(conditions).ok()?;
-                let numeric = class_of_star
-                    .get(&condition.star_var)
-                    .is_some_and(|class_uri| {
-                        crate::sparql_scoper::numeric_at_path(
-                            schema,
-                            class_uri,
-                            &condition.slot_path,
-                        )
-                    });
-                Some(ConditionTree::Leaf(ConditionLeaf { condition, numeric }))
+                let leaf_class_uri = class_of_star.get(&condition.star_var);
+                let numeric = leaf_class_uri.is_some_and(|class_uri| {
+                    crate::sparql_scoper::numeric_at_path(schema, class_uri, &condition.slot_path)
+                });
+                let broken_out_column = leaf_class_uri.and_then(|class_uri| {
+                    crate::sparql_columns::broken_out_column(class_uri, &condition.slot_path)
+                });
+                Some(ConditionTree::Leaf(ConditionLeaf {
+                    condition,
+                    numeric,
+                    broken_out_column,
+                }))
             }
         }
     }
@@ -4237,6 +4253,49 @@ mod tests {
             geometry_leaf.condition.slot_path,
             vec!["hasGeometry".to_owned(), "asWKT".to_owned()]
         );
+        // Resolved against `postal_code_star()`'s real class URI, at the same
+        // point and from the same map `numeric` above is resolved from.
+        assert_eq!(
+            geometry_leaf.broken_out_column,
+            Some(crate::sparql_columns::BrokenOutColumn::Geometry)
+        );
+    }
+
+    /// **The gate the pair above and this test exist for.** `star_var`
+    /// ("s") is non-empty whether or not the star is resolved, and the
+    /// registry's own gate today checks only non-emptiness
+    /// (`sparql_columns.rs`'s module doc) -- so a version of this code that
+    /// substituted `star_var` for `class_uri` at the registry call would
+    /// resolve `Some(Geometry)` here too, identically to the resolved case
+    /// above, and only this test would catch it. Calls `tree_shape_unchecked`
+    /// directly (bypassing `to_sql_tree`'s own gate, `constants_are_the_columns_terms`,
+    /// which already declines an unresolved star before this code would run)
+    /// to pin the resolution itself rather than the gate in front of it --
+    /// the same reason the file already builds a `Not` tree by hand instead
+    /// of only testing what a parsed query can reach.
+    #[test]
+    fn a_leaf_s_broken_out_column_is_none_when_its_star_is_unresolved() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+        let intersects = sf_intersects(Literal::new_typed_literal(box_wkt, wkt_literal_datatype()));
+        let other = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(geometry_slot()),
+            right: Box::new(Expr::Literal(Literal::new_simple_literal("ignored").into())),
+        };
+        let unresolved: HashMap<String, String> = HashMap::new();
+        let tree = Expr::Or(vec![intersects, other])
+            .tree_shape_unchecked(&schema, &unresolved)
+            .expect("the shape resolves even though to_sql_tree's own gate would have declined");
+        let geometry_leaf = tree
+            .leaves()
+            .into_iter()
+            .find(|leaf| matches!(leaf.condition.condition, FilterCondition::Intersects { .. }))
+            .expect("the geometry leaf is present, not silently dropped");
+        assert_eq!(
+            geometry_leaf.broken_out_column, None,
+            "an unresolved star must not resolve a column, not even via its variable name"
+        );
     }
 
     /// **`Not` is representable and never produced**, and the walks must still
@@ -4262,6 +4321,7 @@ mod tests {
                     reading: SlotReading::Column,
                 },
                 numeric: false,
+                broken_out_column: None,
             })
         };
         let negated = |inner: ConditionTree| ConditionTree::Not(Box::new(inner));

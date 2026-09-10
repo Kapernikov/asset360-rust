@@ -202,6 +202,21 @@ pub enum Op {
         /// as text is the `'9' >= '10'` answer the scoper tracks numeric-ness
         /// to prevent.
         numeric: bool,
+        /// Whether this slot has an indexed physical column behind it,
+        /// resolved against the star's *real* `class_uri` in `push_filter` --
+        /// the same value `numeric` is resolved from, not the star variable.
+        ///
+        /// Carried for the reason `numeric` and `reading` are: a renderer
+        /// that has to re-derive this from elsewhere can forget to, or derive
+        /// it from the wrong thing. The wrong thing here has a name: an
+        /// earlier PyO3-boundary draft substituted `star_var` for `class_uri`
+        /// at the registry call, which was flagged in review because it is
+        /// silently wrong the moment the registry grows a real per-class
+        /// check and no test can catch it while the registry stays blind to
+        /// the difference. Resolving it once, here, against the real class
+        /// URI closes that gap at the only point that has both facts in
+        /// scope.
+        broken_out_column: Option<crate::sparql_columns::BrokenOutColumn>,
     },
     /// A condition on one star whose shape is a *tree*: the within-star
     /// disjunction a [`Op::Filter`] list cannot express.
@@ -423,6 +438,10 @@ pub fn lower_sql_pass(
             } else {
                 SlotReading::Column
             };
+            let broken_out_column = crate::sparql_columns::broken_out_column(
+                &star.class_uri,
+                std::slice::from_ref(slot),
+            );
             for condition in conditions {
                 let input = root_by_star[&star.variable];
                 nodes.push(OpNode {
@@ -435,6 +454,7 @@ pub fn lower_sql_pass(
                         numeric,
                         reading,
                         optional_side: star.is_optional,
+                        broken_out_column,
                     },
                     discharges: Vec::new(),
                 });
@@ -442,6 +462,8 @@ pub fn lower_sql_pass(
             }
         }
         for path_filter in &star.path_filters {
+            let broken_out_column =
+                crate::sparql_columns::broken_out_column(&star.class_uri, &path_filter.slot_path);
             for condition in &path_filter.conditions {
                 let input = root_by_star[&star.variable];
                 nodes.push(OpNode {
@@ -458,6 +480,7 @@ pub fn lower_sql_pass(
                         // scoper leaves an array to the engine, so a path
                         // condition names a column.
                         reading: SlotReading::Column,
+                        broken_out_column,
                     },
                     discharges: Vec::new(),
                 });
@@ -1936,6 +1959,12 @@ fn push_filter(
     let numeric = class_uri.is_some_and(|class_uri| {
         crate::sparql_scoper::numeric_at_path(schema, class_uri, &condition.slot_path)
     });
+    // The same real `class_uri` `numeric` is resolved from, not `star_var` --
+    // see the field's doc comment on `Op::Filter` for why that distinction is
+    // load-bearing.
+    let broken_out_column = class_uri.and_then(|class_uri| {
+        crate::sparql_columns::broken_out_column(class_uri, &condition.slot_path)
+    });
     let reading = reading_for_enforcement(enforcement, condition.reading);
     nodes.push(OpNode {
         op: Op::Filter {
@@ -1947,6 +1976,7 @@ fn push_filter(
             numeric,
             reading,
             optional_side,
+            broken_out_column,
         },
         discharges,
     });
@@ -3187,6 +3217,96 @@ mod tests {
             matches!(refusal, LoweringRefusal::ConditionReadsACollection { .. }),
             "{refusal}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `Op::Filter::broken_out_column`: resolved from the real `class_uri`,
+    // never from `star_var`.
+    // -----------------------------------------------------------------------
+
+    /// `push_filter` directly, so the resolution is pinned at the point it is
+    /// made rather than through a full query, which always resolves every
+    /// star it scans and so could never observe `class_uri: None` -- the one
+    /// case that distinguishes "resolved against the real class" from
+    /// "resolved against `star_var` instead", since `star_var` itself is
+    /// always non-empty even when the class is not.
+    fn pushed_geometry_condition() -> crate::sparql_refine::SqlCondition {
+        crate::sparql_refine::SqlCondition {
+            star_var: "s".to_owned(),
+            slot_path: vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+            condition: FilterCondition::Intersects {
+                wkt: "POINT(1 2)".to_owned(),
+            },
+            reading: SlotReading::Column,
+        }
+    }
+
+    /// A resolved class with the registry's geometry shape gets the family
+    /// name -- the positive case, so the negative case below is a real
+    /// contrast and not just "always None".
+    #[test]
+    fn push_filter_resolves_broken_out_column_from_the_real_class_uri() {
+        let sv = test_schema_view();
+        let class_uri = "https://data.infrabel.be/asset360/PostalCode".to_owned();
+        let condition = pushed_geometry_condition();
+        let mut nodes = Vec::new();
+        push_filter(
+            &mut nodes,
+            0,
+            &condition,
+            FilterFacts {
+                schema: &sv,
+                class_uri: Some(&class_uri),
+                enforcement: Enforcement::Narrows,
+                optional_side: false,
+            },
+            Vec::new(),
+        );
+        let Op::Filter {
+            broken_out_column, ..
+        } = &nodes[0].op
+        else {
+            panic!("push_filter always pushes a Filter");
+        };
+        assert_eq!(
+            *broken_out_column,
+            Some(crate::sparql_columns::BrokenOutColumn::Geometry)
+        );
+    }
+
+    /// **The gate this pair of tests exists for.** An unresolved star (no
+    /// scan named it, so `class_uri` is `None`) must resolve to no column at
+    /// all -- even though `condition.star_var` ("s") is a perfectly
+    /// non-empty string and the registry's own gate today checks only
+    /// non-emptiness (`sparql_columns.rs`'s module doc). A version of this
+    /// code that substituted `star_var` for `class_uri` -- exactly what an
+    /// earlier draft of the PyO3 boundary did -- would pass
+    /// `push_filter_resolves_broken_out_column_from_the_real_class_uri`
+    /// identically and only be caught here.
+    #[test]
+    fn push_filter_resolves_no_broken_out_column_when_the_class_is_unresolved() {
+        let sv = test_schema_view();
+        let condition = pushed_geometry_condition();
+        let mut nodes = Vec::new();
+        push_filter(
+            &mut nodes,
+            0,
+            &condition,
+            FilterFacts {
+                schema: &sv,
+                class_uri: None,
+                enforcement: Enforcement::Narrows,
+                optional_side: false,
+            },
+            Vec::new(),
+        );
+        let Op::Filter {
+            broken_out_column, ..
+        } = &nodes[0].op
+        else {
+            panic!("push_filter always pushes a Filter");
+        };
+        assert_eq!(*broken_out_column, None);
     }
 }
 
