@@ -1872,6 +1872,7 @@ pub fn scope_parsed_with_schema_graph(
         &var_to_field,
         &mut star_filters,
         &optional_fields,
+        &var_to_class,
     ) {
         record_loss(cause);
     }
@@ -2517,6 +2518,7 @@ fn collect_filter_conditions(
     var_to_field: &ValueColumns,
     star_filters: &mut StarFilters,
     optional_fields: &HashMap<String, Vec<String>>,
+    var_to_class: &HashMap<String, String>,
 ) -> Option<Inexact> {
     match pattern {
         GraphPattern::Filter { expr, inner } => {
@@ -2540,10 +2542,22 @@ fn collect_filter_conditions(
                 // key, keeping records with *some* element past the bound still
                 // leaves the record's other elements as groups, which only the
                 // `HAVING` removes.
-                extract_equality_from_expr(expr, var_to_field, star_filters, optional_fields);
+                extract_equality_from_expr(
+                    expr,
+                    var_to_field,
+                    star_filters,
+                    optional_fields,
+                    var_to_class,
+                );
                 None
             } else if depth == 0 {
-                if extract_equality_from_expr(expr, var_to_field, star_filters, optional_fields) {
+                if extract_equality_from_expr(
+                    expr,
+                    var_to_field,
+                    star_filters,
+                    optional_fields,
+                    var_to_class,
+                ) {
                     None
                 } else {
                     Some(Inexact::FilterExpression)
@@ -2558,6 +2572,7 @@ fn collect_filter_conditions(
                 var_to_field,
                 star_filters,
                 optional_fields,
+                var_to_class,
             ))
         }
         GraphPattern::LeftJoin {
@@ -2565,14 +2580,21 @@ fn collect_filter_conditions(
             right,
             expression,
         } => {
-            let l =
-                collect_filter_conditions(left, depth, var_to_field, star_filters, optional_fields);
+            let l = collect_filter_conditions(
+                left,
+                depth,
+                var_to_field,
+                star_filters,
+                optional_fields,
+                var_to_class,
+            );
             let r = collect_filter_conditions(
                 right,
                 depth + 1,
                 var_to_field,
                 star_filters,
                 optional_fields,
+                var_to_class,
             );
             // `OPTIONAL { ... FILTER(...) }` does not leave a Filter node:
             // spargebra lifts the condition into the LeftJoin itself. It is not
@@ -2586,17 +2608,22 @@ fn collect_filter_conditions(
         GraphPattern::Join { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Lateral { left, right }
-        | GraphPattern::Minus { left, right } => {
-            collect_filter_conditions(left, depth, var_to_field, star_filters, optional_fields).or(
-                collect_filter_conditions(
-                    right,
-                    depth,
-                    var_to_field,
-                    star_filters,
-                    optional_fields,
-                ),
-            )
-        }
+        | GraphPattern::Minus { left, right } => collect_filter_conditions(
+            left,
+            depth,
+            var_to_field,
+            star_filters,
+            optional_fields,
+            var_to_class,
+        )
+        .or(collect_filter_conditions(
+            right,
+            depth,
+            var_to_field,
+            star_filters,
+            optional_fields,
+            var_to_class,
+        )),
         GraphPattern::Extend { inner, .. }
         | GraphPattern::OrderBy { inner, .. }
         | GraphPattern::Project { inner, .. }
@@ -2605,9 +2632,14 @@ fn collect_filter_conditions(
         | GraphPattern::Slice { inner, .. }
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => {
-            collect_filter_conditions(inner, depth, var_to_field, star_filters, optional_fields)
-        }
+        | GraphPattern::Service { inner, .. } => collect_filter_conditions(
+            inner,
+            depth,
+            var_to_field,
+            star_filters,
+            optional_fields,
+            var_to_class,
+        ),
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => None,
     }
 }
@@ -2649,6 +2681,7 @@ fn extract_equality_from_expr(
     var_to_field: &ValueColumns,
     star_filters: &mut StarFilters,
     optional_fields: &HashMap<String, Vec<String>>,
+    var_to_class: &HashMap<String, String>,
 ) -> bool {
     match expr {
         Expression::Equal(left, right) => {
@@ -2817,8 +2850,20 @@ fn extract_equality_from_expr(
             // Both halves must land: `A && B` with B dropped is a weaker
             // filter, which over-fetches — safe for a prefetch, wrong for an
             // exact plan, and the caller can only tell if it hears about it.
-            let l = extract_equality_from_expr(left, var_to_field, star_filters, optional_fields);
-            let r = extract_equality_from_expr(right, var_to_field, star_filters, optional_fields);
+            let l = extract_equality_from_expr(
+                left,
+                var_to_field,
+                star_filters,
+                optional_fields,
+                var_to_class,
+            );
+            let r = extract_equality_from_expr(
+                right,
+                var_to_field,
+                star_filters,
+                optional_fields,
+                var_to_class,
+            );
             l & r
         }
         // The substring functions. `STRSTARTS(?nm, "BX")` narrows the fetch
@@ -2841,6 +2886,7 @@ fn extract_equality_from_expr(
                         var_to_field,
                         star_filters,
                         optional_fields,
+                        var_to_class,
                     );
                 }
             };
@@ -2903,15 +2949,19 @@ fn extract_equality_from_expr(
 
 /// Lift `geof:sfIntersects` onto a slot with a broken-out geometry column.
 ///
-/// Four gates, each declining rather than approximating: the function has to
+/// Five gates, each declining rather than approximating: the function has to
 /// be `geof:sfIntersects` itself (`geof:area`/`geof:distance` and the other
 /// 41 GeoSPARQL functions are geodesic in `spargeo` and planar in PostGIS on
 /// `geometry(4326)`, so only a topological predicate agrees between the two
 /// routes); the first argument has to resolve, through `var_to_field`, to a
-/// slot path the [`crate::sparql_columns`] registry claims a column for; the
-/// second has to be a literal [`intersects_wkt_from_literal`] accepts (typed
-/// `wktLiteral` in CRS84 — see its doc comment for the two ways a literal
-/// refuses).
+/// slot path; the star variable has to resolve, through `var_to_class`, to a
+/// class (an address nobody can resolve is not a condition — the same rule
+/// `constants_are_the_columns_terms` applies to its own `class_of_star`
+/// lookup, one file over); that `(class_uri, slot_path)` pair has to be one
+/// the [`crate::sparql_columns`] registry claims a column for; the second
+/// argument has to be a literal [`intersects_wkt_from_literal`] accepts
+/// (typed `wktLiteral` in CRS84 — see its doc comment for the two ways a
+/// literal refuses).
 ///
 /// `optional_fields` is unused: unlike `!bound`, a geometry predicate over an
 /// absent optional slot is not a presence check with a different rendering —
@@ -2926,6 +2976,7 @@ fn lift_intersects(
     var_to_field: &ValueColumns,
     star_filters: &mut StarFilters,
     _optional_fields: &HashMap<String, Vec<String>>,
+    var_to_class: &HashMap<String, String>,
 ) -> bool {
     let spargebra::algebra::Function::Custom(node) = function else {
         return false;
@@ -2939,16 +2990,16 @@ fn lift_intersects(
     let Some((star_var, path, _form)) = var_to_field.get(var.as_str()) else {
         return false;
     };
-    // The registry is keyed on `(class_uri, slot_path)`, but no `var_to_class`
-    // map reaches this function — `extract_equality_from_expr`'s signature
-    // (fixed by Task 1) carries only `var_to_field`. Today's registry gate on
-    // `class_uri` is documented (`sparql_columns.rs`) as "non-empty", not
-    // "this class": `star_var` (a SPARQL variable name, always non-empty) is
-    // passed to satisfy that gate as it exists today, not to name a real
-    // class. If the registry ever grows a real per-class check, this call
-    // site needs a real `class_uri` threaded in — this is not that.
+    // The registry is keyed on `(class_uri, slot_path)`. A star the map does
+    // not name is not a condition -- the same refusal `constants_are_the_columns_terms`
+    // makes through `class_of_star.get(star_var).is_some_and(...)` in
+    // `sparql_refine.rs`, and the same shape Task 3's optional-slot lookup
+    // uses: no entry does not default to passing the gate.
+    let Some(class_uri) = var_to_class.get(star_var.as_str()) else {
+        return false;
+    };
     let Some(crate::sparql_columns::BrokenOutColumn::Geometry) =
-        crate::sparql_columns::broken_out_column(star_var.as_str(), path)
+        crate::sparql_columns::broken_out_column(class_uri.as_str(), path)
     else {
         return false;
     };
@@ -4521,6 +4572,85 @@ classes:
                 .iter()
                 .flat_map(|star| star.path_filters.iter())
                 .all(|filter| filter.conditions.is_empty()),
+        );
+    }
+
+    /// `lift_intersects` looks up the real class URI through `var_to_class`,
+    /// not the star variable's own name — and declines when the star is not
+    /// in that map, the same refusal `constants_are_the_columns_terms`
+    /// applies through `class_of_star.get(star_var).is_some_and(...)` in
+    /// `sparql_refine.rs`.
+    ///
+    /// Not reachable through a parsed query: every `star_var` a `PathBinding`
+    /// can name is, by construction, a key of `var_to_class` (both are built
+    /// from the same `stars` in Phase 1 — see the `var_to_class.contains_key`
+    /// check a few lines above `collect_path_bindings`'s call site, which is
+    /// exactly the mechanism that keeps a *path*'s variable out of
+    /// `var_to_field` as a `star_var` in the first place). So this is called
+    /// directly, the same way `sparql_refine.rs`'s empty-disjunction test
+    /// builds an `Expr` by hand for a shape `flatten_or` cannot produce: the
+    /// shape is a legal value of the types involved and the refusal is
+    /// `lift_intersects`'s, not the parser's.
+    ///
+    /// What this does **not** pin, and cannot while `broken_out_column`'s own
+    /// `class_uri` gate stays "non-empty, not which class"
+    /// (`sparql_columns.rs`): a test asserting only that the lift *succeeds*
+    /// on a resolved star cannot distinguish "the real class URI was passed"
+    /// from "the star variable's name was passed instead" — both are
+    /// non-empty strings, and the registry does not (yet) look past that.
+    /// `sf_intersects_lifts_on_a_geometry_slot` already exercises the
+    /// resolved case end to end; this test's job is narrower and sharper:
+    /// pin that an *unresolved* star actually declines, which only holds if
+    /// the lookup is real (a lookup that defaulted to "found" for a missing
+    /// entry would pass every existing test here undetected). Once the
+    /// registry grows a real per-class check, a further test can assert the
+    /// two failure modes ("star unresolved" vs "class resolved but not the
+    /// one the registry wants") disagree — today they cannot, because the
+    /// registry cannot tell them apart either.
+    #[test]
+    fn lift_intersects_declines_a_star_var_to_class_does_not_name() {
+        let var_to_field: ValueColumns = HashMap::from([(
+            "w".to_owned(),
+            (
+                "s".to_owned(),
+                vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+                PushForm::Literal {
+                    datatype: None,
+                    lang: None,
+                    numeric: false,
+                },
+            ),
+        )]);
+        // Deliberately empty: "s" (the only star `var_to_field` names) is not
+        // a key here, as if the builder that would have inserted it never
+        // ran.
+        let var_to_class: HashMap<String, String> = HashMap::new();
+        let mut star_filters: StarFilters = HashMap::new();
+        let optional_fields: HashMap<String, Vec<String>> = HashMap::new();
+
+        let function = spargebra::algebra::Function::Custom(
+            spargebra::term::NamedNode::new_unchecked(SF_INTERSECTS_IRI),
+        );
+        let args = vec![
+            Expression::Variable(spargebra::term::Variable::new("w").unwrap()),
+            Expression::Literal(spargebra::term::Literal::new_typed_literal(
+                "POINT(1 2)",
+                spargebra::term::NamedNode::new_unchecked(WKT_LITERAL_IRI),
+            )),
+        ];
+
+        let lifted = lift_intersects(
+            &function,
+            &args,
+            &var_to_field,
+            &mut star_filters,
+            &optional_fields,
+            &var_to_class,
+        );
+        assert!(!lifted, "an unresolved star must not lift");
+        assert!(
+            star_filters.is_empty(),
+            "nothing should have been pushed either"
         );
     }
 
