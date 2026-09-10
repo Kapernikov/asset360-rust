@@ -848,7 +848,22 @@ classes:
             // `IS NOT NULL AND <>`: absent from `stored` fails the null test,
             // same as it would in SQL.
             FilterCondition::Ne(value) => stored.first().is_some_and(|s| *s != value.as_str()),
-            // `IS NOT PRESENT`: the field carries nothing at all.
+            // `IS NOT PRESENT`. `stored.is_empty()` is the reference answer
+            // for what `!bound` sees *as this harness can express it*:
+            // `null` ("checked, empty") and a missing key ("don't know")
+            // are a real semantic difference in this project, but the
+            // triplifier emits no triple for either, so `stored` cannot
+            // distinguish them and neither can this oracle.
+            //
+            // The real SQL renderer (a later task) is specified to emit
+            // both halves of the check —
+            // `NOT (object_data ? 'field' AND jsonb_typeof(object_data->'field') <> 'null')`
+            // — precisely because key existence alone is wrong for an
+            // explicit null: `object_data ? 'field'` is *true* for a
+            // present-but-null value, so a renderer that checked only that
+            // half would disagree with this oracle on exactly a record
+            // whose slot is explicitly `null` (this harness reports
+            // `NotBound` true there; key-existence-only reports it false).
             FilterCondition::NotBound => stored.is_empty(),
         })
     }

@@ -4190,6 +4190,40 @@ classes:
         assert!(all_stars(&plan).iter().all(|star| star.filters.is_empty()));
     }
 
+    /// `!bound` on a two-hop path does not lift, even though the path is
+    /// fully mandatory (so the *other* gate, "is this slot optional",
+    /// would also decline it here).
+    ///
+    /// `location` -> `longitude` is the same two-hop path
+    /// `test_nested_structure_yields_a_path_binding` pins as a plain
+    /// equality target, reused here under `!bound`. A nested path's
+    /// absence is "the key at this step is missing", a different
+    /// predicate from "the leaf value is absent" -- the renderer only
+    /// ever walks a multi-hop path with `->>`, which has no way to state
+    /// key-presence -- so no `FilterCondition` arm renders it and the gate
+    /// declines regardless of optionality.
+    #[test]
+    fn unbound_on_a_two_hop_path_does_not_lift() {
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:location ?loc . \
+                 ?loc asset360:longitude ?lon . FILTER(!bound(?lon)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        let conditions: Vec<_> = all_stars(&plan)
+            .into_iter()
+            .flat_map(|star| {
+                star.filters
+                    .values()
+                    .flatten()
+                    .chain(star.path_filters.iter().flat_map(|pf| pf.conditions.iter()))
+            })
+            .collect();
+        assert!(conditions.is_empty());
+    }
+
     /// LIMIT must NOT be pushed into the object fetch when an operator has to
     /// see every solution first: the fetch would feed the aggregate / sort /
     /// dedup an arbitrary subset and return a plausible wrong answer with no
