@@ -813,6 +813,57 @@ pub enum FilterCondition {
     /// codepoint collation. The slot's term descriptor says which, so this
     /// carries only the operator and the value.
     Cmp { op: CmpOp, value: String },
+    /// A substring match lifted from `STRSTARTS` / `STRENDS` / `CONTAINS`.
+    ///
+    /// Carries the value the query wrote, *unescaped*: `%` and `_` are
+    /// metacharacters of the renderer's `LIKE`, not of SPARQL, so escaping
+    /// them is the renderer's convention and a pre-built pattern would hide
+    /// the difference between a wildcard and a user searching for `50%`.
+    Like {
+        value: String,
+        anchor: LikeAnchor,
+        /// The query wrapped the *column* in `LCASE(...)`. The renderer emits
+        /// `ILIKE`.
+        ///
+        /// Load-bearing and silent when wrong: the engine leg folds case and
+        /// SQL's `LIKE` does not, so the two routes answer different row sets
+        /// and neither reports anything. `LCASE` on the *constant* is a
+        /// different question and does not set this — see
+        /// `lcase_on_the_constant_does_not_become_case_insensitive`.
+        case_insensitive: bool,
+    },
+    /// `FILTER(?v != "x")` — `expr IS NOT NULL AND expr <> 'x'`.
+    ///
+    /// Not a fifth [`CmpOp`], and the null test in that rendering is why.
+    /// SPARQL's inequality is false for an unbound variable where SQL's `<>`
+    /// on NULL is unknown, so a bare `<>` drops exactly the rows an
+    /// `OPTIONAL` exists to keep. A separate arm makes the renderer state
+    /// the asymmetry instead of inheriting a rendering that ignores it.
+    Ne(String),
+    /// `OPTIONAL { ?s :slot ?x } FILTER(!bound(?x))` — the slot is absent.
+    ///
+    /// Rendered as the negation of the presence check the builder
+    /// deliberately skips for an optional field. No value: absence is not a
+    /// comparison.
+    ///
+    /// Only ever pushed for a one-hop *optional* slot. A required slot
+    /// already carries the positive check, so `!bound` on it selects nothing
+    /// — which the plan cannot say — and a nested path's absence is a
+    /// different predicate from a missing key.
+    NotBound,
+    /// `FILTER(geof:sfIntersects(?wkt, "..."^^geo:wktLiteral))` on a slot the
+    /// broken-out column registry claims.
+    ///
+    /// The WKT body, with a CRS84 prefix stripped. Only CRS84 lifts: `spargeo`
+    /// reads a geometry only from a `wktLiteral`/`geoJSONLiteral` in CRS84
+    /// and returns unbound otherwise, which makes the FILTER silently false —
+    /// so a lifted non-CRS84 geometry would answer rows on the statement
+    /// route where the engine answers none.
+    ///
+    /// `geof:area` and `geof:distance` are deliberately not here: they are
+    /// geodesic in `spargeo` and planar in PostGIS on `geometry(4326)`, so the
+    /// two routes would not agree. Topological predicates do.
+    Intersects { wkt: String },
 }
 
 impl std::fmt::Display for FilterCondition {
@@ -831,15 +882,106 @@ impl std::fmt::Display for FilterCondition {
                     .join(", ")
             ),
             Self::Cmp { op, value } => write!(f, "{} '{value}'", op.as_sql()),
+            Self::Like {
+                value,
+                anchor,
+                case_insensitive,
+            } => {
+                let op = if *case_insensitive { "ILIKE" } else { "LIKE" };
+                let pattern = match anchor {
+                    LikeAnchor::Prefix => format!("{value}%"),
+                    LikeAnchor::Suffix => format!("%{value}"),
+                    LikeAnchor::Anywhere => format!("%{value}%"),
+                };
+                write!(f, "{op} '{pattern}'")
+            }
+            Self::Ne(value) => write!(f, "IS NOT NULL AND <> '{value}'"),
+            Self::NotBound => write!(f, "IS NOT PRESENT"),
+            Self::Intersects { wkt } => write!(f, "INTERSECTS '{wkt}'"),
+        }
+    }
+}
+
+/// The IRI `geof:sfIntersects` parses to, confirmed by printing a parse of
+/// `FILTER(geof:sfIntersects(...))` rather than assumed: it arrives as
+/// `Function::Custom(NamedNode { iri: .. })`, and this is that IRI's text.
+pub(crate) const SF_INTERSECTS_IRI: &str =
+    "http://www.opengis.net/def/function/geosparql/sfIntersects";
+
+/// The GeoSPARQL datatype `geo:wktLiteral`. `spargeo` reads a geometry only
+/// from a literal typed exactly this or `geo:geoJSONLiteral`
+/// (`parse.rs::extract_argument`); anything else — an `xsd:string`, most
+/// obviously — makes the function return unbound, so
+/// `FILTER(geof:sfIntersects(...))` is silently false there. Lifting a
+/// non-`wktLiteral` constant would answer rows on the statement route where
+/// the engine answers none — the quietest possible route disagreement.
+pub(crate) const WKT_LITERAL_IRI: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
+
+/// The only coordinate reference system `spargeo` accepts a leading `<uri>`
+/// prefix for (`parse.rs::parse_wkt_literal`); any other CRS makes it return
+/// `None`. PostGIS transformed the stored value to 4326 on ingest and would
+/// happily match a different CRS's numbers as if they were already in it, so
+/// lifting one here would make the two routes disagree.
+const CRS84_URI: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+
+/// The WKT body a `geof:sfIntersects` constant lifts as, or `None` for either
+/// of the two literal-shaped refusals `spargeo`'s own parser enforces
+/// (`parse.rs::extract_argument`, `parse_wkt_literal`): not typed exactly
+/// `wktLiteral` (this also catches `geoJSONLiteral`, representable in
+/// principle via `ST_GeomFromGeoJSON` but out of scope here — declining
+/// leaves the engine answering it correctly), or prefixed with a CRS other
+/// than CRS84.
+///
+/// Mirrors `parse_wkt_literal`'s trim-then-strip-prefix exactly, short of the
+/// final `Geometry::try_from_wkt_str` — SQL, not this crate, is what
+/// validates the WKT syntax itself. The returned body is therefore
+/// CRS-stripped and trimmed, never re-validated as parseable WKT; the Python
+/// renderer consumes it verbatim.
+pub(crate) fn intersects_wkt_from_literal(literal: &spargebra::term::Literal) -> Option<String> {
+    if literal.datatype().as_str() != WKT_LITERAL_IRI {
+        return None;
+    }
+    let mut value = literal.value().trim();
+    if let Some(rest) = value.strip_prefix('<') {
+        let (system, rest) = rest.split_once('>').unwrap_or((rest, ""));
+        if system != CRS84_URI {
+            return None;
+        }
+        value = rest.trim_start();
+    }
+    Some(value.to_owned())
+}
+
+/// Where a [`FilterCondition::Like`] puts its wildcards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LikeAnchor {
+    /// `STRSTARTS` — `LIKE 'value%'`.
+    Prefix,
+    /// `STRENDS` — `LIKE '%value'`.
+    Suffix,
+    /// `CONTAINS` — `LIKE '%value%'`.
+    Anywhere,
+}
+
+impl LikeAnchor {
+    /// The operator name the PyO3 boundary carries, without the case prefix.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefix => "startswith",
+            Self::Suffix => "endswith",
+            Self::Anywhere => "contains",
         }
     }
 }
 
 /// Ordering operators liftable from a `FILTER` into SQL.
 ///
-/// Deliberately not `!=`: SPARQL's inequality is false for an *unbound*
-/// variable, where SQL's `<>` on NULL is unknown and would drop rows the
-/// query keeps. Equality is already covered by [`FilterCondition::Eq`].
+/// `!=` is not a fifth variant here, even though it lifts: it needs
+/// `expr IS NOT NULL AND expr <> 'x'`, and no ordering comparison needs that
+/// null test — SPARQL's inequality is false for an *unbound* variable, where
+/// SQL's bare `<>` on NULL is unknown and would drop rows the query keeps. See
+/// [`FilterCondition::Ne`] for that separate arm; equality is
+/// [`FilterCondition::Eq`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
     Gt,
@@ -1417,6 +1559,33 @@ pub fn scope_parsed_with_schema_graph(
                         FilterCondition::Eq(v) => identifier_values.push(v),
                         FilterCondition::In(vs) => identifier_values.extend(vs),
                         cmp @ FilterCondition::Cmp { .. } => kept.push(cmp),
+                        // A substring match is not a finite value list either
+                        // — same reasoning as `Cmp` — so it stays a filter
+                        // and the renderer targets `asset360_uri` with LIKE.
+                        like @ FilterCondition::Like { .. } => kept.push(like),
+                        // Nor is `!=`: "not this one value" has no list to
+                        // hoist, so it stays a filter and the renderer's null
+                        // test runs against `asset360_uri` itself.
+                        ne @ FilterCondition::Ne(_) => kept.push(ne),
+                        // `inline_filters` here holds constants seeded from
+                        // triple patterns (Phase 1), never a `!bound` --
+                        // that only ever comes from `FILTER` and lands in
+                        // `star_filters`, handled separately below. Kept
+                        // rather than dropped anyway, on the same "no value
+                        // list to hoist" reasoning as `Ne`, so the match
+                        // stays exhaustive without asserting unreachability
+                        // it cannot prove.
+                        nb @ FilterCondition::NotBound => kept.push(nb),
+                        // Same reasoning again, and doubly unreachable: a
+                        // geometry predicate has no value list to hoist
+                        // either, and `inline_filters` never carries one
+                        // regardless -- `lift_intersects` only ever writes
+                        // into `star_filters` (see its own doc comment),
+                        // and the identifier slot this branch is keyed on is
+                        // never geometry-typed. Kept for the same "match
+                        // stays exhaustive without asserting unreachability
+                        // it cannot prove" reason as `NotBound`.
+                        geo @ FilterCondition::Intersects { .. } => kept.push(geo),
                     }
                 }
                 if !kept.is_empty() {
@@ -1686,7 +1855,25 @@ pub fn scope_parsed_with_schema_graph(
         carried_constants.insert(constant.nested_var.clone());
     }
 
-    if let Some(cause) = collect_filter_conditions(pattern, 0, &var_to_field, &mut star_filters) {
+    // Star variable → its optional slots, for `!bound`'s liftability gate:
+    // a required slot already carries the positive existence check, so
+    // `!bound` on it is unsatisfiable and cannot become a pushed condition.
+    // Built from `stars` (populated above, in Phase 1) rather than from
+    // `star_filters` itself -- `extract_equality_from_expr` only ever sees
+    // the latter, and it does not carry optionality.
+    let optional_fields: HashMap<String, Vec<String>> = stars
+        .iter()
+        .map(|star| (star.variable.clone(), star.optional_fields.clone()))
+        .collect();
+
+    if let Some(cause) = collect_filter_conditions(
+        pattern,
+        0,
+        &var_to_field,
+        &mut star_filters,
+        &optional_fields,
+        &var_to_class,
+    ) {
         record_loss(cause);
     }
     if let Some(cause) = collect_values_filters(pattern, 0, &var_to_field, &mut star_filters) {
@@ -1724,6 +1911,39 @@ pub fn scope_parsed_with_schema_graph(
                             // no value list to hoist, so it stays a filter.
                             cmp @ FilterCondition::Cmp { .. } => {
                                 star.filters.entry(slot.clone()).or_default().push(cmp);
+                            }
+                            // Same reasoning: a substring match has no value
+                            // list to hoist onto `identifier_values`, so it
+                            // stays a filter against `asset360_uri`.
+                            like @ FilterCondition::Like { .. } => {
+                                star.filters.entry(slot.clone()).or_default().push(like);
+                            }
+                            // Same reasoning again: `!=` has no value list
+                            // either, so it stays a filter and the renderer's
+                            // null test runs against `asset360_uri`.
+                            ne @ FilterCondition::Ne(_) => {
+                                star.filters.entry(slot.clone()).or_default().push(ne);
+                            }
+                            // `!bound` cannot actually reach here either:
+                            // its gate requires the slot to be in
+                            // `optional_fields`, and the identifier slot is
+                            // never optional. Handled the same way as `Ne`
+                            // regardless, for the same "no value list"
+                            // reasoning.
+                            nb @ FilterCondition::NotBound => {
+                                star.filters.entry(slot.clone()).or_default().push(nb);
+                            }
+                            // Unreachable in truth, and not just by the
+                            // "no value list" reasoning the other arms give:
+                            // this branch only ever sees a *single*-slot
+                            // path (`<[String; 1]>::try_from(path)`, above),
+                            // and the registry never claims one -- its tail
+                            // is two segments (`sparql_columns.rs`). Handled
+                            // the same way anyway, so the match stays
+                            // exhaustive without asserting a stronger
+                            // unreachability claim than the code proves.
+                            geo @ FilterCondition::Intersects { .. } => {
+                                star.filters.entry(slot.clone()).or_default().push(geo);
                             }
                         }
                     }
@@ -2297,6 +2517,8 @@ fn collect_filter_conditions(
     depth: usize,
     var_to_field: &ValueColumns,
     star_filters: &mut StarFilters,
+    optional_fields: &HashMap<String, Vec<String>>,
+    var_to_class: &HashMap<String, String>,
 ) -> Option<Inexact> {
     match pattern {
         GraphPattern::Filter { expr, inner } => {
@@ -2320,10 +2542,22 @@ fn collect_filter_conditions(
                 // key, keeping records with *some* element past the bound still
                 // leaves the record's other elements as groups, which only the
                 // `HAVING` removes.
-                extract_equality_from_expr(expr, var_to_field, star_filters);
+                extract_equality_from_expr(
+                    expr,
+                    var_to_field,
+                    star_filters,
+                    optional_fields,
+                    var_to_class,
+                );
                 None
             } else if depth == 0 {
-                if extract_equality_from_expr(expr, var_to_field, star_filters) {
+                if extract_equality_from_expr(
+                    expr,
+                    var_to_field,
+                    star_filters,
+                    optional_fields,
+                    var_to_class,
+                ) {
                     None
                 } else {
                     Some(Inexact::FilterExpression)
@@ -2337,6 +2571,8 @@ fn collect_filter_conditions(
                 depth,
                 var_to_field,
                 star_filters,
+                optional_fields,
+                var_to_class,
             ))
         }
         GraphPattern::LeftJoin {
@@ -2344,8 +2580,22 @@ fn collect_filter_conditions(
             right,
             expression,
         } => {
-            let l = collect_filter_conditions(left, depth, var_to_field, star_filters);
-            let r = collect_filter_conditions(right, depth + 1, var_to_field, star_filters);
+            let l = collect_filter_conditions(
+                left,
+                depth,
+                var_to_field,
+                star_filters,
+                optional_fields,
+                var_to_class,
+            );
+            let r = collect_filter_conditions(
+                right,
+                depth + 1,
+                var_to_field,
+                star_filters,
+                optional_fields,
+                var_to_class,
+            );
             // `OPTIONAL { ... FILTER(...) }` does not leave a Filter node:
             // spargebra lifts the condition into the LeftJoin itself. It is not
             // pushable — it decides whether the optional side *matched*, so
@@ -2358,11 +2608,22 @@ fn collect_filter_conditions(
         GraphPattern::Join { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Lateral { left, right }
-        | GraphPattern::Minus { left, right } => {
-            collect_filter_conditions(left, depth, var_to_field, star_filters).or(
-                collect_filter_conditions(right, depth, var_to_field, star_filters),
-            )
-        }
+        | GraphPattern::Minus { left, right } => collect_filter_conditions(
+            left,
+            depth,
+            var_to_field,
+            star_filters,
+            optional_fields,
+            var_to_class,
+        )
+        .or(collect_filter_conditions(
+            right,
+            depth,
+            var_to_field,
+            star_filters,
+            optional_fields,
+            var_to_class,
+        )),
         GraphPattern::Extend { inner, .. }
         | GraphPattern::OrderBy { inner, .. }
         | GraphPattern::Project { inner, .. }
@@ -2371,9 +2632,14 @@ fn collect_filter_conditions(
         | GraphPattern::Slice { inner, .. }
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => {
-            collect_filter_conditions(inner, depth, var_to_field, star_filters)
-        }
+        | GraphPattern::Service { inner, .. } => collect_filter_conditions(
+            inner,
+            depth,
+            var_to_field,
+            star_filters,
+            optional_fields,
+            var_to_class,
+        ),
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => None,
     }
 }
@@ -2414,6 +2680,8 @@ fn extract_equality_from_expr(
     expr: &Expression,
     var_to_field: &ValueColumns,
     star_filters: &mut StarFilters,
+    optional_fields: &HashMap<String, Vec<String>>,
+    var_to_class: &HashMap<String, String>,
 ) -> bool {
     match expr {
         Expression::Equal(left, right) => {
@@ -2433,6 +2701,73 @@ fn extract_equality_from_expr(
                 false
             }
         }
+        Expression::Not(inner) => match inner.as_ref() {
+            // `FILTER(?v != "x")` — spargebra 0.4 spells it `Not(Equal(..))`,
+            // not a dedicated `NotEqual` variant (confirmed by reading
+            // `spargebra::algebra::Expression`, which has no such variant).
+            Expression::Equal(left, right) => {
+                let Some((star_var, field, texts)) = match_var_constant(left, right, var_to_field)
+                    .or_else(|| match_var_constant(right, left, var_to_field))
+                else {
+                    return false;
+                };
+                // An enum constant can select several codes, and "not any of
+                // these" is not one condition — it would need `NOT IN`, which
+                // no `FilterCondition` arm renders. Left to the engine rather
+                // than approximated as a single `<>`.
+                let Ok([only]) = <[String; 1]>::try_from(texts) else {
+                    return false;
+                };
+                star_filters
+                    .entry(star_var)
+                    .or_default()
+                    .entry(field)
+                    .or_default()
+                    .push(FilterCondition::Ne(only));
+                true
+            }
+            // `FILTER(!bound(?x))` — the slot ?x resolves to was never read.
+            // Rendered as the negation of the presence check the builder
+            // already skips for an optional field, so the gate below is not
+            // about whether the check is *expressible* (it always is) but
+            // whether pushing it is *sound*.
+            Expression::Bound(var) => {
+                let Some((star_var, path, _form)) = var_to_field.get(var.as_str()) else {
+                    return false;
+                };
+                if path.len() != 1 {
+                    // A nested path's absence is "the key at this step is
+                    // missing", which is a different predicate from "the
+                    // leaf value is absent" — no `FilterCondition` arm
+                    // renders it, and the renderer only ever walks a
+                    // multi-hop path with `->>`.
+                    return false;
+                }
+                // A required slot already carries the positive existence
+                // check (`object_data ? 'field'`), so on that slot `!bound`
+                // is unsatisfiable and the query selects nothing — which the
+                // plan has no way to state. Checked against `optional_fields`
+                // rather than assumed: an unknown star must decline too, or
+                // a star nobody can resolve would silently lift a presence
+                // check for it.
+                let is_optional = optional_fields
+                    .get(star_var)
+                    .is_some_and(|fields| fields.contains(&path[0]));
+                if !is_optional {
+                    return false;
+                }
+                star_filters
+                    .entry(star_var.clone())
+                    .or_default()
+                    .entry(path.clone())
+                    .or_default()
+                    .push(FilterCondition::NotBound);
+                true
+            }
+            // Every other negation — `!CONTAINS`, `!(A && B)` — is left to
+            // oxigraph.
+            _ => false,
+        },
         Expression::Greater(left, right)
         | Expression::GreaterOrEqual(left, right)
         | Expression::Less(left, right)
@@ -2515,14 +2850,169 @@ fn extract_equality_from_expr(
             // Both halves must land: `A && B` with B dropped is a weaker
             // filter, which over-fetches — safe for a prefetch, wrong for an
             // exact plan, and the caller can only tell if it hears about it.
-            let l = extract_equality_from_expr(left, var_to_field, star_filters);
-            let r = extract_equality_from_expr(right, var_to_field, star_filters);
+            let l = extract_equality_from_expr(
+                left,
+                var_to_field,
+                star_filters,
+                optional_fields,
+                var_to_class,
+            );
+            let r = extract_equality_from_expr(
+                right,
+                var_to_field,
+                star_filters,
+                optional_fields,
+                var_to_class,
+            );
             l & r
         }
-        // Everything else — `!=`, `||`, `!`, REGEX, BOUND, arithmetic — is left
-        // to oxigraph, and the plan is no longer a complete description.
+        // The substring functions. `STRSTARTS(?nm, "BX")` narrows the fetch
+        // the way `LIKE 'BX%'` does, and until now fell to the arm below —
+        // correct, because the engine re-applied it, and unusable on a large
+        // class, because nothing narrowed the fetch and the triple limit
+        // bounds it.
+        Expression::FunctionCall(function, args) => {
+            let anchor = match function {
+                spargebra::algebra::Function::StrStarts => LikeAnchor::Prefix,
+                spargebra::algebra::Function::StrEnds => LikeAnchor::Suffix,
+                spargebra::algebra::Function::Contains => LikeAnchor::Anywhere,
+                // Every other call — REGEX, arithmetic, a custom function —
+                // is left to oxigraph, as before. `geof:sfIntersects` is
+                // handled in `lift_intersects`, called below.
+                _ => {
+                    return lift_intersects(
+                        function,
+                        args,
+                        var_to_field,
+                        star_filters,
+                        optional_fields,
+                        var_to_class,
+                    );
+                }
+            };
+            let [haystack, needle] = args.as_slice() else {
+                return false;
+            };
+            // `LCASE(?nm)` folds the column; a bare `?nm` does not. Anything
+            // else in the haystack position is not a column.
+            let (haystack, case_insensitive) = match haystack {
+                Expression::FunctionCall(spargebra::algebra::Function::LCase, inner) => {
+                    match inner.as_slice() {
+                        [only] => (only, true),
+                        _ => return false,
+                    }
+                }
+                other => (other, false),
+            };
+            let Expression::Variable(var) = haystack else {
+                return false;
+            };
+            let Some((star_var, path, form)) = var_to_field.get(var.as_str()) else {
+                return false;
+            };
+            let Expression::Literal(literal) = needle else {
+                return false;
+            };
+            // Only a plain literal, and only on a column whose stored term is
+            // its own text. `literal_pushable` is the same gate `=` and `IN`
+            // apply through `constant_texts` — it destructures
+            // `PushForm::Literal` and returns `false` for anything else, so an
+            // `Enum` column (which stores a code and translates backwards
+            // through its meanings, where a substring of a *label* matches no
+            // code), an `Iri` column and a `Tagged` one are all refused here
+            // the same way. `constant_texts` itself cannot be reused: it
+            // returns the *codes* an equal constant selects, and a substring
+            // is not a term to translate — there is no `PushForm::Text`
+            // variant to name instead, so the existing gate is reused
+            // directly rather than duplicated.
+            if !literal_pushable(literal, form) {
+                return false;
+            }
+            star_filters
+                .entry(star_var.clone())
+                .or_default()
+                .entry(path.clone())
+                .or_default()
+                .push(FilterCondition::Like {
+                    value: literal.value().to_owned(),
+                    anchor,
+                    case_insensitive,
+                });
+            true
+        }
+        // Everything else — `||`, other negations, REGEX, BOUND, arithmetic —
+        // is left to oxigraph, and the plan is no longer a complete
+        // description. `!=` is handled above, in `Expression::Not`.
         _ => false,
     }
+}
+
+/// Lift `geof:sfIntersects` onto a slot with a broken-out geometry column.
+///
+/// Five gates, each declining rather than approximating: the function has to
+/// be `geof:sfIntersects` itself (`geof:area`/`geof:distance` and the other
+/// 41 GeoSPARQL functions are geodesic in `spargeo` and planar in PostGIS on
+/// `geometry(4326)`, so only a topological predicate agrees between the two
+/// routes); the first argument has to resolve, through `var_to_field`, to a
+/// slot path; the star variable has to resolve, through `var_to_class`, to a
+/// class (an address nobody can resolve is not a condition — the same rule
+/// `constants_are_the_columns_terms` applies to its own `class_of_star`
+/// lookup, one file over); that `(class_uri, slot_path)` pair has to be one
+/// the [`crate::sparql_columns`] registry claims a column for; the second
+/// argument has to be a literal [`intersects_wkt_from_literal`] accepts
+/// (typed `wktLiteral` in CRS84 — see its doc comment for the two ways a
+/// literal refuses).
+///
+/// `optional_fields` is unused: unlike `!bound`, a geometry predicate over an
+/// absent optional slot is not a presence check with a different rendering —
+/// it is an ordinary comparison that the slot's own presence in the row
+/// (`?g asset360:asWKT ?w`, a required triple pattern of the FILTER's own
+/// variable) already has to satisfy for `?w` to be bound at all, the same as
+/// every other arm above this one in `extract_equality_from_expr` that does
+/// not consult it.
+fn lift_intersects(
+    function: &spargebra::algebra::Function,
+    args: &[Expression],
+    var_to_field: &ValueColumns,
+    star_filters: &mut StarFilters,
+    _optional_fields: &HashMap<String, Vec<String>>,
+    var_to_class: &HashMap<String, String>,
+) -> bool {
+    let spargebra::algebra::Function::Custom(node) = function else {
+        return false;
+    };
+    if node.as_str() != SF_INTERSECTS_IRI {
+        return false;
+    }
+    let [Expression::Variable(var), Expression::Literal(literal)] = args else {
+        return false;
+    };
+    let Some((star_var, path, _form)) = var_to_field.get(var.as_str()) else {
+        return false;
+    };
+    // The registry is keyed on `(class_uri, slot_path)`. A star the map does
+    // not name is not a condition -- the same refusal `constants_are_the_columns_terms`
+    // makes through `class_of_star.get(star_var).is_some_and(...)` in
+    // `sparql_refine.rs`, and the same shape Task 3's optional-slot lookup
+    // uses: no entry does not default to passing the gate.
+    let Some(class_uri) = var_to_class.get(star_var.as_str()) else {
+        return false;
+    };
+    let Some(crate::sparql_columns::BrokenOutColumn::Geometry) =
+        crate::sparql_columns::broken_out_column(class_uri.as_str(), path)
+    else {
+        return false;
+    };
+    let Some(wkt) = intersects_wkt_from_literal(literal) else {
+        return false;
+    };
+    star_filters
+        .entry(star_var.clone())
+        .or_default()
+        .entry(path.clone())
+        .or_default()
+        .push(FilterCondition::Intersects { wkt });
+    true
 }
 
 /// How a value at the end of a path compares, or `None` when it cannot be
@@ -3287,6 +3777,8 @@ fn blocks_limit_push(pattern: &GraphPattern) -> bool {
 pub(crate) mod tests {
     use super::*;
 
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
     /// Small hand-written schema shared with the pushdown analyser's tests.
     pub(crate) fn test_schema_view() -> SchemaView {
         use linkml_meta::SchemaDefinition;
@@ -3331,6 +3823,17 @@ enums:
         meaning: eul:GSA
       KSS: {}
       REP_H_D: {}
+  # A second, additive enum — not a change to `SignalKind` — purely so a
+  # `!=` FILTER can be given a constant that selects more than one code.
+  # `AMB1` and `AMB2` deliberately share a `meaning`: `<eul:Amb>` translates
+  # backwards to both, which is exactly the case the `Ne` arm must decline
+  # rather than approximate as a single `<>`.
+  AmbiguousKind:
+    permissible_values:
+      AMB1:
+        meaning: eul:Amb
+      AMB2:
+        meaning: eul:Amb
 
 classes:
   Document:
@@ -3372,6 +3875,12 @@ classes:
         multivalued: true
       kind:
         range: SignalKind
+      # Additive-only slot, paired with `AmbiguousKind` above — exists only
+      # so a test can put a shared-meaning constant on the right-hand side
+      # of `!=` without touching `kind`/`SignalKind`, which ~30 other tests
+      # in this module depend on.
+      ambiguousKind:
+        range: AmbiguousKind
       documents:
         range: Document
         multivalued: true
@@ -3435,6 +3944,25 @@ classes:
       groupsLines:
         range: Line
         multivalued: true
+  # Backs the `geof:sfIntersects` lift tests. The path tail
+  # `[hasGeometry, asWKT]` is exactly what `sparql_columns::broken_out_column`
+  # keys on, so `PostalCode` is the class the registry claims a column for;
+  # `Geometry` is a separate inlined class rather than an attribute on
+  # `PostalCode` directly, matching how the real `postalcode.yaml` spells it
+  # (see `sparql_columns.rs`'s module doc).
+  PostalCode:
+    class_uri: asset360:PostalCode
+    attributes:
+      asset360_uri:
+        identifier: true
+      hasGeometry:
+        range: Geometry
+        inlined: true
+  Geometry:
+    class_uri: asset360:Geometry
+    attributes:
+      asWKT:
+        range: string
 "#;
         let schema: SchemaDefinition =
             p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
@@ -3636,6 +4164,496 @@ classes:
         assert_eq!(conds.len(), 2, "both bounds should be pushed: {conds:?}");
     }
 
+    /// The three substring functions lift, and the `LCASE` wrapper the UI's
+    /// `IContains`/`IStartsWith` operators produce is recognised rather than
+    /// dropped.
+    ///
+    /// Dropping it is the asymmetric failure the differential oracle exists for:
+    /// the engine leg folds case and a `LIKE` does not, so the two routes answer
+    /// different row sets with nothing to say so.
+    #[test]
+    fn substring_filters_lift_with_their_case_folding() {
+        let lifted = |query: &str| -> Vec<FilterCondition> {
+            let scope =
+                sparql_scope(&format!("{PREFIX}{query}"), &test_schema_view()).expect("scopes");
+            all_stars(&scope)
+                .iter()
+                .flat_map(|star| star.filters.values())
+                .flatten()
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(
+            lifted(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(STRSTARTS(?nm, \"BX\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "BX".to_owned(),
+                anchor: LikeAnchor::Prefix,
+                case_insensitive: false,
+            }],
+        );
+        assert_eq!(
+            lifted(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(STRENDS(?nm, \"17\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "17".to_owned(),
+                anchor: LikeAnchor::Suffix,
+                case_insensitive: false,
+            }],
+        );
+        assert_eq!(
+            lifted(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(CONTAINS(?nm, \"X5\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "X5".to_owned(),
+                anchor: LikeAnchor::Anywhere,
+                case_insensitive: false,
+            }],
+        );
+        // `CONTAINS(LCASE(?nm), "x5")` is the idiomatic case-insensitive
+        // spelling, and the only one the UI produces.
+        assert_eq!(
+            lifted(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(CONTAINS(LCASE(?nm), \"x5\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "x5".to_owned(),
+                anchor: LikeAnchor::Anywhere,
+                case_insensitive: true,
+            }],
+        );
+    }
+
+    /// `LCASE` on the *needle* is not the same question, and must not lift.
+    ///
+    /// `CONTAINS(?nm, LCASE("X5"))` folds the constant, not the column, so a
+    /// case-sensitive comparison against a lowered constant is what it asks. An
+    /// `ILIKE` there would match rows the engine excludes.
+    #[test]
+    fn lcase_on_the_constant_does_not_become_case_insensitive() {
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(CONTAINS(?nm, LCASE(\"X5\"))) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope).iter().all(|star| star.filters.is_empty()),
+            "a folded constant is not a folded column"
+        );
+    }
+
+    /// A substring never lifts onto an enum column.
+    ///
+    /// An enum column stores a *code* and translates backwards through its
+    /// meanings — `kind` stores `GSA` or `KSS`, never a label — so a substring
+    /// of a label matches no code and `object_data->>'kind' LIKE '%GS%'` would
+    /// select nothing. If this gate is ever dropped (in `literal_pushable` or
+    /// in the `FunctionCall` arm), the statement route silently starts
+    /// answering an empty (or wrong) result while the engine leg still
+    /// answers real rows — the asymmetric, unreported disagreement between
+    /// the two routes this whole feature exists to prevent.
+    #[test]
+    fn substring_does_not_lift_onto_an_enum_column() {
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
+                 FILTER(CONTAINS(?k, \"GS\")) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope).iter().all(|star| star.filters.is_empty()),
+            "a substring on an enum column must not become a pushed LIKE"
+        );
+    }
+
+    /// `!=` lifts as its own arm, not as a fifth ordering comparison.
+    ///
+    /// The two differ in exactly the rows an OPTIONAL keeps: SPARQL's inequality
+    /// is false for an unbound variable, SQL's `<>` on NULL is unknown. `Ne` is
+    /// separate so the renderer is *made* to state the null test rather than
+    /// inheriting `Cmp`'s rendering, which would drop those rows silently.
+    #[test]
+    fn inequality_lifts_as_its_own_arm() {
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm != \"BX517\") }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        let conditions: Vec<_> = all_stars(&scope)
+            .iter()
+            .flat_map(|star| star.filters.values())
+            .flatten()
+            .cloned()
+            .collect();
+        assert_eq!(conditions, vec![FilterCondition::Ne("BX517".to_owned())]);
+    }
+
+    /// `!=` against a constant that selects more than one code does not lift.
+    ///
+    /// `AmbiguousKind`'s `AMB1` and `AMB2` share one `meaning`, so
+    /// `<eul:Amb>` translates backwards to both codes: "not any of these" is
+    /// not one condition — it would need `NOT IN`, which no `FilterCondition`
+    /// arm renders. The failure mode if this ever regresses is silent wrong
+    /// narrowing: approximating it as a single `<>` against one of the two
+    /// codes would exclude rows the query keeps.
+    #[test]
+    fn inequality_against_a_multi_code_enum_constant_does_not_lift() {
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:ambiguousKind ?k . \
+                 FILTER(?k != <http://ontorail.org/src/Eulynx/Amb>) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope).iter().all(|star| star.filters.is_empty()),
+            "a constant selecting several codes must not become a single pushed Ne"
+        );
+    }
+
+    /// Once `!=` lifts, a `FILTER(?nm != "x")` no longer forces the fetch to
+    /// be inexact, so a `LIMIT` alongside it is safe to push too.
+    ///
+    /// This used to be one of `test_limit_not_pushed_past_holistic_modifiers`'s
+    /// "dropped" cases (`sql_limit` had to be `None`): before this task,
+    /// `!=` fell to the catch-all, the fetch returned an arbitrary row set,
+    /// and pushing the `LIMIT` into it could silently answer fewer rows than
+    /// the query asked for. Pinning the opposite here is the direct evidence
+    /// that the arm actually lifts, not just that it produces a
+    /// `FilterCondition::Ne` in isolation.
+    #[test]
+    fn inequality_filter_does_not_block_limit_pushdown() {
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm != \"BX517\") }} LIMIT 10"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert_eq!(plan.sql_limit, Some(10));
+    }
+
+    /// `OPTIONAL { ... } FILTER(!bound(?x))` lifts to a presence check.
+    ///
+    /// The one thing the builder deliberately skips for an optional field —
+    /// `object_data ? 'field'` — is precisely what this asks for, negated.
+    #[test]
+    fn unbound_on_an_optional_slot_lifts() {
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:name ?nm }} FILTER(!bound(?nm)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        let conditions: Vec<_> = all_stars(&plan)
+            .into_iter()
+            .flat_map(|star| star.filters.values())
+            .flatten()
+            .cloned()
+            .collect();
+        assert_eq!(conditions, vec![FilterCondition::NotBound]);
+    }
+
+    /// `!bound` on a *required* slot does not lift.
+    ///
+    /// The star already carries an existence check for it, so the query
+    /// selects nothing — and "nothing" is not a condition the plan can
+    /// state. Lifting a presence check here would render a contradiction and
+    /// answer zero rows for the right reason by accident; leaving it to the
+    /// engine answers zero rows for the reason the query gives.
+    #[test]
+    fn unbound_on_a_required_slot_does_not_lift() {
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(!bound(?nm)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(all_stars(&plan).iter().all(|star| star.filters.is_empty()));
+    }
+
+    /// `!bound` on a two-hop path does not lift, even though the path is
+    /// fully mandatory (so the *other* gate, "is this slot optional",
+    /// would also decline it here).
+    ///
+    /// `location` -> `longitude` is the same two-hop path
+    /// `test_nested_structure_yields_a_path_binding` pins as a plain
+    /// equality target, reused here under `!bound`. A nested path's
+    /// absence is "the key at this step is missing", a different
+    /// predicate from "the leaf value is absent" -- the renderer only
+    /// ever walks a multi-hop path with `->>`, which has no way to state
+    /// key-presence -- so no `FilterCondition` arm renders it and the gate
+    /// declines regardless of optionality.
+    #[test]
+    fn unbound_on_a_two_hop_path_does_not_lift() {
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:location ?loc . \
+                 ?loc asset360:longitude ?lon . FILTER(!bound(?lon)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        let conditions: Vec<_> = all_stars(&plan)
+            .into_iter()
+            .flat_map(|star| {
+                star.filters
+                    .values()
+                    .flatten()
+                    .chain(star.path_filters.iter().flat_map(|pf| pf.conditions.iter()))
+            })
+            .collect();
+        assert!(conditions.is_empty());
+    }
+
+    /// `geof:sfIntersects` over a slot with a broken-out geometry column
+    /// lifts.
+    #[test]
+    fn sf_intersects_lifts_on_a_geometry_slot() {
+        const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                            PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
+        let path_conditions = |query: &str| -> Vec<FilterCondition> {
+            let scope = sparql_scope(&format!("{PREFIX}{GEOF}{query}"), &test_schema_view())
+                .expect("scopes");
+            scope
+                .root
+                .all_stars()
+                .iter()
+                .flat_map(|star| star.path_filters.iter())
+                .flat_map(|filter| filter.conditions.iter())
+                .cloned()
+                .collect()
+        };
+
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+        assert_eq!(
+            path_conditions(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:PostalCode ; asset360:hasGeometry ?g . \
+                 ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \"{box_wkt}\"^^geo:wktLiteral)) }}"
+            )),
+            vec![FilterCondition::Intersects {
+                wkt: box_wkt.to_owned()
+            }],
+        );
+        // A CRS84 prefix is accepted and stripped; the SQL side takes a bare
+        // WKT.
+        assert_eq!(
+            path_conditions(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:PostalCode ; asset360:hasGeometry ?g . \
+                 ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \
+                 \"<http://www.opengis.net/def/crs/OGC/1.3/CRS84> {box_wkt}\"^^geo:wktLiteral)) }}"
+            )),
+            vec![FilterCondition::Intersects {
+                wkt: box_wkt.to_owned()
+            }],
+        );
+        // An xsd:string makes spargeo return unbound, so the engine answers
+        // no rows. Lifting it would make SQL answer rows instead -- the
+        // quietest possible route disagreement.
+        assert!(
+            path_conditions(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:PostalCode ; asset360:hasGeometry ?g . \
+                 ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \"{box_wkt}\")) }}"
+            ))
+            .is_empty(),
+        );
+        // A different CRS is rejected by spargeo, so it must not lift
+        // either.
+        assert!(
+            path_conditions(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:PostalCode ; asset360:hasGeometry ?g . \
+                 ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \
+                 \"<http://www.opengis.net/def/crs/EPSG/0/31370> {box_wkt}\"^^geo:wktLiteral)) }}"
+            ))
+            .is_empty(),
+        );
+    }
+
+    /// A `geoJSONLiteral` constant declines even though the shape is
+    /// otherwise identical to a lifting `wktLiteral` call. `spargeo` reads a
+    /// geometry from `geoJSONLiteral` too (`parse.rs::extract_argument`), so
+    /// this is not the "unbound" gate above -- it is deliberately out of
+    /// scope, so the fetch must not narrow on the strength of a datatype
+    /// this task never validates against `ST_GeomFromGeoJSON`.
+    #[test]
+    fn sf_intersects_on_a_geojson_literal_does_not_lift() {
+        const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                            PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}{GEOF}SELECT ?s WHERE {{ ?s a asset360:PostalCode ; \
+                 asset360:hasGeometry ?g . ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfIntersects(?w, \
+                 \"{{\\\"type\\\":\\\"Point\\\",\\\"coordinates\\\":[1,2]}}\"^^geo:geoJSONLiteral)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope)
+                .iter()
+                .flat_map(|star| star.path_filters.iter())
+                .all(|filter| filter.conditions.is_empty()),
+        );
+    }
+
+    /// `geof:sfIntersects` on a slot the registry does not claim a column
+    /// for does not lift, even though the function, the constant and its
+    /// datatype are all exactly the ones that lift on `PostalCode`.
+    ///
+    /// Isolates the registry gate from the literal-validity gates the other
+    /// tests here isolate: `TunnelComplex.hasName` is an ordinary string
+    /// slot, and `sparql_columns::broken_out_column` claims no column for
+    /// it.
+    #[test]
+    fn sf_intersects_on_a_slot_the_registry_does_not_claim_does_not_lift() {
+        const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                            PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}{GEOF}SELECT ?s WHERE {{ ?s a asset360:TunnelComplex ; \
+                 asset360:hasName ?w . \
+                 FILTER(geof:sfIntersects(?w, \"POINT(1 2)\"^^geo:wktLiteral)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope)
+                .iter()
+                .all(|star| star.filters.is_empty() && star.path_filters.is_empty()),
+        );
+    }
+
+    /// A different custom function, over the same slot and the same
+    /// `wktLiteral` constant, does not lift: `geof:sfIntersects` is the only
+    /// spelling this task recognises.
+    #[test]
+    fn a_different_function_name_does_not_lift() {
+        const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                            PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
+        let scope = sparql_scope(
+            &format!(
+                "{PREFIX}{GEOF}SELECT ?s WHERE {{ ?s a asset360:PostalCode ; \
+                 asset360:hasGeometry ?g . ?g asset360:asWKT ?w . \
+                 FILTER(geof:sfWithin(?w, \"POINT(1 2)\"^^geo:wktLiteral)) }}"
+            ),
+            &test_schema_view(),
+        )
+        .expect("scopes");
+        assert!(
+            all_stars(&scope)
+                .iter()
+                .flat_map(|star| star.path_filters.iter())
+                .all(|filter| filter.conditions.is_empty()),
+        );
+    }
+
+    /// `lift_intersects` looks up the real class URI through `var_to_class`,
+    /// not the star variable's own name — and declines when the star is not
+    /// in that map, the same refusal `constants_are_the_columns_terms`
+    /// applies through `class_of_star.get(star_var).is_some_and(...)` in
+    /// `sparql_refine.rs`.
+    ///
+    /// Not reachable through a parsed query: every `star_var` a `PathBinding`
+    /// can name is, by construction, a key of `var_to_class` (both are built
+    /// from the same `stars` in Phase 1 — see the `var_to_class.contains_key`
+    /// check a few lines above `collect_path_bindings`'s call site, which is
+    /// exactly the mechanism that keeps a *path*'s variable out of
+    /// `var_to_field` as a `star_var` in the first place). So this is called
+    /// directly, the same way `sparql_refine.rs`'s empty-disjunction test
+    /// builds an `Expr` by hand for a shape `flatten_or` cannot produce: the
+    /// shape is a legal value of the types involved and the refusal is
+    /// `lift_intersects`'s, not the parser's.
+    ///
+    /// What this does **not** pin, and cannot while `broken_out_column`'s own
+    /// `class_uri` gate stays "non-empty, not which class"
+    /// (`sparql_columns.rs`): a test asserting only that the lift *succeeds*
+    /// on a resolved star cannot distinguish "the real class URI was passed"
+    /// from "the star variable's name was passed instead" — both are
+    /// non-empty strings, and the registry does not (yet) look past that.
+    /// `sf_intersects_lifts_on_a_geometry_slot` already exercises the
+    /// resolved case end to end; this test's job is narrower and sharper:
+    /// pin that an *unresolved* star actually declines, which only holds if
+    /// the lookup is real (a lookup that defaulted to "found" for a missing
+    /// entry would pass every existing test here undetected). Once the
+    /// registry grows a real per-class check, a further test can assert the
+    /// two failure modes ("star unresolved" vs "class resolved but not the
+    /// one the registry wants") disagree — today they cannot, because the
+    /// registry cannot tell them apart either.
+    #[test]
+    fn lift_intersects_declines_a_star_var_to_class_does_not_name() {
+        let var_to_field: ValueColumns = HashMap::from([(
+            "w".to_owned(),
+            (
+                "s".to_owned(),
+                vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+                PushForm::Literal {
+                    datatype: None,
+                    lang: None,
+                    numeric: false,
+                },
+            ),
+        )]);
+        // Deliberately empty: "s" (the only star `var_to_field` names) is not
+        // a key here, as if the builder that would have inserted it never
+        // ran.
+        let var_to_class: HashMap<String, String> = HashMap::new();
+        let mut star_filters: StarFilters = HashMap::new();
+        let optional_fields: HashMap<String, Vec<String>> = HashMap::new();
+
+        let function = spargebra::algebra::Function::Custom(
+            spargebra::term::NamedNode::new_unchecked(SF_INTERSECTS_IRI),
+        );
+        let args = vec![
+            Expression::Variable(spargebra::term::Variable::new("w").unwrap()),
+            Expression::Literal(spargebra::term::Literal::new_typed_literal(
+                "POINT(1 2)",
+                spargebra::term::NamedNode::new_unchecked(WKT_LITERAL_IRI),
+            )),
+        ];
+
+        let lifted = lift_intersects(
+            &function,
+            &args,
+            &var_to_field,
+            &mut star_filters,
+            &optional_fields,
+            &var_to_class,
+        );
+        assert!(!lifted, "an unresolved star must not lift");
+        assert!(
+            star_filters.is_empty(),
+            "nothing should have been pushed either"
+        );
+    }
+
     /// LIMIT must NOT be pushed into the object fetch when an operator has to
     /// see every solution first: the fetch would feed the aggregate / sort /
     /// dedup an arbitrary subset and return a plausible wrong answer with no
@@ -3672,11 +4690,6 @@ classes:
                 "dropped REGEX filter",
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(REGEX(?nm, \"^BX\")) } LIMIT 10",
-            ),
-            (
-                "dropped != filter",
-                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-                 FILTER(?nm != \"BX517\") } LIMIT 10",
             ),
             (
                 "unknown predicate",

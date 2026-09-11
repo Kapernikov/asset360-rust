@@ -698,7 +698,7 @@ classes:
 /// than the mislabeling.
 #[cfg(all(test, feature = "sparql-endpoint"))]
 mod pushed_filters_match_sparql {
-    use crate::sparql_scoper::{FilterCondition, sparql_scope};
+    use crate::sparql_scoper::{FilterCondition, LikeAnchor, sparql_scope};
     use linkml_runtime::{LinkMLInstance, load_json_str};
     use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::schemaview::SchemaView;
@@ -829,7 +829,90 @@ classes:
                     _ => *s <= value.as_str(),
                 })
             }
+            FilterCondition::Like {
+                value,
+                anchor,
+                case_insensitive,
+            } => stored.iter().any(|s| {
+                let (haystack, needle) = if *case_insensitive {
+                    (s.to_lowercase(), value.to_lowercase())
+                } else {
+                    (s.to_string(), value.clone())
+                };
+                match anchor {
+                    LikeAnchor::Prefix => haystack.starts_with(&needle),
+                    LikeAnchor::Suffix => haystack.ends_with(&needle),
+                    LikeAnchor::Anywhere => haystack.contains(&needle),
+                }
+            }),
+            // `IS NOT NULL AND <>`: absent from `stored` fails the null test,
+            // same as it would in SQL.
+            FilterCondition::Ne(value) => stored.first().is_some_and(|s| *s != value.as_str()),
+            // `IS NOT PRESENT`. `stored.is_empty()` is the reference answer
+            // for what `!bound` sees *as this harness can express it*:
+            // `null` ("checked, empty") and a missing key ("don't know")
+            // are a real semantic difference in this project, but the
+            // triplifier emits no triple for either, so `stored` cannot
+            // distinguish them and neither can this oracle.
+            //
+            // The real SQL renderer (a later task) is specified to emit
+            // both halves of the check —
+            // `NOT (object_data ? 'field' AND jsonb_typeof(object_data->'field') <> 'null')`
+            // — precisely because key existence alone is wrong for an
+            // explicit null: `object_data ? 'field'` is *true* for a
+            // present-but-null value, so a renderer that checked only that
+            // half would disagree with this oracle on exactly a record
+            // whose slot is explicitly `null` (this harness reports
+            // `NotBound` true there; key-existence-only reports it false).
+            FilterCondition::NotBound => stored.is_empty(),
+            // The same function table `geosparql_evaluator` registers into
+            // oxigraph (`spargeo::GEOSPARQL_EXTENSION_FUNCTIONS`), so this
+            // oracle can never drift from what the engine leg itself
+            // decides for `geof:sfIntersects` -- see that function's doc
+            // comment for why a plain string reads no geometry at all.
+            //
+            // Unreachable through `every_pushed_constant_answers_what_sparql_answers`'s
+            // grid as it stands today: that grid only ever consults
+            // `star.filters` (single-hop), and `Intersects` is at least two
+            // hops by construction (`sparql_columns.rs`'s registry tail), so
+            // it only ever lands in `star.path_filters`. Real rather than a
+            // placeholder anyway -- a caller who does wire a
+            // geometry-bearing fixture into the grid gets a correct answer,
+            // not a silent pass.
+            FilterCondition::Intersects { wkt } => {
+                stored.iter().any(|s| geometry_intersects(s, wkt))
+            }
         })
+    }
+
+    /// The real `geof:sfIntersects`, called directly against two `wktLiteral`
+    /// terms built from plain WKT text -- the same function
+    /// `geosparql_evaluator` wires into oxigraph, so `rendering_matches`'s
+    /// `Intersects` arm can be checked against the engine's own answer rather
+    /// than a hand-rolled approximation of one.
+    ///
+    /// `None` (an unbound result -- neither term parses, or the datatype is
+    /// wrong) reads as `false`: the same "silently no rows" answer
+    /// `FILTER(geof:sfIntersects(...))` gives SPARQL itself.
+    fn geometry_intersects(stored: &str, wkt: &str) -> bool {
+        let datatype =
+            spargebra::term::NamedNode::new_unchecked(crate::sparql_scoper::WKT_LITERAL_IRI);
+        let a = spargebra::term::Term::Literal(spargebra::term::Literal::new_typed_literal(
+            stored,
+            datatype.clone(),
+        ));
+        let b = spargebra::term::Term::Literal(spargebra::term::Literal::new_typed_literal(
+            wkt, datatype,
+        ));
+        let sf_intersects = spargeo::GEOSPARQL_EXTENSION_FUNCTIONS
+            .iter()
+            .find(|(name, _)| name.as_str() == crate::sparql_scoper::SF_INTERSECTS_IRI)
+            .map(|(_, function)| function)
+            .expect("spargeo ships geof:sfIntersects");
+        match sf_intersects(&[a, b]) {
+            Some(spargebra::term::Term::Literal(result)) => result.value() == "true",
+            _ => false,
+        }
     }
 
     #[test]

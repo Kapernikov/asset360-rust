@@ -81,7 +81,7 @@ use spargebra::term::{GroundTerm, NamedNodePattern, Term, TermPattern, TriplePat
 
 pub use crate::sparql_ops::SlotReading;
 use crate::sparql_plan::{LedgerError, Obligation, ObligationId, obligation_of_triple, shorten};
-use crate::sparql_scoper::{FilterCondition, PushForm, ScopeError, literal_pushable};
+use crate::sparql_scoper::{FilterCondition, LikeAnchor, PushForm, ScopeError, literal_pushable};
 
 /// Index into [`Plan::nodes`]. Printed as `n0`, `n1`, ... so a reader can
 /// follow a node's inputs by eye, the way `o0`, `o1` work for obligations.
@@ -195,11 +195,12 @@ impl QueryForm {
 /// A comparison, as the query wrote it.
 ///
 /// Wider than [`crate::sparql_scoper::CmpOp`] on purpose. That type is the
-/// *pushable* set and deliberately excludes `!=`, because SPARQL's inequality
-/// is false for an unbound variable where SQL's `<>` on NULL is unknown and
-/// would drop rows the query keeps. A naive plan has to hold the comparison
-/// the query wrote whether or not it can be pushed, so `Ne` is representable
-/// here and declined by [`Expr::to_sql`].
+/// four ordering comparisons only; `!=` maps to [`FilterCondition::Ne`]
+/// directly rather than through a `CmpOp`, because its renderer owes an extra
+/// `IS NOT NULL` that an ordering comparison does not -- see
+/// [`CompareOp::as_condition`]. A naive plan has to hold the comparison the
+/// query wrote regardless, so `Ne` is representable here whether or not the
+/// rule below it can push it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
     Eq,
@@ -215,20 +216,26 @@ impl CompareOp {
     /// there is one.
     ///
     /// The one mapping from SPARQL's comparison vocabulary to the renderer's,
-    /// shared by [`Expr::to_sql`] and by the `HAVING` lowering. `!=` has no
-    /// mapping, and that is not an oversight: SPARQL's inequality is false for
-    /// an unbound variable where SQL's `<>` on NULL is unknown, and the two
-    /// disagree about exactly the rows an `OPTIONAL` keeps and the groups whose
-    /// aggregate is unbound.
+    /// shared by [`Expr::to_sql`] and by the `HAVING` lowering.
+    ///
+    /// `!=` maps to [`FilterCondition::Ne`], and what that owes the renderer
+    /// is not the same as `<>`: SPARQL's inequality is false for an unbound
+    /// variable where SQL's `<>` on `NULL` is unknown, so a bare `<>` drops
+    /// exactly the rows an `OPTIONAL` keeps and the groups whose aggregate is
+    /// unbound. The renderer has to compensate -- `expr IS NOT NULL AND expr
+    /// <> %s` -- which is why `Ne` is its own [`FilterCondition`] arm rather
+    /// than `Cmp` with an operator string of `"<>"`: a renderer reading `Cmp`
+    /// has no way to know it owes the extra `IS NOT NULL`, while a renderer
+    /// reading `Ne` cannot render it without supplying one.
     pub fn as_condition(&self, value: String) -> Option<FilterCondition> {
         use crate::sparql_scoper::CmpOp;
         let op = match self {
             Self::Eq => return Some(FilterCondition::Eq(value)),
+            Self::Ne => return Some(FilterCondition::Ne(value)),
             Self::Lt => CmpOp::Lt,
             Self::Lte => CmpOp::Lte,
             Self::Gt => CmpOp::Gt,
             Self::Gte => CmpOp::Gte,
-            Self::Ne => return None,
         };
         Some(FilterCondition::Cmp { op, value })
     }
@@ -283,6 +290,24 @@ pub enum Expr {
         /// [`SlotReading`]; without it the address is ambiguous on any
         /// multivalued slot.
         reading: SlotReading,
+        /// Whether the scan that reads this slot requires the value or only
+        /// allows it. See [`SlotPresence`].
+        ///
+        /// Carried the same way `reading` already is, rather than re-derived
+        /// from the plan when a rule needs it: the fact lives on the
+        /// [`ScanSlot`] a scan reads, and `sparql_rules::Visible::collect`
+        /// already visits every such slot while building a
+        /// `sparql_rules::SlotBinding` -- it used to read `slot.presence` and
+        /// then drop it. A `!bound` filter is sound to push only on an
+        /// `Optional` slot (a `Required` one's scan already enforces
+        /// existence, so `!bound` on it is unsatisfiable and the plan has no
+        /// way to state that), and that question is asked once a variable has
+        /// already become a slot -- inside [`Expr::to_sql`], which does not
+        /// see the scan, only the expression. Riding along on `Expr::Slot` is
+        /// what makes the fact available there without widening `to_sql`'s
+        /// own signature, the way `numeric` and `right_multivalued` already
+        /// ride on other join and scan facts elsewhere in this crate.
+        presence: SlotPresence,
     },
     Compare {
         op: CompareOp,
@@ -334,6 +359,197 @@ pub struct SqlCondition {
     /// ignores this renders a containment test as an equality on an array,
     /// which matches nothing.
     pub reading: SlotReading,
+}
+
+/// A condition SQL can ask whose shape is a *tree* rather than a conjunction.
+///
+/// The representation `FILTER(A || B)` needed and did not have. Every
+/// [`SqlCondition`] a filter operator carries is implicitly one conjunct of an
+/// implicitly conjunctive list -- `_OpScan.filters` on the Python side is
+/// `slot -> [conditions]` -- so a disjunction had nowhere to go: it was
+/// accepted, scoped, and never lifted. That is not a slow query but a failed
+/// one, because a filter that does not narrow makes the fetch read the whole
+/// class and the engine leg is bounded by `TripleLimitExceeded`.
+///
+/// **A contract, not an internal detail.** A PyO3 class mirrors it and
+/// `sql_builder.py` renders it, so the shape is read in two other repos.
+/// Three things about it are load-bearing:
+///
+/// * **The leaf is an [`SqlCondition`] plus the physical facts a renderer
+///   needs**, rather than a slot path and an operator string. One shape for
+///   "a condition SQL can ask" means a leaf cannot drift from what
+///   [`Expr::to_sql`] produces -- and `numeric` rides on the *leaf* because
+///   `?nm = "BX517" || ?len > 10` is one operator whose two branches disagree
+///   about it. A per-operator flag would cast one of them wrong, and
+///   comparing a number as text makes `'9' >= '10'` true.
+/// * **`All` and `Any` are n-ary and never empty.** `Any([])` is `FALSE`: a
+///   pushed condition that selects *nothing* makes the engine re-run the query
+///   over no records and answer empty to a query that has an answer, which is
+///   the one direction a pushed condition is not free in. `to_sql_tree`
+///   declines an empty branch list rather than emitting one.
+/// * **A consumer must refuse a node it does not know.** There is no
+///   "unknown condition" node and no wildcard in the walks below, so a new
+///   [`FilterCondition`] arm or a new node kind is a compile error at every
+///   consumer in this crate rather than a branch silently skipped -- and a
+///   silently skipped branch of a disjunction narrows the answer to the other
+///   branch.
+///
+/// **`Not` is representable and is not produced today**, deliberately. SQL's
+/// three-valued logic makes `NOT (col = 'x')` *unknown* rather than true where
+/// the column is NULL, so a negated subtree drops exactly the rows a narrowing
+/// fetch has to keep -- the same debt [`FilterCondition::Ne`] pays with an
+/// explicit `IS NOT NULL`, which a renderer reading a bare `Not` has no way to
+/// know it owes. Negation therefore reaches SQL as a *leaf* (`Ne`,
+/// `NotBound`), whose renderer knows what it owes. The second reason is the
+/// reading weakening a narrowing pass applies (see
+/// `sparql_ops::reading_for_enforcement`): relaxing a leaf from "the element
+/// this row bound" to "some element of the array" only relaxes the whole
+/// condition under monotone connectives, and `Not` is not one. A producer of
+/// `Not` owes an answer to both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionTree {
+    /// Every branch holds. Non-empty.
+    All(Vec<ConditionTree>),
+    /// Some branch holds. Non-empty -- see the type's doc comment.
+    Any(Vec<ConditionTree>),
+    /// The branch does not hold. Never produced by [`Expr::to_sql_tree`]; see
+    /// the type's doc comment for the two things a producer owes first.
+    Not(Box<ConditionTree>),
+    Leaf(ConditionLeaf),
+}
+
+/// One condition at the bottom of a [`ConditionTree`], with the physical facts
+/// the address does not carry.
+///
+/// `numeric` is here rather than on the operator because the branches of one
+/// disjunction name different slots: see [`ConditionTree`]'s doc comment.
+/// `reading` is already inside the [`SqlCondition`], for the same reason it is
+/// there for a single filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionLeaf {
+    pub condition: SqlCondition,
+    /// Whether the value compares as a number rather than as text.
+    ///
+    /// Resolved where the schema is -- [`Expr::to_sql_tree`] -- through the
+    /// same `numeric_at_path` a single filter's lowering asks, so the two
+    /// cannot disagree about a column.
+    pub numeric: bool,
+    /// Whether this leaf's slot has an indexed physical column behind it,
+    /// resolved against the *real* class URI at the same point `numeric` is.
+    ///
+    /// A leaf, not the whole tree, because branches of one disjunction can
+    /// name different slots -- `?nm = "BX517" || geof:sfIntersects(?w, ...)`
+    /// is one operator whose branches disagree about this exactly the way
+    /// they disagree about `numeric`. Resolved here (`tree_shape_unchecked`,
+    /// which already has `class_of_star` in scope to compute `numeric`)
+    /// rather than downstream from `star_var`, because a resolution carried
+    /// on the leaf is a fact a later consumer reads rather than re-derives
+    /// from a value that is not what the registry's parameter name promises
+    /// -- see the PyO3 boundary's fix history for what re-deriving it from
+    /// `star_var` cost.
+    pub broken_out_column: Option<crate::sparql_columns::BrokenOutColumn>,
+}
+
+impl ConditionTree {
+    /// Every leaf, left to right.
+    ///
+    /// The walk every consumer of the tree needs and the reason `Not` is a
+    /// node rather than a flag: a check that has to hold of each leaf --
+    /// "its star is scanned", "it does not read a collection as a column" --
+    /// asks it here rather than re-implementing the recursion, and cannot
+    /// therefore forget a branch.
+    pub fn leaves(&self) -> Vec<&ConditionLeaf> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a ConditionLeaf>) {
+        match self {
+            Self::All(branches) | Self::Any(branches) => {
+                for branch in branches {
+                    branch.collect_leaves(out);
+                }
+            }
+            Self::Not(inner) => inner.collect_leaves(out),
+            Self::Leaf(leaf) => out.push(leaf),
+        }
+    }
+
+    /// The one star every leaf names, or `None` when the leaves name several
+    /// (or none at all).
+    ///
+    /// **The boundary of what a tree may lift, and it is a hard refusal.** A
+    /// disjunction spanning two stars cannot narrow either star's fetch
+    /// independently: the branches only separate after the join, so rendering
+    /// one side would answer a different question and rendering both as a
+    /// conjunction a narrower one. Such a filter stays unlifted and the engine
+    /// finishes it.
+    ///
+    /// One function rather than a check in `to_sql_tree` and a second
+    /// derivation where the operator names its star: a derivation performed
+    /// twice is how an operator comes to disagree with the tree it carries.
+    pub fn star(&self) -> Option<&str> {
+        let leaves = self.leaves();
+        let (first, rest) = leaves.split_first()?;
+        let star = first.condition.star_var.as_str();
+        rest.iter()
+            .all(|leaf| leaf.condition.star_var == star)
+            .then_some(star)
+    }
+
+    /// The same tree with every leaf rewritten.
+    ///
+    /// For the one physical fact the lowering rather than the expression
+    /// decides: whether a narrowing pass, having dropped the fan-out, still
+    /// has an element for a leaf to name. Sound only because `All` and `Any`
+    /// are monotone in their branches -- see this type's note on `Not`.
+    pub fn map_leaves(&self, rewrite: &impl Fn(&ConditionLeaf) -> ConditionLeaf) -> Self {
+        let branches = |branches: &[Self]| -> Vec<Self> {
+            branches
+                .iter()
+                .map(|branch| branch.map_leaves(rewrite))
+                .collect()
+        };
+        match self {
+            Self::All(parts) => Self::All(branches(parts)),
+            Self::Any(parts) => Self::Any(branches(parts)),
+            Self::Not(inner) => Self::Not(Box::new(inner.map_leaves(rewrite))),
+            Self::Leaf(leaf) => Self::Leaf(rewrite(leaf)),
+        }
+    }
+}
+
+impl fmt::Display for ConditionTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let joined = |f: &mut fmt::Formatter<'_>, branches: &[Self], sep: &str| -> fmt::Result {
+            f.write_str("(")?;
+            for (index, branch) in branches.iter().enumerate() {
+                if index > 0 {
+                    write!(f, " {sep} ")?;
+                }
+                write!(f, "{branch}")?;
+            }
+            f.write_str(")")
+        };
+        match self {
+            Self::All(branches) => joined(f, branches, "AND"),
+            Self::Any(branches) => joined(f, branches, "OR"),
+            Self::Not(inner) => write!(f, "NOT {inner}"),
+            // Both physical facts the leaf carries are printed, the way the
+            // single-condition line prints them: a printout that hid them
+            // would hide what a renderer depends on, and inside a tree they
+            // differ from branch to branch.
+            Self::Leaf(leaf) => write!(
+                f,
+                "{}{}{} {}",
+                leaf.condition.slot_path.join("."),
+                leaf.condition.reading,
+                if leaf.numeric { "[num]" } else { "" },
+                leaf.condition.condition
+            ),
+        }
+    }
 }
 
 impl Expr {
@@ -439,6 +655,7 @@ impl Expr {
                     star_var,
                     slot_path,
                     reading,
+                    ..
                 } = slot
                 else {
                     return None;
@@ -455,6 +672,7 @@ impl Expr {
                     star_var,
                     slot_path,
                     reading,
+                    ..
                 } = value.as_ref()
                 else {
                     return None;
@@ -473,17 +691,191 @@ impl Expr {
                     reading: *reading,
                 }])
             }
-            // A disjunction is not a conjunction of conditions, and a
-            // negation is the `!=` problem one level up. Both are left to the
-            // engine until there is a rule that renders them as one condition
-            // rather than several.
-            Self::Or(_)
-            | Self::Not(_)
-            | Self::Var(_)
-            | Self::Literal(_)
-            | Self::Slot { .. }
-            | Self::Function { .. }
-            | Self::Opaque(_) => None,
+            // `!=` -- spargebra has no `NotEqual` variant (confirmed by
+            // reading `spargebra::algebra::Expression`), so `From<&Expression>
+            // for Expr` spells it `Not(Compare { op: Eq, .. })` the same way
+            // `sparql_scoper::extract_equality_from_expr`'s `Expression::Not`
+            // arm reads `Expression::Not(Expression::Equal(..))`. Without this
+            // arm `CompareOp::Ne` is dead: nothing else ever builds an
+            // `Expr::Compare { op: Ne, .. }` from a parsed query, only from a
+            // test that constructs one by hand.
+            Self::Not(inner) => match inner.as_ref() {
+                Self::Compare {
+                    op: CompareOp::Eq,
+                    left,
+                    right,
+                } => {
+                    let (slot, value) = slot_and_value(left, right)?;
+                    let condition = CompareOp::Ne.as_condition(value)?;
+                    let Self::Slot {
+                        star_var,
+                        slot_path,
+                        reading,
+                        ..
+                    } = slot
+                    else {
+                        return None;
+                    };
+                    Some(vec![SqlCondition {
+                        star_var: star_var.clone(),
+                        slot_path: slot_path.clone(),
+                        condition,
+                        reading: *reading,
+                    }])
+                }
+                // `!bound(?v)`, once `?v` has resolved to a slot. Sound only
+                // under the same two preconditions the scoper's identical
+                // lift applies (see `extract_equality_from_expr`'s
+                // `Expression::Bound` arm):
+                //
+                // * **one hop.** A nested path's absence is "the key at this
+                //   step is missing", a different predicate from "the leaf
+                //   value is absent" -- no `FilterCondition` arm renders that,
+                //   and the renderer only ever walks a multi-hop path with
+                //   `->>`.
+                // * **optional.** A `Required` slot's scan already enforces
+                //   existence (`object_data ? 'field'`), so `!bound` on it is
+                //   unsatisfiable and the plan has no way to state "selects
+                //   nothing" as a condition.
+                //
+                // The scoper reads these off a query-syntax fact
+                // (`optional_fields`, built from each triple's `OPTIONAL`
+                // nesting depth). This route reads the same distinction off
+                // `Expr::Slot::presence`, which travels with the slot itself
+                // rather than needing a separate map -- see that field's doc
+                // comment for why carrying it there, rather than widening
+                // `to_sql`'s signature, was the right fix once the earlier
+                // draft of this comment (which declined `!bound` altogether,
+                // reasoning that the fact was not reachable here) turned out
+                // to have the wrong premise: `Visible::collect` had the fact
+                // in scope the whole time and was dropping it on the floor
+                // building `SlotBinding`.
+                //
+                // A **third** scoper precondition -- "resolvable", i.e. the
+                // variable names a slot at all -- has no separate check here:
+                // it is what the `let [Self::Slot { .. }] = args.as_slice()`
+                // pattern below already asks, since an unresolved variable is
+                // still `Expr::Var` at this point and simply fails to match.
+                //
+                // A **fourth** thing the scoper computes explicitly --
+                // "depth 0", i.e. whether the read sits inside an `OPTIONAL`
+                // at all -- has no separate check here either, and not by
+                // oversight: `SlotPresence` is not a per-triple depth count
+                // to be compared against zero, it is the *destination* fact
+                // depth-counting exists to produce -- the plan's own,
+                // already-resolved answer to "does this scan's read of this
+                // slot require the value or only allow it", set once by
+                // whichever rule folded the `OPTIONAL` (or its absence) into
+                // the scan. By the time a `ScanSlot` exists at all, its
+                // `presence` already accounts for every `OPTIONAL` the query
+                // wrote around it; there is no further depth for this
+                // function to re-derive.
+                Self::Function { name, args } if name == "BOUND" => {
+                    let [
+                        Self::Slot {
+                            star_var,
+                            slot_path,
+                            reading,
+                            presence,
+                        },
+                    ] = args.as_slice()
+                    else {
+                        return None;
+                    };
+                    if slot_path.len() != 1 || *presence != SlotPresence::Optional {
+                        return None;
+                    }
+                    Some(vec![SqlCondition {
+                        star_var: star_var.clone(),
+                        slot_path: slot_path.clone(),
+                        condition: FilterCondition::NotBound,
+                        reading: *reading,
+                    }])
+                }
+                // Every other negation -- `!CONTAINS`, `!(A && B)`, `!BOUND`
+                // of anything but a resolved single-hop optional slot --
+                // declines.
+                _ => None,
+            },
+            // `geof:sfIntersects`, the same shape and the same two-refusal
+            // literal check `sparql_scoper::lift_intersects` applies for the
+            // fetch (`intersects_wkt_from_literal`): a constant not typed
+            // exactly `wktLiteral`, or one under a CRS other than CRS84,
+            // declines rather than lifting a statement the engine would
+            // answer differently. The one thing this route checks that the
+            // fetch-side lift does not need repeated here is the registry
+            // gate (`crate::sparql_columns::broken_out_column`) -- that one
+            // lives in `constants_are_the_columns_terms`, the only place in
+            // this file with a schema and a `class_of_star` map to ask it
+            // through. Re-running the literal check here (rather than
+            // trusting that gate alone) also means a direct,
+            // `to_sql`-bypassing call to this `_unchecked` method -- as the
+            // tests below make -- cannot mint an `Intersects` condition from
+            // a constant `spargeo` would read as unbound.
+            Self::Function { name, args } if is_sf_intersects(name) => {
+                let [
+                    Self::Slot {
+                        star_var,
+                        slot_path,
+                        reading,
+                        ..
+                    },
+                    Self::Literal(Term::Literal(literal)),
+                ] = args.as_slice()
+                else {
+                    return None;
+                };
+                let wkt = crate::sparql_scoper::intersects_wkt_from_literal(literal)?;
+                Some(vec![SqlCondition {
+                    star_var: star_var.clone(),
+                    slot_path: slot_path.clone(),
+                    condition: FilterCondition::Intersects { wkt },
+                    reading: *reading,
+                }])
+            }
+            // The three substring predicates, `STRSTARTS`/`STRENDS`/`CONTAINS`,
+            // the same shape as `sparql_scoper::extract_equality_from_expr`
+            // lifts for the fetch. `LCASE` on the haystack folds the column
+            // for a case-insensitive match; `LCASE` on the needle is a
+            // different question (it folds the constant, not the column) and
+            // is not unwrapped -- `peel_lcase` only ever looks at the
+            // haystack position.
+            Self::Function { name, args } => {
+                let anchor = like_anchor(name)?;
+                let [haystack, needle] = args.as_slice() else {
+                    return None;
+                };
+                let (haystack, case_insensitive) = peel_lcase(haystack);
+                let Self::Slot {
+                    star_var,
+                    slot_path,
+                    reading,
+                    ..
+                } = haystack
+                else {
+                    return None;
+                };
+                let Self::Literal(term) = needle else {
+                    return None;
+                };
+                Some(vec![SqlCondition {
+                    star_var: star_var.clone(),
+                    slot_path: slot_path.clone(),
+                    condition: FilterCondition::Like {
+                        value: lexical(term),
+                        anchor,
+                        case_insensitive,
+                    },
+                    reading: *reading,
+                }])
+            }
+            // A disjunction is not a conjunction of conditions, and there is
+            // no rule that renders it as one. `Not` has its own arm above --
+            // it is not always a decline, since `!=` is one -- so it does not
+            // belong in this group.
+            Self::Or(_) | Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::Opaque(_) => {
+                None
+            }
         }
     }
 
@@ -512,6 +904,136 @@ impl Expr {
             return None;
         }
         self.sql_shape_unchecked()
+    }
+
+    /// The [`ConditionTree`] this expression is worth in SQL, or `None` when
+    /// SQL cannot ask the same question.
+    ///
+    /// A **separate entry point** from [`Expr::to_sql`], and that is the
+    /// design rather than an accident:
+    ///
+    /// * it returns `None` when there is no `Or` anywhere, so a pure
+    ///   conjunction stays on the conjunctive fast path and **no shape in the
+    ///   corpus changes route**. `filters` is read by the fetch narrowing and
+    ///   by star-data as well as by the statement renderer; a conjunction that
+    ///   started arriving as one opaque tree would need every one of those
+    ///   consumers to learn the tree for nothing gained.
+    /// * `sql_shape_unchecked`'s `Or` arm keeps declining for the same reason.
+    ///
+    /// It asks the *same first half* [`Expr::to_sql`] asks --
+    /// [`Expr::constants_are_the_columns_terms`] -- before shaping anything,
+    /// and the reason is sharper here than there. A pushed condition is free
+    /// only while it selects a superset; one selecting *nothing* makes the
+    /// engine re-run the query over no records and answer empty. In a
+    /// disjunction a dead branch does not merely fail to narrow, it narrows to
+    /// the *other* branch: `FILTER(?nm = "BX517" || ?kind = "GSA")` on an enum
+    /// column that stores `GSA` and renders as `eul:GSA` would answer
+    /// "the ones called BX517", which is a different question. So a tree shape
+    /// this check does not walk is that bug reintroduced.
+    ///
+    /// Declines, each with what it prevents:
+    ///
+    /// * **any leaf declines** -- a disjunction is all-or-nothing, since
+    ///   dropping one branch narrows the answer to the rest;
+    /// * **the leaves name more than one star** -- see [`ConditionTree::star`];
+    /// * **no `Or` anywhere** -- the fast path above;
+    /// * **an empty `All` or `Any`** -- `Any([])` is `FALSE`, which selects
+    ///   nothing. Not reachable from a parsed query (`flatten_or` builds at
+    ///   least two branches), and refused rather than trusted to stay
+    ///   unreachable.
+    pub fn to_sql_tree(
+        &self,
+        schema: &SchemaView,
+        class_of_star: &HashMap<String, String>,
+    ) -> Option<ConditionTree> {
+        if !self.constants_are_the_columns_terms(schema, class_of_star) {
+            return None;
+        }
+        if !self.contains_disjunction() {
+            return None;
+        }
+        let tree = self.tree_shape_unchecked(schema, class_of_star)?;
+        tree.star()?;
+        Some(tree)
+    }
+
+    /// Whether an `Or` appears anywhere in this expression.
+    ///
+    /// The gate that keeps the conjunctive fast path exactly as it was: only a
+    /// shape that has no representation as a list of conjuncts takes the tree
+    /// route. Walks the connectives only -- an `Or` buried inside a
+    /// [`Expr::Function`]'s arguments is inside a shape that declines
+    /// regardless, and inside an [`Expr::Opaque`] there is no expression to
+    /// walk.
+    fn contains_disjunction(&self) -> bool {
+        match self {
+            Self::Or(_) => true,
+            Self::And(parts) => parts.iter().any(Self::contains_disjunction),
+            Self::Not(inner) => inner.contains_disjunction(),
+            Self::Compare { .. }
+            | Self::In { .. }
+            | Self::Var(_)
+            | Self::Literal(_)
+            | Self::Slot { .. }
+            | Self::Function { .. }
+            | Self::Opaque(_) => false,
+        }
+    }
+
+    /// The tree this expression has the *shape* of, with the physical facts
+    /// filled in.
+    ///
+    /// The counterpart of [`Expr::sql_shape_unchecked`], and it delegates to
+    /// it at every leaf rather than re-deriving one: a leaf that could drift
+    /// from what `to_sql` produces is a leaf a renderer would render
+    /// differently from the same condition written without an `Or` around it.
+    /// Every shape that is not a connective therefore has to produce **exactly
+    /// one** condition to be a leaf -- an arm that produced several would be a
+    /// hidden conjunction, and this declines it rather than guessing which
+    /// connective it meant.
+    ///
+    /// Takes the schema for one fact only: `numeric`, which is a property of
+    /// the column and not of the condition, resolved through the same
+    /// `numeric_at_path` a single filter's lowering asks.
+    fn tree_shape_unchecked(
+        &self,
+        schema: &SchemaView,
+        class_of_star: &HashMap<String, String>,
+    ) -> Option<ConditionTree> {
+        let branches = |parts: &[Self]| -> Option<Vec<ConditionTree>> {
+            if parts.is_empty() {
+                // `Any([])` selects nothing; see `to_sql_tree`.
+                return None;
+            }
+            parts
+                .iter()
+                .map(|part| part.tree_shape_unchecked(schema, class_of_star))
+                .collect()
+        };
+        match self {
+            Self::Or(parts) => Some(ConditionTree::Any(branches(parts)?)),
+            Self::And(parts) => Some(ConditionTree::All(branches(parts)?)),
+            // The one wildcard, and it is not a hole: everything it catches
+            // is handed to `sql_shape_unchecked`, which *is* exhaustive over
+            // `Expr`, so a new variant is a compile error there rather than a
+            // leaf silently invented here.
+            other => {
+                let conditions = other.sql_shape_unchecked()?;
+                let [condition] = <[SqlCondition; 1]>::try_from(conditions).ok()?;
+                let leaf_class_uri = class_of_star.get(&condition.star_var);
+                let numeric = leaf_class_uri.is_some_and(|class_uri| {
+                    crate::sparql_scoper::numeric_at_path(schema, class_uri, &condition.slot_path)
+                });
+                let broken_out_column = leaf_class_uri.and_then(|class_uri| {
+                    crate::sparql_columns::broken_out_column(class_uri, &condition.slot_path)
+                });
+                Some(ConditionTree::Leaf(ConditionLeaf {
+                    condition,
+                    numeric,
+                    broken_out_column,
+                }))
+            }
+        }
     }
 
     /// Whether every constant this expression compares against a slot is the
@@ -561,9 +1083,76 @@ impl Expr {
                 }),
                 _ => true,
             },
-            Self::And(parts) | Self::Or(parts) | Self::Function { args: parts, .. } => parts
+            Self::And(parts) | Self::Or(parts) => parts
                 .iter()
                 .all(|part| part.constants_are_the_columns_terms(schema, class_of_star)),
+            // `geof:sfIntersects` is the one `Function` shape besides the
+            // substring predicates that `sql_shape_unchecked` turns into a
+            // condition, and it is walked here for the same reason: this is
+            // the only place in this file with both a schema and the
+            // `class_of_star` map the registry needs. Unlike the substring
+            // arm below, this checks two different things at once, both
+            // load-bearing: the registry (`broken_out_column`) says the slot
+            // has a column to push against at all, and
+            // `intersects_wkt_from_literal` says the constant is one
+            // `spargeo` reads a geometry from. Miss this arm and
+            // `sql_shape_unchecked`'s own `is_sf_intersects` branch would be
+            // the only gate left on `to_sql`'s route -- which does re-check
+            // the literal, but has no schema to ask the registry through, so
+            // a geometry filter on a plain string slot would narrow a fetch
+            // that reaches a statement naming a column that was never there.
+            Self::Function { name, args } if is_sf_intersects(name) => match args.as_slice() {
+                [
+                    Self::Slot {
+                        star_var,
+                        slot_path,
+                        ..
+                    },
+                    Self::Literal(Term::Literal(literal)),
+                ] => {
+                    class_of_star.get(star_var).is_some_and(|class_uri| {
+                        crate::sparql_columns::broken_out_column(class_uri, slot_path).is_some()
+                    }) && crate::sparql_scoper::intersects_wkt_from_literal(literal).is_some()
+                }
+                _ => true,
+            },
+            // The substring predicates are the one other `Function` shape
+            // `sql_shape_unchecked` turns into a condition, so it is the one
+            // walked here -- everything else declines there regardless of
+            // what this reports. An enum column stores a code and translates
+            // backwards through its meanings, so a substring of a *label*
+            // matches no code: pushing `CONTAINS(?kind, "GS")` against an
+            // enum column the way `literal_pushable` already gates `=` and
+            // `IN` is exactly the check that stops the statement selecting
+            // nothing instead of narrowing it. Reuses `literal_pushable`
+            // through `comparable` -> `constant_is_the_columns_term`, the
+            // same gate the scoper's identical lift applies (see
+            // `extract_equality_from_expr`'s `Expression::FunctionCall` arm)
+            // -- staying consistent rather than duplicating the rule.
+            Self::Function { name, args } => match like_anchor(name) {
+                None => true,
+                Some(_) => match args.as_slice() {
+                    [haystack, Self::Literal(term)] => match peel_lcase(haystack).0 {
+                        Self::Slot {
+                            star_var,
+                            slot_path,
+                            ..
+                        } => comparable(star_var, slot_path, term),
+                        _ => true,
+                    },
+                    _ => true,
+                },
+            },
+            // `!=` is `Not(Compare { op: Eq, .. })` -- see
+            // `sql_shape_unchecked`'s `Not` arm -- and the term check the
+            // inner `Compare` runs does not read `op`, so recursing here asks
+            // the right question for `!=` too: the enum-code gate on `= "x"`
+            // and on `!= "x"` is the same gate. `!bound` is also `Not(...)`
+            // (a negated `Function { name: "BOUND", .. }`), and it compares
+            // against no constant at all, so recursing into the `Function`
+            // arm above correctly reports `true` for it (`like_anchor`
+            // returns `None` for `"BOUND"`) -- there is nothing here for a
+            // term check to gate.
             Self::Not(inner) => inner.constants_are_the_columns_terms(schema, class_of_star),
             Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::Opaque(_) => true,
         }
@@ -594,6 +1183,59 @@ fn constant_is_the_columns_term(
         (PushForm::Literal { .. }, Term::Literal(literal)) => literal_pushable(literal, &form),
         (PushForm::Iri, Term::NamedNode(_)) => true,
         _ => false,
+    }
+}
+
+/// The [`LikeAnchor`] a SPARQL function name asks for, when it names one of
+/// the three substring predicates.
+///
+/// The name is the SPARQL keyword, not a URI or a custom `Display` -- see
+/// `From<&Expression> for Expr`, which builds `Expr::Function::name` as
+/// `function.to_string()`, and `spargebra::algebra::Function`'s own
+/// `Display`, which spells these `"STRSTARTS"` / `"STRENDS"` / `"CONTAINS"`.
+/// Verified by printing a naive plan for `FILTER(CONTAINS(?nm, "x"))` rather
+/// than assumed.
+fn like_anchor(name: &str) -> Option<LikeAnchor> {
+    match name {
+        "STRSTARTS" => Some(LikeAnchor::Prefix),
+        "STRENDS" => Some(LikeAnchor::Suffix),
+        "CONTAINS" => Some(LikeAnchor::Anywhere),
+        _ => None,
+    }
+}
+
+/// Whether a `Function`-shaped expression's name is `geof:sfIntersects`.
+///
+/// `name` here is `function.to_string()` (see `like_anchor`'s doc comment for
+/// why), and `spargebra::algebra::Function::Custom`'s `Display` forwards to
+/// `NamedNode`'s, which wraps the IRI in angle brackets -- confirmed by
+/// printing one rather than assumed. `sparql_scoper::SF_INTERSECTS_IRI` is
+/// the bare IRI the scoper matches on `Function::Custom`'s `NamedNode`
+/// directly, before it is ever stringified; stripping the brackets here
+/// keeps the one IRI literal the source of truth for both routes instead of
+/// a second copy that could drift out of sync with it.
+fn is_sf_intersects(name: &str) -> bool {
+    name.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        == Some(crate::sparql_scoper::SF_INTERSECTS_IRI)
+}
+
+/// Peels an `LCASE(...)` wrapper off a substring function's haystack
+/// argument, reporting whether it was there.
+///
+/// Only the haystack position is ever passed here. `LCASE` on the *needle*
+/// folds the constant rather than the column -- a different question, not a
+/// case-insensitive spelling of the same one -- so it is never unwrapped, by
+/// construction: nothing calls this on the needle.
+fn peel_lcase(haystack: &Expr) -> (&Expr, bool) {
+    match haystack {
+        Expr::Function { name, args } if name == "LCASE" => match args.as_slice() {
+            [only] => (only, true),
+            // The wrong arity for `LCASE`: not a column either way, so the
+            // caller's own `Expr::Slot` match fails and declines.
+            _ => (haystack, false),
+        },
+        other => (other, false),
     }
 }
 
@@ -640,6 +1282,7 @@ impl fmt::Display for Expr {
                 star_var,
                 slot_path,
                 reading,
+                ..
             } => write!(f, "?{star_var}.{}{reading}", slot_path.join(".")),
             Self::Compare { op, left, right } => {
                 write!(f, "({left} {} {right})", op.as_str())
@@ -3225,6 +3868,7 @@ mod tests {
             star_var: "s".to_owned(),
             slot_path: vec!["hasName".to_owned()],
             reading: SlotReading::Column,
+            presence: SlotPresence::Required,
         };
         let value = Expr::Literal(Literal::new_simple_literal("A").into());
 
@@ -3259,29 +3903,41 @@ mod tests {
         };
         assert_eq!(unresolved.sql_shape_unchecked(), None);
 
-        // `!=` is not `<>`: SPARQL's inequality is false for an unbound
-        // variable where SQL's is unknown, so it declines rather than
-        // dropping rows the query keeps.
+        // `!=` maps to `Ne`, which renders as its own condition -- the extra
+        // `IS NOT NULL` `Ne` needs (SPARQL's inequality is false for an
+        // unbound variable where SQL's `<>` on NULL is unknown) is the
+        // renderer's obligation, not this shape check's; see
+        // `CompareOp::as_condition`.
         let inequality = Expr::Compare {
             op: CompareOp::Ne,
             left: Box::new(slot.clone()),
             right: Box::new(value.clone()),
         };
-        assert_eq!(inequality.sql_shape_unchecked(), None);
+        assert_eq!(
+            inequality.sql_shape_unchecked(),
+            Some(vec![SqlCondition {
+                star_var: "s".to_owned(),
+                slot_path: vec!["hasName".to_owned()],
+                condition: FilterCondition::Ne("A".to_owned()),
+                reading: SlotReading::Column,
+            }])
+        );
 
-        // And a whole conjunction declines when one conjunct does: pushing
-        // the half that renders moves who claims the obligation, which is a
-        // rule's decision and not a rendering detail.
-        let half = Expr::And(vec![pushable, inequality]);
-        assert_eq!(half.sql_shape_unchecked(), None);
-
-        // REGEX, arithmetic and a disjunction are all held whole and all
-        // decline.
+        // REGEX is held whole and declines -- unlike `!=`, nothing renders
+        // it as a condition.
         let regex = Expr::Function {
             name: "REGEX".to_owned(),
             args: vec![slot.clone(), value.clone()],
         };
         assert_eq!(regex.sql_shape_unchecked(), None);
+
+        // And a whole conjunction declines when one conjunct does: pushing
+        // the half that renders moves who claims the obligation, which is a
+        // rule's decision and not a rendering detail.
+        let half = Expr::And(vec![pushable, regex.clone()]);
+        assert_eq!(half.sql_shape_unchecked(), None);
+
+        // Arithmetic and a disjunction are also held whole and decline.
         assert_eq!(Expr::Or(vec![regex.clone()]).sql_shape_unchecked(), None);
         assert_eq!(
             Expr::Function {
@@ -3299,6 +3955,7 @@ mod tests {
                 star_var: "s".to_owned(),
                 slot_path: vec!["hasName".to_owned()],
                 reading: SlotReading::Column,
+                presence: SlotPresence::Required,
             }),
             candidates: vec![
                 Expr::Literal(Literal::new_simple_literal("A").into()),
@@ -3318,6 +3975,368 @@ mod tests {
         // terms a string column's values render as.
         let schema = crate::sparql_scoper::tests::test_schema_view();
         assert!(members.to_sql(&schema, &tunnel_star()).is_some());
+    }
+
+    /// The class scanned as `s` in these tests carries a slot the registry
+    /// claims a broken-out geometry column for: `PostalCode.hasGeometry ->
+    /// Geometry.asWKT`. Same fixture the scoper's own
+    /// `sf_intersects_lifts_on_a_geometry_slot` uses.
+    fn postal_code_star() -> HashMap<String, String> {
+        HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/PostalCode".to_owned(),
+        )])
+    }
+
+    fn geometry_slot() -> Expr {
+        Expr::Slot {
+            star_var: "s".to_owned(),
+            slot_path: vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+            reading: SlotReading::Column,
+            presence: SlotPresence::Required,
+        }
+    }
+
+    fn sf_intersects(literal: Literal) -> Expr {
+        Expr::Function {
+            name: "<http://www.opengis.net/def/function/geosparql/sfIntersects>".to_owned(),
+            args: vec![geometry_slot(), Expr::Literal(literal.into())],
+        }
+    }
+
+    fn wkt_literal_datatype() -> NamedNode {
+        NamedNode::new_unchecked(crate::sparql_scoper::WKT_LITERAL_IRI)
+    }
+
+    fn geojson_literal_datatype() -> NamedNode {
+        NamedNode::new_unchecked("http://www.opengis.net/ont/geosparql#geoJSONLiteral")
+    }
+
+    /// `geof:sfIntersects` on a slot the registry claims lifts, through the
+    /// statement route (`to_sql`), not just `sql_shape_unchecked` --
+    /// Finding F1 from earlier tasks: the two are independent, and a
+    /// pushdown that only reaches the fetch-side lift never reaches a
+    /// statement.
+    #[test]
+    fn sf_intersects_lifts_through_to_sql() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+        let expr = sf_intersects(Literal::new_typed_literal(box_wkt, wkt_literal_datatype()));
+        assert_eq!(
+            expr.to_sql(&schema, &postal_code_star()),
+            Some(vec![SqlCondition {
+                star_var: "s".to_owned(),
+                slot_path: vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+                condition: FilterCondition::Intersects {
+                    wkt: box_wkt.to_owned()
+                },
+                reading: SlotReading::Column,
+            }])
+        );
+        // A CRS84 prefix is accepted and stripped -- the SQL side takes a
+        // bare WKT, same as the scoper's fetch-side lift.
+        let prefixed = format!("<http://www.opengis.net/def/crs/OGC/1.3/CRS84> {box_wkt}");
+        let expr = sf_intersects(Literal::new_typed_literal(prefixed, wkt_literal_datatype()));
+        assert_eq!(
+            expr.to_sql(&schema, &postal_code_star()),
+            Some(vec![SqlCondition {
+                star_var: "s".to_owned(),
+                slot_path: vec!["hasGeometry".to_owned(), "asWKT".to_owned()],
+                condition: FilterCondition::Intersects {
+                    wkt: box_wkt.to_owned()
+                },
+                reading: SlotReading::Column,
+            }])
+        );
+    }
+
+    /// The three refusals, through `to_sql`: a plain string, a
+    /// `geoJSONLiteral`, and a non-CRS84 prefix all decline -- each because
+    /// lifting it would have the statement answer rows the engine leg
+    /// answers none for (see `FilterCondition::Intersects`'s doc comment).
+    #[test]
+    fn sf_intersects_declines_through_to_sql() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+
+        let plain_string = sf_intersects(Literal::new_simple_literal(box_wkt));
+        assert_eq!(plain_string.to_sql(&schema, &postal_code_star()), None);
+
+        let geojson = sf_intersects(Literal::new_typed_literal(
+            r#"{"type":"Point","coordinates":[1,2]}"#,
+            geojson_literal_datatype(),
+        ));
+        assert_eq!(geojson.to_sql(&schema, &postal_code_star()), None);
+
+        let other_crs = sf_intersects(Literal::new_typed_literal(
+            format!("<http://www.opengis.net/def/crs/EPSG/0/31370> {box_wkt}"),
+            wkt_literal_datatype(),
+        ));
+        assert_eq!(other_crs.to_sql(&schema, &postal_code_star()), None);
+    }
+
+    /// The registry gate, isolated from the literal gates the test above
+    /// isolates: the same function, over the *same valid* `wktLiteral`
+    /// constant, does not lift when the slot is an ordinary string the
+    /// registry claims no column for (`TunnelComplex.hasName`).
+    ///
+    /// This is also the gate-bypass evidence for `constants_are_the_columns_terms`'s
+    /// own `is_sf_intersects` arm: `sql_shape_unchecked` alone (no schema, no
+    /// registry) *would* build a condition here -- it only checks the
+    /// literal, not whether the slot has a column at all -- so `to_sql`
+    /// disagreeing with it pins that the registry gate is actually being
+    /// asked, not skipped.
+    #[test]
+    fn sf_intersects_on_a_slot_the_registry_does_not_claim_does_not_lift_via_to_sql() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let expr = Expr::Function {
+            name: "<http://www.opengis.net/def/function/geosparql/sfIntersects>".to_owned(),
+            args: vec![
+                Expr::Slot {
+                    star_var: "s".to_owned(),
+                    slot_path: vec!["hasName".to_owned()],
+                    reading: SlotReading::Column,
+                    presence: SlotPresence::Required,
+                },
+                Expr::Literal(
+                    Literal::new_typed_literal("POINT(1 2)", wkt_literal_datatype()).into(),
+                ),
+            ],
+        };
+        assert_eq!(expr.to_sql(&schema, &tunnel_star()), None);
+        // The bypass: with no schema to ask the registry through,
+        // `sql_shape_unchecked` alone builds a condition anyway -- proving
+        // the registry gate lives in `constants_are_the_columns_terms`, not
+        // here, and that `to_sql`'s refusal above is that gate firing and
+        // not a coincidence of the literal check.
+        assert!(expr.sql_shape_unchecked().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // `to_sql_tree`: the within-star disjunction
+    // -----------------------------------------------------------------------
+
+    fn signal_star() -> HashMap<String, String> {
+        HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )])
+    }
+
+    /// An equality on one slot of `?s`, as a rule would have resolved it.
+    fn slot_equals(star_var: &str, slot: &str, value: &str) -> Expr {
+        Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Slot {
+                star_var: star_var.to_owned(),
+                slot_path: vec![slot.to_owned()],
+                reading: SlotReading::Column,
+                presence: SlotPresence::Required,
+            }),
+            right: Box::new(Expr::Literal(Literal::new_simple_literal(value).into())),
+        }
+    }
+
+    /// `Any([])` is `FALSE`, and a pushed condition selecting *nothing* is the
+    /// one direction a pushed condition is not free in: the engine re-runs the
+    /// query over no records and answers empty to a query that has an answer.
+    ///
+    /// Not reachable from a parsed query -- `flatten_or` builds at least two
+    /// branches -- so the expression is built by hand, which is also the
+    /// point: the shape is a legal value of the type and the refusal is the
+    /// type's, not the parser's.
+    ///
+    /// The **nested** case is the one only this gate catches. An empty
+    /// disjunction at the top has no leaves at all, so
+    /// [`ConditionTree::star`] declines it as well; one buried in a
+    /// conjunction leaves the other branch's leaf naming a perfectly good
+    /// star, and a tree that passes every other check while selecting nothing
+    /// is exactly the empty answer to an answerable query.
+    #[test]
+    fn to_sql_tree_declines_an_empty_disjunction() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        assert_eq!(
+            Expr::And(vec![
+                slot_equals("s", "name", "BX517"),
+                Expr::Or(Vec::new()),
+            ])
+            .to_sql_tree(&schema, &signal_star()),
+            None,
+            "a nested FALSE makes the whole conjunction select nothing"
+        );
+        assert_eq!(
+            Expr::Or(Vec::new()).to_sql_tree(&schema, &signal_star()),
+            None
+        );
+        // And the emptiness is what it declined, not the shape: the same
+        // disjunction with two pushable branches lifts.
+        assert!(
+            Expr::Or(vec![
+                slot_equals("s", "name", "BX517"),
+                slot_equals("s", "name", "BX518"),
+            ])
+            .to_sql_tree(&schema, &signal_star())
+            .is_some()
+        );
+    }
+
+    /// A pure conjunction stays on the [`Expr::to_sql`] fast path: the tree
+    /// entry point declines it outright.
+    ///
+    /// Asked of the function rather than of a query because the fast path is
+    /// protected twice over -- `lower_refined` and `PushComparisonFilter` both
+    /// ask `to_sql` *first*, so a route change would need this gate and that
+    /// ordering to fail together. This is the half that can be isolated: with
+    /// no `Or` anywhere there is nothing a tree says that a list of conjuncts
+    /// does not, and `filters` is read by the fetch narrowing and by star-data
+    /// as well as by the statement renderer -- every one of which would have
+    /// to learn the tree for nothing gained.
+    #[test]
+    fn to_sql_tree_declines_a_pure_conjunction() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let above = Expr::Compare {
+            op: CompareOp::Gt,
+            left: Box::new(Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                reading: SlotReading::Column,
+                presence: SlotPresence::Required,
+            }),
+            right: Box::new(Expr::Literal(Literal::new_simple_literal("A").into())),
+        };
+        let conjunction = Expr::And(vec![slot_equals("s", "name", "BX517"), above]);
+        assert_eq!(
+            conjunction
+                .to_sql(&schema, &signal_star())
+                .map(|conditions| conditions.len()),
+            Some(2),
+            "the fast path renders it as two conditions"
+        );
+        assert_eq!(conjunction.to_sql_tree(&schema, &signal_star()), None);
+    }
+
+    /// A `geof:sfIntersects` leaf flows through `to_sql_tree`'s disjunction
+    /// walk exactly like any other leaf shape: `tree_shape_unchecked`'s
+    /// non-connective arm calls the same `sql_shape_unchecked` the fast path
+    /// uses (Task 5's doc comment on that arm says a new `Expr` shape is a
+    /// compile error there, not a silent skip -- confirmed here, not just
+    /// read), and the `numeric` flag it computes from `numeric_at_path`
+    /// correctly reads `false`: WKT text is not a numeric column, so the
+    /// leaf renders as a plain text comparison, not a cast one.
+    #[test]
+    fn a_geometry_leaf_flows_through_the_condition_tree_walk() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+        let intersects = sf_intersects(Literal::new_typed_literal(box_wkt, wkt_literal_datatype()));
+        // A different leaf on the same star -- a plain text equality on the
+        // same slot's own path, not a geometry predicate -- so the tree has
+        // two distinct, independently pushable leaves to walk.
+        let other = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(geometry_slot()),
+            right: Box::new(Expr::Literal(Literal::new_simple_literal("ignored").into())),
+        };
+        let tree = Expr::Or(vec![intersects, other])
+            .to_sql_tree(&schema, &postal_code_star())
+            .expect("a disjunction of two pushable leaves on one star lifts");
+        let leaves = tree.leaves();
+        assert_eq!(leaves.len(), 2);
+        let geometry_leaf = leaves
+            .iter()
+            .find(|leaf| matches!(leaf.condition.condition, FilterCondition::Intersects { .. }))
+            .expect("the geometry leaf is present, not silently dropped");
+        assert!(
+            !geometry_leaf.numeric,
+            "a WKT string is not a numeric column"
+        );
+        assert_eq!(
+            geometry_leaf.condition.slot_path,
+            vec!["hasGeometry".to_owned(), "asWKT".to_owned()]
+        );
+        // Resolved against `postal_code_star()`'s real class URI, at the same
+        // point and from the same map `numeric` above is resolved from.
+        assert_eq!(
+            geometry_leaf.broken_out_column,
+            Some(crate::sparql_columns::BrokenOutColumn::Geometry)
+        );
+    }
+
+    /// **The gate the pair above and this test exist for.** `star_var`
+    /// ("s") is non-empty whether or not the star is resolved, and the
+    /// registry's own gate today checks only non-emptiness
+    /// (`sparql_columns.rs`'s module doc) -- so a version of this code that
+    /// substituted `star_var` for `class_uri` at the registry call would
+    /// resolve `Some(Geometry)` here too, identically to the resolved case
+    /// above, and only this test would catch it. Calls `tree_shape_unchecked`
+    /// directly (bypassing `to_sql_tree`'s own gate, `constants_are_the_columns_terms`,
+    /// which already declines an unresolved star before this code would run)
+    /// to pin the resolution itself rather than the gate in front of it --
+    /// the same reason the file already builds a `Not` tree by hand instead
+    /// of only testing what a parsed query can reach.
+    #[test]
+    fn a_leaf_s_broken_out_column_is_none_when_its_star_is_unresolved() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let box_wkt = "POLYGON((4 50, 5 50, 5 51, 4 51, 4 50))";
+        let intersects = sf_intersects(Literal::new_typed_literal(box_wkt, wkt_literal_datatype()));
+        let other = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(geometry_slot()),
+            right: Box::new(Expr::Literal(Literal::new_simple_literal("ignored").into())),
+        };
+        let unresolved: HashMap<String, String> = HashMap::new();
+        let tree = Expr::Or(vec![intersects, other])
+            .tree_shape_unchecked(&schema, &unresolved)
+            .expect("the shape resolves even though to_sql_tree's own gate would have declined");
+        let geometry_leaf = tree
+            .leaves()
+            .into_iter()
+            .find(|leaf| matches!(leaf.condition.condition, FilterCondition::Intersects { .. }))
+            .expect("the geometry leaf is present, not silently dropped");
+        assert_eq!(
+            geometry_leaf.broken_out_column, None,
+            "an unresolved star must not resolve a column, not even via its variable name"
+        );
+    }
+
+    /// **`Not` is representable and never produced**, and the walks must still
+    /// descend into one.
+    ///
+    /// The reasons `to_sql_tree` does not build a `Not` are on
+    /// [`ConditionTree`]: SQL's three-valued logic makes a negated subtree
+    /// *unknown* rather than true over a NULL column, and the reading
+    /// weakening a narrowing pass applies is only sound under monotone
+    /// connectives. So this tree cannot be manufactured from a query today and
+    /// is built by hand -- what it pins is that a leaf under a `Not` is not
+    /// invisible: [`ConditionTree::leaves`] is the walk every per-leaf check
+    /// uses, so a blind spot here would be a blind spot in the same-star gate
+    /// and in `claims_are_backed_by_rendered_work` at once.
+    #[test]
+    fn a_leaf_under_a_negation_is_still_walked() {
+        let leaf = |star_var: &str, slot: &str| {
+            ConditionTree::Leaf(ConditionLeaf {
+                condition: SqlCondition {
+                    star_var: star_var.to_owned(),
+                    slot_path: vec![slot.to_owned()],
+                    condition: FilterCondition::Eq("BX517".to_owned()),
+                    reading: SlotReading::Column,
+                },
+                numeric: false,
+                broken_out_column: None,
+            })
+        };
+        let negated = |inner: ConditionTree| ConditionTree::Not(Box::new(inner));
+
+        let one_star = ConditionTree::Any(vec![leaf("s", "name"), negated(leaf("s", "length"))]);
+        assert_eq!(
+            one_star.leaves().len(),
+            2,
+            "the negated branch is a leaf too"
+        );
+        assert_eq!(one_star.star(), Some("s"));
+
+        // A second star hidden under a negation is still a second star.
+        let two_stars = ConditionTree::Any(vec![leaf("s", "name"), negated(leaf("c", "hasName"))]);
+        assert_eq!(two_stars.star(), None);
     }
 
     /// The other half of the public entry, and the reason it is the only one:
@@ -3341,6 +4360,7 @@ mod tests {
                 star_var: "s".to_owned(),
                 slot_path: vec![slot.to_owned()],
                 reading: SlotReading::Column,
+                presence: SlotPresence::Required,
             }),
             right: Box::new(Expr::Literal(term)),
         };
@@ -3503,5 +4523,264 @@ mod tests {
 
         assert_eq!(groups[type_match], groups[mandatory], "{plan}");
         assert_ne!(groups[type_match], groups[inside_optional], "{plan}");
+    }
+
+    /// A refined plan, to fixpoint. Mirrors `sparql_ops::tests::refined_plan`
+    /// -- kept local rather than shared because that one is private to its
+    /// own module's `mod tests`.
+    fn refined_plan(query: &str, sv: &SchemaView) -> Plan {
+        let rules = crate::sparql_rules::tier_one_rules(sv);
+        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+            rules.iter().map(|rule| rule.as_ref()).collect();
+        let mut plan = plan_of(query);
+        crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
+        plan
+    }
+
+    /// The class each star variable was scanned as, the way
+    /// `claims_are_backed_by_rendered_work` derives it from a lowered
+    /// `OpTree` -- lifted here because `Expr::to_sql` needs the same map but
+    /// this test works with a `Plan`, not the tree that comes after it.
+    fn class_of_star(plan: &Plan) -> HashMap<String, String> {
+        plan.nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                PlanOp::Scan {
+                    star_var,
+                    class_uri,
+                    ..
+                } => Some((star_var.clone(), class_uri.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The refined route lifts what the scoper lifts.
+    ///
+    /// Two derivations of "what can SQL ask" and only one taught the new
+    /// operators means the fetch narrows and the statement does not -- the
+    /// difference between a query that answers and one that hits the triple
+    /// limit.
+    #[test]
+    fn the_refined_route_lifts_the_new_operators() {
+        let sv = crate::sparql_scoper::tests::test_schema_view();
+        let conditions = |query: &str| -> Vec<FilterCondition> {
+            let plan = refined_plan(query, &sv);
+            plan.nodes
+                .iter()
+                .filter(|node| node.executor == Executor::Sql)
+                .filter_map(|node| match &node.op {
+                    PlanOp::Filter { condition, .. } => Some(condition.clone()),
+                    _ => None,
+                })
+                .flat_map(|expr| expr.to_sql(&sv, &class_of_star(&plan)).unwrap_or_default())
+                .map(|sql| sql.condition)
+                .collect()
+        };
+
+        assert_eq!(
+            conditions(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(STRSTARTS(LCASE(?nm), \"bx\")) }"
+            ),
+            vec![FilterCondition::Like {
+                value: "bx".to_owned(),
+                anchor: LikeAnchor::Prefix,
+                case_insensitive: true,
+            }],
+        );
+        assert_eq!(
+            conditions(
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 FILTER(?nm != \"BX517\") }"
+            ),
+            vec![FilterCondition::Ne("BX517".to_owned())],
+        );
+        // `!bound` on a genuinely optional one-hop slot is the one case this
+        // route actually reaches from a real parsed query: the fold-tests
+        // below (`not_bound_declines_on_a_required_slot`,
+        // `not_bound_declines_on_a_multi_hop_path`) had to be built by hand
+        // because a *declining* filter never gets its `Var` substituted to a
+        // `Slot` (see `to_sql_declines_a_substring_against_an_enum_column`'s
+        // doc comment for why), but this one pushes, so pulling it from a
+        // real refined plan demonstrates the whole path end to end.
+        assert_eq!(
+            conditions(
+                "SELECT ?s WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:name ?nm } FILTER(!BOUND(?nm)) }"
+            ),
+            vec![FilterCondition::NotBound],
+        );
+    }
+
+    /// `!bound` on a *required* slot does not lift, on the refined route the
+    /// same way it does not on the scoper's (see
+    /// `sparql_scoper::tests::unbound_on_a_required_slot_does_not_lift`).
+    ///
+    /// The scan already carries an existence check for it, so the query
+    /// selects nothing -- and "nothing" is not a condition `to_sql` can
+    /// state. Built by hand rather than pulled from a refined plan, for the
+    /// same reason `to_sql_declines_a_substring_against_an_enum_column` is:
+    /// a query written as `?s asset360:name ?nm . FILTER(!BOUND(?nm))` never
+    /// gets `?nm` substituted to a `Slot` at all (`PushComparisonFilter`
+    /// only commits the rewrite together with a successful push), so pulling
+    /// the filter out of that plan would decline for the unrelated "variable
+    /// is not a column" reason and not isolate this gate.
+    #[test]
+    fn not_bound_declines_on_a_required_slot() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let signal = HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )]);
+        let expr = Expr::Not(Box::new(Expr::Function {
+            name: "BOUND".to_owned(),
+            args: vec![Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                reading: SlotReading::Column,
+                presence: SlotPresence::Required,
+            }],
+        }));
+        assert_eq!(expr.to_sql(&schema, &signal), None, "{expr}");
+
+        // Load-bearing: with only the presence check in place (one hop,
+        // required), the shape is otherwise exactly the one that lifts --
+        // see `not_bound_lifts_on_an_optional_one_hop_slot` below for the
+        // `Optional` counterpart of this same expression.
+        assert!(
+            expr.sql_shape_unchecked().is_none(),
+            "the presence gate itself must refuse this, not just the shape: {expr}"
+        );
+    }
+
+    /// `!bound` on a *multi-hop* path does not lift, regardless of whether
+    /// the slot is optional -- mirroring
+    /// `sparql_scoper::tests::unbound_on_a_two_hop_path_does_not_lift`, whose
+    /// own comment records that its query-derived example cannot isolate the
+    /// one-hop gate from the optional gate (a mandatory root cannot carry an
+    /// optional two-hop leaf in that schema, so both gates would decline it
+    /// there regardless).
+    ///
+    /// Built by hand rather than pulled from a plan, for two independent
+    /// reasons: the general one (a declining filter never gets substituted,
+    /// as above), and a second, refined-route-specific one found while
+    /// writing this test -- a `FILTER(!BOUND(?lon))` over a nested
+    /// `OPTIONAL { ?s asset360:location ?loc . ?loc asset360:longitude ?lon }`
+    /// does not even fold into a `PlanOp::Scan` on this route today (checked
+    /// empirically: the plan keeps `?s asset360:location ?loc` and `?loc
+    /// asset360:longitude ?lon` as two separate `Engine` matches under a
+    /// `leftjoin`, never a scan slot), so `?lon` stays unresolved and there
+    /// is no query this route can parse today that reaches a two-hop
+    /// `Expr::Slot` with `presence: Optional` at all. Building the shape by
+    /// hand is not fabricating unreachable state to fake precision: the gate
+    /// itself is exercised on the same `Expr::Slot` shape a future rule could
+    /// legitimately produce (nothing in `Expr::Slot`'s own definition forbids
+    /// a multi-hop, optional address), only today's rule set does not reach
+    /// it from a query yet.
+    #[test]
+    fn not_bound_declines_on_a_multi_hop_path() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let signal = HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )]);
+        let expr = Expr::Not(Box::new(Expr::Function {
+            name: "BOUND".to_owned(),
+            args: vec![Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec!["location".to_owned(), "longitude".to_owned()],
+                reading: SlotReading::Column,
+                // Optional on purpose: with the one-hop gate the only one
+                // that can refuse this, a failure to refuse would prove the
+                // gate un-isolated from the presence check rather than
+                // merely untested.
+                presence: SlotPresence::Optional,
+            }],
+        }));
+        assert_eq!(expr.to_sql(&schema, &signal), None, "{expr}");
+        assert!(
+            expr.sql_shape_unchecked().is_none(),
+            "the one-hop gate itself must refuse this, not just the shape: {expr}"
+        );
+    }
+
+    /// The `Optional` counterpart of `not_bound_declines_on_a_required_slot`:
+    /// the identical one-hop shape, differing only in `presence`, lifts.
+    /// Read the two together -- each changes exactly one gate from the
+    /// other, so between them they show the presence check is neither always
+    /// satisfied nor always refused by this shape.
+    #[test]
+    fn not_bound_lifts_on_an_optional_one_hop_slot() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let signal = HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )]);
+        let expr = Expr::Not(Box::new(Expr::Function {
+            name: "BOUND".to_owned(),
+            args: vec![Expr::Slot {
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                reading: SlotReading::Column,
+                presence: SlotPresence::Optional,
+            }],
+        }));
+        assert_eq!(
+            expr.to_sql(&schema, &signal),
+            Some(vec![SqlCondition {
+                star_var: "s".to_owned(),
+                slot_path: vec!["name".to_owned()],
+                condition: FilterCondition::NotBound,
+                reading: SlotReading::Column,
+            }]),
+            "{expr}"
+        );
+    }
+
+    /// The enum-column term gate, walked through
+    /// `constants_are_the_columns_terms`'s new `Function` arm rather than
+    /// just `sql_shape_unchecked`'s new shape.
+    ///
+    /// `kind` on `asset360:Signal` is the same enum slot
+    /// `sparql_scoper::tests::substring_does_not_lift_onto_an_enum_column` (the
+    /// scoper's identical gate test) uses. Built by hand, the way
+    /// `to_sql_declines_a_constant_the_column_never_spells` above does,
+    /// rather than pulled from a refined plan: `PushComparisonFilter` only
+    /// commits the `Var` -> `Slot` rewrite together with a successful push,
+    /// so a filter node that `to_sql` declined still holds the query's
+    /// original `Expr::Var` -- which would decline for an unrelated reason
+    /// (a variable is not a column) and not isolate this gate at all.
+    #[test]
+    fn to_sql_declines_a_substring_against_an_enum_column() {
+        let schema = crate::sparql_scoper::tests::test_schema_view();
+        let signal = HashMap::from([(
+            "s".to_owned(),
+            "https://data.infrabel.be/asset360/Signal".to_owned(),
+        )]);
+        let expr = Expr::Function {
+            name: "CONTAINS".to_owned(),
+            args: vec![
+                Expr::Slot {
+                    star_var: "s".to_owned(),
+                    slot_path: vec!["kind".to_owned()],
+                    reading: SlotReading::Column,
+                    presence: SlotPresence::Required,
+                },
+                Expr::Literal(Literal::new_simple_literal("GS").into()),
+            ],
+        };
+        assert_eq!(expr.to_sql(&schema, &signal), None, "{expr}");
+
+        // The gate is load-bearing: with the term check skipped,
+        // `sql_shape_unchecked` alone accepts the same expression and would
+        // push a substring test the enum column's codes never satisfy --
+        // `kind` stores `GSA`/`KSS`, never a label, so
+        // `object_data->>'kind' LIKE '%GS%'` selects nothing for a query
+        // that has an answer.
+        assert!(
+            expr.sql_shape_unchecked().is_some(),
+            "the shape is right; only the term check must refuse it: {expr}"
+        );
     }
 }

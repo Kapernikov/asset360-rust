@@ -38,6 +38,7 @@ pub mod predicate;
 pub mod scope_predicate;
 pub mod shacl_ast;
 
+pub mod sparql_columns;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
 pub mod sparql_graph_clauses;
@@ -97,11 +98,13 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sparql_schema_graph_ntriples, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_skipped, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_reads_only_the_schema_graph, m)?)?;
+        m.add_function(wrap_pyfunction!(py_broken_out_column, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
         m.add_class::<Star>()?;
         m.add_class::<JoinEdge>()?;
         m.add_class::<FilterCondition>()?;
+        m.add_class::<FilterNode>()?;
         m.add_class::<ExecutionPlan>()?;
         m.add_class::<PlanPass>()?;
         m.add_class::<PlanOp>()?;
@@ -1262,18 +1265,39 @@ impl PyConstraintSet {
 #[derive(Clone)]
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
 ///
-/// Each condition has an `operator` and one or more string `values`:
+/// Each condition has an `operator` and zero or more string `values`:
 ///
 /// | operator | from | values |
 /// |---|---|---|
 /// | `"eq"` | `FILTER(?v = "x")`, `?s :slot "x"` | one |
 /// | `"in"` | `VALUES ?v { "a" "b" }` | one or more |
 /// | `"gt"` / `"gte"` / `"lt"` / `"lte"` | `FILTER(?v > 10)` and friends | one |
+/// | `"startswith"` / `"endswith"` / `"contains"` | `STRSTARTS`/`STRENDS`/`CONTAINS(?v, "x")` | one |
+/// | `"istartswith"` / `"iendswith"` / `"icontains"` | the same, with the column wrapped in `LCASE(...)` | one |
+/// | `"ne"` | `FILTER(?v != "x")` | one |
+/// | `"not_bound"` | `FILTER(!bound(?v))` | **none** |
+/// | `"intersects"` | `FILTER(geof:sfIntersects(?v, "WKT"^^geo:wktLiteral))` | one (bare WKT) |
 ///
 /// A comparison compares the way SPARQL does, not the way text does: a numeric
 /// slot casts (as text, `"9" > "10"`) and a string slot needs codepoint
 /// collation. The consumer decides from the slot's type, which is why the
 /// operator alone is carried here.
+///
+/// **Case rides in the operator name, not in a separate flag.** The class
+/// carries only `operator` + `values`, so an `i` prefix (`"icontains"` etc.)
+/// keeps the fold inside the vocabulary a renderer already switches on. A
+/// renderer that does not know `"icontains"` then refuses it outright rather
+/// than silently falling back to a plain `"contains"` rendering — which would
+/// emit a case-*sensitive* `LIKE` for a condition the query asked
+/// case-insensitively, wrong and silent in both directions the two routes can
+/// disagree: the engine leg folds case and SQL's `LIKE` does not. The names
+/// also match the UI's own operator ids (`IContains` / `IStartsWith` /
+/// `IEndsWith`).
+///
+/// **`"not_bound"` carries no value**: absence is not a comparison, so there
+/// is nothing to compare against. Calling `.value` on it raises
+/// `IndexError` — correctly, see that getter — so a renderer must check
+/// `operator == "not_bound"` before reaching for one.
 ///
 /// **Unknown operators must be refused, not ignored.** A newer planner can emit
 /// one this consumer does not know, and silently dropping it widens the fetch
@@ -1283,16 +1307,23 @@ impl PyConstraintSet {
 /// Python usage:
 ///
 /// ```python
-/// for field, conditions in scope.predicate_filters.items():
-///     for cond in conditions:
-///         if cond.operator == "eq":
-///             qs = qs.filter(**{f"object_data__{field}": cond.value})
-///         elif cond.operator == "in":
-///             qs = qs.filter(**{f"object_data__{field}__in": cond.values})
-///         elif cond.operator in ("gt", "gte", "lt", "lte"):
-///             qs = qs.filter(**{f"object_data__{field}__{cond.operator}": cond.value})
-///         else:
-///             raise ValueError(f"unsupported filter operator: {cond.operator}")
+/// # Declining rather than raising: a newer planner can emit an operator this
+/// # renderer does not know (the two repos release independently), and across
+/// # that version boundary the right response is "let the engine finish the
+/// # query without this filter", not a 500. See `KNOWN_CONDITION_OPERATORS`
+/// # and `unknown_features_refuse_the_statement` on the consumer side.
+/// def render(field, cond) -> str | None:
+///     if cond.operator == "eq":
+///         return f"object_data__{field} = {cond.value!r}"
+///     elif cond.operator == "in":
+///         return f"object_data__{field} IN {tuple(cond.values)!r}"
+///     elif cond.operator in ("gt", "gte", "lt", "lte"):
+///         return f"object_data__{field} {cond.operator} {cond.value!r}"
+///     elif cond.operator == "not_bound":
+///         return f"object_data__{field} IS NULL"
+///     else:
+///         logging.warning("unsupported filter operator: %s", cond.operator)
+///         return None
 /// ```
 pub struct FilterCondition {
     operator: String,
@@ -1303,12 +1334,12 @@ pub struct FilterCondition {
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl FilterCondition {
-    /// The filter operator: ``"eq"`` (equality), ``"in"`` (set membership), or
-    /// ``"gt"`` / ``"gte"`` / ``"lt"`` / ``"lte"`` (ordering comparison).
-    ///
-    /// ``"ne"`` is deliberately absent: SPARQL's inequality is false for an
-    /// unbound variable, where SQL's ``<>`` against NULL is unknown and would
-    /// drop rows the query keeps.
+    /// The filter operator. See the class docstring's table for the full
+    /// vocabulary and what ``values`` holds for each: ``"eq"``, ``"in"``,
+    /// ``"gt"`` / ``"gte"`` / ``"lt"`` / ``"lte"``, ``"startswith"`` /
+    /// ``"endswith"`` / ``"contains"`` and their case-insensitive ``"i"``
+    /// forms, ``"ne"``, ``"not_bound"`` (no value — see ``.value``) and
+    /// ``"intersects"``.
     #[getter]
     fn operator(&self) -> &str {
         &self.operator
@@ -1340,12 +1371,17 @@ impl FilterCondition {
         // out as `FilterCondition(in=["10"])`.
         if self.operator == "in" {
             format!("FilterCondition(in={:?})", self.values)
+        } else if let Some(value) = self.values.first() {
+            format!("FilterCondition({}={:?})", self.operator, value)
         } else {
-            format!(
-                "FilterCondition({}={:?})",
-                self.operator,
-                self.values.first().map_or("", String::as_str)
-            )
+            // `not_bound` carries no value -- `self.values.first()` is `None`
+            // -- so there is nothing to print after the `=`. The previous
+            // form defaulted to the empty string here, printing
+            // `FilterCondition(not_bound="")`: a value that looks real for a
+            // condition that has none, and `.value` (the getter, not this
+            // debug string) raises `IndexError` on the same emptiness, so the
+            // two disagreed about whether this condition carries a value.
+            format!("FilterCondition({})", self.operator)
         }
     }
 }
@@ -1365,6 +1401,50 @@ impl FilterCondition {
             crate::sparql_scoper::FilterCondition::Cmp { op, value } => Self {
                 operator: op.as_str().to_owned(),
                 values: vec![value.clone()],
+            },
+            // `LikeAnchor::as_str` deliberately omits the case prefix (see
+            // its doc comment) so this boundary can add it: `icontains` /
+            // `istartswith` / `iendswith` for the `LCASE`-wrapped column,
+            // matching the UI's `IContains`/`IStartsWith` operator names.
+            // The full PyO3 surface for this (parsing it back, exposing
+            // `anchor`/`case_insensitive` as their own fields) is Task 7 —
+            // this only has to carry the value through today.
+            crate::sparql_scoper::FilterCondition::Like {
+                value,
+                anchor,
+                case_insensitive,
+            } => Self {
+                operator: if *case_insensitive {
+                    format!("i{}", anchor.as_str())
+                } else {
+                    anchor.as_str().to_owned()
+                },
+                values: vec![value.clone()],
+            },
+            // Not one of the ordering operators `op.as_str()` names — the
+            // renderer's null test has no ordering equivalent — so this
+            // boundary gives it its own operator string. Task 8 owns
+            // confirming this vocabulary against the Python consumer.
+            crate::sparql_scoper::FilterCondition::Ne(value) => Self {
+                operator: "ne".to_owned(),
+                values: vec![value.clone()],
+            },
+            // No value: absence is not a comparison. Operator string per
+            // the brief; Task 8 owns confirming the vocabulary against the
+            // Python consumer.
+            crate::sparql_scoper::FilterCondition::NotBound => Self {
+                operator: "not_bound".to_owned(),
+                values: vec![],
+            },
+            // Not one of the ordering operators either, and not a text
+            // comparison at all -- `values[0]` carries the WKT body
+            // (CRS-stripped, per `intersects_wkt_from_literal`), which the
+            // renderer hands to PostGIS's geometry constructor rather than
+            // comparing as JSONB text. Operator string per the brief; Task 8
+            // owns confirming the vocabulary against the Python consumer.
+            crate::sparql_scoper::FilterCondition::Intersects { wkt } => Self {
+                operator: "intersects".to_owned(),
+                values: vec![wkt.clone()],
             },
         }
     }
@@ -2169,12 +2249,200 @@ impl PushdownOrder {
     }
 }
 
+/// The column *family* name a resolved [`crate::sparql_columns::BrokenOutColumn`]
+/// crosses the PyO3 boundary as.
+///
+/// The one conversion point, so `PlanOp::broken_out_column` and
+/// `FilterNode::broken_out_column` -- which read an *already-resolved*
+/// `Option<BrokenOutColumn>` carried on the op or the leaf, never re-derive
+/// one -- cannot drift apart on how they spell it.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+fn broken_out_column_name(
+    resolved: Option<crate::sparql_columns::BrokenOutColumn>,
+) -> Option<&'static str> {
+    resolved.map(|column| column.as_str())
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(name = "broken_out_column")]
+/// Does `(class_uri, slot_path)` have an indexed physical column behind it?
+///
+/// The direct PyO3 wrapper around `sparql_columns::broken_out_column`, for a
+/// consumer that has a real class URI in hand -- typically a ``"scan"``
+/// operator's own ``class_uri``. Returns the column *family* name
+/// (``"geometry"`` today), not a concrete column: which of several physical
+/// columns is populated depends on facts this crate does not have, so the
+/// consumer maps the family name to its own columns. A `Some` return means
+/// "there is a column to consult", not "this row's column was populated from
+/// this slot" -- see the Rust module's doc comment (`sparql_columns.rs`) for
+/// why that second question is answered in SQL, not here.
+///
+/// `PlanOp.broken_out_column` and `FilterNode.broken_out_column` answer the
+/// same question for a filter already reached through a plan; they read a
+/// resolution the planner already made against the star's *real* class URI
+/// at the point the operator was built, rather than calling this function
+/// with a substitute. Call this function directly when a real class URI is
+/// available from elsewhere and there is no plan operator to ask.
+fn py_broken_out_column(class_uri: &str, slot_path: Vec<String>) -> Option<&'static str> {
+    crate::sparql_columns::broken_out_column(class_uri, &slot_path).map(|column| column.as_str())
+}
+
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass]
 #[derive(Clone)]
-/// One operator of a database pass: a scan, a filter, a join, an unnest, a
-/// grouping, a sort, a distinct, a slice, or a projection.
+/// One node of a [`PlanOp::filter_tree`]'s condition tree: a within-star
+/// disjunction or conjunction, or the leaf condition at its bottom.
+///
+/// **A contract read across a repo boundary.** `kind` is one of ``"all"``,
+/// ``"any"``, ``"not"`` or ``"leaf"``. A consumer that meets a `kind` it does
+/// not recognise, or a `"not"` it does not know how to render (see below),
+/// must refuse the **entire** `"filter_tree"` operator that contains this
+/// node -- never just this node or its subtree. `All` and `Any` are both
+/// monotone in their branches, so *dropping a conjunct* of `All` only widens
+/// the answer (safe on a narrowing fetch), but *dropping a branch* of `Any`
+/// narrows it to the remaining branches, which answers a different question.
+/// One rule that is safe for both connectives -- drop the whole operator --
+/// is simpler than a rule that has to know which connective it is inside,
+/// and it is the rule this contract asks for.
+///
+/// **`"not"` is representable and produced by nothing today.** It is kept in
+/// the vocabulary anyway, and exposed here rather than folded away, because
+/// the guard a consumer runs against an unknown plan operator *kind*
+/// (`filter_tree` itself) cannot see inside the tree: a `Not` node arriving
+/// later would land inside an already-known `"filter_tree"` kind, past that
+/// guard, unless the tree's own node kinds are checked too. A consumer must
+/// decline the statement outright on a `"not"` rather than ever render a bare
+/// SQL `NOT` -- SQL's three-valued logic makes `NOT (col = 'x')` *unknown*
+/// rather than true where `col` is `NULL`, which drops exactly the rows a
+/// narrowing fetch has to keep, and a renderer looking at a bare `"not"` node
+/// has no way to know it owes that `IS NOT NULL` debt the way
+/// [`FilterCondition`]'s ``"ne"`` does explicitly.
+///
+/// ``children`` is empty on a ``"leaf"``; ``slot_path``, ``condition``,
+/// ``reading`` and ``numeric`` are ``None`` (or empty) on every other kind.
+pub struct FilterNode {
+    inner: crate::sparql_refine::ConditionTree,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl FilterNode {
+    /// ``"all"`` (conjunction), ``"any"`` (disjunction), ``"not"`` (negation
+    /// -- see the class docstring for why a consumer must refuse it) or
+    /// ``"leaf"`` (one condition).
+    #[getter]
+    fn kind(&self) -> &'static str {
+        use crate::sparql_refine::ConditionTree;
+        match &self.inner {
+            ConditionTree::All(_) => "all",
+            ConditionTree::Any(_) => "any",
+            ConditionTree::Not(_) => "not",
+            ConditionTree::Leaf(_) => "leaf",
+        }
+    }
+
+    /// The branches: every branch of an ``"all"``/``"any"``, the single
+    /// wrapped node of a ``"not"``, or an empty list for a ``"leaf"``.
+    #[getter]
+    fn children(&self) -> Vec<FilterNode> {
+        use crate::sparql_refine::ConditionTree;
+        match &self.inner {
+            ConditionTree::All(branches) | ConditionTree::Any(branches) => branches
+                .iter()
+                .map(|branch| FilterNode {
+                    inner: branch.clone(),
+                })
+                .collect(),
+            ConditionTree::Not(inner) => vec![FilterNode {
+                inner: (**inner).clone(),
+            }],
+            ConditionTree::Leaf(_) => Vec::new(),
+        }
+    }
+
+    /// For ``"leaf"``: the path from the record root to the value, same
+    /// meaning as [`PlanOp::slot_path`].
+    #[getter]
+    fn slot_path(&self) -> Vec<String> {
+        use crate::sparql_refine::ConditionTree;
+        match &self.inner {
+            ConditionTree::Leaf(leaf) => leaf.condition.slot_path.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"leaf"``: what the value must satisfy.
+    #[getter]
+    fn condition(&self) -> Option<FilterCondition> {
+        use crate::sparql_refine::ConditionTree;
+        match &self.inner {
+            ConditionTree::Leaf(leaf) => {
+                Some(FilterCondition::from_rust(&leaf.condition.condition))
+            }
+            _ => None,
+        }
+    }
+
+    /// For ``"leaf"``: which value at ``slot_path`` the condition holds of,
+    /// same meaning and same vocabulary (``"column"`` / ``"any_element"`` /
+    /// ``"bound_element"``) as [`PlanOp::reading`].
+    #[getter]
+    fn reading(&self) -> Option<&'static str> {
+        use crate::sparql_refine::ConditionTree;
+        match &self.inner {
+            ConditionTree::Leaf(leaf) => Some(leaf.condition.reading.as_str()),
+            _ => None,
+        }
+    }
+
+    /// For ``"leaf"``: whether the value compares as a number rather than as
+    /// text, same meaning as [`PlanOp::numeric`]. Carried per leaf rather than
+    /// once for the whole tree: `?nm = "BX517" || ?len > 10` is one operator
+    /// whose two branches disagree about it.
+    #[getter]
+    fn numeric(&self) -> bool {
+        use crate::sparql_refine::ConditionTree;
+        match &self.inner {
+            ConditionTree::Leaf(leaf) => leaf.numeric,
+            _ => false,
+        }
+    }
+
+    /// For ``"leaf"``: the broken-out-column family name, same meaning as
+    /// [`PlanOp::broken_out_column`].
+    ///
+    /// Reads a resolution [`Expr::to_sql_tree`] already made against the
+    /// leaf's *real* class URI (`tree_shape_unchecked`'s `class_of_star`
+    /// lookup, the same map `numeric` is resolved from) -- it is not
+    /// re-derived here from `star_var` or anything else on this leaf.
+    #[getter]
+    fn broken_out_column(&self) -> Option<&'static str> {
+        use crate::sparql_refine::ConditionTree;
+        match &self.inner {
+            ConditionTree::Leaf(leaf) => broken_out_column_name(leaf.broken_out_column),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FilterNode(kind={:?}, children={})",
+            self.kind(),
+            self.children().len()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
+#[derive(Clone)]
+/// One operator of a database pass: a scan, a filter, a filter tree, a join,
+/// an unnest, a grouping, a sort, a distinct, a slice, or a projection.
 ///
 /// Read ``kind`` first and refuse a value you do not know: skipping an operator
 /// you cannot render answers a different question, which is the failure the
@@ -2189,8 +2457,18 @@ pub struct PlanOp {
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl PlanOp {
-    /// ``"scan"``, ``"unnest"``, ``"filter"``, ``"join"``, ``"group"``,
-    /// ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+    /// ``"scan"``, ``"unnest"``, ``"filter"``, ``"filter_tree"``, ``"join"``,
+    /// ``"group"``, ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+    ///
+    /// ``"filter_tree"`` is a within-star condition whose shape is a tree
+    /// rather than a conjunction -- what ``FILTER(A || B)`` lowers to. Its
+    /// tree is read through ``filter_tree``, which returns a
+    /// [`FilterNode`]. A renderer that does not recognise the ``"filter_tree"``
+    /// kind must still refuse it rather than render what it can see of the
+    /// other fields (the star and the enforcement without the condition would
+    /// narrow to every record of the star) -- refusing an unknown kind is the
+    /// designed outcome, which is why this is a kind of its own rather than a
+    /// wider ``"filter"``.
     #[getter]
     fn kind(&self) -> &'static str {
         self.inner.op.kind()
@@ -2211,14 +2489,18 @@ impl PlanOp {
     }
 
     /// The star this operator works on, for the kinds that name one: scan,
-    /// unnest, filter.
+    /// unnest, filter, filter tree.
     #[getter]
     fn star_var(&self) -> Option<String> {
         use crate::sparql_ops::Op;
         match &self.inner.op {
             Op::Scan { star_var, .. }
             | Op::Unnest { star_var, .. }
-            | Op::Filter { star_var, .. } => Some(star_var.clone()),
+            | Op::Filter { star_var, .. }
+            // Every leaf of a tree names this same star -- that is the
+            // boundary of what a tree may lift -- so the answer is as
+            // definite here as for a single condition.
+            | Op::FilterTree { star_var, .. } => Some(star_var.clone()),
             _ => None,
         }
     }
@@ -2332,7 +2614,81 @@ impl PlanOp {
         }
     }
 
-    /// For ``"filter"``: ``"enforces"`` when this operator decides the
+    /// For ``"filter_tree"``: the condition tree itself, as a [`FilterNode`].
+    ///
+    /// ``None`` for every other kind -- including ``"filter"``, whose single
+    /// condition is read through ``condition`` instead.
+    ///
+    /// **A node kind this getter's caller does not recognise must be
+    /// refused, not skipped.** `FilterNode.kind` can be ``"not"`` even though
+    /// nothing in this crate produces one today (see [`ConditionTree`]'s doc
+    /// comment on why the shape stays representable) -- a renderer meeting a
+    /// ``"not"`` must decline the *whole* ``"filter_tree"`` operator. Do not
+    /// implement or imply a rendering for it here: SQL's three-valued logic
+    /// makes a bare ``NOT`` on a nullable column *unknown* rather than true
+    /// where the column is absent, which drops exactly the rows a narrowing
+    /// fetch has to keep, and there is no way to state the ``IS NOT NULL``
+    /// debt from outside the node that owes it (compare
+    /// [`FilterCondition`]'s ``"ne"``, which states that debt itself because
+    /// it *is* the leaf).
+    ///
+    /// **On an unrenderable node anywhere in the tree, drop the entire
+    /// ``"filter_tree"`` operator, never a subtree.** `All` and `Any` are
+    /// both monotone in their branches: dropping a conjunct of `All` widens
+    /// to a superset, which is safe on the narrowing fetch route, but
+    /// dropping a branch of `Any` narrows to the remaining branches, which is
+    /// a wrong answer -- rows the query keeps would be missing with no
+    /// error. Since one shared rule ("drop the operator") is safe for both
+    /// connectives and "drop the branch" is safe for only one of them, the
+    /// uniform rule is the one to keep.
+    #[getter]
+    fn filter_tree(&self) -> Option<FilterNode> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::FilterTree { tree, .. } => Some(FilterNode {
+                inner: tree.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// For ``"filter"``: the column *family* name from the broken-out-column
+    /// registry, if this filter's slot has one -- ``"geometry"`` today, see
+    /// [`crate::sparql_columns::BrokenOutColumn`].
+    ///
+    /// ``None`` for every other kind, including ``"filter_tree"``: a tree's
+    /// leaves can each name a different slot (``?nm = "BX517" || ?len > 10``
+    /// is one operator whose branches disagree about far more than this), so
+    /// there is no single answer to give for the operator as a whole. Ask
+    /// each [`FilterNode`] leaf's own ``broken_out_column`` instead.
+    ///
+    /// A `Some` here means "there is a column to consult", not "this row's
+    /// column came from this slot" -- see the registry's module doc for why
+    /// that second question is answered in SQL, not here.
+    ///
+    /// Reads a resolution `push_filter` already made against the star's
+    /// *real* class URI (`FilterFacts::class_uri`, the same value `numeric`
+    /// is resolved from) at the point this operator was built -- not
+    /// re-derived here from `star_var` or anything else on this node. An
+    /// earlier draft of this getter did make that substitution; it was
+    /// flagged in review as silently wrong the moment the registry grows a
+    /// real per-class check, with no test able to catch it while the
+    /// registry stays blind to the difference (see `sparql_columns.rs`'s
+    /// module doc). Carrying the resolved answer, the way `reading`,
+    /// `numeric` and `right_multivalued` already are, removes the
+    /// possibility rather than documenting around it.
+    #[getter]
+    fn broken_out_column(&self) -> Option<&'static str> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Filter {
+                broken_out_column, ..
+            } => broken_out_column_name(*broken_out_column),
+            _ => None,
+        }
+    }
+
+    /// For ``"filter"`` and ``"filter_tree"``: ``"enforces"`` when this operator decides the
     /// obligation, ``"narrows"`` when it only reduces rows and a later pass
     /// decides.
     ///
@@ -2342,10 +2698,12 @@ impl PlanOp {
     fn enforcement(&self) -> Option<&'static str> {
         use crate::sparql_ops::{Enforcement, Op};
         match &self.inner.op {
-            Op::Filter { enforcement, .. } => Some(match enforcement {
-                Enforcement::Enforces => "enforces",
-                Enforcement::Narrows => "narrows",
-            }),
+            Op::Filter { enforcement, .. } | Op::FilterTree { enforcement, .. } => {
+                Some(match enforcement {
+                    Enforcement::Enforces => "enforces",
+                    Enforcement::Narrows => "narrows",
+                })
+            }
             _ => None,
         }
     }
@@ -2372,7 +2730,7 @@ impl PlanOp {
         }
     }
 
-    /// For ``"filter"``: whether the condition is on the *optional* side of a
+    /// For ``"filter"`` and ``"filter_tree"``: whether the condition is on the *optional* side of a
     /// left join, so it must not eliminate an unmatched row.
     ///
     /// The single most common way a left-join translation is wrong: in a plain
@@ -2388,7 +2746,9 @@ impl PlanOp {
     fn optional_side(&self) -> bool {
         use crate::sparql_ops::Op;
         match &self.inner.op {
-            Op::Filter { optional_side, .. } => *optional_side,
+            Op::Filter { optional_side, .. } | Op::FilterTree { optional_side, .. } => {
+                *optional_side
+            }
             _ => false,
         }
     }

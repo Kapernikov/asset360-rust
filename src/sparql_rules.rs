@@ -604,6 +604,13 @@ struct SlotBinding {
     /// [`PlanOp::Unnest`] is below the node being asked -- the variable then
     /// stands for one element, which is what SPARQL bound it to.
     reading: SlotReading,
+    /// The [`ScanSlot`] this variable was read from requires the value or
+    /// only allows it. Copied straight off that `ScanSlot` -- `collect`
+    /// already visits it to learn `reading` -- rather than looked up again
+    /// later: a rule asking "is this slot optional" would otherwise have to
+    /// walk back down to the scan a second time, and a fact fetched twice is
+    /// a fact that can disagree with itself.
+    presence: SlotPresence,
 }
 
 /// The variables the `Sql` scans feeding a node have bound, and what to.
@@ -706,6 +713,7 @@ impl Visible {
                     star_var: star_var.clone(),
                     path: slot.path.clone(),
                     reading,
+                    presence: slot.presence,
                 };
                 match slots.entry(bound) {
                     Entry::Vacant(entry) => {
@@ -1095,6 +1103,7 @@ fn sinkable(visible: &Visible, condition: &Expr) -> Option<Expr> {
             star_var: binding.star_var.clone(),
             slot_path: binding.path.clone(),
             reading: binding.reading,
+            presence: binding.presence,
         },
     ))
 }
@@ -1562,6 +1571,12 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
                 star_var: site.star_var.clone(),
                 slot_path,
                 reading,
+                // This rule always adds the existence half itself, a few
+                // lines below in `apply`, as `SlotPresence::Required` -- `?s
+                // :name "BX517"` asserts the slot is there as well as what it
+                // holds, not merely that it might be. The condition built
+                // here has to say the same thing about the same read.
+                presence: SlotPresence::Required,
             }),
             right: Box::new(Expr::Literal(term.clone())),
         };
@@ -2231,6 +2246,7 @@ impl Rule for ValuesBecomesFilter<'_> {
                     star_var: binding.star_var.clone(),
                     slot_path: binding.path.clone(),
                     reading: binding.reading,
+                    presence: binding.presence,
                 }),
                 candidates: terms.into_iter().map(Expr::Literal).collect(),
             };
@@ -2312,7 +2328,26 @@ impl<'s> PushComparisonFilter<'s> {
         // `to_sql` accepts, not a constant of this rule. It is also where the
         // constant-is-the-column's-term half is asked, which is why it takes
         // the schema and the classes the scans below were scanned as.
-        resolved.to_sql(self.schema, &visible.class_of_star)?;
+        // Two entry points, and a condition either one accepts is pushable.
+        // `to_sql` is the conjunctive fast path; `to_sql_tree` is the
+        // within-star disjunction, which `to_sql` declines by construction
+        // and which had no representation at all until
+        // `crate::sparql_refine::ConditionTree` -- so `FILTER(A || B)` was
+        // accepted, scoped, and never lifted, which the triple limit turns
+        // into a failed query rather than a slow one. Asked here rather than
+        // in a rule of its own: which slot binds `?nm` and whether the
+        // landing site runs in SQL are the same questions with the same
+        // answers, and a second rule asking them is a second rule to keep in
+        // agreement with this one.
+        if resolved
+            .to_sql(self.schema, &visible.class_of_star)
+            .is_none()
+            && resolved
+                .to_sql_tree(self.schema, &visible.class_of_star)
+                .is_none()
+        {
+            return None;
+        }
         Some(resolved)
     }
 }
@@ -2494,6 +2529,7 @@ fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
                 star_var: binding.star_var.clone(),
                 slot_path: binding.path.clone(),
                 reading: binding.reading,
+                presence: binding.presence,
             }
         }
         Expr::Literal(term) => Expr::Literal(term.clone()),
