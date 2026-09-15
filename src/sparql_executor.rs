@@ -1192,12 +1192,12 @@ classes:
             .iter()
             .map(|b| b["code"]["value"].as_str().unwrap())
             .collect();
-        // Both, since upstream #127: a permissible value reaches the schema
-        // graph whether or not it carries a `meaning`, the one without simply
-        // being named by an IRI minted from its own enum. Before that,
-        // `LOCAL_ONLY` had no IRI to describe and was absent altogether — so a
-        // client walking the schema graph could not see half of what the
-        // instance data was allowed to say.
+        // Every permissible value is a member of its scheme, whether or not it
+        // carries a `meaning`: `GSA` under its expanded meaning IRI, and
+        // `LOCAL_ONLY` under the `<enum_uri>#<code>` IRI upstream mints for a
+        // meaning-less value. The minted IRI joins nothing in the instance data
+        // — `LOCAL_ONLY` is a plain literal there — but the schema graph still
+        // has to answer "which values does this enum permit?" with all of them.
         assert_eq!(codes, vec!["GSA", "LOCAL_ONLY"], "{answer}");
     }
 
