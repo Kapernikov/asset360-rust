@@ -45,6 +45,8 @@ classes:
       - sections
       - contacts
       - notes
+      - pictures
+      - cover
   Section:
     slots:
       - sequenceNumber
@@ -66,6 +68,10 @@ classes:
   Note:
     slots:
       - body
+  Picture:
+    slots:
+      - sequence
+      - caption
 slots:
   name:
     range: string
@@ -93,6 +99,18 @@ slots:
     range: string
   body:
     range: string
+  pictures:
+    range: Picture
+    multivalued: true
+    inlined_as_list: true
+  sequence:
+    range: integer
+    key: true
+  caption:
+    range: string
+  cover:
+    range: Picture
+    inlined: true
 `;
 
 /** Path segments `diff()` actually emitted under `slot`, in emission order. */
@@ -344,6 +362,162 @@ name: personinfo
     ) as Array<{ path: string[] }>;
     expect(diffSegmentsUnder(deltas, 'sections')).to.deep.equal(['2']);
   });
+});
+
+describe('delta bindings', () => {
+  before(async () => {
+    await readyAsset360();
+  });
+
+  const BASE = {
+    name: 'svc',
+    sections: [
+      { sequenceNumber: 1, note: 'one' },
+      { sequenceNumber: 2, note: 'two' },
+    ],
+    contacts: [{ kind: 'home', primary: true, phone: '555-0100' }],
+  };
+  const EDITED = {
+    name: 'svc',
+    sections: [
+      { sequenceNumber: 1, note: 'one' },
+      { sequenceNumber: 2, note: 'TWO' },
+    ],
+    contacts: [{ kind: 'home', primary: true, phone: '555-0200' }],
+  };
+
+  it('patchJson round-trips a diff and reports unresolvable paths', () => {
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const deltas = view.diffJson('Service', BASE, EDITED, false);
+
+    const applied = view.patchJson('Service', BASE, deltas, false, true) as {
+      value: unknown;
+      failed: string[][];
+    };
+    expect(applied.failed).to.deep.equal([]);
+
+    // The round trip is the property: patching the base with diff(base, edited)
+    // must land exactly on edited, per the engine's own diff.
+    expect(view.diffJson('Service', applied.value, EDITED, false)).to.deep.equal([]);
+
+    // report-never-guess: an address resolving to nothing comes back named,
+    // not silently skipped. A frontend that rendered an unapplied delta would
+    // present stale data as current.
+    const bogus = [
+      { path: ['sections', '404', 'note'], op: 'update', old: 'two', new: 'nope' },
+    ];
+    const partial = view.patchJson('Service', BASE, bogus, false, true) as {
+      value: unknown;
+      failed: string[][];
+    };
+    expect(partial.failed).to.deep.equal([['sections', '404', 'note']]);
+  });
+
+  it('equals answers the unchanged question the same way diff does', () => {
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const a = view.loadInstanceFromJson('Service', JSON.stringify(BASE));
+    const b = view.loadInstanceFromJson('Service', JSON.stringify(BASE));
+    const c = view.loadInstanceFromJson('Service', JSON.stringify(EDITED));
+
+    expect(a.equals(b, false)).to.equal(true);
+    expect(a.equals(c, false)).to.equal(false);
+
+    // The autosave gate's whole reason for existing: this boolean must never
+    // disagree with "diff produced nothing".
+    expect(a.equals(b, false)).to.equal(
+      view.diffJson('Service', BASE, BASE, false).length === 0,
+    );
+    expect(a.equals(c, false)).to.equal(
+      view.diffJson('Service', BASE, EDITED, false).length === 0,
+    );
+  });
+
+  it('diffInstances matches diffJson and can diff a navigated subtree', () => {
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const base = view.loadInstanceFromJson('Service', JSON.stringify(BASE));
+    const edited = view.loadInstanceFromJson('Service', JSON.stringify(EDITED));
+
+    // Order-insensitively, deliberately: `diff` walks an object's slots from a
+    // hash map, so deltas for *sibling slots* come back in no guaranteed order
+    // and the two calls parse their inputs separately. The claim under test is
+    // that the same edits are reported, not that they queue up the same way.
+    const byPath = (ds: Array<{ path: string[] }>) =>
+      [...ds].sort((x, y) => JSON.stringify(x.path).localeCompare(JSON.stringify(y.path)));
+
+    expect(byPath(asset360.diffInstances(base, edited, false))).to.deep.equal(
+      byPath(view.diffJson('Service', BASE, EDITED, false)),
+    );
+
+    // The point of taking handles: a navigated subtree can be diffed without
+    // the caller knowing its class name, which `diffJson` would demand.
+    const baseSections = base.navigate(['sections']);
+    const editedSections = edited.navigate(['sections']);
+    expect(baseSections, 'base sections').to.not.be.undefined;
+    const subtree = asset360.diffInstances(
+      baseSections!,
+      editedSections!,
+      false,
+    ) as Array<{ path: string[] }>;
+    expect(subtree.length).to.equal(1);
+    // Paths are relative to the subtree that was diffed, not the root.
+    expect(subtree[0].path).to.deep.equal(['2', 'note']);
+  });
+
+  it('diffJson can describe a changed key as an update instead of a replacement', () => {
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const before = { name: 'svc', cover: { sequence: 1, caption: 'hero' } };
+    const after = { name: 'svc', cover: { sequence: 2, caption: 'hero' } };
+
+    // Default stays today's behaviour: a changed key means a different thing,
+    // so the element is replaced wholesale.
+    const byDefault = view.diffJson('Service', before, after, false) as Array<{
+      path: string[];
+    }>;
+    expect(byDefault.map((d) => d.path)).to.deep.equal([['cover']]);
+
+    // Passing it explicitly must not change anything — that is what makes the
+    // added parameter non-breaking for every existing caller.
+    expect(view.diffJson('Service', before, after, false, true)).to.deep.equal(byDefault);
+
+    // Opting out describes the edit in place. On a live edit form this is the
+    // difference between the row updating and the row flashing away and back
+    // mid-keystroke.
+    const asUpdate = view.diffJson('Service', before, after, false, false) as Array<{
+      path: string[];
+      old: unknown;
+      new: unknown;
+    }>;
+    expect(asUpdate.map((d) => d.path)).to.deep.equal([['cover', 'sequence']]);
+    expect(asUpdate[0].old).to.equal(1);
+    expect(asUpdate[0].new).to.equal(2);
+  });
+
+  it('leaves keyed list elements alone whatever the identifier flag says', () => {
+    // The flag decides how a changed key is described once two objects are
+    // paired. In a keyed list they are never paired: identity labelling splits
+    // `sequence: 1` and `sequence: 2` into a removal and an addition first, so
+    // the flag has nothing left to decide. Pinned because the obvious reading
+    // of the option — "controls changed keys everywhere" — is wrong here.
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const before = { name: 'svc', pictures: [{ sequence: 1, caption: 'hero' }] };
+    const after = { name: 'svc', pictures: [{ sequence: 2, caption: 'hero' }] };
+
+    const ops = (ds: Array<{ path: string[]; op: string }>) =>
+      ds.map((d) => `${d.op} ${d.path.join('/')}`);
+
+    const withFlag = view.diffJson('Service', before, after, false, true) as Array<{
+      path: string[];
+      op: string;
+    }>;
+    const withoutFlag = view.diffJson('Service', before, after, false, false) as Array<{
+      path: string[];
+      op: string;
+    }>;
+
+    expect(ops(withFlag)).to.deep.equal(['remove pictures/1', 'add pictures/2']);
+    expect(ops(withoutFlag)).to.deep.equal(ops(withFlag));
+  });
+
 });
 
 export {};

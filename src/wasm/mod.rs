@@ -14,7 +14,9 @@ pub use minijinja::*;
 
 use linkml_meta::SchemaDefinition;
 use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
-use linkml_runtime::{DiffOptions, LinkMLInstance, diff, load_json_str};
+use linkml_runtime::{
+    Delta, DiffOptions, LinkMLInstance, PatchOptions, diff, load_json_str, patch,
+};
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::enumview::EnumView;
 use linkml_schemaview::identifier::Identifier;
@@ -264,6 +266,13 @@ impl SchemaViewHandle {
     /// reusing the engine on the frontend).
     ///
     /// `treat_missing_as_null` mirrors [`DiffOptions::treat_missing_as_null`].
+    ///
+    /// `treat_changed_identifier_as_new_object` mirrors the option of the same
+    /// name and defaults to `true`, which is what this binding did before the
+    /// parameter existed. Pass `false` on a live edit form: with it on, typing
+    /// in the identity slot itself reads as remove + add, so the row flashes as
+    /// deleted and re-added mid-keystroke instead of simply updating.
+    ///
     /// Returns `Delta[]` (`{ path, op, old?, new? }`).
     #[wasm_bindgen(js_name = diffJson)]
     pub fn diff_json(
@@ -272,22 +281,57 @@ impl SchemaViewHandle {
         base: JsValue,
         current: JsValue,
         treat_missing_as_null: bool,
+        treat_changed_identifier_as_new_object: Option<bool>,
     ) -> Result<JsValue, JsValue> {
         let base_handle = self.create_instance(class_name, base)?;
         let current_handle = self.create_instance(class_name, current)?;
-        let deltas = diff(
-            &base_handle.inner,
-            &current_handle.inner,
-            DiffOptions::new(treat_missing_as_null),
-        );
-        // A `Delta`'s `old`/`new` are `serde_json::Value`s; object payloads (e.g.
-        // a removed inlined row) serialise to maps. The default serde_wasm_bindgen
-        // serializer emits JS `Map`s — which `JSON.stringify` renders as `{}`, so
-        // the frontend would see empty removed-row data. The json-compatible
-        // serializer emits plain objects instead.
-        deltas
-            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
-            .map_err(|err| format_err(&err))
+        diff_instances(
+            &base_handle,
+            &current_handle,
+            treat_missing_as_null,
+            treat_changed_identifier_as_new_object,
+        )
+    }
+
+    /// Apply `deltas` to `base`, returning the patched value and the paths that
+    /// could not be applied: `{ value, failed }`.
+    ///
+    /// `failed` carries the engine's report-never-guess contract across the
+    /// boundary: an address that resolves to nothing, or ambiguously, comes back
+    /// named rather than silently skipped. One bad delta never voids the batch,
+    /// so a caller wanting all-or-nothing checks `failed` and discards `value`
+    /// itself — and a caller that ignores it would render an unapplied delta,
+    /// presenting stale data as current.
+    ///
+    /// Both flags default to the engine's own defaults (`true`).
+    #[wasm_bindgen(js_name = patchJson)]
+    pub fn patch_json(
+        &self,
+        class_name: &str,
+        base: JsValue,
+        deltas: JsValue,
+        treat_missing_as_null: Option<bool>,
+        ignore_no_ops: Option<bool>,
+    ) -> Result<JsValue, JsValue> {
+        let base_handle = self.create_instance(class_name, base)?;
+        let deltas: Vec<Delta> =
+            serde_wasm_bindgen::from_value(deltas).map_err(|err| format_err(&err))?;
+        let defaults = PatchOptions::default();
+        let opts = PatchOptions {
+            ignore_no_ops: ignore_no_ops.unwrap_or(defaults.ignore_no_ops),
+            treat_missing_as_null: treat_missing_as_null.unwrap_or(defaults.treat_missing_as_null),
+        };
+        let (patched, trace) = patch(&base_handle.inner, &deltas, opts)
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
+        // Same json-compatible serializer as `diff_json`, and for the same
+        // reason: the default emits JS `Map`s, which `JSON.stringify` renders
+        // as `{}`.
+        PatchOutcome {
+            value: patched.to_json(),
+            failed: trace.failed,
+        }
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|err| format_err(&err))
     }
 
     /// Retrieve a [`ClassView`] by name or CURIE (without requiring a schema id).
@@ -433,6 +477,40 @@ pub fn load_schema_view(yaml: &str) -> Result<SchemaViewHandle, JsValue> {
 }
 
 /// Load a [`SchemaView`] from snapshot YAML.
+/// Diff two already-parsed instances, `base` → `current`.
+///
+/// The handle-taking form of [`SchemaViewHandle::diff_json`], which is a thin
+/// wrapper over this. Two reasons to reach for it directly: a caller holding a
+/// stable base re-parses only the edited side, which halves the work on a diff
+/// running per keystroke; and a navigated subtree can be diffed without the
+/// caller knowing its class name, which `diffJson` would demand. Emitted paths
+/// are relative to the instances passed in, not to any root above them.
+#[wasm_bindgen(js_name = diffInstances)]
+pub fn diff_instances(
+    base: &LinkMLInstanceHandle,
+    current: &LinkMLInstanceHandle,
+    treat_missing_as_null: bool,
+    treat_changed_identifier_as_new_object: Option<bool>,
+) -> Result<JsValue, JsValue> {
+    let deltas = diff(
+        &base.inner,
+        &current.inner,
+        DiffOptions {
+            treat_changed_identifier_as_new_object: treat_changed_identifier_as_new_object
+                .unwrap_or(true),
+            ..DiffOptions::new(treat_missing_as_null)
+        },
+    );
+    // A `Delta`'s `old`/`new` are `serde_json::Value`s; object payloads (e.g. a
+    // removed inlined row) serialise to maps. The default serde_wasm_bindgen
+    // serializer emits JS `Map`s — which `JSON.stringify` renders as `{}`, so the
+    // frontend would see empty removed-row data. The json-compatible serializer
+    // emits plain objects instead.
+    deltas
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|err| format_err(&err))
+}
+
 #[wasm_bindgen(js_name = loadSchemaViewFromSnapshot)]
 pub fn load_schema_view_from_snapshot(yaml: &str) -> Result<SchemaViewHandle, JsValue> {
     let view = SchemaView::from_snapshot_yaml(yaml).map_err(map_schema_error)?;
@@ -444,6 +522,13 @@ fn parse_schema_definition(yaml: &str) -> Result<SchemaDefinition, JsValue> {
     let schema: SchemaDefinition = serde_path_to_error::deserialize(deserializer)
         .map_err(|err| JsValue::from_str(&err.to_string()))?;
     Ok(schema)
+}
+
+/// The `{ value, failed }` payload [`SchemaViewHandle::patch_json`] returns.
+#[derive(Serialize)]
+struct PatchOutcome {
+    value: serde_json::Value,
+    failed: Vec<Vec<String>>,
 }
 
 fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
@@ -971,6 +1056,16 @@ impl LinkMLInstanceHandle {
             also_include_id_slots.unwrap_or(false),
         );
         to_js(&refs)
+    }
+
+    /// Semantic equality per the LinkML Instances spec.
+    ///
+    /// The engine's own identity rule, so it cannot disagree with `diff` about
+    /// what "unchanged" means — and it allocates nothing, where asking the same
+    /// question by materialising a delta list and testing its length does.
+    #[wasm_bindgen(js_name = equals)]
+    pub fn equals_js(&self, other: &LinkMLInstanceHandle, treat_missing_as_null: bool) -> bool {
+        self.inner.equals(&other.inner, treat_missing_as_null)
     }
 
     /// This element's identity label, or `undefined` when it has none.
