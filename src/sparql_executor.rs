@@ -1192,10 +1192,13 @@ classes:
             .iter()
             .map(|b| b["code"]["value"].as_str().unwrap())
             .collect();
-        // Only `GSA` has a `meaning`, so only `GSA` has an IRI to describe.
-        // `LOCAL_ONLY` is legible in the instance data as a plain literal and
-        // is deliberately absent here.
-        assert_eq!(codes, vec!["GSA"], "{answer}");
+        // Every permissible value is a member of its scheme, whether or not it
+        // carries a `meaning`: `GSA` under its expanded meaning IRI, and
+        // `LOCAL_ONLY` under the `<enum_uri>#<code>` IRI upstream mints for a
+        // meaning-less value. The minted IRI joins nothing in the instance data
+        // — `LOCAL_ONLY` is a plain literal there — but the schema graph still
+        // has to answer "which values does this enum permit?" with all of them.
+        assert_eq!(codes, vec!["GSA", "LOCAL_ONLY"], "{answer}");
     }
 
     /// The parity guard, asserted directly rather than trusted: the schema

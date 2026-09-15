@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn the_fixture_quad_count_is_pinned() {
         let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert_eq!(graph.quads.len(), 5353);
+        assert_eq!(graph.quads.len(), 5568);
     }
 
     /// The number above is not a number to be re-pinned when it moves; it has
@@ -248,8 +248,20 @@ mod tests {
         // `AccessibleTrack`, `CoveredSection.hasSequenceNumber`, and the `id`
         // that makes `Track` referenceable at all) — 36 more quads, and 36
         // more restrictions with them.
-        // 5353 - 1453 = 3900 = 4 x 975 restrictions, exactly.
-        assert_eq!(graph.quads.len(), 1453 + 4 * restrictions);
+        //
+        // 1668 since upstream stopped skipping permissible values without a
+        // `meaning` and started emitting `owl:hasKey`, +215 in this fixture:
+        //
+        // * 42 of the 43 permissible values carry no `meaning` and used to be
+        //   dropped. Each now contributes five quads — `rdf:type skos:Concept`,
+        //   `rdfs:comment`, `rdfs:label`, `skos:inScheme`, `skos:notation` —
+        //   so 210. (`GSA`, the one with a `meaning`, was already emitted.)
+        // * `AccessibleTrack` is the fixture's only class with `unique_keys`,
+        //   and its key is composite: one `owl:hasKey` plus the four
+        //   `rdf:first`/`rdf:rest` cells of a two-member list, so 5.
+        //
+        // 5568 - 1668 = 3900 = 4 x 975 restrictions, exactly.
+        assert_eq!(graph.quads.len(), 1668 + 4 * restrictions);
     }
 
     /// The unrolled form is the point: upstream matches `gen-owl`'s `simplify`
