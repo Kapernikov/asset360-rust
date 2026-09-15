@@ -972,6 +972,29 @@ impl LinkMLInstanceHandle {
         );
         to_js(&refs)
     }
+
+    /// This element's identity label, or `undefined` when it has none.
+    ///
+    /// Deliberately per-element: `listPathSegments` answers positionally
+    /// unless every element of the list carries a distinct label, so a row
+    /// the user has just added — with its identity slot still empty, or
+    /// duplicating a neighbour — would otherwise flip every row of the list
+    /// to a position and blank the whole table's provenance.
+    #[wasm_bindgen(js_name = elementIdentityLabel)]
+    pub fn element_identity_label(&self) -> Option<String> {
+        linkml_runtime::element_identity_label(&self.inner)
+    }
+
+    /// Name every element of this list the way the engine addresses them:
+    /// identity labels where the list has element identity, positions
+    /// otherwise. Mirrors what `diff()` emits.
+    #[wasm_bindgen(js_name = listPathSegments)]
+    pub fn list_path_segments(&self) -> Option<Vec<String>> {
+        match &self.inner {
+            LinkMLInstance::List { values, .. } => Some(linkml_runtime::list_path_segments(values)),
+            _ => None,
+        }
+    }
 }
 
 #[wasm_bindgen]

@@ -31,6 +31,81 @@ enums:
 
 const PERSON_JSON = JSON.stringify({ name: 'Alice', aliases: ['Al'], role: 'manager' });
 
+const IDENTITY_SCHEMA_YAML = `
+id: https://example.org/identity
+name: identity
+default_prefix: ex
+prefixes:
+  ex:
+    prefix_reference: http://example.org/
+classes:
+  Service:
+    slots:
+      - name
+      - sections
+      - contacts
+      - notes
+  Section:
+    slots:
+      - sequenceNumber
+      - note
+    unique_keys:
+      seq:
+        unique_key_slots:
+          - sequenceNumber
+  Contact:
+    slots:
+      - kind
+      - primary
+      - phone
+    unique_keys:
+      ck:
+        unique_key_slots:
+          - kind
+          - primary
+  Note:
+    slots:
+      - body
+slots:
+  name:
+    range: string
+  sections:
+    range: Section
+    multivalued: true
+    inlined_as_list: true
+  contacts:
+    range: Contact
+    multivalued: true
+    inlined_as_list: true
+  notes:
+    range: Note
+    multivalued: true
+    inlined_as_list: true
+  sequenceNumber:
+    range: integer
+  note:
+    range: string
+  kind:
+    range: string
+  primary:
+    range: boolean
+  phone:
+    range: string
+  body:
+    range: string
+`;
+
+/** Path segments `diff()` actually emitted under `slot`, in emission order. */
+function diffSegmentsUnder(deltas: Array<{ path: string[] }>, slot: string): string[] {
+  const seen: string[] = [];
+  for (const delta of deltas) {
+    if (delta.path[0] === slot && delta.path.length > 1 && !seen.includes(delta.path[1])) {
+      seen.push(delta.path[1]);
+    }
+  }
+  return seen;
+}
+
 describe('LinkMLInstance wasm bindings', () => {
   before(async () => {
     await readyAsset360();
@@ -170,6 +245,104 @@ name: personinfo
     expect(view.getResolutionUriOfSchema('https://example.org/personinfo')).to.equal(
       'https://example.org/personinfo.yaml',
     );
+  });
+
+  it('names list elements the way diff() addresses them', () => {
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const data = {
+      name: 'svc',
+      sections: [
+        { sequenceNumber: 1, note: 'one' },
+        { sequenceNumber: 2, note: 'two' },
+      ],
+      contacts: [
+        { kind: 'home', primary: true, phone: '555-0100' },
+        { kind: 'work', primary: false, phone: '555-0199' },
+      ],
+      notes: [{ body: 'first' }, { body: 'second' }],
+    };
+    const instance = view.loadInstanceFromJson('Service', JSON.stringify(data));
+
+    // A single-slot `unique_keys` labels by the bare scalar value. "1" names
+    // the FIRST element, so a positional answer here would land every rewrite
+    // one element early and still look like a success.
+    const sections = instance.get('sections')!;
+    expect(sections.listPathSegments()).to.deep.equal(['1', '2']);
+    expect(sections.at(0)!.elementIdentityLabel()).to.equal('1');
+    expect(sections.at(1)!.elementIdentityLabel()).to.equal('2');
+
+    // A composite `unique_keys` encodes a compact JSON array, values
+    // stringified in `unique_key_slots` order — booleans lowercase. This is
+    // the segment shape an emitter is likeliest to get subtly wrong alone.
+    const contacts = instance.get('contacts')!;
+    expect(contacts.listPathSegments()).to.deep.equal([
+      '["home","true"]',
+      '["work","false"]',
+    ]);
+    expect(contacts.at(0)!.elementIdentityLabel()).to.equal('["home","true"]');
+
+    // A class declaring no identity at all is positional, and stays that way.
+    const notes = instance.get('notes')!;
+    expect(notes.listPathSegments()).to.deep.equal(['0', '1']);
+    expect(notes.at(0)!.elementIdentityLabel()).to.equal(undefined);
+
+    // listPathSegments only answers for lists.
+    expect(instance.listPathSegments()).to.equal(undefined);
+    expect(instance.get('name')!.listPathSegments()).to.equal(undefined);
+
+    // The property that actually matters: the labels are the segments `diff()`
+    // emits for the same data. Perturb one leaf per list and compare.
+    const changed = JSON.parse(JSON.stringify(data)) as typeof data;
+    changed.sections[1].note = 'TWO';
+    changed.contacts[1].phone = '555-0200';
+    changed.notes[1].body = 'SECOND';
+    const deltas = view.diffJson(
+      'Service',
+      data,
+      changed,
+      false,
+    ) as Array<{ path: string[] }>;
+
+    expect(diffSegmentsUnder(deltas, 'sections')).to.deep.equal(['2']);
+    expect(diffSegmentsUnder(deltas, 'contacts')).to.deep.equal(['["work","false"]']);
+    expect(diffSegmentsUnder(deltas, 'notes')).to.deep.equal(['1']);
+  });
+
+  it('keeps per-element labels when one sibling has no identity', () => {
+    // The case this whole design rests on. A row the user has just added has
+    // its identity slot still empty, which flips the *list* to positional —
+    // but the labelled rows must still report their own labels, or the table
+    // loses every row's provenance the moment someone hits "add".
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const data = {
+      name: 'svc',
+      sections: [
+        { sequenceNumber: 1, note: 'one' },
+        { note: 'freshly added, no key yet' },
+        { sequenceNumber: 3, note: 'three' },
+      ],
+    };
+    const instance = view.loadInstanceFromJson('Service', JSON.stringify(data));
+    const sections = instance.get('sections')!;
+
+    // The whole list goes positional, because one element carries no label.
+    expect(sections.listPathSegments()).to.deep.equal(['0', '1', '2']);
+
+    // ...and yet the per-element rule is untouched.
+    expect(sections.at(0)!.elementIdentityLabel()).to.equal('1');
+    expect(sections.at(1)!.elementIdentityLabel()).to.equal(undefined);
+    expect(sections.at(2)!.elementIdentityLabel()).to.equal('3');
+
+    // diff() agrees: it addresses this list positionally too.
+    const changed = JSON.parse(JSON.stringify(data)) as typeof data;
+    changed.sections[2].note = 'THREE';
+    const deltas = view.diffJson(
+      'Service',
+      data,
+      changed,
+      false,
+    ) as Array<{ path: string[] }>;
+    expect(diffSegmentsUnder(deltas, 'sections')).to.deep.equal(['2']);
   });
 });
 
