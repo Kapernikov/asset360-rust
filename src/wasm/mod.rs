@@ -1082,7 +1082,16 @@ impl LinkMLInstanceHandle {
 
     /// Name every element of this list the way the engine addresses them:
     /// identity labels where the list has element identity, positions
-    /// otherwise. Mirrors what `diff()` emits.
+    /// otherwise. These are the segments `navigate` and `patch` resolve.
+    ///
+    /// Not always the segments `diff` emits. Upstream #124 made `diff`
+    /// schema-shaped: a list whose *class* declares an identity is never
+    /// addressed positionally, so when one element leaves its identity slot
+    /// empty — the freshly-added row — `diff` declines to address the elements
+    /// at all and replaces the whole slot instead. This call stays data-shaped
+    /// (upstream #126 tracks closing that gap), and agrees with `navigate`
+    /// either way. When what you want is one element's own identity regardless
+    /// of the company it keeps, ask `elementIdentityLabel`.
     #[wasm_bindgen(js_name = listPathSegments)]
     pub fn list_path_segments(&self) -> Option<Vec<String>> {
         match &self.inner {

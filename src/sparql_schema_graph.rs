@@ -143,8 +143,9 @@ mod tests {
     use super::*;
     use linkml_meta::SchemaDefinition;
     use linkml_runtime::schema_rdf::{
-        OWL_ALL_VALUES_FROM, OWL_CLASS, OWL_MAX_CARDINALITY, OWL_MIN_CARDINALITY, OWL_ON_PROPERTY,
-        OWL_RESTRICTION, RDF_TYPE, RDFS_LABEL, RDFS_SUBCLASS_OF, SKOS_IN_SCHEME, XSD_INTEGER,
+        OWL_ALL_VALUES_FROM, OWL_CLASS, OWL_HAS_KEY, OWL_MAX_CARDINALITY, OWL_MIN_CARDINALITY,
+        OWL_ON_PROPERTY, OWL_RESTRICTION, RDF_FIRST, RDF_REST, RDF_TYPE, RDFS_LABEL,
+        RDFS_SUBCLASS_OF, SKOS_IN_SCHEME, SKOS_NOTATION, XSD_INTEGER,
     };
     use linkml_schemaview::identifier::Identifier;
     use oxigraph::model::{NamedOrBlankNode, Term};
@@ -181,10 +182,11 @@ mod tests {
     /// change in the upstream triplifier cannot silently change what this
     /// endpoint serves. (The *live* asset360 schema is much larger; the
     /// consolidator-server test suite pins that count.)
+
     #[test]
     fn the_fixture_quad_count_is_pinned() {
         let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert_eq!(graph.quads.len(), 5353);
+        assert_eq!(graph.quads.len(), 5568);
     }
 
     /// The number above is not a number to be re-pinned when it moves; it has
@@ -242,14 +244,43 @@ mod tests {
             .count();
         assert_eq!(typed_restrictions, restrictions);
 
+        // Every permissible value carries the same five quads: `rdf:type`,
+        // `rdfs:label`, `rdfs:comment`, `skos:inScheme` and `skos:notation`.
+        assert_eq!(
+            count(SKOS_IN_SCHEME),
+            count(SKOS_NOTATION),
+            "one notation per permissible value"
+        );
+        let permissible_values = count(SKOS_IN_SCHEME);
+
+        // `unique_keys` is an `owl:hasKey` over an RDF list: the key quad
+        // itself, plus an `rdf:first`/`rdf:rest` pair per cell.
+        let unique_key_quads = count(OWL_HAS_KEY) + count(RDF_FIRST) + count(RDF_REST);
+
         // 1417 was the count before per-class cardinality and range existed;
         // 1453 since the fixture gained the keyed inlined lists the
         // foreign-reference walker is tested against (`TunnelComplex`,
         // `AccessibleTrack`, `CoveredSection.hasSequenceNumber`, and the `id`
         // that makes `Track` referenceable at all) — 36 more quads, and 36
         // more restrictions with them.
-        // 5353 - 1453 = 3900 = 4 x 975 restrictions, exactly.
-        assert_eq!(graph.quads.len(), 1453 + 4 * restrictions);
+        //
+        // Upstream #127 then added two constructs `gen-owl` emits and this did
+        // not, which is where the remaining 215 come from:
+        //
+        //   * every permissible value is emitted, not only those carrying a
+        //     `meaning`. The fixture declares 43. Exactly one has a `meaning`
+        //     and so already had an IRI to describe before #127; the other 42
+        //     were absent entirely, at five quads each — hence
+        //     `5 * (permissible_values - 1)`, not `5 * permissible_values`.
+        //   * `unique_keys` becomes `owl:hasKey`. The fixture declares one, over
+        //     a two-cell list: 1 + 2 + 2 = 5 quads.
+        //
+        // 1453 + 210 + 5 = 1668, and 5568 - 1668 = 3900 = 4 x 975 restrictions,
+        // exactly.
+        assert_eq!(
+            graph.quads.len(),
+            1453 + 5 * (permissible_values - 1) + unique_key_quads + 4 * restrictions
+        );
     }
 
     /// The unrolled form is the point: upstream matches `gen-owl`'s `simplify`

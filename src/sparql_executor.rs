@@ -1192,10 +1192,13 @@ classes:
             .iter()
             .map(|b| b["code"]["value"].as_str().unwrap())
             .collect();
-        // Only `GSA` has a `meaning`, so only `GSA` has an IRI to describe.
-        // `LOCAL_ONLY` is legible in the instance data as a plain literal and
-        // is deliberately absent here.
-        assert_eq!(codes, vec!["GSA"], "{answer}");
+        // Both, since upstream #127: a permissible value reaches the schema
+        // graph whether or not it carries a `meaning`, the one without simply
+        // being named by an IRI minted from its own enum. Before that,
+        // `LOCAL_ONLY` had no IRI to describe and was absent altogether — so a
+        // client walking the schema graph could not see half of what the
+        // instance data was allowed to say.
+        assert_eq!(codes, vec!["GSA", "LOCAL_ONLY"], "{answer}");
     }
 
     /// The parity guard, asserted directly rather than trusted: the schema

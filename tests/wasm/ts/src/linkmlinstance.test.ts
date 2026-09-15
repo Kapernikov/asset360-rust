@@ -351,7 +351,17 @@ name: personinfo
     expect(sections.at(1)!.elementIdentityLabel()).to.equal(undefined);
     expect(sections.at(2)!.elementIdentityLabel()).to.equal('3');
 
-    // diff() agrees: it addresses this list positionally too.
+    // `navigate` resolves the same positional segments this call just named —
+    // that agreement is what makes them usable as addresses at all.
+    expect(instance.navigate(['sections', '0'])!.get('note')!.scalarValue()).to.equal('one');
+    expect(instance.navigate(['sections', '2'])!.get('note')!.scalarValue()).to.equal('three');
+
+    // `diff` does NOT agree, and deliberately so since upstream #124 made it
+    // schema-shaped: the class declares an identity, so diff refuses to address
+    // these elements positionally, and replaces the whole slot instead of
+    // naming a row. Pinned because it is the reason `elementIdentityLabel`
+    // cannot be derived from diff output — the labels above survive an edit
+    // that diff reports as one undifferentiated slot write.
     const changed = JSON.parse(JSON.stringify(data)) as typeof data;
     changed.sections[2].note = 'THREE';
     const deltas = view.diffJson(
@@ -360,7 +370,39 @@ name: personinfo
       changed,
       false,
     ) as Array<{ path: string[] }>;
-    expect(diffSegmentsUnder(deltas, 'sections')).to.deep.equal(['2']);
+    expect(deltas.map((d) => d.path)).to.deep.equal([['sections']]);
+    expect(diffSegmentsUnder(deltas, 'sections')).to.deep.equal([]);
+  });
+
+  it('agrees with diff element by element once every row carries a label', () => {
+    // The other side of the #124 rule, and the common case: with no empty
+    // identity slot in the list, all three — listPathSegments, navigate and
+    // diff — name the same rows the same way.
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const data = {
+      name: 'svc',
+      sections: [
+        { sequenceNumber: 1, note: 'one' },
+        { sequenceNumber: 2, note: 'two' },
+      ],
+    };
+    const instance = view.loadInstanceFromJson('Service', JSON.stringify(data));
+    const sections = instance.get('sections')!;
+    expect(sections.listPathSegments()).to.deep.equal(['1', '2']);
+
+    expect(instance.navigate(['sections', '1'])!.get('note')!.scalarValue()).to.equal('one');
+    // A position is not an address here: '0' names nothing.
+    expect(instance.navigate(['sections', '0'])).to.equal(undefined);
+
+    const changed = JSON.parse(JSON.stringify(data)) as typeof data;
+    changed.sections[1].note = 'TWO';
+    const deltas = view.diffJson(
+      'Service',
+      data,
+      changed,
+      false,
+    ) as Array<{ path: string[] }>;
+    expect(deltas.map((d) => d.path)).to.deep.equal([['sections', '2', 'note']]);
   });
 });
 
