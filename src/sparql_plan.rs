@@ -933,12 +933,18 @@ pub fn naive_plan_text(query: &str) -> Result<String, String> {
 /// evidence: the artifact `plan_query_refined` returns carries today's
 /// operators, so the plan the gate rejected is gone by the time anyone reads
 /// the reason. This is that plan.
+///
+/// `schema_graph_iri` is the graph the active datamodel serves its schema in,
+/// and it is a parameter here for the same reason it is one everywhere else:
+/// it decides which rules exist, so a diagnostic that left it out would print a
+/// plan production never builds.
 pub fn refined_plan_text(
     query: &str,
     schema: &linkml_schemaview::schemaview::SchemaView,
+    schema_graph_iri: Option<&str>,
 ) -> Result<String, String> {
     let naive = crate::sparql_refine::naive_plan_of(query).map_err(|e| e.to_string())?;
-    let rules = crate::sparql_rules::tier_one_rules(schema);
+    let rules = crate::sparql_rules::tier_one_rules(schema, schema_graph_iri);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
         rules.iter().map(|rule| rule.as_ref()).collect();
     let mut plan = naive;
@@ -1028,7 +1034,7 @@ pub fn plan_query_refined_with_schema_graph(
         // engine answer over it.
         Err(error) => return Ok(fetch_only(obligations, &scoped, error.to_string())),
     };
-    let rules = crate::sparql_rules::tier_one_rules(schema_view);
+    let rules = crate::sparql_rules::tier_one_rules(schema_view, schema_graph_iri);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
         rules.iter().map(|rule| rule.as_ref()).collect();
     if let Err(failure) = crate::sparql_rules::refine(&mut refined, &borrowed) {
@@ -2196,7 +2202,7 @@ mod tests {
         );
 
         let naive = naive_plan_text(&query).expect("the naive plan is a transcription");
-        let refined = refined_plan_text(&query, &sv).expect("this shape refines");
+        let refined = refined_plan_text(&query, &sv, None).expect("this shape refines");
 
         assert_ne!(naive, refined, "refinement moved nothing");
         // The naive plan is the engine's throughout; the refined one is not.

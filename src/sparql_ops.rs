@@ -2554,7 +2554,7 @@ mod tests {
 
     /// A refined plan, to fixpoint.
     fn refined_plan(query: &str, sv: &SchemaView) -> crate::sparql_refine::Plan {
-        let rules = crate::sparql_rules::tier_one_rules(sv);
+        let rules = crate::sparql_rules::tier_one_rules(sv, None);
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         let mut plan = crate::sparql_refine::naive_plan_of(&format!("{PREFIX}{query}"))

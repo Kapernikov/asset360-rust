@@ -2322,6 +2322,19 @@ impl<'s> PushComparisonFilter<'s> {
     /// The condition with its variables resolved to slots, when SQL can
     /// express the result.
     fn render(&self, condition: &Expr, visible: &Visible) -> Option<Expr> {
+        rendered_condition(self.schema, condition, visible)
+    }
+}
+
+/// The condition with its variables resolved to slots, when SQL can express
+/// the result.
+///
+/// Free rather than a method because two rules need the same answer for
+/// opposite reasons: [`PushComparisonFilter`] pushes what renders, and
+/// [`SinkFilterIntoJoinSide`] refuses to *move* what renders, so that moving a
+/// filter can never cost the statement one it was about to take.
+fn rendered_condition(schema: &SchemaView, condition: &Expr, visible: &Visible) -> Option<Expr> {
+    {
         let resolved = substitute_slots(condition, visible)?;
         // The rendering test itself, and the one 28d asks a rule to *ask*
         // rather than to decide: the pushable subset is the sum of what
@@ -2339,11 +2352,9 @@ impl<'s> PushComparisonFilter<'s> {
         // landing site runs in SQL are the same questions with the same
         // answers, and a second rule asking them is a second rule to keep in
         // agreement with this one.
-        if resolved
-            .to_sql(self.schema, &visible.class_of_star)
-            .is_none()
+        if resolved.to_sql(schema, &visible.class_of_star).is_none()
             && resolved
-                .to_sql_tree(self.schema, &visible.class_of_star)
+                .to_sql_tree(schema, &visible.class_of_star)
                 .is_none()
         {
             return None;
@@ -3694,8 +3705,12 @@ fn scan_of_star(plan: &Plan, star: &str) -> Option<NodeId> {
 /// `the_rule_order_does_not_decide_the_fixpoint` holds it to that. What the
 /// order buys is rounds: a filter cannot push before the scan below it exists,
 /// so running the fold first reaches the fixpoint in fewer passes.
-pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
-    vec![
+pub fn tier_one_rules<'a>(
+    schema: &'a SchemaView,
+    schema_graph_iri: Option<&'a str>,
+) -> Vec<Box<dyn Rule + 'a>> {
+    #[cfg_attr(not(feature = "sparql-endpoint"), allow(unused_mut))]
+    let mut rules: Vec<Box<dyn Rule + 'a>> = vec![
         Box::new(FoldMatchesIntoScan::new(schema)),
         Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(DeliverOptionalRead::new(schema)),
@@ -3709,7 +3724,433 @@ pub fn tier_one_rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
         Box::new(PushNotExists::new(schema)),
         Box::new(NarrowByAKeptHop::new(schema)),
         Box::new(PushGrouping::new(schema)),
-    ]
+        // This one knows nothing about a schema graph: it is a semi-join
+        // reduction, and it is what a materialised relation is worth to the
+        // planner whether the schema produced it or the client wrote it.
+        Box::new(ValuesNarrowTheJoinedScan::new(schema)),
+    ];
+    // Only for a deployment that serves a schema graph: without one, no
+    // subplan can depend on nothing but the schema, so the rule would ask a
+    // question with no answers.
+    #[cfg(feature = "sparql-endpoint")]
+    if let Some(iri) = schema_graph_iri {
+        rules.push(Box::new(SinkFilterIntoAnEvaluableSide::new(schema, iri)));
+        rules.push(Box::new(EvaluateSchemaSubplan::new(schema, iri)));
+    }
+    #[cfg(not(feature = "sparql-endpoint"))]
+    let _ = schema_graph_iri;
+    rules
+}
+
+// ---------------------------------------------------------------------------
+// Narrow a scan by the relation it is joined to
+// ---------------------------------------------------------------------------
+
+/// A `Join` against a materialised relation constrains the other side: the join
+/// variable can only take the values that relation holds for it, so the scan
+/// may be narrowed to them before a row is read.
+///
+/// The textbook semi-join reduction, and it is what turns an evaluated schema
+/// subplan into a narrower fetch -- but nothing here knows that. It applies to
+/// any [`PlanOp::Values`], however it got there: one the client wrote, one
+/// `evaluate_schema_subplan` produced, one a future rule materialises.
+///
+/// **Why this adds a condition rather than replacing the node**, unlike
+/// [`ValuesBecomesFilter`]. That rule fires when the `VALUES` binds only a
+/// variable the other side already binds, so it adds no rows and no columns and
+/// *is* a filter. A relation of two columns is not: dropping it would lose
+/// `?code`. So the constraint is **derived** from it and both stay -- which is
+/// sound for the same reason the derivation is: every solution of the join
+/// already satisfies it. It claims no obligation, because it discharges none;
+/// the `VALUES` still answers for its own.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **every row binds the variable.** An `UNDEF` cell means that row
+///   constrains nothing, so the column is not a set of permitted values.
+/// * **the other side binds the variable in every solution**
+///   ([`Visible::mandatorily_below`]). An optional binding would make this drop
+///   the rows an `OPTIONAL` exists to keep.
+/// * **the condition renders** -- `Expr::to_sql` is what says whether the terms
+///   are ones this column can be compared against, and it is where an enum's
+///   concept IRIs become the codes the column stores.
+/// * **the constraint is not already there**, or the rule would fire forever.
+pub struct ValuesNarrowTheJoinedScan<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> ValuesNarrowTheJoinedScan<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for ValuesNarrowTheJoinedScan<'_> {
+    fn name(&self) -> &'static str {
+        "values_narrow_the_joined_scan"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for join in 0..plan.nodes.len() {
+            let PlanOp::Join {
+                left, right, on, ..
+            } = &plan.nodes[join].op
+            else {
+                continue;
+            };
+            let (left, right, on) = (*left, *right, on.clone());
+            for (values_side, other) in [(left, right), (right, left)] {
+                let PlanOp::Values { variables, rows } = &plan.nodes[values_side].op else {
+                    continue;
+                };
+                let (variables, rows) = (variables.clone(), rows.clone());
+                // A one-column relation is [`ValuesBecomesFilter`]'s, whether
+                // it fires or declines: that rule *replaces* the node, and a
+                // constraint derived here first would leave the same condition
+                // twice -- which showed up as the fixpoint depending on the
+                // rule order. This rule exists for the relations that must
+                // stay, because they bind something the other side does not.
+                if variables.len() < 2 {
+                    continue;
+                }
+                let visible = Visible::mandatorily_below(plan, other);
+                for name in &on {
+                    let Some(index) = variables.iter().position(|v| v.as_str() == name) else {
+                        continue;
+                    };
+                    let Some(binding) = visible.slot_of(name) else {
+                        continue;
+                    };
+                    let mut terms: Vec<Term> = Vec::new();
+                    let mut undef = false;
+                    for row in &rows {
+                        match row.get(index) {
+                            Some(Some(ground)) => {
+                                let term = ground_term(ground);
+                                if !terms.contains(&term) {
+                                    terms.push(term);
+                                }
+                            }
+                            _ => undef = true,
+                        }
+                    }
+                    if undef || terms.is_empty() {
+                        continue;
+                    }
+                    // A set, so the order is this rule's to choose, and a
+                    // stable one is worth choosing: these terms become the
+                    // `IN (...)` of a statement a human reads and a test pins,
+                    // and a solution order nobody guarantees would make both
+                    // flap.
+                    terms.sort_by_key(|term| term.to_string());
+                    let condition = Expr::In {
+                        value: Box::new(Expr::Slot {
+                            star_var: binding.star_var.clone(),
+                            slot_path: binding.path.clone(),
+                            reading: binding.reading,
+                            presence: binding.presence,
+                        }),
+                        candidates: terms.into_iter().map(Expr::Literal).collect(),
+                    };
+                    if condition
+                        .to_sql(self.schema, &visible.class_of_star)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    if already_constrained(plan, &condition) {
+                        continue;
+                    }
+                    insert_filter_above(plan, other, join, condition);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Whether this exact condition is already somewhere in the plan, which is what
+/// stops the rule re-deriving its own output for ever.
+///
+/// The whole plan and not just the node below, because a relation with two join
+/// variables yields two conditions: checking only the immediate input let each
+/// one see the *other* one sitting there, and the rule alternated between them
+/// until the round limit. The condition names its own star and slot, so an
+/// identical one anywhere is the same constraint.
+fn already_constrained(plan: &Plan, condition: &Expr) -> bool {
+    plan.nodes.iter().any(|node| {
+        matches!(&node.op, PlanOp::Filter { condition: existing, .. } if existing == condition)
+    })
+}
+
+/// Put a new `Sql` filter directly above `side`, and make `consumer` read it.
+fn insert_filter_above(plan: &mut Plan, side: NodeId, consumer: NodeId, condition: Expr) {
+    let inserted = Node::sql(
+        PlanOp::Filter {
+            input: side,
+            condition,
+        },
+        // Nothing: the relation this was derived from still answers for the
+        // obligations it claims, and claiming them twice is what the ledger
+        // refuses.
+        Vec::new(),
+    );
+
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() + 1);
+    let mut origin: Vec<Option<NodeId>> = Vec::with_capacity(plan.nodes.len() + 1);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        nodes.push(node.clone());
+        origin.push(Some(old));
+        remap[old] = Some(nodes.len() - 1);
+        if old == side {
+            nodes.push(inserted.clone());
+            origin.push(None);
+        }
+    }
+    let side_landed = remap[side].expect("every node is kept");
+    let landed = side_landed + 1;
+    for index in 0..nodes.len() {
+        let Some(old) = origin[index] else {
+            nodes[index].op.map_inputs(|_| side_landed);
+            continue;
+        };
+        nodes[index].op.map_inputs(|input| {
+            if input == side && old == consumer {
+                landed
+            } else {
+                remap[input].expect("inputs precede their node")
+            }
+        });
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+// ---------------------------------------------------------------------------
+// Sink a filter onto the side that binds it
+// ---------------------------------------------------------------------------
+
+/// `Filter(Join(A, B), e)` where every variable of `e` is one `A` binds, and
+/// `A` is a region that can be evaluated without the rest of the plan, becomes
+/// `Join(Filter(A, e), B)`.
+///
+/// A local equivalence, so it is valid wherever the join sits: a filter drops
+/// solutions and binds nothing, and applying it before or after a join that
+/// preserves `A`'s bindings selects the same solutions. Nothing here is about
+/// the schema — it is a filter-pushdown rule the planner did not have, and the
+/// reason it is needed now is that SPARQL puts a group's `FILTER` above the
+/// group's `JOIN`. Above the join, the filter is outside the schema-only
+/// subplan, the subplan evaluates to every concept in the datamodel, and
+/// nothing selective has happened.
+///
+/// **Only through a `Join`.** Through a `LeftJoin` a filter on the optional
+/// side would drop the rows the join exists to keep. Through a `Union` it would
+/// be worse and quieter: the arms are alternatives, so a filter that holds of
+/// every answer would hold of one arm's, and the other arm would lose rows with
+/// a balanced ledger and no error. Through a `Minus`, narrowing what is
+/// subtracted widens the answer. None of those is a `Join`, which is why this
+/// asks for one rather than asking a separate question about the context.
+///
+/// **Only onto an evaluable side**, and that restriction is deliberate rather
+/// than timid. The move is sound onto *any* side that binds the variables — it
+/// is a local equivalence — but applying it everywhere made the fixpoint depend
+/// on the rule order: a filter moved onto a side another rule was still folding
+/// (a `match` about to become a scan, a join about to become a reference join)
+/// takes that side out of the other rule's reach, and the statement loses a
+/// condition it would have taken. On a side that is *closed* — one
+/// [`crate::sparql_schema_filters::schema_only`] says can be evaluated without
+/// the rest of the plan — nothing else is competing, and the move is what turns
+/// a bigger region closed. So the rule is stated by the property that makes it
+/// useful, not by the shape it was written for: widen what counts as evaluable
+/// and this widens with it.
+#[cfg(feature = "sparql-endpoint")]
+pub struct SinkFilterIntoAnEvaluableSide<'s> {
+    schema: &'s SchemaView,
+    schema_graph_iri: &'s str,
+}
+
+#[cfg(feature = "sparql-endpoint")]
+impl<'s> SinkFilterIntoAnEvaluableSide<'s> {
+    pub fn new(schema: &'s SchemaView, schema_graph_iri: &'s str) -> Self {
+        Self {
+            schema,
+            schema_graph_iri,
+        }
+    }
+}
+
+#[cfg(feature = "sparql-endpoint")]
+impl Rule for SinkFilterIntoAnEvaluableSide<'_> {
+    fn name(&self) -> &'static str {
+        "sink_filter_into_an_evaluable_side"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            // An `Sql` filter has already landed where the lowering wants it,
+            // and moving it could put an `Sql` node below an `Engine` one.
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Filter { input, condition } = &plan.nodes[id].op else {
+                continue;
+            };
+            let (input, condition) = (*input, condition.clone());
+            let PlanOp::Join { left, right, .. } = plan.nodes[input].op else {
+                continue;
+            };
+            let used = crate::sparql_refine::variables_used(&condition);
+            // A filter naming nothing is a constant, and a filter already
+            // resolved to slots belongs to the node it was resolved against.
+            if used.is_empty() {
+                continue;
+            }
+            // **Last resort, and this is what keeps the rule set confluent.**
+            // A filter the statement can already take must not move: sinking
+            // it onto one side of the join puts it between a `match` and its
+            // consumer, which stops that match folding into the scan, and the
+            // condition the statement was about to take is lost. That showed
+            // up as the fixpoint depending on the rule order -- the one thing
+            // `the_rule_order_does_not_decide_the_fixpoint` exists to catch.
+            if let Some(base) = landing_site(plan, id)
+                && rendered_condition(self.schema, &condition, &Visible::below(plan, base))
+                    .is_some()
+            {
+                continue;
+            }
+            for side in [left, right] {
+                if !crate::sparql_schema_filters::schema_only(plan, side, self.schema_graph_iri) {
+                    continue;
+                }
+                let bound = plan.variables_of(side);
+                if used.iter().all(|name| bound.contains(name)) {
+                    move_filter_onto(plan, id, side, input);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Move `filter` from above `join` to directly above `side`, keeping it the
+/// engine's.
+///
+/// Modelled on [`sink_below_engine_filters`], which does the same relocation
+/// for a filter that is becoming `Sql`; kept separate rather than generalised
+/// because that one commits a *rewritten* condition and flips the executor,
+/// and folding two decisions into one helper is how a rule ends up doing
+/// something its name does not say.
+#[cfg(feature = "sparql-endpoint")]
+fn move_filter_onto(plan: &mut Plan, filter: NodeId, side: NodeId, join: NodeId) {
+    let PlanOp::Filter { condition, .. } = plan.nodes[filter].op.clone() else {
+        unreachable!("only a filter node is moved")
+    };
+    let moved = Node::engine(
+        PlanOp::Filter {
+            input: side,
+            condition,
+        },
+        plan.nodes[filter].discharges.clone(),
+    );
+
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len());
+    let mut origin: Vec<Option<NodeId>> = Vec::with_capacity(plan.nodes.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if old == filter {
+            continue;
+        }
+        nodes.push(node.clone());
+        origin.push(Some(old));
+        remap[old] = Some(nodes.len() - 1);
+        if old == side {
+            // Directly above its new input, so every node that reads it still
+            // comes after it.
+            nodes.push(moved.clone());
+            origin.push(None);
+        }
+    }
+    let side_landed = remap[side].expect("the side is not the node being moved");
+    let landed = side_landed + 1;
+
+    for index in 0..nodes.len() {
+        let Some(old) = origin[index] else {
+            nodes[index].op.map_inputs(|_| side_landed);
+            continue;
+        };
+        nodes[index].op.map_inputs(|input| {
+            if input == filter {
+                // What read the filter now reads the join it sat on.
+                remap[join].expect("the join is not the node being moved")
+            } else if input == side && old == join {
+                landed
+            } else {
+                remap[input].expect("inputs precede their node")
+            }
+        });
+    }
+
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+// ---------------------------------------------------------------------------
+// Evaluate a subplan that depends on nothing but the schema
+// ---------------------------------------------------------------------------
+
+/// A subplan with no dependency on anything outside the schema is evaluated
+/// now and **replaced** by the relation it denotes.
+///
+/// The criterion, the reconstruction and the evaluation are
+/// [`crate::sparql_schema_filters`]'s; this is the rule that applies them. It
+/// fires once per subplan and the fixpoint comes back for the next, so a query
+/// with a schema subplan in each union arm needs nothing special — each arm is
+/// a subplan like any other.
+///
+/// The replacement is a [`PlanOp::Values`], which is where the narrowing comes
+/// from: `values_becomes_filter` folds one onto the scan that binds the same
+/// variable, and `Expr::to_sql` renders its terms as the texts that column
+/// stores. Nothing downstream knows a schema graph exists.
+#[cfg(feature = "sparql-endpoint")]
+pub struct EvaluateSchemaSubplan<'a> {
+    probe: crate::sparql_schema_filters::SchemaProbe<'a>,
+    schema_graph_iri: &'a str,
+}
+
+#[cfg(feature = "sparql-endpoint")]
+impl<'a> EvaluateSchemaSubplan<'a> {
+    pub fn new(schema: &'a SchemaView, schema_graph_iri: &'a str) -> Self {
+        Self {
+            probe: crate::sparql_schema_filters::SchemaProbe::new(schema, schema_graph_iri),
+            schema_graph_iri,
+        }
+    }
+}
+
+#[cfg(feature = "sparql-endpoint")]
+impl Rule for EvaluateSchemaSubplan<'_> {
+    fn name(&self) -> &'static str {
+        "evaluate_schema_subplan"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        let Some(root) = crate::sparql_schema_filters::evaluable_root(plan, self.schema_graph_iri)
+        else {
+            return false;
+        };
+        let Some((variables, rows)) = self.probe.evaluate(plan, root) else {
+            return false;
+        };
+        crate::sparql_schema_filters::replace_subtree(
+            plan,
+            root,
+            PlanOp::Values { variables, rows },
+        );
+        true
+    }
 }
 
 #[cfg(test)]
@@ -4586,8 +5027,46 @@ mod tests {
                 1,
                 "{why}, so the block stays: {query}\n{plan}"
             );
-            assert!(plan.find("filter").is_empty(), "{why}: {query}\n{plan}");
+            // The block stays, and it keeps its obligation. A filter that
+            // *replaced* it would answer a narrower question; a filter
+            // `values_narrow_the_joined_scan` *derived* from it is a different
+            // thing -- the block is still there enforcing the tuple, and the
+            // derived condition claims nothing, which is how the two are told
+            // apart.
+            for filter in plan.find("filter") {
+                assert!(
+                    plan.nodes[filter].discharges.is_empty(),
+                    "{why}, so no filter may take the block's obligation: \
+                     {query}\n{plan}"
+                );
+            }
         }
+    }
+
+    /// The derivation the test above allows, on its own, because it is the
+    /// whole of what a materialised relation is worth to a fetch: a join
+    /// against one means the scan can be narrowed to the values it holds,
+    /// *per column*, while the relation stays and keeps enforcing the tuple.
+    ///
+    /// `("a" 1)` admits one pair; `name IN ("a") AND length IN (1)` admits the
+    /// same one here and could admit four for a bigger table -- which is why
+    /// this may only ever narrow a *fetch*, never replace the block. The
+    /// engine re-runs the query over the rows fetched, so a wider fetch is
+    /// slower and never wrong, and the block is what keeps it from being
+    /// wrong.
+    #[test]
+    fn a_relation_that_must_stay_still_narrows_the_scan_it_joins() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:length ?len . VALUES (?nm ?len) { (\"a\" 1) } }",
+            &schema,
+            false,
+        );
+        let printed = format!("{plan}");
+        assert!(printed.contains("?s.name IN (\"a\")"), "{printed}");
+        assert!(printed.contains("?s.length IN ("), "{printed}");
+        assert_eq!(plan.find("values").len(), 1, "{printed}");
     }
 
     /// An `OPTIONAL` read of a scanned star becomes a bound nullable column,
@@ -5223,27 +5702,38 @@ mod tests {
         println!("{plan}");
     }
 
-    /// The same term test the filter rule applies, at the point the constant
-    /// enters the plan: an enum column stores `GSA` and its values render as
-    /// `eul:GSA`, so neither spelling is a condition on the column.
+    /// The same term question the filter rule asks, at the point the constant
+    /// enters the plan: a client writing the *code* as a literal names a term
+    /// no record carries -- the answer is no records, which no condition
+    /// states -- so it stays a match. The IRI spelling of the same value is
+    /// the term, and becomes a condition; both are asserted here so the pair
+    /// cannot drift apart.
     #[test]
-    fn a_constant_the_enum_column_never_spells_stays_a_match() {
+    fn an_enum_constant_becomes_a_condition_only_in_the_spelling_records_carry() {
         let schema = test_schema_view();
         let rules: [&dyn Rule; 3] = [
             &FoldMatchesIntoScan::new(&schema),
             &ConstantObjectBecomesFilter::new(&schema),
             &PushComparisonFilter::new(&schema),
         ];
-        for query in [
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind \"GSA\" }",
+
+        let mut literal =
+            plan_of("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind \"GSA\" }");
+        refine(&mut literal, &rules).expect("every invariant holds");
+        assert_eq!(literal.find("match").len(), 1, "{literal}");
+        assert!(literal.find("filter").is_empty(), "{literal}");
+
+        let mut iri = plan_of(
             "PREFIX eul: <http://ontorail.org/src/Eulynx/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind eul:GSA }",
-        ] {
-            let mut plan = plan_of(query);
-            refine(&mut plan, &rules).expect("every invariant holds");
-            assert_eq!(plan.find("match").len(), 1, "{query}\n{plan}");
-            assert!(plan.find("filter").is_empty(), "{query}\n{plan}");
-        }
+        );
+        refine(&mut iri, &rules).expect("every invariant holds");
+        assert_eq!(iri.find("filter").len(), 1, "{iri}");
+        assert_eq!(
+            iri.nodes[iri.find("filter")[0]].executor,
+            Executor::Sql,
+            "{iri}"
+        );
     }
 
     /// A star with no scan has no column to constrain, so the constant stays
@@ -5571,7 +6061,7 @@ mod tests {
             "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" ; \
              asset360:trafficKinds ?k }",
         );
-        let rules = tier_one_rules(&schema);
+        let rules = tier_one_rules(&schema, None);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).expect("every invariant holds");
 
@@ -5609,15 +6099,6 @@ mod tests {
                 "an enum code is not the term it renders as",
             ),
             (
-                // The other direction: the IRI is the term, and the column
-                // stores the code. Pushing it needs a translation backwards,
-                // which is a rule of its own rather than a rendering.
-                "PREFIX eul: <http://ontorail.org/src/Eulynx/> \
-                 SELECT ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-                 FILTER(?k = eul:GSA) }",
-                "an enum column is not compared, it is translated",
-            ),
-            (
                 "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(?nm = \"BX\"@en) }",
                 "a tagged literal is a different term from the plain one",
@@ -5636,6 +6117,35 @@ mod tests {
                 "{why}: {query}\n{plan}"
             );
         }
+    }
+
+    /// The other direction, and it is not a translation *rule*: an enum
+    /// column's values render as concept IRIs, so an IRI constant names some
+    /// of them, and `stored_texts_equal_to` says which -- the same function,
+    /// asking the same question, that answers it for every other column.
+    #[test]
+    fn an_enum_iri_constant_reaches_the_statement() {
+        let schema = test_schema_view();
+        let mut plan = plan_of(
+            "PREFIX eul: <http://ontorail.org/src/Eulynx/> \
+             SELECT ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             FILTER(?k = eul:GSA) }",
+        );
+        refine(
+            &mut plan,
+            &[
+                &FoldMatchesIntoScan::new(&schema),
+                &PushComparisonFilter::new(&schema),
+            ],
+        )
+        .expect("every invariant holds");
+        // `Sql` is the whole claim. The node keeps the *term the query
+        // wrote* -- a refined plan shows the query, not the storage -- and
+        // `Expr::to_sql` is where it becomes the code; `to_sql_translates_an_
+        // enum_iri_to_the_codes_it_names` pins that, and the lowered
+        // `ExecutionPlan` is where a reader sees `kind = 'GSA'`.
+        let filter = plan.find("filter")[0];
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
     }
 
     /// The canonical constant on the same column does push, so the test above
@@ -5802,7 +6312,7 @@ mod tests {
     /// `(COUNT(*) AS ?n)` freshly each time, so comparing two plans built from
     /// two parses compares those names as well.
     fn refine_naive(naive: &Plan, schema: &SchemaView, reverse: bool) -> Plan {
-        let mut rules = tier_one_rules(schema);
+        let mut rules = tier_one_rules(schema, None);
         if reverse {
             rules.reverse();
         }
@@ -6795,7 +7305,7 @@ mod tests {
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm . FILTER(REGEX(?nm, \"^A\")) } GROUP BY ?nm",
         );
-        let rules = tier_one_rules(&schema);
+        let rules = tier_one_rules(&schema, None);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).expect("the regex keeps the grouping with the engine");
         assert_eq!(
@@ -6874,7 +7384,7 @@ mod tests {
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm ; asset360:trafficKinds ?k } GROUP BY ?nm",
         );
-        let rules = tier_one_rules(&schema);
+        let rules = tier_one_rules(&schema, None);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).expect("the fold inserts the unnest below everything");
         assert_eq!(plan.find("unnest").len(), 1, "{plan}");
@@ -6957,7 +7467,7 @@ mod tests {
     #[test]
     fn every_invariant_holds_after_every_application_of_every_rule() {
         let schema = test_schema_view();
-        let rules = tier_one_rules(&schema);
+        let rules = tier_one_rules(&schema, None);
         for query in CORPUS {
             let mut plan = plan_of(query);
             plan.check()

@@ -47,6 +47,8 @@ pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;
 pub mod sparql_rules;
+#[cfg(feature = "sparql-endpoint")]
+pub mod sparql_schema_filters;
 pub mod sparql_schema_graph;
 pub mod sparql_scoper;
 pub mod sparql_terms;
@@ -3257,6 +3259,7 @@ fn py_naive_plan_text(query: &str) -> PyResult<String> {
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "refined_plan_text")]
+#[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
 /// The refined plan for a query, as the text the Rust tests print.
 ///
 /// Diagnostics, and the one thing the `ExecutionPlan` artifact cannot show: on
@@ -3268,6 +3271,10 @@ fn py_naive_plan_text(query: &str) -> PyResult<String> {
 /// Args:
 ///     query: SPARQL query string.
 ///     schema_view: The LinkML schema.
+///     schema_graph_iri: The named graph the active datamodel serves its schema
+///         in -- ``asset360_model.datamodel_config.get_schema_graph_iri()``.
+///         Leave it out and the plan printed is the one a deployment without a
+///         schema graph builds, which is not the one production runs.
 ///
 /// Returns:
 ///     str: the plan, one line per node, with the obligation ledger.
@@ -3278,11 +3285,12 @@ fn py_refined_plan_text(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
+    schema_graph_iri: Option<String>,
 ) -> PyResult<String> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
-    crate::sparql_plan::refined_plan_text(query, sv)
+    crate::sparql_plan::refined_plan_text(query, sv, schema_graph_iri.as_deref())
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 

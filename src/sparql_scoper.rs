@@ -465,7 +465,7 @@ pub(crate) enum PushForm {
 /// Empty is impossible by construction: a literal that matches nothing returns
 /// `None`, and a literal that is not a mapped code selects itself, which is
 /// also what a value outside the enum stores.
-fn enum_codes(meanings: &[(String, String)], term: &TermPattern) -> Option<Vec<String>> {
+pub(crate) fn enum_codes(meanings: &[(String, String)], term: &TermPattern) -> Option<Vec<String>> {
     match term {
         // An IRI constant selects every code whose meaning is that IRI. Two
         // codes may share one, which is why this is a list.
