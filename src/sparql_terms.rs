@@ -18,7 +18,8 @@
 //! exposes permissible values. What is not public is the *precedence*, which
 //! this module restates:
 //!
-//! 1. an enum value carrying a `meaning` → that IRI;
+//! 1. an enum value → its concept IRI (`permissible_value_iri`, shared with the
+//!    schema graph and the writer, so all three name a value identically);
 //! 2. a range that is IRI-ish → a named node;
 //! 3. a language tag on the slot (only when there is no datatype, since RDF
 //!    allows one or the other) → a language-tagged literal;
@@ -43,9 +44,10 @@ pub enum TermKind {
     Iri,
     /// A literal, possibly typed or language-tagged.
     Literal,
-    /// An enum whose permissible values carry `meaning` IRIs. Values that have
-    /// a meaning become IRIs; any value without one falls back to a literal,
-    /// which is what the turtle writer does.
+    /// An enum. Every permissible value becomes its concept IRI — the one the
+    /// schema graph describes, whether the value declared a `meaning` or had
+    /// its IRI minted. A stored value the enum does not permit falls back to a
+    /// literal, which is what the turtle writer does.
     EnumIri,
 }
 
@@ -172,9 +174,9 @@ pub fn describe_slot(
     let datatype = info.and_then(|ri| ri.rdf_datatype_iri.clone());
     let is_iri = info.is_some_and(|ri| ri.is_range_iri);
 
-    // Enum values with a `meaning` serialise as IRIs; the map is finite (the
-    // permissible values), unlike the schema graph, so materialising it here is
-    // safe. A value with no meaning falls through to a literal.
+    // Enum values serialise as concept IRIs; the map is finite (the permissible
+    // values), unlike the schema graph, so materialising it here is safe. It is
+    // empty only when the range is not an enum.
     let enum_map = enum_meanings(schema_view, slot);
     if !enum_map.is_empty() {
         return Some(TermDescriptor {
@@ -258,11 +260,10 @@ fn enum_meanings(
     let mut out: Vec<(String, String)> = values
         .iter()
         .map(|(text, pv)| {
-            let iri = linkml_schemaview::enumview::permissible_value_iri(
-                &enum_uri, text, pv, &converter,
-            )
-            // An unexpandable `meaning` keeps its raw spelling, as before.
-            .unwrap_or_else(|raw| raw);
+            let iri =
+                linkml_schemaview::enumview::permissible_value_iri(&enum_uri, text, pv, &converter)
+                    // An unexpandable `meaning` keeps its raw spelling, as before.
+                    .unwrap_or_else(|raw| raw);
             (text.clone(), iri)
         })
         .collect();
