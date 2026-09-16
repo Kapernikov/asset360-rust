@@ -566,6 +566,22 @@ pub fn lower_sql_pass(
 pub enum LoweringRefusal {
     /// No node runs in SQL, so there is nothing to render.
     NothingPushed,
+    /// The plan contains a `UNION`.
+    ///
+    /// The island analysis below reads the `Sql` frontier and nothing else,
+    /// and a `UNION` is the one shape where a single island is *not* the whole
+    /// fetch: the arms bind the same variables, so an arm the rules pushed and
+    /// an arm they did not still look like one island with a residual above
+    /// it -- and the statement would then fetch one arm's records while the
+    /// engine answers a query that needs both. It comes back short, with a
+    /// balanced ledger and no error.
+    ///
+    /// Refused whole, so the scoper's branch-merged decomposition is the
+    /// fetch (`sparql_plan::fetch_only`). Pushing a union whose every arm is
+    /// SQL is a `UNION ALL` in the statement and the next step in this work;
+    /// it needs an `Op` of its own and a renderer that knows the arms have to
+    /// be union-compatible, neither of which exists yet.
+    UnionNotLowered,
     /// The `Sql` nodes form more than one island. The frontier is a *cut*, so
     /// this is a legal plan -- an `OPTIONAL` over two stars is exactly it --
     /// and it is not a statement: today's pass is one SQL query, and rendering
@@ -642,6 +658,9 @@ impl fmt::Display for LoweringRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NothingPushed => f.write_str("no operator runs in SQL"),
+            Self::UnionNotLowered => {
+                f.write_str("the plan contains a UNION, whose arms a single statement cannot fetch")
+            }
             Self::SeveralIslands { islands } => write!(
                 f,
                 "the SQL frontier is {islands} islands, and a pass is one statement"
@@ -714,6 +733,16 @@ pub fn lower_refined(
     fetch_bound: Option<usize>,
 ) -> Result<OpTree, LoweringRefusal> {
     use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp, SlotPresence};
+
+    // Before the island analysis, because a UNION is the shape that analysis
+    // cannot see -- see `LoweringRefusal::UnionNotLowered`.
+    if plan
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, RefinedOp::Union { .. }))
+    {
+        return Err(LoweringRefusal::UnionNotLowered);
+    }
 
     let sql: Vec<usize> = (0..plan.nodes.len())
         .filter(|id| plan.nodes[*id].executor == Executor::Sql)
