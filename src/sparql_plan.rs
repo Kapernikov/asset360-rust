@@ -1262,6 +1262,41 @@ mod tests {
 
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
+    /// A `UNION` plans, and it plans as a *fetch*: the statement reads both
+    /// arms' classes and the engine answers the query over them.
+    ///
+    /// The fetch is the scoper's branch-merged decomposition, reached by
+    /// `lower_refined` refusing the union whole — see
+    /// `sparql_ops::LoweringRefusal::UnionNotLowered` for why a single SQL
+    /// island is not a safe fetch for a union.
+    #[test]
+    fn a_union_plans_as_a_fetch_covering_every_arm() {
+        let sv = test_schema_view();
+        let plan = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ {{ ?s a asset360:Signal }} \
+                 UNION {{ ?s a asset360:BaliseGroup }} }}"
+            ),
+            &sv,
+        )
+        .expect("a UNION plans");
+
+        assert!(
+            matches!(plan.refinement, Refinement::Fallback(ref why) if why.contains("UNION")),
+            "the union is refused by the lowering, not silently half-pushed: {plan}"
+        );
+        assert!(plan.is_accounted(), "{plan}");
+        assert!(!plan.sql_only(), "the engine answers a union: {plan}");
+
+        let printed = plan.to_string();
+        for class in ["Signal", "BaliseGroup"] {
+            assert!(
+                printed.contains(class),
+                "the fetch must read {class}: {printed}"
+            );
+        }
+    }
+
     /// An aggregate no rule takes is named on the artifact, so one call gives
     /// the caller both the route and something to tell whoever wrote the
     /// query.

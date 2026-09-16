@@ -3685,15 +3685,26 @@ mod tests {
         assert_eq!(plan.find("subselect").len(), 1, "{plan}");
     }
 
-    /// `UNION`, `MINUS` and property paths have nodes, and no query reaches
-    /// them: obligation enumeration refuses those constructs, so a naive plan
-    /// for one would have nothing to claim. Pinned as a test because the
+    /// A `UNION` plans: obligation enumeration accepts it, both arms claim
+    /// their own triples, and the node joins them.
+    #[test]
+    fn a_union_plans_with_both_arms_claiming_their_own_triples() {
+        let plan =
+            plan_of("SELECT ?s WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:Track } }");
+        assert_eq!(plan.find("union").len(), 1, "{plan}");
+        assert_eq!(plan.find("match").len(), 2, "{plan}");
+        plan.check().expect("the ledger balances");
+    }
+
+    /// `MINUS` and property paths have nodes, and no query reaches them:
+    /// obligation enumeration refuses those constructs, so a naive plan for
+    /// one would have nothing to claim. Pinned as a test because the
     /// difference between "representable" and "reachable" is exactly what a
-    /// reader of the node list would otherwise get wrong.
+    /// reader of the node list would otherwise get wrong. `UNION` was on this
+    /// list until it was lifted -- see the test above.
     #[test]
     fn the_constructs_obligations_refuse_do_not_plan_yet() {
         for query in [
-            "SELECT ?s WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:Track } }",
             "SELECT ?s WHERE { ?s a asset360:Signal MINUS { ?s asset360:name ?nm } }",
             "SELECT ?nm WHERE { ?s asset360:locatedOnTrack+/asset360:hasName ?nm }",
         ] {
