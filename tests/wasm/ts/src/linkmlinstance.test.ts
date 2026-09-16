@@ -356,6 +356,70 @@ name: personinfo
     expect(deltas.map((d) => d.path)).to.deep.equal([['sections']]);
   });
 
+  it('listPathSegments names every element the way navigate resolves them', () => {
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const data = {
+      name: 'svc',
+      sections: [
+        { sequenceNumber: 1, note: 'one' },
+        { sequenceNumber: 2, note: 'two' },
+      ],
+      contacts: [
+        { kind: 'home', primary: true, phone: '555-0100' },
+        { kind: 'work', primary: false, phone: '555-0199' },
+      ],
+      notes: [{ body: 'first' }, { body: 'second' }],
+    };
+    const instance = view.loadInstanceFromJson('Service', JSON.stringify(data));
+
+    // Labels where the list has element identity...
+    expect(instance.get('sections')!.listPathSegments()).to.deep.equal(['1', '2']);
+    expect(instance.get('contacts')!.listPathSegments()).to.deep.equal([
+      '["home","true"]',
+      '["work","false"]',
+    ]);
+    // ...positions where it has none.
+    expect(instance.get('notes')!.listPathSegments()).to.deep.equal(['0', '1']);
+
+    // A question only a list can answer.
+    expect(instance.listPathSegments()).to.equal(undefined);
+    expect(instance.get('name')!.listPathSegments()).to.equal(undefined);
+
+    // What makes them addresses: `navigate` resolves exactly these, and a
+    // position is not an address in a keyed list.
+    expect(instance.navigate(['sections', '1'])!.get('note')!.scalarValue()).to.equal('one');
+    expect(instance.navigate(['sections', '0'])).to.equal(undefined);
+    expect(instance.navigate(['notes', '0'])!.get('body')!.scalarValue()).to.equal('first');
+  });
+
+  it('listPathSegments stays data-shaped where diff went schema-shaped', () => {
+    // The one case the two disagree, and the reason this call is not derivable
+    // from diff output. Upstream #124 made `diff` schema-shaped: with the class
+    // declaring an identity its data fails to honour, diff replaces the whole
+    // slot rather than address a row. This call still answers positionally, and
+    // `navigate` still resolves what it answers — which is the agreement that
+    // matters for an address. Revisit when upstream #126 lands.
+    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
+    const data = {
+      name: 'svc',
+      sections: [
+        { sequenceNumber: 1, note: 'one' },
+        { note: 'freshly added, no key yet' },
+        { sequenceNumber: 3, note: 'three' },
+      ],
+    };
+    const instance = view.loadInstanceFromJson('Service', JSON.stringify(data));
+
+    expect(instance.get('sections')!.listPathSegments()).to.deep.equal(['0', '1', '2']);
+    expect(instance.navigate(['sections', '0'])!.get('note')!.scalarValue()).to.equal('one');
+    expect(instance.navigate(['sections', '2'])!.get('note')!.scalarValue()).to.equal('three');
+
+    const changed = JSON.parse(JSON.stringify(data)) as typeof data;
+    changed.sections[2].note = 'THREE';
+    const deltas = view.diffJson('Service', data, changed, false) as Array<{ path: string[] }>;
+    expect(deltas.map((d) => d.path)).to.deep.equal([['sections']]);
+  });
+
   it('declaresElementIdentity answers from the schema, not the data', () => {
     // The guard this exists for asks "can rows in this slot be told apart at
     // all?", which is a question about the *class*. Asking the data instead
