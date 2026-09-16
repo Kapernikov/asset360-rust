@@ -1017,31 +1017,6 @@ impl LinkMLInstanceHandle {
     pub fn element_identity_label(&self) -> Option<String> {
         linkml_runtime::element_identity_label(&self.inner)
     }
-
-    /// Name every element of this list the way the engine addresses them:
-    /// identity labels where the list has element identity, positions
-    /// otherwise. `undefined` for anything that is not a list.
-    ///
-    /// These are the segments `navigate` and `patch` resolve, which is what
-    /// makes them addresses. Reach for it when naming a whole list at once —
-    /// deriving labels element by element walks the class's merged
-    /// `unique_keys` per element and is quadratic in the length of the list.
-    ///
-    /// Not always the segments `diff` emits. Upstream #124 made `diff`
-    /// schema-shaped: a list whose *class* declares an identity is never
-    /// addressed positionally, so when one element leaves its identity slot
-    /// empty — the freshly-added row — `diff` declines to address the elements
-    /// at all and replaces the whole slot instead. This call stays data-shaped
-    /// (upstream issue #126 tracks closing that gap) and agrees with `navigate`
-    /// either way. When what you want is one element's own identity regardless
-    /// of the company it keeps, ask `elementIdentityLabel`.
-    #[wasm_bindgen(js_name = listPathSegments)]
-    pub fn list_path_segments(&self) -> Option<Vec<String>> {
-        match &self.inner {
-            LinkMLInstance::List { values, .. } => Some(linkml_runtime::list_path_segments(values)),
-            _ => None,
-        }
-    }
 }
 
 #[wasm_bindgen]
