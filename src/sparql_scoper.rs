@@ -58,6 +58,29 @@ pub struct QueryPlan {
     /// limit apply before them.
     pub sql_limit: Option<usize>,
 
+    /// The same bound, for the one shape this struct cannot decide alone: a
+    /// `UNION` that the lowering turns into a **single** `UNION ALL`
+    /// statement.
+    ///
+    /// `sql_limit` is `None` for every union, and stays that way, because a
+    /// union is several statements unless the lowering manages to stack it:
+    /// ten rows of one arm are not the ten the query asked for. One statement
+    /// over all the arms *is* the union's rows, and then the same bound is
+    /// sound for the same reason it is sound for a single class.
+    ///
+    /// Set only when **every** branch's own plan carries a `sql_limit` — so
+    /// every branch is exact, single-relation and `OPTIONAL`-free, and each
+    /// branch's rows stand one-for-one with its solutions. That is the
+    /// scoper's existing analysis, asked once per branch rather than
+    /// re-derived, which is what keeps one owner for the question of whether a
+    /// limit may reach a fetch at all.
+    ///
+    /// `None` everywhere else, including for every non-union plan: a consumer
+    /// reading this instead of `sql_limit` would bound a fetch that is not a
+    /// union, and `lower_refined` picks between the two by whether the
+    /// statement it built is actually rooted in a `UNION ALL`.
+    pub sql_limit_if_unioned: Option<usize>,
+
     /// Variables reached by walking *into* a star's nested structures, as
     /// `variable -> (star, path of slots)`.
     ///
@@ -2190,6 +2213,8 @@ pub fn scope_parsed_with_schema_graph(
         root,
         unconsumed: unconsumed_indices,
         sql_limit,
+        // Not a union: `scope_union` is the only place this is ever set.
+        sql_limit_if_unioned: None,
         path_bindings,
         inexact,
     })
@@ -2619,9 +2644,16 @@ fn scope_union(
     let mut seen: HashMap<String, String> = HashMap::new();
     let mut taken: HashSet<String> = HashSet::new();
 
+    // The bound each branch would have accepted on its own. A branch that
+    // declines one -- inexact, joined, or with an `OPTIONAL` -- makes the
+    // whole union decline, because the statement's rows are every branch's
+    // rows together. See `QueryPlan::sql_limit_if_unioned`.
+    let mut branch_limits: Vec<Option<usize>> = Vec::new();
+
     for branch in branches {
         let branch_query = with_pattern(query, branch.clone());
         let plan = scope_parsed_with_schema_graph(&branch_query, schema_view, schema_graph_iri)?;
+        branch_limits.push(plan.sql_limit);
 
         // The stars this branch joins. Sharing one of them across branches is
         // how a join edge would end up narrowing another branch's fetch — see
@@ -2702,6 +2734,17 @@ fn scope_union(
         // its answers: ten rows of one arm are not the ten the query asked
         // for. Never pushed.
         sql_limit: None,
+        // The same bound, sound only if the arms end up in one statement --
+        // which the lowering decides, not this. Every branch has to have
+        // accepted it; `max` rather than `min` because the bound covers the
+        // window and a larger one covers a smaller one, and in practice every
+        // branch reports the same `LIMIT + OFFSET` because they share the
+        // query's modifiers.
+        sql_limit_if_unioned: branch_limits
+            .iter()
+            .copied()
+            .try_fold(0usize, |widest, limit| limit.map(|limit| widest.max(limit)))
+            .filter(|_| !branch_limits.is_empty()),
         path_bindings,
         // The cause that matters most, and it holds of the whole plan rather
         // than of one dropped triple: a branch's own cause, if it had one, is

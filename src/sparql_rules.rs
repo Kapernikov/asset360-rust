@@ -369,13 +369,26 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // the engine's -- and the grouping above it declines, because `?t`
             // is not a column any scan binds. That is today's plan for this
             // query, arrived at by the rules.
+            //
+            // **The arms of a `UNION` are alternatives and not an
+            // intersection**, so a type match in the other arm is not a second
+            // class on this star. Counting it as one is what kept
+            // `{ ?s a :Signal } UNION { ?s a :BaliseGroup }` from folding into
+            // two scans at all -- every arm stayed a bare `match`, the whole
+            // plan stayed with the engine, and a union could never become a
+            // statement. Two scans of one variable is then a shape the rest of
+            // the pipeline has to tolerate rather than collapse; see
+            // `sparql_ops::classes_feeding`, which resolves a star's class per
+            // node for exactly this reason.
             let classes_on_star = plan
                 .nodes
                 .iter()
-                .filter(|other| match &other.op {
+                .enumerate()
+                .filter(|(other_id, other)| match &other.op {
                     PlanOp::Match { pattern } => {
                         type_class_iri(pattern).is_some()
                             && subject_star(&keys, pattern).as_deref() == Some(star)
+                            && !in_other_union_arm(plan, type_node, *other_id)
                     }
                     _ => false,
                 })
@@ -403,6 +416,30 @@ impl Rule for FoldMatchesIntoScan<'_> {
         }
         false
     }
+}
+
+/// Whether `left` and `right` sit in *different* arms of some `UNION`.
+///
+/// Two such nodes are alternatives: no solution is described by both, so a
+/// constraint in one says nothing about the other. A rule that treats them as
+/// conjoined reads the query wrong in the direction that loses answers -- the
+/// intersection-of-classes guard in [`FoldMatchesIntoScan`] is the case that
+/// found this.
+///
+/// Quadratic in the number of union nodes, over plans with single-digit node
+/// counts, and the reachability is the same `feeds` the frontier analysis
+/// uses, so there is no second notion of "below" to disagree with.
+fn in_other_union_arm(plan: &Plan, left: NodeId, right: NodeId) -> bool {
+    plan.nodes.iter().any(|node| match &node.op {
+        PlanOp::Union {
+            left: arm_left,
+            right: arm_right,
+        } => {
+            (plan.feeds(left, *arm_left) && plan.feeds(right, *arm_right))
+                || (plan.feeds(left, *arm_right) && plan.feeds(right, *arm_left))
+        }
+        _ => false,
+    })
 }
 
 /// Replace the type match and the folded slot matches with a scan, renumbering
@@ -3735,6 +3772,81 @@ fn scan_of_star(plan: &Plan, star: &str) -> Option<NodeId> {
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Push a union
+// ---------------------------------------------------------------------------
+
+/// A `UNION` whose every arm is already entirely SQL becomes SQL itself, so
+/// the statement stacks the arms with `UNION ALL` instead of the fetch issuing
+/// one statement per arm.
+///
+/// **What this buys, and why it is the whole point.** Nothing *above* a union
+/// can reach the database while the union is several statements: a `LIMIT` is
+/// applied after both arms have been materialised whole, so paginating a
+/// unioned list costs the size of the arms rather than the size of the page,
+/// and an `OFFSET` makes it worse the further the reader scrolls. One
+/// statement puts the bound back in the database.
+///
+/// **`UNION ALL`, and the rule is SPARQL's algebra rather than a guess about
+/// the arms.** See [`crate::sparql_ops::Op::Union`]: a union is a multiset
+/// union, a SQL `UNION` would delete duplicate solutions the query requires,
+/// and the deduplication a query *does* ask for arrives as a `DISTINCT` above
+/// this node.
+///
+/// **Only an all-SQL union.** A mixed union -- one arm SQL, one the engine's
+/// -- keeps the per-arm behaviour it has always had. Pushing one would be the
+/// under-fetch `LoweringRefusal::UnionNotLowered` exists to prevent: the arms
+/// bind the same variables, so an arm the rules pushed and an arm they did not
+/// look like one island with a residual above it, and the statement would
+/// fetch one arm's records for a query that needs both. This rule is the only
+/// thing that narrows that refusal, and it narrows it to the case it has
+/// checked.
+///
+/// Stated over the arms' whole subtrees rather than over the two arm roots:
+/// the frontier is a cut, so a root may be `Sql` above something that is not
+/// only if a rule broke an invariant -- and this is the rule that would be
+/// blamed for it, so it checks rather than assumes.
+pub struct PushUnion;
+
+impl PushUnion {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for PushUnion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for PushUnion {
+    fn name(&self) -> &'static str {
+        "push_union"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Union { left, right } = &plan.nodes[id].op else {
+                continue;
+            };
+            let (left, right) = (*left, *right);
+            let all_sql = (0..plan.nodes.len())
+                .filter(|node| plan.feeds(*node, left) || plan.feeds(*node, right))
+                .all(|node| plan.nodes[node].executor == Executor::Sql);
+            if !all_sql {
+                continue;
+            }
+            plan.nodes[id].executor = Executor::Sql;
+            return true;
+        }
+        false
+    }
+}
+
 /// Every rule, in the order 28d lists them: scope a type, fold a nested read
 /// into a path, deliver an optional read, turn a constant object into a
 /// filter, turn a `VALUES` over a bound variable into one, push a comparison,
@@ -3777,6 +3889,7 @@ pub fn tier_one_rules<'a>(
         Box::new(PushReferenceJoin::new(schema)),
         Box::new(PushLeftJoin::new(schema)),
         Box::new(PushNotExists::new(schema)),
+        Box::new(PushUnion::new()),
         Box::new(NarrowByAKeptHop::new(schema)),
         Box::new(PushGrouping::new(schema)),
         // This one knows nothing about a schema graph: it is a semi-join
@@ -7275,7 +7388,7 @@ mod tests {
             &schema,
             false,
         );
-        let tree = crate::sparql_ops::lower_refined(&plan, &schema, None)
+        let tree = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
             .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
 
         let mut sides = Vec::new();

@@ -523,6 +523,10 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 }
             )?,
             Op::Unnest { slot_path, .. } => writeln!(f, "      unnest    {}", slot_path.join("."))?,
+            // `ALL` spelled out, because which of the two SQL spellings this
+            // is is the one thing a reader checks here: a deduplicating
+            // `UNION` would drop solutions SPARQL's multiset union keeps.
+            Op::Union { left, right } => writeln!(f, "      union all n{left}, n{right}")?,
             Op::Join {
                 left_star,
                 right_star,
@@ -1091,7 +1095,12 @@ pub fn plan_query_refined_with_schema_graph(
         ));
     }
 
-    let mut ops = match crate::sparql_ops::lower_refined(&refined, schema_view, scoped.sql_limit) {
+    let mut ops = match crate::sparql_ops::lower_refined(
+        &refined,
+        schema_view,
+        scoped.sql_limit,
+        scoped.sql_limit_if_unioned,
+    ) {
         Ok(ops) => ops,
         // No statement the renderer can express. Every shape in the inventory
         // lowers, so this is a guard rather than a path -- and the guard has
@@ -1616,15 +1625,16 @@ mod tests {
 
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
-    /// A `UNION` plans, and it plans as a *fetch*: the statement reads both
-    /// arms' classes and the engine answers the query over them.
+    /// A `UNION` whose every arm is SQL plans as **one** statement, stacking
+    /// the arms with `UNION ALL`.
     ///
-    /// The fetch is the scoper's branch-merged decomposition, reached by
-    /// `lower_refined` refusing the union whole — see
-    /// `sparql_ops::LoweringRefusal::UnionNotLowered` for why a single SQL
-    /// island is not a safe fetch for a union.
+    /// It used to plan as the scoper's branch-merged decomposition — one
+    /// statement per arm — because `lower_refined` refused any union whole.
+    /// That is still what a *mixed* union does (see the test below); what
+    /// changed is that the all-SQL case is lowered, which is the only way
+    /// anything above the union can reach the database.
     #[test]
-    fn a_union_plans_as_a_fetch_covering_every_arm() {
+    fn a_union_plans_as_one_union_all_statement() {
         let sv = test_schema_view();
         let plan = plan_query_refined(
             &format!(
@@ -1636,19 +1646,141 @@ mod tests {
         .expect("a UNION plans");
 
         assert!(
-            matches!(plan.refinement, Refinement::Fallback { ref why, .. } if why.contains("UNION")),
-            "the union is refused by the lowering, not silently half-pushed: {plan}"
+            !matches!(plan.refinement, Refinement::Fallback { .. }),
+            "an all-SQL union lowers rather than falling back: {plan}"
         );
         assert!(plan.is_accounted(), "{plan}");
-        assert!(!plan.sql_only(), "the engine answers a union: {plan}");
+        assert!(
+            !plan.sql_only(),
+            "the statement is still a fetch — the engine answers: {plan}"
+        );
 
         let printed = plan.to_string();
+        assert!(
+            printed.contains("union all"),
+            "the arms are stacked, and with ALL: {printed}"
+        );
         for class in ["Signal", "BaliseGroup"] {
             assert!(
                 printed.contains(class),
                 "the fetch must read {class}: {printed}"
             );
         }
+    }
+
+    /// The payoff, and the thing issue #410 (pepibru GitLab) measured as
+    /// missing: a `LIMIT` above an all-SQL union reaches the statement.
+    ///
+    /// Asserted as `OFFSET + LIMIT`, because the engine re-applies the offset
+    /// to whatever comes back — fetching ten rows and then skipping twenty
+    /// returns nothing. Same arithmetic as the single-class bound, which is
+    /// the point: the union stopped being the shape that loses it.
+    #[test]
+    fn a_limit_above_an_all_sql_union_reaches_the_statement() {
+        let sv = test_schema_view();
+        for (modifiers, expected) in [
+            ("LIMIT 1", Some(1)),
+            ("LIMIT 10 OFFSET 20", Some(30)),
+            // No limit at all is no bound, rather than a bound of nothing.
+            ("", None),
+        ] {
+            let plan = plan_query_refined(
+                &format!(
+                    "{PREFIX}SELECT ?s WHERE {{ {{ ?s a asset360:Signal }} \
+                     UNION {{ ?s a asset360:BaliseGroup }} }} {modifiers}"
+                ),
+                &sv,
+            )
+            .expect("a UNION plans");
+            let Some(crate::sparql_plan::PassKind::Sql(sql)) =
+                plan.passes.first().map(|pass| &pass.kind)
+            else {
+                panic!("the first pass is the statement: {plan}");
+            };
+            assert_eq!(
+                crate::sparql_ops::fetch_bound_of(&sql.ops),
+                expected,
+                "for modifiers {modifiers:?}: {plan}"
+            );
+        }
+    }
+
+    /// A condition in one arm is resolved against **that arm's** class.
+    ///
+    /// The arms of a union are the only shape where one variable is scanned as
+    /// two classes, and the lowering used to hold one plan-wide
+    /// `star -> class` map built from every scan, so the last one won.
+    /// `:length` is a slot of `Signal` and not of `BaliseGroup`, which makes
+    /// the difference observable as a route: resolved against the wrong arm
+    /// the condition does not render at all and the whole query falls back to
+    /// the engine. The same mistake on a slot both classes *have* is not a
+    /// route change, it is the wrong column — which is why this is pinned on
+    /// the shape that shows.
+    #[test]
+    fn a_condition_in_a_union_arm_resolves_against_its_own_arms_class() {
+        let sv = test_schema_view();
+        let plan = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ \
+                 {{ ?s a asset360:Signal ; asset360:length ?l . FILTER(?l > 10) }} \
+                 UNION {{ ?s a asset360:BaliseGroup }} }}"
+            ),
+            &sv,
+        )
+        .expect("a UNION plans");
+
+        assert!(
+            !matches!(plan.refinement, Refinement::Fallback(_)),
+            "the arm's own class is what resolves its condition: {plan}"
+        );
+        let printed = plan.to_string();
+        assert!(
+            printed.contains("union all"),
+            "and the arms are still one statement: {printed}"
+        );
+        assert!(
+            printed.contains("length") && printed.contains("numeric"),
+            "the condition renders, against Signal's integer column: {printed}"
+        );
+    }
+
+    /// A union with one arm the rules could not push keeps the per-arm fetch
+    /// it has always had.
+    ///
+    /// The refusal this asserts is not a limitation to remove later: the arms
+    /// bind the same variables, so an arm that lowered and an arm that did not
+    /// look like one island with a residual above it, and the statement would
+    /// fetch one arm's records for a query that needs both. Short answer,
+    /// balanced ledger, no error.
+    #[test]
+    fn a_union_with_an_engine_arm_keeps_the_per_arm_fetch() {
+        let sv = test_schema_view();
+        let plan = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ {{ ?s a asset360:Signal }} UNION \
+                 {{ ?s a asset360:BaliseGroup ; asset360:name ?nm . \
+                 FILTER(STRLEN(?nm) > 3) }} }} LIMIT 1"
+            ),
+            &sv,
+        )
+        .expect("a UNION plans");
+
+        assert!(
+            matches!(plan.refinement, Refinement::Fallback(ref why) if why.contains("UNION")),
+            "a mixed union is refused whole rather than half-pushed: {plan}"
+        );
+        assert!(plan.is_accounted(), "{plan}");
+        let Some(crate::sparql_plan::PassKind::Sql(sql)) =
+            plan.passes.first().map(|pass| &pass.kind)
+        else {
+            panic!("the first pass is the fetch: {plan}");
+        };
+        assert_eq!(
+            crate::sparql_ops::fetch_bound_of(&sql.ops),
+            None,
+            "and the bound stays off a per-arm fetch, where ten rows of one \
+             arm are not the ten the query asked for: {plan}"
+        );
     }
 
     /// An aggregate no rule takes is named on the artifact, so one call gives

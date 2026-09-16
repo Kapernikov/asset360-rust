@@ -279,6 +279,32 @@ pub enum Op {
         right_multivalued: bool,
         kind: JoinType,
     },
+    /// The arms of a `UNION`, stacked as one statement.
+    ///
+    /// **`UNION ALL`, and never a deduplicating `UNION`.** SPARQL's `Union` is
+    /// *multiset* union -- `{ ?s a :A } UNION { ?s a :A }` binds every `?s`
+    /// twice, and the engine leg does exactly that -- so a SQL `UNION` would
+    /// delete solutions the query requires and make the two routes disagree
+    /// about a count. Deduplication is emitted when the *query* asks for it,
+    /// which it does with a `DISTINCT` -- already an [`Op::Distinct`] above
+    /// this node, already rendered as `SELECT DISTINCT`. That is what makes
+    /// the choice follow from the query rather than from a guess about
+    /// whether the arms' classes can overlap: a guess would be wrong for a
+    /// union of one class with itself, and the shape it would be wrong on is
+    /// the shape nobody writes a test for.
+    ///
+    /// Binary, mirroring [`crate::sparql_refine::PlanOp::Union`]: three arms
+    /// are two nodes, and `(a UNION ALL b) UNION ALL c` is `a UNION ALL b
+    /// UNION ALL c`.
+    ///
+    /// The renderer's own constraint, which is why this is not simply two
+    /// statements: the `SELECT` list is per-star, so two arms binding
+    /// different stars are not union-compatible until both are projected onto
+    /// the union of their columns with `NULL` for the ones they do not bind.
+    Union {
+        left: OpId,
+        right: OpId,
+    },
     /// Grouping and aggregation. `keys` are indices into `bindings`; empty
     /// means one row over the whole input, which is what SPARQL returns for a
     /// bare aggregate.
@@ -332,6 +358,7 @@ impl Op {
             | Self::Slice { input, .. }
             | Self::Project { input, .. } => vec![*input],
             Self::Join { left, right, .. } => vec![*left, *right],
+            Self::Union { left, right } => vec![*left, *right],
         }
     }
 
@@ -344,6 +371,7 @@ impl Op {
             Self::Filter { .. } => "filter",
             Self::FilterTree { .. } => "filter_tree",
             Self::Join { .. } => "join",
+            Self::Union { .. } => "union",
             Self::Group { .. } => "group",
             Self::Sort { .. } => "sort",
             Self::Distinct { .. } => "distinct",
@@ -577,10 +605,14 @@ pub enum LoweringRefusal {
     /// balanced ledger and no error.
     ///
     /// Refused whole, so the scoper's branch-merged decomposition is the
-    /// fetch (`sparql_plan::fetch_only`). Pushing a union whose every arm is
-    /// SQL is a `UNION ALL` in the statement and the next step in this work;
-    /// it needs an `Op` of its own and a renderer that knows the arms have to
-    /// be union-compatible, neither of which exists yet.
+    /// fetch (`sparql_plan::fetch_only`).
+    ///
+    /// Raised now only for a union the rules did **not** push -- a *mixed*
+    /// union, one arm SQL and one the engine's. That is the shape the island
+    /// analysis still cannot see, and it keeps the per-arm behaviour it has
+    /// always had. A union whose every arm is entirely SQL is pushed by
+    /// `PushUnion`, lowers to [`Op::Union`] and renders as one `UNION ALL`
+    /// statement, which is what lets a `LIMIT` above it reach the database.
     UnionNotLowered,
     /// The `Sql` nodes form more than one island. The frontier is a *cut*, so
     /// this is a legal plan -- an `OPTIONAL` over two stars is exactly it --
@@ -727,19 +759,63 @@ impl fmt::Display for LoweringRefusal {
 /// indexed `asset360_uri` column rather than the JSONB payload). Both come
 /// from the same `resolve_column` today's lowering uses, so the two cannot
 /// disagree about a column.
+/// Which class each star is scanned as, among the nodes feeding `node`.
+///
+/// A variable two feeding scans disagree about is **left out**: the caller's
+/// `.get` then answers `None` and the lowering refuses, which is the only safe
+/// answer when a condition names a star whose class the plan does not fix. See
+/// the call site for why a union is the shape that produces one.
+fn classes_feeding(
+    plan: &crate::sparql_refine::Plan,
+    node: usize,
+) -> std::collections::HashMap<String, String> {
+    use crate::sparql_refine::PlanOp as RefinedOp;
+    let mut classes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut disputed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (id, below) in plan.nodes.iter().enumerate() {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            ..
+        } = &below.op
+        else {
+            continue;
+        };
+        if !plan.feeds(id, node) {
+            continue;
+        }
+        match classes.get(star_var) {
+            Some(seen) if seen != class_uri => {
+                disputed.insert(star_var.clone());
+            }
+            _ => {
+                classes.insert(star_var.clone(), class_uri.clone());
+            }
+        }
+    }
+    for star_var in disputed {
+        classes.remove(&star_var);
+    }
+    classes
+}
+
 pub fn lower_refined(
     plan: &crate::sparql_refine::Plan,
     schema: &linkml_schemaview::schemaview::SchemaView,
     fetch_bound: Option<usize>,
+    unioned_fetch_bound: Option<usize>,
 ) -> Result<OpTree, LoweringRefusal> {
     use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp, SlotPresence};
 
-    // Before the island analysis, because a UNION is the shape that analysis
-    // cannot see -- see `LoweringRefusal::UnionNotLowered`.
+    // Before the island analysis, because a UNION the rules did not push is
+    // the shape that analysis cannot see -- see
+    // `LoweringRefusal::UnionNotLowered`. One `PushUnion` admits: a union
+    // whose every arm is already entirely SQL, which is one island rooted at
+    // the union itself and renders as `UNION ALL`.
     if plan
         .nodes
         .iter()
-        .any(|node| matches!(node.op, RefinedOp::Union { .. }))
+        .any(|node| matches!(node.op, RefinedOp::Union { .. }) && node.executor != Executor::Sql)
     {
         return Err(LoweringRefusal::UnionNotLowered);
     }
@@ -873,21 +949,6 @@ pub fn lower_refined(
         return Err(LoweringRefusal::IdentityIsNotATriple { node: id });
     }
 
-    // Which class each star was scanned as, for the conditions and for the
-    // identifier hoist.
-    let classes: std::collections::HashMap<String, String> = plan
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            RefinedOp::Scan {
-                star_var,
-                class_uri,
-                ..
-            } => Some((star_var.clone(), class_uri.clone())),
-            _ => None,
-        })
-        .collect();
-
     let mut nodes: Vec<OpNode> = Vec::with_capacity(sql.len());
     let mut remap: std::collections::HashMap<usize, OpId> = std::collections::HashMap::new();
     // The columns a grouping produced, for the modifiers above it. An
@@ -898,6 +959,24 @@ pub fn lower_refined(
 
     for id in sql.iter().copied() {
         let node = &plan.nodes[id];
+        // Which class each star was scanned as **for this node**, rather than
+        // for the plan.
+        //
+        // A union is where the two differ. Its arms are alternatives, so
+        // `{ ?s a :Signal } UNION { ?s a :BaliseGroup }` has two scans of one
+        // variable, and a single plan-wide map keeps whichever it saw last --
+        // which is the "one class wins" wrong answer part 1 of this work
+        // removed from the scoper, walking back in through the lowering. A
+        // condition an arm wrote would then be resolved against the other
+        // arm's class: a different column, a different numeric-ness, and no
+        // error to say so.
+        //
+        // Scoped to the nodes feeding this one, and left *absent* where two
+        // of them disagree, so a consumer asking for a class it cannot have
+        // gets a refusal rather than an arbitrary answer. Identical to the
+        // plan-wide map for every plan with one scan per variable, which is
+        // every plan without a union.
+        let classes = classes_feeding(plan, id);
         match &node.op {
             RefinedOp::Scan {
                 star_var,
@@ -1254,6 +1333,20 @@ pub fn lower_refined(
                     discharges: node.discharges.clone(),
                 });
             }
+            RefinedOp::Union { left, right } => {
+                // `UNION ALL`, decided by SPARQL's algebra rather than by a
+                // guess about the arms -- see `Op::Union`. Nothing else is
+                // needed here: the arms are already lowered (they feed this
+                // node, so they come earlier in `sql`), and what makes them
+                // union-compatible is the renderer's business.
+                nodes.push(OpNode {
+                    op: Op::Union {
+                        left: remap[left],
+                        right: remap[right],
+                    },
+                    discharges: node.discharges.clone(),
+                });
+            }
             RefinedOp::Group {
                 keys,
                 measures,
@@ -1453,6 +1546,20 @@ pub fn lower_refined(
     // `LIMIT 1` fetched every row of the class, which is what
     // `test_single_star_limit_1_returns_exactly_one` caught the last time a
     // planner mislaid it.
+    //
+    // `unioned_fetch_bound` is the same bound for the shape the scoper cannot
+    // decide on its own. It sets `sql_limit` to `None` for any union, because
+    // until this lowering existed a union was always several statements and a
+    // branch's fetch is not the query's answers -- ten rows of one arm are not
+    // the ten the query asked for. One `UNION ALL` statement *is* the union's
+    // rows, so the bound becomes sound exactly when the union lowered, which
+    // is a fact only this function has. The scoper still decides *whether* the
+    // bound is safe, per branch, so there is no second derivation; this picks
+    // which of its two answers applies.
+    let fetch_bound = match &nodes.last().map(|node| &node.op) {
+        Some(Op::Union { .. }) => unioned_fetch_bound,
+        _ => fetch_bound,
+    };
     if enforcement == Enforcement::Narrows
         && let Some(limit) = fetch_bound
         && let Some(input) = nodes.len().checked_sub(1)
@@ -2151,7 +2258,7 @@ mod tests {
             "{plan}"
         );
 
-        let tree = lower_refined(&plan, &sv, None).expect("should lower");
+        let tree = lower_refined(&plan, &sv, None, None).expect("should lower");
         assert!(
             tree.find("unnest").is_empty(),
             "a narrowing fetch does not fan out"
@@ -2254,7 +2361,7 @@ mod tests {
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }",
             &sv,
         );
-        lower_refined(&plan, &sv, None).expect("as built, it lowers");
+        lower_refined(&plan, &sv, None, None).expect("as built, it lowers");
         let filter = plan.find("filter")[0];
         if let RefinedOp::Filter { condition, .. } = &mut plan.nodes[filter].op
             && let crate::sparql_refine::Expr::Compare { left, .. } = condition
@@ -2262,7 +2369,7 @@ mod tests {
         {
             *reading = Reading::Column;
         }
-        let refusal = lower_refined(&plan, &sv, None)
+        let refusal = lower_refined(&plan, &sv, None, None)
             .expect_err("a column reading of a collection must not render");
         assert!(
             matches!(refusal, LoweringRefusal::ConditionReadsACollection { .. }),
@@ -2278,7 +2385,7 @@ mod tests {
         if let RefinedOp::Scan { class_uri, .. } = &mut plan.nodes[scan].op {
             *class_uri = "https://data.infrabel.be/asset360/Track".to_owned();
         }
-        let refusal = lower_refined(&plan, &sv, None)
+        let refusal = lower_refined(&plan, &sv, None, None)
             .expect_err("a scan must scan the class it claims to scope");
         assert!(
             matches!(refusal, LoweringRefusal::ClaimWithoutTheWork { .. }),
@@ -2311,8 +2418,8 @@ mod tests {
         if let RefinedOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
             slots.clear();
         }
-        let refusal =
-            lower_refined(&plan, &sv, None).expect_err("a scan must make the reads it claims");
+        let refusal = lower_refined(&plan, &sv, None, None)
+            .expect_err("a scan must make the reads it claims");
         assert!(
             matches!(refusal, LoweringRefusal::ClaimWithoutTheWork { .. }),
             "{refusal}"
@@ -2326,10 +2433,10 @@ mod tests {
              LIMIT 10 OFFSET 5",
             &sv,
         );
-        lower_refined(&plan, &sv, Some(15)).expect("exactly enough rows lowers");
-        lower_refined(&plan, &sv, Some(50)).expect("more than enough lowers too");
+        lower_refined(&plan, &sv, Some(15), None).expect("exactly enough rows lowers");
+        lower_refined(&plan, &sv, Some(50), None).expect("more than enough lowers too");
         let refusal =
-            lower_refined(&plan, &sv, Some(14)).expect_err("one row short must not lower");
+            lower_refined(&plan, &sv, Some(14), None).expect_err("one row short must not lower");
         assert!(
             matches!(refusal, LoweringRefusal::FetchBoundTooTight { .. }),
             "{refusal}"
@@ -2354,13 +2461,13 @@ mod tests {
             &sv,
         );
         // As built, the two agree and it lowers.
-        lower_refined(&plan, &sv, None).expect("an optional collection read lowers");
+        lower_refined(&plan, &sv, None, None).expect("an optional collection read lowers");
 
         let unnest = plan.find("unnest")[0];
         if let RefinedOp::Unnest { presence, .. } = &mut plan.nodes[unnest].op {
             *presence = SlotPresence::Required;
         }
-        let refusal = lower_refined(&plan, &sv, None)
+        let refusal = lower_refined(&plan, &sv, None, None)
             .expect_err("a fan-out that contradicts its slot must not render");
         assert!(
             matches!(refusal, LoweringRefusal::Unrenderable { .. }),
@@ -2385,7 +2492,7 @@ mod tests {
             &sv,
         );
         // As the rules leave it, identity is folded and it lowers.
-        lower_refined(&plan, &sv, None).expect("folded identity lowers");
+        lower_refined(&plan, &sv, None, None).expect("folded identity lowers");
 
         // Unfold it, as a planner blind to identity would leave it: the
         // constant back as a `match`, the scan reading the class.
@@ -2423,7 +2530,7 @@ mod tests {
                 .map_inputs(|input| if input > scan { input + 1 } else { input });
         }
 
-        let refusal = lower_refined(&plan, &sv, None)
+        let refusal = lower_refined(&plan, &sv, None, None)
             .expect_err("a class scan where the query names one record must not render");
         assert!(
             matches!(refusal, LoweringRefusal::IdentityUnfolded { .. }),
@@ -2474,7 +2581,7 @@ mod tests {
             "the join itself is pushed:\n{plan}"
         );
 
-        let refusal = lower_refined(&plan, &sv, None)
+        let refusal = lower_refined(&plan, &sv, None, None)
             .expect_err("a lifted condition must not be rendered as a WHERE");
         assert!(
             matches!(refusal, LoweringRefusal::PushedOptional { .. }),
@@ -2564,7 +2671,7 @@ mod tests {
     }
 
     fn lowered(query: &str, sv: &SchemaView) -> Result<OpTree, LoweringRefusal> {
-        lower_refined(&refined_plan(query, sv), sv, None)
+        lower_refined(&refined_plan(query, sv), sv, None, None)
     }
 
     /// A condition on a multivalued slot is a test over the array's elements,
@@ -3221,7 +3328,7 @@ mod tests {
         let query = "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
                      FILTER(?k = \"m\" || ?k = \"n\") }";
         let mut plan = refined_plan(query, &sv);
-        let tree = lower_refined(&plan, &sv, None).expect("as built, it lowers");
+        let tree = lower_refined(&plan, &sv, None, None).expect("as built, it lowers");
         assert_eq!(
             tree.find("filter_tree").len(),
             1,
@@ -3240,7 +3347,7 @@ mod tests {
                 }
             }
         }
-        let refusal = lower_refined(&plan, &sv, None)
+        let refusal = lower_refined(&plan, &sv, None, None)
             .expect_err("a column reading of a collection must not render");
         assert!(
             matches!(refusal, LoweringRefusal::ConditionReadsACollection { .. }),
