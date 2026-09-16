@@ -1351,12 +1351,13 @@ classes:
             "the enum IRI should have resolved to its code: {answer}"
         );
         assert_eq!(bindings[1]["name"]["value"], "BX518");
-        // `LOCAL_ONLY` has no meaning, so `?type` is a literal with no IRI to
-        // describe and the OPTIONAL binds nothing. That is the honest answer,
-        // not an error.
-        assert!(
-            bindings[1].get("code").is_none(),
-            "a meaning-less value must not acquire a label: {answer}"
+        // `LOCAL_ONLY` declares no meaning, and is described all the same: its
+        // IRI is minted, so the OPTIONAL binds. This used to be the hole the
+        // whole join fell into — one enum answering labels for the values a
+        // schema happened to map and silence for the rest.
+        assert_eq!(
+            bindings[1]["code"]["value"], "LOCAL_ONLY",
+            "a value without a meaning is described too: {answer}"
         );
     }
 

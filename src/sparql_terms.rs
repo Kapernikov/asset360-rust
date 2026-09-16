@@ -18,7 +18,8 @@
 //! exposes permissible values. What is not public is the *precedence*, which
 //! this module restates:
 //!
-//! 1. an enum value carrying a `meaning` → that IRI;
+//! 1. an enum value → its concept IRI (`permissible_value_iri`, shared with the
+//!    schema graph and the writer, so all three name a value identically);
 //! 2. a range that is IRI-ish → a named node;
 //! 3. a language tag on the slot (only when there is no datatype, since RDF
 //!    allows one or the other) → a language-tagged literal;
@@ -43,9 +44,10 @@ pub enum TermKind {
     Iri,
     /// A literal, possibly typed or language-tagged.
     Literal,
-    /// An enum whose permissible values carry `meaning` IRIs. Values that have
-    /// a meaning become IRIs; any value without one falls back to a literal,
-    /// which is what the turtle writer does.
+    /// An enum. Every permissible value becomes its concept IRI — the one the
+    /// schema graph describes, whether the value declared a `meaning` or had
+    /// its IRI minted. A stored value the enum does not permit falls back to a
+    /// literal, which is what the turtle writer does.
     EnumIri,
 }
 
@@ -172,9 +174,9 @@ pub fn describe_slot(
     let datatype = info.and_then(|ri| ri.rdf_datatype_iri.clone());
     let is_iri = info.is_some_and(|ri| ri.is_range_iri);
 
-    // Enum values with a `meaning` serialise as IRIs; the map is finite (the
-    // permissible values), unlike the schema graph, so materialising it here is
-    // safe. A value with no meaning falls through to a literal.
+    // Enum values serialise as concept IRIs; the map is finite (the permissible
+    // values), unlike the schema graph, so materialising it here is safe. It is
+    // empty only when the range is not an enum.
     let enum_map = enum_meanings(schema_view, slot);
     if !enum_map.is_empty() {
         return Some(TermDescriptor {
@@ -228,8 +230,16 @@ pub fn describe_slot(
     })
 }
 
-/// Permissible value → expanded meaning IRI, for enum ranges. Empty when the
-/// range is not an enum, or when no permissible value carries a meaning.
+/// Permissible value → the IRI that names it, for enum ranges. Empty only when
+/// the range is not an enum.
+///
+/// *Every* value is mapped, not only those carrying a `meaning`: the range of
+/// an enum-valued slot is a `skos:ConceptScheme`, so a value nobody mapped to
+/// an ontology is still a concept, and rendering it as a bare string made this
+/// endpoint answer two kinds of term for one slot. The spelling comes from
+/// [`linkml_schemaview::enumview::permissible_value_iri`], which the schema
+/// graph and the instance writer also use — pushdown SQL has to reproduce
+/// exactly the term the oxigraph leg binds, or the two legs disagree.
 fn enum_meanings(
     schema_view: &SchemaView,
     slot: &linkml_schemaview::slotview::SlotView,
@@ -242,15 +252,19 @@ fn enum_meanings(
     };
 
     let converter = schema_view.converter();
+    let enum_uri = enum_view
+        .canonical_uri()
+        .to_uri(&converter)
+        .map(|u| u.0)
+        .unwrap_or_else(|_| enum_view.canonical_uri().to_string());
     let mut out: Vec<(String, String)> = values
         .iter()
-        .filter_map(|(text, pv)| {
-            let meaning = pv.meaning.as_ref()?;
-            let iri = Identifier::new(meaning)
-                .to_uri(&converter)
-                .map(|u| u.0)
-                .unwrap_or_else(|_| meaning.clone());
-            Some((text.clone(), iri))
+        .map(|(text, pv)| {
+            let iri =
+                linkml_schemaview::enumview::permissible_value_iri(&enum_uri, text, pv, &converter)
+                    // An unexpandable `meaning` keeps its raw spelling, as before.
+                    .unwrap_or_else(|raw| raw);
+            (text.clone(), iri)
         })
         .collect();
     // Deterministic order: the map crosses to Python and ends up in generated
@@ -443,12 +457,25 @@ classes:
     }
 
     #[test]
-    fn enum_without_meanings_stays_literal() {
-        // Nothing to map to, so the turtle writer emits the value as a
-        // literal — the descriptor has to agree.
+    fn enum_without_meanings_gets_minted_iris() {
+        // Nothing to map to, so gen-owl's `<enum_uri>#<code>` names each value
+        // — which is what the schema graph describes and the turtle writer
+        // emits, so the descriptor has to agree.
         let d = describe("flag");
-        assert_eq!(d.kind, TermKind::Literal);
-        assert!(d.enum_map.is_empty());
+        assert_eq!(d.kind, TermKind::EnumIri);
+        assert_eq!(
+            d.enum_map,
+            vec![
+                (
+                    "No".to_owned(),
+                    "https://data.infrabel.be/asset360/Uncontrolled#No".to_owned()
+                ),
+                (
+                    "Yes".to_owned(),
+                    "https://data.infrabel.be/asset360/Uncontrolled#Yes".to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]

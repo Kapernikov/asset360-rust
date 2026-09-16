@@ -4271,8 +4271,10 @@ types:
     base: int
 
 # Partially mapped, as the real `signalType` is: `GSA` carries a `meaning` and
-# renders as that IRI, while `KSS` has none and renders as the plain literal
-# it stores. One enum answers both halves of the rule.
+# renders as that IRI, while `KSS` has none and renders as the IRI minted for
+# it, `<…/SignalKind#KSS>`. Both are concepts — where the mapped one's IRI
+# comes from is the only difference — so one enum shows that the rule does not
+# depend on it.
 enums:
   SignalKind:
     permissible_values:
@@ -5669,15 +5671,15 @@ classes:
         );
     }
 
-    /// An enum column stores a code, not the term it renders as. All three
-    /// shapes of that, on one partially mapped enum: `GSA` carries a meaning
-    /// and renders as an IRI, `KSS` carries none and renders as itself.
+    /// An enum column stores a code, not the term it renders as — and it
+    /// renders as a concept IRI for every value, whether the schema mapped it
+    /// to an ontology (`GSA`) or the IRI was minted for it (`KSS`).
     #[test]
     fn an_enum_constant_is_translated_back_to_the_stored_code() {
         let sv = test_schema_view();
         let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
-        // An IRI constant selects the code whose meaning it is.
+        // A declared meaning selects the code whose meaning it is.
         let plan = sparql_scope(
             &format!(
                 "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; \
@@ -5693,31 +5695,42 @@ classes:
             "the pushed condition names the stored code, not the IRI"
         );
 
-        // A literal constant selects itself, when the value has no meaning.
+        // A minted IRI is not a lesser kind of constant: same rule, same push.
         let plan = sparql_scope(
-            &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"KSS\" }}"),
+            &format!(
+                "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; \
+                 asset360:kind <https://data.infrabel.be/asset360/SignalKind#KSS> }}"
+            ),
             &sv,
         )
         .unwrap();
-        assert_eq!(plan.inexact, None);
+        assert_eq!(plan.inexact, None, "a minted IRI is pushable too");
         assert_eq!(
             plan.root.all_stars()[0].filters["kind"],
             vec![FilterCondition::Eq("KSS".to_owned())]
         );
 
-        // The literal spelling of a mapped code is a term nothing renders as.
-        // Pushing it would answer with every GSA record where SPARQL answers
-        // with none.
-        let plan = sparql_scope(
-            &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"GSA\" }}"),
-            &sv,
-        )
-        .unwrap();
-        assert_eq!(plan.inexact, Some(Inexact::EnumConstantUnmatched));
-        assert!(
-            !plan.root.all_stars()[0].filters.contains_key("kind"),
-            "nothing is pushed for a constant no record renders as"
-        );
+        // A literal is a term no record renders as — for any value now, not
+        // just the mapped ones. Pushing it would answer with every matching
+        // record where SPARQL answers with none.
+        for code in ["GSA", "KSS"] {
+            let plan = sparql_scope(
+                &format!(
+                    "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"{code}\" }}"
+                ),
+                &sv,
+            )
+            .unwrap();
+            assert_eq!(
+                plan.inexact,
+                Some(Inexact::EnumConstantUnmatched),
+                "literal {code:?} matches no term"
+            );
+            assert!(
+                !plan.root.all_stars()[0].filters.contains_key("kind"),
+                "nothing is pushed for a constant no record renders as ({code})"
+            );
+        }
     }
 
     /// The same rule through `FILTER(?k = ...)` and `IN` -- the two routes that
@@ -5738,14 +5751,15 @@ classes:
             (
                 format!(
                     "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
-                     FILTER(?k = \"KSS\") }}"
+                     FILTER(?k = <https://data.infrabel.be/asset360/SignalKind#KSS>) }}"
                 ),
                 FilterCondition::Eq("KSS".to_owned()),
             ),
             (
                 format!(
                     "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
-                     FILTER(?k IN (<http://ontorail.org/src/Eulynx/GSA>, \"KSS\")) }}"
+                     FILTER(?k IN (<http://ontorail.org/src/Eulynx/GSA>, \
+                     <https://data.infrabel.be/asset360/SignalKind#KSS>)) }}"
                 ),
                 FilterCondition::In(vec!["GSA".to_owned(), "KSS".to_owned()]),
             ),
