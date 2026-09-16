@@ -42,13 +42,13 @@ pub mod sparql_columns;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
 pub mod sparql_graph_clauses;
+#[cfg(feature = "sparql-endpoint")]
+pub mod sparql_materialise;
 pub mod sparql_ops;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;
 pub mod sparql_rules;
-#[cfg(feature = "sparql-endpoint")]
-pub mod sparql_schema_filters;
 pub mod sparql_schema_graph;
 pub mod sparql_scoper;
 pub mod sparql_terms;

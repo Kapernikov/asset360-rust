@@ -4760,7 +4760,7 @@ mod tests {
     ///
     /// `Expr` exists so a rule can reason about an expression; writing one
     /// back as SPARQL is what lets a schema-only subplan be *evaluated*
-    /// (see `crate::sparql_schema_filters`). A silent gap in the inverse would
+    /// (see `crate::sparql_materialise`). A silent gap in the inverse would
     /// mean a subplan quietly evaluated as a different question, which is the
     /// failure mode this engine keeps producing -- so every shape goes there
     /// and back and has to come out identical.

@@ -6909,7 +6909,7 @@ def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_
             scoped at all.
     """
 
-def refined_plan_text(query:builtins.str, schema_view:SchemaView) -> builtins.str:
+def refined_plan_text(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None) -> builtins.str:
     r"""
     The refined plan for a query, as the text the Rust tests print.
     
@@ -6922,6 +6922,10 @@ def refined_plan_text(query:builtins.str, schema_view:SchemaView) -> builtins.st
     Args:
         query: SPARQL query string.
         schema_view: The LinkML schema.
+        schema_graph_iri: The named graph the active datamodel serves its schema
+            in -- ``asset360_model.datamodel_config.get_schema_graph_iri()``.
+            Leave it out and the plan printed is the one a deployment without a
+            schema graph builds, which is not the one production runs.
     
     Returns:
         str: the plan, one line per node, with the obligation ledger.

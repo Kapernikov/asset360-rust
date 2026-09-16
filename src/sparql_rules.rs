@@ -3734,8 +3734,16 @@ pub fn tier_one_rules<'a>(
     // question with no answers.
     #[cfg(feature = "sparql-endpoint")]
     if let Some(iri) = schema_graph_iri {
-        rules.push(Box::new(SinkFilterIntoAnEvaluableSide::new(schema, iri)));
-        rules.push(Box::new(EvaluateSchemaSubplan::new(schema, iri)));
+        // Two lines per materialisation pass, and this is the only place a
+        // second one would be added: one rule to sink a filter into the pass's
+        // regions, one to materialise them.
+        rules.push(Box::new(SinkFilterIntoAnEvaluableSide::new(
+            schema,
+            crate::sparql_materialise::SchemaGraphMaterialisation::new(schema, iri),
+        )));
+        rules.push(Box::new(Materialise::new(
+            crate::sparql_materialise::SchemaGraphMaterialisation::new(schema, iri),
+        )));
     }
     #[cfg(not(feature = "sparql-endpoint"))]
     let _ = schema_graph_iri;
@@ -3813,11 +3821,28 @@ impl Rule for ValuesNarrowTheJoinedScan<'_> {
                 if variables.len() < 2 {
                     continue;
                 }
-                let visible = Visible::mandatorily_below(plan, other);
+                // Where the condition may land: the side itself, or -- when
+                // that side is a join of its own -- any side of it. Nested
+                // inner joins are transparent to a constraint on a variable
+                // they do not rebind, which is the same equivalence that lets
+                // a filter sink through one. Anything else in the way
+                // (`LeftJoin`, `Minus`, `Union`, `Unnest`) is not, and is not
+                // descended into.
+                let mut sites = vec![(other, join)];
+                sites.extend(join_sides(plan, other));
                 for name in &on {
                     let Some(index) = variables.iter().position(|v| v.as_str() == name) else {
                         continue;
                     };
+                    let Some((site, consumer)) = sites.iter().copied().find(|(site, _)| {
+                        plan.nodes[*site].executor == Executor::Sql
+                            && Visible::mandatorily_below(plan, *site)
+                                .slot_of(name)
+                                .is_some()
+                    }) else {
+                        continue;
+                    };
+                    let visible = Visible::mandatorily_below(plan, site);
                     let Some(binding) = visible.slot_of(name) else {
                         continue;
                     };
@@ -3861,7 +3886,7 @@ impl Rule for ValuesNarrowTheJoinedScan<'_> {
                     if already_constrained(plan, &condition) {
                         continue;
                     }
-                    insert_filter_above(plan, other, join, condition);
+                    insert_filter_above(plan, site, consumer, condition);
                     return true;
                 }
             }
@@ -3960,29 +3985,29 @@ fn insert_filter_above(plan: &mut Plan, side: NodeId, consumer: NodeId, conditio
 /// (a `match` about to become a scan, a join about to become a reference join)
 /// takes that side out of the other rule's reach, and the statement loses a
 /// condition it would have taken. On a side that is *closed* — one
-/// [`crate::sparql_schema_filters::schema_only`] says can be evaluated without
-/// the rest of the plan — nothing else is competing, and the move is what turns
+/// the pass says it can evaluate without the rest of the plan — nothing else is competing, and the move is what turns
 /// a bigger region closed. So the rule is stated by the property that makes it
 /// useful, not by the shape it was written for: widen what counts as evaluable
 /// and this widens with it.
 #[cfg(feature = "sparql-endpoint")]
-pub struct SinkFilterIntoAnEvaluableSide<'s> {
+pub struct SinkFilterIntoAnEvaluableSide<'s, M> {
     schema: &'s SchemaView,
-    schema_graph_iri: &'s str,
+    pass: M,
 }
 
 #[cfg(feature = "sparql-endpoint")]
-impl<'s> SinkFilterIntoAnEvaluableSide<'s> {
-    pub fn new(schema: &'s SchemaView, schema_graph_iri: &'s str) -> Self {
-        Self {
-            schema,
-            schema_graph_iri,
-        }
+impl<'s, M: crate::sparql_materialise::Materialisation> SinkFilterIntoAnEvaluableSide<'s, M> {
+    /// Paired with the pass whose regions it feeds. A second materialisation
+    /// gets its own pair of lines in [`tier_one_rules`] and nothing else: this
+    /// asks the pass whether a side is evaluable, so "evaluable" widens with
+    /// the pass rather than being restated here.
+    pub fn new(schema: &'s SchemaView, pass: M) -> Self {
+        Self { schema, pass }
     }
 }
 
 #[cfg(feature = "sparql-endpoint")]
-impl Rule for SinkFilterIntoAnEvaluableSide<'_> {
+impl<M: crate::sparql_materialise::Materialisation> Rule for SinkFilterIntoAnEvaluableSide<'_, M> {
     fn name(&self) -> &'static str {
         "sink_filter_into_an_evaluable_side"
     }
@@ -3998,9 +4023,19 @@ impl Rule for SinkFilterIntoAnEvaluableSide<'_> {
                 continue;
             };
             let (input, condition) = (*input, condition.clone());
-            let PlanOp::Join { left, right, .. } = plan.nodes[input].op else {
+            // Commute down past the other filters of the same group to reach
+            // the join. SPARQL puts every `FILTER` of a group above the group's
+            // join, so a group with two of them is `Filter(Filter(Join(..)))`
+            // and only the innermost would ever see a join to sink through.
+            // Filters commute with each other -- both select, neither binds --
+            // so reading past them asks the same question.
+            let mut below = input;
+            while let PlanOp::Filter { input: next, .. } = plan.nodes[below].op {
+                below = next;
+            }
+            if !matches!(plan.nodes[below].op, PlanOp::Join { .. }) {
                 continue;
-            };
+            }
             let used = crate::sparql_refine::variables_used(&condition);
             // A filter naming nothing is a constant, and a filter already
             // resolved to slots belongs to the node it was resolved against.
@@ -4020,19 +4055,44 @@ impl Rule for SinkFilterIntoAnEvaluableSide<'_> {
             {
                 continue;
             }
-            for side in [left, right] {
-                if !crate::sparql_schema_filters::schema_only(plan, side, self.schema_graph_iri) {
+            // Every side of every join below, with the join that reads it.
+            // Descending through nested joins rather than stopping at the first
+            // is the same local equivalence applied twice -- a group of three
+            // patterns is `Join(Join(a, b), c)`, and a filter over `b` has two
+            // levels to travel.
+            for (side, join) in join_sides(plan, below) {
+                if !self.pass.qualifies(plan, side) {
                     continue;
                 }
                 let bound = plan.variables_of(side);
                 if used.iter().all(|name| bound.contains(name)) {
-                    move_filter_onto(plan, id, side, input);
+                    move_filter_onto(plan, id, side, join, input);
                     return true;
                 }
             }
         }
         false
     }
+}
+
+/// Every `(side, the join that reads it)` in the tree of joins rooted at
+/// `node`, outermost first.
+///
+/// A side that is itself a join contributes its own sides as well as itself, so
+/// a filter can travel more than one level in one move.
+fn join_sides(plan: &Plan, node: NodeId) -> Vec<(NodeId, NodeId)> {
+    let mut out = Vec::new();
+    let mut frontier = vec![node];
+    while let Some(current) = frontier.pop() {
+        let PlanOp::Join { left, right, .. } = plan.nodes[current].op else {
+            continue;
+        };
+        for side in [left, right] {
+            out.push((side, current));
+            frontier.push(side);
+        }
+    }
+    out
 }
 
 /// Move `filter` from above `join` to directly above `side`, keeping it the
@@ -4044,7 +4104,13 @@ impl Rule for SinkFilterIntoAnEvaluableSide<'_> {
 /// and folding two decisions into one helper is how a rule ends up doing
 /// something its name does not say.
 #[cfg(feature = "sparql-endpoint")]
-fn move_filter_onto(plan: &mut Plan, filter: NodeId, side: NodeId, join: NodeId) {
+fn move_filter_onto(
+    plan: &mut Plan,
+    filter: NodeId,
+    side: NodeId,
+    join: NodeId,
+    reparent_to: NodeId,
+) {
     let PlanOp::Filter { condition, .. } = plan.nodes[filter].op.clone() else {
         unreachable!("only a filter node is moved")
     };
@@ -4083,8 +4149,9 @@ fn move_filter_onto(plan: &mut Plan, filter: NodeId, side: NodeId, join: NodeId)
         };
         nodes[index].op.map_inputs(|input| {
             if input == filter {
-                // What read the filter now reads the join it sat on.
-                remap[join].expect("the join is not the node being moved")
+                // What read the filter now reads whatever the filter read --
+                // the join it sat on, or the next filter of the same group.
+                remap[reparent_to].expect("the filter's input is not the node being moved")
             } else if input == side && old == join {
                 landed
             } else {
@@ -4098,57 +4165,55 @@ fn move_filter_onto(plan: &mut Plan, filter: NodeId, side: NodeId, join: NodeId)
 }
 
 // ---------------------------------------------------------------------------
-// Evaluate a subplan that depends on nothing but the schema
+// Materialise a subplan that can be evaluated now
 // ---------------------------------------------------------------------------
 
-/// A subplan with no dependency on anything outside the schema is evaluated
-/// now and **replaced** by the relation it denotes.
+/// A subplan a [`crate::sparql_materialise::Materialisation`] can evaluate is
+/// evaluated now and **replaced** by the relation it denotes.
 ///
-/// The criterion, the reconstruction and the evaluation are
-/// [`crate::sparql_schema_filters`]'s; this is the rule that applies them. It
-/// fires once per subplan and the fixpoint comes back for the next, so a query
-/// with a schema subplan in each union arm needs nothing special — each arm is
-/// a subplan like any other.
+/// One rule, any pass. The criterion and the dataset are the pass's; the search
+/// for the maximal subplan, the write-back, the evaluation and the replacement
+/// are [`crate::sparql_materialise`]'s, and this rule is what runs them inside
+/// the fixpoint. It fires once per subplan and the loop comes back for the
+/// next, so a query with a qualifying subplan in each union arm needs nothing
+/// special -- each arm is a subplan like any other.
 ///
 /// The replacement is a [`PlanOp::Values`], which is where the narrowing comes
-/// from: `values_becomes_filter` folds one onto the scan that binds the same
-/// variable, and `Expr::to_sql` renders its terms as the texts that column
-/// stores. Nothing downstream knows a schema graph exists.
+/// from: [`ValuesBecomesFilter`] folds one onto the scan that binds the same
+/// variable, [`ValuesNarrowTheJoinedScan`] derives a condition from one that
+/// must stay, and `Expr::to_sql` renders its terms as the texts the column
+/// stores. Nothing downstream knows a materialisation happened, which is what
+/// lets a second pass reuse all of it without editing the first.
 #[cfg(feature = "sparql-endpoint")]
-pub struct EvaluateSchemaSubplan<'a> {
-    probe: crate::sparql_schema_filters::SchemaProbe<'a>,
-    schema_graph_iri: &'a str,
+pub struct Materialise<M> {
+    pass: M,
 }
 
 #[cfg(feature = "sparql-endpoint")]
-impl<'a> EvaluateSchemaSubplan<'a> {
-    pub fn new(schema: &'a SchemaView, schema_graph_iri: &'a str) -> Self {
-        Self {
-            probe: crate::sparql_schema_filters::SchemaProbe::new(schema, schema_graph_iri),
-            schema_graph_iri,
-        }
+impl<M: crate::sparql_materialise::Materialisation> Materialise<M> {
+    pub fn new(pass: M) -> Self {
+        Self { pass }
     }
 }
 
 #[cfg(feature = "sparql-endpoint")]
-impl Rule for EvaluateSchemaSubplan<'_> {
+impl<M: crate::sparql_materialise::Materialisation> Rule for Materialise<M> {
     fn name(&self) -> &'static str {
-        "evaluate_schema_subplan"
+        // The pass's name and not the rule's: a plan carrying two passes has to
+        // say which one fired.
+        self.pass.name()
     }
 
     fn apply(&self, plan: &mut Plan) -> bool {
-        let Some(root) = crate::sparql_schema_filters::evaluable_root(plan, self.schema_graph_iri)
+        let Some(root) = crate::sparql_materialise::materialisable_root(plan, &self.pass) else {
+            return false;
+        };
+        let Some((variables, rows)) =
+            crate::sparql_materialise::materialise(plan, root, &self.pass)
         else {
             return false;
         };
-        let Some((variables, rows)) = self.probe.evaluate(plan, root) else {
-            return false;
-        };
-        crate::sparql_schema_filters::replace_subtree(
-            plan,
-            root,
-            PlanOp::Values { variables, rows },
-        );
+        crate::sparql_materialise::replace_subtree(plan, root, PlanOp::Values { variables, rows });
         true
     }
 }

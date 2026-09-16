@@ -1,16 +1,83 @@
-//! Evaluating the part of a plan that depends on nothing but the schema.
+//! **Materialisation**: evaluating a subplan now, and replacing it in the plan
+//! with the relation it denotes.
 //!
-//! # The criterion
+//! # The shape
 //!
-//! > **A subplan qualifies when it has no dependency on anything outside the
-//! > schema.** Such a subplan can be evaluated now and *replaced* in the plan
-//! > by its results.
+//! A *materialisation pass* is two things and nothing else:
 //!
-//! That is the whole rule, and it is a property computed on the plan rather
-//! than a list of query shapes. A shape nobody has thought of yet either
-//! satisfies it or does not, and no code is written either way.
+//! * a **criterion** — which subplans this pass can evaluate;
+//! * a **dataset** — what it evaluates them against.
 //!
-//! # Why this is worth doing
+//! Everything else is shared and lives here: finding the maximal subplan that
+//! qualifies, writing it back as a query, running it, and swapping it into the
+//! plan as a [`PlanOp::Values`]. A pass supplies the two answers and inherits
+//! the rest, which is what makes a second pass an implementation of
+//! [`Materialisation`] rather than an edit to the first.
+//!
+//! [`SchemaGraphMaterialisation`] is the first instance, and the one asset360
+//! GitLab issue #409 is about. It is not the only shape there is: a subplan
+//! built only from `VALUES` blocks depends on no dataset at all and could be
+//! materialised the same way, and `a_second_pass_needs_no_edit_to_the_first`
+//! exercises exactly that — a second `Materialisation` defined entirely in the
+//! test module, running through the same rule, touching none of this.
+//!
+//! # `PlanOp::Values` is the interface
+//!
+//! What a materialisation produces is an ordinary inline table, and that is
+//! deliberate. Nothing downstream knows a materialisation happened: the rules
+//! that turn a relation into a narrower fetch — `values_becomes_filter` and
+//! `values_narrow_the_joined_scan` — consume a `Values` whether the client
+//! wrote it, the schema produced it, or a pass nobody has written yet did.
+//! Those rules are the "variable resolver" half, and they are general because
+//! the thing they consume is.
+//!
+//! # It is a fixpoint, not a pipeline
+//!
+//! Materialising is not a step that runs once before resolving. A pass is an
+//! ordinary rule in [`crate::sparql_rules::refine`]'s loop, so:
+//!
+//! * a materialisation can **enable another one**. Replacing a subplan with a
+//!   `Values` makes it read nothing, so a *larger* region around it can become
+//!   closed and qualify in the next round;
+//! * a resolution can enable a materialisation, and the other way round, for
+//!   the same reason.
+//!
+//! **Termination.** Each materialisation replaces a subtree of *n* nodes with
+//! one, and never fires on a node that is already a `Values`, so it can happen
+//! at most once per node in the plan. Resolution adds a node per (relation,
+//! join variable) pair and refuses to add one twice
+//! (`values_narrow_the_joined_scan`'s `already_constrained`), so it is bounded
+//! by the same count. `refine`'s round limit is the backstop, not the argument.
+//!
+//! **Order does not matter.** Two subplans that qualify independently are
+//! disjoint — [`subtree_is_private`] is what says so — and replacing a subplan
+//! by the relation it denotes is an equivalence, so doing either first leaves
+//! the same plan. `two_independent_regions_are_both_materialised` asserts that
+//! both happen; that the order between them is immaterial is the equivalence,
+//! not a separate mechanism.
+//!
+//! **What a cascade needs, stated honestly.** The loop *permits* one pass to
+//! enable another, and that is worth having for free rather than sequencing by
+//! hand. It is not reachable with the two criteria that exist today: both treat
+//! a `Values` as reading nothing, so a region containing a materialised one
+//! already qualified before it was materialised. A pass with a narrower
+//! criterion — one that does not look through a relation — would cascade, and
+//! nothing would have to change here for it to.
+//!
+//! # Why the criterion is the pass's and the structure is not
+//!
+//! [`SchemaGraphMaterialisation`]'s criterion is:
+//!
+//! > **no dependency on anything outside the schema** — it reads only the
+//! > schema graph, and it binds every variable it names.
+//!
+//! A property computed on the plan, not a list of query shapes: a shape nobody
+//! has thought of yet either satisfies it or does not, and no code is written
+//! either way. A different pass has a different criterion and the same
+//! machinery; what they share is the *shape* of the claim — **this subplan can
+//! be evaluated now** — which is what [`Materialisation::qualifies`] names.
+//!
+//! # Why the schema case is worth it
 //!
 //! Since every permissible value of an enum became a concept IRI, the only way
 //! to ask "which signals have a type whose code contains `GS`" is to join the
@@ -27,17 +94,17 @@
 //! The only selective predicate lives on the schema side, so the scan has
 //! nothing to narrow with and the whole class is materialised — `Signal` is
 //! 23,503 objects on dev against a `MAX_RESULT_ROWS` of 10,000, so the query is
-//! refused outright (asset360 GitLab issue #409). The schema graph is
-//! thousands of triples; evaluating the predicate over nine permissible values
-//! instead of 23,503 rows is the whole of the fix.
+//! refused outright. The schema graph is thousands of triples; evaluating the
+//! predicate over nine permissible values instead of 23,503 rows is the whole
+//! of the fix.
 //!
-//! # Three things follow from the criterion
+//! # Three things follow from replacement, and they are why this is a plan pass
 //!
 //! **Replacement is context-free.** Substituting a subplan by the relation it
 //! denotes is an equivalence under SPARQL's bottom-up semantics, and an
 //! equivalence holds wherever the subplan sits: under an `OPTIONAL`, inside a
 //! `MINUS`, inside `NOT EXISTS`, in one arm of a `UNION`. None of those is a
-//! case this module handles, because none of them is a case. An earlier
+//! case anything here handles, because none of them is a case. An earlier
 //! attempt injected a `VALUES` *beside* the schema pattern, which is sound only
 //! when the pattern is in required position — and that precondition is exactly
 //! what forces a catalogue of shapes to be enumerated and excluded.
@@ -48,10 +115,8 @@
 //! evaluating it standalone and replacing it with *all* of its solutions is
 //! exactly correct, and the join is what narrows.
 //!
-//! **"Outside the schema" is about reads.** A node depends on something outside
-//! the schema iff it reads a triple from somewhere that is not the schema
-//! graph, or reaches a service, or is an instance scan. Everything else
-//! inherits the property from its inputs.
+//! **A free variable is.** A `FILTER` naming a variable nothing below it binds
+//! depends on whatever does bind it — see [`no_free_variables`].
 //!
 //! # What is genuinely out, and why none of it is a query shape
 //!
@@ -91,7 +156,44 @@ pub type Relation = (Vec<Variable>, Vec<Vec<Option<GroundTerm>>>);
 pub const MAX_MATERIALISED_ROWS: usize = 500;
 
 // ---------------------------------------------------------------------------
-// The criterion
+// What a pass supplies
+// ---------------------------------------------------------------------------
+
+/// One materialisation pass: a criterion, and a dataset to evaluate against.
+///
+/// Implementing this is the whole of adding a pass. The maximal-subplan search,
+/// the write-back, the evaluation, the row cap and the replacement are
+/// [`materialisable_root`]'s and [`materialise`]'s, and they do not know which
+/// pass they are serving.
+pub trait Materialisation {
+    /// Stable name, for the log a reader checks a plan against.
+    fn name(&self) -> &'static str;
+
+    /// **Can this subplan be evaluated now?**
+    ///
+    /// The pass's whole judgement, and it should be a *property* of the plan
+    /// rather than a list of query shapes — see
+    /// [`SchemaGraphMaterialisation`]'s, which is "depends on nothing outside
+    /// the schema". A criterion stated as a property answers for a shape nobody
+    /// has thought of yet; a criterion stated as a list does not.
+    ///
+    /// It does not need to check that the node emits solutions, that it is not
+    /// already a relation, or that its subtree is private to it. Those are
+    /// conditions for replacing *any* subplan with a relation, so they are
+    /// asked once, in [`materialisable_root`].
+    fn qualifies(&self, plan: &Plan, node: NodeId) -> bool;
+
+    /// What to evaluate against, or `None` when the pass cannot answer right
+    /// now — a store it failed to build, say. `None` leaves the plan untouched.
+    ///
+    /// A pass over subplans that read nothing at all would return an empty
+    /// store here, not `None`: "nothing to read" is a dataset, and "I cannot
+    /// answer" is not.
+    fn dataset(&self) -> Option<&Store>;
+}
+
+// ---------------------------------------------------------------------------
+// The schema graph's criterion
 // ---------------------------------------------------------------------------
 
 /// Whether this subplan depends on nothing outside the schema graph.
@@ -238,34 +340,65 @@ fn names_the_schema_graph(name: &str, schema_graph_iri: &str) -> bool {
     name.starts_with('?') || name == format!("<{schema_graph_iri}>")
 }
 
-/// The root of a maximal schema-only subplan worth evaluating, if there is one.
+/// The root of a maximal subplan this pass can evaluate, if there is one.
 ///
-/// *Maximal* because a subplan's consumer, if it is also schema-only, is a
-/// bigger subplan with the same answer and one fewer join to leave behind.
-/// *Worth* excludes what evaluating could not improve:
+/// *Maximal* because a subplan's consumer, if it also qualifies, is a bigger
+/// subplan with the same answer and one fewer join to leave behind.
 ///
-/// * a node that is already a [`PlanOp::Values`] — it is its own answer, and
+/// Three conditions here are **every** pass's, which is why they are not
+/// [`Materialisation::qualifies`]'s to repeat:
+///
+/// * the node is not already a [`PlanOp::Values`] — it is its own answer, and
 ///   replacing it with itself would never reach a fixpoint;
-/// * a node that does not emit solutions, since a relation cannot replace a
-///   boolean or a graph;
-/// * a node whose subtree is shared with the rest of the plan, which is not a
-///   subtree to lift out.
-pub fn evaluable_root(plan: &Plan, schema_graph_iri: &str) -> Option<NodeId> {
+/// * it emits solutions, since a relation cannot replace a boolean or a graph;
+/// * its subtree is private to it, or it is not a subtree to lift out.
+pub fn materialisable_root(plan: &Plan, pass: &dyn Materialisation) -> Option<NodeId> {
     (0..plan.nodes.len()).rev().find(|&node| {
         !matches!(plan.nodes[node].op, PlanOp::Values { .. })
             && plan.nodes[node].output == crate::sparql_refine::OutputKind::Solutions
-            && schema_only(plan, node, schema_graph_iri)
-            && is_the_top_of_its_region(plan, node, schema_graph_iri)
+            && pass.qualifies(plan, node)
+            && is_the_top_of_its_region(plan, node, pass)
             && subtree_is_private(plan, node)
+            && nothing_is_still_sinking_into_it(plan, node)
     })
 }
 
-/// Whether no consumer of this node is itself schema-only — i.e. this node is
-/// the top of its schema-only region.
-fn is_the_top_of_its_region(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
-    !plan.nodes.iter().enumerate().any(|(id, other)| {
-        other.op.inputs().contains(&node) && schema_only(plan, id, schema_graph_iri)
+/// Whether a filter above this subplan is still on its way *into* it.
+///
+/// A filter that reads only what the subplan binds belongs inside it — that is
+/// what `sink_filter_into_an_evaluable_side` is for — and evaluating the
+/// subplan before it arrives gives an answer that is correct and useless: the
+/// region without its own predicate is the whole datamodel, which materialises
+/// into a relation that narrows nothing.
+///
+/// Both rules live in the same fixpoint and there is no ordering between them
+/// to rely on, so this is asked of the plan rather than of the rule set: wait
+/// while a filter that could still land here has not.
+fn nothing_is_still_sinking_into_it(plan: &Plan, node: NodeId) -> bool {
+    let bound = plan.variables_of(node);
+    let inside = subtree(plan, node);
+    !plan.nodes.iter().enumerate().any(|(id, above)| {
+        let PlanOp::Filter { condition, .. } = &above.op else {
+            return false;
+        };
+        // A filter that has already arrived is part of the subplan, not
+        // something still on its way into it.
+        if inside.contains(&id) || !plan.feeds(node, id) {
+            return false;
+        }
+        let used = crate::sparql_refine::variables_used(condition);
+        !used.is_empty() && used.iter().all(|name| bound.contains(name))
     })
+}
+
+/// Whether no consumer of this node also qualifies — i.e. this node is the top
+/// of its region.
+fn is_the_top_of_its_region(plan: &Plan, node: NodeId, pass: &dyn Materialisation) -> bool {
+    !plan
+        .nodes
+        .iter()
+        .enumerate()
+        .any(|(id, other)| other.op.inputs().contains(&node) && pass.qualifies(plan, id))
 }
 
 /// Whether every node below `root` feeds `root` and nothing else.
@@ -476,18 +609,23 @@ fn graph_name(name: &str) -> Option<NamedNodePattern> {
 // Evaluating one
 // ---------------------------------------------------------------------------
 
-/// The schema graph, built once and only when something asks.
+/// The one materialisation pass this change adds: evaluate what depends on
+/// nothing but the datamodel.
 ///
-/// A plan that contains no `GRAPH` node naming the schema graph never asks, so
-/// the overwhelming majority of requests pay nothing. A plan that does asks
-/// once, however many subplans it has.
-pub struct SchemaProbe<'a> {
+/// Its criterion is [`schema_only`]; its dataset is the datamodel as quads, in
+/// the one named graph this endpoint serves it in — the same shape the engine
+/// leg loads, so a probe answers what the engine would answer.
+///
+/// The store is built lazily and once. A plan with no `GRAPH` node naming the
+/// schema graph never asks, so the overwhelming majority of requests pay
+/// nothing; a plan that does asks once, however many subplans it has.
+pub struct SchemaGraphMaterialisation<'a> {
     schema_view: &'a SchemaView,
     schema_graph_iri: &'a str,
     store: OnceCell<Option<Store>>,
 }
 
-impl<'a> SchemaProbe<'a> {
+impl<'a> SchemaGraphMaterialisation<'a> {
     pub fn new(schema_view: &'a SchemaView, schema_graph_iri: &'a str) -> Self {
         Self {
             schema_view,
@@ -495,11 +633,18 @@ impl<'a> SchemaProbe<'a> {
             store: OnceCell::new(),
         }
     }
+}
 
-    /// The datamodel as quads, in the one named graph this endpoint serves it
-    /// in — the same shape the engine leg loads, so a probe answers what the
-    /// engine would answer.
-    fn store(&self) -> Option<&Store> {
+impl Materialisation for SchemaGraphMaterialisation<'_> {
+    fn name(&self) -> &'static str {
+        "schema_graph"
+    }
+
+    fn qualifies(&self, plan: &Plan, node: NodeId) -> bool {
+        schema_only(plan, node, self.schema_graph_iri)
+    }
+
+    fn dataset(&self) -> Option<&Store> {
         self.store
             .get_or_init(|| {
                 let graph = crate::sparql_schema_graph::SchemaGraph::build(
@@ -523,77 +668,81 @@ impl<'a> SchemaProbe<'a> {
             })
             .as_ref()
     }
+}
 
-    /// The relation this subplan denotes, as the variables and rows a
-    /// [`PlanOp::Values`] holds.
-    ///
-    /// `None` when the subplan cannot be written back as a query, when a
-    /// solution carries a blank node, or when there are more rows than
-    /// [`MAX_MATERIALISED_ROWS`] — each of which leaves the plan exactly as it
-    /// was.
-    ///
-    /// Duplicate rows are **kept**. SPARQL solutions are a bag and so is a
-    /// `VALUES` block; folding duplicates away here would change a count.
-    pub fn evaluate(&self, plan: &Plan, root: NodeId) -> Option<Relation> {
-        let pattern = pattern_of(plan, root)?;
-        let mut variables: Vec<Variable> = Vec::new();
-        pattern.on_in_scope_variable(|variable| {
-            if !variables.contains(variable) {
-                variables.push(variable.clone());
-            }
-        });
-        if variables.is_empty() {
-            // Nothing to bind, so nothing a relation can say that the plan
-            // does not already say.
-            return None;
+/// The relation a subplan denotes, as the variables and rows a
+/// [`PlanOp::Values`] holds.
+///
+/// Shared by every pass: the write-back, the evaluation, the blank-node refusal
+/// and the row cap are properties of *replacing a subplan with a relation*, not
+/// of any one criterion.
+///
+/// `None` when the subplan cannot be written back as a query, when the pass has
+/// no dataset to answer against, when a solution carries a blank node, or when
+/// there are more rows than [`MAX_MATERIALISED_ROWS`] — each of which leaves
+/// the plan exactly as it was.
+///
+/// Duplicate rows are **kept**. SPARQL solutions are a bag and so is a `VALUES`
+/// block; folding duplicates away here would change a count.
+pub fn materialise(plan: &Plan, root: NodeId, pass: &dyn Materialisation) -> Option<Relation> {
+    let pattern = pattern_of(plan, root)?;
+    let mut variables: Vec<Variable> = Vec::new();
+    pattern.on_in_scope_variable(|variable| {
+        if !variables.contains(variable) {
+            variables.push(variable.clone());
         }
-        variables.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-
-        let query = Query::Select {
-            dataset: None,
-            pattern: GraphPattern::Project {
-                inner: Box::new(pattern),
-                variables: variables.clone(),
-            },
-            base_iri: None,
-        };
-        let QueryResults::Solutions(solutions) = SparqlEvaluator::new()
-            .for_query(query)
-            .on_store(self.store()?)
-            .execute()
-            .ok()?
-        else {
-            return None;
-        };
-
-        let mut rows: Vec<Vec<Option<GroundTerm>>> = Vec::new();
-        for solution in solutions {
-            let solution = solution.ok()?;
-            let mut row = Vec::with_capacity(variables.len());
-            for variable in &variables {
-                row.push(match solution.get(variable.as_str()) {
-                    Some(term) => Some(ground(term)?),
-                    None => None,
-                });
-            }
-            rows.push(row);
-            if rows.len() > MAX_MATERIALISED_ROWS {
-                return None;
-            }
-        }
-        // A bag, so sorting changes nothing about what it denotes -- and it
-        // makes the node a reader and a test can rely on, where the evaluator's
-        // solution order is not something to rely on.
-        rows.sort_by_key(|row| {
-            row.iter()
-                .map(|cell| match cell {
-                    Some(term) => term.to_string(),
-                    None => String::new(),
-                })
-                .collect::<Vec<_>>()
-        });
-        Some((variables, rows))
+    });
+    if variables.is_empty() {
+        // Nothing to bind, so nothing a relation can say that the plan does
+        // not already say.
+        return None;
     }
+    variables.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+    let query = Query::Select {
+        dataset: None,
+        pattern: GraphPattern::Project {
+            inner: Box::new(pattern),
+            variables: variables.clone(),
+        },
+        base_iri: None,
+    };
+    let QueryResults::Solutions(solutions) = SparqlEvaluator::new()
+        .for_query(query)
+        .on_store(pass.dataset()?)
+        .execute()
+        .ok()?
+    else {
+        return None;
+    };
+
+    let mut rows: Vec<Vec<Option<GroundTerm>>> = Vec::new();
+    for solution in solutions {
+        let solution = solution.ok()?;
+        let mut row = Vec::with_capacity(variables.len());
+        for variable in &variables {
+            row.push(match solution.get(variable.as_str()) {
+                Some(term) => Some(ground(term)?),
+                None => None,
+            });
+        }
+        rows.push(row);
+        if rows.len() > MAX_MATERIALISED_ROWS {
+            return None;
+        }
+    }
+    // A bag, so sorting changes nothing about what it denotes -- and it makes
+    // the node a reader and a test can rely on, where the evaluator's solution
+    // order is not something to rely on.
+    rows.sort_by_key(|row| {
+        row.iter()
+            .map(|cell| match cell {
+                Some(term) => term.to_string(),
+                None => String::new(),
+            })
+            .collect::<Vec<_>>()
+    });
+    Some((variables, rows))
 }
 
 /// A solution term as a `VALUES` cell. `None` for a blank node, which a
@@ -763,6 +912,97 @@ mod tests {
             plan.contains("match     ?s a asset360:BaliseGroup"),
             "the other arm is untouched:\n{plan}"
         );
+    }
+
+    /// **The test that says the structure is right rather than asserting it:**
+    /// a second materialisation, defined entirely in this test module, running
+    /// through the same rule, touching nothing in the pass that already exists.
+    ///
+    /// Its criterion is different from the schema pass's — "reads nothing at
+    /// all" rather than "reads only the schema graph" — and its dataset is an
+    /// empty store, which is what "nothing to read" *is*. Everything else, the
+    /// maximal-subplan search and the write-back and the row cap and the
+    /// replacement, it inherits.
+    ///
+    /// If adding this had needed an edit to `SchemaGraphMaterialisation`, the
+    /// design would have the same defect as the version before it: a
+    /// mechanism that is general in the prose and specific in the code.
+    #[test]
+    fn a_second_pass_needs_no_edit_to_the_first() {
+        let mut plan = crate::sparql_refine::naive_plan_of(
+            "SELECT ?x ?y WHERE { VALUES ?x { 1 2 } VALUES ?y { 3 } }",
+        )
+        .expect("a naive plan");
+        let rule = crate::sparql_rules::Materialise::new(ReadsNothing::default());
+        crate::sparql_rules::refine(&mut plan, &[&rule]).expect("every invariant holds");
+
+        let printed = format!("{plan}");
+        assert_eq!(plan.find("values").len(), 1, "{printed}");
+        assert!(printed.contains("values    ?x ?y × 2 row(s)"), "{printed}");
+    }
+
+    /// Two regions that qualify independently are both materialised. The order
+    /// between them is immaterial because replacing a subplan by the relation
+    /// it denotes is an equivalence and the two are disjoint — that is an
+    /// argument, and this is the part of it that can be run.
+    #[test]
+    fn two_independent_regions_are_both_materialised() {
+        let plan = refined_for(&format!(
+            "SELECT ?s WHERE {{ \
+             ?s a asset360:Signal ; asset360:signalType ?t ; asset360:regime ?r . \
+             GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:notation ?tc }} \
+             GRAPH <{SCHEMA_GRAPH}> {{ ?r skos:notation ?rc }} \
+             FILTER(CONTAINS(?tc, \"GS\")) FILTER(CONTAINS(?rc, \"VNS\")) }}"
+        ));
+        assert_eq!(
+            plan.matches("values").count(),
+            2,
+            "both regions are evaluated:\n{plan}"
+        );
+        let statement = plan_for(&format!(
+            "SELECT ?s WHERE {{ \
+             ?s a asset360:Signal ; asset360:signalType ?t ; asset360:regime ?r . \
+             GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:notation ?tc }} \
+             GRAPH <{SCHEMA_GRAPH}> {{ ?r skos:notation ?rc }} \
+             FILTER(CONTAINS(?tc, \"GS\")) FILTER(CONTAINS(?rc, \"VNS\")) }}"
+        ));
+        assert!(statement.contains("signalType = 'GSA'"), "{statement}");
+        assert!(statement.contains("regime = 'VNS'"), "{statement}");
+    }
+
+    /// A materialisation over a subplan that reads nothing at all. Deliberately
+    /// trivial: the point is that a criterion and a dataset are the whole of a
+    /// pass.
+    #[derive(Default)]
+    struct ReadsNothing {
+        store: OnceCell<Option<Store>>,
+    }
+
+    impl Materialisation for ReadsNothing {
+        fn name(&self) -> &'static str {
+            "reads_nothing"
+        }
+
+        fn qualifies(&self, plan: &Plan, node: NodeId) -> bool {
+            fn walk(plan: &Plan, node: NodeId) -> bool {
+                match &plan.nodes[node].op {
+                    PlanOp::Values { .. } | PlanOp::Unit => true,
+                    PlanOp::Match { .. }
+                    | PlanOp::Path { .. }
+                    | PlanOp::Graph { .. }
+                    | PlanOp::Service { .. }
+                    | PlanOp::Scan { .. }
+                    | PlanOp::Unnest { .. } => false,
+                    other => other.inputs().iter().all(|input| walk(plan, *input)),
+                }
+            }
+            walk(plan, node) && no_free_variables(plan, node)
+        }
+
+        fn dataset(&self) -> Option<&Store> {
+            // An empty store: "nothing to read" is a dataset, not a refusal.
+            self.store.get_or_init(|| Store::new().ok()).as_ref()
+        }
     }
 
     /// A `GRAPH` naming a variable is the schema graph, because this endpoint
