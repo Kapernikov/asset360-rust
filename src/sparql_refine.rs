@@ -561,7 +561,7 @@ impl Expr {
     /// when the constant is the term the column's values render as -- and
     /// deciding that needs the schema, which an expression does not have.
     /// [`Expr::to_sql`] is the public entry and asks both halves. See
-    /// [`constant_is_the_columns_term`] for what the second half prevents.
+    /// [`stored_texts_equal_to`] for what the second half prevents.
     ///
     /// Partial in two directions, and both are the point:
     ///
@@ -1352,11 +1352,6 @@ fn function_expression(name: &str, mut args: Vec<Expression>) -> Option<Expressi
 /// than invent one: the answer is "no records", which SQL cannot state as a
 /// comparison. Never `Some(vec![])` -- an empty membership is the same
 /// unsayable thing, so the empty case comes back as `None`.
-///
-/// This replaced a `constant_is_the_columns_term` that asked only the yes/no
-/// half and answered `false` for every enum, with a comment saying the
-/// translation "is a rule of its own". It is not a rule. It is how a constant
-/// renders against a column, and every other form already went through here.
 pub(crate) fn stored_texts_equal_to(
     schema: &SchemaView,
     class_uri: &str,

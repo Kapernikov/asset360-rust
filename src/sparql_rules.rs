@@ -1513,7 +1513,8 @@ fn fold_into_scan(
 ///   cardinality-preserving. Rendering it as an equality on the column would
 ///   compare the array's text and match nothing.
 /// * **The constant is the term the column's values render as.** See
-///   [`constant_is_the_columns_term`]. Without it this rule would be the one
+///   [`crate::sparql_refine::stored_texts_equal_to`]. Without it this rule
+///   would be the one
 ///   that turns "no record renders as `eul:GSA`" into "no rows", which is a
 ///   different answer rather than a narrower fetch.
 pub struct ConstantObjectBecomesFilter<'s> {
@@ -2306,7 +2307,8 @@ fn ground_term(ground: &GroundTerm) -> Term {
 ///   binds, which is 28d's lesson twice over: the rule could not be written
 ///   safely because the representation was missing a fact.
 /// * **The constant is the term the column's values render as.** See
-///   [`constant_is_the_columns_term`]: the pushed-conditions-only-narrow
+///   [`crate::sparql_refine::stored_texts_equal_to`]: the
+///   pushed-conditions-only-narrow
 ///   argument fails for a constant no stored value spells.
 /// * **The landing site runs in SQL.** The frontier is a cut, so a filter over
 ///   an engine node cannot be `Sql` however well it renders.
@@ -3695,7 +3697,7 @@ fn scan_of_star(plan: &Plan, star: &str) -> Option<NodeId> {
 /// leg re-runs the whole query, so a node below the first row-collapsing
 /// operator only ever narrows what SQL hands over -- provided the condition it
 /// applies is the query's own, which is the one place these rules are stricter
-/// than that argument (see [`constant_is_the_columns_term`]).
+/// than that argument (see [`crate::sparql_refine::stored_texts_equal_to`]).
 ///
 /// The order is a preference and not a requirement: each rule is monotone --
 /// three of them remove a `match`, two turn an `Engine` node `Sql`, one adds a
@@ -3761,7 +3763,7 @@ pub fn tier_one_rules<'a>(
 /// The textbook semi-join reduction, and it is what turns an evaluated schema
 /// subplan into a narrower fetch -- but nothing here knows that. It applies to
 /// any [`PlanOp::Values`], however it got there: one the client wrote, one
-/// `evaluate_schema_subplan` produced, one a future rule materialises.
+/// a materialisation pass produced, one a future rule materialises.
 ///
 /// **Why this adds a condition rather than replacing the node**, unlike
 /// [`ValuesBecomesFilter`]. That rule fires when the `VALUES` binds only a
@@ -3815,9 +3817,9 @@ impl Rule for ValuesNarrowTheJoinedScan<'_> {
                 // A one-column relation is [`ValuesBecomesFilter`]'s, whether
                 // it fires or declines: that rule *replaces* the node, and a
                 // constraint derived here first would leave the same condition
-                // twice -- which showed up as the fixpoint depending on the
-                // rule order. This rule exists for the relations that must
-                // stay, because they bind something the other side does not.
+                // twice, and the fixpoint would depend on the rule order. This
+                // rule exists for the relations that must stay, because they
+                // bind something the other side does not.
                 if variables.len() < 2 {
                     continue;
                 }
@@ -3980,8 +3982,8 @@ fn insert_filter_above(plan: &mut Plan, side: NodeId, consumer: NodeId, conditio
 ///
 /// **Only onto an evaluable side**, and that restriction is deliberate rather
 /// than timid. The move is sound onto *any* side that binds the variables — it
-/// is a local equivalence — but applying it everywhere made the fixpoint depend
-/// on the rule order: a filter moved onto a side another rule was still folding
+/// is a local equivalence — but applying it everywhere makes the fixpoint
+/// depend on the rule order: a filter moved onto a side another rule is still folding
 /// (a `match` about to become a scan, a join about to become a reference join)
 /// takes that side out of the other rule's reach, and the statement loses a
 /// condition it would have taken. On a side that is *closed* — one
@@ -4046,8 +4048,8 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for SinkFilterIntoAnEva
             // A filter the statement can already take must not move: sinking
             // it onto one side of the join puts it between a `match` and its
             // consumer, which stops that match folding into the scan, and the
-            // condition the statement was about to take is lost. That showed
-            // up as the fixpoint depending on the rule order -- the one thing
+            // condition the statement was about to take is lost -- and the
+            // fixpoint then depends on the rule order, which is the one thing
             // `the_rule_order_does_not_decide_the_fixpoint` exists to catch.
             if let Some(base) = landing_site(plan, id)
                 && rendered_condition(self.schema, &condition, &Visible::below(plan, base))
@@ -4061,7 +4063,7 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for SinkFilterIntoAnEva
             // patterns is `Join(Join(a, b), c)`, and a filter over `b` has two
             // levels to travel.
             for (side, join) in join_sides(plan, below) {
-                if !self.pass.qualifies(plan, side) {
+                if !crate::sparql_materialise::is_an_evaluable_region(plan, side, &self.pass) {
                     continue;
                 }
                 let bound = plan.variables_of(side);
@@ -4224,7 +4226,9 @@ mod tests {
     use crate::sparql_refine::naive_plan_of;
     use crate::sparql_scoper::tests::test_schema_view;
 
-    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+         PREFIX skos: <http://www.w3.org/2004/02/skos/core#> ";
 
     fn plan_of(query: &str) -> Plan {
         naive_plan_of(&format!("{PREFIX}{query}")).expect("should build a naive plan")
@@ -6368,6 +6372,81 @@ mod tests {
          asset360:name ?nm . FILTER(?nm > \"A\") }",
         "DESCRIBE ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . \
          FILTER(?len >= 10) }",
+        // A relation of *two* columns, which is the only shape
+        // `values_narrow_the_joined_scan` has anything to do: a one-column
+        // `VALUES` is folded away by `values_becomes_filter` before it gets
+        // there, so without this the rule is in neither cross-rule test.
+        "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+         VALUES (?s ?nm) { (\"u\" \"a\") (\"v\" \"b\") } }",
+    ];
+
+    /// The graph the fixture's datamodel is served in, for the corpus runs
+    /// that configure one.
+    #[cfg(feature = "sparql-endpoint")]
+    const CORPUS_SCHEMA_GRAPH: &str = "https://data.infrabel.be/asset360/schema";
+
+    /// The queries that reach the two rules a schema graph adds. `CORPUS`
+    /// cannot: with no `GRAPH` node naming the schema graph, no subplan
+    /// qualifies, so `sink_filter_into_an_evaluable_side` and the
+    /// materialisation pass never fire on any of it.
+    ///
+    /// Every cross-rule test below is run again over `CORPUS` *and* these,
+    /// with the schema graph configured — which is the only run in which
+    /// those two rules exist at all.
+    #[cfg(feature = "sparql-endpoint")]
+    const SCHEMA_CORPUS: &[&str] = &[
+        // The shape of asset360 GitLab issue #409: the only selective
+        // predicate is on the schema side.
+        "SELECT ?s ?code WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k skos:notation ?code } \
+         FILTER(CONTAINS(?code, \"S\")) }",
+        // The same, by label, and with the filter written before the graph.
+        "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+         FILTER(STRSTARTS(?l, \"K\")) \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k rdfs:label ?l } }",
+        // Two triples joined *inside* the schema graph, with no filter at all.
+        "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { \
+         ?k skos:inScheme ?scheme . ?scheme rdfs:label ?sl } }",
+        // A variable graph, which this dataset can only bind to the schema.
+        "SELECT ?s ?g WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+         GRAPH ?g { ?k skos:notation ?code } FILTER(CONTAINS(?code, \"S\")) }",
+        // Under an `OPTIONAL`: evaluated, and narrowing nothing.
+        "SELECT ?s ?code WHERE { ?s a asset360:Signal . \
+         OPTIONAL { ?s asset360:kind ?k . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k skos:notation ?code } \
+         FILTER(CONTAINS(?code, \"S\")) } }",
+        // In one arm of a `UNION`, with the other arm untouched.
+        "SELECT ?s WHERE { { ?s a asset360:Signal ; asset360:kind ?k . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k skos:notation ?code } \
+         FILTER(CONTAINS(?code, \"S\")) } UNION { ?s a asset360:BaliseGroup } }",
+        // Two regions that qualify independently.
+        "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind ?k ; \
+         asset360:ambiguousKind ?a . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k skos:notation ?kc } \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?a skos:notation ?ac } \
+         FILTER(CONTAINS(?kc, \"S\")) FILTER(CONTAINS(?ac, \"AMB\")) }",
+        // A filter the sink rule can never deliver: it is outside the
+        // `OPTIONAL` the region sits in.
+        "SELECT ?s ?code WHERE { ?s a asset360:Signal . \
+         OPTIONAL { ?s asset360:kind ?k . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k skos:notation ?code } } \
+         FILTER(CONTAINS(?code, \"S\")) }",
+        // A filter that reads the instance side: the region is not closed,
+        // and nothing may be evaluated.
+        "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind ?k ; \
+         asset360:name ?nm . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k skos:notation ?code } \
+         FILTER(CONTAINS(?code, ?nm)) }",
+        // A schema region under an aggregate, and one under a sub-select.
+        "SELECT ?code (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+         asset360:kind ?k . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k skos:notation ?code } } \
+         GROUP BY ?code",
+        "SELECT ?s WHERE { { SELECT ?s ?code WHERE { ?s a asset360:Signal ; \
+         asset360:kind ?k . \
+         GRAPH <https://data.infrabel.be/asset360/schema> { ?k skos:notation ?code } \
+         FILTER(CONTAINS(?code, \"S\")) } LIMIT 3 } }",
     ];
 
     /// The whole rule set, applied to fixpoint in a given order.
@@ -6376,6 +6455,21 @@ mod tests {
     /// not the same plan: spargebra names the internal variable of
     /// `(COUNT(*) AS ?n)` freshly each time, so comparing two plans built from
     /// two parses compares those names as well.
+    /// The same, with a schema graph configured — so the rule set includes the
+    /// sink rule and the materialisation pass, which `tier_one_rules(_, None)`
+    /// leaves out entirely.
+    #[cfg(feature = "sparql-endpoint")]
+    fn refine_naive_with_schema_graph(naive: &Plan, schema: &SchemaView, reverse: bool) -> Plan {
+        let mut rules = tier_one_rules(schema, Some(CORPUS_SCHEMA_GRAPH));
+        if reverse {
+            rules.reverse();
+        }
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let mut plan = naive.clone();
+        refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}"));
+        plan
+    }
+
     fn refine_naive(naive: &Plan, schema: &SchemaView, reverse: bool) -> Plan {
         let mut rules = tier_one_rules(schema, None);
         if reverse {
@@ -7486,6 +7580,91 @@ mod tests {
                 backwards.to_string(),
                 "the rule order decided the plan for {query}"
             );
+        }
+    }
+
+    /// The same, over the rule set a deployment with a schema graph runs.
+    ///
+    /// Its own test rather than a parameter on the one above, because it is
+    /// the only run in which `sink_filter_into_an_evaluable_side` and the
+    /// materialisation pass exist at all — and both were found breaking an
+    /// invariant under an order nothing was running.
+    #[cfg(feature = "sparql-endpoint")]
+    #[test]
+    fn the_rule_order_does_not_decide_the_fixpoint_with_a_schema_graph() {
+        let schema = test_schema_view();
+        for query in CORPUS.iter().chain(SCHEMA_CORPUS.iter()) {
+            let naive = plan_of(query);
+            let forwards = refine_naive_with_schema_graph(&naive, &schema, false);
+            let backwards = refine_naive_with_schema_graph(&naive, &schema, true);
+            assert_eq!(
+                forwards.to_string(),
+                backwards.to_string(),
+                "the rule order decided the plan for {query}"
+            );
+        }
+    }
+
+    /// Every invariant after every application, over the schema-graph rule
+    /// set. The materialisation rule inserting a node above an engine subtree
+    /// broke `frontier_is_a_cut`, and this is the run that says so.
+    #[cfg(feature = "sparql-endpoint")]
+    #[test]
+    fn every_invariant_holds_after_every_application_with_a_schema_graph() {
+        let schema = test_schema_view();
+        let rules = tier_one_rules(&schema, Some(CORPUS_SCHEMA_GRAPH));
+        for query in CORPUS.iter().chain(SCHEMA_CORPUS.iter()) {
+            let mut plan = plan_of(query);
+            plan.check()
+                .unwrap_or_else(|defect| panic!("naive: {defect} for {query}\n{plan}"));
+            let mut applications = 0;
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for rule in &rules {
+                    if rule.apply(&mut plan) {
+                        changed = true;
+                        applications += 1;
+                        plan.check().unwrap_or_else(|defect| {
+                            panic!(
+                                "{}, application {applications}: {defect} for {query}\n{plan}",
+                                rule.name()
+                            )
+                        });
+                        assert!(applications < 32, "no fixpoint for {query}\n{plan}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The schema-graph corpus must actually reach the two rules it exists
+    /// for: a corpus that silently stopped exercising them would keep passing.
+    #[cfg(feature = "sparql-endpoint")]
+    #[test]
+    fn the_schema_corpus_reaches_both_schema_graph_rules() {
+        let schema = test_schema_view();
+        let rules = tier_one_rules(&schema, Some(CORPUS_SCHEMA_GRAPH));
+        let mut fired: std::collections::BTreeSet<&str> = Default::default();
+        for query in CORPUS.iter().chain(SCHEMA_CORPUS.iter()) {
+            let mut plan = plan_of(query);
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for rule in &rules {
+                    if rule.apply(&mut plan) {
+                        changed = true;
+                        fired.insert(rule.name());
+                    }
+                }
+            }
+        }
+        for name in [
+            "sink_filter_into_an_evaluable_side",
+            "schema_graph",
+            "values_narrow_the_joined_scan",
+        ] {
+            assert!(fired.contains(name), "{name} never fired: {fired:?}");
         }
     }
 

@@ -1,25 +1,24 @@
 //! **Materialisation**: evaluating a subplan now, and replacing it in the plan
 //! with the relation it denotes.
 //!
-//! # The shape
+//! # What a pass is
 //!
 //! A *materialisation pass* is two things and nothing else:
 //!
 //! * a **criterion** — which subplans this pass can evaluate;
 //! * a **dataset** — what it evaluates them against.
 //!
-//! Everything else is shared and lives here: finding the maximal subplan that
+//! Everything else is shared and lives here: the precondition every criterion
+//! shares ([`is_an_evaluable_region`]), finding the maximal subplan that
 //! qualifies, writing it back as a query, running it, and swapping it into the
 //! plan as a [`PlanOp::Values`]. A pass supplies the two answers and inherits
 //! the rest, which is what makes a second pass an implementation of
 //! [`Materialisation`] rather than an edit to the first.
 //!
-//! [`SchemaGraphMaterialisation`] is the first instance, and the one asset360
-//! GitLab issue #409 is about. It is not the only shape there is: a subplan
-//! built only from `VALUES` blocks depends on no dataset at all and could be
-//! materialised the same way, and `a_second_pass_needs_no_edit_to_the_first`
-//! exercises exactly that — a second `Materialisation` defined entirely in the
-//! test module, running through the same rule, touching none of this.
+//! [`SchemaGraphMaterialisation`] is the first instance. It is not the only
+//! shape there is: a subplan built only from `VALUES` blocks depends on no
+//! dataset at all and can be materialised the same way, which is what
+//! `a_second_pass_needs_no_edit_to_the_first` runs.
 //!
 //! # `PlanOp::Values` is the interface
 //!
@@ -28,19 +27,14 @@
 //! that turn a relation into a narrower fetch — `values_becomes_filter` and
 //! `values_narrow_the_joined_scan` — consume a `Values` whether the client
 //! wrote it, the schema produced it, or a pass nobody has written yet did.
-//! Those rules are the "variable resolver" half, and they are general because
-//! the thing they consume is.
 //!
 //! # It is a fixpoint, not a pipeline
 //!
-//! Materialising is not a step that runs once before resolving. A pass is an
-//! ordinary rule in [`crate::sparql_rules::refine`]'s loop, so:
-//!
-//! * a materialisation can **enable another one**. Replacing a subplan with a
-//!   `Values` makes it read nothing, so a *larger* region around it can become
-//!   closed and qualify in the next round;
-//! * a resolution can enable a materialisation, and the other way round, for
-//!   the same reason.
+//! A pass is an ordinary rule in [`crate::sparql_rules::refine`]'s loop, so a
+//! materialisation can **enable another one** — replacing a subplan with a
+//! `Values` makes it read nothing, so a larger region around it can become
+//! closed and qualify in the next round — and a resolution can enable a
+//! materialisation, and the other way round.
 //!
 //! **Termination.** Each materialisation replaces a subtree of *n* nodes with
 //! one, and never fires on a node that is already a `Values`, so it can happen
@@ -52,36 +46,28 @@
 //! **Order does not matter.** Two subplans that qualify independently are
 //! disjoint — [`subtree_is_private`] is what says so — and replacing a subplan
 //! by the relation it denotes is an equivalence, so doing either first leaves
-//! the same plan. `two_independent_regions_are_both_materialised` asserts that
-//! both happen; that the order between them is immaterial is the equivalence,
-//! not a separate mechanism.
+//! the same plan.
 //!
-//! **What a cascade needs, stated honestly.** The loop *permits* one pass to
-//! enable another, and that is worth having for free rather than sequencing by
-//! hand. It is not reachable with the two criteria that exist today: both treat
-//! a `Values` as reading nothing, so a region containing a materialised one
-//! already qualified before it was materialised. A pass with a narrower
-//! criterion — one that does not look through a relation — would cascade, and
-//! nothing would have to change here for it to.
+//! **A cascade is permitted, not reachable.** Both criteria that exist today
+//! treat a `Values` as reading nothing, so a region containing a materialised
+//! one already qualified before it was materialised. A pass that does not look
+//! through a relation would cascade, and nothing here would change for it to.
 //!
 //! # Why the criterion is the pass's and the structure is not
 //!
 //! [`SchemaGraphMaterialisation`]'s criterion is:
 //!
-//! > **no dependency on anything outside the schema** — it reads only the
-//! > schema graph, and it binds every variable it names.
+//! > **it reads only the schema graph.**
 //!
 //! A property computed on the plan, not a list of query shapes: a shape nobody
 //! has thought of yet either satisfies it or does not, and no code is written
 //! either way. A different pass has a different criterion and the same
 //! machinery; what they share is the *shape* of the claim — **this subplan can
-//! be evaluated now** — which is what [`Materialisation::qualifies`] names.
+//! be evaluated now** — which is what [`Materialisation::qualifies`] names, and
+//! the conditions that hold of every pass, which [`is_an_evaluable_region`] and
+//! [`materialisable_root`] ask so that no criterion has to.
 //!
-//! # Why the schema case is worth it
-//!
-//! Since every permissible value of an enum became a concept IRI, the only way
-//! to ask "which signals have a type whose code contains `GS`" is to join the
-//! instance side to the datamodel:
+//! # The case it exists for
 //!
 //! ```sparql
 //! SELECT ?s ?code WHERE {
@@ -91,32 +77,25 @@
 //! }
 //! ```
 //!
-//! The only selective predicate lives on the schema side, so the scan has
-//! nothing to narrow with and the whole class is materialised — `Signal` is
-//! 23,503 objects on dev against a `MAX_RESULT_ROWS` of 10,000, so the query is
-//! refused outright. The schema graph is thousands of triples; evaluating the
-//! predicate over nine permissible values instead of 23,503 rows is the whole
-//! of the fix.
+//! The only selective predicate is on the schema side, so the scan has nothing
+//! to narrow with and the whole class is fetched — past `MAX_RESULT_ROWS`, so
+//! the query is refused. Evaluating the predicate over the enum's permissible
+//! values instead gives the scan a condition. See doc 28g for the rest.
 //!
-//! # Three things follow from replacement, and they are why this is a plan pass
+//! # Two things follow from replacement
 //!
 //! **Replacement is context-free.** Substituting a subplan by the relation it
 //! denotes is an equivalence under SPARQL's bottom-up semantics, and an
 //! equivalence holds wherever the subplan sits: under an `OPTIONAL`, inside a
 //! `MINUS`, inside `NOT EXISTS`, in one arm of a `UNION`. None of those is a
-//! case anything here handles, because none of them is a case. An earlier
-//! attempt injected a `VALUES` *beside* the schema pattern, which is sound only
-//! when the pattern is in required position — and that precondition is exactly
-//! what forces a catalogue of shapes to be enumerated and excluded.
+//! case anything here handles, because none of them is a case.
 //!
 //! **A correlated variable is not a dependency.** The subplan above mentions
 //! `?t`, which the instance side also binds. Bottom-up, that is not a
 //! dependency: the subplan is evaluated on its own and joined afterwards. So
 //! evaluating it standalone and replacing it with *all* of its solutions is
-//! exactly correct, and the join is what narrows.
-//!
-//! **A free variable is.** A `FILTER` naming a variable nothing below it binds
-//! depends on whatever does bind it — see [`no_free_variables`].
+//! exactly correct, and the join is what narrows. A *free* variable is a
+//! dependency, and that is [`no_free_variables`]'s.
 //!
 //! # What is genuinely out, and why none of it is a query shape
 //!
@@ -229,18 +208,19 @@ pub fn schema_only(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
                 .all(|input| walk(plan, *input, in_schema_graph, iri)),
         }
     }
-    walk(plan, node, false, schema_graph_iri) && no_free_variables(plan, node)
+    walk(plan, node, false, schema_graph_iri)
 }
 
 /// Whether every variable the subplan *uses* is one it also binds.
 ///
-/// The second half of "no dependency on anything outside the schema", and the
-/// half that is about values rather than about reads. A `FILTER` naming a
-/// variable nothing below it binds is a dependency on whatever does bind it —
+/// **Every pass's, not this one's**, which is why it is asked in
+/// [`is_an_evaluable_region`] rather than inside a criterion. A `FILTER` naming
+/// a variable nothing below it binds is a dependency on whatever does bind it —
 /// evaluating the subplan on its own would evaluate that filter against an
 /// unbound variable, which in SPARQL is an error, which excludes the solution.
 /// The relation would come back empty and the plan would answer nothing for a
-/// query that has an answer.
+/// query that has an answer. That argument mentions no criterion, so no
+/// criterion should have to restate it.
 ///
 /// Checked per node rather than per subplan: a node's expressions may only name
 /// what its own inputs bind, which is the same statement one level at a time.
@@ -340,6 +320,21 @@ fn names_the_schema_graph(name: &str, schema_graph_iri: &str) -> bool {
     name.starts_with('?') || name == format!("<{schema_graph_iri}>")
 }
 
+/// **Whether this subplan is a region `pass` can evaluate.**
+///
+/// The pass's [`Materialisation::qualifies`] *and* the precondition every
+/// criterion shares: no free variable. Anything asking "can this pass evaluate
+/// that subplan" asks this and not `qualifies` directly — the search here, and
+/// `sink_filter_into_an_evaluable_side`, which is outside this module.
+///
+/// This is what makes the "a pass is a criterion and a dataset" claim true
+/// outside this file: a criterion written elsewhere states what its pass reads
+/// and nothing else, because everything that is true of *every* pass is asked
+/// here.
+pub fn is_an_evaluable_region(plan: &Plan, node: NodeId, pass: &dyn Materialisation) -> bool {
+    pass.qualifies(plan, node) && no_free_variables(plan, node)
+}
+
 /// The root of a maximal subplan this pass can evaluate, if there is one.
 ///
 /// *Maximal* because a subplan's consumer, if it also qualifies, is a bigger
@@ -356,7 +351,7 @@ pub fn materialisable_root(plan: &Plan, pass: &dyn Materialisation) -> Option<No
     (0..plan.nodes.len()).rev().find(|&node| {
         !matches!(plan.nodes[node].op, PlanOp::Values { .. })
             && plan.nodes[node].output == crate::sparql_refine::OutputKind::Solutions
-            && pass.qualifies(plan, node)
+            && is_an_evaluable_region(plan, node, pass)
             && is_the_top_of_its_region(plan, node, pass)
             && subtree_is_private(plan, node)
             && nothing_is_still_sinking_into_it(plan, node)
@@ -374,6 +369,17 @@ pub fn materialisable_root(plan: &Plan, pass: &dyn Materialisation) -> Option<No
 /// Both rules live in the same fixpoint and there is no ordering between them
 /// to rely on, so this is asked of the plan rather than of the rule set: wait
 /// while a filter that could still land here has not.
+///
+/// **"Could still" is the load-bearing word.** The gate asks whether the sink
+/// rule can still move the filter here, not merely whether such a filter
+/// exists — a filter separated from the region by a `LeftJoin`, a `Union` arm
+/// or a `Minus` will never sink through it, and waiting for it would block the
+/// region for the life of the plan. See
+/// `a_filter_that_can_never_sink_does_not_block_the_region`: the worst that
+/// costs is a region materialised without its predicate,
+/// which is a relation that narrows nothing — a missed optimisation, never a
+/// wrong answer and never a hang, since a blocked region simply leaves the plan
+/// as it was and the fixpoint is reached regardless.
 fn nothing_is_still_sinking_into_it(plan: &Plan, node: NodeId) -> bool {
     let bound = plan.variables_of(node);
     let inside = subtree(plan, node);
@@ -387,18 +393,49 @@ fn nothing_is_still_sinking_into_it(plan: &Plan, node: NodeId) -> bool {
             return false;
         }
         let used = crate::sparql_refine::variables_used(condition);
-        !used.is_empty() && used.iter().all(|name| bound.contains(name))
+        !used.is_empty()
+            && used.iter().all(|name| bound.contains(name))
+            && can_still_sink_into(plan, id, node)
     })
+}
+
+/// Whether `sink_filter_into_an_evaluable_side` still has a route from this
+/// filter into this region.
+///
+/// The same route that rule takes, asked of the plan: commute down past the
+/// other filters of the group, require a `Join`, and descend the tree of inner
+/// joins. Anything else between the two — a `LeftJoin`, a `Union` arm, a
+/// `Minus` — is a barrier the sink refuses to cross, so a filter behind one is
+/// not on its way anywhere and this region is not waiting for it.
+fn can_still_sink_into(plan: &Plan, filter: NodeId, node: NodeId) -> bool {
+    let PlanOp::Filter { input, .. } = plan.nodes[filter].op else {
+        return false;
+    };
+    let mut below = input;
+    while let PlanOp::Filter { input: next, .. } = plan.nodes[below].op {
+        below = next;
+    }
+    let mut frontier = vec![below];
+    while let Some(current) = frontier.pop() {
+        let PlanOp::Join { left, right, .. } = plan.nodes[current].op else {
+            continue;
+        };
+        for side in [left, right] {
+            if side == node {
+                return true;
+            }
+            frontier.push(side);
+        }
+    }
+    false
 }
 
 /// Whether no consumer of this node also qualifies — i.e. this node is the top
 /// of its region.
 fn is_the_top_of_its_region(plan: &Plan, node: NodeId, pass: &dyn Materialisation) -> bool {
-    !plan
-        .nodes
-        .iter()
-        .enumerate()
-        .any(|(id, other)| other.op.inputs().contains(&node) && pass.qualifies(plan, id))
+    !plan.nodes.iter().enumerate().any(|(id, other)| {
+        other.op.inputs().contains(&node) && is_an_evaluable_region(plan, id, pass)
+    })
 }
 
 /// Whether every node below `root` feeds `root` and nothing else.
@@ -581,7 +618,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
         },
         // A scan or an unnest is never inside a schema-only subplan, and the
         // three query forms are roots whose output is not a relation — both
-        // are refused by `evaluable_root` before this is reached, and refused
+        // are refused by `materialisable_root` before this is reached, and refused
         // again here rather than approximated.
         PlanOp::Service { .. }
         | PlanOp::Scan { .. }
@@ -859,10 +896,9 @@ mod tests {
         );
     }
 
-    /// The shapes the previous design had to exclude one by one, and which the
-    /// criterion does not distinguish at all: replacing a subplan by the
-    /// relation it denotes is an equivalence, so it holds wherever the subplan
-    /// sits.
+    /// A region in each of the positions a subplan can sit in, none of which
+    /// the criterion distinguishes: replacing a subplan by the relation it
+    /// denotes is an equivalence, so it holds wherever the subplan sits.
     ///
     /// Each of these is asserted on the *answer-preserving* side rather than on
     /// the narrowing: under an `OPTIONAL` the narrowing must **not** reach the
@@ -996,7 +1032,10 @@ mod tests {
                     other => other.inputs().iter().all(|input| walk(plan, *input)),
                 }
             }
-            walk(plan, node) && no_free_variables(plan, node)
+            // No `no_free_variables` here, and that is the point: a pass
+            // states what it reads, and the precondition every pass shares is
+            // `is_an_evaluable_region`'s.
+            walk(plan, node)
         }
 
         fn dataset(&self) -> Option<&Store> {
@@ -1005,19 +1044,48 @@ mod tests {
         }
     }
 
+    /// A filter the sink rule will never move must not block the region for
+    /// the life of the plan.
+    ///
+    /// The `FILTER` is outside the `OPTIONAL` and the region is inside it, so
+    /// `sink_filter_into_an_evaluable_side` — which refuses to sink through a
+    /// `LeftJoin` — can never deliver it. The gate asks whether the filter
+    /// *can still sink*, not whether one exists, so the region is evaluated
+    /// anyway. What that costs is the predicate: the relation is every
+    /// permissible value rather than the matching ones, so it narrows nothing
+    /// and the engine applies the filter as it did before. A missed
+    /// optimisation, and the answer is the same either way.
+    #[test]
+    fn a_filter_that_can_never_sink_does_not_block_the_region() {
+        let plan = refined_for(&format!(
+            "SELECT ?s ?code WHERE {{ \
+             ?s a asset360:Signal . \
+             OPTIONAL {{ ?s asset360:signalType ?t . \
+             GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:notation ?code }} }} \
+             FILTER(CONTAINS(?code, \"GS\")) }}"
+        ));
+        assert!(
+            plan.contains("values    ?code ?t"),
+            "the region is evaluated rather than waiting forever:\n{plan}"
+        );
+        assert!(
+            plan.contains("CONTAINS(?code"),
+            "and the filter it never received is still applied:\n{plan}"
+        );
+    }
+
     /// A `GRAPH` naming a variable is the schema graph, because this endpoint
     /// serves exactly one named graph -- and the probe binds `?g` to it rather
     /// than assuming nobody looks.
     #[test]
     fn a_graph_naming_a_variable_is_the_schema_graph() {
-        let plan = plan_for(&format!(
-            "SELECT ?s ?g WHERE {{ \
+        let plan = plan_for(
+            "SELECT ?s ?g WHERE { \
              ?s a asset360:Signal ; asset360:signalType ?t . \
-             GRAPH ?g {{ ?t skos:notation ?code }} \
-             FILTER(CONTAINS(?code, \"GS\")) }}"
-        ));
+             GRAPH ?g { ?t skos:notation ?code } \
+             FILTER(CONTAINS(?code, \"GS\")) }",
+        );
         assert!(plan.contains("signalType = 'GSA'"), "{plan}");
-        let _ = SCHEMA_GRAPH;
     }
 
     /// The dataset invariant the case above rests on, asserted rather than
