@@ -204,6 +204,12 @@ inexact_variants! {
     /// (`:kinds "p" ; :kinds ?x`): two independent reads of the same values,
     /// which the plan collapses into one filtered read.
     ConstantAndVariableOnSlot,
+    /// A `UNION`. The plan holds the stars of every branch, so the fetch
+    /// covers all of them, but no branch's constraints hold of the query's
+    /// answers as a whole: one branch's `FILTER` does not narrow the other's
+    /// rows, and the plan carries no way to say which star belongs to which
+    /// branch.
+    UnionBranch,
 }
 
 impl Inexact {
@@ -231,6 +237,7 @@ impl Inexact {
             Self::TypedNestedStructure => "typed_nested_structure",
             Self::ValuesTuple => "values_tuple",
             Self::ConstantAndVariableOnSlot => "constant_and_variable_on_slot",
+            Self::UnionBranch => "union_branch",
         }
     }
 
@@ -320,6 +327,11 @@ impl Inexact {
                  variable, which pairs its values with each other; the plan \
                  describes a single filtered read"
             }
+            Self::UnionBranch => {
+                "the query is a UNION, and the plan is the union of its \
+                 branches' fetches — wide enough to answer, but it does not \
+                 say which branch a constraint belongs to"
+            }
         }
     }
 
@@ -395,6 +407,11 @@ impl Inexact {
             Self::ConstantAndVariableOnSlot => {
                 "Read the slot once — drop the constant and filter the \
                  variable instead."
+            }
+            Self::UnionBranch => {
+                "Nothing: a UNION is answered from the branches' combined \
+                 fetch. Issue each branch as its own query if you need the \
+                 narrower fetch each one allows."
             }
         }
     }
@@ -1176,6 +1193,14 @@ pub fn scope_parsed_with_schema_graph(
         Query::Describe { pattern, .. } => pattern,
         Query::Ask { pattern, .. } => pattern,
     };
+
+    // A `UNION` is scoped one branch at a time and the fetches merged: a
+    // star holds one class, so two arms typing one variable differently
+    // cannot share one. See `union_branches` for why distributing is sound
+    // for a *fetch* even though it is not a rewrite of the query.
+    if let Some(branches) = union_branches(pattern)? {
+        return scope_union(query, &branches, schema_view, schema_graph_iri);
+    }
 
     // Phase 0: Depth-tag every BGP triple, rejecting unsupported
     // constructs along the way (UNION, MINUS, property paths).
@@ -2232,6 +2257,421 @@ fn resolve_star_class(
     }
 }
 
+/// How many branches a `UNION` query may be scoped as before it is refused.
+///
+/// Branches multiply: `n` nested unions are `2^n` conjunctive queries, and
+/// each one is scoped in full. Sixteen is four nested unions, which is more
+/// than any configuration writes and small enough that the planning cost stays
+/// invisible. A query past it is refused by name rather than planned slowly.
+const MAX_UNION_BRANCHES: usize = 16;
+
+/// The conjunctive queries a `UNION` query is the union of, or `None` when
+/// there is no `UNION` in it.
+///
+/// **Why the star decomposition cannot just walk a `UNION` in place.** Stars
+/// are keyed by subject variable, and a star holds one class. Two arms typing
+/// the same variable differently -- `{ ?s a :Signal } UNION { ?s a :Track }`,
+/// which is the shape the construct exists for -- would collapse into one
+/// star: the plan would fetch Signals, the engine would find no Track to
+/// answer the second arm with, and the query would come back short with no
+/// error. `Inexact::RepeatedType` records that collapse, and recording it is
+/// not enough, because an inexact plan still *fetches* what it says.
+///
+/// So the union is distributed out instead. Each branch is a conjunctive
+/// query the existing decomposition already handles, and the fetch is the
+/// union of the branches' fetches -- which covers every record any branch
+/// could need, because every triple of the query appears in at least one
+/// branch. Distribution is not a semantics-preserving rewrite of the *query*
+/// (the engine still runs the original), and it does not have to be: it is
+/// only ever asked which records to load.
+///
+/// The arms are distributed over every binary node, including the ones this
+/// endpoint refuses further down (`MINUS`, `LATERAL`). Refusing them stays the
+/// refusal's job; duplicating it here would be two places to keep in step.
+fn union_branches(pattern: &GraphPattern) -> Result<Option<Vec<GraphPattern>>, ScopeError> {
+    if !contains_union(pattern) {
+        return Ok(None);
+    }
+    let branches = distribute_unions(pattern)?;
+    Ok(Some(branches))
+}
+
+/// Whether a `UNION` appears anywhere in the pattern.
+fn contains_union(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Union { .. } => true,
+        GraphPattern::Join { left, right }
+        | GraphPattern::Lateral { left, right }
+        | GraphPattern::Minus { left, right }
+        | GraphPattern::LeftJoin { left, right, .. } => {
+            contains_union(left) || contains_union(right)
+        }
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Group { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Service { inner, .. } => contains_union(inner),
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
+    }
+}
+
+/// The pattern rewritten as a list of union-free patterns.
+///
+/// Exhaustive on `GraphPattern` with no `_` arm, for the reason
+/// [`tag_triples_by_depth`] is: a spargebra release that adds a variant must
+/// be a compile error here rather than a construct silently dropped from every
+/// branch.
+fn distribute_unions(pattern: &GraphPattern) -> Result<Vec<GraphPattern>, ScopeError> {
+    fn cap(branches: Vec<GraphPattern>) -> Result<Vec<GraphPattern>, ScopeError> {
+        if branches.len() > MAX_UNION_BRANCHES {
+            return Err(ScopeError::UnsupportedConstruct(format!(
+                "this query's UNIONs make {} branches to scope, past the {MAX_UNION_BRANCHES} \
+                 this endpoint plans; ask fewer alternatives, or issue them as separate queries",
+                branches.len()
+            )));
+        }
+        Ok(branches)
+    }
+
+    /// Both sides' branches, paired -- the cartesian product a binary node
+    /// over two unions is.
+    fn pair(
+        left: &GraphPattern,
+        right: &GraphPattern,
+        build: impl Fn(GraphPattern, GraphPattern) -> GraphPattern,
+    ) -> Result<Vec<GraphPattern>, ScopeError> {
+        let lefts = distribute_unions(left)?;
+        let rights = distribute_unions(right)?;
+        let mut out = Vec::with_capacity(lefts.len() * rights.len());
+        for l in &lefts {
+            for r in &rights {
+                out.push(build(l.clone(), r.clone()));
+            }
+        }
+        cap(out)
+    }
+
+    /// One unary node's branches: the inner pattern's, each rewrapped.
+    fn wrap(
+        inner: &GraphPattern,
+        build: impl Fn(GraphPattern) -> GraphPattern,
+    ) -> Result<Vec<GraphPattern>, ScopeError> {
+        Ok(distribute_unions(inner)?.into_iter().map(build).collect())
+    }
+
+    match pattern {
+        GraphPattern::Union { left, right } => {
+            let mut out = distribute_unions(left)?;
+            out.extend(distribute_unions(right)?);
+            cap(out)
+        }
+        GraphPattern::Join { left, right } => pair(left, right, |left, right| GraphPattern::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+        }),
+        GraphPattern::Lateral { left, right } => {
+            pair(left, right, |left, right| GraphPattern::Lateral {
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        GraphPattern::Minus { left, right } => {
+            pair(left, right, |left, right| GraphPattern::Minus {
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            let expression = expression.clone();
+            pair(left, right, move |left, right| GraphPattern::LeftJoin {
+                left: Box::new(left),
+                right: Box::new(right),
+                expression: expression.clone(),
+            })
+        }
+        GraphPattern::Filter { expr, inner } => wrap(inner, |inner| GraphPattern::Filter {
+            expr: expr.clone(),
+            inner: Box::new(inner),
+        }),
+        GraphPattern::Extend {
+            inner,
+            variable,
+            expression,
+        } => wrap(inner, |inner| GraphPattern::Extend {
+            inner: Box::new(inner),
+            variable: variable.clone(),
+            expression: expression.clone(),
+        }),
+        GraphPattern::OrderBy { inner, expression } => wrap(inner, |inner| GraphPattern::OrderBy {
+            inner: Box::new(inner),
+            expression: expression.clone(),
+        }),
+        GraphPattern::Project { inner, variables } => wrap(inner, |inner| GraphPattern::Project {
+            inner: Box::new(inner),
+            variables: variables.clone(),
+        }),
+        GraphPattern::Distinct { inner } => wrap(inner, |inner| GraphPattern::Distinct {
+            inner: Box::new(inner),
+        }),
+        GraphPattern::Reduced { inner } => wrap(inner, |inner| GraphPattern::Reduced {
+            inner: Box::new(inner),
+        }),
+        GraphPattern::Slice {
+            inner,
+            start,
+            length,
+        } => wrap(inner, |inner| GraphPattern::Slice {
+            inner: Box::new(inner),
+            start: *start,
+            length: *length,
+        }),
+        GraphPattern::Group {
+            inner,
+            variables,
+            aggregates,
+        } => wrap(inner, |inner| GraphPattern::Group {
+            inner: Box::new(inner),
+            variables: variables.clone(),
+            aggregates: aggregates.clone(),
+        }),
+        GraphPattern::Graph { inner, name } => wrap(inner, |inner| GraphPattern::Graph {
+            inner: Box::new(inner),
+            name: name.clone(),
+        }),
+        GraphPattern::Service {
+            inner,
+            name,
+            silent,
+        } => wrap(inner, |inner| GraphPattern::Service {
+            inner: Box::new(inner),
+            name: name.clone(),
+            silent: *silent,
+        }),
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
+            Ok(vec![pattern.clone()])
+        }
+    }
+}
+
+/// The same query with its pattern replaced, for scoping one branch.
+fn with_pattern(query: &Query, pattern: GraphPattern) -> Query {
+    match query {
+        Query::Select {
+            dataset, base_iri, ..
+        } => Query::Select {
+            dataset: dataset.clone(),
+            pattern,
+            base_iri: base_iri.clone(),
+        },
+        Query::Construct {
+            template,
+            dataset,
+            base_iri,
+            ..
+        } => Query::Construct {
+            template: template.clone(),
+            dataset: dataset.clone(),
+            pattern,
+            base_iri: base_iri.clone(),
+        },
+        Query::Describe {
+            dataset, base_iri, ..
+        } => Query::Describe {
+            dataset: dataset.clone(),
+            pattern,
+            base_iri: base_iri.clone(),
+        },
+        Query::Ask {
+            dataset, base_iri, ..
+        } => Query::Ask {
+            dataset: dataset.clone(),
+            pattern,
+            base_iri: base_iri.clone(),
+        },
+    }
+}
+
+/// Scope every branch of a `UNION` and merge the fetches.
+///
+/// The merged plan is one `Bgp` holding every branch's stars. Two stars from
+/// different branches are never joined -- a join edge only ever connects stars
+/// of the branch it came from -- so the consumer fetches each group
+/// independently and the engine sees the union of the records, which is what
+/// evaluating the original query over them needs.
+///
+/// **A branch that cannot be scoped fails the whole query.** Its records would
+/// simply never be fetched and that arm of the union would answer empty, which
+/// is the wrong answer rather than a slow one. The refusal the branch raised is
+/// the one the caller sees, because it names the actual problem -- an unscoped
+/// subject in the second arm reads as an unscoped subject.
+///
+/// **Nothing is claimed.** `unconsumed` lists every triple of the *whole*
+/// query, so the fetch narrows but the ledger credits the engine with
+/// enforcing everything. The branch triple lists are renumbered relative to
+/// their own branch and there is no honest mapping back onto the query's
+/// enumeration; claiming by index anyway would credit the statement with
+/// enforcing a constraint that belongs to another triple. See
+/// `sparql_plan::fetch_only`, which reads exactly this field.
+fn scope_union(
+    query: &Query,
+    branches: &[GraphPattern],
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+) -> Result<QueryPlan, ScopeError> {
+    let pattern = query_pattern(query);
+    let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
+    tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
+
+    let mut stars: Vec<Star> = Vec::new();
+    let mut joins: Vec<JoinEdge> = Vec::new();
+    let mut path_bindings: HashMap<String, PathBinding> = HashMap::new();
+    // A key that ignores the variable name: two branches that scope to the
+    // same fetch contribute one star, not two identical ones.
+    //
+    // **Only join-free stars are ever entered here**, and that restriction is
+    // the whole reason "no join edge crosses a branch boundary" is true rather
+    // than merely intended. A star that a branch joins is a star whose fetch
+    // the join *narrows*; share it with another branch and that branch's fetch
+    // is narrowed by a constraint its own arm never wrote. The shape that
+    // showed it:
+    //
+    // ```sparql
+    // { ?s a :TunnelComplex ; :hasName ?n }
+    // UNION
+    // { ?s a :CivilEngineeringAsset ; :belongsTo ?t . ?t a :TunnelComplex ; :hasName ?n }
+    // ```
+    //
+    // Both arms' `TunnelComplex` stars have the same shape, so `?t` deduplicated
+    // onto `?s` and the second arm's join edge was retargeted at the first arm's
+    // star. The statement then fetched only those tunnel complexes some civil
+    // engineering asset points at, and the first arm lost every other one —
+    // short answer, balanced ledger, no error. Exactly the failure the
+    // distribution exists to prevent, reintroduced by the optimisation.
+    //
+    // Keeping the key to join-free stars keeps the saving where it is safe (two
+    // arms scanning the same class is one scan) and gives it up where it is not.
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut taken: HashSet<String> = HashSet::new();
+
+    for branch in branches {
+        let branch_query = with_pattern(query, branch.clone());
+        let plan = scope_parsed_with_schema_graph(&branch_query, schema_view, schema_graph_iri)?;
+
+        // The stars this branch joins. Sharing one of them across branches is
+        // how a join edge would end up narrowing another branch's fetch — see
+        // `seen` above.
+        let joined: HashSet<String> = plan
+            .root
+            .all_joins()
+            .iter()
+            .flat_map(|join| [join.left.clone(), join.right.clone()])
+            .collect();
+
+        // Old name -> name in the merged plan, for this branch only.
+        let mut renamed: HashMap<String, String> = HashMap::new();
+        for star in plan.root.all_stars() {
+            let shareable = !joined.contains(&star.variable);
+            let shape = star_shape(star);
+            if shareable && let Some(existing) = seen.get(&shape) {
+                renamed.insert(star.variable.clone(), existing.clone());
+                continue;
+            }
+            let mut name = star.variable.clone();
+            let mut suffix = 1usize;
+            while taken.contains(&name) {
+                name = format!("{}__u{suffix}", star.variable);
+                suffix += 1;
+            }
+            taken.insert(name.clone());
+            if shareable {
+                seen.insert(shape, name.clone());
+            }
+            renamed.insert(star.variable.clone(), name.clone());
+            let mut star = star.clone();
+            star.variable = name;
+            stars.push(star);
+        }
+
+        for join in plan.root.all_joins() {
+            let (Some(left), Some(right)) = (renamed.get(&join.left), renamed.get(&join.right))
+            else {
+                // Unreachable: every join edge names two stars of the same
+                // plan, and every star of that plan was just renamed.
+                continue;
+            };
+            let mut join = join.clone();
+            join.left = left.clone();
+            join.right = right.clone();
+            joins.push(join);
+        }
+
+        // A path binding is a promise about one query variable, and two
+        // branches may bind the same variable through different records. The
+        // first branch to bind it wins and a disagreeing second one removes
+        // it: a consumer reading the wrong record's path gets a wrong value,
+        // where a missing binding only costs it the shortcut.
+        for (variable, binding) in &plan.path_bindings {
+            let Some(star_var) = renamed.get(&binding.star_var) else {
+                continue;
+            };
+            let mut binding = binding.clone();
+            binding.star_var = star_var.clone();
+            match path_bindings.get(variable) {
+                Some(existing) if *existing != binding => {
+                    path_bindings.remove(variable);
+                }
+                Some(_) => {}
+                None => {
+                    path_bindings.insert(variable.clone(), binding);
+                }
+            }
+        }
+    }
+
+    Ok(QueryPlan {
+        root: PlanNode::Bgp { stars, joins },
+        // Every triple, unclaimed. See this function's own doc comment.
+        unconsumed: (0..triples_with_depth.len()).collect(),
+        // A `LIMIT` bounds the query's answers, and a branch's fetch is not
+        // its answers: ten rows of one arm are not the ten the query asked
+        // for. Never pushed.
+        sql_limit: None,
+        path_bindings,
+        // The cause that matters most, and it holds of the whole plan rather
+        // than of one dropped triple: a branch's own cause, if it had one, is
+        // a fact about a pattern this plan no longer has a node for.
+        inexact: Some(Inexact::UnionBranch),
+    })
+}
+
+/// A star's fetch, as a string, so two branches that ask for the same records
+/// contribute one star. Name-free on purpose: the variable is what differs
+/// between an identical star in two branches.
+fn star_shape(star: &Star) -> String {
+    let mut star = star.clone();
+    star.variable = String::new();
+    format!("{star:?}")
+}
+
+/// The pattern of a query, whatever form it takes.
+fn query_pattern(query: &Query) -> &GraphPattern {
+    match query {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    }
+}
+
 /// Recursively walk the SPARQL algebra tree and collect every BGP
 /// triple pattern, tagged with the OPTIONAL nesting depth at which it
 /// occurs. `depth == 0` means the triple is in the mandatory part of
@@ -2326,9 +2766,26 @@ pub(crate) fn tag_triples_by_depth<'a>(
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Service { inner, .. } => tag_triples_by_depth(inner, depth, out),
         GraphPattern::Values { .. } => Ok(()),
-        GraphPattern::Union { .. } => Err(ScopeError::UnsupportedConstruct(
-            "UNION is not supported yet; issue separate queries and merge client-side".into(),
-        )),
+        // Both arms, left then right — the order
+        // `sparql_refine::Builder::pattern` walks them in, because the
+        // obligation list this produces is consumed positionally by the plan
+        // builder and the two must agree about which triple is which.
+        //
+        // `depth + 1` on both sides, for the same reason the right side of a
+        // `LeftJoin` gets it: a triple in one arm does not hold of an answer
+        // that came through the other, so it is not an existence check the
+        // fetch may apply. Depth is what the star decomposition reads that
+        // from, and the answer here is "not mandatory".
+        //
+        // This walk is the query's *whole* triple list, which is what the
+        // obligation ledger needs. The star decomposition does not use it for
+        // a UNION — see `union_branches`, which scopes each branch separately
+        // so two arms typing the same variable differently cannot collapse
+        // into one class.
+        GraphPattern::Union { left, right } => {
+            tag_triples_by_depth(left, depth + 1, out)?;
+            tag_triples_by_depth(right, depth + 1, out)
+        }
         GraphPattern::Lateral { .. } => Err(ScopeError::UnsupportedConstruct(
             "LATERAL is not supported; it is a SPARQL extension this endpoint does not serve"
                 .into(),
@@ -5982,17 +6439,169 @@ classes:
 
     // ---- Unsupported constructs ----
 
+    /// The shape the construct exists for, and the one a star map cannot
+    /// hold: one variable, two classes. Both have to be fetched, or the
+    /// second arm answers empty.
     #[test]
-    fn test_union_rejected() {
+    fn test_union_scopes_every_branch() {
         let sv = test_schema_view();
-        let result = sparql_scope(
+        let plan = sparql_scope(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
             &sv,
+        )
+        .expect("a UNION is scopable");
+        let mut classes: Vec<&str> = plan
+            .root
+            .all_stars()
+            .iter()
+            .map(|s| s.class_uri.as_str())
+            .collect();
+        classes.sort_unstable();
+        assert_eq!(
+            classes,
+            vec![
+                "https://data.infrabel.be/asset360/BaliseGroup",
+                "https://data.infrabel.be/asset360/Signal",
+            ],
+            "both arms have to be fetched: {plan:?}"
+        );
+        assert_eq!(plan.inexact, Some(Inexact::UnionBranch));
+        assert_eq!(
+            plan.sql_limit, None,
+            "a LIMIT does not bound a branch fetch"
+        );
+    }
+
+    /// Two stars in one plan cannot share a name: the name is the SQL alias.
+    #[test]
+    fn test_union_branches_get_distinct_star_names() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
+            &sv,
+        )
+        .expect("a UNION is scopable");
+        let names: HashSet<&str> = plan
+            .root
+            .all_stars()
+            .iter()
+            .map(|s| s.variable.as_str())
+            .collect();
+        assert_eq!(names.len(), 2, "one alias per star: {plan:?}");
+    }
+
+    /// A join in one branch must not narrow another branch's fetch.
+    ///
+    /// Found by driving the endpoint from Django rather than from here: the
+    /// first arm silently lost every tunnel complex that no civil engineering
+    /// asset points at. Both arms scope a `TunnelComplex` star of the same
+    /// shape, the deduplication merged them, and the second arm's join edge
+    /// was retargeted onto the first arm's star — so the statement joined a
+    /// fetch the first arm never asked to have joined. A short answer with a
+    /// balanced ledger and no error, which is the one failure mode the whole
+    /// distribution exists to prevent.
+    ///
+    /// The property, asserted rather than the fix: no join edge may name a
+    /// star that more than one branch reads.
+    #[test]
+    fn test_a_join_in_one_branch_does_not_narrow_another() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?tn WHERE { \
+               { ?s a asset360:TunnelComplex ; asset360:hasName ?tn } \
+               UNION \
+               { ?s a asset360:CivilEngineeringAsset ; \
+                    asset360:belongsToTunnelComplex ?t . \
+                 ?t a asset360:TunnelComplex ; asset360:hasName ?tn } \
+             }",
+            &sv,
+        )
+        .expect("a UNION is scopable");
+
+        // Three stars: each arm's own, and the joined one is the second arm's
+        // alone. Two would mean the first arm's star is the join's target.
+        assert_eq!(
+            all_stars(&plan).len(),
+            3,
+            "the joined star is the second arm's own: {plan:?}"
+        );
+
+        let joins = all_joins(&plan);
+        assert_eq!(joins.len(), 1, "{plan:?}");
+        // The first arm's star is named for the query variable it came from,
+        // and it is the one that must stay unjoined.
+        let unjoined = find_star(&plan, "s");
+        assert_eq!(
+            unjoined.class_uri,
+            "https://data.infrabel.be/asset360/TunnelComplex"
+        );
+        for join in &joins {
+            assert!(
+                join.left != unjoined.variable && join.right != unjoined.variable,
+                "a join edge narrows the other branch's fetch: {join:?} in {plan:?}"
+            );
+        }
+    }
+
+    /// A triple outside the union belongs to every branch, and a triple inside
+    /// one belongs only to its own: two stars of the same class, each
+    /// requiring what its branch reads, and neither requiring the other's.
+    #[test]
+    fn test_union_does_not_make_one_arms_read_mandatory() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { ?s a asset360:Signal . \
+             { ?s asset360:name ?n } UNION { ?s asset360:trackCode ?t } }",
+            &sv,
+        )
+        .expect("a UNION is scopable");
+        for star in plan.root.all_stars() {
+            assert!(
+                !(star.required_fields.contains(&"name".to_owned())
+                    && star.required_fields.contains(&"trackCode".to_owned())),
+                "one branch's read is not the other's: {star:?}"
+            );
+        }
+    }
+
+    /// A branch that cannot be scoped is the whole query's refusal: its
+    /// records would never be fetched and that arm would answer empty.
+    #[test]
+    fn test_union_branch_that_cannot_be_scoped_refuses_the_query() {
+        let sv = test_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT * WHERE { { ?s a asset360:Signal } UNION { ?x ?p ?o } }",
+            &sv,
         );
         assert!(
-            matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("UNION")),
-            "expected UnsupportedConstruct with UNION, got {result:?}"
+            matches!(result, Err(ScopeError::Unscoped(_))),
+            "an unscopable arm refuses the query, got {result:?}"
+        );
+    }
+
+    /// Branches multiply, and the planner says so rather than planning
+    /// 2^n conjunctive queries.
+    #[test]
+    fn test_too_many_union_branches_are_refused() {
+        let sv = test_schema_view();
+        let arms = (0..5)
+            .map(|_| "{ { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }".to_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = sparql_scope(
+            &format!(
+                "PREFIX asset360: <https://data.infrabel.be/asset360/> SELECT * WHERE {{ {arms} }}"
+            ),
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("branches")),
+            "expected a branch-count refusal, got {result:?}"
         );
     }
 
