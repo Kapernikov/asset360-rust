@@ -1744,6 +1744,60 @@ mod tests {
         );
     }
 
+    /// The same resolution, on a slot **both** arms' classes carry.
+    ///
+    /// The variant above shows as a route, because `:length` is a slot only
+    /// `Signal` has. This one cannot: `spanCount` is an integer on
+    /// `TunnelComplex` and a string on `CivilEngineeringAsset`, so a condition
+    /// resolved against the other arm's class still renders -- against a
+    /// column of the wrong type, comparing `"9" > "10"` lexically or casting a
+    /// name to a number. No fallback, no error, a different answer. Both
+    /// orderings, because a plan-wide map is last-scan-wins and one ordering
+    /// would pass with it broken.
+    #[test]
+    fn a_condition_resolves_against_its_own_arm_for_a_slot_both_classes_carry() {
+        let sv = test_schema_view();
+        for (first, condition, second, numeric) in [
+            (
+                "asset360:TunnelComplex",
+                "FILTER(?n > 10)",
+                "asset360:CivilEngineeringAsset",
+                true,
+            ),
+            (
+                "asset360:CivilEngineeringAsset",
+                "FILTER(?n = \"10\")",
+                "asset360:TunnelComplex",
+                false,
+            ),
+        ] {
+            let plan = plan_query_refined(
+                &format!(
+                    "{PREFIX}SELECT ?s WHERE {{ \
+                     {{ ?s a {first} ; asset360:spanCount ?n . {condition} }} \
+                     UNION {{ ?s a {second} }} }}"
+                ),
+                &sv,
+            )
+            .expect("a UNION plans");
+
+            assert!(
+                !matches!(plan.refinement, Refinement::Fallback(_)),
+                "for {first}: {plan}"
+            );
+            let printed = plan.to_string();
+            assert!(
+                printed.contains("union all") && printed.contains("spanCount"),
+                "for {first}: {printed}"
+            );
+            assert_eq!(
+                printed.contains("numeric"),
+                numeric,
+                "the condition is rendered against {first}'s column: {printed}"
+            );
+        }
+    }
+
     /// A union with one arm the rules could not push keeps the per-arm fetch
     /// it has always had.
     ///

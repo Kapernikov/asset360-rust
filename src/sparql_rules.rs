@@ -3787,11 +3787,7 @@ fn scan_of_star(plan: &Plan, star: &str) -> Option<NodeId> {
 /// and an `OFFSET` makes it worse the further the reader scrolls. One
 /// statement puts the bound back in the database.
 ///
-/// **`UNION ALL`, and the rule is SPARQL's algebra rather than a guess about
-/// the arms.** See [`crate::sparql_ops::Op::Union`]: a union is a multiset
-/// union, a SQL `UNION` would delete duplicate solutions the query requires,
-/// and the deduplication a query *does* ask for arrives as a `DISTINCT` above
-/// this node.
+/// The stacking is `UNION ALL`; see [`crate::sparql_ops::Op::Union`] for why.
 ///
 /// **Only an all-SQL union.** A mixed union -- one arm SQL, one the engine's
 /// -- keeps the per-arm behaviour it has always had. Pushing one would be the

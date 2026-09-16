@@ -4534,12 +4534,20 @@ classes:
         identifier: true
       hasName:
         range: string
+      # Additive, and deliberately paired with `CivilEngineeringAsset`'s slot
+      # of the same name and a different range: a union arm's condition
+      # resolved against the other arm's class is then the wrong *column
+      # type*, with no route change to show for it.
+      spanCount:
+        range: integer
   CivilEngineeringAsset:
     class_uri: asset360:CivilEngineeringAsset
     attributes:
       asset360_uri:
         identifier: true
       hasName:
+        range: string
+      spanCount:
         range: string
       belongsToTunnelComplex:
         range: TunnelComplex

@@ -281,17 +281,11 @@ pub enum Op {
     },
     /// The arms of a `UNION`, stacked as one statement.
     ///
-    /// **`UNION ALL`, and never a deduplicating `UNION`.** SPARQL's `Union` is
-    /// *multiset* union -- `{ ?s a :A } UNION { ?s a :A }` binds every `?s`
-    /// twice, and the engine leg does exactly that -- so a SQL `UNION` would
-    /// delete solutions the query requires and make the two routes disagree
-    /// about a count. Deduplication is emitted when the *query* asks for it,
-    /// which it does with a `DISTINCT` -- already an [`Op::Distinct`] above
-    /// this node, already rendered as `SELECT DISTINCT`. That is what makes
-    /// the choice follow from the query rather than from a guess about
-    /// whether the arms' classes can overlap: a guess would be wrong for a
-    /// union of one class with itself, and the shape it would be wrong on is
-    /// the shape nobody writes a test for.
+    /// **`UNION ALL`, and never a deduplicating `UNION`:** SPARQL's `Union` is
+    /// *multiset* union, and deduplication is emitted when the *query* asks
+    /// for it, as an [`Op::Distinct`] above this node. The argument in full,
+    /// including the shape a class-distinctness guess gets wrong, is in
+    /// `doc_book/src/design/28f-sparql-union.md` (consolidator-server).
     ///
     /// Binary, mirroring [`crate::sparql_refine::PlanOp::Union`]: three arms
     /// are two nodes, and `(a UNION ALL b) UNION ALL c` is `a UNION ALL b
