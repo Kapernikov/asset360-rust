@@ -2536,6 +2536,29 @@ fn scope_union(
     let mut path_bindings: HashMap<String, PathBinding> = HashMap::new();
     // A key that ignores the variable name: two branches that scope to the
     // same fetch contribute one star, not two identical ones.
+    //
+    // **Only join-free stars are ever entered here**, and that restriction is
+    // the whole reason "no join edge crosses a branch boundary" is true rather
+    // than merely intended. A star that a branch joins is a star whose fetch
+    // the join *narrows*; share it with another branch and that branch's fetch
+    // is narrowed by a constraint its own arm never wrote. The shape that
+    // showed it:
+    //
+    // ```sparql
+    // { ?s a :TunnelComplex ; :hasName ?n }
+    // UNION
+    // { ?s a :CivilEngineeringAsset ; :belongsTo ?t . ?t a :TunnelComplex ; :hasName ?n }
+    // ```
+    //
+    // Both arms' `TunnelComplex` stars have the same shape, so `?t` deduplicated
+    // onto `?s` and the second arm's join edge was retargeted at the first arm's
+    // star. The statement then fetched only those tunnel complexes some civil
+    // engineering asset points at, and the first arm lost every other one —
+    // short answer, balanced ledger, no error. Exactly the failure the
+    // distribution exists to prevent, reintroduced by the optimisation.
+    //
+    // Keeping the key to join-free stars keeps the saving where it is safe (two
+    // arms scanning the same class is one scan) and gives it up where it is not.
     let mut seen: HashMap<String, String> = HashMap::new();
     let mut taken: HashSet<String> = HashSet::new();
 
@@ -2543,11 +2566,22 @@ fn scope_union(
         let branch_query = with_pattern(query, branch.clone());
         let plan = scope_parsed_with_schema_graph(&branch_query, schema_view, schema_graph_iri)?;
 
+        // The stars this branch joins. Sharing one of them across branches is
+        // how a join edge would end up narrowing another branch's fetch — see
+        // `seen` above.
+        let joined: HashSet<String> = plan
+            .root
+            .all_joins()
+            .iter()
+            .flat_map(|join| [join.left.clone(), join.right.clone()])
+            .collect();
+
         // Old name -> name in the merged plan, for this branch only.
         let mut renamed: HashMap<String, String> = HashMap::new();
         for star in plan.root.all_stars() {
+            let shareable = !joined.contains(&star.variable);
             let shape = star_shape(star);
-            if let Some(existing) = seen.get(&shape) {
+            if shareable && let Some(existing) = seen.get(&shape) {
                 renamed.insert(star.variable.clone(), existing.clone());
                 continue;
             }
@@ -2558,7 +2592,9 @@ fn scope_union(
                 suffix += 1;
             }
             taken.insert(name.clone());
-            seen.insert(shape, name.clone());
+            if shareable {
+                seen.insert(shape, name.clone());
+            }
             renamed.insert(star.variable.clone(), name.clone());
             let mut star = star.clone();
             star.variable = name;
@@ -6454,6 +6490,60 @@ classes:
             .map(|s| s.variable.as_str())
             .collect();
         assert_eq!(names.len(), 2, "one alias per star: {plan:?}");
+    }
+
+    /// A join in one branch must not narrow another branch's fetch.
+    ///
+    /// Found by driving the endpoint from Django rather than from here: the
+    /// first arm silently lost every tunnel complex that no civil engineering
+    /// asset points at. Both arms scope a `TunnelComplex` star of the same
+    /// shape, the deduplication merged them, and the second arm's join edge
+    /// was retargeted onto the first arm's star — so the statement joined a
+    /// fetch the first arm never asked to have joined. A short answer with a
+    /// balanced ledger and no error, which is the one failure mode the whole
+    /// distribution exists to prevent.
+    ///
+    /// The property, asserted rather than the fix: no join edge may name a
+    /// star that more than one branch reads.
+    #[test]
+    fn test_a_join_in_one_branch_does_not_narrow_another() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?tn WHERE { \
+               { ?s a asset360:TunnelComplex ; asset360:hasName ?tn } \
+               UNION \
+               { ?s a asset360:CivilEngineeringAsset ; \
+                    asset360:belongsToTunnelComplex ?t . \
+                 ?t a asset360:TunnelComplex ; asset360:hasName ?tn } \
+             }",
+            &sv,
+        )
+        .expect("a UNION is scopable");
+
+        // Three stars: each arm's own, and the joined one is the second arm's
+        // alone. Two would mean the first arm's star is the join's target.
+        assert_eq!(
+            all_stars(&plan).len(),
+            3,
+            "the joined star is the second arm's own: {plan:?}"
+        );
+
+        let joins = all_joins(&plan);
+        assert_eq!(joins.len(), 1, "{plan:?}");
+        // The first arm's star is named for the query variable it came from,
+        // and it is the one that must stay unjoined.
+        let unjoined = find_star(&plan, "s");
+        assert_eq!(
+            unjoined.class_uri,
+            "https://data.infrabel.be/asset360/TunnelComplex"
+        );
+        for join in &joins {
+            assert!(
+                join.left != unjoined.variable && join.right != unjoined.variable,
+                "a join edge narrows the other branch's fetch: {join:?} in {plan:?}"
+            );
+        }
     }
 
     /// A triple outside the union belongs to every branch, and a triple inside
