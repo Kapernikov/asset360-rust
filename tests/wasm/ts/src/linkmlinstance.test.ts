@@ -265,7 +265,7 @@ name: personinfo
     );
   });
 
-  it('names list elements the way diff() addresses them', () => {
+  it('labels an element the way diff() addresses it', () => {
     const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
     const data = {
       name: 'svc',
@@ -281,35 +281,28 @@ name: personinfo
     };
     const instance = view.loadInstanceFromJson('Service', JSON.stringify(data));
 
-    // A single-slot `unique_keys` labels by the bare scalar value. "1" names
-    // the FIRST element, so a positional answer here would land every rewrite
+    // A single-slot `unique_keys` labels by the bare scalar value. "1" also
+    // names the FIRST position, so confusing the two would land every rewrite
     // one element early and still look like a success.
     const sections = instance.get('sections')!;
-    expect(sections.listPathSegments()).to.deep.equal(['1', '2']);
     expect(sections.at(0)!.elementIdentityLabel()).to.equal('1');
     expect(sections.at(1)!.elementIdentityLabel()).to.equal('2');
 
     // A composite `unique_keys` encodes a compact JSON array, values
     // stringified in `unique_key_slots` order — booleans lowercase. This is
-    // the segment shape an emitter is likeliest to get subtly wrong alone.
+    // the shape a caller is likeliest to get subtly wrong on its own.
     const contacts = instance.get('contacts')!;
-    expect(contacts.listPathSegments()).to.deep.equal([
-      '["home","true"]',
-      '["work","false"]',
-    ]);
     expect(contacts.at(0)!.elementIdentityLabel()).to.equal('["home","true"]');
+    expect(contacts.at(1)!.elementIdentityLabel()).to.equal('["work","false"]');
 
-    // A class declaring no identity at all is positional, and stays that way.
-    const notes = instance.get('notes')!;
-    expect(notes.listPathSegments()).to.deep.equal(['0', '1']);
-    expect(notes.at(0)!.elementIdentityLabel()).to.equal(undefined);
+    // A class declaring no identity has no label, and neither does a scalar or
+    // the root object.
+    expect(instance.get('notes')!.at(0)!.elementIdentityLabel()).to.equal(undefined);
+    expect(instance.get('name')!.elementIdentityLabel()).to.equal(undefined);
+    expect(instance.elementIdentityLabel()).to.equal(undefined);
 
-    // listPathSegments only answers for lists.
-    expect(instance.listPathSegments()).to.equal(undefined);
-    expect(instance.get('name')!.listPathSegments()).to.equal(undefined);
-
-    // The property that actually matters: the labels are the segments `diff()`
-    // emits for the same data. Perturb one leaf per list and compare.
+    // The property that actually matters: those labels are the segments
+    // `diff()` emits for the same data. Perturb one leaf per list and compare.
     const changed = JSON.parse(JSON.stringify(data)) as typeof data;
     changed.sections[1].note = 'TWO';
     changed.contacts[1].phone = '555-0200';
@@ -327,10 +320,10 @@ name: personinfo
   });
 
   it('keeps per-element labels when one sibling has no identity', () => {
-    // The case this whole design rests on. A row the user has just added has
-    // its identity slot still empty, which flips the *list* to positional —
-    // but the labelled rows must still report their own labels, or the table
-    // loses every row's provenance the moment someone hits "add".
+    // The case this design rests on. A row the user has just added has its
+    // identity slot still empty. Any whole-list rule collapses to positions
+    // there, so the labelled rows must still report their own labels or the
+    // table loses every row's provenance the moment someone hits "add".
     const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
     const data = {
       name: 'svc',
@@ -343,25 +336,15 @@ name: personinfo
     const instance = view.loadInstanceFromJson('Service', JSON.stringify(data));
     const sections = instance.get('sections')!;
 
-    // The whole list goes positional, because one element carries no label.
-    expect(sections.listPathSegments()).to.deep.equal(['0', '1', '2']);
-
-    // ...and yet the per-element rule is untouched.
     expect(sections.at(0)!.elementIdentityLabel()).to.equal('1');
     expect(sections.at(1)!.elementIdentityLabel()).to.equal(undefined);
     expect(sections.at(2)!.elementIdentityLabel()).to.equal('3');
 
-    // `navigate` resolves the same positional segments this call just named —
-    // that agreement is what makes them usable as addresses at all.
-    expect(instance.navigate(['sections', '0'])!.get('note')!.scalarValue()).to.equal('one');
-    expect(instance.navigate(['sections', '2'])!.get('note')!.scalarValue()).to.equal('three');
-
-    // `diff` does NOT agree, and deliberately so since upstream #124 made it
-    // schema-shaped: the class declares an identity, so diff refuses to address
-    // these elements positionally, and replaces the whole slot instead of
-    // naming a row. Pinned because it is the reason `elementIdentityLabel`
-    // cannot be derived from diff output — the labels above survive an edit
-    // that diff reports as one undifferentiated slot write.
+    // `diff` addresses nothing here, and deliberately so since upstream #124
+    // made it schema-shaped: the class declares an identity, so rather than
+    // fall back to positions it replaces the whole slot. Pinned because it is
+    // why the labels above cannot be recovered from diff output — they survive
+    // an edit that diff reports as one undifferentiated slot write.
     const changed = JSON.parse(JSON.stringify(data)) as typeof data;
     changed.sections[2].note = 'THREE';
     const deltas = view.diffJson(
@@ -371,38 +354,43 @@ name: personinfo
       false,
     ) as Array<{ path: string[] }>;
     expect(deltas.map((d) => d.path)).to.deep.equal([['sections']]);
-    expect(diffSegmentsUnder(deltas, 'sections')).to.deep.equal([]);
   });
 
-  it('agrees with diff element by element once every row carries a label', () => {
-    // The other side of the #124 rule, and the common case: with no empty
-    // identity slot in the list, all three — listPathSegments, navigate and
-    // diff — name the same rows the same way.
+  it('declaresElementIdentity answers from the schema, not the data', () => {
+    // The guard this exists for asks "can rows in this slot be told apart at
+    // all?", which is a question about the *class*. Asking the data instead
+    // misses exactly the case worth catching: a list whose rows are supposed to
+    // be distinguishable but currently are not.
     const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
-    const data = {
-      name: 'svc',
-      sections: [
-        { sequenceNumber: 1, note: 'one' },
-        { sequenceNumber: 2, note: 'two' },
-      ],
-    };
-    const instance = view.loadInstanceFromJson('Service', JSON.stringify(data));
-    const sections = instance.get('sections')!;
-    expect(sections.listPathSegments()).to.deep.equal(['1', '2']);
+    const slotOf = (slot: string) =>
+      view.classViewByName('Service')!.slotViews().find((s) => s.name() === slot)!;
 
-    expect(instance.navigate(['sections', '1'])!.get('note')!.scalarValue()).to.equal('one');
-    // A position is not an address here: '0' names nothing.
-    expect(instance.navigate(['sections', '0'])).to.equal(undefined);
+    // Declared via `unique_keys`, single-slot and composite alike.
+    expect(slotOf('sections').declaresElementIdentity()).to.equal(true);
+    expect(slotOf('contacts').declaresElementIdentity()).to.equal(true);
+    // Declared via a `key` slot.
+    expect(slotOf('pictures').declaresElementIdentity()).to.equal(true);
+    // Range class declares nothing.
+    expect(slotOf('notes').declaresElementIdentity()).to.equal(false);
+    // Not a multivalued class-ranged slot at all.
+    expect(slotOf('name').declaresElementIdentity()).to.equal(false);
 
-    const changed = JSON.parse(JSON.stringify(data)) as typeof data;
-    changed.sections[1].note = 'TWO';
-    const deltas = view.diffJson(
+    // The point of asking the schema: still true when the data fails to honour
+    // it. A row with an empty key, and two rows sharing one, are precisely what
+    // the caller wants to reject — so the answer must not go false underneath
+    // them.
+    const broken = view.loadInstanceFromJson(
       'Service',
-      data,
-      changed,
-      false,
-    ) as Array<{ path: string[] }>;
-    expect(deltas.map((d) => d.path)).to.deep.equal([['sections', '2', 'note']]);
+      JSON.stringify({
+        name: 'svc',
+        sections: [{ sequenceNumber: 1, note: 'a' }, { note: 'no key' }, { sequenceNumber: 1, note: 'dup' }],
+      }),
+    );
+    expect(broken.get('sections')!.slotView()!.declaresElementIdentity()).to.equal(true);
+    expect(broken.get('sections')!.at(1)!.elementIdentityLabel()).to.equal(undefined);
+    expect(broken.get('sections')!.at(0)!.elementIdentityLabel()).to.equal(
+      broken.get('sections')!.at(2)!.elementIdentityLabel(),
+    );
   });
 });
 
@@ -427,83 +415,6 @@ describe('delta bindings', () => {
     ],
     contacts: [{ kind: 'home', primary: true, phone: '555-0200' }],
   };
-
-  it('patchJson round-trips a diff and reports unresolvable paths', () => {
-    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
-    const deltas = view.diffJson('Service', BASE, EDITED, false);
-
-    const applied = view.patchJson('Service', BASE, deltas, false, true) as {
-      value: unknown;
-      failed: string[][];
-    };
-    expect(applied.failed).to.deep.equal([]);
-
-    // The round trip is the property: patching the base with diff(base, edited)
-    // must land exactly on edited, per the engine's own diff.
-    expect(view.diffJson('Service', applied.value, EDITED, false)).to.deep.equal([]);
-
-    // report-never-guess: an address resolving to nothing comes back named,
-    // not silently skipped. A frontend that rendered an unapplied delta would
-    // present stale data as current.
-    const bogus = [
-      { path: ['sections', '404', 'note'], op: 'update', old: 'two', new: 'nope' },
-    ];
-    const partial = view.patchJson('Service', BASE, bogus, false, true) as {
-      value: unknown;
-      failed: string[][];
-    };
-    expect(partial.failed).to.deep.equal([['sections', '404', 'note']]);
-  });
-
-  it('equals answers the unchanged question the same way diff does', () => {
-    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
-    const a = view.loadInstanceFromJson('Service', JSON.stringify(BASE));
-    const b = view.loadInstanceFromJson('Service', JSON.stringify(BASE));
-    const c = view.loadInstanceFromJson('Service', JSON.stringify(EDITED));
-
-    expect(a.equals(b, false)).to.equal(true);
-    expect(a.equals(c, false)).to.equal(false);
-
-    // The autosave gate's whole reason for existing: this boolean must never
-    // disagree with "diff produced nothing".
-    expect(a.equals(b, false)).to.equal(
-      view.diffJson('Service', BASE, BASE, false).length === 0,
-    );
-    expect(a.equals(c, false)).to.equal(
-      view.diffJson('Service', BASE, EDITED, false).length === 0,
-    );
-  });
-
-  it('diffInstances matches diffJson and can diff a navigated subtree', () => {
-    const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);
-    const base = view.loadInstanceFromJson('Service', JSON.stringify(BASE));
-    const edited = view.loadInstanceFromJson('Service', JSON.stringify(EDITED));
-
-    // Order-insensitively, deliberately: `diff` walks an object's slots from a
-    // hash map, so deltas for *sibling slots* come back in no guaranteed order
-    // and the two calls parse their inputs separately. The claim under test is
-    // that the same edits are reported, not that they queue up the same way.
-    const byPath = (ds: Array<{ path: string[] }>) =>
-      [...ds].sort((x, y) => JSON.stringify(x.path).localeCompare(JSON.stringify(y.path)));
-
-    expect(byPath(asset360.diffInstances(base, edited, false))).to.deep.equal(
-      byPath(view.diffJson('Service', BASE, EDITED, false)),
-    );
-
-    // The point of taking handles: a navigated subtree can be diffed without
-    // the caller knowing its class name, which `diffJson` would demand.
-    const baseSections = base.navigate(['sections']);
-    const editedSections = edited.navigate(['sections']);
-    expect(baseSections, 'base sections').to.not.be.undefined;
-    const subtree = asset360.diffInstances(
-      baseSections!,
-      editedSections!,
-      false,
-    ) as Array<{ path: string[] }>;
-    expect(subtree.length).to.equal(1);
-    // Paths are relative to the subtree that was diffed, not the root.
-    expect(subtree[0].path).to.deep.equal(['2', 'note']);
-  });
 
   it('diffJson can describe a changed key as an update instead of a replacement', () => {
     const view = asset360.loadSchemaView(IDENTITY_SCHEMA_YAML);

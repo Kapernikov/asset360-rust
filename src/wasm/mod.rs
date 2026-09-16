@@ -14,9 +14,7 @@ pub use minijinja::*;
 
 use linkml_meta::SchemaDefinition;
 use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
-use linkml_runtime::{
-    Delta, DiffOptions, LinkMLInstance, PatchOptions, diff, load_json_str, patch,
-};
+use linkml_runtime::{DiffOptions, LinkMLInstance, diff, load_json_str};
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::enumview::EnumView;
 use linkml_schemaview::identifier::Identifier;
@@ -285,53 +283,23 @@ impl SchemaViewHandle {
     ) -> Result<JsValue, JsValue> {
         let base_handle = self.create_instance(class_name, base)?;
         let current_handle = self.create_instance(class_name, current)?;
-        diff_instances(
-            &base_handle,
-            &current_handle,
-            treat_missing_as_null,
-            treat_changed_identifier_as_new_object,
-        )
-    }
-
-    /// Apply `deltas` to `base`, returning the patched value and the paths that
-    /// could not be applied: `{ value, failed }`.
-    ///
-    /// `failed` carries the engine's report-never-guess contract across the
-    /// boundary: an address that resolves to nothing, or ambiguously, comes back
-    /// named rather than silently skipped. One bad delta never voids the batch,
-    /// so a caller wanting all-or-nothing checks `failed` and discards `value`
-    /// itself — and a caller that ignores it would render an unapplied delta,
-    /// presenting stale data as current.
-    ///
-    /// Both flags default to the engine's own defaults (`true`).
-    #[wasm_bindgen(js_name = patchJson)]
-    pub fn patch_json(
-        &self,
-        class_name: &str,
-        base: JsValue,
-        deltas: JsValue,
-        treat_missing_as_null: Option<bool>,
-        ignore_no_ops: Option<bool>,
-    ) -> Result<JsValue, JsValue> {
-        let base_handle = self.create_instance(class_name, base)?;
-        let deltas: Vec<Delta> =
-            serde_wasm_bindgen::from_value(deltas).map_err(|err| format_err(&err))?;
-        let defaults = PatchOptions::default();
-        let opts = PatchOptions {
-            ignore_no_ops: ignore_no_ops.unwrap_or(defaults.ignore_no_ops),
-            treat_missing_as_null: treat_missing_as_null.unwrap_or(defaults.treat_missing_as_null),
-        };
-        let (patched, trace) = patch(&base_handle.inner, &deltas, opts)
-            .map_err(|err| JsValue::from_str(&err.to_string()))?;
-        // Same json-compatible serializer as `diff_json`, and for the same
-        // reason: the default emits JS `Map`s, which `JSON.stringify` renders
-        // as `{}`.
-        PatchOutcome {
-            value: patched.to_json(),
-            failed: trace.failed,
-        }
-        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
-        .map_err(|err| format_err(&err))
+        let deltas = diff(
+            &base_handle.inner,
+            &current_handle.inner,
+            DiffOptions {
+                treat_changed_identifier_as_new_object: treat_changed_identifier_as_new_object
+                    .unwrap_or(true),
+                ..DiffOptions::new(treat_missing_as_null)
+            },
+        );
+        // A `Delta`'s `old`/`new` are `serde_json::Value`s; object payloads (e.g.
+        // a removed inlined row) serialise to maps. The default serde_wasm_bindgen
+        // serializer emits JS `Map`s — which `JSON.stringify` renders as `{}`, so
+        // the frontend would see empty removed-row data. The json-compatible
+        // serializer emits plain objects instead.
+        deltas
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|err| format_err(&err))
     }
 
     /// Retrieve a [`ClassView`] by name or CURIE (without requiring a schema id).
@@ -477,40 +445,6 @@ pub fn load_schema_view(yaml: &str) -> Result<SchemaViewHandle, JsValue> {
 }
 
 /// Load a [`SchemaView`] from snapshot YAML.
-/// Diff two already-parsed instances, `base` → `current`.
-///
-/// The handle-taking form of [`SchemaViewHandle::diff_json`], which is a thin
-/// wrapper over this. Two reasons to reach for it directly: a caller holding a
-/// stable base re-parses only the edited side, which halves the work on a diff
-/// running per keystroke; and a navigated subtree can be diffed without the
-/// caller knowing its class name, which `diffJson` would demand. Emitted paths
-/// are relative to the instances passed in, not to any root above them.
-#[wasm_bindgen(js_name = diffInstances)]
-pub fn diff_instances(
-    base: &LinkMLInstanceHandle,
-    current: &LinkMLInstanceHandle,
-    treat_missing_as_null: bool,
-    treat_changed_identifier_as_new_object: Option<bool>,
-) -> Result<JsValue, JsValue> {
-    let deltas = diff(
-        &base.inner,
-        &current.inner,
-        DiffOptions {
-            treat_changed_identifier_as_new_object: treat_changed_identifier_as_new_object
-                .unwrap_or(true),
-            ..DiffOptions::new(treat_missing_as_null)
-        },
-    );
-    // A `Delta`'s `old`/`new` are `serde_json::Value`s; object payloads (e.g. a
-    // removed inlined row) serialise to maps. The default serde_wasm_bindgen
-    // serializer emits JS `Map`s — which `JSON.stringify` renders as `{}`, so the
-    // frontend would see empty removed-row data. The json-compatible serializer
-    // emits plain objects instead.
-    deltas
-        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
-        .map_err(|err| format_err(&err))
-}
-
 #[wasm_bindgen(js_name = loadSchemaViewFromSnapshot)]
 pub fn load_schema_view_from_snapshot(yaml: &str) -> Result<SchemaViewHandle, JsValue> {
     let view = SchemaView::from_snapshot_yaml(yaml).map_err(map_schema_error)?;
@@ -522,13 +456,6 @@ fn parse_schema_definition(yaml: &str) -> Result<SchemaDefinition, JsValue> {
     let schema: SchemaDefinition = serde_path_to_error::deserialize(deserializer)
         .map_err(|err| JsValue::from_str(&err.to_string()))?;
     Ok(schema)
-}
-
-/// The `{ value, failed }` payload [`SchemaViewHandle::patch_json`] returns.
-#[derive(Serialize)]
-struct PatchOutcome {
-    value: serde_json::Value,
-    failed: Vec<Vec<String>>,
 }
 
 fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
@@ -667,6 +594,24 @@ impl SlotViewHandle {
 
 #[wasm_bindgen]
 impl SlotViewHandle {
+    /// Can the elements of this slot be told apart by identity at all?
+    ///
+    /// A question about the *schema*, not the data: true when this is an
+    /// element-addressable multivalued slot whose declared range class carries
+    /// a key/identifier or any `unique_keys`. It stays true when the data fails
+    /// to honour that declaration — a row with its key still empty, or two rows
+    /// sharing one — which is exactly the state a caller guarding against
+    /// missing or duplicate keys wants to reject, so the answer must not go
+    /// false underneath it.
+    ///
+    /// Deliberately the declared range class only, not the class family: a
+    /// polymorphic list ranged on a class declaring nothing still answers
+    /// `false`, even where its descendants declare `unique_keys`.
+    #[wasm_bindgen(js_name = declaresElementIdentity)]
+    pub fn declares_element_identity(&self) -> bool {
+        linkml_runtime::slot_declares_element_identity(&self.inner)
+    }
+
     #[wasm_bindgen(js_name = name)]
     pub fn name(&self) -> String {
         self.inner.name.clone()
@@ -1058,46 +1003,19 @@ impl LinkMLInstanceHandle {
         to_js(&refs)
     }
 
-    /// Semantic equality per the LinkML Instances spec.
-    ///
-    /// The engine's own identity rule, so it cannot disagree with `diff` about
-    /// what "unchanged" means — and it allocates nothing, where asking the same
-    /// question by materialising a delta list and testing its length does.
-    #[wasm_bindgen(js_name = equals)]
-    pub fn equals_js(&self, other: &LinkMLInstanceHandle, treat_missing_as_null: bool) -> bool {
-        self.inner.equals(&other.inner, treat_missing_as_null)
-    }
-
     /// This element's identity label, or `undefined` when it has none.
     ///
-    /// Deliberately per-element: `listPathSegments` answers positionally
-    /// unless every element of the list carries a distinct label, so a row
-    /// the user has just added — with its identity slot still empty, or
-    /// duplicating a neighbour — would otherwise flip every row of the list
-    /// to a position and blank the whole table's provenance.
+    /// Per-element by design: it answers for *this* element and never consults
+    /// its siblings. A whole-list rule cannot, because it goes positional the
+    /// moment one element's identity slot is empty or duplicates a neighbour —
+    /// so a row the user has just added would blank the provenance of every
+    /// other row in the table at the same time.
+    ///
+    /// Translating a path needs a keyed-shaped list anyway, where this call and
+    /// a whole-list one agree element for element.
     #[wasm_bindgen(js_name = elementIdentityLabel)]
     pub fn element_identity_label(&self) -> Option<String> {
         linkml_runtime::element_identity_label(&self.inner)
-    }
-
-    /// Name every element of this list the way the engine addresses them:
-    /// identity labels where the list has element identity, positions
-    /// otherwise. These are the segments `navigate` and `patch` resolve.
-    ///
-    /// Not always the segments `diff` emits. Upstream #124 made `diff`
-    /// schema-shaped: a list whose *class* declares an identity is never
-    /// addressed positionally, so when one element leaves its identity slot
-    /// empty — the freshly-added row — `diff` declines to address the elements
-    /// at all and replaces the whole slot instead. This call stays data-shaped
-    /// (upstream #126 tracks closing that gap), and agrees with `navigate`
-    /// either way. When what you want is one element's own identity regardless
-    /// of the company it keeps, ask `elementIdentityLabel`.
-    #[wasm_bindgen(js_name = listPathSegments)]
-    pub fn list_path_segments(&self) -> Option<Vec<String>> {
-        match &self.inner {
-            LinkMLInstance::List { values, .. } => Some(linkml_runtime::list_path_segments(values)),
-            _ => None,
-        }
     }
 }
 
