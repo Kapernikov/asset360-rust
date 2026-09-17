@@ -1187,6 +1187,35 @@ pub fn scope_parsed_with_schema_graph(
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> Result<QueryPlan, ScopeError> {
+    // A `FROM` / `FROM NAMED` clause redefines the dataset the query is asked
+    // against, and nothing downstream of here carries it: every arm below
+    // discards it with `..`, the plan has no field for it, and
+    // `sparql_materialise` rebuilds a query with `dataset: None`. So
+    //
+    //     SELECT (COUNT(*) AS ?n) FROM <urn:empty> WHERE { ?s a :TunnelComplex }
+    //
+    // was planned as *all in SQL*, admitted, and answered `2` from the table
+    // — against a dataset holding no triples, where the answer is `0`. The
+    // engine gets the original query text and honours the clause, so the two
+    // routes answered different questions and which one you got depended on
+    // whether a rule happened to lift the pattern.
+    //
+    // Refused by name, and refused for *both* routes rather than merely kept
+    // out of SQL. Routing it to the engine would answer this query correctly
+    // today, and it would rest on "no analysis's conclusion changes under a
+    // dataset clause" — an invariant that is true by inspection and recorded
+    // nowhere, which is the arrangement that produced this defect. When the
+    // dataset is a field of the plan it can be honoured; until then the
+    // refusal is the only answer that is checkable. See doc 28h.
+    if dataset_of(query).is_some() {
+        return Err(ScopeError::UnsupportedConstruct(
+            "a FROM / FROM NAMED dataset clause is not supported; the endpoint serves one \
+             dataset and the query plan does not carry a dataset restriction, so honouring \
+             the clause on one route and not the other would answer a different question"
+                .into(),
+        ));
+    }
+
     let pattern = match query {
         Query::Select { pattern, .. } => pattern,
         Query::Construct { pattern, .. } => pattern,
@@ -2885,6 +2914,80 @@ pub(crate) fn exists_patterns_of<'a>(expr: &'a Expression, out: &mut Vec<&'a Gra
         | Expression::Variable(_)
         | Expression::Bound(_) => {}
     }
+}
+
+/// The query's `FROM` / `FROM NAMED` clause, if it wrote one.
+///
+/// Exhaustive over [`Query`]: every form can carry a dataset clause, and a
+/// form that carried one unnoticed is the defect this exists to refuse.
+fn dataset_of(query: &Query) -> Option<&spargebra::algebra::QueryDataset> {
+    match query {
+        Query::Select { dataset, .. }
+        | Query::Construct { dataset, .. }
+        | Query::Describe { dataset, .. }
+        | Query::Ask { dataset, .. } => dataset.as_ref(),
+    }
+}
+
+/// Every graph pattern hiding in *this node's* expressions, and none deeper.
+///
+/// The single answer to "where can a pattern be that is not a child pattern".
+/// A walker over [`GraphPattern`] recurses into `inner`, `left` and `right`
+/// and, doing only that, walks straight past `FILTER EXISTS { … }`: the block
+/// is a pattern held by an [`Expression`], not a child of the node. Three
+/// separate walkers made exactly that mistake and produced three wrong
+/// answers, so the knowledge lives here once and each walker asks for it in
+/// one line rather than growing its own half of it.
+///
+/// Exhaustive over [`GraphPattern`] with no `_` arm, for the same reason
+/// [`exists_patterns_of`] is exhaustive over [`Expression`]: a spargebra
+/// release that adds a node carrying an expression must be a compile error
+/// here, not a fourth silent omission.
+///
+/// `ORDER BY` and aggregate positions are included even though
+/// [`tag_triples_by_depth`] refuses an `EXISTS` there. A caller is not obliged
+/// to have scoped first — `observable_slots` and
+/// [`crate::sparql_graph_clauses`] both run before or without the scoper — and
+/// an analysis whose correctness depends on another analysis having refused
+/// first is the arrangement this function exists to end.
+pub(crate) fn exists_patterns_in_expressions_of(pattern: &GraphPattern) -> Vec<&GraphPattern> {
+    let mut out: Vec<&GraphPattern> = Vec::new();
+    match pattern {
+        GraphPattern::Filter { expr, .. } => exists_patterns_of(expr, &mut out),
+        GraphPattern::Extend { expression, .. } => exists_patterns_of(expression, &mut out),
+        GraphPattern::OrderBy { expression, .. } => {
+            for term in expression {
+                let (OrderExpression::Asc(expr) | OrderExpression::Desc(expr)) = term;
+                exists_patterns_of(expr, &mut out);
+            }
+        }
+        GraphPattern::Group { aggregates, .. } => {
+            for (_, aggregate) in aggregates {
+                if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
+                    exists_patterns_of(expr, &mut out);
+                }
+            }
+        }
+        GraphPattern::LeftJoin { expression, .. } => {
+            if let Some(expr) = expression {
+                exists_patterns_of(expr, &mut out);
+            }
+        }
+        GraphPattern::Bgp { .. }
+        | GraphPattern::Path { .. }
+        | GraphPattern::Join { .. }
+        | GraphPattern::Union { .. }
+        | GraphPattern::Lateral { .. }
+        | GraphPattern::Minus { .. }
+        | GraphPattern::Graph { .. }
+        | GraphPattern::Project { .. }
+        | GraphPattern::Distinct { .. }
+        | GraphPattern::Reduced { .. }
+        | GraphPattern::Slice { .. }
+        | GraphPattern::Service { .. }
+        | GraphPattern::Values { .. } => {}
+    }
+    out
 }
 
 /// Every triple pattern that reads the schema graph, by identity.
@@ -6630,6 +6733,41 @@ classes:
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("MINUS")),
             "expected UnsupportedConstruct with MINUS, got {result:?}"
+        );
+    }
+
+    /// Review finding 4. A dataset clause used to be discarded by the `..` in
+    /// every arm of [`scope_parsed_with_schema_graph`], so
+    /// `FROM <urn:empty>` was planned as all-in-SQL, admitted, and answered
+    /// from the table — `2` for a dataset in which the answer is `0`. Refused
+    /// by name now, for both routes: see doc 28h on why routing it to the
+    /// engine would be correct today and still the wrong default.
+    #[test]
+    fn a_dataset_clause_is_refused_by_name() {
+        let sv = test_schema_view();
+        for query in [
+            "SELECT (COUNT(*) AS ?n) FROM <urn:empty> WHERE { ?s a asset360:Signal }",
+            "SELECT ?s FROM NAMED <urn:empty> WHERE { ?s a asset360:Signal }",
+            "ASK FROM <urn:empty> WHERE { ?s a asset360:Signal }",
+        ] {
+            let result = sparql_scope(
+                &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+                &sv,
+            );
+            assert!(
+                matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("FROM")),
+                "expected a FROM refusal for `{query}`, got {result:?}"
+            );
+        }
+        // And no dataset clause is still scoped, which is every query the
+        // application sends.
+        assert!(
+            sparql_scope(
+                "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                 SELECT ?s WHERE { ?s a asset360:Signal }",
+                &sv,
+            )
+            .is_ok()
         );
     }
 
