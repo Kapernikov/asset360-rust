@@ -993,10 +993,85 @@ mod tests {
     ///
     /// Asserted on the *refined* plan and not on the statement, because
     /// turning a narrowed arm into a narrowed statement is the per-arm
-    /// lowering of asset360 GitLab issue #410, which is a separate change on a
-    /// separate branch. On this base the two arms still lower to one wide
-    /// fetch; once that lands the condition rides along with no change here,
-    /// which is the whole point of the two changes being independent.
+    /// lowering of asset360 GitLab issue #410. That has now landed, and the
+    /// condition did ride along: the only thing that changed here is that the
+    /// untouched arm folds into a scan instead of staying a `match`, because
+    /// #410's `in_other_union_arm` stopped the *other* arm's type match
+    /// counting as a second class on the star. The narrowing is still on the
+    /// arm that earned it, and still only on that arm.
+    /// **Where asset360-rust#40 and #41 meet, and nobody had run it.**
+    ///
+    /// A `UNION` whose *every* arm carries a schema-side filter: #40 evaluates
+    /// each arm's schema subplan, #41 folds each arm into a scan and stacks
+    /// all-SQL unions into one statement. This records what the pair actually
+    /// does, including the part it does not do yet.
+    ///
+    /// What composes: before #41, `FoldMatchesIntoScan` counted the *other*
+    /// arm's type match as a second class on the star, so neither arm folded
+    /// and every node stayed with the engine -- there was no scan for #40's
+    /// `values_narrow_the_joined_scan` to narrow, and the fallback reported
+    /// "no rule derived a narrowing". With #41's `in_other_union_arm` both arms
+    /// fold, and #40's narrowing now fires on a shape it could not reach
+    /// before. #41 *enables* #40 here; neither displaces the other.
+    ///
+    /// What does not, and it is not a regression: the narrowings do not reach
+    /// the statement. A schema-side filter leaves the materialised `values`
+    /// relation and its join on the arm, both engine nodes, so `PushUnion` --
+    /// which requires every node feeding either arm to be SQL -- never fires,
+    /// the union is not lowered, and the merge refuses a condition sitting
+    /// under an unlowered union because a per-class fetch cannot say which
+    /// branch the condition belongs to. Conservative and sound: a short fetch
+    /// would be a wrong answer, a wide one is only a slow right one. `main`
+    /// fetches both classes whole for this query too, so nothing got worse.
+    ///
+    /// Closing the gap means lowering the materialised `VALUES` into the
+    /// statement so the arm becomes all-SQL. That is neither PR's scope.
+    #[test]
+    fn a_union_of_schema_filtered_arms_narrows_each_arm_but_not_the_fetch() {
+        let body = format!(
+            "SELECT ?s WHERE {{ \
+             {{ ?s a asset360:Signal ; asset360:signalType ?t . \
+                GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:notation ?code }} \
+                FILTER(CONTAINS(?code, \"GS\")) }} \
+             UNION \
+             {{ ?s a asset360:BaliseGroup ; asset360:baliseGroupType ?b . \
+                GRAPH <{SCHEMA_GRAPH}> {{ ?b skos:notation ?bc }} \
+                FILTER(CONTAINS(?bc, \"SwBG\")) }} }}"
+        );
+
+        // #41: both arms fold into scans, each keeping only its own class.
+        let refined = refined_for(&body);
+        for (class, slot) in [
+            ("asset360:Signal", "signalType"),
+            ("asset360:BaliseGroup", "baliseGroupType"),
+        ] {
+            assert!(
+                refined.contains(&format!("scan      {class} as ?s")),
+                "{class}'s arm folds into a scan of its own class alone:\n{refined}"
+            );
+            // #40: and that scan is narrowed by its own arm's schema filter.
+            assert!(
+                refined.contains(&format!("filter    (?s.{slot} IN (")),
+                "the arm's schema filter narrows {class}'s scan:\n{refined}"
+            );
+        }
+
+        // The gap, pinned so that closing it fails this test rather than
+        // passing unnoticed: the union is not lowered, so neither narrowing
+        // reaches the fetch.
+        let lowered = plan_for(&body);
+        assert!(
+            lowered.contains("not lowerable: the plan contains a UNION"),
+            "a schema-filtered arm keeps an engine-side VALUES, so the union \
+             is not all-SQL and is not stacked:\n{lowered}"
+        );
+        assert!(
+            !lowered.contains("signalType IN") && !lowered.contains("baliseGroupType IN"),
+            "and a condition under an unlowered union is refused rather than \
+             applied to the wrong branch:\n{lowered}"
+        );
+    }
+
     #[test]
     fn a_union_arm_narrows_on_its_own() {
         let plan = refined_for(&format!(
@@ -1012,8 +1087,9 @@ mod tests {
             "the arm's schema subplan is evaluated in place:\n{plan}"
         );
         assert!(
-            plan.contains("match     ?s a asset360:BaliseGroup"),
-            "the other arm is untouched:\n{plan}"
+            plan.contains("scan      asset360:BaliseGroup as ?s, requires []"),
+            "the other arm is untouched -- it reads nothing the narrowing \
+             asked for:\n{plan}"
         );
     }
 

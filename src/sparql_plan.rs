@@ -1730,7 +1730,7 @@ mod tests {
         .expect("a UNION plans");
 
         assert!(
-            !matches!(plan.refinement, Refinement::Fallback(_)),
+            !matches!(plan.refinement, Refinement::Fallback { .. }),
             "the arm's own class is what resolves its condition: {plan}"
         );
         let printed = plan.to_string();
@@ -1782,7 +1782,7 @@ mod tests {
             .expect("a UNION plans");
 
             assert!(
-                !matches!(plan.refinement, Refinement::Fallback(_)),
+                !matches!(plan.refinement, Refinement::Fallback { .. }),
                 "for {first}: {plan}"
             );
             let printed = plan.to_string();
@@ -1820,7 +1820,7 @@ mod tests {
         .expect("a UNION plans");
 
         assert!(
-            matches!(plan.refinement, Refinement::Fallback(ref why) if why.contains("UNION")),
+            matches!(plan.refinement, Refinement::Fallback { ref why, .. } if why.contains("UNION")),
             "a mixed union is refused whole rather than half-pushed: {plan}"
         );
         assert!(plan.is_accounted(), "{plan}");
@@ -3116,7 +3116,11 @@ mod tests {
             "SELECT ?nm ?tag WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
              ?t a asset360:Track ; asset360:hasName ?nm . \
              VALUES (?nm ?tag) { (\"a\" \"x\") (\"b\" \"y\") } }",
-            "SELECT ?s WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
+            // A *mixed* union: since asset360-rust#41 an all-SQL union lowers
+            // and no longer falls back, so the shape that still exercises the
+            // fallback here is the one with an arm the rules could not push.
+            "SELECT ?s WHERE { { ?s a asset360:Signal } UNION \
+             { ?s a asset360:BaliseGroup ; asset360:name ?nm . FILTER(STRLEN(?nm) > 3) } }",
             "SELECT ?nm ?tag WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
              ?t a asset360:Track ; asset360:hasName ?h . \
              VALUES (?nm ?tag) { (\"a\" \"x\") } \
