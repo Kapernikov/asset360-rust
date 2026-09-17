@@ -2012,7 +2012,7 @@ fn push_filter(
 }
 
 /// The name of a class's identifier slot, when it has one.
-fn identifier_slot_of(
+pub(crate) fn identifier_slot_of(
     schema: &linkml_schemaview::schemaview::SchemaView,
     class_uri: &str,
 ) -> Option<String> {
@@ -2554,7 +2554,7 @@ mod tests {
 
     /// A refined plan, to fixpoint.
     fn refined_plan(query: &str, sv: &SchemaView) -> crate::sparql_refine::Plan {
-        let rules = crate::sparql_rules::tier_one_rules(sv);
+        let rules = crate::sparql_rules::tier_one_rules(sv, None);
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         let mut plan = crate::sparql_refine::naive_plan_of(&format!("{PREFIX}{query}"))
@@ -3477,6 +3477,17 @@ pub fn observable_slots(
         schema: &SchemaView,
         found: &mut BTreeSet<String>,
     ) -> Result<(), NotEnumerable> {
+        // A pattern held by an expression, before the node's own children.
+        // `FILTER EXISTS { ?s a:hasName "Shared" }` reads `hasName` off the
+        // record exactly as a triple in the BGP would, and this walk used to
+        // recurse into `inner` only: the fetch retrieved `id` and `typeURI`,
+        // the engine evaluated the negation-free EXISTS against a record with
+        // no name on it, and the endpoint answered zero rows. One call, and
+        // `exists_patterns_in_expressions_of` is the only thing that knows
+        // where those patterns can be.
+        for block in crate::sparql_scoper::exists_patterns_in_expressions_of(pattern) {
+            walk(block, schema, found)?;
+        }
         match pattern {
             GraphPattern::Bgp { patterns } => {
                 for triple in patterns {
@@ -3756,5 +3767,40 @@ mod retrieval_tests {
             !slots.iter().any(|slot| slot.contains("notation")),
             "{slots:?}"
         );
+    }
+
+    /// A slot read only inside an expression is still read off the record.
+    ///
+    /// Review finding 3. This walk recursed into child patterns and nothing
+    /// else, so the block in `FILTER EXISTS { … }` was invisible: the fetch
+    /// retrieved `id` and `typeURI`, the engine re-ran the query against a
+    /// record with no `hasName` on it, and the endpoint answered zero rows for
+    /// a query with a matching record. A *constant* object is what makes it
+    /// reachable — with a variable object `DeliverOptionalRead` puts the slot
+    /// on the scan for its own reasons and the omission is masked.
+    #[test]
+    fn a_slot_read_only_inside_an_exists_is_observable() {
+        let sv = test_schema_view();
+        for query in [
+            // Positive, constant object: the reproduced wrong answer.
+            "SELECT ?s WHERE { ?s a asset360:Signal . \
+             FILTER EXISTS { ?s asset360:hasName \"Shared\" } }",
+            // Negated: the fetch needs the slot to evaluate the negation.
+            "SELECT ?s WHERE { ?s a asset360:Signal . \
+             FILTER NOT EXISTS { ?s asset360:hasName \"Shared\" } }",
+            // Nested inside a boolean expression, which is where a walker
+            // that special-cased the top-level `EXISTS` would stop.
+            "SELECT ?s WHERE { ?s a asset360:Signal . \
+             FILTER(?s != ?s || EXISTS { ?s asset360:hasName \"Shared\" }) }",
+            // A position the node's children do not include either: the
+            // condition spargebra lifts out of `OPTIONAL { … FILTER }`.
+            "SELECT ?s WHERE { ?s a asset360:Signal \
+             OPTIONAL { ?s asset360:kind ?k FILTER EXISTS { ?s asset360:hasName \"Shared\" } } }",
+        ] {
+            let parsed =
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("parses");
+            let slots = observable_slots(&parsed, &sv).expect("enumerable");
+            assert!(slots.contains("hasName"), "{query}\n{slots:?}");
+        }
     }
 }

@@ -39,6 +39,18 @@ pub fn query_reads_named_graphs(query: &str) -> bool {
     use spargebra::algebra::GraphPattern;
 
     fn walk(pattern: &GraphPattern) -> bool {
+        // A `GRAPH` inside an expression's `EXISTS` block is a `GRAPH` clause.
+        // Walking children only, this answered *false* for
+        // `FILTER EXISTS { GRAPH <…/schema> { ?c ?p ?o } }`, the schema graph
+        // was never built, and the query answered zero rows — while the same
+        // query with an otherwise ineffective `OPTIONAL { GRAPH … }` bolted on
+        // answered correctly, which is how the defect was found.
+        if crate::sparql_scoper::exists_patterns_in_expressions_of(pattern)
+            .into_iter()
+            .any(walk)
+        {
+            return true;
+        }
         match pattern {
             GraphPattern::Graph { .. } => true,
             GraphPattern::Join { left, right }
@@ -114,6 +126,14 @@ pub fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) 
         in_graph: &mut usize,
         is_schema_graph: &dyn Fn(&NamedNodePattern) -> bool,
     ) {
+        // Counted at this node's own `inside`, which is what a `GRAPH`
+        // enclosing the filter already set. Omitting these undercounted
+        // `total`, so a query whose only *instance* pattern sat inside a
+        // `FILTER EXISTS` looked schema-only, was answered from the schema
+        // graph with no instances loaded, and returned nothing.
+        for block in crate::sparql_scoper::exists_patterns_in_expressions_of(pattern) {
+            walk(block, inside, total, in_graph, is_schema_graph);
+        }
         match pattern {
             GraphPattern::Bgp { patterns } => {
                 *total += patterns.len();
@@ -208,6 +228,53 @@ mod tests {
         // An unparseable query is treated as possibly reading it, so oxigraph
         // reports the real parse error rather than this function inventing one.
         assert!(query_reads_named_graphs("SELECT ?s WHERE {"));
+    }
+
+    /// Review finding 3, second manifestation.
+    ///
+    /// A `GRAPH` inside an expression's `EXISTS` block is a `GRAPH` clause, and
+    /// both walkers used to recurse into child patterns only. The first
+    /// consequence was that the schema graph was never built, so the query
+    /// answered zero rows — and bolting on an *otherwise ineffective*
+    /// `OPTIONAL { GRAPH … }` with constant terms that match nothing made the
+    /// same query answer correctly, which is how it was found. The second was
+    /// that the instance pattern inside a `FILTER EXISTS` was not counted, so
+    /// a mixed query looked schema-only and was answered with no instances
+    /// loaded at all.
+    #[test]
+    fn an_exists_block_is_part_of_the_query_for_both_questions() {
+        let inside_exists = format!(
+            "SELECT ?s WHERE {{ ?s ?p ?o . FILTER EXISTS {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c ?q ?r }} }} }}"
+        );
+        assert!(query_reads_named_graphs(&inside_exists));
+        // Mixed, not schema-only: one instance pattern, one schema pattern.
+        assert!(!reads_only_the_schema_graph(
+            &inside_exists,
+            Some(SCHEMA_GRAPH)
+        ));
+
+        // The other way round — the only *instance* pattern is the one inside
+        // the block. Undercounting `total` made this look schema-only.
+        let instance_inside_exists = format!(
+            "SELECT ?c WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c ?p ?o }} \
+             FILTER EXISTS {{ ?s a <https://data.infrabel.be/asset360/Signal> }} }}"
+        );
+        assert!(!reads_only_the_schema_graph(
+            &instance_inside_exists,
+            Some(SCHEMA_GRAPH)
+        ));
+
+        // And a genuinely schema-only query whose schema pattern happens to sit
+        // in a block is still schema-only: the count is per-node `inside`, not
+        // a guess.
+        let schema_only_inside_exists = format!(
+            "SELECT ?c WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c ?p ?o }} \
+             FILTER EXISTS {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c a owl:Class }} }} }}"
+        );
+        assert!(reads_only_the_schema_graph(
+            &schema_only_inside_exists,
+            Some(SCHEMA_GRAPH)
+        ));
     }
 
     #[test]

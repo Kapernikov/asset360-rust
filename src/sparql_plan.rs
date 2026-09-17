@@ -422,6 +422,23 @@ impl fmt::Display for ExecutionPlan {
             writeln!(f, "      {obligation}")?;
         }
 
+        // A partial refusal, stated. The kept list is the justification doc
+        // 28h §5 requires for answering by the slower route; the refused list
+        // is what 28g used to lose without saying so, and it is the more
+        // useful of the two to read.
+        if let Refinement::Fallback { why, narrowings } = &self.refinement {
+            writeln!(f, "  fallback  {why}")?;
+            for kept in &narrowings.kept {
+                writeln!(f, "      kept      {kept}")?;
+            }
+            for refused in &narrowings.refused {
+                writeln!(f, "      refused   {refused}")?;
+            }
+            if narrowings.kept.is_empty() && narrowings.refused.is_empty() {
+                writeln!(f, "      kept      (no rule derived a narrowing)")?;
+            }
+        }
+
         writeln!(f, "\nobligations")?;
         for (id, obligation) in self.obligations.iter().enumerate() {
             writeln!(f, "  o{id}  {obligation}")?;
@@ -877,9 +894,23 @@ pub enum Refinement {
     /// test against the engine leg, because there is nothing else to check it
     /// against.
     UsedAlone(String),
-    /// The pipeline produced no statement, so the scoper's fetch is used and
-    /// the engine answers over it. No shape in the frozen inventory does this.
-    Fallback(String),
+    /// The renderer could not express the refined plan as one statement, so
+    /// the scoper's decomposition is the fetch and the engine answers over it.
+    ///
+    /// **Partial, not total.** `why` is the lowering's refusal; `narrowings`
+    /// is every restriction the refined plan derived that was merged into that
+    /// decomposition anyway, and every one that was refused, each with its
+    /// reason. Both lists are the *record* doc 28h §5 requires of a
+    /// degrade-and-report: a kept narrowing whose justification nothing states
+    /// is the arrangement that produced findings 3, 4 and 10.
+    ///
+    /// `SeveralIslands` is the shape that matters here -- any equality join
+    /// between two stars produces it -- and it used to discard 28g's schema-side
+    /// pushdown wholesale.
+    Fallback {
+        why: String,
+        narrowings: Box<KeptNarrowings>,
+    },
 }
 
 impl Refinement {
@@ -887,14 +918,23 @@ impl Refinement {
         match self {
             Self::Used(_) => "used",
             Self::UsedAlone(_) => "used_alone",
-            Self::Fallback(_) => "fallback",
+            Self::Fallback { .. } => "fallback",
         }
     }
 
     /// Why the pipeline produced no statement, for a log line.
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::Fallback(reason) => Some(reason),
+            Self::Fallback { why, .. } => Some(why),
+            _ => None,
+        }
+    }
+
+    /// What a partial refusal kept and what it refused, or `None` when the
+    /// refined plan was used and there was nothing to refuse.
+    pub fn narrowings(&self) -> Option<&KeptNarrowings> {
+        match self {
+            Self::Fallback { narrowings, .. } => Some(narrowings),
             _ => None,
         }
     }
@@ -933,12 +973,18 @@ pub fn naive_plan_text(query: &str) -> Result<String, String> {
 /// evidence: the artifact `plan_query_refined` returns carries today's
 /// operators, so the plan the gate rejected is gone by the time anyone reads
 /// the reason. This is that plan.
+///
+/// `schema_graph_iri` is the graph the active datamodel serves its schema in,
+/// and it is a parameter here for the same reason it is one everywhere else:
+/// it decides which rules exist, so a diagnostic that left it out would print a
+/// plan production never builds.
 pub fn refined_plan_text(
     query: &str,
     schema: &linkml_schemaview::schemaview::SchemaView,
+    schema_graph_iri: Option<&str>,
 ) -> Result<String, String> {
     let naive = crate::sparql_refine::naive_plan_of(query).map_err(|e| e.to_string())?;
-    let rules = crate::sparql_rules::tier_one_rules(schema);
+    let rules = crate::sparql_rules::tier_one_rules(schema, schema_graph_iri);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
         rules.iter().map(|rule| rule.as_ref()).collect();
     let mut plan = naive;
@@ -1026,16 +1072,22 @@ pub fn plan_query_refined_with_schema_graph(
         // not represent. The scoper has already accepted it, so there are rows
         // to fetch: hand back the star decomposition's fetch and let the
         // engine answer over it.
-        Err(error) => return Ok(fetch_only(obligations, &scoped, error.to_string())),
+        // No refined plan exists, so there is nothing to keep: a
+        // partial refusal is partial in what the *rules* proved.
+        Err(error) => return Ok(fetch_only(obligations, &scoped, error.to_string(), None)),
     };
-    let rules = crate::sparql_rules::tier_one_rules(schema_view);
+    let rules = crate::sparql_rules::tier_one_rules(schema_view, schema_graph_iri);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
         rules.iter().map(|rule| rule.as_ref()).collect();
     if let Err(failure) = crate::sparql_rules::refine(&mut refined, &borrowed) {
+        // A plan a rule broke is a plan whose narrowings nothing vouches
+        // for -- the invariant that would have vouched for them is the one
+        // that failed. Refuse them all.
         return Ok(fetch_only(
             obligations,
             &scoped,
             format!("a rule broke the plan: {failure}"),
+            None,
         ));
     }
 
@@ -1046,10 +1098,15 @@ pub fn plan_query_refined_with_schema_graph(
         // to be a *fetch* rather than an error, because a query that answers
         // slowly today must not start refusing.
         Err(refusal) => {
+            // **The partial refusal.** The renderer cannot express this
+            // plan as one statement, which says nothing about whether an
+            // individual narrowing holds of every answer -- so the refined
+            // plan comes along and each narrowing is judged on its own.
             return Ok(fetch_only(
                 obligations,
                 &scoped,
                 format!("not lowerable: {refusal}"),
+                Some((&refined, schema_view)),
             ));
         }
     };
@@ -1115,6 +1172,282 @@ pub fn plan_query_refined_with_schema_graph(
     Ok(plan)
 }
 
+/// What a partial refusal kept, and what it refused, each with its reason.
+///
+/// Both lists, always. A kept narrowing without a recorded justification is
+/// the arrangement doc 28h §5 forbids, and a refused one that nobody records
+/// is 28g evaporating silently -- which is the defect this whole milestone
+/// exists to stop. The strings are diagnostics, printed by
+/// [`ExecutionPlan`]'s `Display`; nothing switches on them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeptNarrowings {
+    pub kept: Vec<String>,
+    pub refused: Vec<String>,
+}
+
+/// Merge into the scoper's decomposition every narrowing the refined plan
+/// *proved*, and record every one it could not.
+///
+/// **Why this exists.** `lower_refined` refuses a plan it cannot render as one
+/// SQL statement -- `SeveralIslands` above all, which any equality join between
+/// two stars produces. Until now that refusal discarded the refined plan
+/// entirely and re-derived the fetch from the star decomposition, so every
+/// rule-derived narrowing survived *only* while the whole plan collapsed to one
+/// island. 28g's schema-side pushdown worked on its motivating shape and
+/// evaporated one operator away from it, silently and completely (doc 28h §4).
+///
+/// **What makes a narrowing keepable is a property, not a shape**, and the
+/// property is doc 28h §4.1's sufficiency condition rather than the weaker
+/// phrase this function was first written against ("the fetch is a superset of
+/// what the query needs"). The engine re-runs the *original query* over the
+/// store built from the fetched records, so the fallback is correct exactly
+/// when
+///
+/// ```text
+/// eval(Q, fetched) = eval(Q, complete)
+/// ```
+///
+/// as solution bags with RDF term identity. That decomposes into three demands,
+/// and this function owns the first:
+///
+/// * **D1 — every record a solution reads is fetched.** Precondition 1 below.
+/// * **D2 — every fetched record is fetched whole.** Not this function's to
+///   enforce and this function's to *not break*: it writes only `filters`,
+///   `path_filters` and `multivalued_fields`, never `required_fields` or a
+///   retrieval, because a fetch that narrows *projection* rather than rows
+///   invents answers — omit a present `:p` and `FILTER NOT EXISTS { ?s :p ?v }`
+///   reports a solution the database does not have. Asserted by
+///   `the_merge_never_adds_a_required_slot`.
+/// * **D3 — restrictions do not compose across roles.** Each condition is
+///   written to the one star it names, so two roles of one class stay two scans
+///   and two `UNION` branches stay two stars. Asserted by
+///   `a_narrowing_on_one_role_does_not_restrict_another`.
+///
+/// Six preconditions, each of which refuses rather than assumes:
+///
+/// 1. **It reaches every answer (D1).** [`crate::sparql_rules::applies_to_every_answer`]
+///    -- the exhaustive one, whose missing `AntiJoin` arm *was* review finding
+///    10. A condition under a `LeftJoin`'s optional side, a `Union` branch, a
+///    `Minus`/`AntiJoin` right side or a `Service` decides a binding or a
+///    negation and not which records exist, so merging it would drop rows.
+/// 2. **It is a conjunction.** A `Star`'s `filters` map is `slot -> [condition]`
+///    and implicitly conjunctive, so a within-star disjunction (the shape
+///    `to_sql` declines and `to_sql_tree` carries) has nowhere to live here.
+///    Merging one branch as a conjunct answers a narrower question.
+/// 3. **The star is one the fallback fetches**, with the class the refined
+///    scan read it as. A condition on a star the decomposition does not have
+///    would be dropped by the renderer, and one on a star it scanned as another
+///    class would be rendered against the wrong column.
+/// 4. **The reading agrees.** `lower_sql_pass` recomputes `Column` versus
+///    `AnyElement` from `Star::multivalued_fields`, so a condition the refined
+///    plan derived as an element test must land on a slot that star lists as
+///    multivalued -- otherwise the renderer compares a constant against the
+///    array's text and matches nothing (`ConditionReadsACollection`, the one
+///    defect this pipeline shipped). The slot is *added* to that list when the
+///    refined plan says it holds several values, because the list's contract is
+///    "every slot mentioned on this star"; a disagreement in the other
+///    direction refuses.
+/// 5. **It is not the identifier slot.** An identifier restriction is
+///    `Star::identifier_values`, rendered against the indexed `asset360_uri`
+///    column, and the scoper already derives its own. Appending to a list that
+///    renders as a conjunctive `IN` from a second source is an intersection
+///    nobody asked for (`IdentityUnfolded` is the same fact one level up).
+/// 6. **`to_sql` can state it at all.** The same call `lower_refined` makes, so
+///    a condition that does not render is refused here exactly as it would be
+///    there.
+///
+/// Note what is *not* a precondition: the refusal that brought us here. Why the
+/// renderer cannot express the plan as one statement says nothing about whether
+/// an individual condition holds of every answer -- that is the whole content
+/// of "partial".
+///
+/// And note what these preconditions are *not* sufficient for. A restriction a
+/// rule derived by **evaluating an expression early** is admitted by §2's
+/// conservative rejection of context-dependent and volatile expressions, not by
+/// D1--D3: this function cannot tell such a condition from any other, and if
+/// that rejection were relaxed without an effect analysis, D1 would still hold
+/// of a condition computed from the wrong draw.
+fn keep_what_the_rules_proved(
+    scoped: &mut crate::sparql_scoper::QueryPlan,
+    refined: &crate::sparql_refine::Plan,
+    schema: &SchemaView,
+) -> KeptNarrowings {
+    use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
+
+    let mut out = KeptNarrowings::default();
+
+    // Which class each star was scanned as, and which of its slots the refined
+    // plan read as multivalued. Both come from the refined scans, so
+    // precondition 3 and 4 are answered by the plan under discussion rather
+    // than by a second derivation.
+    let mut classes: HashMap<String, String> = HashMap::new();
+    let mut multivalued: HashMap<(String, String), bool> = HashMap::new();
+    for node in &refined.nodes {
+        if let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            slots,
+            ..
+        } = &node.op
+        {
+            classes.insert(star_var.clone(), class_uri.clone());
+            for slot in slots {
+                if let [name] = slot.path.as_slice() {
+                    multivalued.insert((star_var.clone(), name.clone()), slot.multivalued);
+                }
+            }
+        }
+    }
+
+    for (id, node) in refined.nodes.iter().enumerate() {
+        let RefinedOp::Filter { condition, .. } = &node.op else {
+            continue;
+        };
+        // A filter the rules left with the engine narrows nothing here either:
+        // it is a condition SQL was never asked to apply.
+        if node.executor != Executor::Sql {
+            continue;
+        }
+        // Precondition 1.
+        if !crate::sparql_rules::applies_to_every_answer(refined, id) {
+            out.refused.push(format!(
+                "n{id}: an operator above it makes the constraint conditional, so \
+                 the records it excludes can still be in an answer"
+            ));
+            continue;
+        }
+        // Preconditions 2 and 6, in one call: `to_sql` declines both a shape it
+        // cannot render and a within-star disjunction.
+        let Some(conditions) = condition.to_sql(schema, &classes) else {
+            out.refused.push(format!(
+                "n{id}: not a conjunction of conditions a star's filter map can \
+                 hold -- a disjunction merged as a conjunct narrows the answer"
+            ));
+            continue;
+        };
+        for condition in conditions {
+            let Some(class_uri) = classes.get(&condition.star_var).cloned() else {
+                out.refused.push(format!(
+                    "n{id}: ?{} is not a star the refined plan scanned",
+                    condition.star_var
+                ));
+                continue;
+            };
+            let identifier = crate::sparql_ops::identifier_slot_of(schema, &class_uri);
+            // Precondition 5.
+            if identifier
+                .as_deref()
+                .is_some_and(|slot| condition.slot_path.as_slice() == [slot.to_owned()])
+            {
+                out.refused.push(format!(
+                    "n{id}: a restriction on the identifier slot belongs against \
+                     the indexed column as identifier_values, which the \
+                     decomposition derives itself"
+                ));
+                continue;
+            }
+            // Precondition 3.
+            let Some(star) = scoped
+                .root
+                .all_stars_mut()
+                .into_iter()
+                .find(|star| star.variable == condition.star_var)
+            else {
+                out.refused.push(format!(
+                    "n{id}: ?{} is not a star this fetch reads",
+                    condition.star_var
+                ));
+                continue;
+            };
+            if star.class_uri != class_uri {
+                out.refused.push(format!(
+                    "n{id}: ?{} is scanned as {} here and as {class_uri} there",
+                    condition.star_var, star.class_uri
+                ));
+                continue;
+            }
+            match condition.slot_path.as_slice() {
+                [] => out
+                    .refused
+                    .push(format!("n{id}: a condition on no slot at all")),
+                // A column of the record itself.
+                [slot] => {
+                    // Precondition 4.
+                    let says_several = matches!(
+                        condition.reading,
+                        crate::sparql_ops::SlotReading::AnyElement
+                            | crate::sparql_ops::SlotReading::BoundElement
+                    );
+                    let listed = star.multivalued_fields.iter().any(|field| field == slot);
+                    match (says_several, listed) {
+                        (true, false) => {
+                            // The refined plan read it as an array and this
+                            // star has not mentioned it. Add the fact rather
+                            // than the condition-with-the-wrong-reading: the
+                            // list's contract is every slot mentioned on the
+                            // star, and it is now mentioned.
+                            star.multivalued_fields.push(slot.clone());
+                            star.multivalued_fields.sort();
+                        }
+                        (false, true) => {
+                            out.refused.push(format!(
+                                "n{id}: reads ?{}.{slot} as a column and this fetch \
+                                 holds several values there, so the comparison would \
+                                 be against the array's text",
+                                condition.star_var
+                            ));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let existing = star.filters.entry(slot.clone()).or_default();
+                    if existing.contains(&condition.condition) {
+                        // Already derived by the scoper. Not a refusal and not
+                        // a second conjunct -- the same condition twice renders
+                        // as two identical predicates.
+                        continue;
+                    }
+                    existing.push(condition.condition.clone());
+                    out.kept.push(format!(
+                        "n{id}: ?{}.{slot} -- the constraint reaches every answer",
+                        condition.star_var
+                    ));
+                }
+                // A value inside one of the record's columns. Same
+                // preconditions; a different field, because the two render
+                // differently and `numeric` cannot be read off
+                // `numeric_fields` for a nested value.
+                path => {
+                    let numeric = crate::sparql_scoper::numeric_at_path(schema, &class_uri, path);
+                    if let Some(existing) = star
+                        .path_filters
+                        .iter_mut()
+                        .find(|filter| filter.slot_path == path)
+                    {
+                        if existing.conditions.contains(&condition.condition) {
+                            continue;
+                        }
+                        existing.conditions.push(condition.condition.clone());
+                    } else {
+                        star.path_filters.push(crate::sparql_scoper::PathFilter {
+                            slot_path: path.to_vec(),
+                            conditions: vec![condition.condition.clone()],
+                            numeric,
+                        });
+                    }
+                    out.kept.push(format!(
+                        "n{id}: ?{}.{} -- the constraint reaches every answer",
+                        condition.star_var,
+                        path.join(".")
+                    ));
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// A fetch from the star decomposition, with the engine answering over it.
 ///
 /// The last resort, and deliberately not a planner: the scoper decided which
@@ -1122,10 +1455,18 @@ pub fn plan_query_refined_with_schema_graph(
 /// aggregate, no solution, nothing claimed beyond the triples the scoper
 /// represented -- which is what the endpoint has always fetched when the
 /// aggregate route refused.
+///
+/// **Partial since 28h §4.** When a refined plan exists, the narrowings it
+/// proved are merged into that decomposition by
+/// [`keep_what_the_rules_proved`], and each one kept or refused is recorded on
+/// `Refinement::Fallback`. The decomposition is still the *baseline* -- a
+/// refusal is a refusal of the lowering, and the scoper's fetch is the superset
+/// every kept narrowing then restricts.
 fn fetch_only(
     obligations: Vec<Obligation>,
     scoped: &crate::sparql_scoper::QueryPlan,
     why: String,
+    refined: Option<(&crate::sparql_refine::Plan, &SchemaView)>,
 ) -> ExecutionPlan {
     let triple_count = obligations
         .iter()
@@ -1145,6 +1486,16 @@ fn fetch_only(
     let engine_claims: Vec<ObligationId> = (0..obligations.len())
         .filter(|id| !sql_claims.contains(id))
         .collect();
+    // The partial refusal. The decomposition is the baseline either way; what
+    // a refined plan adds is every narrowing it can prove applies to every
+    // answer. The claims above are untouched by design: a merged narrowing
+    // *narrows* and claims nothing, so the ledger says exactly what it said
+    // before -- see `Enforcement::Narrows`.
+    let mut narrowed = scoped.clone();
+    let narrowings = match refined {
+        Some((refined, schema)) => keep_what_the_rules_proved(&mut narrowed, refined, schema),
+        None => KeptNarrowings::default(),
+    };
     ExecutionPlan {
         contract: PLAN_CONTRACT,
         passes: vec![
@@ -1154,7 +1505,7 @@ fn fetch_only(
                 discharges: sql_claims.clone(),
                 emits: Vec::new(),
                 kind: PassKind::Sql(Box::new(SqlPass {
-                    ops: crate::sparql_ops::lower_sql_pass(scoped, &sql_claims),
+                    ops: crate::sparql_ops::lower_sql_pass(&narrowed, &sql_claims),
                 })),
             },
             Pass {
@@ -1169,7 +1520,10 @@ fn fetch_only(
         ],
         residual: Vec::new(),
         obligations,
-        refinement: Refinement::Fallback(why),
+        refinement: Refinement::Fallback {
+            why,
+            narrowings: Box::new(narrowings),
+        },
     }
 }
 
@@ -1282,7 +1636,7 @@ mod tests {
         .expect("a UNION plans");
 
         assert!(
-            matches!(plan.refinement, Refinement::Fallback(ref why) if why.contains("UNION")),
+            matches!(plan.refinement, Refinement::Fallback { ref why, .. } if why.contains("UNION")),
             "the union is refused by the lowering, not silently half-pushed: {plan}"
         );
         assert!(plan.is_accounted(), "{plan}");
@@ -2196,7 +2550,7 @@ mod tests {
         );
 
         let naive = naive_plan_text(&query).expect("the naive plan is a transcription");
-        let refined = refined_plan_text(&query, &sv).expect("this shape refines");
+        let refined = refined_plan_text(&query, &sv, None).expect("this shape refines");
 
         assert_ne!(naive, refined, "refinement moved nothing");
         // The naive plan is the engine's throughout; the refined one is not.
@@ -2334,5 +2688,326 @@ mod tests {
         // Printed here so a failing run shows the format a human is meant to
         // read, not just an assertion.
         println!("{printed}");
+    }
+
+    // -- partial refusal (doc 28h §4) ------------------------------------
+
+    /// The query this milestone exists for: **one equality join away from the
+    /// shape that works**.
+    ///
+    /// A two-column `VALUES` joined onto a scan is a semi-join reduction the
+    /// rules derive and the star decomposition does not
+    /// (`ValuesNarrowTheJoinedScan`). Add a second star joined to the first on
+    /// a value, and the `Sql` frontier is two islands, which the renderer
+    /// refuses because a pass is one statement. Until this change that refusal
+    /// discarded the refined plan whole and the fetch read the entire class.
+    ///
+    /// The control is the point of the test: the *same* scoped plan lowered on
+    /// its own carries no condition at all, so the assertion says the merge
+    /// produced this rather than pinning a string the scoper would satisfy
+    /// anyway.
+    #[test]
+    fn a_narrowing_survives_a_plan_the_renderer_cannot_lower() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?nm ?tag WHERE {{ \
+             ?s a asset360:Signal ; asset360:name ?nm . \
+             ?t a asset360:Track ; asset360:hasName ?nm . \
+             VALUES (?nm ?tag) {{ (\"a\" \"x\") (\"b\" \"y\") }} }}"
+        );
+        let plan = plan_query_refined(&query, &sv).expect("plans");
+
+        let Refinement::Fallback {
+            ref why,
+            ref narrowings,
+        } = plan.refinement
+        else {
+            panic!("a value join between two stars is two islands: {plan}");
+        };
+        assert!(why.contains("islands"), "{why}");
+        assert_eq!(narrowings.kept.len(), 1, "{plan}");
+        assert!(narrowings.kept[0].contains("?s.name"), "{plan}");
+
+        let printed = plan.to_string();
+        assert!(
+            printed.contains("filter    name IN ('a', 'b')"),
+            "the narrowing must reach the fetch: {printed}"
+        );
+
+        // The control. The decomposition on its own derives nothing here, so
+        // the condition above is the refined plan's and not the scoper's.
+        let parsed = parse_query(&query).expect("parses");
+        let scoped = crate::sparql_scoper::scope_parsed_with_schema_graph(&parsed, &sv, None)
+            .expect("scopes");
+        let bare = crate::sparql_ops::lower_sql_pass(&scoped, &[]);
+        assert!(
+            !bare
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, crate::sparql_ops::Op::Filter { .. })),
+            "the control must derive nothing, or this test proves nothing: {plan}"
+        );
+    }
+
+    /// The same, for a value *inside* a column: it lands in `path_filters`
+    /// rather than `filters`, and it has to carry its own `numeric`, which
+    /// `Star::numeric_fields` cannot answer for a nested value.
+    #[test]
+    fn a_narrowing_on_a_nested_value_survives_as_a_path_filter() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?lo ?tag WHERE {{ \
+             ?s a asset360:Signal ; asset360:location ?loc . ?loc asset360:longitude ?lo . \
+             ?t a asset360:Track ; asset360:hasName ?h . \
+             VALUES (?lo ?tag) {{ (1 \"x\") (2 \"y\") }} }}"
+        );
+        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let printed = plan.to_string();
+        assert!(
+            printed.contains("location.longitude IN ('1', '2')") && printed.contains("numeric"),
+            "a nested narrowing must reach the fetch, and as a number: {printed}"
+        );
+    }
+
+    /// And the multivalued case, where getting the *reading* wrong is a wrong
+    /// answer rather than a slow query: a containment test rendered as a
+    /// comparison against the array's text matches nothing
+    /// (`LoweringRefusal::ConditionReadsACollection`, the one defect this
+    /// pipeline shipped).
+    #[test]
+    fn a_narrowing_on_a_multivalued_slot_keeps_its_containment_reading() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?k ?tag WHERE {{ \
+             ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             ?t a asset360:Track ; asset360:hasName ?h . \
+             VALUES (?k ?tag) {{ (\"m\" \"x\") (\"f\" \"y\") }} }}"
+        );
+        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
+            panic!("{plan}");
+        };
+        assert_eq!(narrowings.kept.len(), 1, "{plan}");
+
+        let Some(PassKind::Sql(sql)) = plan.passes.first().map(|pass| &pass.kind) else {
+            panic!("{plan}");
+        };
+        let readings: Vec<crate::sparql_ops::SlotReading> = sql
+            .ops
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                crate::sparql_ops::Op::Filter { reading, .. } => Some(*reading),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            readings,
+            vec![crate::sparql_ops::SlotReading::AnyElement],
+            "a condition on an array is a containment test: {plan}"
+        );
+    }
+
+    /// **The refusal half, and it is the half that matters.**
+    ///
+    /// A test of the *code*, not of a query, in the genre doc 28h §3 asks for:
+    /// no rule in today's set pushes a narrowing inside a negation — each one
+    /// checks its own precondition — so the shape is reached by making the
+    /// edit a future rule would make, and asserting the merge stands down.
+    ///
+    /// The plan is the working two-island plan with an `AntiJoin` appended over
+    /// its narrowing. That is exactly review finding 10 one level up: a
+    /// constraint inside a negated pattern says what must *not* be there, so
+    /// turning it into a restriction on the records fetched inverts the query
+    /// and drops rows the negation keeps. `applies_to_every_answer` is the
+    /// exhaustive predicate that answers it, and this asserts the merge
+    /// consults it.
+    #[test]
+    fn a_narrowing_inside_a_negation_is_refused_rather_than_kept() {
+        use crate::sparql_refine::{Node, PlanOp as RefinedOp};
+
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?nm ?tag WHERE {{ \
+             ?s a asset360:Signal ; asset360:name ?nm . \
+             ?t a asset360:Track ; asset360:hasName ?nm . \
+             VALUES (?nm ?tag) {{ (\"a\" \"x\") (\"b\" \"y\") }} }}"
+        );
+        let parsed = parse_query(&query).expect("parses");
+        let mut refined = crate::sparql_refine::naive_plan(&parsed).expect("a naive plan");
+        let rules = crate::sparql_rules::tier_one_rules(&sv, None);
+        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+            rules.iter().map(|rule| rule.as_ref()).collect();
+        crate::sparql_rules::refine(&mut refined, &borrowed).expect("refines");
+
+        let narrowing = refined
+            .nodes
+            .iter()
+            .position(|node| matches!(node.op, RefinedOp::Filter { .. }))
+            .expect("the rules derived a narrowing, or the shape moved");
+        let root = refined.nodes.len() - 1;
+        refined.nodes.push(Node::engine(
+            RefinedOp::AntiJoin {
+                left: root,
+                right: narrowing,
+                reference: None,
+            },
+            Vec::new(),
+        ));
+
+        let mut scoped = crate::sparql_scoper::scope_parsed_with_schema_graph(&parsed, &sv, None)
+            .expect("scopes");
+        let narrowings = keep_what_the_rules_proved(&mut scoped, &refined, &sv);
+
+        assert!(narrowings.kept.is_empty(), "{narrowings:?}");
+        assert_eq!(narrowings.refused.len(), 1, "{narrowings:?}");
+        assert!(
+            narrowings.refused[0].contains("conditional"),
+            "the refusal has to say why: {narrowings:?}"
+        );
+        assert!(
+            scoped
+                .root
+                .all_stars()
+                .iter()
+                .all(|star| star.filters.is_empty()),
+            "nothing may reach the fetch: {:?}",
+            scoped.root.all_stars()
+        );
+    }
+
+    /// A narrowing on the identifier slot is refused rather than merged.
+    ///
+    /// Not because it is unsound as a *fetch* restriction — it is the one
+    /// narrowing `LoweringRefusal::IdentityIsNotATriple` says is fine for a
+    /// fetch and wrong for an answer — but because it belongs in
+    /// `Star::identifier_values`, against the indexed column, and the
+    /// decomposition derives its own. Appending to a list that renders as a
+    /// conjunctive `IN` from a second source is an intersection nobody asked
+    /// for.
+    #[test]
+    fn a_narrowing_on_the_identifier_slot_is_left_to_the_decomposition() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?id ?tag WHERE {{ \
+             ?s a asset360:Signal ; asset360:asset360_uri ?id . \
+             ?t a asset360:Track ; asset360:hasName ?h . \
+             VALUES (?id ?tag) {{ (\"one\" \"x\") (\"two\" \"y\") }} }}"
+        );
+        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
+            panic!("{plan}");
+        };
+        // Either nothing was derived, or it was derived and refused. What must
+        // not happen is a second `identifier_values` source.
+        assert!(
+            narrowings.kept.is_empty(),
+            "an identifier restriction is not a column filter: {plan}"
+        );
+    }
+
+    /// **D2, and it is the demand "keep candidate answers" misses.**
+    ///
+    /// `eval(Q, fetched) = eval(Q, complete)` is not satisfied by fetching every
+    /// record a solution reads: the engine decides `NOT EXISTS { ?s :p ?v }` by
+    /// the *absence* of a `:p` triple in the store it built. Fetch the record
+    /// and omit a `:p` it actually has, and the store says absent where the
+    /// database says present -- so the engine reports a solution the complete
+    /// dataset has not got. It does not lose an answer, it **invents** one, and
+    /// that is why a present triple which makes a negative pattern false is a
+    /// *negative witness* and part of what must be fetched.
+    ///
+    /// Two halves, both asserted here because both are true today by the shape
+    /// of the code and were recorded nowhere: every fallback scan retrieves the
+    /// whole record, and the merge never turns a narrowing into a *presence*
+    /// requirement. The second is review finding 10's mechanism exactly --
+    /// `required_fields` is what renders as `object_data ? 'hasName'`.
+    #[test]
+    fn the_merge_never_narrows_the_projection() {
+        let sv = test_schema_view();
+        // Each of these falls back, and the last is the negative-witness shape.
+        for query in [
+            "SELECT ?nm ?tag WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             ?t a asset360:Track ; asset360:hasName ?nm . \
+             VALUES (?nm ?tag) { (\"a\" \"x\") (\"b\" \"y\") } }",
+            "SELECT ?s WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
+            "SELECT ?nm ?tag WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             ?t a asset360:Track ; asset360:hasName ?h . \
+             VALUES (?nm ?tag) { (\"a\" \"x\") } \
+             FILTER NOT EXISTS { ?s asset360:kind ?k } }",
+        ] {
+            let query = format!("{PREFIX}{query}");
+            let plan = plan_query_refined(&query, &sv).expect("plans");
+            assert!(
+                matches!(plan.refinement, Refinement::Fallback { .. }),
+                "this test only says anything about the fallback: {plan}"
+            );
+            let Some(PassKind::Sql(sql)) = plan.passes.first().map(|pass| &pass.kind) else {
+                panic!("{plan}");
+            };
+            for node in &sql.ops.nodes {
+                let crate::sparql_ops::Op::Scan {
+                    retrieval,
+                    required_slots,
+                    ..
+                } = &node.op
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    *retrieval,
+                    crate::sparql_ops::Retrieval::Whole,
+                    "a fallback scan that projects cannot answer a negation: {plan}"
+                );
+                // The merge writes conditions, never presence requirements.
+                // The scoper's own `required_fields` are the query's reads and
+                // are not this function's; what must not appear is a slot only
+                // a *narrowing* mentioned.
+                assert!(
+                    !required_slots.iter().any(|slot| slot == "kind"),
+                    "a slot read only inside a negation must not become required: {plan}"
+                );
+            }
+        }
+    }
+
+    /// **D3.** A record narrowed in one role is still needed unrestricted in
+    /// another. Two stars of the same class are two scans, and the store is the
+    /// *union* of their fetches, so a condition written to `?s` must not reach
+    /// `?o` -- which is the shape in which restrictions from two `UNION`
+    /// branches would otherwise meet as a conjunction on one scan.
+    #[test]
+    fn a_narrowing_on_one_role_does_not_restrict_another() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?o ?tag WHERE {{ \
+             ?s a asset360:Signal ; asset360:name ?nm . \
+             ?o a asset360:Signal ; asset360:length ?len . \
+             ?t a asset360:Track ; asset360:hasName ?nm . \
+             VALUES (?nm ?tag) {{ (\"a\" \"x\") }} }}"
+        );
+        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let Some(PassKind::Sql(sql)) = plan.passes.first().map(|pass| &pass.kind) else {
+            panic!("{plan}");
+        };
+        let narrowed: Vec<&String> = sql
+            .ops
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                crate::sparql_ops::Op::Filter { star_var, .. } => Some(star_var),
+                _ => None,
+            })
+            .collect();
+        // `?s` and `?t` both bind `?nm` in a slot position, so the semi-join
+        // reduction reaches both and D1 holds of each: every answer's `?s` has
+        // `name = 'a'` and every answer's `?t` has `hasName = 'a'`. `?o` is the
+        // point -- it scans the *same class* as `?s` in a different role, binds
+        // nothing the `VALUES` constrains, and must come back unrestricted.
+        assert!(narrowed.contains(&&"s".to_owned()), "{plan}");
+        assert!(
+            !narrowed.contains(&&"o".to_owned()),
+            "a second role of the same class must not inherit the restriction: {plan}"
+        );
     }
 }
