@@ -1895,15 +1895,36 @@ fn sole_scan_of_star(plan: &Plan, node: NodeId, star: &str) -> Option<NodeId> {
     found
 }
 
-/// Whether a node's rows reach every answer: no left join above it keeps rows
-/// it did not match, no union offers an alternative to it, no minus subtracts
-/// through it.
+/// Whether a node's rows reach every answer: nothing above it makes this
+/// node's constraint conditional.
 ///
-/// The condition an identity fold needs, and not
+/// The condition an identity fold and a hop narrowing need, and not
 /// [`mandatorily_feeds`] to the root, which stops at the first modifier and
 /// would answer `false` for every plan with a projection. What matters is not
 /// that the path is joins all the way up but that nothing on it makes this
 /// node's constraint conditional.
+///
+/// **Exhaustive, with no `_` arm, and that is the point.** This used to end in
+/// `_ => false` -- "anything I have not been taught about leaves the
+/// constraint unconditional" -- which is a default that fails towards
+/// wrongness: a node kind added to the plan silently became one this analysis
+/// vouched for. `PlanOp::AntiJoin` was exactly that. It is the plan's
+/// `FILTER NOT EXISTS`, it negates its right side the way `Minus` does, and it
+/// was not in the list, so
+///
+/// ```sparql
+/// SELECT ?s WHERE { ?s a a:TunnelComplex . FILTER NOT EXISTS { ?s a:hasName "Shared" } }
+/// ```
+///
+/// made `hasName` *required* on the outer scan, the fetch added
+/// `object_data ? 'hasName'`, and the record with no name was gone before the
+/// engine could evaluate the negation -- so a record the query answers was
+/// dropped. That is the asset360 review's finding 10, and it is the review's
+/// wider point in miniature: an operator the plan represents whose semantics
+/// one analysis did not respect.
+///
+/// Listing every variant means the next operator is a compile error here
+/// rather than a wrong answer somewhere else.
 fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
     !plan.nodes.iter().any(|other| match &other.op {
         // The preserved side keeps rows the optional side did not match, so a
@@ -1915,7 +1936,39 @@ fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
         PlanOp::Union { left, right } => plan.feeds(node, *left) || plan.feeds(node, *right),
         // Narrowing what is subtracted *widens* the answer.
         PlanOp::Minus { right, .. } => plan.feeds(node, *right),
-        _ => false,
+        // **The same, and it was missing.** An anti join is a negated
+        // existence test: a constraint inside its right side says what must
+        // *not* be there, so it constrains nothing about the rows that survive
+        // -- and turning it into a requirement on the outer record inverts the
+        // query. See the doc comment above.
+        PlanOp::AntiJoin { right, .. } => plan.feeds(node, *right),
+        // A `SERVICE` subtree is somebody else's dataset. A constraint in it
+        // says nothing about the records fetched here.
+        PlanOp::Service { input, .. } => plan.feeds(node, *input),
+        // Everything else passes its input's rows through, so a constraint
+        // below it still decides which answers there are. Spelled out rather
+        // than defaulted, so adding an operator forces the question to be
+        // asked here.
+        PlanOp::Unit
+        | PlanOp::Match { .. }
+        | PlanOp::Path { .. }
+        | PlanOp::Values { .. }
+        | PlanOp::Join { .. }
+        | PlanOp::Filter { .. }
+        | PlanOp::Bind { .. }
+        | PlanOp::Group { .. }
+        | PlanOp::Sort { .. }
+        | PlanOp::Distinct { .. }
+        | PlanOp::Reduced { .. }
+        | PlanOp::Slice { .. }
+        | PlanOp::Project { .. }
+        | PlanOp::SubSelect { .. }
+        | PlanOp::Graph { .. }
+        | PlanOp::Scan { .. }
+        | PlanOp::Unnest { .. }
+        | PlanOp::Construct { .. }
+        | PlanOp::Describe { .. }
+        | PlanOp::Ask { .. } => false,
     })
 }
 
@@ -4044,6 +4097,15 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for SinkFilterIntoAnEva
             if used.is_empty() {
                 continue;
             }
+            // An `EXISTS` hides its pattern, so `used` is what this rule can
+            // *see* and not what the condition reads: the subquery may
+            // correlate on a variable the other side of the join binds, and
+            // moving the filter would evaluate it where that variable is
+            // unbound. Decline rather than decide on absent information --
+            // see `Expr::contains_an_opaque_subquery`.
+            if condition.contains_an_opaque_subquery() {
+                continue;
+            }
             // **Last resort, and this is what keeps the rule set confluent.**
             // A filter the statement can already take must not move: sinking
             // it onto one side of the join puts it between a `match` and its
@@ -4066,7 +4128,22 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for SinkFilterIntoAnEva
                 if !crate::sparql_materialise::is_an_evaluable_region(plan, side, &self.pass) {
                     continue;
                 }
-                let bound = plan.variables_of(side);
+                // **Definitely bound, not merely in scope.** `variables_of`
+                // would answer "in scope", and a variable can be in scope on
+                // this side and unbound in some of its solutions -- a `VALUES`
+                // column holding `UNDEF`, an `OPTIONAL`'s right side, a
+                // `UNION` arm that does not mention it, a `BIND` that errored.
+                // In each of those the join above is what supplies the
+                // binding, so the filter answers `true` there and errors
+                // here, and the move loses solutions. That is the asset360
+                // review's finding 1, reproduced as
+                // `a_filter_does_not_sink_onto_a_side_that_may_leave_it_unbound`.
+                //
+                // With the guarantee, the move is the textbook equivalence
+                // `σ_c(A ⋈ B) = σ_c(A) ⋈ B`: a compatible merge cannot change
+                // a value the side already committed to, so `c` decides the
+                // same way on both sides of the move.
+                let bound = plan.definitely_bound_of(side);
                 if used.iter().all(|name| bound.contains(name)) {
                     move_filter_onto(plan, id, side, join, input);
                     return true;

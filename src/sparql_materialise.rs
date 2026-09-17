@@ -226,11 +226,20 @@ pub fn schema_only(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
 /// what its own inputs bind, which is the same statement one level at a time.
 fn no_free_variables(plan: &Plan, node: NodeId) -> bool {
     subtree(plan, node).into_iter().all(|id| {
+        // **Definitely bound, not merely in scope**, for the reason
+        // `sink_filter_into_an_evaluable_side` needs the same distinction. A
+        // variable that is in scope below this node but unbound in some of its
+        // solutions -- an `UNDEF` column, an `OPTIONAL`'s right side, a
+        // `UNION` arm that does not mention it -- is still a dependency on
+        // whatever binds it: the join above the region is what supplies the
+        // value, and evaluating the region on its own evaluates the expression
+        // against an unbound variable instead. That excludes solutions the
+        // query has, which is the same lost-answer shape one level up.
         let bound: Vec<String> = plan.nodes[id]
             .op
             .inputs()
             .iter()
-            .flat_map(|input| plan.variables_of(*input))
+            .flat_map(|input| plan.definitely_bound_of(*input))
             .collect();
         expressions_of(&plan.nodes[id].op)
             .into_iter()
@@ -332,7 +341,60 @@ fn names_the_schema_graph(name: &str, schema_graph_iri: &str) -> bool {
 /// and nothing else, because everything that is true of *every* pass is asked
 /// here.
 pub fn is_an_evaluable_region(plan: &Plan, node: NodeId, pass: &dyn Materialisation) -> bool {
-    pass.qualifies(plan, node) && no_free_variables(plan, node)
+    pass.qualifies(plan, node)
+        && no_free_variables(plan, node)
+        && every_expression_evaluates_the_same_out_of_context(plan, node)
+}
+
+/// Whether every expression in the subplan would give the same answer when
+/// evaluated out of its place in the query.
+///
+/// **The second half of the eligibility contract, and every pass's.** A
+/// criterion says *what a subplan reads*; this says *whether evaluating it
+/// early is the same as evaluating it where it stands*. The asset360 review
+/// reproduced two wrong answers from asking only the first --
+/// `RAND`/`STRUUID` (finding 2) and a fully deterministic `IRI("foo")` under a
+/// `BASE` (finding 9) -- and the second is why the property is
+/// [`Expr::evaluates_the_same_out_of_context`] rather than determinism.
+///
+/// **This is a refusal and not a repair.** There are two sound alternatives
+/// and neither is available here yet: carry the materialised bindings into
+/// execution so the expression is evaluated exactly once, which needs the
+/// refined plan to reach the runtime (finding 5); or carry the whole
+/// evaluation context -- base IRI, dataset, active graph -- into the
+/// reconstructed query, which needs the plan to hold it (finding 4). Until one
+/// of those exists, a subplan this cannot vouch for keeps the behaviour it had
+/// before any of this.
+fn every_expression_evaluates_the_same_out_of_context(plan: &Plan, node: NodeId) -> bool {
+    subtree(plan, node).into_iter().all(|id| {
+        expressions_of(&plan.nodes[id].op)
+            .into_iter()
+            .all(crate::sparql_refine::Expr::evaluates_the_same_out_of_context)
+            // An aggregate carries an expression of its own, and
+            // `expressions_of` does not reach it.
+            && match &plan.nodes[id].op {
+                PlanOp::Group { measures, .. } => measures
+                    .iter()
+                    .all(|measure| aggregate_evaluates_the_same_out_of_context(&measure.aggregate)),
+                _ => true,
+            }
+    })
+}
+
+/// Whether an aggregate's inner expression may be evaluated out of context.
+///
+/// `COUNT(*)` has no expression, so it is; everything else is exactly as
+/// repeatable as what it aggregates. A variant this does not know declines,
+/// which leaves the plan as it was.
+fn aggregate_evaluates_the_same_out_of_context(
+    aggregate: &spargebra::algebra::AggregateExpression,
+) -> bool {
+    use spargebra::algebra::AggregateExpression as Agg;
+    let inner = match aggregate {
+        Agg::CountSolutions { .. } => return true,
+        Agg::FunctionCall { expr, .. } => expr,
+    };
+    crate::sparql_refine::Expr::from(inner).evaluates_the_same_out_of_context()
 }
 
 /// The root of a maximal subplan this pass can evaluate, if there is one.
@@ -381,7 +443,12 @@ pub fn materialisable_root(plan: &Plan, pass: &dyn Materialisation) -> Option<No
 /// wrong answer and never a hang, since a blocked region simply leaves the plan
 /// as it was and the fixpoint is reached regardless.
 fn nothing_is_still_sinking_into_it(plan: &Plan, node: NodeId) -> bool {
-    let bound = plan.variables_of(node);
+    // The same predicate the sink rule applies, and it has to be the same one:
+    // predicting that rule's route with a *wider* set would wait for a filter
+    // the rule will now never move, which leaves the region unmaterialised for
+    // the life of the plan. Costs a missed narrowing, never a wrong answer --
+    // but there is no reason to pay it.
+    let bound = plan.definitely_bound_of(node);
     let inside = subtree(plan, node);
     !plan.nodes.iter().enumerate().any(|(id, above)| {
         let PlanOp::Filter { condition, .. } = &above.op else {
@@ -1177,5 +1244,255 @@ mod tests {
             Some(SCHEMA_GRAPH),
         )
         .expect("the query refines")
+    }
+
+    /// **The asset360 review's finding 1, at the step that is unsound.**
+    ///
+    /// `?nm` is in scope on the `VALUES` side and *unbound in one of its rows*,
+    /// and the instance side is what binds it. Sinking the filter onto that
+    /// side evaluates `CONTAINS` against an unbound variable, which is an error
+    /// in SPARQL, which drops the `UNDEF` row -- and the query's answers that
+    /// came through that row with it. Above the join the same filter sees the
+    /// value the scan supplied.
+    ///
+    /// Asserted on the refined plan and not on the rendered SQL, because the
+    /// sink is the step that stops being an equivalence. Whether a lost
+    /// solution then reaches the statement depends on which consumer rule
+    /// happens to fire on the narrowed relation, and pinning the consumer would
+    /// be pinning the symptom. Before the fix this plan reads
+    /// `join n0, filter(values)`; the review reproduced the full wrong answer
+    /// from it against the production datamodel.
+    #[test]
+    fn a_filter_does_not_sink_onto_a_side_that_may_leave_it_unbound() {
+        let refined = refined_for(
+            "SELECT ?s ?nm ?tag WHERE { \
+             ?s a asset360:Signal ; asset360:NationalUniqueID ?nm . \
+             VALUES (?nm ?tag) { (UNDEF \"wild\") (\"GSA\" \"specific\") } \
+             FILTER(CONTAINS(?nm, \"GS\")) }",
+        );
+        let values = refined
+            .lines()
+            .find(|line| line.contains("values"))
+            .expect("the relation is in the plan");
+        assert!(
+            values.contains("× 2 row(s)"),
+            "the relation keeps both rows, UNDEF included:\n{refined}"
+        );
+        let filter = refined
+            .lines()
+            .position(|line| line.contains("filter    CONTAINS"))
+            .expect("the filter is in the plan");
+        let join = refined
+            .lines()
+            .position(|line| line.contains("join"))
+            .expect("the join is in the plan");
+        assert!(
+            filter > join,
+            "the filter stays above the join, where ?nm is bound:\n{refined}"
+        );
+    }
+
+    /// The same rule still sinks where the side *does* guarantee the binding:
+    /// finding 1's fix narrows the precondition, and this is what it must not
+    /// narrow away. This is issue #409's own query, and its acceptance
+    /// criterion is `the_schema_side_is_evaluated_and_the_scan_is_narrowed`.
+    #[test]
+    fn a_filter_still_sinks_onto_a_side_that_guarantees_the_binding() {
+        let refined = refined_for(&format!(
+            "SELECT ?s ?code WHERE {{ \
+             ?s a asset360:Signal ; asset360:signalType ?t . \
+             GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:notation ?code }} \
+             FILTER(CONTAINS(?code, \"GS\")) }}"
+        ));
+        assert!(
+            refined.contains("values"),
+            "the schema side was evaluated, so the filter reached it:\n{refined}"
+        );
+    }
+
+    /// The property itself, asked directly: which expressions may be
+    /// evaluated at plan time. The two rewrite-level tests around this one are
+    /// its consumers; this is the statement they rest on, so a new arm is
+    /// pinned here whether or not a query shape reaches it.
+    #[test]
+    fn only_a_context_free_expression_may_be_evaluated_early() {
+        for (sparql, safe) in [
+            // Pure functions of their arguments.
+            ("CONTAINS(?code, \"GS\")", true),
+            ("SUBSTR(UCASE(STR(?code)), 1, 2)", true),
+            ("(?code = \"GSA\")", true),
+            // A fresh draw per call -- review finding 2.
+            ("(RAND() < 0.5)", false),
+            ("CONTAINS(STRUUID(), ?code)", false),
+            ("CONTAINS(STR(UUID()), ?code)", false),
+            ("CONTAINS(STR(BNODE()), ?code)", false),
+            // A reading of the evaluation context -- review finding 9.
+            ("CONTAINS(STR(IRI(\"foo\")), ?code)", false),
+            ("CONTAINS(STR(URI(\"foo\")), ?code)", false),
+            ("CONTAINS(STR(NOW()), ?code)", false),
+            ("<https://example.org/f>(?code)", false),
+            // Nested under a pure function, so the whole expression declines.
+            ("IF(RAND() < 0.5, \"a\", \"b\")", false),
+        ] {
+            let parsed = spargebra::SparqlParser::new()
+                .parse_query(&format!(
+                    "SELECT * WHERE {{ ?code ?p ?o FILTER({sparql}) }}"
+                ))
+                .unwrap_or_else(|e| panic!("`{sparql}` parses: {e}"));
+            let spargebra::Query::Select { pattern, .. } = &parsed else {
+                unreachable!("a SELECT")
+            };
+            let mut conditions: Vec<crate::sparql_refine::Expr> = Vec::new();
+            collect_filter_conditions(pattern, &mut conditions);
+            let [condition] = conditions.as_slice() else {
+                panic!("`{sparql}` yields exactly one filter")
+            };
+            assert_eq!(
+                condition.evaluates_the_same_out_of_context(),
+                safe,
+                "`{sparql}`"
+            );
+        }
+    }
+
+    /// Every `FILTER` condition in a pattern, as an [`Expr`].
+    fn collect_filter_conditions(
+        pattern: &GraphPattern,
+        out: &mut Vec<crate::sparql_refine::Expr>,
+    ) {
+        match pattern {
+            GraphPattern::Filter { expr, inner } => {
+                out.push(crate::sparql_refine::Expr::from(expr));
+                collect_filter_conditions(inner, out);
+            }
+            GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Graph { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::OrderBy { inner, .. } => collect_filter_conditions(inner, out),
+            GraphPattern::Join { left, right, .. } | GraphPattern::Union { left, right } => {
+                collect_filter_conditions(left, out);
+                collect_filter_conditions(right, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// **Finding 9's own shape**, which finding 2's is not: a read-free
+    /// `BIND` region that binds a variable the instance side also binds, so
+    /// materialising it derives a fetch restriction on that column. The
+    /// expression is deterministic and still unsafe, because `IRI` resolves
+    /// against the base IRI and `materialise` rebuilds the subplan with
+    /// `base_iri: None`. Under a `BASE` the review got
+    /// `hasName IN ("Other")` in the plan and zero rows from an endpoint whose
+    /// correct answer is two.
+    ///
+    /// Asserted as "no restriction is derived", which is the right assertion
+    /// whatever the base happens to be: the planner cannot know the answer, so
+    /// it must not act on a guess.
+    #[test]
+    fn a_context_dependent_bind_does_not_narrow_the_fetch() {
+        for expression in [
+            // Finding 9, verbatim in shape.
+            "IF(COALESCE(STR(IRI(\"foo\")) = \"https://example.org/foo\", false), \"AAA\", \"BBB\")",
+            "IF(COALESCE(STR(URI(\"foo\")) = \"https://example.org/foo\", false), \"AAA\", \"BBB\")",
+            // Finding 2, in the same shape, so the two are pinned side by side.
+            "IF(RAND() < 0.5, \"AAA\", \"BBB\")",
+            "SUBSTR(STRUUID(), 1, 3)",
+        ] {
+            let plan = plan_for(&format!(
+                "SELECT ?s ?nm ?tag WHERE {{ \
+                 ?s a asset360:Signal ; asset360:NationalUniqueID ?nm . \
+                 {{ VALUES ?tag {{ \"x\" }} BIND({expression} AS ?nm) }} }}"
+            ));
+            assert!(
+                !plan.contains("filter    NationalUniqueID"),
+                "{expression} must not become a fetch restriction:\n{plan}"
+            );
+        }
+    }
+
+    /// **The asset360 review's finding 10.**
+    ///
+    /// `hasName` appears only inside a negated pattern, so it is a property
+    /// the fetch must *read* and never a property the outer record must
+    /// *have*. Making it `requires` put `object_data ? 'NationalUniqueID'`
+    /// into the fetch SQL, and the record with no name was dropped before the
+    /// engine could evaluate the negation -- so a record the query answers was
+    /// lost on both wheels.
+    ///
+    /// Asserted on the scan's own declaration, which is where the inversion
+    /// happens; the SQL predicate the review quoted is that declaration
+    /// rendered.
+    #[test]
+    fn a_negated_pattern_does_not_make_its_property_required() {
+        let refined = refined_for(
+            "SELECT ?s WHERE { ?s a asset360:Signal . \
+             FILTER NOT EXISTS { ?s asset360:NationalUniqueID \"GSA\" } }",
+        );
+        let scan = refined
+            .lines()
+            .find(|line| line.contains("scan      asset360:Signal"))
+            .expect("the scan is in the plan");
+        assert!(
+            !scan.contains("requires [NationalUniqueID"),
+            "a property only a negation reads must not be required:\n{refined}"
+        );
+    }
+
+    /// The four ways SPARQL lets a variable be in scope and unbound, asked of
+    /// the analysis directly rather than through a query that happens to
+    /// produce one of them. This is the property the review asked for; the two
+    /// rules above are its consumers.
+    #[test]
+    fn in_scope_and_definitely_bound_are_different_questions() {
+        for (body, variable, guaranteed) in [
+            // An UNDEF column.
+            (
+                "SELECT * WHERE { VALUES (?a ?b) { (UNDEF \"x\") (\"y\" \"z\") } }",
+                "a",
+                false,
+            ),
+            (
+                "SELECT * WHERE { VALUES (?a ?b) { (UNDEF \"x\") (\"y\" \"z\") } }",
+                "b",
+                true,
+            ),
+            // An OPTIONAL's right side.
+            (
+                "SELECT * WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:NationalUniqueID ?a } }",
+                "a",
+                false,
+            ),
+            // A UNION arm that does not mention it.
+            (
+                "SELECT * WHERE { { ?s a asset360:Signal ; asset360:NationalUniqueID ?a } \
+                 UNION { ?s a asset360:Signal } }",
+                "a",
+                false,
+            ),
+            // A BIND, whose expression may error and leave the variable
+            // unbound rather than failing the solution.
+            (
+                "SELECT * WHERE { ?s a asset360:Signal . BIND(1/0 AS ?a) }",
+                "a",
+                false,
+            ),
+        ] {
+            let plan = crate::sparql_refine::naive_plan_of(&query(body)).expect("the query parses");
+            let root = plan.nodes.len() - 1;
+            assert!(
+                plan.variables_of(root).contains(variable),
+                "?{variable} is in scope for `{body}`"
+            );
+            assert_eq!(
+                plan.definitely_bound_of(root).contains(variable),
+                guaranteed,
+                "?{variable} guaranteed for `{body}`:\n{plan}"
+            );
+        }
     }
 }

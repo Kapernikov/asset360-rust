@@ -1023,6 +1023,119 @@ impl Expr {
         }
     }
 
+    /// Whether an `EXISTS`/`NOT EXISTS` appears anywhere in this expression.
+    ///
+    /// [`Expr::Opaque`] keeps such a subquery as its *rendering* and not as a
+    /// pattern, so nothing that walks this expression can see what it reads or
+    /// which variables it correlates on. In particular
+    /// [`variables_used`] reports none for it.
+    ///
+    /// So any rule whose precondition is stated over the variables or the
+    /// reads of an expression has to ask this first and decline: "names no
+    /// variables" and "names none I can see" are different answers, and a rule
+    /// that cannot tell them apart is deciding on the absence of information.
+    /// Closing this properly means making `Expr` carry the pattern, which is
+    /// the asset360 review's finding 3 and is its own piece of work.
+    pub fn contains_an_opaque_subquery(&self) -> bool {
+        match self {
+            Self::Opaque(_) => true,
+            Self::And(parts) | Self::Or(parts) | Self::Function { args: parts, .. } => {
+                parts.iter().any(Self::contains_an_opaque_subquery)
+            }
+            Self::Not(inner) => inner.contains_an_opaque_subquery(),
+            Self::Compare { left, right, .. } => {
+                left.contains_an_opaque_subquery() || right.contains_an_opaque_subquery()
+            }
+            Self::In { value, candidates } => {
+                value.contains_an_opaque_subquery()
+                    || candidates.iter().any(Self::contains_an_opaque_subquery)
+            }
+            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } => false,
+        }
+    }
+
+    /// **Whether evaluating this expression early gives the answer execution
+    /// would give.**
+    ///
+    /// The precondition for evaluating an expression at plan time, and it is
+    /// one property and not a list of hazards: an expression may be evaluated
+    /// early exactly when its value is a function of *its arguments alone*.
+    /// Anything else -- a fresh draw, or a reading of the environment the
+    /// evaluator happens to be in -- can differ between the plan-time
+    /// evaluator and the execution-time one, and the two both run: the engine
+    /// is handed the *original* query, so an expression evaluated early is
+    /// evaluated again later. A rewrite that assumed they agree is only sound
+    /// if they must.
+    ///
+    /// The asset360 review reproduced both halves of that.
+    ///
+    /// * **A fresh draw.** `BIND(IF(RAND() < 0.5, "Shared", "Other") AS ?nm)`
+    ///   reads nothing, so a "reads only the schema" criterion accepted it. It
+    ///   narrowed the fetch to one name; the engine then tossed the coin again
+    ///   and chose the other. A query with one solution returned zero or one.
+    ///   `STRUUID` behaved the same way (review finding 2).
+    /// * **A reading of the environment.** `BIND(... STR(IRI("foo")) ...)` is
+    ///   perfectly deterministic, and still wrong to evaluate early:
+    ///   `IRI` resolves a relative IRI against the *base IRI*, and
+    ///   [`crate::sparql_materialise::materialise`] rebuilds the subplan as a
+    ///   query with `base_iri: None`. Under a `BASE` declaration the two
+    ///   evaluations disagree, the fetch was restricted to the wrong name, and
+    ///   the endpoint answered zero rows where the query has two (review
+    ///   finding 9).
+    ///
+    /// **Finding 9 is why this is one predicate and not two.** Determinism
+    /// alone is not the property; being closed over the evaluation context is
+    /// the other half, and a check written for volatility only would have
+    /// passed finding 9's expression. So the arms below are the *kinds* of
+    /// dependence rather than a list of functions to avoid:
+    ///
+    /// | function | depends on |
+    /// |---|---|
+    /// | `RAND`, `UUID`, `STRUUID`, `BNODE` | a fresh draw per call |
+    /// | `NOW` | the evaluation's timestamp -- stable within one evaluation, which is exactly the problem when there are two |
+    /// | `IRI` / `URI` | the query's base IRI |
+    /// | a custom function (name written `<iri>`) | the evaluator's function registry, which the plan-time evaluator's need not share |
+    /// | [`Expr::Opaque`] | the dataset and active graph, and it hides its own pattern so neither can be checked |
+    ///
+    /// Everything else is a pure function of its arguments, so it qualifies
+    /// exactly when they do.
+    ///
+    /// **What this does not cover, and deliberately.** A dataset clause
+    /// (`FROM`, `FROM NAMED`) also changes what an evaluation sees, and no
+    /// expression check can notice it because the clause is not in the
+    /// expression -- it is not in the [`Plan`] at all. That is review finding 4
+    /// and it is fixed by putting the dataset into the plan, not by another arm
+    /// here.
+    pub fn evaluates_the_same_out_of_context(&self) -> bool {
+        match self {
+            Self::Opaque(_) => false,
+            Self::Function { name, args } => {
+                !matches!(
+                    name.as_str(),
+                    "RAND" | "UUID" | "STRUUID" | "BNODE" | "NOW" | "IRI"
+                )
+                    // A custom function is written as its IRI, in brackets.
+                    && !name.starts_with('<')
+                    && args.iter().all(Self::evaluates_the_same_out_of_context)
+            }
+            Self::And(parts) | Self::Or(parts) => {
+                parts.iter().all(Self::evaluates_the_same_out_of_context)
+            }
+            Self::Not(inner) => inner.evaluates_the_same_out_of_context(),
+            Self::Compare { left, right, .. } => {
+                left.evaluates_the_same_out_of_context()
+                    && right.evaluates_the_same_out_of_context()
+            }
+            Self::In { value, candidates } => {
+                value.evaluates_the_same_out_of_context()
+                    && candidates
+                        .iter()
+                        .all(Self::evaluates_the_same_out_of_context)
+            }
+            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } => true,
+        }
+    }
+
     /// The tree this expression has the *shape* of, with the physical facts
     /// filled in.
     ///
@@ -2692,6 +2805,152 @@ impl Plan {
                     out.extend(self.variables_of(input));
                 }
             }
+        }
+        out
+    }
+
+    /// The variables this node binds **in every solution it emits**.
+    ///
+    /// A subset of [`Plan::variables_of`], and the difference is the whole
+    /// point. `variables_of` answers *which variables are in scope here* --
+    /// the set a join key can be drawn from, the set a name resolves against.
+    /// This answers *which variables a solution from here is guaranteed to
+    /// have a value for*, which is the question a rule must ask before it
+    /// moves an expression across a join.
+    ///
+    /// They differ wherever SPARQL lets a variable be in scope and unbound:
+    /// a `VALUES` column holding `UNDEF`, an `OPTIONAL`'s right side, a
+    /// `UNION` arm that does not mention it, a `BIND` whose expression
+    /// errored. In every one of those the join above supplies the binding the
+    /// side does not have, so a filter evaluated below the join sees an
+    /// unbound variable -- an error, which excludes the solution -- where the
+    /// same filter above the join sees a value. That is the lost-answer shape
+    /// the asset360 review reproduced with
+    /// `VALUES (?nm ?tag) { (UNDEF "wild") ("Shared" "specific") }`.
+    ///
+    /// **The default arm is empty, not the union of the inputs**, and that is
+    /// the invariant that keeps this sound as node kinds are added: a node
+    /// kind nobody has taught this function about guarantees nothing, so a
+    /// rule keyed on it declines and the plan keeps the behaviour it had.
+    /// `variables_of`'s default is the opposite, because being in scope *is*
+    /// inherited from the inputs.
+    pub fn definitely_bound_of(&self, node: NodeId) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let Some(node) = self.nodes.get(node) else {
+            return out;
+        };
+        match &node.op {
+            // A scan's star and its *required* slots: exactly what
+            // `variables_of` already says, for the same reason -- a delivered
+            // (`Optional`) read may come back null.
+            PlanOp::Scan {
+                star_var, slots, ..
+            } => {
+                out.insert(star_var.clone());
+                out.extend(
+                    slots
+                        .iter()
+                        .filter(|slot| slot.presence == SlotPresence::Required)
+                        .filter_map(|slot| slot.var.clone()),
+                );
+            }
+            // A triple pattern matches or it does not: every variable in it is
+            // bound in every solution.
+            PlanOp::Match { pattern } => {
+                add_term_var(&pattern.subject, &mut out);
+                if let NamedNodePattern::Variable(variable) = &pattern.predicate {
+                    out.insert(variable.as_str().to_owned());
+                }
+                add_term_var(&pattern.object, &mut out);
+            }
+            PlanOp::Path {
+                subject, object, ..
+            } => {
+                add_term_var(subject, &mut out);
+                add_term_var(object, &mut out);
+            }
+            // **The UNDEF case.** A column is guaranteed only when no row
+            // leaves it empty. A relation with no rows emits no solutions, so
+            // every column is vacuously guaranteed in all of them -- which is
+            // sound, and is what lets empty-relation propagation stay an
+            // optimisation rather than becoming a special case here.
+            PlanOp::Values { variables, rows } => {
+                for (column, variable) in variables.iter().enumerate() {
+                    if rows
+                        .iter()
+                        .all(|row| row.get(column).is_some_and(Option::is_some))
+                    {
+                        out.insert(variable.as_str().to_owned());
+                    }
+                }
+            }
+            // A join's solutions are compatible merges, so each side's
+            // guarantees hold and they add up.
+            PlanOp::Join { left, right, .. } => {
+                out.extend(self.definitely_bound_of(*left));
+                out.extend(self.definitely_bound_of(*right));
+            }
+            // The right side is exactly what an `OPTIONAL` does not promise.
+            PlanOp::LeftJoin { left, .. }
+            | PlanOp::Minus { left, .. }
+            | PlanOp::AntiJoin { left, .. } => out.extend(self.definitely_bound_of(*left)),
+            // Only what *both* arms promise. An arm that never mentions the
+            // variable leaves it unbound in that arm's solutions.
+            PlanOp::Union { left, right } => {
+                let right = self.definitely_bound_of(*right);
+                out.extend(
+                    self.definitely_bound_of(*left)
+                        .into_iter()
+                        .filter(|name| right.contains(name)),
+                );
+            }
+            // Select, do not bind.
+            PlanOp::Filter { input, .. }
+            | PlanOp::Sort { input, .. }
+            | PlanOp::Distinct { input, .. }
+            | PlanOp::Reduced { input, .. }
+            | PlanOp::Slice { input, .. }
+            | PlanOp::Graph { input, .. } => out.extend(self.definitely_bound_of(*input)),
+            // **A `BIND` does not promise its own variable.** SPARQL says an
+            // expression that errors leaves the variable unbound rather than
+            // failing the solution, so `BIND(1/0 AS ?x)` is in scope and never
+            // bound. `variables_of` adds `var` here; this deliberately does
+            // not.
+            PlanOp::Bind { input, .. } => out.extend(self.definitely_bound_of(*input)),
+            // A grouping key is bound in the group when it was bound in the
+            // rows -- `GROUP BY ?x` over solutions where `?x` is unbound puts
+            // the unbound group in the output too. Measures are left out:
+            // `SUM`/`AVG`/`MIN` over values that error is unbound, and `COUNT`
+            // being the exception is not worth an arm a rule would then have
+            // to trust.
+            PlanOp::Group { input, keys, .. } => {
+                let below = self.definitely_bound_of(*input);
+                out.extend(keys.iter().filter(|key| below.contains(*key)).cloned());
+            }
+            // A projection can only keep a guarantee, never make one: naming a
+            // variable in `SELECT` does not bind it.
+            PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars } => {
+                let below = self.definitely_bound_of(*input);
+                out.extend(vars.iter().filter(|var| below.contains(*var)).cloned());
+            }
+            // An unnest binds its element variable exactly when an empty
+            // collection drops the row, which is what `Required` means; the
+            // `Optional` form answers once with the variable unbound.
+            PlanOp::Unnest {
+                input,
+                var,
+                presence,
+                ..
+            } => {
+                out.extend(self.definitely_bound_of(*input));
+                if *presence == SlotPresence::Required {
+                    out.insert(var.clone());
+                }
+            }
+            // Everything else -- `Unit`, `Service`, `Construct`, `Describe`,
+            // `Ask`, and whatever is added next -- promises nothing. See the
+            // note above on why this arm is empty rather than inherited.
+            _ => {}
         }
         out
     }
