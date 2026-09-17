@@ -2185,16 +2185,10 @@ pub fn scope_parsed_with_schema_graph(
 
     // A subject the path walk reached is a step inside a star, which the plan
     // describes. Anything left is a subject nothing accounts for -- and that
-    // is a refusal, not a loss to record.
-    //
-    // It used to be recorded (as an `Inexact::UntypedSubject`) and the engine left
-    // to finish, on the reasoning that an inexact plan is still a correct
-    // fetch for the engine to re-apply the query over. It is not, here: the
-    // engine sees exactly the records the stars fetched, and a subject with
-    // no class is a record no star fetched. Its triples match *nothing*, so a
-    // mandatory one answered zero rows and an optional one a column of
-    // unbound values -- both 200, both wrong, neither distinguishable from
-    // "no such data". Doc 28h: refuse, and say what to write instead.
+    // is a refusal, not a loss to record: the engine sees exactly the records
+    // the stars fetched, so the triples of a subject no star fetches match
+    // *nothing*, and a plan marked inexact would still answer zero rows (or an
+    // unbound column) with a 200. Doc 28h: refuse, and say what to write.
     {
         let mut unaccounted: Vec<&String> = unresolved_subjects
             .iter()
@@ -2743,9 +2737,24 @@ fn scope_union(
     // rows together. See `QueryPlan::sql_limit_if_unioned`.
     let mut branch_limits: Vec<Option<usize>> = Vec::new();
 
-    for branch in branches {
+    for (index, branch) in branches.iter().enumerate() {
         let branch_query = with_pattern(query, branch.clone());
-        let plan = scope_parsed_with_schema_graph(&branch_query, schema_view, schema_graph_iri)?;
+        // A branch is scoped as a query of its own, so a type written in
+        // another arm does not reach it. The refusal says so, because the
+        // rewrite it names -- `?m a <Municipality>` -- may be one the author
+        // already wrote, in the other arm, and being told to add it again is
+        // worse than not being told which arm is short.
+        let plan = scope_parsed_with_schema_graph(&branch_query, schema_view, schema_graph_iri)
+            .map_err(|err| match err {
+                ScopeError::Unscoped(msg) => ScopeError::Unscoped(format!(
+                    "in UNION branch {} of {}: {msg} Each branch is scoped on its own, so a \
+                     type written in another branch does not carry over; the triple has to be \
+                     in every branch that uses the variable.",
+                    index + 1,
+                    branches.len()
+                )),
+                other => other,
+            })?;
         branch_limits.push(plan.sql_limit);
 
         // The stars this branch joins. Sharing one of them across branches is
@@ -4559,11 +4568,79 @@ fn untyped_subject_refusal(
              triple pattern. Use a variable that names a record."
         ));
     }
+    // The holder of a reference to a typed object: the schema knows which
+    // classes declare such a slot, so the message can list them rather than
+    // leave `<Class>` for the author to look up — the mirror of the reference
+    // arm above, where the slot's range names the object's class.
+    let declared_on = holder_candidates(var, star_map, var_to_class, schema_view);
+    if !declared_on.is_empty() {
+        let listed = declared_on
+            .iter()
+            .map(|class| format!("<{class}>"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return ScopeError::Unscoped(format!(
+            "?{var} has no rdf:type; only typed subjects are read from the database, so a \
+             triple with ?{var} as its subject can never match. Add `?{var} a <Class>`; the \
+             slots it reads are declared on {listed}."
+        ));
+    }
     ScopeError::Unscoped(format!(
         "?{var} has no rdf:type; only typed subjects are read from the database, so a triple \
          with ?{var} as its subject can never match. Add `?{var} a <Class>`, naming the \
          class whose records it stands for."
     ))
+}
+
+/// The classes an untyped subject could be, read off the references it holds.
+///
+/// `?l :belongsToMunicipality ?m . ?m a :Municipality` reads one slot whose
+/// object is typed; every class declaring `belongsToMunicipality` as a
+/// reference to `Municipality` is a candidate, and a subject reading several
+/// such slots must be a class declaring all of them. Sorted, so the message is
+/// stable. Empty when no slot on the subject leads to a typed object, or the
+/// schema declares the combination on no class.
+fn holder_candidates(
+    var: &str,
+    star_map: &HashMap<String, StarBuilder>,
+    var_to_class: &HashMap<String, String>,
+    schema_view: &SchemaView,
+) -> Vec<String> {
+    let Some(builder) = star_map.get(var) else {
+        return Vec::new();
+    };
+    let mut typed_slots: Vec<(&String, &String)> = builder
+        .object_variables
+        .iter()
+        .filter_map(|(slot, object_var)| var_to_class.get(object_var).map(|class| (slot, class)))
+        .collect();
+    typed_slots.sort();
+    if typed_slots.is_empty() {
+        return Vec::new();
+    }
+    let Ok(classes) = schema_view.class_views() else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<String> = classes
+        .iter()
+        .filter(|cv| {
+            typed_slots.iter().all(|(slot_name, class_uri)| {
+                cv.slot(&Identifier::Name((*slot_name).clone()))
+                    .filter(|slot| {
+                        matches!(
+                            slot.determine_slot_inline_mode(),
+                            linkml_schemaview::slotview::SlotInlineMode::Reference
+                        )
+                    })
+                    .and_then(|slot| slot.get_range_class())
+                    .is_some_and(|range| range.canonical_uri().to_string() == **class_uri)
+            })
+        })
+        .map(|cv| cv.canonical_uri().to_string())
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn cause_for_unconsumed(tp: &TriplePattern, depth: usize, schema_view: &SchemaView) -> Inexact {
@@ -5032,10 +5109,21 @@ classes:
 
         for (expected, query) in [
             // The holder of a reference, untyped: the referenced class is
-            // fetched, the holder never is.
+            // fetched, the holder never is. The schema knows which classes
+            // declare the slot, so the message lists them.
             (
-                "?sig has no rdf:type",
+                "Add `?sig a <Class>`; the slots it reads are declared on \
+                 <https://data.infrabel.be/asset360/Signal>.",
                 "SELECT ?t WHERE { ?sig asset360:locatedOnTrack ?t . ?t a asset360:Track }",
+            ),
+            // The same subject in one arm of a UNION, typed in the other: the
+            // rewrite the message names is one the author wrote already, so
+            // the message says which arm is short and why the type does not
+            // carry over.
+            (
+                "in UNION branch 2 of 2: ?t is the object of `locatedOnTrack` on ?s",
+                "SELECT ?n WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+                 { ?t a asset360:Track ; asset360:name ?n } UNION { ?t asset360:name ?n } }",
             ),
             // The object of a reference, untyped: the schema knows the class.
             (
