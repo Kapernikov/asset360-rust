@@ -1683,24 +1683,45 @@ mod tests {
     /// The payoff, and the thing issue #410 (pepibru GitLab) measured as
     /// missing: a `LIMIT` above an all-SQL union reaches the statement.
     ///
-    /// Asserted as `OFFSET + LIMIT`, because the engine re-applies the offset
-    /// to whatever comes back — fetching ten rows and then skipping twenty
-    /// returns nothing. Same arithmetic as the single-class bound, which is
-    /// the point: the union stopped being the shape that loses it.
+    /// The same bound as the single-class one, which is the point: the union
+    /// stopped being the shape that loses it. And the same refusal: under an
+    /// `OFFSET` the engine pages in its own order, not the fetch's, so a bound
+    /// there answered page one for every page (`pushable_limit`).
+    ///
+    /// **And the shape that must not get it**: arms that are each a rooted
+    /// `OPTIONAL` join. On its own such an arm carries a bound — on its
+    /// *driving scan*, never on its rows (`LimitScope::DrivingScan`) — and the
+    /// union has only one place to put a bound, an outer `LIMIT` on the
+    /// stacked join product. The argument that makes the bound sound is made
+    /// of the driving scan (each of its rows is worth at least one solution)
+    /// and says nothing about the product's rows, so a cap there is a cap
+    /// nobody has argued for — the kind that answers short with no error the
+    /// day a row is not a solution. The union declines, and the fetch is
+    /// unbounded rather than reasoned about by luck.
     #[test]
     fn a_limit_above_an_all_sql_union_reaches_the_statement() {
         let sv = test_schema_view();
-        for (modifiers, expected) in [
-            ("LIMIT 1", Some(1)),
-            ("LIMIT 10 OFFSET 20", Some(30)),
+        let single_star_arms = "{ ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup }";
+        // Each arm is one mandatory star with an optional star hanging off it
+        // by a reference, which is the shape whose `LEFT JOIN` the rules push
+        // -- so the union is all-SQL and stacks, and the leak would be live.
+        let optional_join_arms = "{ ?s a asset360:Signal . \
+             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s ; \
+             asset360:asset360_uri ?n } } \
+             UNION { ?s a asset360:Track . \
+             OPTIONAL { ?x a asset360:Signal ; asset360:locatedOnTrack ?s ; \
+             asset360:name ?n } }";
+        for (arms, modifiers, expected) in [
+            (single_star_arms, "LIMIT 1", Some(1)),
+            (single_star_arms, "LIMIT 10 OFFSET 20", None),
             // No limit at all is no bound, rather than a bound of nothing.
-            ("", None),
+            (single_star_arms, "", None),
+            // A bound on a joined arm is a bound on its driving scan, and the
+            // stacked statement has nowhere to put that. See above.
+            (optional_join_arms, "LIMIT 10", None),
         ] {
             let plan = plan_query_refined(
-                &format!(
-                    "{PREFIX}SELECT ?s WHERE {{ {{ ?s a asset360:Signal }} \
-                     UNION {{ ?s a asset360:BaliseGroup }} }} {modifiers}"
-                ),
+                &format!("{PREFIX}SELECT ?s ?n WHERE {{ {arms} }} {modifiers}"),
                 &sv,
             )
             .expect("a UNION plans");
