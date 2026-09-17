@@ -2012,7 +2012,7 @@ fn push_filter(
 }
 
 /// The name of a class's identifier slot, when it has one.
-fn identifier_slot_of(
+pub(crate) fn identifier_slot_of(
     schema: &linkml_schemaview::schemaview::SchemaView,
     class_uri: &str,
 ) -> Option<String> {

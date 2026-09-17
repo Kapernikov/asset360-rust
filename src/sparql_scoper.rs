@@ -586,6 +586,34 @@ impl PlanNode {
         out
     }
 
+    /// [`Self::all_stars`], for a caller that edits a star in place.
+    ///
+    /// One caller: `sparql_plan::keep_what_the_rules_proved`, which merges the
+    /// narrowings a refined plan derived into the decomposition the fallback
+    /// fetches. It edits rather than rebuilds because a star carries facts the
+    /// refined plan does not restate -- `multivalued_fields` for every slot the
+    /// query mentions, `numeric_fields`, the optional marking -- and a rebuilt
+    /// star would have to re-derive all of them from a second source.
+    pub fn all_stars_mut(&mut self) -> Vec<&mut Star> {
+        let mut out = Vec::new();
+        self.visit_stars_mut(&mut out);
+        out
+    }
+
+    fn visit_stars_mut<'a>(&'a mut self, out: &mut Vec<&'a mut Star>) {
+        match self {
+            PlanNode::Bgp { stars, .. } => {
+                for s in stars {
+                    out.push(s);
+                }
+            }
+            PlanNode::LeftJoin { left, right } => {
+                left.visit_stars_mut(out);
+                right.visit_stars_mut(out);
+            }
+        }
+    }
+
     fn visit_stars<'a>(&'a self, out: &mut Vec<&'a Star>) {
         match self {
             PlanNode::Bgp { stars, .. } => {

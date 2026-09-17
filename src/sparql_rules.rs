@@ -1925,7 +1925,7 @@ fn sole_scan_of_star(plan: &Plan, node: NodeId, star: &str) -> Option<NodeId> {
 ///
 /// Listing every variant means the next operator is a compile error here
 /// rather than a wrong answer somewhere else.
-fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
+pub(crate) fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
     !plan.nodes.iter().any(|other| match &other.op {
         // The preserved side keeps rows the optional side did not match, so a
         // constraint inside the optional side decides whether the *value*
