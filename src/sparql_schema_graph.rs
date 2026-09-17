@@ -52,6 +52,10 @@ use linkml_schemaview::schemaview::SchemaView;
 #[cfg(feature = "sparql-endpoint")]
 use oxigraph::model::{GraphName, NamedNode, Quad};
 
+/// `owl:equivalentProperty`, the predicate that bridges a slot's two spellings.
+#[cfg(feature = "sparql-endpoint")]
+pub const OWL_EQUIVALENT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#equivalentProperty";
+
 /// The caller's graph IRI was not an absolute IRI.
 ///
 /// Returned, not panicked on and not worked around: the value comes from
@@ -110,14 +114,80 @@ impl SchemaGraph {
             })?);
 
         let built = schema_triples(sv, &SchemaRdfOptions::default());
+        let mut quads: Vec<Quad> = built
+            .triples
+            .into_iter()
+            .map(|t| Quad::new(t.subject, t.predicate, t.object, graph.clone()))
+            .collect();
+        quads.extend(Self::alias_quads(sv, &graph));
         Ok(SchemaGraph {
-            quads: built
-                .triples
-                .into_iter()
-                .map(|t| Quad::new(t.subject, t.predicate, t.object, graph.clone()))
-                .collect(),
+            quads,
             skipped: built.skipped,
         })
+    }
+
+    /// The second spelling of every slot that has one.
+    ///
+    /// A slot that declares a `slot_uri` is written into the data under that
+    /// IRI and under no other, while the spelling a query author can actually
+    /// derive from the datamodel is the native one — `irsm:name`, not
+    /// `<http://rsm.uic.org/RSM12#EAID_080C70AE_…>`. The endpoint's planner
+    /// accepts both (see [`crate::sparql_alias`]), and this is the graph
+    /// admitting that: without it the schema says a slot has one IRI while the
+    /// endpoint answers to two, and a client has no way to find the second
+    /// except by being told out of band. That is #447 (pepibru GitLab issue,
+    /// asset360/consolidator-server).
+    ///
+    /// It is emitted here and not in [`linkml_runtime::schema_rdf`] because it
+    /// is not a fact about the datamodel — upstream deliberately names each
+    /// element once, by the spelling the instance writer uses. It is a fact
+    /// about *this endpoint's query surface*, which is this module's subject.
+    ///
+    /// `owl:equivalentProperty` and not `skos:exactMatch`: the latter already
+    /// carries the slot's declared `exact_mappings`, and folding a spelling of
+    /// the slot itself in among its mappings to other vocabularies would make
+    /// both unreadable. Both directions are materialised — the relation is
+    /// symmetric in OWL, but a client asking plain SPARQL gets no entailment,
+    /// and the lookup has to work from whichever spelling they hold.
+    fn alias_quads(sv: &SchemaView, graph: &GraphName) -> Vec<Quad> {
+        let conv = sv.converter();
+        let mut pairs: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for slot in sv.slot_views().unwrap_or_default() {
+            let (Ok(canonical), Ok(native)) = (
+                slot.canonical_uri().to_uri(&conv),
+                sv.get_uri(slot.schema_id(), &slot.name).to_uri(&conv),
+            ) else {
+                continue;
+            };
+            if canonical.0 != native.0 {
+                pairs.insert((native.0, canonical.0));
+            }
+        }
+
+        let Ok(equivalent_property) = NamedNode::new(OWL_EQUIVALENT_PROPERTY) else {
+            return Vec::new();
+        };
+        let mut quads = Vec::new();
+        for (native, canonical) in pairs {
+            let (Ok(native), Ok(canonical)) = (NamedNode::new(native), NamedNode::new(canonical))
+            else {
+                continue;
+            };
+            quads.push(Quad::new(
+                native.clone(),
+                equivalent_property.clone(),
+                canonical.clone(),
+                graph.clone(),
+            ));
+            quads.push(Quad::new(
+                canonical,
+                equivalent_property.clone(),
+                native,
+                graph.clone(),
+            ));
+        }
+        quads
     }
 
     /// The graph as N-Triples, for tests and for a human reading it.
@@ -184,7 +254,7 @@ mod tests {
     #[test]
     fn the_fixture_quad_count_is_pinned() {
         let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert_eq!(graph.quads.len(), 5568);
+        assert_eq!(graph.quads.len(), 5716);
     }
 
     /// The number above is not a number to be re-pinned when it moves; it has
@@ -261,7 +331,15 @@ mod tests {
         //   `rdf:first`/`rdf:rest` cells of a two-member list, so 5.
         //
         // 5568 - 1668 = 3900 = 4 x 975 restrictions, exactly.
-        assert_eq!(graph.quads.len(), 1668 + 4 * restrictions);
+        //
+        // 5716 since this module started emitting the slot aliases (#447,
+        // pepibru GitLab issue): 74 of the fixture's slots declare a
+        // `slot_uri` that differs from their native spelling -- every RSM and
+        // Eulynx attribute -- and each contributes one
+        // `owl:equivalentProperty` quad in each direction.
+        let aliases = count(OWL_EQUIVALENT_PROPERTY);
+        assert_eq!(aliases, 2 * 74, "74 aliased slots, both directions");
+        assert_eq!(graph.quads.len(), 1668 + 4 * restrictions + aliases);
     }
 
     /// The unrolled form is the point: upstream matches `gen-owl`'s `simplify`
@@ -450,6 +528,65 @@ classes:
                 .map(|s| s.unwrap().get("n").unwrap().to_string())
                 .collect(),
             _ => panic!("a SELECT must return solutions"),
+        }
+    }
+
+    /// A client holding the readable spelling can find the one in the data.
+    ///
+    /// This is the discoverable half of #447 (pepibru GitLab issue,
+    /// asset360/consolidator-server). The planner accepting both spellings is
+    /// only half an answer: unless the graph admits the second one exists, the
+    /// next person still has to be told out of band which IRI `Track`'s `name`
+    /// is written under. Asserted through a real engine, from both ends, on
+    /// the query a client would actually write.
+    #[test]
+    fn a_client_can_look_up_the_spelling_the_data_uses() {
+        const NATIVE: &str = "https://data.infrabel.be/asset360-rsm-subset/name";
+        const CANONICAL: &str =
+            "http://rsm.uic.org/RSM12#EAID_080C70AE_7680_4515_B580_0B30E8066364";
+
+        let sv = asset360_schema_view();
+        let store = store_of(&sv);
+
+        let ask = |subject: &str| -> Vec<String> {
+            let query = format!(
+                "SELECT ?o WHERE {{ GRAPH <{ASSET360_SCHEMA_GRAPH}> {{ \
+                 <{subject}> <{OWL_EQUIVALENT_PROPERTY}> ?o }} }}"
+            );
+            match oxigraph::sparql::SparqlEvaluator::new()
+                .for_query(query.parse::<spargebra::Query>().unwrap())
+                .on_store(&store)
+                .execute()
+                .unwrap()
+            {
+                QueryResults::Solutions(solutions) => solutions
+                    .map(|s| s.unwrap().get("o").unwrap().to_string())
+                    .collect(),
+                _ => panic!("a SELECT must return solutions"),
+            }
+        };
+
+        assert_eq!(ask(NATIVE), vec![format!("<{CANONICAL}>")]);
+        assert_eq!(
+            ask(CANONICAL),
+            vec![format!("<{NATIVE}>")],
+            "the lookup has to work from whichever spelling the client holds"
+        );
+
+        // And the IRI it hands back is the one the rest of the graph talks
+        // about, so the client can carry on from it.
+        let restrictions = format!(
+            "ASK {{ GRAPH <{ASSET360_SCHEMA_GRAPH}> {{ \
+             ?c <{RDFS_SUBCLASS_OF}> [ <{OWL_ON_PROPERTY}> <{CANONICAL}> ] }} }}"
+        );
+        match oxigraph::sparql::SparqlEvaluator::new()
+            .for_query(restrictions.parse::<spargebra::Query>().unwrap())
+            .on_store(&store)
+            .execute()
+            .unwrap()
+        {
+            QueryResults::Boolean(answer) => assert!(answer),
+            _ => panic!("an ASK must return a boolean"),
         }
     }
 
