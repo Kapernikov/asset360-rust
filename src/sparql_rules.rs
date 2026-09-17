@@ -2828,6 +2828,217 @@ impl Rule for PushReferenceJoin<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Absorb an optional reference
+// ---------------------------------------------------------------------------
+
+/// `OPTIONAL { ?s :ref ?l . ?l a Line ... }` over a star the scan below scans:
+/// the reference read becomes the left join's own edge, and the `match`
+/// disappears.
+///
+/// The shape [`PushLeftJoin`] could not see. It finds the edge by looking for
+/// a *bound* foreign key on one side -- the preserved star reading
+/// `:ref ?l` outside the `OPTIONAL`, or the optional star reading `:refersTo
+/// ?s` inside it -- and a reference read that sits inside the `OPTIONAL` on
+/// the preserved star is neither: the fold rule leaves it a `match` (folding
+/// it in as an existence check would drop the rows the `OPTIONAL` keeps), and
+/// [`DeliverOptionalRead`] only hands the column to the engine. The optional
+/// side then stays a join of a `match` and a scan, two islands fall out of it,
+/// and the query that walks a class with its reference -- the export shape of
+/// issue 457 (consolidator-server) -- is a fetch the engine finishes, so its
+/// pages die on the triple cap.
+///
+/// What the rewrite states is the SQL left join exactly: `Line` is joined on
+/// `t0.ref = t1.uri`, so a record whose reference is empty, or names a record
+/// that is not a `Line`, keeps its row with `?l` unbound -- which is what the
+/// `OPTIONAL` answers, since its inner join of the read and the type has no
+/// solution for either. The edge is recorded on the left join, whose `ON`
+/// clause is the work that discharges the triple, and the read stays a
+/// *delivered* slot of the preserved scan (unbound, optional): `?l` is bound
+/// by the referenced star's identity and by nothing else, so a projection of
+/// it is the `Line` that matched and never the raw reference value.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **No lifted condition.** Same as [`PushLeftJoin`]: a condition on the
+///   optional side decides whether it matched, and this builds no conditional
+///   binding.
+/// * **The optional side is one `match` joined to a scan of its object**, and
+///   the join is on that object alone. Any other shape is a row set this
+///   rewrite does not describe.
+/// * **The match reads a single-valued reference column of the preserved
+///   star**, resolved against the class the scan scans. A collection of
+///   references is one solution per element, which an equality cannot state.
+/// * **The preserved side takes every row from that scan**, through plain
+///   joins only -- the same condition [`AbsorbOptionalRead`] puts on its scan.
+pub struct AbsorbOptionalReference<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> AbsorbOptionalReference<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for AbsorbOptionalReference<'_> {
+    fn name(&self) -> &'static str {
+        "absorb_optional_reference"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            let PlanOp::LeftJoin {
+                left,
+                right,
+                condition,
+                reference,
+            } = &plan.nodes[id].op
+            else {
+                continue;
+            };
+            if condition.is_some() || reference.is_some() {
+                continue;
+            }
+            let (left, right) = (*left, *right);
+
+            // The optional side: a join of one match and one scan, on the
+            // match's object.
+            let PlanOp::Join {
+                left: a,
+                right: b,
+                on,
+                reference: None,
+            } = &plan.nodes[right].op
+            else {
+                continue;
+            };
+            let (a, b) = (*a, *b);
+            let (matched, other) = match (&plan.nodes[a].op, &plan.nodes[b].op) {
+                (PlanOp::Match { .. }, _) => (a, b),
+                (_, PlanOp::Match { .. }) => (b, a),
+                _ => continue,
+            };
+            let PlanOp::Match { pattern } = &plan.nodes[matched].op else {
+                continue;
+            };
+            if plan.nodes[matched].executor != Executor::Engine || is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(star), Some(predicate), Some(var)) = (
+                subject_variable(pattern),
+                predicate_iri(pattern),
+                object_variable(pattern),
+            ) else {
+                continue;
+            };
+            let (star, predicate, var) = (star.to_owned(), predicate.to_owned(), var.to_owned());
+            if on.as_slice() != [var.clone()] {
+                continue;
+            }
+            // The object is a star the other side scans, in SQL.
+            if Visible::below(plan, other).identity_of(&var).is_none() {
+                continue;
+            }
+
+            // The preserved side: a scan of the match's subject, in SQL, whose
+            // rows all reach the join.
+            let Some((scan, class_uri)) =
+                plan.nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(scan, node)| match &node.op {
+                        PlanOp::Scan {
+                            star_var,
+                            class_uri,
+                            ..
+                        } if star_var == &star
+                            && node.executor == Executor::Sql
+                            && mandatorily_feeds(plan, scan, left) =>
+                        {
+                            Some((scan, class_uri.clone()))
+                        }
+                        _ => None,
+                    })
+            else {
+                continue;
+            };
+
+            // A single-valued reference column of that class.
+            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
+                continue;
+            };
+            let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
+                continue;
+            };
+            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+                continue;
+            };
+            if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue
+                || !PushReferenceJoin::new(self.schema).stores_a_reference(&class_uri, &slot.name)
+            {
+                continue;
+            }
+            let path = vec![slot.name.clone()];
+
+            // The delivered read, so the column reaches whoever renders the
+            // join. Unbound: `?l` is the referenced record's identity.
+            if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+                let delivered = ScanSlot {
+                    path: path.clone(),
+                    var: None,
+                    multivalued: false,
+                    presence: SlotPresence::Optional,
+                };
+                if !slots.iter().any(|slot| slot.path == path) {
+                    slots.push(delivered);
+                }
+            }
+
+            // The join takes the match's claim: its `ON` clause is the work.
+            let claims = std::mem::take(&mut plan.nodes[matched].discharges);
+            plan.nodes[id].discharges.extend(claims);
+            plan.nodes[id].discharges.sort_unstable();
+            if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
+                *reference = Some(ReferenceEdge {
+                    referenced: var,
+                    holder: star,
+                    slot: slot.name.clone(),
+                });
+            }
+
+            // The optional side is the scan now: the join and the match go.
+            replace_nodes(plan, &[(right, other), (matched, other)]);
+            return true;
+        }
+        false
+    }
+}
+
+/// Remove nodes, each standing in for another that stays.
+///
+/// [`remove_nodes`] stands a removed node in for its first input, which is
+/// right for a unary node and wrong for a join whose surviving side is the
+/// other one; this says which.
+fn replace_nodes(plan: &mut Plan, replaced: &[(NodeId, NodeId)]) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if let Some((_, by)) = replaced.iter().find(|(removed, _)| *removed == old) {
+            remap[old] = remap[*by];
+            continue;
+        }
+        nodes.push(node.clone());
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+// ---------------------------------------------------------------------------
 // Push a left join
 // ---------------------------------------------------------------------------
 
@@ -2902,10 +3113,15 @@ impl Rule for PushLeftJoin<'_> {
                 continue;
             }
 
-            // The edge, found the same way an inner join finds it: one side
-            // scans a star, the other binds that star's identifier in a
-            // single-valued reference slot.
-            let Some(edge) = self.reference_between(plan, left, right) else {
+            // The edge: one [`AbsorbOptionalReference`] recorded, or else
+            // found the same way an inner join finds it -- one side scans a
+            // star, the other binds that star's identifier in a single-valued
+            // reference slot.
+            let recorded = match &plan.nodes[id].op {
+                PlanOp::LeftJoin { reference, .. } => reference.clone(),
+                _ => None,
+            };
+            let Some(edge) = recorded.or_else(|| self.reference_between(plan, left, right)) else {
                 continue;
             };
             plan.nodes[id].executor = Executor::Sql;
@@ -4106,6 +4322,7 @@ pub fn tier_one_rules<'a>(
         Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(DeliverOptionalRead::new(schema)),
         Box::new(AbsorbOptionalRead::new(schema)),
+        Box::new(AbsorbOptionalReference::new(schema)),
         Box::new(FoldIdentityConstant::new(schema)),
         Box::new(ConstantObjectBecomesFilter::new(schema)),
         Box::new(ValuesBecomesFilter::new(schema)),
@@ -7523,6 +7740,101 @@ mod tests {
             plan.nodes.iter().all(|node| node.executor == Executor::Sql),
             "the grouping takes its ordering with it:\n{plan}"
         );
+    }
+
+    /// A reference read inside the `OPTIONAL`, on the preserved star, is the
+    /// left join's edge -- the export shape of issue 457 (consolidator-server).
+    ///
+    /// Before: the match stayed a `match` on the optional side, joined to the
+    /// scan of its object, and the plan was two islands the lowering refused.
+    /// After: one left join carrying the edge, the read delivered on the
+    /// preserved scan, `?t` bound by the `Track` scan's identity, and the
+    /// projection answering with its ordering and its slice.
+    #[test]
+    fn a_reference_read_inside_the_optional_is_the_left_join_s_edge() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track } } \
+             ORDER BY ?s LIMIT 50 OFFSET 100",
+            &schema,
+            false,
+        );
+        plan.check()
+            .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+        assert!(
+            plan.find("match").is_empty(),
+            "the read is the edge:\n{plan}"
+        );
+        let leftjoins = plan.find("leftjoin");
+        let [leftjoin] = leftjoins.as_slice() else {
+            panic!("one left join:\n{plan}");
+        };
+        let PlanOp::LeftJoin {
+            reference: Some(edge),
+            ..
+        } = &plan.nodes[*leftjoin].op
+        else {
+            panic!("the edge is recorded:\n{plan}");
+        };
+        assert_eq!(
+            (
+                edge.holder.as_str(),
+                edge.slot.as_str(),
+                edge.referenced.as_str()
+            ),
+            ("s", "locatedOnTrack", "t")
+        );
+        // The read is delivered, not bound: `?t` is the `Track`'s identity.
+        let PlanOp::Scan { slots, .. } = &plan.nodes[plan.find("scan")[0]].op else {
+            unreachable!()
+        };
+        let read = slots
+            .iter()
+            .find(|slot| slot.path.as_slice() == ["locatedOnTrack".to_owned()])
+            .expect("the delivered read");
+        assert_eq!(
+            (read.var.as_deref(), read.presence),
+            (None, SlotPresence::Optional)
+        );
+        // The join claims the triple: its `ON` clause is the work.
+        assert!(
+            plan.nodes[*leftjoin]
+                .discharges
+                .iter()
+                .any(|id| plan.obligations[*id].to_string().contains("locatedOnTrack")),
+            "{plan}"
+        );
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "the projection answers over it:\n{plan}"
+        );
+
+        // A collection of references is one solution per element, which an
+        // equality cannot state: declined, and the plan stays a fetch.
+        let plan = refined(
+            "SELECT ?g ?l WHERE { ?g a asset360:LineGroup . \
+             OPTIONAL { ?g asset360:groupsLines ?l . ?l a asset360:Line } }",
+            &schema,
+            false,
+        );
+        assert!(!plan.find("match").is_empty(), "{plan}");
+        assert!(
+            plan.nodes
+                .iter()
+                .any(|node| node.executor == Executor::Engine),
+            "{plan}"
+        );
+        // A lifted condition decides whether the optional side matched, and
+        // no rule builds a conditional binding.
+        let plan = refined(
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
+             asset360:hasName ?tn . FILTER(?tn > \"A\") } }",
+            &schema,
+            false,
+        );
+        assert!(!plan.find("match").is_empty(), "{plan}");
     }
 
     /// What the projection rule takes, and what it declines -- each decline

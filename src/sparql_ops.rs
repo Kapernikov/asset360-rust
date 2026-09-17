@@ -2634,6 +2634,34 @@ mod tests {
         assert_eq!(fetch_bound_of(&tree), None);
         assert!(!tree.nodes[tree.find("slice")[0]].discharges.is_empty());
 
+        // A reference read inside the OPTIONAL: `?t` is the referenced
+        // star's identity, never the raw reference value -- a reference to a
+        // record that is not a `Track` leaves `?t` unbound, as the `OPTIONAL`
+        // answers.
+        let tree = lowered(
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track } } \
+             ORDER BY ?s LIMIT 50 OFFSET 100",
+            &sv,
+        )
+        .expect("the export shape lowers as one answering statement");
+        let Op::Project { bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        let t = bindings
+            .iter()
+            .find(|spec| spec.var == "t")
+            .expect("?t is a column");
+        assert_eq!(
+            (t.star_var.as_str(), t.slot_path.as_slice()),
+            ("t", &[][..])
+        );
+        assert!(matches!(
+            &tree.nodes[tree.find("join")[0]].op,
+            Op::Join { kind: crate::sparql_scoper::JoinType::Left, right_slot, .. }
+                if right_slot == "locatedOnTrack"
+        ));
+
         // Above a grouping the projection carries nothing: the columns are
         // the grouping's.
         let tree = lowered(
