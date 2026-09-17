@@ -3162,6 +3162,18 @@ class JoinEdge:
         Slot on the right star whose value = left's ``asset360_uri``.
         """
     @property
+    def right_path(self) -> builtins.list[builtins.str]:
+        r"""
+        The inline hops from the right record's root to ``right_slot``.
+        
+        Empty for a column of the record. Non-empty means the reference sits
+        inside an inline structure -- ``["hasCoveredSection"]`` for
+        ``?s :hasCoveredSection ?cs . ?cs :belongsToTrack ?t`` -- and a
+        renderer has to walk into ``object_data`` rather than compare a
+        column; ``object_data->>'belongsToTrack'`` names a column the record
+        does not have and matches nothing.
+        """
+    @property
     def right_multivalued(self) -> builtins.bool:
         r"""
         Whether ``right_slot`` holds a *collection* of identifiers.
@@ -4050,6 +4062,12 @@ class PlanOp:
         r"""
         For ``"join"``: the slot on the right input whose value is the left
         row's ``asset360_uri``.
+        """
+    @property
+    def right_path(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"join"``: the inline hops from the right record's root to
+        ``right_slot``. Empty for a column; see ``JoinEdge.right_path``.
         """
     @property
     def right_multivalued(self) -> builtins.bool:

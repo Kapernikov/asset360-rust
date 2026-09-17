@@ -531,12 +531,17 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 left_star,
                 right_star,
                 right_slot,
+                right_path,
                 right_multivalued,
                 kind,
                 ..
             } => writeln!(
                 f,
-                "      join      ?{right_star}.{right_slot}{} = ?{left_star}{}",
+                "      join      ?{right_star}.{}{right_slot}{} = ?{left_star}{}",
+                right_path
+                    .iter()
+                    .map(|hop| format!("{hop}."))
+                    .collect::<String>(),
                 if *right_multivalued { "[]" } else { "" },
                 match kind {
                     crate::sparql_scoper::JoinType::Inner => "",

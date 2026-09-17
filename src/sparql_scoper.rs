@@ -170,9 +170,6 @@ inexact_variants! {
     UnknownPredicate,
     /// A subject that is neither a variable nor an IRI, so it cannot be a star.
     UnscopedSubject,
-    /// A subject with no resolvable class: its triples are not represented at
-    /// all, and a count over the remaining stars is one per group.
-    UntypedSubject,
     /// A constant object inside an `OPTIONAL`. Pushing it would filter out rows
     /// the join preserves, so it is left to oxigraph.
     ConstantInOptional,
@@ -244,7 +241,6 @@ impl Inexact {
             Self::VariablePredicate => "variable_predicate",
             Self::UnknownPredicate => "unknown_predicate",
             Self::UnscopedSubject => "unscoped_subject",
-            Self::UntypedSubject => "untyped_subject",
             Self::ConstantInOptional => "constant_in_optional",
             Self::UnboundValues => "unbound_values",
             Self::Subquery => "subquery",
@@ -285,10 +281,6 @@ impl Inexact {
                  so its constraint is not in the plan"
             }
             Self::UnscopedSubject => "a triple has a subject that cannot be scoped",
-            Self::UntypedSubject => {
-                "a subject has no resolvable rdf:type, so its triples are not \
-                 represented in the plan at all"
-            }
             Self::ConstantInOptional => {
                 "a constant value inside an OPTIONAL cannot be applied to the \
                  fetch without dropping rows the OPTIONAL preserves"
@@ -379,7 +371,7 @@ impl Inexact {
                 "Use a predicate the schema defines; check the spelling and the \
                  prefix."
             }
-            Self::UnscopedSubject | Self::UntypedSubject => {
+            Self::UnscopedSubject => {
                 "Give every subject an rdf:type, e.g. `?s a asset360:Signal`, so \
                  the class it belongs to is known."
             }
@@ -809,8 +801,23 @@ pub struct JoinEdge {
     /// E.g. `"belongsToTunnelComplex"`.
     pub right_slot: String,
 
+    /// The inline hops from the right record's root to `right_slot`, when the
+    /// reference sits *inside* an inline structure rather than on the record
+    /// itself. Empty for a column, which every edge was until the path walk
+    /// started raising edges.
+    ///
+    /// `?s :hasCoveredSection ?cs . ?cs :belongsToTrack ?t . ?t a :Track` is
+    /// `right_path = ["hasCoveredSection"]`, `right_slot = "belongsToTrack"`:
+    /// the identifier is two slots down, and the first of them is a list. A
+    /// renderer cannot state that as a column comparison, so the fact is on
+    /// the edge -- a renderer that overlooks it compares
+    /// `object_data->>'belongsToTrack'` on a record that has no such column
+    /// and answers *empty*, which is the failure `right_multivalued` exists to
+    /// prevent one level up.
+    pub right_path: Vec<String>,
+
     /// Whether `right_slot` holds a *collection* of identifiers rather than
-    /// one.
+    /// one. On a path edge: whether *any* hop, or the slot, does.
     ///
     /// Stated here for the reason [`Star::multivalued_fields`] and
     /// `PlanOp::reading` are: a renderer that has to fetch this fact from the
@@ -1349,6 +1356,13 @@ pub fn scope_parsed_with_schema_graph(
     // plan does not describe.
     let mut unconsumed: HashSet<usize> = (0..triples_with_depth.len()).collect();
 
+    // Subjects with at least one triple in the default graph -- the ones that
+    // stand for golden records, and the only ones the untyped-subject refusal
+    // below is about. A subject seen only inside a `GRAPH` or `SERVICE` block
+    // is somebody else's, and the block's own inexactness accounts for it.
+    let foreign_triples = triples_outside_the_default_graph(pattern);
+    let mut default_graph_subjects: HashSet<String> = HashSet::new();
+
     for (index, (tp, depth)) in triples_with_depth.iter().enumerate() {
         // A triple subject is either a query variable or a constant IRI.
         // Constant-IRI subjects become identifier-scoped stars (keyed by a
@@ -1372,6 +1386,10 @@ pub fn scope_parsed_with_schema_graph(
                 continue;
             }
         };
+
+        if !foreign_triples.contains(&std::ptr::from_ref(*tp)) {
+            default_graph_subjects.insert(subj_var.clone());
+        }
 
         let pred_iri = match &tp.predicate {
             NamedNodePattern::NamedNode(nn) => nn.as_str(),
@@ -1587,19 +1605,20 @@ pub fn scope_parsed_with_schema_graph(
 
     for builder in star_map.values() {
         // Resolve the class (and its identifier slot). A variable subject we
-        // can't scope yields `None` and is skipped (oxigraph handles it). A
+        // can't scope yields `None` and is set aside for the path walk. A
         // constant-IRI subject we can't scope yields `Err` and rejects the
         // whole query — never a silent drop that returns wrong data.
         let (class_uri, identifier_slot_name) = match resolve_star_class(builder, schema_view)? {
             Some(resolved) => resolved,
             None => {
                 // A variable subject whose class cannot be resolved. Two very
-                // different things look like this, and only Phase 6 can tell
-                // them apart: a step inside another star's nested structure
-                // (`?s :location ?loc . ?loc :longitude ?v`), which the plan
-                // *does* represent as a path, and a subject nothing accounts
-                // for (`?sig :locatedOnTrack ?t` with ?sig untyped), whose
-                // triples vanish and leave a count of one per group.
+                // different things look like this, and only the path walk can
+                // tell them apart: a step inside another star's nested
+                // structure (`?s :location ?loc . ?loc :longitude ?v`), which
+                // the plan *does* represent as a path, and a subject nothing
+                // accounts for (`?sig :locatedOnTrack ?t` with ?sig untyped),
+                // whose records no star fetches -- refused after the walk,
+                // with the class to add where the schema knows it.
                 //
                 // So record the name rather than the verdict, and let the path
                 // walk clear the ones it explains — and hand the triples this
@@ -1849,10 +1868,67 @@ pub fn scope_parsed_with_schema_graph(
                     left: obj_var.clone(),
                     right: builder.variable.clone(),
                     right_slot: slot_name.clone(),
+                    right_path: Vec::new(),
                     right_multivalued,
                     join_type,
                 });
             }
+        }
+    }
+
+    // Paths into nested structures. Done after the stars exist, so a variable
+    // that *is* a star is never mistaken for a step inside one -- and before
+    // the filters, so a condition on a nested value has a path to be attached
+    // to. Reading `?m :zoneName ?z . FILTER(?z = "Charleroi")` without the
+    // paths is how that filter used to be dropped.
+    //
+    // Before the connectivity check too, because the walk is what finds the
+    // edges that run *through* a structure.
+    let PathWalk {
+        bindings: path_bindings,
+        traversed,
+        constants: nested_constants,
+        references,
+    } = collect_path_bindings(&star_map, &var_to_class, schema_view);
+
+    // Phase 2a: a reference reached through an inline structure is a join
+    // edge too. `?s :hasCoveredSection ?cs . ?cs :belongsToTrack ?t . ?t a
+    // :Track` holds ?t's identifier two slots down in ?s's record, and the
+    // loop above only looked at the record's own columns -- so ?t had no edge,
+    // was refused as *disconnected* inside an OPTIONAL, and was fetched whole
+    // as an island outside one. It is connected, by exactly this edge; what is
+    // different is only how the renderer has to state it, which the path on
+    // the edge is for.
+    //
+    // Column references (`slot_path.len() == 1`) are the loop above's, and
+    // are not raised twice.
+    {
+        let mut reached: Vec<(&String, &ReferenceReach)> = references
+            .iter()
+            .filter(|(var, reach)| var_to_class.contains_key(*var) && reach.slot_path.len() > 1)
+            .collect();
+        reached.sort_by(|a, b| a.0.cmp(b.0));
+        for (var, reach) in reached {
+            let (right_slot, right_path) = reach
+                .slot_path
+                .split_last()
+                .map(|(last, rest)| (last.clone(), rest.to_vec()))
+                .unwrap_or_default();
+            let left_d = *star_depths.get(var).unwrap_or(&0);
+            let right_d = *star_depths.get(&reach.star_var).unwrap_or(&0);
+            let join_type = if reach.optional || left_d > 0 || right_d > 0 {
+                JoinType::Left
+            } else {
+                JoinType::Inner
+            };
+            joins.push(JoinEdge {
+                left: var.clone(),
+                right: reach.star_var.clone(),
+                right_slot,
+                right_path,
+                right_multivalued: reach.multivalued,
+                join_type,
+            });
         }
     }
 
@@ -1883,14 +1959,6 @@ pub fn scope_parsed_with_schema_graph(
             }
         }
     }
-
-    // Paths into nested structures. Done after the stars exist, so a variable
-    // that *is* a star is never mistaken for a step inside one -- and before
-    // the filters, so a condition on a nested value has a path to be attached
-    // to. Reading `?m :zoneName ?z . FILTER(?z = "Charleroi")` without the
-    // paths is how that filter used to be dropped.
-    let (path_bindings, traversed, nested_constants) =
-        collect_path_bindings(&star_map, &var_to_class, schema_view);
 
     // Phase 3: Collect filter conditions per star.
     let mut var_to_field: ValueColumns = HashMap::new();
@@ -2116,12 +2184,33 @@ pub fn scope_parsed_with_schema_graph(
     };
 
     // A subject the path walk reached is a step inside a star, which the plan
-    // describes. Anything left is a subject nothing accounts for.
-    if unresolved_subjects
-        .iter()
-        .any(|var| !traversed.contains(var))
+    // describes. Anything left is a subject nothing accounts for -- and that
+    // is a refusal, not a loss to record.
+    //
+    // It used to be recorded (as an `Inexact::UntypedSubject`) and the engine left
+    // to finish, on the reasoning that an inexact plan is still a correct
+    // fetch for the engine to re-apply the query over. It is not, here: the
+    // engine sees exactly the records the stars fetched, and a subject with
+    // no class is a record no star fetched. Its triples match *nothing*, so a
+    // mandatory one answered zero rows and an optional one a column of
+    // unbound values -- both 200, both wrong, neither distinguishable from
+    // "no such data". Doc 28h: refuse, and say what to write instead.
     {
-        record_loss(Inexact::UntypedSubject);
+        let mut unaccounted: Vec<&String> = unresolved_subjects
+            .iter()
+            .filter(|var| !traversed.contains(*var) && default_graph_subjects.contains(*var))
+            .collect();
+        unaccounted.sort();
+        if let Some(var) = unaccounted.first() {
+            return Err(untyped_subject_refusal(
+                var,
+                &star_map,
+                &var_to_class,
+                &references,
+                &path_bindings,
+                schema_view,
+            ));
+        }
     }
 
     // Hand back what a discarded star had claimed. Reaching the subject is not
@@ -2140,8 +2229,12 @@ pub fn scope_parsed_with_schema_graph(
                 // A leaf comes back as a path binding. An *intermediate* node
                 // deliberately does not — it serialises as a blank node, so the
                 // walk records it as a step and keeps going — and the paths that
-                // continue past it carry the hop that introduced it.
-                path_bindings.contains_key(var) || traversed.contains(var)
+                // continue past it carry the hop that introduced it. A typed
+                // variable reached through a reference is a star of its own,
+                // and Phase 2a raised the edge that represents the triple.
+                path_bindings.contains_key(var)
+                    || traversed.contains(var)
+                    || (var_to_class.contains_key(var) && references.contains_key(var))
             });
         if !represented {
             // Both, deliberately. The `extend` keeps the working set meaning
@@ -3086,12 +3179,33 @@ fn triples_in_the_schema_graph(
         spargebra::term::NamedNodePattern::NamedNode(node) => node.as_str() == schema_graph_iri,
         spargebra::term::NamedNodePattern::Variable(_) => true,
     };
+    triples_in_blocks(pattern, &reads_the_schema_graph, false)
+}
 
+/// The triples the endpoint's own store does not hold: inside any `GRAPH`
+/// block, or inside a `SERVICE` block.
+///
+/// A subject that appears only there is not a golden record, so "give it an
+/// rdf:type" is the wrong thing to tell its author; the plan's inexactness for
+/// the block (`Inexact::NamedGraph`, `Inexact::RemoteService`) is what
+/// accounts for it.
+fn triples_outside_the_default_graph(pattern: &GraphPattern) -> HashSet<*const TriplePattern> {
+    triples_in_blocks(pattern, &|_| true, true)
+}
+
+/// The triples inside the `GRAPH` blocks `is_the_graph` accepts -- and inside
+/// `SERVICE` blocks too when `and_services` is set.
+fn triples_in_blocks(
+    pattern: &GraphPattern,
+    is_the_graph: &dyn Fn(&spargebra::term::NamedNodePattern) -> bool,
+    and_services: bool,
+) -> HashSet<*const TriplePattern> {
     fn walk(
         pattern: &GraphPattern,
         inside: bool,
         out: &mut HashSet<*const TriplePattern>,
-        is_schema_graph: &dyn Fn(&spargebra::term::NamedNodePattern) -> bool,
+        is_the_graph: &dyn Fn(&spargebra::term::NamedNodePattern) -> bool,
+        and_services: bool,
     ) {
         match pattern {
             GraphPattern::Bgp { patterns } => {
@@ -3101,19 +3215,30 @@ fn triples_in_the_schema_graph(
                     }
                 }
             }
-            GraphPattern::Graph { name, inner } => {
-                walk(inner, inside || is_schema_graph(name), out, is_schema_graph)
-            }
+            GraphPattern::Graph { name, inner } => walk(
+                inner,
+                inside || is_the_graph(name),
+                out,
+                is_the_graph,
+                and_services,
+            ),
+            GraphPattern::Service { inner, .. } => walk(
+                inner,
+                inside || and_services,
+                out,
+                is_the_graph,
+                and_services,
+            ),
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
             | GraphPattern::Lateral { left, right }
             | GraphPattern::Minus { left, right } => {
-                walk(left, inside, out, is_schema_graph);
-                walk(right, inside, out, is_schema_graph);
+                walk(left, inside, out, is_the_graph, and_services);
+                walk(right, inside, out, is_the_graph, and_services);
             }
             GraphPattern::LeftJoin { left, right, .. } => {
-                walk(left, inside, out, is_schema_graph);
-                walk(right, inside, out, is_schema_graph);
+                walk(left, inside, out, is_the_graph, and_services);
+                walk(right, inside, out, is_the_graph, and_services);
             }
             GraphPattern::Filter { inner, .. }
             | GraphPattern::Extend { inner, .. }
@@ -3122,14 +3247,15 @@ fn triples_in_the_schema_graph(
             | GraphPattern::Distinct { inner }
             | GraphPattern::Reduced { inner }
             | GraphPattern::Slice { inner, .. }
-            | GraphPattern::Group { inner, .. }
-            | GraphPattern::Service { inner, .. } => walk(inner, inside, out, is_schema_graph),
+            | GraphPattern::Group { inner, .. } => {
+                walk(inner, inside, out, is_the_graph, and_services)
+            }
             GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
         }
     }
 
     let mut out = HashSet::new();
-    walk(pattern, false, &mut out, &reads_the_schema_graph);
+    walk(pattern, false, &mut out, is_the_graph, and_services);
     out
 }
 
@@ -4114,15 +4240,49 @@ struct NestedConstant {
     conditions: Vec<FilterCondition>,
 }
 
+/// A variable the path walk reached through a *reference* slot: the record it
+/// stands for is another class's, held by identifier, and never inside the
+/// star's own JSON.
+///
+/// Recorded whether or not the variable is typed, because the two need it for
+/// opposite reasons. A typed one is a star of its own, and this says which
+/// slot -- at which depth -- holds its identifier, which is what a join edge
+/// through an inline structure is made of. An untyped one names records the
+/// fetch never reads, and this says which class the author has to name to
+/// make it readable.
+struct ReferenceReach {
+    /// The star whose record holds the reference.
+    star_var: String,
+    /// Slots from that record's root to the reference slot. Length one is a
+    /// column of the record; longer is a reference inside an inline structure.
+    slot_path: Vec<String>,
+    /// The class the reference points at.
+    range_class_uri: String,
+    /// Whether any hop, or the reference slot itself, holds a collection --
+    /// in which case the record holds *several* identifiers at this path.
+    multivalued: bool,
+    /// Whether any hop was introduced inside an `OPTIONAL`.
+    optional: bool,
+}
+
+/// Everything the path walk learned, named so a caller cannot mix up two
+/// maps keyed on the same variables.
+struct PathWalk {
+    /// Scalar leaves, by the variable bound to them.
+    bindings: HashMap<String, PathBinding>,
+    /// Variables the walk passed *through*: the inline structures.
+    traversed: HashSet<String>,
+    /// Constants written on a nested step.
+    constants: Vec<NestedConstant>,
+    /// Variables reached through a reference slot, by variable.
+    references: HashMap<String, ReferenceReach>,
+}
+
 fn collect_path_bindings(
     star_map: &HashMap<String, StarBuilder>,
     var_to_class: &HashMap<String, String>,
     schema_view: &SchemaView,
-) -> (
-    HashMap<String, PathBinding>,
-    HashSet<String>,
-    Vec<NestedConstant>,
-) {
+) -> PathWalk {
     let mut out: HashMap<String, PathBinding> = HashMap::new();
     // Variables the walk explained *as steps*: the intermediate nodes it passed
     // through. Scalar leaves are deliberately absent — a leaf holds a value, so
@@ -4132,6 +4292,7 @@ fn collect_path_bindings(
     // Used only to clear a recorded drop, never to re-derive the check.
     let mut traversed: HashSet<String> = HashSet::new();
     let mut constants: Vec<NestedConstant> = Vec::new();
+    let mut references: HashMap<String, ReferenceReach> = HashMap::new();
 
     // Deterministic order: two stars could in principle reach the same variable,
     // and which path wins must not depend on hash iteration order.
@@ -4152,11 +4313,18 @@ fn collect_path_bindings(
             &mut out,
             &mut traversed,
             &mut constants,
+            &mut references,
+            false,
             false,
         );
     }
 
-    (out, traversed, constants)
+    PathWalk {
+        bindings: out,
+        traversed,
+        constants,
+        references,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4170,7 +4338,9 @@ fn walk_paths(
     out: &mut HashMap<String, PathBinding>,
     traversed: &mut HashSet<String>,
     constants: &mut Vec<NestedConstant>,
+    references: &mut HashMap<String, ReferenceReach>,
     optional_so_far: bool,
+    multivalued_so_far: bool,
 ) {
     if path_so_far.len() >= MAX_PATH_DEPTH {
         return;
@@ -4203,10 +4373,6 @@ fn walk_paths(
     slots.sort_by(|a, b| a.0.cmp(b.0));
 
     for (slot_name, object_var) in slots {
-        // A typed object variable is its own star, reached by a join edge.
-        if var_to_class.contains_key(object_var) {
-            continue;
-        }
         // The class's own O(1) name index rather than a scan. It hands back an
         // owned SlotView, which this did not need before — worth it for a wide
         // class (TunnelComplex has 95 slots), a wash for a narrow one.
@@ -4216,6 +4382,41 @@ fn walk_paths(
 
         let mut path = path_so_far.to_vec();
         path.push(slot_name.clone());
+        let hop_optional = builder
+            .slot_depth
+            .get(slot_name)
+            .is_some_and(|depth| *depth > 0);
+        let hop_multivalued = slot.determine_slot_container_mode()
+            != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
+
+        // A reference: the value is another record's identifier, and there is
+        // nothing here to walk into. Recorded for whoever holds the other end
+        // -- typed or not -- and, deliberately, only the first path to reach
+        // a variable: the walk is in sorted order, so which one that is does
+        // not depend on hash order.
+        let is_reference = matches!(
+            slot.determine_slot_inline_mode(),
+            linkml_schemaview::slotview::SlotInlineMode::Reference
+        );
+        if let Some(range_class) = slot.get_range_class().filter(|_| is_reference) {
+            references
+                .entry(object_var.clone())
+                .or_insert_with(|| ReferenceReach {
+                    star_var: star_var.to_owned(),
+                    slot_path: path.clone(),
+                    range_class_uri: range_class.canonical_uri().to_string(),
+                    multivalued: multivalued_so_far || hop_multivalued,
+                    optional: optional_so_far || hop_optional,
+                });
+            continue;
+        }
+
+        // A typed object variable is its own star, reached by a join edge --
+        // or, if the slot stores the structure itself, a typed nested
+        // structure, which Phase 2 reports.
+        if var_to_class.contains_key(object_var) {
+            continue;
+        }
 
         match slot.get_range_class() {
             // A nested structure: keep walking. The variable standing for the
@@ -4228,10 +4429,6 @@ fn walk_paths(
                     linkml_schemaview::slotview::SlotInlineMode::Inline
                 ) {
                     traversed.insert(object_var.clone());
-                    let hop_optional = builder
-                        .slot_depth
-                        .get(slot_name)
-                        .is_some_and(|depth| *depth > 0);
                     walk_paths(
                         star_var,
                         object_var,
@@ -4242,7 +4439,9 @@ fn walk_paths(
                         out,
                         traversed,
                         constants,
+                        references,
                         optional_so_far || hop_optional,
+                        multivalued_so_far || hop_multivalued,
                     );
                 }
             }
@@ -4253,11 +4452,7 @@ fn walk_paths(
                     // Optional anywhere along the path makes the read optional:
                     // a missing hop leaves the leaf unbound just as a missing
                     // leaf does.
-                    let optional = optional_so_far
-                        || builder
-                            .slot_depth
-                            .get(slot_name)
-                            .is_some_and(|depth| *depth > 0);
+                    let optional = optional_so_far || hop_optional;
                     out.insert(
                         object_var.clone(),
                         PathBinding {
@@ -4305,6 +4500,72 @@ pub(crate) fn stars_reachable_from<'a>(
 /// The verdict does not depend on getting this right: the triple is already
 /// inexact by virtue of being unconsumed. This just turns "something was
 /// dropped" into something the author can act on.
+/// The refusal for a subject variable no star and no path accounts for.
+///
+/// One message per way of getting here, each naming the rewrite, because the
+/// four look identical in the query and need different fixes. The most useful
+/// is the reference: the schema knows which class the slot points at, so the
+/// message can spell the triple to add.
+fn untyped_subject_refusal(
+    var: &str,
+    star_map: &HashMap<String, StarBuilder>,
+    var_to_class: &HashMap<String, String>,
+    references: &HashMap<String, ReferenceReach>,
+    path_bindings: &HashMap<String, PathBinding>,
+    schema_view: &SchemaView,
+) -> ScopeError {
+    // Typed with a class the schema does not know: not "add a type" but "fix
+    // the one you wrote".
+    if let Some(iri) = star_map.get(var).and_then(|b| b.type_iri.as_deref()) {
+        return ScopeError::Unscoped(format!(
+            "?{var} has rdf:type <{iri}>, which is not a class in the schema, so no records \
+             can be read for it. Check the class IRI and its prefix."
+        ));
+    }
+    // Reached through a reference: the class is known, so say it.
+    if let Some(reach) = references.get(var) {
+        let path = reach.slot_path.join(".");
+        return ScopeError::Unscoped(format!(
+            "?{var} is the object of `{path}` on ?{holder}, a reference to <{class}>, but has \
+             no rdf:type; only typed subjects are read from the database, so a triple with \
+             ?{var} as its subject can never match. Add `?{var} a <{class}>`.",
+            holder = reach.star_var,
+            class = reach.range_class_uri,
+        ));
+    }
+    // Bound to a value: a literal has no triples, so the pattern is empty by
+    // construction rather than for want of a fetch.
+    let is_value = path_bindings.contains_key(var)
+        || star_map.values().any(|builder| {
+            let Some(class_uri) = var_to_class.get(&builder.variable) else {
+                return false;
+            };
+            builder
+                .object_variables
+                .iter()
+                .any(|(slot_name, object_var)| {
+                    object_var == var
+                        && schema_view
+                            .get_class_by_uri(class_uri)
+                            .ok()
+                            .flatten()
+                            .and_then(|cv| cv.slot(&Identifier::Name(slot_name.clone())))
+                            .is_some_and(|slot| slot.get_range_class().is_none())
+                })
+        });
+    if is_value {
+        return ScopeError::Unscoped(format!(
+            "?{var} is bound to a value, not a record, so it cannot be the subject of a \
+             triple pattern. Use a variable that names a record."
+        ));
+    }
+    ScopeError::Unscoped(format!(
+        "?{var} has no rdf:type; only typed subjects are read from the database, so a triple \
+         with ?{var} as its subject can never match. Add `?{var} a <Class>`, naming the \
+         class whose records it stands for."
+    ))
+}
+
 fn cause_for_unconsumed(tp: &TriplePattern, depth: usize, schema_view: &SchemaView) -> Inexact {
     let NamedNodePattern::NamedNode(pred) = &tp.predicate else {
         return Inexact::VariablePredicate;
@@ -4728,25 +4989,113 @@ classes:
         );
     }
 
+    /// `locatedOnTrack` holds another object's URI, so its value is a join
+    /// key. Reading through it in JSONB would look for data that is not
+    /// there -- and a fetch that reads only `?s`'s class never holds the
+    /// record `?t` names, so `?t asset360:hasName ?tn` matched nothing and
+    /// the query answered zero rows with a 200. Refused now, naming the class
+    /// the reference points at, which is the one thing the author has to add.
     #[test]
     fn test_reference_slots_are_not_walked_into() {
-        // `locatedOnTrack` holds another object's URI, so its value is a join
-        // key. Reading through it in JSONB would look for data that is not
-        // there.
         let sv = test_schema_view();
-        let plan = sparql_scope(
+        let err = sparql_scope(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
              ?t asset360:hasName ?tn }",
             &sv,
         )
-        .unwrap();
+        .unwrap_err();
 
+        let ScopeError::Unscoped(msg) = err else {
+            panic!("expected an unscoped refusal, got {err:?}");
+        };
         assert!(
-            !plan.path_bindings.contains_key("tn"),
-            "a reference must not become a JSON path: {:?}",
-            plan.path_bindings
+            msg.contains("?t is the object of `locatedOnTrack` on ?s")
+                && msg.contains("Add `?t a <https://data.infrabel.be/asset360/Track>`"),
+            "{msg}"
         );
+    }
+
+    /// Every way a subject can end up naming records no star fetches, and
+    /// what each is told. One table for the same reason
+    /// `dropping_part_of_the_query_is_recorded_at_the_drop_site` is one: a new
+    /// way in belongs here as a row.
+    ///
+    /// These were `Inexact::UntypedSubject` -- recorded, and the engine left
+    /// to finish over a store that does not hold the records. That answers
+    /// zero rows for a mandatory pattern and an unbound column for an
+    /// optional one, 200 either way. Doc 28h: refuse.
+    #[test]
+    fn a_subject_no_star_fetches_is_refused_with_the_rewrite() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+        for (expected, query) in [
+            // The holder of a reference, untyped: the referenced class is
+            // fetched, the holder never is.
+            (
+                "?sig has no rdf:type",
+                "SELECT ?t WHERE { ?sig asset360:locatedOnTrack ?t . ?t a asset360:Track }",
+            ),
+            // The object of a reference, untyped: the schema knows the class.
+            (
+                "Add `?t a <https://data.infrabel.be/asset360/Track>`",
+                "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+                 ?t asset360:hasName ?tn }",
+            ),
+            // The same, inside an OPTIONAL: the column would have come back
+            // unbound on every row.
+            (
+                "Add `?t a <https://data.infrabel.be/asset360/Track>`",
+                "SELECT ?tn WHERE { ?s a asset360:Signal . \
+                 OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t asset360:hasName ?tn } }",
+            ),
+            // A scalar leaf used as a subject: a literal cannot be a subject,
+            // and the path walk must not clear it just because it is a leaf.
+            (
+                "?nm is bound to a value, not a record",
+                "SELECT ?x WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 ?nm asset360:name ?x }",
+            ),
+            // Typed, with a class the schema does not know: the fix is the
+            // IRI, not a missing type.
+            (
+                "?s has rdf:type <https://data.infrabel.be/asset360/Sginal>, which is not a class",
+                "SELECT ?s WHERE { ?s a asset360:Sginal . ?o a asset360:Signal }",
+            ),
+            // Free-floating: nothing reaches it, nothing fetches it.
+            (
+                "?x has no rdf:type",
+                "SELECT ?x WHERE { ?s a asset360:Signal . ?x asset360:name ?n }",
+            ),
+        ] {
+            let err = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap_err();
+            let ScopeError::Unscoped(msg) = &err else {
+                panic!("{query}: expected an unscoped refusal, got {err:?}");
+            };
+            assert!(msg.contains(expected), "{query}: {msg}");
+        }
+    }
+
+    /// A subject that lives only inside a `GRAPH` or `SERVICE` block is not a
+    /// golden record, so it is not refused for lacking a type: the block's own
+    /// inexactness routes the query to the engine, as before.
+    #[test]
+    fn a_subject_seen_only_inside_a_foreign_block_is_not_refused() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             GRAPH <urn:other> { ?k <urn:label> ?l } }",
+            "SELECT ?s WHERE { ?s a asset360:Signal . SERVICE <urn:remote> { ?x <urn:p> ?o } }",
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv)
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                plan.inexact.is_some(),
+                "{query}: the block must still route to the engine"
+            );
+        }
     }
 
     #[test]
@@ -5385,10 +5734,6 @@ classes:
                 "SELECT ?s WHERE { ?s a asset360:Signal . VALUES ?zz { \"a\" } }",
             ),
             (
-                Inexact::UntypedSubject,
-                "SELECT ?t WHERE { ?sig asset360:locatedOnTrack ?t . ?t a asset360:Track }",
-            ),
-            (
                 Inexact::FilterExpression,
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(REGEX(?nm, \"^BX\")) }",
@@ -5459,13 +5804,6 @@ classes:
                 Inexact::FilterInOptional,
                 "SELECT ?s WHERE { ?s a asset360:Signal . \
                  OPTIONAL { ?s asset360:name ?nm . VALUES ?nm { \"a\" } } }",
-            ),
-            // A scalar leaf used as a subject: a literal cannot be a subject,
-            // and the path walk must not clear it just because it is a leaf.
-            (
-                Inexact::UntypedSubject,
-                "SELECT ?x WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
-                 ?nm asset360:name ?x }",
             ),
             // A VALUES over several variables lists tuples; one IN per column
             // admits combinations the query does not.
@@ -7153,6 +7491,150 @@ classes:
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("disconnected")),
             "expected UnsupportedConstruct with disconnected, got {result:?}"
+        );
+    }
+
+    // ---- A reference reached through an inline structure (issue #444) ----
+
+    /// The real schema, because the shape needs an inline *list* whose
+    /// elements hold a reference: `TunnelComplex.hasCoveredSection` is a list
+    /// of `CoveredSection`, and `CoveredSection.belongsToTrack` references
+    /// `Track`. The inline test schema has no such slot.
+    fn asset360_fixture_schema_view() -> SchemaView {
+        use linkml_meta::SchemaDefinition;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("data");
+        let mut sv = SchemaView::new();
+        for name in ["types.yaml", "rsm.yaml", "eulynx.yaml", "asset360.yaml"] {
+            let yaml = std::fs::read_to_string(dir.join(name)).unwrap();
+            let deser = serde_yml::Deserializer::from_str(&yaml);
+            let schema: SchemaDefinition = serde_path_to_error::deserialize(deser).unwrap();
+            sv.add_schema(schema).unwrap();
+        }
+        sv
+    }
+
+    const TUNNEL_TRACK_OPTIONAL: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+        SELECT ?s ?tn WHERE { \
+          ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+          OPTIONAL { ?s asset360:hasCoveredSection ?cs . \
+                     ?cs asset360:belongsToTrack ?t . \
+                     ?t a asset360:Track ; asset360:typeURI ?tn } }";
+
+    /// `?t` is reached from `?s` through `?cs`, an element of an inline list.
+    /// That is a join -- ?t's identifier is in ?s's record, two slots down --
+    /// and the edge says where: the path on it is what a renderer has to walk,
+    /// because there is no `belongsToTrack` column on a TunnelComplex row.
+    #[test]
+    fn a_reference_inside_an_inline_list_is_a_join_edge_with_a_path() {
+        let sv = asset360_fixture_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?tn WHERE { \
+               ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+               ?s asset360:hasCoveredSection ?cs . \
+               ?cs asset360:belongsToTrack ?t . \
+               ?t a asset360:Track ; asset360:typeURI ?tn }",
+            &sv,
+        )
+        .unwrap();
+
+        let joins = all_joins(&plan);
+        assert_eq!(joins.len(), 1, "{joins:?}");
+        let join = joins[0];
+        assert_eq!(join.left, "t");
+        assert_eq!(join.right, "s");
+        assert_eq!(join.right_path, vec!["hasCoveredSection".to_owned()]);
+        assert_eq!(join.right_slot, "belongsToTrack");
+        assert!(
+            join.right_multivalued,
+            "the list hop makes the path hold several identifiers"
+        );
+        assert_eq!(join.join_type, JoinType::Inner);
+        // The edge represents `?cs :belongsToTrack ?t`, so nothing is left to
+        // the engine.
+        assert_eq!(plan.inexact, None, "{:?}", plan.unconsumed);
+    }
+
+    /// The same edge inside an OPTIONAL. This was refused as *disconnected*
+    /// -- "?t shares no variable with the mandatory pattern" -- because only
+    /// column references raised edges and ?t is reached through ?cs. It is
+    /// connected by exactly this edge, and the edge is a left join.
+    #[test]
+    fn an_optional_through_an_inline_list_is_connected() {
+        let sv = asset360_fixture_schema_view();
+        let plan = sparql_scope(TUNNEL_TRACK_OPTIONAL, &sv).unwrap();
+
+        let joins = all_joins(&plan);
+        assert_eq!(joins.len(), 1, "{joins:?}");
+        assert_eq!(joins[0].right_path, vec!["hasCoveredSection".to_owned()]);
+        assert_eq!(joins[0].join_type, JoinType::Left);
+        assert!(find_star(&plan, "t").is_optional);
+        assert!(!find_star(&plan, "s").is_optional);
+    }
+
+    /// Admitting the path edge admits nothing else: an OPTIONAL star that no
+    /// path reaches is still disconnected, inline list or not.
+    #[test]
+    fn a_path_edge_does_not_connect_an_unrelated_optional() {
+        let sv = asset360_fixture_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?tn WHERE { \
+               ?s a asset360:TunnelComplex ; asset360:hasCoveredSection ?cs . \
+               ?cs asset360:belongsToTrack ?t . ?t a asset360:Track . \
+               OPTIONAL { ?u a asset360:Line ; asset360:typeURI ?tn } }",
+            &sv,
+        );
+        assert!(
+            matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("?u") && m.contains("disconnected")),
+            "{result:?}"
+        );
+    }
+
+    /// Through the whole pipeline: the refined plan has no rule for a path
+    /// edge (`PushReferenceJoin` pushes column references only), so the
+    /// statement route declines and the fetch is the scoper's -- *with* the
+    /// edge, so the fetch reads the Tracks the covered sections name rather
+    /// than every Track there is, and the engine finishes the OPTIONAL over
+    /// both sides.
+    #[test]
+    fn the_execution_plan_carries_the_path_edge_into_the_fetch() {
+        let sv = asset360_fixture_schema_view();
+        let plan = crate::sparql_plan::plan_query_refined(TUNNEL_TRACK_OPTIONAL, &sv).unwrap();
+        let rendered = format!("{plan}");
+        assert!(
+            rendered.contains("join      ?s.hasCoveredSection.belongsToTrack[] = ?t   left"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("engine finishes"), "{rendered}");
+    }
+
+    /// The other half of issue #444, and the worse one: drop `?t a
+    /// asset360:Track` and the query used to be *accepted* -- ?t was an
+    /// untyped subject, recorded as inexact, and the engine finished over a
+    /// store holding no Track at all. Every row came back with `?tn` unbound.
+    /// A refusal that names the type to add is the only honest answer.
+    #[test]
+    fn an_untyped_reference_through_an_inline_list_is_refused_by_name() {
+        let sv = asset360_fixture_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?tn WHERE { \
+               ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+               OPTIONAL { ?s asset360:hasCoveredSection ?cs . \
+                          ?cs asset360:belongsToTrack ?t . \
+                          ?t asset360:typeURI ?tn } }",
+            &sv,
+        );
+        let Err(ScopeError::Unscoped(msg)) = result else {
+            panic!("expected an unscoped refusal, got {result:?}");
+        };
+        assert!(
+            msg.contains("?t is the object of `hasCoveredSection.belongsToTrack` on ?s")
+                && msg.contains("Add `?t a <https://data.infrabel.be/asset360/Track>`"),
+            "{msg}"
         );
     }
 }
