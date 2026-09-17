@@ -2844,11 +2844,19 @@ impl PlanOp {
     }
 
     /// For ``"group"``: one entry per projected value, addressed by position.
+    ///
+    /// For ``"project"``: the columns of an **ungrouped** statement that
+    /// answers -- the projected variables first, in ``SELECT`` order, then
+    /// the columns its ``sort`` names and the answer does not, every fan-out,
+    /// and the identity of every star (the row's key, which is what makes
+    /// its ``ORDER BY`` total and a page a partition). Empty for a projection
+    /// above a grouping, whose ``"group"`` carries the columns, and for a
+    /// fetch, which projects nothing.
     #[getter]
     fn bindings(&self) -> Vec<PushdownBinding> {
         use crate::sparql_ops::Op;
         match &self.inner.op {
-            Op::Group { bindings, .. } => bindings
+            Op::Group { bindings, .. } | Op::Project { bindings, .. } => bindings
                 .iter()
                 .map(|inner| PushdownBinding {
                     inner: inner.clone(),

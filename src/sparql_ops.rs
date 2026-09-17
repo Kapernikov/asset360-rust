@@ -337,9 +337,20 @@ pub enum Op {
     /// The variables the query asked for, in `SELECT` order. Anything not
     /// listed is machinery: a variable that exists only to be grouped by, or
     /// an aggregate spargebra named internally.
+    ///
+    /// `bindings` is empty above a grouping, whose [`Op::Group`] already
+    /// carries the columns. **Non-empty, it makes the statement the answer**:
+    /// an ungrouped projection whose every row is one solution, with one
+    /// binding per column the statement selects -- the projected variables
+    /// first, in `SELECT` order, then the columns the modifiers above need
+    /// and the answer does not name (an `ORDER BY` term the query does not
+    /// select, every fan-out below, and the identity of every star, which
+    /// is what makes the row order total so that a page is a partition).
+    /// A renderer reads a `sort` above this node by index into this list.
     Project {
         input: OpId,
         vars: Vec<String>,
+        bindings: Vec<crate::sparql_pushdown::BindingSpec>,
     },
 }
 
@@ -1473,11 +1484,18 @@ pub fn lower_refined(
             }
             RefinedOp::Sort { terms, .. } => {
                 let input = remap[&node.op.inputs()[0]];
-                // An ordering is only renderable over a grouped result: it
-                // sorts columns of one, and the renderer places a term inside
-                // or outside the grouping by which kind of column it names.
-                // Below a grouping an ordering is the engine's -- the rows SQL
-                // hands back there are a fetch, not an answer.
+                // An ordering is only renderable over a result whose rows
+                // are solutions: it sorts columns of one, and the renderer
+                // places a term inside or outside a grouping by which kind of
+                // column it names. Below a grouping an ordering is the
+                // engine's -- the rows SQL hands back there are a fetch, not
+                // an answer. Above one the columns are the grouping's; with
+                // no grouping they are the projection's, built here because
+                // the sort sits *below* the projection in the algebra and is
+                // lowered first.
+                if grouped.is_none() {
+                    grouped = Some(projected_columns(plan, schema, &classes, id)?);
+                }
                 let Some(columns) = &grouped else {
                     return Err(LoweringRefusal::Unrenderable { node: id });
                 };
@@ -1525,10 +1543,28 @@ pub fn lower_refined(
             }
             RefinedOp::Project { vars, .. } => {
                 let input = remap[&node.op.inputs()[0]];
+                // Above a grouping the columns are the grouping's and this
+                // node carries none. With no grouping the projection *is*
+                // the statement's column list -- built here unless a sort
+                // below already needed it -- and carrying it is what makes
+                // the statement an answer rather than a fetch.
+                let has_group = nodes.iter().any(|node| matches!(node.op, Op::Group { .. }));
+                let bindings = if has_group {
+                    Vec::new()
+                } else {
+                    if grouped.is_none() {
+                        grouped = Some(projected_columns(plan, schema, &classes, id)?);
+                    }
+                    grouped
+                        .as_ref()
+                        .map(|columns| columns.bindings.clone())
+                        .unwrap_or_default()
+                };
                 nodes.push(OpNode {
                     op: Op::Project {
                         input,
                         vars: vars.clone(),
+                        bindings,
                     },
                     discharges: node.discharges.clone(),
                 });
@@ -1830,6 +1866,152 @@ impl GroupedColumns {
             .position(|b| b.var == var)
             .map(crate::sparql_pushdown::OrderKey::Binding)
     }
+}
+
+/// The columns of an **ungrouped** statement that answers: what its rows
+/// carry, in the order the statement lists them.
+///
+/// Every row is one solution here, so the list is what a renderer selects
+/// and what a serialiser reads back, and the order is a contract with both:
+///
+/// 1. the projected variables, one binding each, in `SELECT` order;
+/// 2. every `ORDER BY` term the query does not select -- a column the
+///    statement sorts on and the answer does not name;
+/// 3. every fan-out below the projection, so the statement reads the
+///    array's elements and not the array (the same reason the grouping
+///    lowering adds them -- one row per element is what SPARQL answers);
+/// 4. the identity of every star the statement scans.
+///
+/// The fourth is what makes a page a partition. An `ORDER BY ?s` over a
+/// join is not a total order -- a record with two matches is two rows with
+/// one key -- and `LIMIT`/`OFFSET` over a partial order may return a tied row
+/// on two pages and its neighbour on none. Together with the fan-outs (each
+/// unnest yields distinct elements per record) the star identities are a key
+/// of the row, so the renderer can settle every tie the query's own ordering
+/// leaves, and a walk by `OFFSET` tiles: three consecutive pages are disjoint
+/// and their union is the head of the unbounded answer. The engine's own
+/// enumeration cannot make that promise, which is why an offset is answered
+/// here or not at all.
+///
+/// `None` where a column cannot be described -- a variable no `Sql` scan
+/// binds, an inlined structure (a blank node nothing can reproduce), a
+/// projected term the renderer has no term shape for -- and the lowering
+/// refuses, which hands the query to the engine.
+fn projected_columns(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    classes: &std::collections::HashMap<String, String>,
+    node: usize,
+) -> Result<GroupedColumns, LoweringRefusal> {
+    use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp};
+
+    let unrenderable = || LoweringRefusal::Unrenderable { node };
+    let project = plan
+        .nodes
+        .iter()
+        .find(|node| matches!(node.op, RefinedOp::Project { .. }) && node.executor == Executor::Sql)
+        .ok_or_else(unrenderable)?;
+    let RefinedOp::Project { vars, .. } = &project.op else {
+        return Err(unrenderable());
+    };
+
+    let mut bindings: Vec<crate::sparql_pushdown::BindingSpec> = Vec::new();
+    // One column per projected variable, under that variable's own name --
+    // no deduplication by address here: two variables reading one slot are
+    // two columns of the answer, whatever they hold.
+    for var in vars {
+        let (star_var, class_uri, path) = scanned_column(plan, var).ok_or_else(unrenderable)?;
+        let spec = crate::sparql_pushdown::binding_spec(schema, &star_var, &class_uri, var, path)
+            .ok_or_else(unrenderable)?;
+        bindings.push(spec);
+    }
+    // Then the ordering's terms the answer does not name.
+    for sort in plan
+        .nodes
+        .iter()
+        .filter(|node| node.executor == Executor::Sql)
+    {
+        let RefinedOp::Sort { terms, .. } = &sort.op else {
+            continue;
+        };
+        for term in terms {
+            let RefinedExpr::Var(name) = &term.expr else {
+                return Err(unrenderable());
+            };
+            if bindings.iter().any(|spec| &spec.var == name) {
+                continue;
+            }
+            let (star_var, class_uri, path) =
+                scanned_column(plan, name).ok_or_else(unrenderable)?;
+            let spec =
+                crate::sparql_pushdown::binding_spec(schema, &star_var, &class_uri, name, path)
+                    .ok_or_else(unrenderable)?;
+            bindings.push(spec);
+        }
+    }
+    // Then every fan-out, by address: an element the answer already names
+    // is one lateral, not two.
+    for fanout in plan
+        .nodes
+        .iter()
+        .filter(|node| node.executor == Executor::Sql)
+    {
+        let RefinedOp::Unnest {
+            star_var,
+            slot_path,
+            var,
+            ..
+        } = &fanout.op
+        else {
+            continue;
+        };
+        if bindings
+            .iter()
+            .any(|spec| spec.star_var == *star_var && spec.slot_path == *slot_path)
+        {
+            continue;
+        }
+        let class_uri = classes.get(star_var).ok_or_else(unrenderable)?;
+        let spec = crate::sparql_pushdown::binding_spec(
+            schema,
+            star_var,
+            class_uri,
+            var,
+            slot_path.clone(),
+        )
+        .ok_or_else(unrenderable)?;
+        bindings.push(spec);
+    }
+    // And the identity of every scanned star, by address again, so the row
+    // has a key the renderer can order by.
+    for scan in plan
+        .nodes
+        .iter()
+        .filter(|node| node.executor == Executor::Sql)
+    {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            ..
+        } = &scan.op
+        else {
+            continue;
+        };
+        if bindings
+            .iter()
+            .any(|spec| spec.star_var == *star_var && spec.slot_path.is_empty())
+        {
+            continue;
+        }
+        let spec =
+            crate::sparql_pushdown::binding_spec(schema, star_var, class_uri, star_var, Vec::new())
+                .ok_or_else(unrenderable)?;
+        bindings.push(spec);
+    }
+    Ok(GroupedColumns {
+        bindings,
+        measures: Vec::new(),
+    })
 }
 
 /// Add a binding for the column a variable reads, or return the index of the
@@ -2237,6 +2419,82 @@ mod tests {
         }
     }
 
+    /// An ungrouped projection that answers carries its columns, in the
+    /// order the renderer and the serialiser both rely on: the projected
+    /// variables, then the ordering's unprojected terms, then every fan-out,
+    /// then every star's identity -- and the sort addresses them by index.
+    #[test]
+    fn an_answering_projection_carries_its_columns() {
+        let sv = test_schema_view();
+        let tree = lowered(
+            "SELECT ?nm ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:trafficKinds ?k ; asset360:length ?len } \
+             ORDER BY ?len ?nm LIMIT 5 OFFSET 10",
+            &sv,
+        )
+        .expect("an answering projection lowers");
+        assert!(tree.is_well_formed());
+        let Op::Project { vars, bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        assert_eq!(vars, &["nm", "k"]);
+        let columns: Vec<(String, Vec<String>)> = bindings
+            .iter()
+            .map(|spec| (spec.var.clone(), spec.slot_path.clone()))
+            .collect();
+        assert_eq!(
+            columns,
+            vec![
+                ("nm".to_owned(), vec!["name".to_owned()]),
+                ("k".to_owned(), vec!["trafficKinds".to_owned()]),
+                ("len".to_owned(), vec!["length".to_owned()]),
+                ("s".to_owned(), Vec::new()),
+            ],
+            "projected, then the sort's own, then the identity"
+        );
+        // The fan-out is a binding whose path holds a collection -- the
+        // renderer builds its LATERAL from that, one row per element.
+        assert!(
+            bindings[1]
+                .containers
+                .iter()
+                .any(|c| *c != crate::sparql_pushdown::Container::Single),
+            "{:?}",
+            bindings[1].containers
+        );
+        let Op::Sort { terms, .. } = &tree.nodes[tree.find("sort")[0]].op else {
+            panic!("a sort node");
+        };
+        let keys: Vec<crate::sparql_pushdown::OrderKey> = terms.iter().map(|t| t.key).collect();
+        assert_eq!(
+            keys,
+            vec![
+                crate::sparql_pushdown::OrderKey::Binding(2),
+                crate::sparql_pushdown::OrderKey::Binding(0)
+            ]
+        );
+        let Op::Slice { limit, offset, .. } = &tree.nodes[tree.find("slice")[0]].op else {
+            panic!("a slice node");
+        };
+        assert_eq!((*limit, *offset), (Some(5), 10));
+        // The slice is the query's own, claimed -- not a fetch bound.
+        assert_eq!(fetch_bound_of(&tree), None);
+        assert!(!tree.nodes[tree.find("slice")[0]].discharges.is_empty());
+
+        // Above a grouping the projection carries nothing: the columns are
+        // the grouping's.
+        let tree = lowered(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm",
+            &sv,
+        )
+        .expect("a grouping lowers");
+        let Op::Project { bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        assert!(bindings.is_empty());
+    }
+
     /// A narrowing pass drops the fan-out and weakens the element condition to
     /// a containment test.
     ///
@@ -2254,8 +2512,10 @@ mod tests {
     #[test]
     fn a_narrowing_pass_reads_the_record_and_not_the_element() {
         let sv = test_schema_view();
-        let query = "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
-                     FILTER(?k = \"m\") }";
+        let query = &format!(
+            "SELECT ?k WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             FILTER(?k = \"m\") {KEEP_A_FETCH} }}"
+        );
         let plan = refined_plan(query, &sv);
         // The refined plan itself says element: the unnest is there and the
         // condition names what it bound.
@@ -2368,7 +2628,10 @@ mod tests {
         // A containment test on a collection, which the rules render as an
         // element test.
         let mut plan = refined_plan(
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }",
+            &format!(
+                "SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds \"m\" \
+                 {KEEP_A_FETCH} }}"
+            ),
             &sv,
         );
         lower_refined(&plan, &sv, None, None).expect("as built, it lowers");
@@ -2388,7 +2651,10 @@ mod tests {
 
         // And a scan claiming to scope a subject to a class it does not scan.
         let mut plan = refined_plan(
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            &format!(
+                "SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm \
+                 {KEEP_A_FETCH} }}"
+            ),
             &sv,
         );
         let scan = plan.find("scan")[0];
@@ -2421,7 +2687,10 @@ mod tests {
         // A read the scan claims and does not make. The claim is what makes it
         // wrong: the engine was told this node answered it, so nobody does.
         let mut plan = refined_plan(
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            &format!(
+                "SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm \
+                 {KEEP_A_FETCH} }}"
+            ),
             &sv,
         );
         let scan = plan.find("scan")[0];
@@ -2439,8 +2708,10 @@ mod tests {
         // so no ledger notices, and the engine cannot find a solution in a row
         // the fetch never returned.
         let plan = refined_plan(
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
-             LIMIT 10 OFFSET 5",
+            &format!(
+                "SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm \
+                 {KEEP_A_FETCH} }} LIMIT 10 OFFSET 5"
+            ),
             &sv,
         );
         lower_refined(&plan, &sv, Some(15), None).expect("exactly enough rows lowers");
@@ -2684,6 +2955,15 @@ mod tests {
         lower_refined(&refined_plan(query, sv), sv, None, None)
     }
 
+    /// A conjunct no rule pushes, to keep a query a *fetch*.
+    ///
+    /// A fully pushed `SELECT` now answers in SQL (`PushProjection`), so a
+    /// test about the fetch -- the pass an engine finishes -- needs one
+    /// construct the statement cannot take. A `REGEX` is that: it stays with
+    /// the engine, every pushable conjunct sinks below it, and the rows the
+    /// statement returns are a narrowing again.
+    const KEEP_A_FETCH: &str = " FILTER(REGEX(STR(?s), \"^x\"))";
+
     /// A condition on a multivalued slot is a test over the array's elements,
     /// and the operator has to say so.
     ///
@@ -2708,16 +2988,30 @@ mod tests {
                 .collect()
         };
 
+        // A fetch reads the record: the engine re-runs the query, so the
+        // containment test is the narrowing that selects the same records.
         assert_eq!(
-            readings("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }"),
+            readings(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds \"m\" \
+                 {KEEP_A_FETCH} }}"
+            )),
             vec![(vec!["trafficKinds".to_owned()], SlotReading::AnyElement)],
         );
+        assert_eq!(
+            readings(&format!(
+                "SELECT ?k WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+                 FILTER(?k = \"m\") {KEEP_A_FETCH} }}"
+            )),
+            vec![(vec!["trafficKinds".to_owned()], SlotReading::AnyElement)],
+        );
+        // A statement that answers keeps the fan-out and reads the element
+        // it bound: one row per matching value is what SPARQL answers.
         assert_eq!(
             readings(
                 "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
                  FILTER(?k = \"m\") }"
             ),
-            vec![(vec!["trafficKinds".to_owned()], SlotReading::AnyElement)],
+            vec![(vec!["trafficKinds".to_owned()], SlotReading::BoundElement)],
         );
         // A single-valued slot names a column, and so does a value inside a
         // structure: the scoper walks single-valued hops only.
@@ -2931,10 +3225,10 @@ mod tests {
 
         // The engine finishes: the same shape of filter narrows only, because
         // the engine reapplies it with SPARQL's term semantics.
-        let (_claims, ops) = sql_passes(
-            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k ; \
-             asset360:name \"BX517\" } LIMIT 3",
-        )
+        let (_claims, ops) = sql_passes(&format!(
+            "SELECT ?s ?k WHERE {{ ?s a asset360:Signal ; asset360:kind ?k ; \
+             asset360:name \"BX517\" {KEEP_A_FETCH} }} LIMIT 3"
+        ))
         .into_iter()
         .next()
         .expect("one SQL pass");
@@ -3300,10 +3594,10 @@ mod tests {
     /// `push_filter` makes for a single condition.
     #[test]
     fn a_narrowing_filter_tree_reads_the_record_and_not_the_element() {
-        let trees = filter_trees(
-            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
-             FILTER(?k = \"m\" || ?k = \"n\") }",
-        );
+        let trees = filter_trees(&format!(
+            "SELECT ?k WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             FILTER(?k = \"m\" || ?k = \"n\") {KEEP_A_FETCH} }}"
+        ));
         assert_eq!(trees.len(), 1);
         let readings: Vec<SlotReading> = trees[0]
             .1

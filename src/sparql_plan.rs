@@ -53,6 +53,12 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// a planner/executor version skew a loud failure rather than a wrong number,
 /// which is the failure this whole module is shaped around.
 ///
+/// 4 added [`crate::sparql_ops::Op::Project`]'s bindings: an ungrouped
+/// projection that carries them is a statement that *answers*, and its
+/// `sort` and `slice` are the query's own rather than a fetch bound. A
+/// consumer built against 3 reads such a `slice` as the fetch bound -- with
+/// the offset dropped -- and pages wrong: every page the lowest records.
+///
 /// 3 added [`crate::sparql_ops::Op::Filter`]'s reading, which is not a new
 /// kind but *is* a new obligation on a renderer: one that ignores it renders a
 /// containment test over an array as an equality on the column and matches
@@ -65,7 +71,7 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// conjunction into one obligation per conjunct did *not* bump it: that
 /// changes how many `Filter` obligations a query raises, not what kinds exist,
 /// and a consumer that reads the list rather than counting it is unaffected.
-pub const PLAN_CONTRACT: u32 = 3;
+pub const PLAN_CONTRACT: u32 = 4;
 
 /// Index into [`ExecutionPlan::obligations`]. Printed as `o1`, `o2`, ... so a
 /// human can check the ledger by eye.
@@ -592,9 +598,24 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                     .map(|limit| limit.to_string())
                     .unwrap_or_else(|| "-".to_owned())
             )?,
-            // The projection is the pass's emitted variables, already printed
-            // on the pass line.
-            Op::Project { .. } => {}
+            // The projected variables are the pass's emitted ones, already
+            // printed on the pass line; what an *answering* projection reads
+            // each column from is not, and it is where the term shape lives.
+            Op::Project { bindings, .. } => {
+                for binding in bindings {
+                    writeln!(
+                        f,
+                        "      column    ?{} ← {}   {}",
+                        binding.var,
+                        if binding.slot_path.is_empty() {
+                            "<identity>".to_owned()
+                        } else {
+                            binding.slot_path.join(".")
+                        },
+                        binding.descriptor.shape()
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -1603,11 +1624,13 @@ fn answers_alone(plan: &ExecutionPlan, refined: &crate::sparql_ops::OpTree) -> R
             unclaimed.join("; ")
         ));
     }
-    if !refined
-        .nodes
-        .iter()
-        .any(|node| matches!(node.op, crate::sparql_ops::Op::Group { .. }))
-    {
+    // A statement emits solutions through a grouping or through a projection
+    // that carries its columns; without either its rows are records, a
+    // fetch.
+    if !refined.nodes.iter().any(|node| {
+        matches!(node.op, crate::sparql_ops::Op::Group { .. })
+            || matches!(&node.op, crate::sparql_ops::Op::Project { bindings, .. } if !bindings.is_empty())
+    }) {
         return Err(
             "the refined statement fetches rows rather than emitting solutions, so it \
              cannot answer alone"
@@ -2286,13 +2309,32 @@ mod tests {
         );
         assert!(plan.sql_only(), "{plan}");
 
-        // A fetch: the statement narrows and the engine answers. Today's gate
-        // calls this `used` too, so the deletion changes nothing here -- which
-        // is the reassuring half of the rehearsal.
+        // A projection over a fully pushed pattern answers alone too: its
+        // rows are the solutions, so the statement is the answer and not a
+        // fetch (it was a fetch before `PushProjection`, and the engine
+        // applied the projection over the same rows).
         let plan = plan_query_refined(
             &format!(
                 "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; \
                  asset360:name ?nm . FILTER(?nm > \"A\") }}"
+            ),
+            &sv,
+        )
+        .expect("should plan");
+        assert!(
+            matches!(plan.refinement, Refinement::UsedAlone(_)),
+            "{:?}",
+            plan.refinement
+        );
+        assert!(plan.sql_only(), "the statement answers it:\n{plan}");
+
+        // A fetch: one conjunct the statement cannot take keeps the engine,
+        // and the statement narrows.
+        let plan = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; \
+                 asset360:name ?nm . FILTER(?nm > \"A\") \
+                 FILTER(REGEX(STR(?s), \"^x\")) }}"
             ),
             &sv,
         )
@@ -2417,9 +2459,11 @@ mod tests {
     #[test]
     fn an_optional_read_is_claimed_by_the_scan_that_answers_it() {
         let sv = test_schema_view();
+        // A fetch, kept one by a conjunct no statement takes: the claim
+        // under test is the scan's, whichever pass finishes.
         let query = format!(
             "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
-             OPTIONAL {{ ?s asset360:name ?nm }} }}"
+             OPTIONAL {{ ?s asset360:name ?nm }} FILTER(REGEX(STR(?s), \"^x\")) }}"
         );
         let plan = plan_query_refined(&query, &sv).expect("should plan");
 
@@ -2543,17 +2587,26 @@ mod tests {
         assert!(refined.is_accounted(), "{refined}");
     }
 
-    /// The statement carries the scoper's fetch bound.
+    /// A fetch carries the scoper's fetch bound; a statement that answers
+    /// carries the query's own slice instead.
     ///
-    /// It claims nothing, so no ledger check would miss it and no answer would
-    /// be wrong -- the engine still applies the query's own `LIMIT`. What
-    /// happens without it is that `LIMIT 1` fetches every row of the class,
-    /// which is the regression `test_single_star_limit_1_returns_exactly_one`
-    /// caught the last time a planner mislaid it.
+    /// The bound claims nothing, so no ledger check would miss it and no
+    /// answer would be wrong -- the engine still applies the query's own
+    /// `LIMIT`. What happens without it is that `LIMIT 1` fetches every row of
+    /// the class, which is the regression
+    /// `test_single_star_limit_1_returns_exactly_one` caught the last time a
+    /// planner mislaid it.
     #[test]
     fn the_statement_carries_the_fetch_bound() {
         let sv = test_schema_view();
-        let query = format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal }} LIMIT 1");
+        // A fetch: the projected structure has no term shape a statement
+        // could emit, so the projection stays the engine's -- and nothing is
+        // dropped, so the scoper's bound holds. (A dropped filter would
+        // withdraw the bound too, which is a different test.)
+        let query = format!(
+            "{PREFIX}SELECT ?s ?loc WHERE {{ ?s a asset360:Signal ; \
+             asset360:location ?loc }} LIMIT 1"
+        );
         let bound_of = |plan: &ExecutionPlan| -> Option<usize> {
             plan.passes
                 .iter()
@@ -2583,6 +2636,23 @@ mod tests {
                 .iter()
                 .any(|id| matches!(refined.obligations[*id], Obligation::Slice { .. }))),
             "the query's own LIMIT is the engine's: {refined}"
+        );
+
+        // Fully pushed, the statement answers: the slice is the query's own,
+        // claimed, and there is no fetch bound to read -- a consumer that
+        // read the claimed slice as one would drop its offset (issue 457,
+        // consolidator-server).
+        let query = format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal }} LIMIT 1");
+        let answered = plan_query_refined(&query, &sv).expect("should plan");
+        assert!(answered.sql_only(), "{answered}");
+        assert_eq!(bound_of(&answered), None, "{answered}");
+        let claimed: Vec<&Pass> = answered.passes.iter().collect();
+        assert!(
+            claimed.iter().any(|pass| pass
+                .discharges
+                .iter()
+                .any(|id| matches!(answered.obligations[*id], Obligation::Slice { .. }))),
+            "the query's own LIMIT is the statement's: {answered}"
         );
     }
 
