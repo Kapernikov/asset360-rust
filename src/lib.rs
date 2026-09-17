@@ -1656,6 +1656,19 @@ impl JoinEdge {
         &self.inner.right_slot
     }
 
+    /// The inline hops from the right record's root to ``right_slot``.
+    ///
+    /// Empty for a column of the record. Non-empty means the reference sits
+    /// inside an inline structure -- ``["hasCoveredSection"]`` for
+    /// ``?s :hasCoveredSection ?cs . ?cs :belongsToTrack ?t`` -- and a
+    /// renderer has to walk into ``object_data`` rather than compare a
+    /// column; ``object_data->>'belongsToTrack'`` names a column the record
+    /// does not have and matches nothing.
+    #[getter]
+    fn right_path(&self) -> Vec<String> {
+        self.inner.right_path.clone()
+    }
+
     /// Whether ``right_slot`` holds a *collection* of identifiers.
     ///
     /// A renderer that ignores this emits ``object_data->>'slot' = uri``,
@@ -1678,9 +1691,10 @@ impl JoinEdge {
 
     fn __repr__(&self) -> String {
         format!(
-            "JoinEdge(left={:?}, right={:?}, slot={:?}, multivalued={:?}, type={:?})",
+            "JoinEdge(left={:?}, right={:?}, path={:?}, slot={:?}, multivalued={:?}, type={:?})",
             self.inner.left,
             self.inner.right,
+            self.inner.right_path,
             self.inner.right_slot,
             self.inner.right_multivalued,
             self.join_type()
@@ -2765,6 +2779,17 @@ impl PlanOp {
         match &self.inner.op {
             Op::Join { right_slot, .. } => Some(right_slot.clone()),
             _ => None,
+        }
+    }
+
+    /// For ``"join"``: the inline hops from the right record's root to
+    /// ``right_slot``. Empty for a column; see ``JoinEdge.right_path``.
+    #[getter]
+    fn right_path(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join { right_path, .. } => right_path.clone(),
+            _ => Vec::new(),
         }
     }
 

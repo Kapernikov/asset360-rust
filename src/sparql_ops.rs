@@ -270,6 +270,12 @@ pub enum Op {
         right_star: String,
         /// Slot on the right whose value is the left row's `asset360_uri`.
         right_slot: String,
+        /// The inline hops from the right record's root to `right_slot`;
+        /// empty for a column. Same fact and same reason as
+        /// [`JoinEdge::right_path`]: a renderer that reads `right_slot` as a
+        /// column of a record that holds it two slots down compares a column
+        /// that is not there and answers empty.
+        right_path: Vec<String>,
         /// Whether `right_slot` holds a collection of identifiers.
         ///
         /// Same fact and same reason as [`JoinEdge::right_multivalued`]: a
@@ -531,6 +537,7 @@ pub fn lower_sql_pass(
                 left_star: join.left.clone(),
                 right_star: join.right.clone(),
                 right_slot: join.right_slot.clone(),
+                right_path: join.right_path.clone(),
                 right_multivalued: join.right_multivalued,
                 kind: join.join_type,
             },
@@ -1254,6 +1261,9 @@ pub fn lower_refined(
                         left_star: edge.referenced.clone(),
                         right_star: edge.holder.clone(),
                         right_slot: edge.slot.clone(),
+                        // A rule only ever pushes a column reference (see
+                        // `PushReferenceJoin::foreign_key_on`).
+                        right_path: Vec::new(),
                         // A *pushed* join is single-valued by construction:
                         // `PushReferenceJoin::foreign_key_on` only takes a
                         // scan slot with `!multivalued`, and
@@ -1287,6 +1297,9 @@ pub fn lower_refined(
                         left_star: edge.referenced.clone(),
                         right_star: edge.holder.clone(),
                         right_slot: edge.slot.clone(),
+                        // A rule only ever pushes a column reference (see
+                        // `PushReferenceJoin::foreign_key_on`).
+                        right_path: Vec::new(),
                         // Single-valued for the reason the two joins below
                         // give: `foreign_key_on` only takes a single-valued
                         // reference slot, and `reference_joins_agree` refuses
@@ -1316,6 +1329,9 @@ pub fn lower_refined(
                         left_star: edge.referenced.clone(),
                         right_star: edge.holder.clone(),
                         right_slot: edge.slot.clone(),
+                        // A rule only ever pushes a column reference (see
+                        // `PushReferenceJoin::foreign_key_on`).
+                        right_path: Vec::new(),
                         // Single-valued for the reason given on the left join
                         // above: `reference_joins_agree` refuses a recorded
                         // edge on a multivalued slot.
