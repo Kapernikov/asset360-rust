@@ -2277,57 +2277,81 @@ fn lower_having(
     })
 }
 
-fn scanned_column(
-    plan: &crate::sparql_refine::Plan,
-    var: &str,
-) -> Option<(String, String, Vec<String>)> {
+/// A column a variable reads: `(star, class, path)`, with an empty path for
+/// a record's own identity.
+type ScannedColumn = (String, String, Vec<String>);
+
+/// The column a variable reads -- see [`ScannedColumn`].
+///
+/// A variable can be bound in two places at once -- as one star's identity
+/// and as a slot value of another, which is what a pushed reference join is
+/// -- and on a *left* join the two columns are not the same value: the one on
+/// the optional side is `NULL` wherever the join found nothing. So the column
+/// on the **preserved side** is the binding, because that is the side every
+/// solution has: `?s :ref ?t . OPTIONAL { ?t a Track }` binds `?t` by the
+/// slot (the identity is `NULL` for a signal with no track), while `?s a Port
+/// . OPTIONAL { ?o a Port ; :adjacent ?s }` binds `?s` by the identity (the
+/// slot is `NULL` for a port nothing is adjacent to). Reading the optional
+/// side's column there answered `?s` unbound for six of eight ports.
+///
+/// Among the columns on one side a slot is read before the identity: on an
+/// inner join the two hold the same value, and the slot is the column the
+/// rule resolved. The optional side is read only when nothing on the
+/// preserved side binds the variable, which is an `OPTIONAL`'s own read.
+fn scanned_column(plan: &crate::sparql_refine::Plan, var: &str) -> Option<ScannedColumn> {
     use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
-    plan.nodes
-        .iter()
-        .find_map(|node| {
-            let RefinedOp::Scan {
-                star_var,
-                class_uri,
-                slots,
-                ..
-            } = &node.op
-            else {
-                return None;
-            };
-            if node.executor != Executor::Sql {
-                return None;
-            }
-            // Either presence: a group key may be a value the record need not
-            // have. That is the missing-value bucket -- the column reads `NULL`
-            // and the bucket is a group like any other -- and the existence check
-            // is what `presence` decides, which the scan carries separately.
-            slots
-                .iter()
-                .find(|slot| slot.var.as_deref() == Some(var))
-                .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
+
+    // Whether a scan sits on the optional side of a left join this
+    // statement renders.
+    let optional_side = |scan: usize| -> bool {
+        plan.nodes.iter().any(|node| {
+            matches!(&node.op, RefinedOp::LeftJoin { right, .. }
+                if node.executor == Executor::Sql && plan.feeds(scan, *right))
         })
-        // Or the record's own identity. `GROUP BY ?t` over a scanned star groups
-        // by its URI, which the renderer reads from the identifier column at the
-        // empty path -- a column of the row rather than a value in its payload.
-        //
-        // Slots first, and that order is the resolution the rule used: a variable
-        // that is both some star's identity and another star's slot value is a
-        // value join, which `Visible` reports as ambiguous and the rule declines
-        // before reaching here.
-        .or_else(|| {
-            plan.nodes.iter().find_map(|node| {
-                let RefinedOp::Scan {
-                    star_var,
-                    class_uri,
-                    ..
-                } = &node.op
-                else {
-                    return None;
-                };
-                (node.executor == Executor::Sql && star_var == var)
-                    .then(|| (star_var.clone(), class_uri.clone(), Vec::new()))
-            })
-        })
+    };
+
+    let mut candidates: Vec<(bool, usize, ScannedColumn)> = Vec::new();
+    for (id, node) in plan.nodes.iter().enumerate() {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            slots,
+            ..
+        } = &node.op
+        else {
+            continue;
+        };
+        if node.executor != Executor::Sql {
+            continue;
+        }
+        let optional = optional_side(id);
+        // Either presence: a group key may be a value the record need not
+        // have. That is the missing-value bucket -- the column reads `NULL`
+        // and the bucket is a group like any other -- and the existence check
+        // is what `presence` decides, which the scan carries separately.
+        if let Some(slot) = slots.iter().find(|slot| slot.var.as_deref() == Some(var)) {
+            candidates.push((
+                optional,
+                0,
+                (star_var.clone(), class_uri.clone(), slot.path.clone()),
+            ));
+        }
+        // Or the record's own identity. `GROUP BY ?t` over a scanned star
+        // groups by its URI, which the renderer reads from the identifier
+        // column at the empty path -- a column of the row rather than a value
+        // in its payload.
+        if star_var == var {
+            candidates.push((
+                optional,
+                1,
+                (star_var.clone(), class_uri.clone(), Vec::new()),
+            ));
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by_key(|(optional, rank, _)| (*optional, *rank))
+        .map(|(_, _, column)| column)
 }
 
 /// The scan node for a star, in a tree being built.
@@ -2662,6 +2686,49 @@ mod tests {
                 if right_slot == "locatedOnTrack"
         ));
 
+        // The foreign key on the optional star: `?s` is the preserved star's
+        // identity, not the optional star's slot -- which is `NULL` for a
+        // port nothing is adjacent to, and answered `?s` unbound for six of
+        // eight ports.
+        let tree = lowered(
+            "SELECT ?s ?o WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?o a asset360:BaliseGroup ; asset360:refersToSignal ?s } } \
+             ORDER BY ?s LIMIT 2",
+            &sv,
+        )
+        .expect("lowers as one answering statement");
+        let Op::Project { bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        let s = bindings
+            .iter()
+            .find(|spec| spec.var == "s")
+            .expect("?s is a column");
+        assert_eq!(
+            (s.star_var.as_str(), s.slot_path.as_slice()),
+            ("s", &[][..])
+        );
+        // And the other way round: the foreign key on the preserved star
+        // binds `?t` by the slot, which every signal has; the `Track`'s
+        // identity is `NULL` where there is no track.
+        let tree = lowered(
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } } LIMIT 2",
+            &sv,
+        )
+        .expect("lowers as one answering statement");
+        let Op::Project { bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        let t = bindings
+            .iter()
+            .find(|spec| spec.var == "t")
+            .expect("?t is a column");
+        assert_eq!(
+            (t.star_var.as_str(), t.slot_path.as_slice()),
+            ("s", &["locatedOnTrack".to_owned()][..])
+        );
+
         // Above a grouping the projection carries nothing: the columns are
         // the grouping's.
         let tree = lowered(
@@ -2674,6 +2741,36 @@ mod tests {
             panic!("a project node");
         };
         assert!(bindings.is_empty());
+    }
+
+    /// A group key bound on both sides of a left join reads the preserved
+    /// side -- the same resolution the projection makes, and a wrong answer
+    /// the grouped route shipped: keyed on the optional star's slot, every
+    /// record the join left unmatched fell into one `NULL` bucket.
+    #[test]
+    fn a_group_key_bound_on_both_sides_of_a_left_join_reads_the_preserved_side() {
+        let sv = test_schema_view();
+        let tree = lowered(
+            "SELECT ?s (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?o a asset360:BaliseGroup ; asset360:refersToSignal ?s } } \
+             GROUP BY ?s",
+            &sv,
+        )
+        .expect("a grouping over a pushed left join lowers");
+        let Op::Group { bindings, keys, .. } = &tree.nodes[tree.find("group")[0]].op else {
+            panic!("a group node");
+        };
+        let key = &bindings[keys[0]];
+        assert_eq!(
+            (
+                key.var.as_str(),
+                key.star_var.as_str(),
+                key.slot_path.as_slice()
+            ),
+            ("s", "s", &[][..]),
+            "{:?}",
+            bindings
+        );
     }
 
     /// A narrowing pass drops the fan-out and weakens the element condition to
