@@ -314,14 +314,16 @@ pub fn sparql_execute(
     let mut parsed = crate::sparql_scoper::parse_query(query_str)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
-    // One slot, two spellings. The data carries the canonical IRI (the
-    // declared `slot_uri`); a query author writes the readable native one. The
-    // planner resolves the alias on its own parse, so this leg has to resolve
-    // it on this one -- otherwise the SQL leg answers the native spelling and
-    // the engine answers nothing, which is a silent route-dependent answer
-    // rather than the silent empty column it replaced. See
-    // [`crate::sparql_alias`].
-    crate::sparql_alias::canonicalize_predicates(&mut parsed, schema_view)
+    // One slot, two spellings -- and one class, two spellings. The data
+    // carries the canonical IRI (the declared `slot_uri` / `class_uri`); a
+    // query author writes the readable native one. The planner resolves the
+    // alias on its own parse, so this leg has to resolve it on this one --
+    // otherwise the SQL leg answers the native spelling and the engine answers
+    // nothing, which is a silent route-dependent answer rather than the silent
+    // empty column it replaced. The same pass refuses a predicate the
+    // subject's class cannot carry, so the two legs refuse the same queries
+    // too. See [`crate::sparql_alias`].
+    crate::sparql_alias::canonicalize(&mut parsed, schema_view)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
     let results = geosparql_evaluator()
         .for_query(parsed)

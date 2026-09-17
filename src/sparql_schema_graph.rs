@@ -56,6 +56,10 @@ use oxigraph::model::{GraphName, NamedNode, Quad};
 #[cfg(feature = "sparql-endpoint")]
 pub const OWL_EQUIVALENT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#equivalentProperty";
 
+/// `owl:equivalentClass`, the predicate that bridges a class's two spellings.
+#[cfg(feature = "sparql-endpoint")]
+pub const OWL_EQUIVALENT_CLASS: &str = "http://www.w3.org/2002/07/owl#equivalentClass";
+
 /// The caller's graph IRI was not an absolute IRI.
 ///
 /// Returned, not panicked on and not worked around: the value comes from
@@ -129,7 +133,7 @@ impl SchemaGraph {
         })
     }
 
-    /// The second spelling of every slot that has one.
+    /// The second spelling of every slot and every class that has one.
     ///
     /// A slot that declares a `slot_uri` is written into the data under that
     /// IRI and under no other, while the spelling a query author can actually
@@ -139,22 +143,25 @@ impl SchemaGraph {
     /// admitting that: without it the schema says a slot has one IRI while the
     /// endpoint answers to two, and a client has no way to find the second
     /// except by being told out of band. That is #447 (pepibru GitLab issue,
-    /// asset360/consolidator-server).
+    /// asset360/consolidator-server). A class that declares a `class_uri` is
+    /// the same story on the right of `rdf:type` — #451 — and is published
+    /// the same way, as `owl:equivalentClass`.
     ///
     /// It is emitted here and not in [`linkml_runtime::schema_rdf`] because it
     /// is not a fact about the datamodel — upstream deliberately names each
     /// element once, by the spelling the instance writer uses. It is a fact
     /// about *this endpoint's query surface*, which is this module's subject.
     ///
-    /// `owl:equivalentProperty` and not `skos:exactMatch`: the latter already
-    /// carries the slot's declared `exact_mappings`, and folding a spelling of
-    /// the slot itself in among its mappings to other vocabularies would make
-    /// both unreadable. Both directions are materialised — the relation is
-    /// symmetric in OWL, but a client asking plain SPARQL gets no entailment,
-    /// and the lookup has to work from whichever spelling they hold.
+    /// `owl:equivalentProperty` / `owl:equivalentClass` and not
+    /// `skos:exactMatch`: the latter already carries the element's declared
+    /// `exact_mappings`, and folding a spelling of the element itself in among
+    /// its mappings to other vocabularies would make both unreadable. Both
+    /// directions are materialised — the relation is symmetric in OWL, but a
+    /// client asking plain SPARQL gets no entailment, and the lookup has to
+    /// work from whichever spelling they hold.
     fn alias_quads(sv: &SchemaView, graph: &GraphName) -> Vec<Quad> {
         let conv = sv.converter();
-        let mut pairs: std::collections::BTreeSet<(String, String)> =
+        let mut slot_pairs: std::collections::BTreeSet<(String, String)> =
             std::collections::BTreeSet::new();
         for slot in sv.slot_views().unwrap_or_default() {
             let (Ok(canonical), Ok(native)) = (
@@ -164,31 +171,50 @@ impl SchemaGraph {
                 continue;
             };
             if canonical.0 != native.0 {
-                pairs.insert((native.0, canonical.0));
+                slot_pairs.insert((native.0, canonical.0));
+            }
+        }
+        let mut class_pairs: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for class in sv.class_views().unwrap_or_default() {
+            let (Ok(canonical), Ok(native)) = (
+                class.canonical_uri().to_uri(&conv),
+                sv.get_uri(class.schema_id(), class.name()).to_uri(&conv),
+            ) else {
+                continue;
+            };
+            if canonical.0 != native.0 {
+                class_pairs.insert((native.0, canonical.0));
             }
         }
 
-        let Ok(equivalent_property) = NamedNode::new(OWL_EQUIVALENT_PROPERTY) else {
-            return Vec::new();
-        };
         let mut quads = Vec::new();
-        for (native, canonical) in pairs {
-            let (Ok(native), Ok(canonical)) = (NamedNode::new(native), NamedNode::new(canonical))
-            else {
+        for (predicate, pairs) in [
+            (OWL_EQUIVALENT_PROPERTY, slot_pairs),
+            (OWL_EQUIVALENT_CLASS, class_pairs),
+        ] {
+            let Ok(equivalent) = NamedNode::new(predicate) else {
                 continue;
             };
-            quads.push(Quad::new(
-                native.clone(),
-                equivalent_property.clone(),
-                canonical.clone(),
-                graph.clone(),
-            ));
-            quads.push(Quad::new(
-                canonical,
-                equivalent_property.clone(),
-                native,
-                graph.clone(),
-            ));
+            for (native, canonical) in pairs {
+                let (Ok(native), Ok(canonical)) =
+                    (NamedNode::new(native), NamedNode::new(canonical))
+                else {
+                    continue;
+                };
+                quads.push(Quad::new(
+                    native.clone(),
+                    equivalent.clone(),
+                    canonical.clone(),
+                    graph.clone(),
+                ));
+                quads.push(Quad::new(
+                    canonical,
+                    equivalent.clone(),
+                    native,
+                    graph.clone(),
+                ));
+            }
         }
         quads
     }
@@ -258,7 +284,7 @@ mod tests {
     #[test]
     fn the_fixture_quad_count_is_pinned() {
         let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert_eq!(graph.quads.len(), 5722);
+        assert_eq!(graph.quads.len(), 5826);
     }
 
     /// The number above is not a number to be re-pinned when it moves; it has
@@ -352,9 +378,16 @@ mod tests {
         // and contributes nothing.
         let labels = count(SKOS_PREF_LABEL);
         assert_eq!(labels, 6, "six annotated languages across three values");
+
+        // 5826 since the class aliases (#451, pepibru GitLab issue): 52 of the
+        // fixture's classes declare a `class_uri` that differs from their
+        // native spelling -- every RSM and Eulynx class -- and each contributes
+        // one `owl:equivalentClass` quad in each direction.
+        let class_aliases = count(OWL_EQUIVALENT_CLASS);
+        assert_eq!(class_aliases, 2 * 52, "52 aliased classes, both directions");
         assert_eq!(
             graph.quads.len(),
-            1668 + 4 * restrictions + aliases + labels
+            1668 + 4 * restrictions + aliases + class_aliases + labels
         );
     }
 
@@ -604,6 +637,59 @@ classes:
             QueryResults::Boolean(answer) => assert!(answer),
             _ => panic!("an ASK must return a boolean"),
         }
+    }
+
+    /// The class-side twin of the lookup above, for #451 (pepibru GitLab
+    /// issue): `irsm:Track` is what a query author derives from the
+    /// datamodel, `RSM:#EAID_…` is what every `Track`'s `rdf:type` carries,
+    /// and the graph says so from both ends. The IRI it hands back is the one
+    /// the rest of the graph describes as the class.
+    #[test]
+    fn a_client_can_look_up_the_class_spelling_the_data_uses() {
+        let sv = asset360_schema_view();
+        let conv = sv.converter();
+        // Resolved by the native spelling on purpose: that is the lookup a
+        // client would make, and the one the planner makes.
+        let element = sv
+            .get_class_by_uri("https://data.infrabel.be/asset360-rsm-subset/LinearElement")
+            .unwrap()
+            .expect("the RSM subset declares LinearElement");
+        let native = sv
+            .get_uri(element.schema_id(), element.name())
+            .to_uri(&conv)
+            .unwrap()
+            .0;
+        let canonical = element.canonical_uri().to_uri(&conv).unwrap().0;
+        assert_ne!(native, canonical, "LinearElement declares a class_uri");
+        let store = store_of(&sv);
+
+        let ask = |subject: &str| -> Vec<String> {
+            let query = format!(
+                "SELECT ?o WHERE {{ GRAPH <{ASSET360_SCHEMA_GRAPH}> {{ \
+                 <{subject}> <{OWL_EQUIVALENT_CLASS}> ?o }} }}"
+            );
+            match oxigraph::sparql::SparqlEvaluator::new()
+                .for_query(query.parse::<spargebra::Query>().unwrap())
+                .on_store(&store)
+                .execute()
+                .unwrap()
+            {
+                QueryResults::Solutions(solutions) => solutions
+                    .map(|s| s.unwrap().get("o").unwrap().to_string())
+                    .collect(),
+                _ => panic!("a SELECT must return solutions"),
+            }
+        };
+
+        assert_eq!(ask(&native), vec![format!("<{canonical}>")]);
+        assert_eq!(ask(&canonical), vec![format!("<{native}>")]);
+        assert!(
+            SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
+                .unwrap()
+                .to_ntriples()
+                .contains(&format!("<{canonical}> <{RDF_TYPE}> <{OWL_CLASS}>")),
+            "the spelling handed back is the one the graph describes"
+        );
     }
 
     #[test]
