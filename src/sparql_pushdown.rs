@@ -84,7 +84,7 @@ impl Container {
 
     /// Map the schema's own three-way distinction to the string form the
     /// Python boundary uses. Not a parallel vocabulary — a rendering of one.
-    fn from_mode(mode: &linkml_schemaview::slotview::SlotContainerMode) -> Self {
+    pub(crate) fn from_mode(mode: &linkml_schemaview::slotview::SlotContainerMode) -> Self {
         use linkml_schemaview::slotview::SlotContainerMode;
         match mode {
             SlotContainerMode::SingleValue => Self::Single,

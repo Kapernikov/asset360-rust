@@ -135,6 +135,12 @@ pub enum Op {
         required_slots: Vec<String>,
         /// Slots that may be absent, so no existence check.
         optional_slots: Vec<String>,
+        /// Nested reads that must find a value: one predicate over the record
+        /// per scan -- see [`crate::sparql_scoper::RequiredPath`]. The
+        /// premise of the fetch bound, restated where the scoper could and
+        /// the bound declined where it could not; a renderer that ignores
+        /// these and applies the bound pages short, silently.
+        required_paths: Vec<crate::sparql_scoper::RequiredPath>,
         /// Whether the star itself appears only inside `OPTIONAL`.
         ///
         /// Decides both the join type above it and whether its own conditions
@@ -446,6 +452,7 @@ pub fn lower_sql_pass(
                 identifier_values: star.identifier_values.clone(),
                 required_slots: star.required_fields.clone(),
                 optional_slots: star.optional_fields.clone(),
+                required_paths: star.required_paths.clone(),
                 is_optional: star.is_optional,
                 // The scoper's decomposition, used when the refinement
                 // pipeline produced nothing. Nothing here knows what the query
@@ -817,7 +824,97 @@ pub fn lower_refined(
     fetch_bound: Option<usize>,
     unioned_fetch_bound: Option<usize>,
 ) -> Result<OpTree, LoweringRefusal> {
+    lower_refined_with(
+        plan,
+        schema,
+        &FetchBounds {
+            limit: fetch_bound,
+            limit_if_unioned: unioned_fetch_bound,
+            required_paths: std::collections::HashMap::new(),
+        },
+    )
+}
+
+/// The scoper's decisions about the fetch, carried into [`lower_refined_with`]
+/// together: the bound, and the premise the bound rests on.
+///
+/// The two travel as one value because they are one decision. A bound is
+/// sound only where each fetched row of the bounded scan yields a solution,
+/// and the nested reads in `required_paths` are what makes that true of a
+/// record read through a path (`crate::sparql_scoper::RequiredPath`). A
+/// lowering handed the bound without the premise would render a statement
+/// that pages short.
+#[derive(Debug, Clone, Default)]
+pub struct FetchBounds {
+    /// [`crate::sparql_scoper::QueryPlan::sql_limit`].
+    pub limit: Option<usize>,
+    /// [`crate::sparql_scoper::QueryPlan::sql_limit_if_unioned`].
+    pub limit_if_unioned: Option<usize>,
+    /// The nested reads each scan restates, keyed by the star's variable and
+    /// class -- the two things a refined scan and a scoped star share.
+    pub required_paths:
+        std::collections::HashMap<(String, String), Vec<crate::sparql_scoper::RequiredPath>>,
+}
+
+impl FetchBounds {
+    /// What the scoper decided, read off its plan.
+    ///
+    /// A `UNION` is the one shape where a scoped star is not one refined
+    /// scan: `scope_union` merges the branches and gives a variable scanned
+    /// in two arms two stars (`?s` and `?s__u1`), while the refined plan
+    /// scans `?s` twice. Where the two arms restate the same nested reads --
+    /// or none -- the key is unambiguous. Where they differ, no key can say
+    /// which arm's reads belong to which scan, so nothing is attached to
+    /// either and the bound is declined: the union's bound rests on every
+    /// arm's rows being solutions, and one arm's premise can no longer be
+    /// stated on its scan.
+    pub fn of(scoped: &crate::sparql_scoper::QueryPlan) -> Self {
+        let mut required_paths: std::collections::HashMap<
+            (String, String),
+            Vec<crate::sparql_scoper::RequiredPath>,
+        > = std::collections::HashMap::new();
+        let mut ambiguous = false;
+        for star in scoped.root.all_stars() {
+            // A union renames a second star of one variable `var__uN`;
+            // the refined plan knows it by the query's own name.
+            let var = star
+                .variable
+                .split_once("__u")
+                .map_or(star.variable.as_str(), |(base, _)| base)
+                .to_owned();
+            let key = (var, star.class_uri.clone());
+            match required_paths.get(&key) {
+                Some(existing) if *existing != star.required_paths => ambiguous = true,
+                Some(_) => {}
+                None => {
+                    required_paths.insert(key, star.required_paths.clone());
+                }
+            }
+        }
+        if ambiguous {
+            return Self::default();
+        }
+        Self {
+            limit: scoped.sql_limit,
+            limit_if_unioned: scoped.sql_limit_if_unioned,
+            required_paths,
+        }
+    }
+}
+
+/// [`lower_refined`], with the fetch bound's premise alongside the bound.
+///
+/// This is the entry point the planner uses; the four-argument form exists
+/// for tests that build a refined plan by hand and have no scoped plan to
+/// read a premise from.
+pub fn lower_refined_with(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    bounds: &FetchBounds,
+) -> Result<OpTree, LoweringRefusal> {
     use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp, SlotPresence};
+    let fetch_bound = bounds.limit;
+    let unioned_fetch_bound = bounds.limit_if_unioned;
 
     // Before the island analysis, because a UNION the rules did not push is
     // the shape that analysis cannot see -- see
@@ -1024,6 +1121,16 @@ pub fn lower_refined(
                             .filter(|slot| Some(slot.as_str()) != identifier.as_deref())
                             .collect(),
                         optional_slots: column_slots(SlotPresence::Optional),
+                        // The scoper's, not the refined plan's: the refined
+                        // scan lists the nested reads a rule folded into it,
+                        // which is fewer than the query wrote (a read through
+                        // a collection stays with the engine), and the
+                        // premise has to cover every mandatory read.
+                        required_paths: bounds
+                            .required_paths
+                            .get(&(star_var.clone(), class_uri.clone()))
+                            .cloned()
+                            .unwrap_or_default(),
                         // Whether the query only optionally wants these rows,
                         // which is what decides how the renderer wraps every
                         // condition on them. A scan on the optional side of a
@@ -2386,6 +2493,52 @@ mod tests {
                 PassKind::Engine(_) => None,
             })
             .collect()
+    }
+
+    /// `FetchBounds::of` keys a scoped star's nested reads by variable and
+    /// class, which a `UNION` can make ambiguous: two arms scanning `?s` as
+    /// one class with different nested reads are two scoped stars and two
+    /// refined scans of one name. Then nothing is attached and the bound is
+    /// declined; where the arms agree, the key holds and the bound stays.
+    #[test]
+    fn a_union_whose_arms_restate_different_reads_declines_the_bound() {
+        let sv = test_schema_view();
+        let scope = |query: &str| {
+            crate::sparql_scoper::sparql_scope(&format!("{PREFIX}{query}"), &sv).unwrap()
+        };
+
+        let differing = FetchBounds::of(&scope(
+            "SELECT ?s ?v WHERE { { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v } UNION { ?s a asset360:Signal ; asset360:location ?c2 . \
+             ?c2 asset360:latitude ?v } } LIMIT 10",
+        ));
+        assert_eq!(differing.limit_if_unioned, None);
+        assert!(differing.required_paths.is_empty(), "{differing:?}");
+
+        let agreeing = FetchBounds::of(&scope(
+            "SELECT ?s ?v WHERE { { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v } UNION { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v ; asset360:latitude ?la } } LIMIT 10",
+        ));
+        // The second arm reads one leaf more, so the two arms are two stars
+        // of one name again -- and they disagree, so this declines too. The
+        // key only holds where the arms restate the same reads.
+        assert_eq!(agreeing.limit_if_unioned, None);
+
+        let same = FetchBounds::of(&scope(
+            "SELECT ?s ?v WHERE { { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v } UNION { ?s a asset360:BaliseGroup ; \
+             asset360:refersToSignal ?v } } LIMIT 10",
+        ));
+        assert_eq!(same.limit_if_unioned, Some(10), "{same:?}");
+        assert_eq!(
+            same.required_paths[&(
+                "s".to_owned(),
+                "https://data.infrabel.be/asset360/Signal".to_owned()
+            )]
+                .len(),
+            1
+        );
     }
 
     /// Every refined plan the rules produce for these queries lowers, and the

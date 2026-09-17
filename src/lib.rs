@@ -1603,6 +1603,23 @@ impl Star {
             .collect()
     }
 
+    /// Nested reads the scan restates as presence checks, as
+    /// ``[(slot_path, containers), ...]`` -- the same shape and the same
+    /// obligation as ``PlanOp.required_paths``; see there.
+    #[getter]
+    fn required_paths(&self) -> Vec<(Vec<String>, Vec<&'static str>)> {
+        self.inner
+            .required_paths
+            .iter()
+            .map(|path| {
+                (
+                    path.slot_path.clone(),
+                    path.containers.iter().map(|c| c.as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
     /// Which SPARQL variable each slot binds to, as ``{slot: variable}``.
     ///
     /// Answers "where does ``?name`` come from" without re-parsing the
@@ -2562,6 +2579,42 @@ impl PlanOp {
         use crate::sparql_ops::Op;
         match &self.inner.op {
             Op::Scan { optional_slots, .. } => optional_slots.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"scan"``: nested reads that must find a value, as
+    /// ``[(slot_path, containers), ...]`` with ``containers`` parallel to
+    /// ``slot_path`` (``"single"``, ``"list"`` or ``"mapping"`` per step).
+    ///
+    /// ``required_slots`` restates the first hop of ``?s :superStructure ?c .
+    /// ?c :hasMaterial ?v``; this restates the rest. **Not optional to
+    /// read**: the fetch bound (a claim-free ``slice`` on this pass) rests on
+    /// every fetched row yielding a solution, and a record whose structure
+    /// lacks the value is a fetched row that yields none -- ``LIMIT 50``
+    /// answered 38, silently, until the scan checked (issue #455, pepibru
+    /// GitLab). Render every entry of one scan as **one** predicate over the
+    /// record, so two leaves under one collection hop are required on the
+    /// same element: ``jsonb_path_exists(object_data, '$."a"[*]."b" ? (@ !=
+    /// null)')``, ``[*]`` at a list hop, ``.*`` at a mapping hop, and the
+    /// leaf not JSON ``null`` because an explicit ``null`` emits no triple.
+    ///
+    /// Empty where the scoper restated nothing -- and where it *could not*
+    /// restate a mandatory nested read, the pass carries no fetch bound at
+    /// all, so a renderer never sees a bound whose premise is missing.
+    #[getter]
+    fn required_paths(&self) -> Vec<(Vec<String>, Vec<&'static str>)> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { required_paths, .. } => required_paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.slot_path.clone(),
+                        path.containers.iter().map(|c| c.as_str()).collect(),
+                    )
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }

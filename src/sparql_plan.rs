@@ -53,11 +53,16 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// a planner/executor version skew a loud failure rather than a wrong number,
 /// which is the failure this whole module is shaped around.
 ///
-/// 4 added [`crate::sparql_ops::Op::Project`]'s bindings: an ungrouped
-/// projection that carries them is a statement that *answers*, and its
-/// `sort` and `slice` are the query's own rather than a fetch bound. A
-/// consumer built against 3 reads such a `slice` as the fetch bound -- with
-/// the offset dropped -- and pages wrong: every page the lowest records.
+/// 4 added two things one release carries together. [`crate::sparql_ops::
+/// Op::Project`]'s bindings: an ungrouped projection that carries them is a
+/// statement that *answers*, and its `sort` and `slice` are the query's own
+/// rather than a fetch bound -- a consumer built against 3 reads such a
+/// `slice` as the fetch bound, with the offset dropped, and pages wrong:
+/// every page the lowest records. And [`crate::sparql_ops::Op::Scan`]'s
+/// `required_paths`: the premise of the fetch bound, restated on the scan --
+/// a consumer built against 3 applies the bound without them and answers a
+/// short page with no error (issue #455, pepibru GitLab). Both are exactly
+/// the skew this number exists to make loud.
 ///
 /// 3 added [`crate::sparql_ops::Op::Filter`]'s reading, which is not a new
 /// kind but *is* a new obligation on a renderer: one that ignores it renders a
@@ -482,6 +487,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 star_var,
                 class_uri,
                 identifier_values,
+                required_paths,
                 is_optional,
                 ..
             } => {
@@ -493,6 +499,25 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 )?;
                 if !identifier_values.is_empty() {
                     writeln!(f, "      identity  {}", identifier_values.join(", "))?;
+                }
+                // The premise of a fetch bound, one line per nested read the
+                // scan restates, with each hop's storage after its name so
+                // the printout says what the predicate walks through.
+                for path in required_paths {
+                    let steps: Vec<String> = path
+                        .slot_path
+                        .iter()
+                        .zip(&path.containers)
+                        .map(|(slot, container)| {
+                            use crate::sparql_pushdown::Container;
+                            match container {
+                                Container::Single => slot.clone(),
+                                Container::List => format!("{slot}[*]"),
+                                Container::Mapping => format!("{slot}.*"),
+                            }
+                        })
+                        .collect();
+                    writeln!(f, "      present   {}", steps.join("."))?;
                 }
             }
             Op::Filter {
@@ -1128,11 +1153,10 @@ pub fn plan_query_refined_with_schema_graph(
         ));
     }
 
-    let mut ops = match crate::sparql_ops::lower_refined(
+    let mut ops = match crate::sparql_ops::lower_refined_with(
         &refined,
         schema_view,
-        scoped.sql_limit,
-        scoped.sql_limit_if_unioned,
+        &crate::sparql_ops::FetchBounds::of(&scoped),
     ) {
         Ok(ops) => ops,
         // No statement the renderer can express. Every shape in the inventory
@@ -2654,6 +2678,81 @@ mod tests {
                 .any(|id| matches!(answered.obligations[*id], Obligation::Slice { .. }))),
             "the query's own LIMIT is the statement's: {answered}"
         );
+    }
+
+    /// The bound travels with its premise. The statement that carries a
+    /// `LIMIT` over a nested read also carries the scan's presence check for
+    /// that read -- on the served route, which lowers the *refined* plan and
+    /// would otherwise know only the nested reads a rule folded in. Whether
+    /// that `LIMIT` is the fetch bound or the statement's own (a fully
+    /// pushed projection answers with it) the scan states the premise
+    /// either needs. And where the scoper declined the bound (a mapping key
+    /// leaf), the pass carries no bound at all: never a bound without its
+    /// premise.
+    #[test]
+    fn the_fetch_bound_travels_with_the_presence_it_rests_on() {
+        let sv = test_schema_view();
+        let scan_of = |plan: &ExecutionPlan| -> (Option<usize>, Vec<Vec<String>>) {
+            let ops = plan
+                .passes
+                .iter()
+                .find_map(|pass| match &pass.kind {
+                    PassKind::Sql(sql) => Some(&sql.ops),
+                    PassKind::Engine(_) => None,
+                })
+                .expect("a SQL pass");
+            let paths = ops
+                .nodes
+                .iter()
+                .find_map(|node| match &node.op {
+                    crate::sparql_ops::Op::Scan { required_paths, .. } => Some(
+                        required_paths
+                            .iter()
+                            .map(|path| path.slot_path.clone())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .expect("a scan");
+            let limit = ops.nodes.iter().rev().find_map(|node| match &node.op {
+                crate::sparql_ops::Op::Slice { limit, .. } => *limit,
+                _ => None,
+            });
+            (limit, paths)
+        };
+
+        let restated = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s ?v WHERE {{ ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c asset360:longitude ?v }} LIMIT 50"
+            ),
+            &sv,
+        )
+        .expect("should plan");
+        assert_eq!(
+            scan_of(&restated),
+            (
+                Some(50),
+                vec![vec!["location".to_owned(), "longitude".to_owned()]]
+            ),
+            "{restated}"
+        );
+        assert!(
+            restated
+                .to_string()
+                .contains("present   location.longitude"),
+            "the printout names the premise: {restated}"
+        );
+
+        let declined = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s ?k WHERE {{ ?s a asset360:Signal ; asset360:documents ?d . \
+                 ?d asset360:docId ?k }} LIMIT 50"
+            ),
+            &sv,
+        )
+        .expect("should plan");
+        assert_eq!(scan_of(&declined), (None, vec![]), "{declined}");
     }
 
     /// A query that never asked for an aggregate is owed no explanation.

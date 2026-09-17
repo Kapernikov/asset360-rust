@@ -588,6 +588,41 @@ pub struct PathBinding {
     pub optional: bool,
 }
 
+/// A nested read the scan restates as a presence check, so that a fetched
+/// row is a row the query has a solution for.
+///
+/// `?s :superStructure ?c . ?c :hasMaterial ?v` requires a value at the end
+/// of a path. [`Star::required_fields`] restates the first hop — the record
+/// holds a `superStructure` — and stops there, so a record whose structure
+/// lacks the material was fetched and yielded nothing. Harmless while the
+/// engine re-runs the query over everything fetched; fatal under a fetch
+/// bound, whose premise is "each fetched row yields at least one solution":
+/// `LIMIT 50` read fifty records, twelve of them empty, and answered 38 with
+/// no error (issue #455, pepibru GitLab).
+///
+/// One entry per mandatory nested read of a mandatory star. A consumer
+/// renders every entry of one star as **one** predicate over the record —
+/// two leaves under the same collection hop have to be found on the *same*
+/// element, because that is the one blank node the two triples share — with
+/// each leaf present and not JSON `null` (an explicit `null` emits no
+/// triple, see `sql_builder._presence_expression`). In Postgres that is
+/// `jsonb_path_exists(object_data, '$."a"[*]."b"[*] ? (@ != null)')`,
+/// with `[*]` at a list hop, `.*` at a mapping hop and nothing at a
+/// single-valued one.
+///
+/// **Not optional to read.** A renderer that leaves these out and applies
+/// [`QueryPlan::sql_limit`] answers a short page silently, which is the
+/// defect this exists to close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredPath {
+    /// Slots from the record's root to the value, always at least two long:
+    /// a single slot is a column and lives in [`Star::required_fields`].
+    pub slot_path: Vec<String>,
+    /// Parallel to `slot_path`: how each step is stored, which decides how
+    /// the predicate steps through it.
+    pub containers: Vec<crate::sparql_pushdown::Container>,
+}
+
 /// The datatype every plain literal carries in RDF 1.1.
 const XSD_STRING_IRI: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -784,6 +819,20 @@ pub struct Star {
     /// renders only `filters` answers a weaker question than the query asked,
     /// so this is not optional to read.
     pub path_filters: Vec<PathFilter>,
+
+    /// Nested reads the scan restates as presence checks — see
+    /// [`RequiredPath`] for what one is and why a renderer must not skip it.
+    ///
+    /// Only for a mandatory star and only for reads outside any `OPTIONAL`:
+    /// the fetch bound rests on this star's rows, and an optional read leaves
+    /// a variable unbound rather than costing the row its solution. Sorted by
+    /// path, so two plans of one query render the same predicate.
+    ///
+    /// Filled in Phase 3 alongside `path_filters`. A mandatory nested read
+    /// that cannot be restated here declines the fetch bound instead
+    /// (`nested_presence_of`), never a third option where the bound stays and
+    /// the page is short.
+    pub required_paths: Vec<RequiredPath>,
 
     /// Which of this star's slots compare as numbers rather than as text.
     ///
@@ -1816,6 +1865,7 @@ pub fn scope_parsed_with_schema_graph(
             numeric_fields,
             // Filled in Phase 3, once the paths into this record are known.
             path_filters: Vec::new(),
+            required_paths: Vec::new(),
             identifier_values,
             required_fields,
             optional_fields,
@@ -2167,6 +2217,52 @@ pub fn scope_parsed_with_schema_graph(
         }
     }
 
+    // Phase 3b: the presence of every mandatory nested read, restated on the
+    // star's scan. `required_fields` covers the first hop; this covers the
+    // rest, so a fetched row of a mandatory star is a row the query answers
+    // through. That is the premise the fetch bound (Phase 7) rests on, and it
+    // is either restated here or the bound is declined there — see
+    // `RequiredPath`.
+    //
+    // A read inside an `OPTIONAL` requires nothing: a missing value leaves
+    // the variable unbound and the row keeps its solution. A read on an
+    // optional star is the join's business, and the bound never rests on
+    // that star's rows.
+    let mut nested_presence_restated = true;
+    {
+        // Sorted, so the order of `required_paths` (and so the rendered
+        // predicate) does not depend on hash order.
+        let mut mandatory_reads: Vec<&PathBinding> = path_bindings
+            .values()
+            .filter(|binding| !binding.optional)
+            .collect();
+        mandatory_reads
+            .sort_by(|a, b| (&a.star_var, &a.slot_path).cmp(&(&b.star_var, &b.slot_path)));
+        for binding in mandatory_reads {
+            let Some(star) = stars
+                .iter_mut()
+                .find(|star| star.variable == binding.star_var)
+            else {
+                continue;
+            };
+            if star.is_optional {
+                continue;
+            }
+            match nested_presence_of(schema_view, &star.class_uri, &binding.slot_path) {
+                Some(required) => {
+                    if !star.required_paths.contains(&required) {
+                        star.required_paths.push(required);
+                    }
+                }
+                // A read the scan cannot restate. The plan still describes
+                // the query -- the engine re-applies it over what is fetched
+                // -- but the fetched rows are no longer each worth a
+                // solution, so no bound may rest on them.
+                None => nested_presence_restated = false,
+            }
+        }
+    }
+
     // Phase 5: Wrap the result into a PlanNode tree. If the original
     // pattern has no OPTIONAL (all joins inner, no optional stars), emit
     // a single `Bgp` node. If any OPTIONAL is present, split mandatory
@@ -2341,7 +2437,16 @@ pub fn scope_parsed_with_schema_graph(
     // arms and may only cap the stack with a `Rows` bound. One that applies a
     // join's bound to the product returns fewer solutions than the query asked
     // for, silently.
-    let sql_limit_scope = if inexact.is_some() {
+    //
+    // Both shapes share one more premise: each fetched row of the bounded
+    // scan yields at least one solution. The scan restates the class, the
+    // top-level slots (`required_fields`) and every nested read it can
+    // (`required_paths`); a nested read it cannot restate (Phase 3b) breaks
+    // the premise, and a bound whose premise the scan cannot guarantee is
+    // declined. The fetch is then unbounded, which is slow and right, rather
+    // than bounded and short with nothing to say so (issue #455, pepibru
+    // GitLab).
+    let sql_limit_scope = if inexact.is_some() || !nested_presence_restated {
         None
     } else if single_relation && !has_optional {
         Some(LimitScope::Rows)
@@ -3871,6 +3976,58 @@ fn path_push_form(
         .iter()
         .all(|mode| *mode == linkml_schemaview::slotview::SlotContainerMode::SingleValue)
         .then(|| (push_form_of(&descriptor), descriptor.numeric))
+}
+
+/// The presence check a scan can state for a nested read, or `None` when it
+/// cannot.
+///
+/// The walk that produced the binding already resolved every step against
+/// the schema, so a path that fails to resolve here is a defect in one of
+/// the two walks rather than a query shape -- and the answer to a defect is
+/// to decline the bound, not to guess. The one shape declined on purpose: a
+/// leaf that is the **key slot of a mapping element**. A mapping is stored
+/// keyed by that slot's value, and the loader injects the key into the
+/// element when the payload leaves it out (`rust-linkml-core`,
+/// `build_mapping_entry_for_slot`), so the stored JSON may not carry it and
+/// no predicate over the payload can say whether the triple exists. Every
+/// other shape is restated: single-valued, list and mapping hops, a
+/// single- or multivalued leaf, and several leaves under one element.
+fn nested_presence_of(
+    schema_view: &SchemaView,
+    class_uri: &str,
+    slot_path: &[String],
+) -> Option<RequiredPath> {
+    use linkml_schemaview::slotview::SlotContainerMode;
+    if slot_path.len() < 2 {
+        return None;
+    }
+    let mut class = schema_view.get_class_by_uri(class_uri).ok().flatten()?;
+    let mut containers = Vec::with_capacity(slot_path.len());
+    for (index, name) in slot_path.iter().enumerate() {
+        let slot = class.slot(&Identifier::Name(name.clone()))?;
+        let mode = slot.determine_slot_container_mode();
+        containers.push(mode);
+        if index + 1 == slot_path.len() {
+            break;
+        }
+        let range = slot.get_range_class()?;
+        if mode == SlotContainerMode::Mapping
+            && index + 2 == slot_path.len()
+            && range
+                .key_or_identifier_slot()
+                .is_some_and(|key| key.name == slot_path[index + 1])
+        {
+            return None;
+        }
+        class = range;
+    }
+    Some(RequiredPath {
+        slot_path: slot_path.to_vec(),
+        containers: containers
+            .iter()
+            .map(crate::sparql_pushdown::Container::from_mode)
+            .collect(),
+    })
 }
 
 /// The stored texts a constant selects on a column, or `None` when no
@@ -6003,6 +6160,120 @@ classes:
             assert_eq!(plan.sql_limit, expected, "for: {label}");
             assert_eq!(plan.sql_limit_scope, scope, "scope, for: {label}");
         }
+    }
+
+    /// The premise of the fetch bound, restated: a mandatory read through a
+    /// nested path is a presence check on the scan, so every fetched row is
+    /// one the query has a solution for. `LIMIT 50` over
+    /// `?s :superStructure ?c . ?c :hasMaterial ?v` fetched fifty records,
+    /// twelve without a material, and answered 38 with no error (issue #455,
+    /// pepibru GitLab).
+    ///
+    /// One table: which nested reads a scan restates, and which shape
+    /// declines the bound instead. Nothing in between.
+    #[test]
+    fn a_nested_read_is_restated_on_the_scan_or_the_bound_is_declined() {
+        use crate::sparql_pushdown::Container::{Mapping, Single};
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+        let path =
+            |slots: &[&str], containers: &[crate::sparql_pushdown::Container]| RequiredPath {
+                slot_path: slots.iter().map(|s| (*s).to_owned()).collect(),
+                containers: containers.to_vec(),
+            };
+
+        for (label, query, expected, limit) in [
+            (
+                "the issue's shape: one hop into a structure, single-valued",
+                "SELECT ?s ?v WHERE { ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c asset360:longitude ?v } LIMIT 50",
+                vec![path(&["location", "longitude"], &[Single, Single])],
+                Some(50),
+            ),
+            (
+                "two leaves under one structure: two entries, sorted by path",
+                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c asset360:longitude ?lo ; asset360:latitude ?la } LIMIT 50",
+                vec![
+                    path(&["location", "latitude"], &[Single, Single]),
+                    path(&["location", "longitude"], &[Single, Single]),
+                ],
+                Some(50),
+            ),
+            (
+                "three hops: the whole chain",
+                "SELECT ?v WHERE { ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c asset360:detail ?d . ?d asset360:value ?v } LIMIT 5",
+                vec![path(
+                    &["location", "detail", "value"],
+                    &[Single, Single, Single],
+                )],
+                Some(5),
+            ),
+            (
+                "through a mapping to an ordinary slot: restated, `.*` at the hop",
+                "SELECT ?s ?t WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
+                 ?d asset360:title ?t } LIMIT 50",
+                vec![path(&["documents", "title"], &[Mapping, Single])],
+                Some(50),
+            ),
+            (
+                "a read inside OPTIONAL requires nothing, and the bound stays",
+                "SELECT ?s ?v WHERE { ?s a asset360:Signal ; asset360:name ?n . \
+                 OPTIONAL { ?s asset360:location ?c . ?c asset360:longitude ?v } } LIMIT 50",
+                vec![],
+                Some(50),
+            ),
+            (
+                "the key slot of a mapping element lives in the dict key, not the \
+                 payload: nothing the scan can state, so the bound is declined",
+                "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
+                 ?d asset360:docId ?k } LIMIT 50",
+                vec![],
+                None,
+            ),
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(plan.inexact, None, "a walked path is not a loss: {label}");
+            let star = &plan.root.all_stars()[0];
+            assert_eq!(star.required_paths, expected, "restated, for: {label}");
+            assert_eq!(plan.sql_limit, limit, "bound, for: {label}");
+        }
+    }
+
+    /// The same premise on the driving scan of a rooted `OPTIONAL` join: the
+    /// bound is on the mandatory star's rows, so it is that star's nested
+    /// reads that are restated, and an optional star's never are.
+    #[test]
+    fn a_driving_scan_restates_its_own_nested_reads_and_keeps_its_bound() {
+        use crate::sparql_pushdown::Container::Single;
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?v ?n WHERE { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
+             asset360:documents ?d . ?d asset360:title ?n } } LIMIT 50",
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None);
+        assert_eq!(plan.sql_limit, Some(50));
+        assert_eq!(plan.sql_limit_scope, Some(LimitScope::DrivingScan));
+        let stars = plan.root.all_stars();
+        let driving = stars.iter().find(|s| s.variable == "s").unwrap();
+        let optional = stars.iter().find(|s| s.variable == "t").unwrap();
+        assert_eq!(
+            driving.required_paths,
+            vec![RequiredPath {
+                slot_path: vec!["location".to_owned(), "longitude".to_owned()],
+                containers: vec![Single, Single],
+            }]
+        );
+        assert!(
+            optional.required_paths.is_empty(),
+            "an optional star's read leaves the variable unbound, it does not cost a row"
+        );
     }
 
     /// Every point that drops part of the query must say so, because a LIMIT is
