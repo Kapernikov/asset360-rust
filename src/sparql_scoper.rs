@@ -32,6 +32,22 @@ use linkml_schemaview::schemaview::SchemaView;
 /// constructs (`UNION`, `MINUS`, `NOT EXISTS`, …) can be added as new
 /// node variants without breaking the existing `Bgp` / `LeftJoin`
 /// consumers. Today exactly two node kinds are emitted.
+/// What a [`QueryPlan::sql_limit`] bounds.
+///
+/// Both variants bound *the scan the fetch drives from*; they differ in
+/// whether that scan is also the statement's row set. See
+/// [`bound_applies_to_the_driving_scan`] for the join shape and why its bound
+/// must not land on the product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitScope {
+    /// One relation, no join, no `OPTIONAL`: a row is a solution, and the
+    /// bound is an outer `LIMIT` on the rows.
+    Rows,
+    /// A rooted `OPTIONAL` join: the bound is on the mandatory star's scan
+    /// only, and the joined rows are **not** capped.
+    DrivingScan,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     /// Root of the algebra tree.
@@ -63,6 +79,22 @@ pub struct QueryPlan {
     /// and whose modifiers let a limit apply before them.
     pub sql_limit: Option<usize>,
 
+    /// What `sql_limit` bounds, for the consumer that has to tell the two
+    /// shapes apart — and the reason it is a field rather than something
+    /// re-derived from the stars and joins.
+    ///
+    /// [`LimitScope::Rows`] is the single-relation shape, where the fetch's
+    /// rows stand one-for-one with the query's solutions and the bound may
+    /// be applied as an outer `LIMIT` on whatever statement carries them.
+    /// [`LimitScope::DrivingScan`] is the rooted-`OPTIONAL` join, where the
+    /// rows are a product and the bound holds only for the mandatory star's
+    /// scan. `scope_union` stacks branches into one statement and applies
+    /// one bound to the stack, which is sound for the first and not for the
+    /// second; it reads this rather than repeating the analysis.
+    ///
+    /// `None` exactly when `sql_limit` is `None`.
+    pub sql_limit_scope: Option<LimitScope>,
+
     /// The same bound, for the one shape this struct cannot decide alone: a
     /// `UNION` that the lowering turns into a **single** `UNION ALL`
     /// statement.
@@ -73,9 +105,13 @@ pub struct QueryPlan {
     /// over all the arms *is* the union's rows, and then the same bound is
     /// sound for the same reason it is sound for a single class.
     ///
-    /// Set only when **every** branch's own plan carries a `sql_limit` — so
-    /// every branch is exact, single-relation and `OPTIONAL`-free, and each
-    /// branch's rows stand one-for-one with its solutions. That is the
+    /// Set only when **every** branch's own plan carries a `sql_limit` whose
+    /// scope is [`LimitScope::Rows`] — so every branch is exact,
+    /// single-relation and `OPTIONAL`-free, and each branch's rows stand
+    /// one-for-one with its solutions. A branch bounded on its *driving scan*
+    /// declines: its rows are a join product, and an outer `LIMIT` on the
+    /// stacked statement would cap that product, which is the short answer
+    /// with no error that the driving-scan bound exists to avoid. That is the
     /// scoper's existing analysis, asked once per branch rather than
     /// re-derived, which is what keeps one owner for the question of whether a
     /// limit may reach a fetch at all.
@@ -2301,16 +2337,22 @@ pub fn scope_parsed_with_schema_graph(
     // which is why the bound has always read as a row cap. For the shape
     // `bound_applies_to_the_driving_scan` admits it is the mandatory star's
     // scan, and the consumer applies it there rather than to the join product
-    // — `sparql/fetch.py`, `execute_plan`. A consumer that cannot tell the two
-    // apart must apply neither; one that applies a join's bound to the product
-    // returns fewer solutions than the query asked for, silently.
-    let sql_limit = if inexact.is_none()
-        && (single_relation && !has_optional || driving_scan_carries_the_bound)
-    {
-        pushable_limit(pattern)
+    // — `sparql/fetch.py`, `execute_plan`. `sql_limit_scope` says which, for
+    // the consumer that has one place to put a bound: `scope_union` stacks its
+    // arms and may only cap the stack with a `Rows` bound. One that applies a
+    // join's bound to the product returns fewer solutions than the query asked
+    // for, silently.
+    let sql_limit_scope = if inexact.is_some() {
+        None
+    } else if single_relation && !has_optional {
+        Some(LimitScope::Rows)
+    } else if driving_scan_carries_the_bound {
+        Some(LimitScope::DrivingScan)
     } else {
         None
     };
+    let sql_limit = sql_limit_scope.and_then(|_| pushable_limit(pattern));
+    let sql_limit_scope = sql_limit_scope.filter(|_| sql_limit.is_some());
 
     let mut unconsumed_indices: Vec<usize> = unconsumed.into_iter().collect();
     unconsumed_indices.sort_unstable();
@@ -2319,6 +2361,7 @@ pub fn scope_parsed_with_schema_graph(
         root,
         unconsumed: unconsumed_indices,
         sql_limit,
+        sql_limit_scope,
         // Not a union: `scope_union` is the only place this is ever set.
         sql_limit_if_unioned: None,
         path_bindings,
@@ -2750,10 +2793,15 @@ fn scope_union(
     let mut seen: HashMap<String, String> = HashMap::new();
     let mut taken: HashSet<String> = HashSet::new();
 
-    // The bound each branch would have accepted on its own. A branch that
-    // declines one -- inexact, joined, or with an `OPTIONAL` -- makes the
-    // whole union decline, because the statement's rows are every branch's
-    // rows together. See `QueryPlan::sql_limit_if_unioned`.
+    // The bound each branch would have accepted *on its rows*. A branch that
+    // declines one -- inexact, or with a modifier the limit cannot pass --
+    // makes the whole union decline, because the statement's rows are every
+    // branch's rows together. So does a branch whose bound is on its driving
+    // scan rather than on its rows (`LimitScope::DrivingScan`): the union
+    // applies one outer `LIMIT` to the stacked statement, and on a joined
+    // arm that caps the join product, which is a relation the driving-scan
+    // argument says nothing about. A cap nobody has argued for is the one
+    // that answers short with no error. See `QueryPlan::sql_limit_if_unioned`.
     let mut branch_limits: Vec<Option<usize>> = Vec::new();
 
     for (index, branch) in branches.iter().enumerate() {
@@ -2774,7 +2822,10 @@ fn scope_union(
                 )),
                 other => other,
             })?;
-        branch_limits.push(plan.sql_limit);
+        branch_limits.push(
+            plan.sql_limit
+                .filter(|_| plan.sql_limit_scope == Some(LimitScope::Rows)),
+        );
 
         // The stars this branch joins. Sharing one of them across branches is
         // how a join edge would end up narrowing another branch's fetch — see
@@ -2855,6 +2906,7 @@ fn scope_union(
         // its answers: ten rows of one arm are not the ten the query asked
         // for. Never pushed.
         sql_limit: None,
+        sql_limit_scope: None,
         // The same bound, sound only if the arms end up in one statement --
         // which the lowering decides, not this. Every branch has to have
         // accepted it; `max` rather than `min` because the bound covers the
@@ -5895,33 +5947,46 @@ classes:
              OPTIONAL { ?c asset360:belongsToTunnelComplex ?t . \
              ?t a asset360:TunnelComplex ; asset360:hasName ?n }";
 
-        for (label, expected, query) in [
+        for (label, expected, scope, query) in [
             (
                 "one OPTIONAL hop off one mandatory star",
                 Some(50),
+                Some(LimitScope::DrivingScan),
                 format!("SELECT ?c ?n WHERE {{ {optional_hop} }} LIMIT 50"),
             ),
             (
                 "the bound covers the window, offset included",
                 Some(150),
+                Some(LimitScope::DrivingScan),
                 format!("SELECT ?c ?n WHERE {{ {optional_hop} }} LIMIT 50 OFFSET 100"),
             ),
             (
                 "an ORDER BY still has to see every solution first",
+                None,
                 None,
                 format!("SELECT ?c ?n WHERE {{ {optional_hop} }} ORDER BY ?h LIMIT 50"),
             ),
             (
                 "a mandatory hop is an inner join, which can drop a driving row",
                 None,
+                None,
                 "SELECT ?c ?n WHERE { ?c a asset360:CivilEngineeringAsset ; \
                  asset360:hasName ?h ; asset360:belongsToTunnelComplex ?t . \
                  ?t a asset360:TunnelComplex ; asset360:hasName ?n } LIMIT 50"
                     .to_owned(),
             ),
+            // The single-relation bound is the other scope, and the only one
+            // a `UNION` may stack: its rows *are* its solutions.
+            (
+                "one star, no join: the bound is on the rows themselves",
+                Some(50),
+                Some(LimitScope::Rows),
+                "SELECT ?c WHERE { ?c a asset360:CivilEngineeringAsset } LIMIT 50".to_owned(),
+            ),
         ] {
             let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
             assert_eq!(plan.sql_limit, expected, "for: {label}");
+            assert_eq!(plan.sql_limit_scope, scope, "scope, for: {label}");
         }
     }
 
