@@ -1062,7 +1062,14 @@ pub fn plan_query_refined_with_schema_graph(
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> Result<ExecutionPlan, ScopeError> {
-    let parsed = crate::sparql_scoper::parse_query(query_str)?;
+    let mut parsed = crate::sparql_scoper::parse_query(query_str)?;
+    // Before anything reads a predicate: one slot has two legitimate IRIs when
+    // it declares a `slot_uri`, and both routes have to be looking at the same
+    // one. Resolved here, on the plan, rather than by rewriting the query text
+    // the client sent. See [`crate::sparql_alias`].
+    crate::sparql_alias::canonicalize_predicates(&mut parsed, schema_view)
+        .map_err(|e| ScopeError::UnsupportedConstruct(e.to_string()))?;
+    let parsed = parsed;
     let obligations = obligations_of(&parsed)?;
     let scoped = crate::sparql_scoper::scope_parsed_with_schema_graph(
         &parsed,
@@ -1835,6 +1842,34 @@ mod tests {
             "and the bound stays off a per-arm fetch, where ten rows of one \
              arm are not the ten the query asked for: {plan}"
         );
+    }
+
+    /// The two spellings of one mapped slot plan to the same statement.
+    ///
+    /// Not "both work": *identical*. The endpoint has two routes and they are
+    /// required to answer alike, so an alias that reached the SQL leg as one
+    /// column and the engine as another would replace #447's silent empty
+    /// column with a silent route-dependent answer. Resolving the alias on the
+    /// parse -- before obligations, scoping, rules or lowering see it -- is
+    /// what makes that impossible rather than merely tested.
+    #[test]
+    fn both_spellings_of_a_mapped_slot_plan_to_the_same_statement() {
+        let sv = test_schema_view();
+        let native = plan_query_refined(
+            &format!("{PREFIX}SELECT ?n WHERE {{ ?t a asset360:Track ; asset360:rsmName ?n }}"),
+            &sv,
+        )
+        .expect("the readable spelling plans");
+        let canonical = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?n WHERE \
+                 {{ ?t a asset360:Track ; <http://ontorail.org/src/Eulynx/EAID_NAME> ?n }}"
+            ),
+            &sv,
+        )
+        .expect("the declared spelling plans");
+
+        assert_eq!(format!("{native:?}"), format!("{canonical:?}"));
     }
 
     /// An aggregate no rule takes is named on the artifact, so one call gives

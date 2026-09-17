@@ -4558,6 +4558,13 @@ classes:
         identifier: true
       hasName:
         range: string
+      # Additive-only, and the one slot in this fixture that declares a
+      # `slot_uri` -- so the data carries `<eul:EAID_NAME>` while the readable
+      # spelling is `asset360:rsmName`. That is the asset360 datamodel's RSM
+      # shape in miniature, and what `crate::sparql_alias` exists for.
+      rsmName:
+        range: string
+        slot_uri: eul:EAID_NAME
       # Deliberately the same slot name Signal uses, so a check that matches a
       # carried path by spelling alone is caught rather than trusted.
       documents:

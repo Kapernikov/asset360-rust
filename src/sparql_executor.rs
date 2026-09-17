@@ -311,7 +311,17 @@ pub fn sparql_execute(
     // `spargebra =0.3.5`), and what crossed instead was the query *rendered
     // back to SPARQL* for oxigraph's own parser to read again — a round trip
     // whose only job was to bridge two versions of one crate.
-    let parsed = crate::sparql_scoper::parse_query(query_str)
+    let mut parsed = crate::sparql_scoper::parse_query(query_str)
+        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+
+    // One slot, two spellings. The data carries the canonical IRI (the
+    // declared `slot_uri`); a query author writes the readable native one. The
+    // planner resolves the alias on its own parse, so this leg has to resolve
+    // it on this one -- otherwise the SQL leg answers the native spelling and
+    // the engine answers nothing, which is a silent route-dependent answer
+    // rather than the silent empty column it replaced. See
+    // [`crate::sparql_alias`].
+    crate::sparql_alias::canonicalize_predicates(&mut parsed, schema_view)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
     let results = geosparql_evaluator()
         .for_query(parsed)
@@ -1567,5 +1577,135 @@ classes:
             ],
             "the inside point and the crossing line intersect the box; the outside point does not"
         );
+    }
+}
+
+/// The readable spelling of an RSM-mapped slot, through the engine.
+///
+/// The defect this pins is #447 (pepibru GitLab issue, asset360/consolidator-server):
+/// `Track`'s `name` is written into the data under its declared `slot_uri`, an
+/// RSM EAID nobody can guess, and the readable `irsm:name` matched nothing at
+/// all — a 200 with an empty column, not an error. The resolution itself is
+/// unit-tested in [`crate::sparql_alias`]; what is tested here is that the
+/// engine leg, the one that matches IRIs against triples, now answers it.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod alias_tests {
+    use super::*;
+    use linkml_runtime::load_json_str;
+    use linkml_schemaview::identifier::Identifier;
+
+    /// The two spellings of `name` on an RSM-mapped class, and the third that
+    /// belongs to a different slot entirely.
+    const NATIVE: &str = "https://data.infrabel.be/asset360-rsm-subset/name";
+    const CANONICAL: &str = "http://rsm.uic.org/RSM12#EAID_080C70AE_7680_4515_B580_0B30E8066364";
+    const ASSET360_NAME: &str = "https://data.infrabel.be/asset360/name";
+
+    fn schema() -> SchemaView {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+
+        let rsm = r#"
+id: https://w3id.org/infrabel/rsm
+name: rsm
+prefixes:
+  linkml: https://w3id.org/linkml/
+  RSM: http://rsm.uic.org/RSM12
+  irsm: https://data.infrabel.be/asset360-rsm-subset/
+default_prefix: irsm
+default_range: string
+classes:
+  Track:
+    class_uri: RSM:#EAID_TRACK
+    attributes:
+      asset360_uri:
+        identifier: true
+      name:
+        range: string
+        slot_uri: RSM:#EAID_080C70AE_7680_4515_B580_0B30E8066364
+"#;
+        let asset360 = r#"
+id: https://data.infrabel.be/asset360
+name: asset360
+prefixes:
+  linkml: https://w3id.org/linkml/
+  asset360: https://data.infrabel.be/asset360/
+default_prefix: asset360
+default_range: string
+classes:
+  Zone:
+    class_uri: asset360:Zone
+    attributes:
+      asset360_uri:
+        identifier: true
+      name:
+        range: string
+"#;
+        let mut sv = SchemaView::new();
+        for raw in [rsm, asset360] {
+            let schema: SchemaDefinition =
+                p2e::deserialize(yml::Deserializer::from_str(raw)).unwrap();
+            sv.add_schema(schema).unwrap();
+        }
+        sv
+    }
+
+    fn tracks(sv: &SchemaView) -> Vec<LinkMLInstance> {
+        let conv = sv.converter();
+        let cv = sv
+            .get_class(&Identifier::new("Track"), &conv)
+            .unwrap()
+            .unwrap();
+        vec![
+            load_json_str(
+                r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/1", "name": "L50A"}"#,
+                sv,
+                &cv,
+                &conv,
+            )
+            .unwrap()
+            .into_instance_tolerate_errors()
+            .unwrap(),
+        ]
+    }
+
+    fn names_for(predicate: &str) -> Vec<String> {
+        let sv = schema();
+        let instances = tracks(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let answer = sparql_execute(
+            &format!("SELECT ?n WHERE {{ ?t <{predicate}> ?n }}"),
+            &refs,
+            &sv,
+            ExecuteLimits::default(),
+            None,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        parsed["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["n"]["value"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn both_spellings_of_an_rsm_mapped_slot_answer_the_same() {
+        assert_eq!(names_for(CANONICAL), vec!["L50A".to_owned()]);
+        assert_eq!(
+            names_for(NATIVE),
+            vec!["L50A".to_owned()],
+            "the readable spelling used to answer an empty column"
+        );
+    }
+
+    /// `asset360:name` is not a spelling of this slot. It is a different slot
+    /// — the one `Zone` declares — and the datamodel keeps them apart. Making
+    /// it match here would conflate two slots, so it still answers nothing,
+    /// and the schema graph is where a client finds out which IRI to write.
+    #[test]
+    fn an_unrelated_slots_iri_still_matches_nothing() {
+        assert!(names_for(ASSET360_NAME).is_empty());
     }
 }
