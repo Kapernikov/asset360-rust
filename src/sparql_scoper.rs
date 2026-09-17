@@ -61,13 +61,12 @@ pub struct QueryPlan {
     /// what a plan needs in order to hand them to another pass instead of
     /// refusing the whole query.
     pub unconsumed: Vec<usize>,
-    /// How many rows the object fetch may be limited to — `OFFSET + LIMIT`,
-    /// not `LIMIT`.
+    /// How many rows the object fetch may be limited to: the query's `LIMIT`,
+    /// and only when it carries no `OFFSET`.
     ///
-    /// The fetch has to cover the whole window the query asks for, because the
-    /// engine applies the offset to whatever comes back: `LIMIT 10 OFFSET 20`
-    /// needs thirty rows, and fetching ten then skipping twenty returns
-    /// nothing.
+    /// An offset is a position in a sequence the fetch and the engine do not
+    /// share, so no bound covers it — see [`pushable_limit`]. A paged query
+    /// is fetched whole and paged by the engine.
     ///
     /// **It bounds the scan the fetch drives from**, which for a single-class
     /// query is the whole row set and for a joined one is the mandatory star's
@@ -2911,8 +2910,8 @@ fn scope_union(
         // which the lowering decides, not this. Every branch has to have
         // accepted it; `max` rather than `min` because the bound covers the
         // window and a larger one covers a smaller one, and in practice every
-        // branch reports the same `LIMIT + OFFSET` because they share the
-        // query's modifiers.
+        // branch reports the same `LIMIT` because they share the query's
+        // modifiers.
         sql_limit_if_unioned: branch_limits
             .iter()
             .copied()
@@ -4294,10 +4293,11 @@ fn bound_applies_to_the_driving_scan(stars: &[Star], joins: &[JoinEdge]) -> bool
 
 /// How many rows the object fetch may be limited to, if it may be limited.
 ///
-/// This is `OFFSET + LIMIT`, not `LIMIT`: the fetch has to cover the whole
-/// window the query asks for, because the engine applies the offset to what
-/// comes back. `LIMIT 10 OFFSET 20` needs thirty rows — fetching ten and then
-/// skipping twenty of them returns nothing.
+/// The query's `LIMIT`, and only without an `OFFSET`. It used to be
+/// `OFFSET + LIMIT`, on the reasoning that the fetch has to cover the whole
+/// window because the engine applies the offset to what comes back — which is
+/// true and not enough: the engine applies it in *its* order, not the fetch's,
+/// so the covered window was the wrong window (the `Slice` arm below).
 ///
 /// One function decides, because the bug this replaced was two of them
 /// disagreeing: extraction walked `Slice`/`Project` while the eligibility check
@@ -4337,11 +4337,26 @@ fn pushable_limit(pattern: &GraphPattern) -> Option<usize> {
                 // carry unreachable arithmetic that would be wrong if it ever
                 // did run, refuse to push anything.
                 None
+            } else if *start > 0 {
+                // An OFFSET is a position in a sequence, and the fetch and
+                // the engine do not agree on the sequence. Bounding the
+                // fetch to `OFFSET + LIMIT` rows covers the window only if
+                // the engine skips `OFFSET` rows *in the fetch's order*; it
+                // enumerates the fetched store in its own order instead, so
+                // `LIMIT 2 OFFSET 4` fetched six lowest records, skipped
+                // four from the engine's top, and answered the same two
+                // records `OFFSET 0` did. Every page was page one, with no
+                // error (consolidator-server !995 review round 2, and issue
+                // #456 for the single-star shape; both pepibru GitLab).
+                // Until order is a contract — an `ORDER BY` the driving
+                // scan honours, pushed with the bound, and total over the
+                // solutions, because the engine sorts unstably and a tie
+                // is not a position either — a paged query is fetched whole
+                // and paged by the engine, as it was before any bound
+                // existed: slower, and right.
+                None
             } else {
-                // Cover the window: the rows skipped by OFFSET still have to
-                // be fetched, or the engine offsets into a short result and
-                // returns fewer rows than the query asked for — or none.
-                length.map(|length| length.saturating_add(*start))
+                *length
             }
         }
 
@@ -5955,9 +5970,9 @@ classes:
                 format!("SELECT ?c ?n WHERE {{ {optional_hop} }} LIMIT 50"),
             ),
             (
-                "the bound covers the window, offset included",
-                Some(150),
-                Some(LimitScope::DrivingScan),
+                "an OFFSET is a position in a sequence the fetch does not share",
+                None,
+                None,
                 format!("SELECT ?c ?n WHERE {{ {optional_hop} }} LIMIT 50 OFFSET 100"),
             ),
             (
@@ -6659,11 +6674,18 @@ classes:
         assert_eq!(binding.slot_path, ["location", "detail", "value"]);
     }
 
-    /// A LIMIT bounds the fetch, so the fetch has to cover the whole window the
-    /// query asks for. `LIMIT 10 OFFSET 20` needs thirty rows: fetching ten and
-    /// then offsetting twenty of them returns nothing at all.
+    /// An `OFFSET` declines the bound, on a single star as on a join.
+    ///
+    /// This used to push `OFFSET + LIMIT`, on the reasoning that the fetch has
+    /// to cover the window and the engine skips the offset from what comes
+    /// back. It does — in its own order, which is not the fetch's, so `LIMIT 10
+    /// OFFSET 20` fetched the thirty lowest records and the engine handed back
+    /// the same ten `OFFSET 0` did: page one for every page, with no error
+    /// (consolidator-server !995 review round 2, and issue #456 for this
+    /// single-star shape; both pepibru GitLab). The fetch is unbounded under an
+    /// offset until an order is pushed with the bound.
     #[test]
-    fn offset_is_included_in_the_pushed_row_count() {
+    fn an_offset_declines_the_bound() {
         let sv = test_schema_view();
         let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
@@ -6674,7 +6696,13 @@ classes:
             ),
             (
                 "SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10 OFFSET 20",
-                Some(30),
+                None,
+            ),
+            (
+                // `OFFSET 0` is written but is no offset: the window starts
+                // where the fetch does.
+                "SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10 OFFSET 0",
+                Some(10),
             ),
             (
                 "SELECT ?s WHERE { ?s a asset360:Signal } OFFSET 20",

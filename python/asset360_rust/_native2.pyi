@@ -4481,13 +4481,12 @@ class QueryPlan:
     @property
     def sql_limit(self) -> typing.Optional[builtins.int]:
         r"""
-        How many rows the object fetch may be limited to — ``OFFSET + LIMIT``,
-        not ``LIMIT``.
+        How many rows the object fetch may be limited to: the query's
+        ``LIMIT``, and only when it carries no ``OFFSET``.
         
-        The fetch has to cover the whole window the query asks for, because the
-        engine applies the offset to whatever comes back: ``LIMIT 10 OFFSET 20``
-        needs thirty rows, and fetching ten and then skipping twenty of them
-        returns nothing.
+        An offset is a position in a sequence the fetch and the engine do not
+        share, so no bound covers it and a paged query is fetched whole and
+        paged by the engine.
         
         ``None`` means no limit may be pushed — several classes, a join, an
         OPTIONAL, a modifier that must see every solution first, or a plan that

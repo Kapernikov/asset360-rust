@@ -1683,10 +1683,10 @@ mod tests {
     /// The payoff, and the thing issue #410 (pepibru GitLab) measured as
     /// missing: a `LIMIT` above an all-SQL union reaches the statement.
     ///
-    /// Asserted as `OFFSET + LIMIT`, because the engine re-applies the offset
-    /// to whatever comes back — fetching ten rows and then skipping twenty
-    /// returns nothing. Same arithmetic as the single-class bound, which is
-    /// the point: the union stopped being the shape that loses it.
+    /// The same bound as the single-class one, which is the point: the union
+    /// stopped being the shape that loses it. And the same refusal: under an
+    /// `OFFSET` the engine pages in its own order, not the fetch's, so a bound
+    /// there answered page one for every page (`pushable_limit`).
     ///
     /// **And the shape that must not get it**: arms that are each a rooted
     /// `OPTIONAL` join. On its own such an arm carries a bound — on its
@@ -1713,7 +1713,7 @@ mod tests {
              asset360:name ?n } }";
         for (arms, modifiers, expected) in [
             (single_star_arms, "LIMIT 1", Some(1)),
-            (single_star_arms, "LIMIT 10 OFFSET 20", Some(30)),
+            (single_star_arms, "LIMIT 10 OFFSET 20", None),
             // No limit at all is no bound, rather than a bound of nothing.
             (single_star_arms, "", None),
             // A bound on a joined arm is a bound on its driving scan, and the
