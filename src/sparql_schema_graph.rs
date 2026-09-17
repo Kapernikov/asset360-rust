@@ -104,8 +104,9 @@ impl SchemaGraph {
     /// Build the schema graph for one [`SchemaView`], in the named graph
     /// `graph_iri`.
     ///
-    /// The triples come from [`linkml_runtime::schema_rdf`] unchanged; this
-    /// only decides where they live.
+    /// The triples come from [`linkml_runtime::schema_rdf`], plus what this
+    /// crate adds on top: slot aliases ([`Self::alias_quads`]) and the
+    /// language-tagged enum labels of [`crate::sparql_schema_labels`].
     pub fn build(sv: &SchemaView, graph_iri: &str) -> Result<Self, InvalidGraphIri> {
         let graph =
             GraphName::NamedNode(NamedNode::new(graph_iri).map_err(|err| InvalidGraphIri {
@@ -120,6 +121,8 @@ impl SchemaGraph {
             .map(|t| Quad::new(t.subject, t.predicate, t.object, graph.clone()))
             .collect();
         quads.extend(Self::alias_quads(sv, &graph));
+        // The one call into the shim; see that module for why it is one.
+        quads.extend(crate::sparql_schema_labels::enum_label_quads(sv, &graph));
         Ok(SchemaGraph {
             quads,
             skipped: built.skipped,
@@ -211,6 +214,7 @@ impl SchemaGraph {
 #[cfg(all(test, feature = "sparql-endpoint"))]
 mod tests {
     use super::*;
+    use crate::sparql_schema_labels::SKOS_PREF_LABEL;
     use linkml_meta::SchemaDefinition;
     use linkml_runtime::schema_rdf::{
         OWL_ALL_VALUES_FROM, OWL_CLASS, OWL_MAX_CARDINALITY, OWL_MIN_CARDINALITY, OWL_ON_PROPERTY,
@@ -254,7 +258,7 @@ mod tests {
     #[test]
     fn the_fixture_quad_count_is_pinned() {
         let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert_eq!(graph.quads.len(), 5716);
+        assert_eq!(graph.quads.len(), 5722);
     }
 
     /// The number above is not a number to be re-pinned when it moves; it has
@@ -339,7 +343,19 @@ mod tests {
         // `owl:equivalentProperty` quad in each direction.
         let aliases = count(OWL_EQUIVALENT_PROPERTY);
         assert_eq!(aliases, 2 * 74, "74 aliased slots, both directions");
-        assert_eq!(graph.quads.len(), 1668 + 4 * restrictions + aliases);
+
+        // 5722 since the label shim (#446, pepibru GitLab issue): the fixture
+        // annotates three permissible values with six per-language labels
+        // between them -- `VNS` in three languages, `CVT` in Dutch only, `GSA`
+        // (the one with a `meaning`) in Dutch and French -- and each is one
+        // `skos:prefLabel`. `SB`'s `label/short/nl-be` is not in the table
+        // and contributes nothing.
+        let labels = count(SKOS_PREF_LABEL);
+        assert_eq!(labels, 6, "six annotated languages across three values");
+        assert_eq!(
+            graph.quads.len(),
+            1668 + 4 * restrictions + aliases + labels
+        );
     }
 
     /// The unrolled form is the point: upstream matches `gen-owl`'s `simplify`
@@ -738,6 +754,99 @@ classes:
             "fixture has no enum value carrying a meaning, so this test would \
              not be testing anything"
         );
+    }
+
+    /// #446 (pepibru GitLab issue): a client rendering an enum column for a
+    /// Dutch or French user needs a label in that language, and the schema
+    /// graph is the only place it can come from. Asserted through a real
+    /// SPARQL engine with the `LANG()` filter the issue itself proposes.
+    ///
+    /// Three fixture values, one per shape the shim has to get right:
+    ///
+    /// * `SignalRegime.VNS` is annotated in all three languages and gets all
+    ///   three.
+    /// * `SignalRegime.CVT` is annotated in Dutch only and gets Dutch only —
+    ///   no French is invented from the code or from a description that
+    ///   happens to contain French.
+    /// * `SignalTypes.GSA` carries a `meaning`, so its concept IRI is the
+    ///   Eulynx one; the labels must land there, on the same subject as the
+    ///   `skos:Concept`, not on a synthesised `SignalTypes#GSA`.
+    ///
+    /// And two things that must not move: `rdfs:label` and `skos:notation`
+    /// stay the bare code, untagged, because that is what every existing
+    /// consumer keys on.
+    #[test]
+    fn enum_concepts_carry_language_tagged_pref_labels() {
+        let sv = asset360_schema_view();
+        let store = store_of(&sv);
+
+        let labels = |code: &str, lang: &str| -> Vec<String> {
+            let query = format!(
+                "PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+                 SELECT ?l WHERE {{
+                   GRAPH <{ASSET360_SCHEMA_GRAPH}> {{
+                     ?c skos:notation \"{code}\" .
+                     ?c skos:prefLabel ?l .
+                     FILTER(lang(?l) = \"{lang}\")
+                   }}
+                 }} ORDER BY ?l"
+            );
+            let QueryResults::Solutions(solutions) = oxigraph::sparql::SparqlEvaluator::new()
+                .for_query(query.parse::<spargebra::Query>().unwrap())
+                .on_store(&store)
+                .execute()
+                .unwrap()
+            else {
+                panic!("not a SELECT");
+            };
+            solutions
+                .map(|s| s.unwrap().get("l").unwrap().to_string())
+                .collect()
+        };
+
+        assert_eq!(labels("VNS", "nl-be"), vec!["\"Normaalspoor\"@nl-be"]);
+        assert_eq!(labels("VNS", "fr-be"), vec!["\"Voie normale\"@fr-be"]);
+        assert_eq!(labels("VNS", "en-us"), vec!["\"Normal track\"@en-us"]);
+
+        assert_eq!(labels("CVT", "nl-be"), vec!["\"Tegenspoor\"@nl-be"]);
+        assert!(
+            labels("CVT", "fr-be").is_empty(),
+            "CVT has no French annotation, so no French label may be invented"
+        );
+        assert!(labels("CVT", "en-us").is_empty());
+
+        assert_eq!(labels("GSA", "nl-be"), vec!["\"Groot stopsein\"@nl-be"]);
+        assert_eq!(
+            labels("GSA", "fr-be"),
+            vec!["\"Grand signal d'arrêt\"@fr-be"]
+        );
+
+        assert!(
+            labels("SB", "nl-be").is_empty(),
+            "label/short/nl-be is not in the table and must not be read as nl-be"
+        );
+        assert!(
+            labels("FB", "nl-be").is_empty(),
+            "an unannotated value is unchanged"
+        );
+
+        // The untagged code stays where it was, on both predicates.
+        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
+            .unwrap()
+            .to_ntriples();
+        let conv = sv.converter();
+        let regime = sv
+            .enum_views()
+            .unwrap()
+            .into_iter()
+            .find(|ev| ev.name() == "SignalRegime")
+            .unwrap();
+        let regime_iri = regime.canonical_uri().to_uri(&conv).unwrap().0;
+        let vns = format!("{regime_iri}#VNS");
+        assert!(ntriples.contains(&format!("<{vns}> <{RDFS_LABEL}> \"VNS\" .")));
+        assert!(ntriples.contains(&format!(
+            "<{vns}> <http://www.w3.org/2004/02/skos/core#notation> \"VNS\" ."
+        )));
     }
 
     #[test]

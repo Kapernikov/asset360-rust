@@ -51,6 +51,7 @@ pub mod sparql_pushdown;
 pub mod sparql_refine;
 pub mod sparql_rules;
 pub mod sparql_schema_graph;
+pub mod sparql_schema_labels;
 pub mod sparql_scoper;
 pub mod sparql_terms;
 

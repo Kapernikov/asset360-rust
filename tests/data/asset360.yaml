@@ -460,6 +460,9 @@ enums:
       GSA:
         description: big stop signal
         meaning: eulynx:EAID_28C3D8B9_69BF_44c8_BF11_A28EA7F1A248
+        annotations:
+          data.infrabel.be/linkml/label/nl-be: Groot stopsein
+          data.infrabel.be/linkml/label/fr-be: Grand signal d'arrêt
       PAN_SNELHEID:
         description: speed panel
         todos:
@@ -490,14 +493,26 @@ enums:
     permissible_values:
       SB:
         description: switchable balise
+        annotations:
+          # A slot-style short/long label on a value: not in the shim's table,
+          # so it must NOT become a language-tagged label.
+          data.infrabel.be/linkml/label/short/nl-be: SB
       FB:
         description: fixed balise
   SignalRegime:
     permissible_values:
       VNS:
         description: normal way / voie normale / normaalspoor
+        annotations:
+          data.infrabel.be/linkml/label/en-us: Normal track
+          data.infrabel.be/linkml/label/nl-be: Normaalspoor
+          data.infrabel.be/linkml/label/fr-be: Voie normale
       CVT:
         description: counter-track / contre-voie / tegenspoor
+        annotations:
+          # Dutch only: the French label must not be invented from the code
+          # or the description.
+          data.infrabel.be/linkml/label/nl-be: Tegenspoor
 
 types: 
   weblink:
