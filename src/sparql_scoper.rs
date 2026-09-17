@@ -53,9 +53,14 @@ pub struct QueryPlan {
     /// needs thirty rows, and fetching ten then skipping twenty returns
     /// nothing.
     ///
-    /// Only set for a single-class, zero-join, zero-OPTIONAL query whose plan
-    /// describes the whole question (see `inexact`) and whose modifiers let a
-    /// limit apply before them.
+    /// **It bounds the scan the fetch drives from**, which for a single-class
+    /// query is the whole row set and for a joined one is the mandatory star's
+    /// scan — see [`bound_applies_to_the_driving_scan`] for which joined shapes
+    /// carry a bound at all, and why applying it to the join *product* instead
+    /// returns fewer solutions than the query asked for.
+    ///
+    /// Only set for a plan that describes the whole question (see `inexact`)
+    /// and whose modifiers let a limit apply before them.
     pub sql_limit: Option<usize>,
 
     /// The same bound, for the one shape this struct cannot decide alone: a
@@ -2142,6 +2147,9 @@ pub fn scope_parsed_with_schema_graph(
     // more than one star, or any join, a row is a combination and the top N
     // rows are not the top N solutions.
     let single_relation = stars.len() == 1 && joins.is_empty();
+    // …but a *driving scan* can be bounded even when the rows are a
+    // combination. See `bound_applies_to_the_driving_scan`.
+    let driving_scan_carries_the_bound = bound_applies_to_the_driving_scan(&stars, &joins);
 
     let root = if has_optional {
         let mandatory_vars: HashSet<String> = stars
@@ -2287,7 +2295,18 @@ pub fn scope_parsed_with_schema_graph(
     // real row set. With anything dropped, ten rows off the top are ten
     // arbitrary rows and the engine filters them down to fewer than the query
     // asked for. One assignment, so there is no second owner to disagree with.
-    let sql_limit = if inexact.is_none() && single_relation && !has_optional {
+    //
+    // Two shapes carry a bound, and they bound *the same thing*: the scan the
+    // fetch drives from. For a single relation that scan is the whole row set,
+    // which is why the bound has always read as a row cap. For the shape
+    // `bound_applies_to_the_driving_scan` admits it is the mandatory star's
+    // scan, and the consumer applies it there rather than to the join product
+    // — `sparql/fetch.py`, `execute_plan`. A consumer that cannot tell the two
+    // apart must apply neither; one that applies a join's bound to the product
+    // returns fewer solutions than the query asked for, silently.
+    let sql_limit = if inexact.is_none()
+        && (single_relation && !has_optional || driving_scan_carries_the_bound)
+    {
         pushable_limit(pattern)
     } else {
         None
@@ -4158,6 +4177,69 @@ fn contains_subquery(pattern: &GraphPattern) -> bool {
     walk(pattern, false)
 }
 
+/// Whether a fetch bound may be applied to the scan this shape drives from.
+///
+/// **The question a join makes hard.** A `LIMIT` counts *solutions*. For one
+/// star a row is a solution, so a row cap is a solution cap and the bound is
+/// obviously safe. Join two stars and a row is a combination: N rows of the
+/// product are not N solutions, and capping the product cuts records the first
+/// N solutions need — the engine then answers with one side of an edge
+/// missing, which under `OPTIONAL` is a *wrong* binding rather than a missing
+/// one. That is why every join has had no bound at all, and why the fetch read
+/// the whole class for a `LIMIT 50` (issue #443, asset360 pepibru GitLab).
+///
+/// There is a shape where the bound is sound anyway, applied one level down —
+/// to the **driving scan** rather than to the product:
+///
+/// * exactly one star is mandatory. It is the scan the fetch drives from, and
+///   its rows already satisfy the mandatory pattern, so each one yields **at
+///   least one** solution. N of them therefore cover N solutions.
+/// * every join is a `LEFT` join, so no row of the driving scan can be
+///   eliminated by a match that is not there. One inner join and a driving row
+///   may yield no solution at all, which is the short answer this must not
+///   produce.
+/// * every star is reachable from that one through the edges. A record kept by
+///   the bound brings **all** of its matches with it, so the engine sees each
+///   fetched record's neighbourhood whole — which is what makes an `OPTIONAL`
+///   bind where it should rather than come back unbound.
+///
+/// Reachability is walked undirected: an edge's `left` is the referenced star
+/// and its `right` the one holding the identifier, and either may be the
+/// optional side.
+///
+/// The caller still owns the other half of the question — nothing is pushed
+/// through a `GROUP BY`, an `ORDER BY` or a `DISTINCT` ([`pushable_limit`]),
+/// and nothing is pushed at all through a plan that dropped part of the query
+/// (`inexact`), where the fetched rows are not the real row set.
+fn bound_applies_to_the_driving_scan(stars: &[Star], joins: &[JoinEdge]) -> bool {
+    let mut mandatory = stars.iter().filter(|star| !star.is_optional);
+    let (Some(root), None) = (mandatory.next(), mandatory.next()) else {
+        return false;
+    };
+    if !joins.iter().all(|join| join.join_type == JoinType::Left) {
+        return false;
+    }
+    let mut reached: HashSet<&str> = HashSet::from([root.variable.as_str()]);
+    loop {
+        let mut newly: Vec<&str> = Vec::new();
+        for join in joins {
+            if reached.contains(join.left.as_str()) && !reached.contains(join.right.as_str()) {
+                newly.push(join.right.as_str());
+            }
+            if reached.contains(join.right.as_str()) && !reached.contains(join.left.as_str()) {
+                newly.push(join.left.as_str());
+            }
+        }
+        if newly.is_empty() {
+            break;
+        }
+        reached.extend(newly);
+    }
+    stars
+        .iter()
+        .all(|star| reached.contains(star.variable.as_str()))
+}
+
 /// How many rows the object fetch may be limited to, if it may be limited.
 ///
 /// This is `OFFSET + LIMIT`, not `LIMIT`: the fetch has to cover the whole
@@ -5787,6 +5869,59 @@ classes:
         ] {
             let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
             assert_eq!(plan.sql_limit, None, "sql_limit must be None for: {label}");
+        }
+    }
+
+    /// A `LIMIT` over a join reaches the fetch as a bound on the **driving
+    /// scan**, and only where every row of that scan is worth at least one
+    /// solution.
+    ///
+    /// Before this, a join of any kind meant no bound at all: `LIMIT 50` and
+    /// `LIMIT 500` fetched the same 20 000 records and the same 1.5M triples,
+    /// and the engine's own cap refused the query after forty seconds of
+    /// database work (issue #443, asset360 pepibru GitLab). The narrowing had
+    /// to come from a `FILTER`, which is not what a client paging an export
+    /// writes.
+    ///
+    /// The refusals in the table are the point of the rule and not its
+    /// leftovers: an inner join can eliminate a driving row, so N driving rows
+    /// are not N solutions, and a bound there returns fewer rows than the
+    /// query asked for with nothing to say so.
+    #[test]
+    fn a_limit_bounds_the_driving_scan_of_a_rooted_optional_join() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+        let optional_hop = "?c a asset360:CivilEngineeringAsset ; asset360:hasName ?h . \
+             OPTIONAL { ?c asset360:belongsToTunnelComplex ?t . \
+             ?t a asset360:TunnelComplex ; asset360:hasName ?n }";
+
+        for (label, expected, query) in [
+            (
+                "one OPTIONAL hop off one mandatory star",
+                Some(50),
+                format!("SELECT ?c ?n WHERE {{ {optional_hop} }} LIMIT 50"),
+            ),
+            (
+                "the bound covers the window, offset included",
+                Some(150),
+                format!("SELECT ?c ?n WHERE {{ {optional_hop} }} LIMIT 50 OFFSET 100"),
+            ),
+            (
+                "an ORDER BY still has to see every solution first",
+                None,
+                format!("SELECT ?c ?n WHERE {{ {optional_hop} }} ORDER BY ?h LIMIT 50"),
+            ),
+            (
+                "a mandatory hop is an inner join, which can drop a driving row",
+                None,
+                "SELECT ?c ?n WHERE { ?c a asset360:CivilEngineeringAsset ; \
+                 asset360:hasName ?h ; asset360:belongsToTunnelComplex ?t . \
+                 ?t a asset360:TunnelComplex ; asset360:hasName ?n } LIMIT 50"
+                    .to_owned(),
+            ),
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            assert_eq!(plan.sql_limit, expected, "for: {label}");
         }
     }
 
