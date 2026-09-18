@@ -3140,6 +3140,31 @@ class ImportExpression:
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     def __new__(cls, import_from:builtins.str, import_as:typing.Optional[builtins.str]=None, import_map:typing.Optional[builtins.dict[builtins.str, Setting]]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> ImportExpression: ...
 
+class JoinColumn:
+    r"""
+    One column a join key names: a star's identity or slot, or a column of a
+    relation by alias.
+    """
+    @property
+    def source(self) -> builtins.str:
+        r"""
+        The star variable (a table alias), or the relation alias when
+        ``column`` is set.
+        """
+    @property
+    def path(self) -> builtins.list[builtins.str]:
+        r"""
+        The slot path on the star; empty for its identity (``asset360_uri``).
+        For an ``"element"`` key it is the collection path whose unnested
+        element's occurrence identifier is compared.
+        """
+    @property
+    def column(self) -> typing.Optional[builtins.str]:
+        r"""
+        The relation column's name, when ``source`` is a relation alias.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class JoinEdge:
     r"""
     A join between two stars, pushable to a SQL JOIN.
@@ -3852,7 +3877,8 @@ class PlanNode:
 class PlanOp:
     r"""
     One operator of a database pass: a scan, a filter, a filter tree, a join,
-    an unnest, a grouping, a sort, a distinct, a slice, or a projection.
+    an unnest, a grouping, a sort, a distinct, a slice, a projection, or a
+    relation.
     
     Read ``kind`` first and refuse a value you do not know: skipping an operator
     you cannot render answers a different question, which is the failure the
@@ -3864,7 +3890,15 @@ class PlanOp:
     def kind(self) -> builtins.str:
         r"""
         ``"scan"``, ``"unnest"``, ``"filter"``, ``"filter_tree"``, ``"join"``,
-        ``"group"``, ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+        ``"union"``, ``"group"``, ``"sort"``, ``"distinct"``, ``"slice"``,
+        ``"project"`` or ``"relation"``.
+        
+        ``"relation"`` is a derived table: a scope's body rendered as a
+        statement of its own (``relation_body``, an operator list with its
+        own alias space, rendered recursively) and joined by column under
+        ``relation_alias``; ``relation_columns`` says what the outside may
+        read of it. A renderer that does not recognise it must refuse the
+        plan, and the contract version says so before it has to.
         
         ``"filter_tree"`` is a within-star condition whose shape is a tree
         rather than a conjunction -- what ``FILTER(A || B)`` lowers to. Its
@@ -4115,6 +4149,64 @@ class PlanOp:
         indices alone would have to be walked down to their scans.
         """
     @property
+    def join_key(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"join"``: what the join is on. ``"reference"`` is the edge the
+        flat fields (``join_stars``, ``right_slot``, ``right_path``,
+        ``right_multivalued``) describe; ``"identity"`` and ``"element"``
+        join two columns named by ``join_key_left`` / ``join_key_right``;
+        ``"cross"`` joins every pair. A renderer reads this first: the flat
+        fields are empty for any key but ``"reference"``.
+        """
+    @property
+    def join_key_left(self) -> typing.Optional[JoinColumn]:
+        r"""
+        For a ``"join"`` on ``"identity"`` or ``"element"``: the left column,
+        as [`JoinColumn`].
+        """
+    @property
+    def join_key_right(self) -> typing.Optional[JoinColumn]:
+        r"""
+        For a ``"join"`` on ``"identity"`` or ``"element"``: the right column.
+        """
+    @property
+    def right_reading(self) -> typing.Optional[builtins.str]:
+        r"""
+        For a ``"join"`` on ``"reference"`` whose ``right_path`` crosses a
+        collection: how the key is read -- ``"any_element"`` (the fetch's
+        containment: some element holds the key) or ``"bound_element"`` (the
+        statement's: the key is read off the element's own row, the lateral
+        the statement already has). ``"column"`` when the path is empty. The
+        two answer differently, and only one is the statement's.
+        """
+    @property
+    def dedup(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"unnest"``: how the elements are deduplicated. ``"by_value"``
+        for a scalar or IRI slot (a repeated value is one triple: ``SELECT
+        DISTINCT e.value``), ``"by_occurrence"`` for an inlined structure
+        (each element is its own blank node: ``WITH ORDINALITY`` and no
+        ``DISTINCT``). A renderer that dedups a structure step counts one
+        where the engine counts two.
+        """
+    @property
+    def relation_alias(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"relation"``: the alias the derived table is joined under.
+        """
+    @property
+    def relation_body(self) -> builtins.list[PlanOp]:
+        r"""
+        For ``"relation"``: the body's operators, a complete list of their
+        own (indices are into this list, the root last), rendered as a
+        statement in an alias space of its own.
+        """
+    @property
+    def relation_columns(self) -> builtins.list[RelationColumn]:
+        r"""
+        For ``"relation"``: one entry per column the outside may read.
+        """
+    @property
     def join_kind(self) -> typing.Optional[builtins.str]:
         r"""
         For ``"join"``: ``"inner"``, ``"left"`` or ``"anti"``.
@@ -4282,6 +4374,26 @@ class PushdownBinding:
         mapping, whose keys are not part of the graph) or the counts come out as
         one per record. Any hop along a path may be a collection, and each one
         multiplies the rows.
+        """
+    @property
+    def relation(self) -> typing.Optional[builtins.str]:
+        r"""
+        The relation this column is read from, by alias, when it is a column
+        of a derived table (a ``"relation"`` operator) rather than of a star:
+        ``star_var`` is then that alias and ``slot_path`` the one column name,
+        and the renderer reads ``<alias>.<column>``. ``None`` for a star's
+        own column, which is every binding that existed before relations did.
+        """
+    @property
+    def occurrence(self) -> builtins.bool:
+        r"""
+        ``True`` when the column is an inlined element's *occurrence
+        identifier* rather than a value: the holder's identity concatenated
+        with one hop per collection step of ``slot_path`` (a JSON pointer
+        composed from each lateral's ordinal, or a mapping's key). It is
+        representable -- a relation exports it, a join compares it, a
+        ``GROUP BY`` groups by it -- and never serialisable; ``term_kind`` is
+        a placeholder for it and a renderer must not emit it as an answer.
         """
     @property
     def numeric(self) -> builtins.bool:
@@ -4561,6 +4673,75 @@ class ReachabilityQuery:
     @traverse_up.setter
     def traverse_up(self, value: typing.Optional[builtins.bool]) -> None: ...
     def __new__(cls, source_ontology:typing.Optional[builtins.str]=None, source_nodes:typing.Optional[typing.Sequence[builtins.str]]=None, relationship_types:typing.Optional[typing.Sequence[builtins.str]]=None, is_direct:typing.Optional[builtins.bool]=None, include_self:typing.Optional[builtins.bool]=None, traverse_up:typing.Optional[builtins.bool]=None) -> ReachabilityQuery: ...
+
+class RelationColumn:
+    r"""
+    One export of a ``"relation"``: what the outside reads of the derived
+    table, under the variable's name as the column's.
+    """
+    @property
+    def var(self) -> builtins.str:
+        r"""
+        The variable, which is also the column's name in the derived table.
+        """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        ``"identity"`` (a scanned record's ``asset360_uri``, under
+        ``holder_star``), ``"slot"`` (a value the body's ``binding`` reads),
+        ``"measure"`` (an aggregate under its own name in the body's
+        grouping) or ``"structure"`` (an inlined element's occurrence
+        identifier, composed in the body from ``binding``'s hops).
+        """
+    @property
+    def holder_star(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"structure"``: the star inside the body that holds the
+        element, and the collection path from it (``holder_path``).
+        """
+    @property
+    def holder_path(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"structure"``: the collection path from ``holder_star`` to the
+        element.
+        """
+    @property
+    def class_uri(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"identity"`` and ``"structure"``: the class the column's record
+        or element is of.
+        """
+    @property
+    def binding(self) -> typing.Optional[PushdownBinding]:
+        r"""
+        For ``"slot"`` and ``"structure"``: the binding inside the body that
+        reads the value, or whose hops compose the occurrence.
+        """
+    @property
+    def term_kind(self) -> typing.Optional[builtins.str]:
+        r"""
+        How the column's text becomes an RDF term, as ``term_kind`` on a
+        binding: ``"iri"``, ``"literal"`` or ``"enum_iri"``; ``None`` for a
+        structure, which is representable and never serialisable.
+        """
+    @property
+    def numeric(self) -> builtins.bool:
+        r"""
+        ``True`` when the column compares as a number.
+        """
+    @property
+    def datatype(self) -> typing.Optional[builtins.str]:
+        r"""
+        Datatype IRI for a typed literal column, or ``None``.
+        """
+    @property
+    def guaranteed(self) -> builtins.bool:
+        r"""
+        ``True`` when the body binds the column in every row: a left join
+        on the relation then reads ``NULL`` for an unmatched row and nothing
+        else, which is what ``BOUND`` on the variable tests.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 class SchemaDefinition:
     @property

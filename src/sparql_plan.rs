@@ -53,6 +53,18 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// a planner/executor version skew a loud failure rather than a wrong number,
 /// which is the failure this whole module is shaped around.
 ///
+/// 5 added scopes as relations (`docs/design/sparql-scopes-as-relations.md`,
+/// issue #466): [`crate::sparql_ops::Op::Relation`], a derived table with a
+/// body of its own and typed export columns; [`crate::sparql_ops::JoinKey`]
+/// on every join (`identity`, `element` and `cross` beside the reference
+/// edge, whose flat fields are empty for any other key); a join's
+/// `right_reading` (`any_element` is the fetch's containment, `bound_element`
+/// the statement's own row); an unnest's `dedup` (`by_occurrence` for an
+/// inlined structure, where `SELECT DISTINCT e.value` merges two blank
+/// nodes into one); and a binding's `relation` / `occurrence`. A consumer
+/// built against 4 does not know a relation and renders nothing for it, so
+/// this is the first bump a renderer *must* refuse on rather than record.
+///
 /// 4 added two things one release carries together. [`crate::sparql_ops::
 /// Op::Project`]'s bindings: an ungrouped projection that carries them is a
 /// statement that *answers*, and its `sort` and `slice` are the query's own
@@ -76,7 +88,7 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// conjunction into one obligation per conjunct did *not* bump it: that
 /// changes how many `Filter` obligations a query raises, not what kinds exist,
 /// and a consumer that reads the list rather than counting it is unaffected.
-pub const PLAN_CONTRACT: u32 = 4;
+pub const PLAN_CONTRACT: u32 = 5;
 
 /// Index into [`ExecutionPlan::obligations`]. Printed as `o1`, `o2`, ... so a
 /// human can check the ledger by eye.

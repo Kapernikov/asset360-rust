@@ -127,6 +127,8 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PlanPass>()?;
         m.add_class::<PlanOp>()?;
         m.add_class::<PushdownBinding>()?;
+        m.add_class::<JoinColumn>()?;
+        m.add_class::<RelationColumn>()?;
         m.add_class::<PushdownMeasure>()?;
         m.add_class::<PushdownOrder>()?;
         m.add_class::<PushdownHaving>()?;
@@ -2039,6 +2041,28 @@ impl PushdownBinding {
             .collect()
     }
 
+    /// The relation this column is read from, by alias, when it is a column
+    /// of a derived table (a ``"relation"`` operator) rather than of a star:
+    /// ``star_var`` is then that alias and ``slot_path`` the one column name,
+    /// and the renderer reads ``<alias>.<column>``. ``None`` for a star's
+    /// own column, which is every binding that existed before relations did.
+    #[getter]
+    fn relation(&self) -> Option<String> {
+        self.inner.relation.clone()
+    }
+
+    /// ``True`` when the column is an inlined element's *occurrence
+    /// identifier* rather than a value: the holder's identity concatenated
+    /// with one hop per collection step of ``slot_path`` (a JSON pointer
+    /// composed from each lateral's ordinal, or a mapping's key). It is
+    /// representable -- a relation exports it, a join compares it, a
+    /// ``GROUP BY`` groups by it -- and never serialisable; ``term_kind`` is
+    /// a placeholder for it and a renderer must not emit it as an answer.
+    #[getter]
+    fn occurrence(&self) -> bool {
+        self.inner.occurrence
+    }
+
     /// ``True`` when the slot's values are numbers.
     ///
     /// The renderer needs this twice over: a numeric column is cast before
@@ -2489,8 +2513,183 @@ impl FilterNode {
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass]
 #[derive(Clone)]
+/// One column a join key names: a star's identity or slot, or a column of a
+/// relation by alias.
+pub struct JoinColumn {
+    inner: crate::sparql_ops::ColumnRef,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl JoinColumn {
+    /// The star variable (a table alias), or the relation alias when
+    /// ``column`` is set.
+    #[getter]
+    fn source(&self) -> String {
+        self.inner.source.clone()
+    }
+
+    /// The slot path on the star; empty for its identity (``asset360_uri``).
+    /// For an ``"element"`` key it is the collection path whose unnested
+    /// element's occurrence identifier is compared.
+    #[getter]
+    fn path(&self) -> Vec<String> {
+        self.inner.path.clone()
+    }
+
+    /// The relation column's name, when ``source`` is a relation alias.
+    #[getter]
+    fn column(&self) -> Option<String> {
+        self.inner.column.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "JoinColumn(source={:?}, path={:?}, column={:?})",
+            self.inner.source, self.inner.path, self.inner.column
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
+#[derive(Clone)]
+/// One export of a ``"relation"``: what the outside reads of the derived
+/// table, under the variable's name as the column's.
+pub struct RelationColumn {
+    inner: crate::sparql_ops::RelationColumn,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl RelationColumn {
+    /// The variable, which is also the column's name in the derived table.
+    #[getter]
+    fn var(&self) -> String {
+        self.inner.var.clone()
+    }
+
+    /// ``"identity"`` (a scanned record's ``asset360_uri``, under
+    /// ``holder_star``), ``"slot"`` (a value the body's ``binding`` reads),
+    /// ``"measure"`` (an aggregate under its own name in the body's
+    /// grouping) or ``"structure"`` (an inlined element's occurrence
+    /// identifier, composed in the body from ``binding``'s hops).
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.inner.kind.as_str()
+    }
+
+    /// For ``"structure"``: the star inside the body that holds the
+    /// element, and the collection path from it (``holder_path``).
+    #[getter]
+    fn holder_star(&self) -> Option<String> {
+        use crate::sparql_ops::ColumnKind;
+        match &self.inner.kind {
+            ColumnKind::Structure { holder_star, .. } => Some(holder_star.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``"structure"``: the collection path from ``holder_star`` to the
+    /// element.
+    #[getter]
+    fn holder_path(&self) -> Vec<String> {
+        use crate::sparql_ops::ColumnKind;
+        match &self.inner.kind {
+            ColumnKind::Structure { path, .. } => path.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"identity"`` and ``"structure"``: the class the column's record
+    /// or element is of.
+    #[getter]
+    fn class_uri(&self) -> Option<String> {
+        use crate::sparql_ops::ColumnKind;
+        match &self.inner.kind {
+            ColumnKind::Identity { class_uri } | ColumnKind::Structure { class_uri, .. } => {
+                Some(class_uri.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// For ``"slot"`` and ``"structure"``: the binding inside the body that
+    /// reads the value, or whose hops compose the occurrence.
+    #[getter]
+    fn binding(&self) -> Option<PushdownBinding> {
+        use crate::sparql_ops::ColumnKind;
+        match &self.inner.kind {
+            ColumnKind::Slot(binding) | ColumnKind::Structure { binding, .. } => {
+                Some(PushdownBinding {
+                    inner: binding.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// How the column's text becomes an RDF term, as ``term_kind`` on a
+    /// binding: ``"iri"``, ``"literal"`` or ``"enum_iri"``; ``None`` for a
+    /// structure, which is representable and never serialisable.
+    #[getter]
+    fn term_kind(&self) -> Option<&'static str> {
+        use crate::sparql_terms::TermKind;
+        self.inner
+            .descriptor
+            .as_ref()
+            .map(|descriptor| match descriptor.kind {
+                TermKind::Iri => "iri",
+                TermKind::Literal => "literal",
+                TermKind::EnumIri => "enum_iri",
+            })
+    }
+
+    /// ``True`` when the column compares as a number.
+    #[getter]
+    fn numeric(&self) -> bool {
+        self.inner
+            .descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.numeric)
+    }
+
+    /// Datatype IRI for a typed literal column, or ``None``.
+    #[getter]
+    fn datatype(&self) -> Option<String> {
+        self.inner
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.datatype.clone())
+    }
+
+    /// ``True`` when the body binds the column in every row: a left join
+    /// on the relation then reads ``NULL`` for an unmatched row and nothing
+    /// else, which is what ``BOUND`` on the variable tests.
+    #[getter]
+    fn guaranteed(&self) -> bool {
+        self.inner.guaranteed
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RelationColumn(var={:?}, kind={:?})",
+            self.inner.var,
+            self.kind()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
+#[derive(Clone)]
 /// One operator of a database pass: a scan, a filter, a filter tree, a join,
-/// an unnest, a grouping, a sort, a distinct, a slice, or a projection.
+/// an unnest, a grouping, a sort, a distinct, a slice, a projection, or a
+/// relation.
 ///
 /// Read ``kind`` first and refuse a value you do not know: skipping an operator
 /// you cannot render answers a different question, which is the failure the
@@ -2506,7 +2705,15 @@ pub struct PlanOp {
 #[pymethods]
 impl PlanOp {
     /// ``"scan"``, ``"unnest"``, ``"filter"``, ``"filter_tree"``, ``"join"``,
-    /// ``"group"``, ``"sort"``, ``"distinct"``, ``"slice"`` or ``"project"``.
+    /// ``"union"``, ``"group"``, ``"sort"``, ``"distinct"``, ``"slice"``,
+    /// ``"project"`` or ``"relation"``.
+    ///
+    /// ``"relation"`` is a derived table: a scope's body rendered as a
+    /// statement of its own (``relation_body``, an operator list with its
+    /// own alias space, rendered recursively) and joined by column under
+    /// ``relation_alias``; ``relation_columns`` says what the outside may
+    /// read of it. A renderer that does not recognise it must refuse the
+    /// plan, and the contract version says so before it has to.
     ///
     /// ``"filter_tree"`` is a within-star condition whose shape is a tree
     /// rather than a conjunction -- what ``FILTER(A || B)`` lowers to. Its
@@ -2892,6 +3099,125 @@ impl PlanOp {
                 right_star,
                 ..
             } => vec![left_star.clone(), right_star.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"join"``: what the join is on. ``"reference"`` is the edge the
+    /// flat fields (``join_stars``, ``right_slot``, ``right_path``,
+    /// ``right_multivalued``) describe; ``"identity"`` and ``"element"``
+    /// join two columns named by ``join_key_left`` / ``join_key_right``;
+    /// ``"cross"`` joins every pair. A renderer reads this first: the flat
+    /// fields are empty for any key but ``"reference"``.
+    #[getter]
+    fn join_key(&self) -> Option<&'static str> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join { key, .. } => Some(key.as_str()),
+            _ => None,
+        }
+    }
+
+    /// For a ``"join"`` on ``"identity"`` or ``"element"``: the left column,
+    /// as [`JoinColumn`].
+    #[getter]
+    fn join_key_left(&self) -> Option<JoinColumn> {
+        use crate::sparql_ops::{JoinKey, Op};
+        match &self.inner.op {
+            Op::Join {
+                key: JoinKey::Identity { left, .. } | JoinKey::Element { left, .. },
+                ..
+            } => Some(JoinColumn {
+                inner: left.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// For a ``"join"`` on ``"identity"`` or ``"element"``: the right column.
+    #[getter]
+    fn join_key_right(&self) -> Option<JoinColumn> {
+        use crate::sparql_ops::{JoinKey, Op};
+        match &self.inner.op {
+            Op::Join {
+                key: JoinKey::Identity { right, .. } | JoinKey::Element { right, .. },
+                ..
+            } => Some(JoinColumn {
+                inner: right.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// For a ``"join"`` on ``"reference"`` whose ``right_path`` crosses a
+    /// collection: how the key is read -- ``"any_element"`` (the fetch's
+    /// containment: some element holds the key) or ``"bound_element"`` (the
+    /// statement's: the key is read off the element's own row, the lateral
+    /// the statement already has). ``"column"`` when the path is empty. The
+    /// two answer differently, and only one is the statement's.
+    #[getter]
+    fn right_reading(&self) -> Option<&'static str> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Join { right_reading, .. } => Some(right_reading.as_str()),
+            _ => None,
+        }
+    }
+
+    /// For ``"unnest"``: how the elements are deduplicated. ``"by_value"``
+    /// for a scalar or IRI slot (a repeated value is one triple: ``SELECT
+    /// DISTINCT e.value``), ``"by_occurrence"`` for an inlined structure
+    /// (each element is its own blank node: ``WITH ORDINALITY`` and no
+    /// ``DISTINCT``). A renderer that dedups a structure step counts one
+    /// where the engine counts two.
+    #[getter]
+    fn dedup(&self) -> Option<&'static str> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Unnest { dedup, .. } => Some(dedup.as_str()),
+            _ => None,
+        }
+    }
+
+    /// For ``"relation"``: the alias the derived table is joined under.
+    #[getter]
+    fn relation_alias(&self) -> Option<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Relation { alias, .. } => Some(alias.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``"relation"``: the body's operators, a complete list of their
+    /// own (indices are into this list, the root last), rendered as a
+    /// statement in an alias space of its own.
+    #[getter]
+    fn relation_body(&self) -> Vec<PlanOp> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Relation { body, .. } => body
+                .nodes
+                .iter()
+                .map(|node| PlanOp {
+                    inner: node.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"relation"``: one entry per column the outside may read.
+    #[getter]
+    fn relation_columns(&self) -> Vec<RelationColumn> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Relation { columns, .. } => columns
+                .iter()
+                .map(|column| RelationColumn {
+                    inner: column.clone(),
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
