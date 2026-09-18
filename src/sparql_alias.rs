@@ -837,10 +837,19 @@ struct SubjectSpellings {
     /// Only the lexical form: a typed or language-tagged literal is no more
     /// an IRI than a plain one.
     literals: BTreeMap<String, BTreeSet<String>>,
+    /// The variables the subject's slots bind, per predicate: `?s :p ?v`.
+    objects: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// One variable scope's subjects, keyed by the subject as the query wrote it.
-type Scope = BTreeMap<String, SubjectSpellings>;
+/// One variable scope: its subjects, keyed as the query wrote them, and the
+/// string literals its expressions compare variables with.
+#[derive(Debug, Default)]
+struct Scope {
+    subjects: BTreeMap<String, SubjectSpellings>,
+    /// `(variable, literal)` for every `?v = "x"`, `?v != "x"`, `sameTerm`
+    /// and `?v IN ("x", …)` in a `FILTER`, `BIND` or `OPTIONAL` condition.
+    compared: Vec<(String, String)>,
+}
 
 /// Refuse a fixed predicate on a subject typed with a known class that
 /// carries no slot under that IRI.
@@ -858,7 +867,7 @@ pub fn refuse_uncarried_predicates(
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     };
-    let mut scopes: Vec<Scope> = vec![Scope::new()];
+    let mut scopes: Vec<Scope> = vec![Scope::default()];
     collect_scopes(pattern, &mut scopes, 0, false);
 
     let conv = schema_view.converter();
@@ -866,7 +875,7 @@ pub fn refuse_uncarried_predicates(
     // named — most queries name one or two.
     let mut carried: HashMap<String, Option<(String, BTreeSet<String>)>> = HashMap::new();
     for scope in &scopes {
-        for (subject, spellings) in scope {
+        for (subject, spellings) in &scope.subjects {
             // Exactly one type, and one the schema knows. Two types is an
             // intersection the scoper judges; none, or an unknown one, is the
             // scoper's untyped-subject refusal.
@@ -980,13 +989,27 @@ pub fn refuse_literals_against_concepts(
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     };
-    let mut scopes: Vec<Scope> = vec![Scope::new()];
+    let mut scopes: Vec<Scope> = vec![Scope::default()];
     collect_scopes(pattern, &mut scopes, 0, false);
     let conv = schema_view.converter();
 
     for scope in &scopes {
-        for (subject, spellings) in scope {
-            if spellings.literals.is_empty() {
+        for (subject, spellings) in &scope.subjects {
+            // The literals to judge on this subject: written as the object
+            // of a pattern, or compared in an expression with a variable one
+            // of the subject's slots binds. Keyed by predicate either way.
+            let mut literals: BTreeMap<&String, BTreeSet<&String>> = BTreeMap::new();
+            for (predicate, texts) in &spellings.literals {
+                literals.entry(predicate).or_default().extend(texts);
+            }
+            for (variable, text) in &scope.compared {
+                for (predicate, objects) in &spellings.objects {
+                    if objects.contains(variable) {
+                        literals.entry(predicate).or_default().insert(text);
+                    }
+                }
+            }
+            if literals.is_empty() {
                 continue;
             }
             let mut types = spellings.types.iter();
@@ -996,7 +1019,8 @@ pub fn refuse_literals_against_concepts(
             let Some(class) = schema_view.get_class_by_uri(class_iri).ok().flatten() else {
                 continue;
             };
-            for (predicate, literals) in &spellings.literals {
+            for (predicate, literals) in &literals {
+                let predicate: &String = predicate;
                 let Some(slot) = class.slots().iter().find(|slot| {
                     slot.canonical_uri()
                         .to_uri(&conv)
@@ -1015,14 +1039,18 @@ pub fn refuse_literals_against_concepts(
                     .to_uri(&conv)
                     .map(|u| u.0)
                     .unwrap_or_else(|_| enum_view.canonical_uri().to_string());
-                let Some(literal) = literals.iter().next() else {
+                let Some(literal) = literals.iter().next().map(|l| (*l).clone()) else {
                     continue;
                 };
                 let concept = enum_view
                     .definition()
                     .permissible_values
                     .as_ref()
-                    .and_then(|values| values.get(literal.as_str()).map(|pv| (literal, pv)))
+                    .and_then(|values| {
+                        values
+                            .get(literal.as_str())
+                            .map(|pv| (literal.as_str(), pv))
+                    })
                     .map(|(text, pv)| {
                         linkml_schemaview::enumview::permissible_value_iri(
                             &enum_iri, text, pv, &conv,
@@ -1040,7 +1068,7 @@ pub fn refuse_literals_against_concepts(
                 return Err(Box::new(LiteralAgainstAConcept {
                     subject: subject.clone(),
                     predicate: predicate.clone(),
-                    literal: literal.clone(),
+                    literal,
                     class_name: class.name().to_owned(),
                     enum_iri,
                     concept,
@@ -1088,19 +1116,29 @@ fn collect_scopes(
                 let NamedNodePattern::NamedNode(predicate) = &triple.predicate else {
                     continue;
                 };
-                let entry = scopes[scope].entry(subject).or_default();
+                let entry = scopes[scope].subjects.entry(subject).or_default();
                 if predicate.as_str() == RDF_TYPE {
                     if let TermPattern::NamedNode(class) = &triple.object {
                         entry.types.insert(class.as_str().to_owned());
                     }
                 } else {
                     entry.predicates.insert(predicate.as_str().to_owned());
-                    if let TermPattern::Literal(literal) = &triple.object {
-                        entry
-                            .literals
-                            .entry(predicate.as_str().to_owned())
-                            .or_default()
-                            .insert(literal.value().to_owned());
+                    match &triple.object {
+                        TermPattern::Literal(literal) => {
+                            entry
+                                .literals
+                                .entry(predicate.as_str().to_owned())
+                                .or_default()
+                                .insert(literal.value().to_owned());
+                        }
+                        TermPattern::Variable(object) => {
+                            entry
+                                .objects
+                                .entry(predicate.as_str().to_owned())
+                                .or_default()
+                                .insert(object.as_str().to_owned());
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1139,7 +1177,7 @@ fn collect_scopes(
         }
         GraphPattern::Project { inner, .. } => {
             if under_project {
-                scopes.push(Scope::new());
+                scopes.push(Scope::default());
                 let fresh = scopes.len() - 1;
                 collect_scopes(inner, scopes, fresh, true);
             } else {
@@ -1160,6 +1198,28 @@ fn collect_scopes_expression(
     scope: usize,
     under_project: bool,
 ) {
+    // A variable compared with a string literal: what `refuse_literals_against_concepts`
+    // judges once it knows what the variable is bound to.
+    let mut compared = |a: &Expression, b: &Expression| {
+        if let (Expression::Variable(v), Expression::Literal(l))
+        | (Expression::Literal(l), Expression::Variable(v)) = (a, b)
+        {
+            scopes[scope]
+                .compared
+                .push((v.as_str().to_owned(), l.value().to_owned()));
+        }
+    };
+    match expr {
+        Expression::Equal(left, right) | Expression::SameTerm(left, right) => {
+            compared(left, right);
+        }
+        Expression::In(value, candidates) if matches!(**value, Expression::Variable(_)) => {
+            for candidate in candidates {
+                compared(value, candidate);
+            }
+        }
+        _ => {}
+    }
     match expr {
         Expression::Exists(pattern) => collect_scopes(pattern, scopes, scope, under_project),
         Expression::Or(left, right)
@@ -1592,8 +1652,37 @@ classes:
         let refusal = canonicalize(&mut parsed, &sv).expect_err("refused");
         assert!(refusal.to_string().contains("No value of"), "{refusal}");
 
-        // The concept IRI itself, and a string on a string slot, pass.
+        // The same comparison in a FILTER -- `=`, `!=`, `IN` -- is the same
+        // mistake: the statement compared the stored code with the string
+        // and answered rows where SPARQL, comparing a concept IRI with a
+        // literal, answers none (`=`) or every record (`!=`).
+        for filter in [
+            "FILTER(?k = \"Tunnel\")",
+            "FILTER(?k != \"Tunnel\")",
+            "FILTER(\"Tunnel\" = ?k)",
+            "FILTER(?k IN (\"Bridge\", \"Tunnel\"))",
+            "FILTER(sameTerm(?k, \"Tunnel\"))",
+        ] {
+            let query = format!(
+                "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> ?k . {filter} }}"
+            );
+            let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let refusal = canonicalize(&mut parsed, &sv).expect_err(&query);
+            assert!(
+                matches!(refusal, SpellingError::LiteralAgainstAConcept(_)),
+                "{query}: {refusal:?}"
+            );
+        }
+
+        // The concept IRI itself, and a string on a string slot, pass -- in
+        // a pattern and in a FILTER.
         for accepted in [
+            format!(
+                "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> ?k . FILTER(?k = <https://data.infrabel.be/asset360/ZoneKind#Tunnel>) }}"
+            ),
+            format!(
+                "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> ?n . FILTER(?n != \"Tunnel\") }}"
+            ),
             format!(
                 "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> <https://data.infrabel.be/asset360/ZoneKind#Tunnel> }}"
             ),

@@ -3757,24 +3757,31 @@ mod tests {
     }
 
     /// A branch whose constant is not the term its column's values render as
-    /// declines the *whole* tree, the same way it declines a single
-    /// condition.
+    /// never reaches the tree: the query is refused at the parse.
     ///
     /// `kind` is an enum column: it stores `GSA` and renders as `eul:GSA`, so
     /// `= "GSA"` matches no stored value. Pushing it as one branch of a
-    /// disjunction is worse than pushing it alone -- the branch is dead, so
-    /// the disjunction silently narrows to the *other* branch and answers a
-    /// different question. The tree entry point therefore asks
-    /// `constants_are_the_columns_terms` first, exactly as `to_sql` does.
+    /// disjunction would be worse than pushing it alone -- the branch is
+    /// dead, so the disjunction would silently narrow to the *other* branch
+    /// and answer a different question. Until #461 the tree entry point
+    /// asked `constants_are_the_columns_terms` and declined the whole tree;
+    /// now the comparison itself is refused by name
+    /// (`crate::sparql_alias::refuse_literals_against_concepts`), before any
+    /// rule sees it, so neither leg can answer it wrong.
     #[test]
-    fn a_branch_whose_constant_is_not_the_columns_term_does_not_lift() {
+    fn a_branch_whose_constant_is_not_the_columns_term_is_refused() {
+        let sv = test_schema_view();
+        let err = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm ; \
+                 asset360:kind ?k . FILTER(?nm = \"BX517\" || ?k = \"GSA\") }}"
+            ),
+            &sv,
+        )
+        .expect_err("a string against a concept is refused");
         assert!(
-            filter_trees(
-                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
-                 asset360:kind ?k . FILTER(?nm = \"BX517\" || ?k = \"GSA\") }",
-            )
-            .is_empty(),
-            "a dead branch would narrow to the other one"
+            err.to_string().contains("\"GSA\" is a string"),
+            "refused by name: {err}"
         );
     }
 
