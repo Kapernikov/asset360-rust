@@ -78,7 +78,8 @@ pub enum ExecuteError {
     /// its end in the background, holding its store. Each such evaluation is
     /// counted until it finishes, and a request that would start another
     /// while [`MAX_ABANDONED_EVALUATIONS`] are already running is refused
-    /// here, before it loads a store of its own, so the backlog is bounded
+    /// at the top of [`sparql_execute`], before it loads a store of its own,
+    /// so the backlog is bounded
     /// instead of compounding to an OOM after every caller has been told
     /// "gave up" (#460, pepibru GitLab). The endpoint returns this as HTTP
     /// 503: it is the process's state, not the query's shape.
@@ -112,8 +113,8 @@ impl std::fmt::Display for ExecuteError {
             ExecuteError::EvaluationBacklog { abandoned, limit } => {
                 write!(
                     f,
-                    "Evaluation backlog: {abandoned} evaluations are still running past \
-                     their deadline, and {limit} is the most this process carries"
+                    "Evaluation backlog full: {abandoned} evaluations are still running past \
+                     their deadline in this process, and {limit} is the most it carries"
                 )
             }
             ExecuteError::QueryError(msg) => write!(f, "Query execution error: {msg}"),
@@ -297,6 +298,20 @@ pub fn sparql_execute(
     limits: ExecuteLimits,
     schema_graph_iri: Option<&str>,
 ) -> Result<SparqlAnswer, ExecuteError> {
+    // The bound on the backlog, before anything is allocated: what a full
+    // backlog is bounding is memory, and the store built below is up to
+    // `max_triples` quads of it. A call without a ceiling never abandons an
+    // evaluation and is not this bound's business.
+    if limits.max_eval_millis.is_some() {
+        let abandoned = ABANDONED_EVALUATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        if abandoned >= MAX_ABANDONED_EVALUATIONS {
+            return Err(ExecuteError::EvaluationBacklog {
+                abandoned,
+                limit: MAX_ABANDONED_EVALUATIONS,
+            });
+        }
+    }
+
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
     // Load instance data
@@ -424,18 +439,6 @@ pub fn sparql_execute(
         Some(millis) => {
             use std::sync::atomic::{AtomicU8, Ordering};
 
-            // The bound on the backlog. Read before the store is built, at
-            // the top of this function, would be earlier still; but the
-            // count changes only when a ceiling fires, and a store that is
-            // then dropped is the cheaper of the two mistakes.
-            let abandoned = ABANDONED_EVALUATIONS.load(Ordering::SeqCst);
-            if abandoned >= MAX_ABANDONED_EVALUATIONS {
-                return Err(ExecuteError::EvaluationBacklog {
-                    abandoned,
-                    limit: MAX_ABANDONED_EVALUATIONS,
-                });
-            }
-
             // Who let go of this evaluation first: the caller, at the
             // deadline, or the worker, by finishing. Exactly one of them
             // moves the state off RUNNING, and that one owns the count --
@@ -453,16 +456,27 @@ pub fn sparql_execute(
             let worker_token = token.clone();
             let worker_state = state.clone();
             std::thread::spawn(move || {
+                // The worker's hand-off runs on the way out whatever the
+                // way out is: a panic in the evaluator would otherwise
+                // leave an abandoned evaluation counted forever, and two of
+                // those would refuse every ceilinged call until restart.
+                struct Ended(std::sync::Arc<AtomicU8>);
+                impl Drop for Ended {
+                    fn drop(&mut self) {
+                        if self
+                            .0
+                            .compare_exchange(RUNNING, FINISHED, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            ABANDONED_EVALUATIONS.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+                let _ended = Ended(worker_state);
                 let answer = evaluate(parsed, &store, &limits, Some(worker_token));
                 // The receiver is gone when the caller gave up waiting; the
                 // answer has nobody to go to, and that is fine.
                 let _ = sender.send(answer);
-                if worker_state
-                    .compare_exchange(RUNNING, FINISHED, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
-                    ABANDONED_EVALUATIONS.fetch_sub(1, Ordering::SeqCst);
-                }
             });
             match receiver.recv_timeout(std::time::Duration::from_millis(millis)) {
                 Ok(answer) => answer,
@@ -852,8 +866,11 @@ classes:
         let refs: Vec<&LinkMLInstance> = instances.iter().collect();
         let query = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
                      SELECT ?s WHERE { ?s a asset360:Signal }";
+        // A triple cap no store can meet: were the store loaded first, its
+        // refusal would win, so the backlog refusal winning is the proof
+        // that nothing was loaded.
         let with_ceiling = ExecuteLimits {
-            max_triples: 500_000,
+            max_triples: 0,
             max_result_rows: 10_000,
             max_eval_millis: Some(30_000),
         };

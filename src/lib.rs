@@ -100,6 +100,13 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(py_naive_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
+        // The token an unscoped refusal opens with when it names its own
+        // rewrite (`sparql_scoper::UNSCOPED_REWRITE_NAMED`): exported so the
+        // endpoint reads the constant instead of carrying a copy of it.
+        m.add(
+            "UNSCOPED_REWRITE_NAMED",
+            crate::sparql_scoper::UNSCOPED_REWRITE_NAMED,
+        )?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_ntriples, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_skipped, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_reads_only_the_schema_graph, m)?)?;
@@ -3615,12 +3622,8 @@ fn sparql_execute(
                 "Evaluation time limit exceeded: the engine ran for more than {millis} ms"
             )))
         }
-        Err(crate::sparql_executor::ExecuteError::EvaluationBacklog { abandoned, limit }) => {
-            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Evaluation backlog full: {abandoned} evaluations are still running past \
-                 their deadline in this process, and {limit} is the most it carries"
-            )))
-        }
+        // `EvaluationBacklog` reaches Python as its own `Display`, through
+        // the arm below: one text, the one `sparql/engine.py` matches on.
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }
@@ -3695,6 +3698,13 @@ fn sparql_schema_graph_skipped(
 fn sparql_reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<String>) -> bool {
     crate::sparql_graph_clauses::reads_only_the_schema_graph(query, schema_graph_iri.as_deref())
 }
+
+#[cfg(all(
+    feature = "python-bindings",
+    feature = "stubgen",
+    feature = "sparql-endpoint"
+))]
+pyo3_stub_gen::module_variable!("asset360_rust._native2", "UNSCOPED_REWRITE_NAMED", String);
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
 define_stub_info_gatherer!(stub_info);

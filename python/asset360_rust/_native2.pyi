@@ -6,6 +6,7 @@ import builtins
 import datetime
 import typing
 
+UNSCOPED_REWRITE_NAMED: builtins.str
 class AltDescription:
     @property
     def alt_description_source(self) -> builtins.str: ...
