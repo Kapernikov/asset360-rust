@@ -539,13 +539,13 @@ fn fold(
             op,
             executor: node.executor,
             output: node.output,
+            key: node.key,
             discharges: node.discharges.clone(),
         });
         remap[old] = Some(nodes.len() - 1);
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 /// Recompute every plain join's `on` from the variables its sides now bind.
@@ -1150,8 +1150,7 @@ fn drop_optional_pair(plan: &mut Plan, leftjoin: NodeId, matched: NodeId, left: 
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 /// One `HAVING` conjunct as a condition on a column, when the variable it
@@ -1191,6 +1190,7 @@ fn insert_unnest_above(plan: &mut Plan, scan: NodeId, star: &str, path: Vec<Stri
             op,
             executor: node.executor,
             output: node.output,
+            key: node.key,
             discharges: node.discharges.clone(),
         });
         remap[old] = Some(nodes.len() - 1);
@@ -1211,8 +1211,7 @@ fn insert_unnest_above(plan: &mut Plan, scan: NodeId, star: &str, path: Vec<Stri
             remap[old] = Some(nodes.len() - 1);
         }
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 /// Insert filters immediately below a node, in order, each reading the one
@@ -1239,6 +1238,7 @@ fn insert_filters_below(plan: &mut Plan, target: NodeId, filters: Vec<(Vec<Oblig
                 op,
                 executor: node.executor,
                 output: node.output,
+                key: node.key,
                 discharges: node.discharges.clone(),
             });
             remap[old] = Some(nodes.len() - 1);
@@ -1250,12 +1250,12 @@ fn insert_filters_below(plan: &mut Plan, target: NodeId, filters: Vec<(Vec<Oblig
             op,
             executor: node.executor,
             output: node.output,
+            key: node.key,
             discharges: node.discharges.clone(),
         });
         remap[old] = Some(nodes.len() - 1);
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -1537,8 +1537,7 @@ fn fold_into_scan(
             .map_inputs(|input| remap[input].expect("nothing reads the match but the join"));
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,8 +1806,7 @@ fn replace_match_with_filter(
             .map_inputs(|input| remap[input].expect("nothing reads the match but the join"));
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -2056,8 +2054,7 @@ fn remove_nodes(plan: &mut Plan, removed: &[NodeId]) {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 impl Rule for FoldIdentityConstant<'_> {
@@ -2265,8 +2262,7 @@ fn collapse_leaf_into(plan: &mut Plan, leaf: NodeId, join: NodeId, other: NodeId
         node.op
             .map_inputs(|input| remap[input].expect("nothing reads the leaf but the join"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -2639,8 +2635,7 @@ fn sink_below_engine_filters(plan: &mut Plan, filter: NodeId, base: NodeId, cond
         });
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 /// The condition with every variable rewritten into the slot that binds it.
@@ -3093,8 +3088,7 @@ fn replace_nodes(plan: &mut Plan, replaced: &[(NodeId, NodeId)]) {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -3901,8 +3895,7 @@ fn push_grouping(plan: &mut Plan, group: NodeId, tail: GroupingTail) {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
     // Below the grouping, which is now wherever the renumbering put it.
     if !sinks.is_empty() {
         let group = plan
@@ -4616,8 +4609,7 @@ fn insert_filter_above(plan: &mut Plan, side: NodeId, consumer: NodeId, conditio
             }
         });
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -4851,8 +4843,7 @@ fn move_filter_onto(
         });
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -4985,6 +4976,68 @@ mod tests {
             "{plan}"
         );
         println!("{plan}");
+    }
+
+    /// A node's key outlives the rewrite that removes it: a folded match is
+    /// *retired* to the scan that took its work, and a key recorded before the
+    /// fold still resolves after it. The evidence the obligation ledger holds
+    /// is keys, so this is what lets it stay right across renumbering.
+    #[test]
+    fn a_folded_node_s_key_resolves_to_the_scan_that_took_its_work() {
+        use crate::sparql_refine::NodeKey;
+        let schema = test_schema_view();
+        let rule = FoldMatchesIntoScan::new(&schema);
+        let mut plan = plan_of(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(REGEX(?nm, \"^A\")) }",
+        );
+        let keys: Vec<NodeKey> = plan.nodes.iter().map(|node| node.key).collect();
+        assert!(
+            keys.iter().all(|key| *key != NodeKey::UNASSIGNED),
+            "every node of a built plan is keyed:\n{plan}"
+        );
+        assert_eq!(
+            keys.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            keys.len(),
+            "keys are unique:\n{plan}"
+        );
+        let type_match = plan.find("match")[0];
+        let type_key = plan.key_of(type_match);
+        let filter_key = plan.key_of(plan.find("filter")[0]);
+        let root_key = plan.key_of(plan.nodes.len() - 1);
+
+        refine(&mut plan, &[&rule]).unwrap();
+
+        let scan = plan.find("scan")[0];
+        assert_eq!(plan.node(type_key), None, "the match is gone:\n{plan}");
+        assert_eq!(
+            plan.resolve(type_key),
+            Some(scan),
+            "…and resolves to the scan that took its work:\n{plan}"
+        );
+        assert_eq!(
+            plan.node(filter_key),
+            Some(plan.find("filter")[0]),
+            "a node the rule kept keeps its key at its new position:\n{plan}"
+        );
+        assert_eq!(plan.node(root_key), Some(plan.nodes.len() - 1), "{plan}");
+        assert!(
+            plan.nodes
+                .iter()
+                .all(|node| node.key != NodeKey::UNASSIGNED),
+            "a node a rule built is keyed on install:\n{plan}"
+        );
+        // A retirement with no successor resolves to nothing, and says so
+        // rather than pointing at a stale position.
+        plan.retire(root_key, None);
+        assert_eq!(
+            plan.resolve(root_key),
+            Some(plan.nodes.len() - 1),
+            "live wins"
+        );
+        let gone = NodeKey(plan.next_key + 7);
+        plan.retire(gone, None);
+        assert_eq!(plan.resolve(gone), None);
     }
 
     /// The rule moves claims, it does not create or drop them. Stated as the

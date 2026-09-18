@@ -68,7 +68,7 @@
 //! [`Plan::fanout_restored`] catches the missing unnest that would otherwise
 //! only show up as a count of 1 where the answer was 3.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use linkml_schemaview::schemaview::SchemaView;
@@ -86,6 +86,31 @@ use crate::sparql_scoper::{FilterCondition, LikeAnchor, PushForm, ScopeError, li
 /// Index into [`Plan::nodes`]. Printed as `n0`, `n1`, ... so a reader can
 /// follow a node's inputs by eye, the way `o0`, `o1` work for obligations.
 pub type NodeId = usize;
+
+/// A node's identity, which survives renumbering.
+///
+/// [`NodeId`] is a *position*: an index into [`Plan::nodes`] that every
+/// removal renumbers. Evidence a rule records about a node -- an obligation's
+/// provenance, a join occurrence, a transfer step -- has to outlive the next
+/// rewrite, so it names the node by this key instead. Allocated from a
+/// counter on the plan and never reused; [`Plan::node`] resolves it to the
+/// current position, or through [`Plan::retired`] to the node that took its
+/// work over. Zero is "not yet assigned": a node built by a rule gets its key
+/// when [`Plan::rebuild`] installs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeKey(pub usize);
+
+impl NodeKey {
+    /// The placeholder a freshly built node carries until the plan installs
+    /// it. Never the key of a node in a plan.
+    pub const UNASSIGNED: NodeKey = NodeKey(0);
+}
+
+impl fmt::Display for NodeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "k{}", self.0)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Executor, output kind, query form
@@ -2230,6 +2255,8 @@ impl PlanOp {
 pub struct Node {
     pub op: PlanOp,
     pub executor: Executor,
+    /// The node's identity across rewrites. See [`NodeKey`].
+    pub key: NodeKey,
     /// What this node produces. Redundant with
     /// [`PlanOp::output_kind`] and kept as a field because 28d asks every node
     /// to *declare* it; [`Plan::well_formed`] checks the two agree, so a hand
@@ -2246,6 +2273,7 @@ impl Node {
             output: op.output_kind(),
             op,
             executor: Executor::Engine,
+            key: NodeKey::UNASSIGNED,
             discharges,
         }
     }
@@ -2256,6 +2284,7 @@ impl Node {
             output: op.output_kind(),
             op,
             executor: Executor::Sql,
+            key: NodeKey::UNASSIGNED,
             discharges,
         }
     }
@@ -2338,6 +2367,13 @@ pub struct Plan {
     /// Obligations no node discharges. Empty in a naive plan, which is why a
     /// naive plan is already an answer.
     pub residual: Vec<ObligationId>,
+    /// The next [`NodeKey`] to hand out. Keys are never reused.
+    pub next_key: usize,
+    /// Nodes a rule removed, each with the node that took its work over --
+    /// the input a dropped unary node stood in for, the scan a folded match
+    /// became -- or `None` when nothing did. What lets evidence recorded by
+    /// key resolve after the node it named is gone. See [`Plan::retire`].
+    pub retired: BTreeMap<NodeKey, Option<NodeKey>>,
 }
 
 /// A plan that violates one of the invariants.
@@ -2448,6 +2484,105 @@ impl Plan {
     /// The root: the node every other node feeds.
     pub fn root(&self) -> Option<&Node> {
         self.nodes.last()
+    }
+
+    /// A plan over these nodes, keyed from scratch. For a builder or a test
+    /// that assembles nodes by hand; a rule edits an existing plan through
+    /// [`Plan::rebuild`].
+    pub fn from_nodes(form: QueryForm, obligations: Vec<Obligation>, nodes: Vec<Node>) -> Self {
+        let mut plan = Plan {
+            form,
+            obligations,
+            nodes: Vec::new(),
+            residual: Vec::new(),
+            next_key: 1,
+            retired: BTreeMap::new(),
+        };
+        plan.install(nodes);
+        plan
+    }
+
+    /// Install a node list, giving every unkeyed node a fresh key.
+    fn install(&mut self, nodes: Vec<Node>) {
+        self.nodes = nodes;
+        for node in &mut self.nodes {
+            if node.key == NodeKey::UNASSIGNED {
+                node.key = NodeKey(self.next_key);
+                self.next_key += 1;
+            }
+        }
+    }
+
+    /// The current position of a node, by key.
+    ///
+    /// `None` for a key that is retired or was never issued; a caller that
+    /// wants the successor of a retired node asks [`Plan::resolve`].
+    pub fn node(&self, key: NodeKey) -> Option<NodeId> {
+        self.nodes.iter().position(|node| node.key == key)
+    }
+
+    /// The node a key stands for now: itself while it is live, or the node
+    /// its work went to when it was retired, followed through any number of
+    /// retirements. `None` when the chain ends in a retirement with no
+    /// successor.
+    pub fn resolve(&self, key: NodeKey) -> Option<NodeId> {
+        let mut current = key;
+        for _ in 0..=self.retired.len() {
+            if let Some(id) = self.node(current) {
+                return Some(id);
+            }
+            match self.retired.get(&current) {
+                Some(Some(successor)) => current = *successor,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The key at a position.
+    pub fn key_of(&self, id: NodeId) -> NodeKey {
+        self.nodes[id].key
+    }
+
+    /// **The one renumbering primitive.** Replace the node list with one a
+    /// rule rebuilt, given where each old position went.
+    ///
+    /// `remap[old]` is the new position of the old node, or of the node that
+    /// took its work over when the rule dropped it -- what every rule already
+    /// computes to renumber the inputs above its edit. This reads that same
+    /// table to keep the evidence straight: a node whose key is gone from the
+    /// new list is *retired* to the key at `remap[old]`, a fresh node gets a
+    /// key, and every join's `on` is recomputed from the bindings its sides
+    /// now have ([`crate::sparql_rules::refresh_join_variables`]).
+    ///
+    /// The rules used to do the first and last of these by hand at nine
+    /// sites, and none of them did the middle one, because nothing held a
+    /// key. Now the ledger can name a node and still be right after the rule
+    /// that removes it.
+    pub fn rebuild(&mut self, nodes: Vec<Node>, remap: &[Option<NodeId>]) {
+        let before = std::mem::take(&mut self.nodes);
+        // Keys first, so a node the rule built can be a successor.
+        self.install(nodes);
+        let live: BTreeSet<NodeKey> = self.nodes.iter().map(|node| node.key).collect();
+        for (old, node) in before.iter().enumerate() {
+            if live.contains(&node.key) {
+                continue;
+            }
+            let successor = remap
+                .get(old)
+                .copied()
+                .flatten()
+                .and_then(|new| self.nodes.get(new))
+                .map(|node| node.key);
+            self.retired.insert(node.key, successor);
+        }
+        crate::sparql_rules::refresh_join_variables(self);
+    }
+
+    /// Retire a key by hand, for a rule that removes a node without
+    /// rebuilding the list. `successor` is the node that took its work over.
+    pub fn retire(&mut self, key: NodeKey, successor: Option<NodeKey>) {
+        self.retired.insert(key, successor);
     }
 
     /// All six invariants, in the order a reader of 28d expects them: its four,
@@ -3358,12 +3493,15 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
     debug_assert_eq!(root, builder.nodes.len() - 1, "the root is the last node");
 
     let nodes = builder.nodes;
-    let plan = Plan {
+    let mut plan = Plan {
         form,
         obligations,
-        nodes,
+        nodes: Vec::new(),
         residual: Vec::new(),
+        next_key: 1,
+        retired: BTreeMap::new(),
     };
+    plan.install(nodes);
     plan.check().map_err(RefineError::Defect)?;
     Ok(plan)
 }
@@ -4289,12 +4427,7 @@ mod tests {
                 root: OutputKind::Solutions,
             })
         );
-        let empty = Plan {
-            form: QueryForm::Select,
-            obligations: Vec::new(),
-            nodes: Vec::new(),
-            residual: Vec::new(),
-        };
+        let empty = Plan::from_nodes(QueryForm::Select, Vec::new(), Vec::new());
         assert_eq!(empty.check(), Err(PlanDefect::Empty));
 
         // 5. A scan that folded a multivalued slot without its unnest. The
