@@ -1,13 +1,69 @@
 # A body is a relation: lowering a grouped sub-select and an `OPTIONAL` body as one derived table
 
 Status: **design, nothing built.** Draft PR for review; the two issues it
-answers stay parked until the design is agreed. **Revision 4**, after
-[review round 3](https://github.com/Kapernikov/asset360-rust/pull/49#issuecomment-5733057475):
-the first-stage contract now has a scope-local scoper and a boundary
-that wraps the *complete* sub-query; the 3a/3b stage has recursive,
-branching transfer paths and ownership along the path. Not
-implementation-ready until round 4 agrees those two first-stage
-contracts.
+answers stay parked until the design is agreed. **Revision 5**, after
+[review round 4](https://github.com/Kapernikov/asset360-rust/pull/49#issuecomment-5733331086),
+which listed ten acceptance criteria for the full design. They are now
+the document's **definition of done** (next section), and every later
+round is a walk of that list. Revision 5 closes the three integration
+contracts round 4 named — the pipeline (who types a star, and when a
+refusal is final), the structure-valued interface, and the lifetime of
+rewrite evidence — and reconciles the capability and test matrix with
+them. Self-assessed against the criteria: all ten met as design
+contracts; round 5 decides.
+
+<details><summary>What revision 5 changed, point by point</summary>
+
+* **The acceptance criteria are the definition of done.** Round 4's
+  ten criteria, verbatim, each with where in the document it is met.
+* **The pipeline is one sequence with one interpretation of a star's
+  class** ("The pipeline" section). Today the scoper refuses an untyped
+  star before the naive plan exists, which would refuse the outer read
+  3a exists to type. Now the scoper *records* an untyped star, the
+  plan is refined, and a `resolve` step types the star from the refined
+  plan's `Scan` for it or refuses — the refusal is final there and
+  nowhere earlier. The scoper copies no rule: it reads a fact the plan
+  derived. Four endpoint outcomes are named (`Statement`, `Fetch`,
+  `Rejected`, `FetchDeclined`) and every table row says which.
+* **Naming domain and evaluation unit are two things.** A sub-select
+  makes a variable private; an `OPTIONAL` body or a `UNION` arm does
+  not — its `?a` *is* the outer `?a`. Stars are keyed by naming domain;
+  a class travels across a combining node only by that node's proof,
+  spelled per operator in one table (`union_branches` is the precedent
+  in the scoper).
+* **A structure may cross a relation; it may not be an answer.**
+  `ColumnKind::Structure` identified by *occurrence* (holder, path,
+  ordinal) — the engine leg's turtle writer mints one blank node per
+  occurrence, so that is bnode identity. Representable and
+  serialisable are two properties; `key_is_readable` conflates them
+  today. A new equivalence, `PruneUnusedExports`, drops an export
+  nothing above reads (bag projection). Pinned: scalar projection over
+  #464 is a statement, `SELECT *` is a fetch (an explicitly unsupported
+  result form until elements have a term), an element joined outside is
+  a join by occurrence. Questions 5 and 6 closed.
+* **Found on the way: the unnest dedup is wrong for structures.**
+  `SELECT DISTINCT e.value` is right for a scalar slot (a graph is a set
+  of triples) and wrong for an inlined structure (two identical
+  elements are two blank nodes). It affects today's flat `GROUP BY ?a
+  COUNT(?cs)`. The `Unnest` contract states the rule per step kind, and
+  MR1 fixes it.
+* **Evidence holds keys, the proof is recomputed.** `Node` gains a
+  stable `NodeKey`; the nine renumbering sites become one primitive;
+  the ledger's `OutputSlot`/`JoinOccurrence`/steps hold keys; a removed
+  node is *retired* with its successor. The chain-of-3b-arms invariant
+  walks the *current* plan up the unique-consumer chain from the
+  discharge to the origin; the stored path is a log asserted against
+  it. "Already carries a restriction" is a canonical obligation key in
+  the append-only ledger, not a position. Progress: a decreasing
+  measure per rule; at the budget the plan is correct and lowers.
+* **The matrix reconciled.** The top-N counter-example's outcome is
+  `Rejected` (`query_unscoped`), not "correct fallback" — no fetch
+  preserving the answer exists; test 7 asserts that and the oracle's
+  answer, no SQL. The nested row derives its untyped outer read by 3a.
+  `GROUP BY ?cs` in #466's key bullet lowers under the structure
+  contract. Question 10 is closed by the `resolve` step.
+
+</details>
 
 <details><summary>What revision 4 changed, point by point</summary>
 
@@ -191,6 +247,29 @@ Two tests every section below is held to:
    catch a bad application of it, in the style 28d calls "an invariant can
    only catch what the representation makes local".
 
+## Acceptance criteria — the definition of done
+
+Review round 4 stated these ten as the non-negotiable criteria for the
+full design. "Met" means the **design contract** is specified, not that
+unbuilt code passes a test. Each row names where the contract lives;
+a row that is not met says "not yet — see Q*n*". The criteria do not ask
+for a particular optimizer framework, a cost model, an exact SQL
+spelling, or every SPARQL construct; they ask that the chosen domain be
+correct and composable and its boundaries honest.
+
+| ID | Criterion | Where it is met | Revision 5 |
+|---|---|---|---|
+| **AC1** | **A relation boundary covers the complete logical unit.** Projection, grouping, `HAVING`, ordering, duplicate handling and slicing retain their algebraic order; construction does not depend on SQL admission. | "The fact: a scope" → *The boundary is the complete sub-query*; pinned trees, test 9. | Met (round 4 agreed). |
+| **AC2** | **Binding identity and scope mean the same thing in every phase.** Private-name alpha-renaming cannot change inference or answers. Class restrictions cross boundaries only through justified interfaces; scoping cannot preempt a valid optimizer derivation. | "The pipeline": the scoper records, the plan derives, `resolve` decides, in that order; *Naming domain versus evaluation unit* gives the correspondence per operator for sub-selects, `OPTIONAL` bodies and `UNION` arms; tests 8 and 10. | Met. |
+| **AC3** | **Rules consume sound operator properties.** Outputs, guaranteed bindings, term identity, correlation and effects have explicit transfer contracts. Unknown facts are handled conservatively; lexical name equality is never a substitute. | "What a relational subtree derives"; `term_of` now answers `Structure` for an element (*What may cross a relation*); Q9 keeps the conservative half. | Met. |
+| **AC4** | **Every rewrite is an equivalence under explicit preconditions and in its stated context.** Preserve RDF-term equality, bags, unboundness, expression errors/effects and modifiers. Contextual restrictions preserve the enclosing join, not necessarily the restricted child. | Ops 1, 2, 3a, 3b, 4, 5 and `PruneUnusedExports`, each with *Match / Edit / Equivalence / caught by*; 3a is proved on the enclosing join; test 2(d) evaluates each rewrite alone. | Met. |
+| **AC5** | **Logical interfaces and physical implementations compose.** Every supported exported value has a defined representation and valid consumers; recursive lowering and absorption preserve the same interface and multiplicity. | *What may cross a relation*: `ColumnKind` incl. `Structure` by occurrence, its consumers, demand pruning, three pinned results for #464; the `Unnest` multiplicity contract (dedup by value for a scalar step, by occurrence for a structure step); Q5 and Q6 closed. | Met. |
+| **AC6** | **Contextual rewrites cannot affect another consumer, and their evidence survives composition.** Ownership is checked along mutated paths; transfers compose to arbitrary depth; splits account for every branch; later mutations cannot leave stale justification. | Op 3a's ownership rule; 3b's cursor and `Split`; *Evidence that survives rewriting*: `NodeKey`, one renumbering primitive, `retire`, the invariant recomputed from the current plan; test 11. | Met. |
+| **AC7** | **The optimizer has a defined safe progress policy.** Repeated rules are idempotent or make bounded progress; property updates and proof validation follow mutations; rule scheduling affects cost/choice, not correctness. | *Evidence that survives rewriting* → *Progress*: a measure per rule, the canonical obligation key, derived facts recomputed on demand, behaviour at `MAX_ROUNDS`, schedules; tests 2(d) and 11. | Met. |
+| **AC8** | **Lowering refusal never licenses an incorrect fallback.** The fallback fetch must preserve the original query's answers, with justification for any narrowing; otherwise report a deliberate refusal. A statement refusal, a fallback execution and a whole-query rejection must be distinguished. | "The pipeline" → *Outcomes*: `Statement` / `Fetch` / `Rejected` / `FetchDeclined`, and every capability row names its outcome; narrowing justification is the producer-keyed ledger plus `resolve`; the top-N row is a `Rejected`. | Met. |
+| **AC9** | **Equivalence is tested independently of SQL admission and of the optimized fetch.** Evaluate before/after each rewrite, use a complete-fixture oracle, compare bags of RDF terms, cover empty/unbound/duplicate and nested cases, and test the translator's new nodes directly. | "Tests that would prove equivalence": `plan_to_algebra`, the in-memory oracle, bags, the grammar; tests 10 (full entry point) and 11 (lifecycle) added. | Met as a test design (round 4 agreed the base). |
+| **AC10** | **The complete supported domain is explicit and internally consistent.** Motivating examples follow from generic rules; unsupported cases have property-based reasons. Every claimed capability has a valid derivation and acceptance test. Staging does not excuse unresolved contracts. | "The same vocabulary" table with an outcome per row and 3a named where an outer read is untyped; "What stays refused" with the property each rests on; every open question either closed or marked not blocking with its assumption; staging delivers contracts this document already states. | Met. |
+
 ## The two shapes, and the one fact the plan cannot state
 
 ### #466 — a count beside a row
@@ -342,10 +421,13 @@ run inside it unchanged.**
 ## The vocabulary
 
 One representational fact, five derived properties every relational
-subtree carries, one lowering target, and five equivalence ops (one of them
-in two halves). Three of the five are new rules; two are widenings of rules
-that exist, each a precondition made precise rather than a branch added.
-Nothing in the list names a predicate, a class, or a query.
+subtree carries, one pipeline that reads them in one order, one lowering
+target with its column kinds, and six equivalence ops (one of them in
+two halves). Five of the six are new rules (ops 1, 2, 3, 4 and the
+small `PruneUnusedExports`); op 5 and the element-held edge are
+widenings of rules that exist, each a precondition made precise rather
+than a branch added. Nothing in the
+list names a predicate, a class, or a query.
 
 ### The fact: a scope
 
@@ -512,7 +594,8 @@ rules run inside" claim:
   *pushed* barrier is invisible above it, and the barrier contributes one
   `Column` per export, typed by `term_of` at the scope root and flagged by
   `guaranteed` there — `Identity(class)` when the body's scan bound it, a
-  slot binding (path, reading, presence), `Measure` for an aggregate.
+  slot binding (path, reading, presence), `Measure` for an aggregate,
+  `Structure` for an unnested element (by occurrence).
   `identity_of(?a)` above a pushed sub-select therefore answers the inner
   star's class, which is what lets a join key on it, and `slot_of(?a)`
   stays ambiguous, so a filter on it still declines. A scan inside an
@@ -587,28 +670,34 @@ rules run inside" claim:
   shape code this document exists to refuse.
 
   The contract, the same fact the plan carries: **a star is a
-  `(scope, variable)`, not a variable.** A triple's subject is a star of
-  the scope it is written in — each off-spine `Project` opens one, as it
-  opens a `SubSelect` in the builder — and a star acquires its class
-  from its own scope only: an `rdf:type` triple there, or the
-  reference-based inference `untyped_subject_refusal` already performs,
-  over triples of that scope. A star that its own scope leaves untyped
-  is the untyped subject the scoper **already refuses** (`Unscoped`,
-  with the rewrite advice it already spells), whatever an outer variable
-  of the same name is typed as. So the inner `?s` above is refused
+  `(naming domain, variable)`, not a variable.** A triple's subject is a
+  star of the naming domain it is written in — each off-spine `Project`
+  opens one, as it opens a `SubSelect` in the builder (an `OPTIONAL`
+  body does not: see *Naming domain versus evaluation unit* in the
+  pipeline section) — and a star acquires its class from its own domain
+  only: an `rdf:type` triple there, or the reference-based inference
+  `untyped_subject_refusal` already performs, over triples of that
+  domain. A star that its own domain leaves untyped is the untyped
+  subject the scoper **already refuses** (`Unscoped`, with the rewrite
+  advice it already spells), whatever an outer variable of the same name
+  is typed as — refused at the pipeline's `resolve` step, after the
+  refined plan has had its one chance to type it (3a/3b), and not
+  before. So the inner `?s` above is refused
   exactly as `?inner` would be, and the top-N counter-example is refused
   for the same reason rather than for having a `Slice`. Two stars in two
-  scopes that are typed alike and read alike still merge into one fetch
+  domains that are typed alike and read alike still merge into one fetch
   star (`star_shape` is name-free already); two typed differently, or
   read differently, are two stars and the fetch is their union — wider
   than today's merged star, never narrower, which is the direction a
   fetch may err in.
 
   What may cross a boundary is then the same as for the plan: nothing in
-  the first MR (question 10), and later a restriction that rides an
+  the first MR, and with the 3a/3b MR a restriction that rides an
   *exported* binding with the transfer proof of 3a/3b read downward — an
   outer class reaching an inner star only through an `Export` the join
-  actually uses, never through a name. The test is **alpha-renaming**:
+  actually uses, never through a name, and read by the scoper from the
+  refined plan's `Scan` rather than re-derived (the `resolve` step;
+  question 10 is closed by it). The test is **alpha-renaming**:
   for every query in the property grammar, renaming each private inner
   variable to a fresh name must leave the scoper's fetch (`sparql_scope`'s
   stars and required fields) and the refined plan identical up to the
@@ -642,6 +731,143 @@ The invariants that make it local, added to `Plan::check()`:
   Revision 1's "structurally unreachable" claim about the 18-vs-17 trap
   is withdrawn in favour of this, which is checkable.
 
+### The pipeline: who decides what, and when a refusal is final
+
+Round 4's first finding. `plan_query_refined_with_schema_graph`
+(`sparql_plan.rs`) runs, in order: parse, `canonicalize`,
+`obligations_of`, **the scoper**, `naive_plan`, `refine`,
+`lower_refined`, `answers_alone`. The scoper refuses an untyped star on
+the spot (`ScopeError::Unscoped` → 422 `query_unscoped`), before a
+naive plan exists. Under the scope-local contract that refuses `{
+SELECT ?s WHERE { ?s a :Signal } LIMIT 3 } ?s :hasName ?n` for its
+untyped outer star — the read op 3a exists to type — before 3a has run.
+Saying "the scoper will use the same transfer proof" named no producer
+of that proof and no way for it to reach the scoper; and giving the
+scoper a copy of 3a is two derivations of one fact, which is what 28d
+removed a planner to stop.
+
+**The contract: the refined plan is the one derivation of a star's
+class across a boundary, and the scoper never crosses one.** A star its
+own domain types is typed by the scoper as today; a star its domain
+leaves untyped is *recorded*, and typed or refused only after the plan
+has been refined. The phases, revised:
+
+1. **Parse, `canonicalize`, `obligations_of`.** Unchanged.
+2. **`scope_parsed` → `Scoping`.** The refusals for what the fetch
+   cannot represent stay immediate and final — `UnsupportedConstruct`
+   for `MINUS`, property paths, `LATERAL`, an `EXISTS` in an `ORDER
+   BY` — they are the user's, as today. Star construction is keyed by
+   `(naming domain, variable)`; every star carries `class: Typed(iri) |
+   Untyped`. **An `Untyped` star is recorded, not refused.** The
+   fetch-dependent results (`sql_limit`, `inexact`, required and
+   optional fields) are computed at step 5, once every star has a
+   class, by the code that computes them today.
+3. **`naive_plan`.** The builder constructs the barriers (the
+   normalised scope graph, *The boundary is the complete sub-query*);
+   `Scope::of` reads it. **Correspondence invariant:** the scoper's
+   naming domains and the plan's `SubSelect` barriers are in bijection,
+   each pair binding the same variable set, and each scoper star has
+   exactly one plan producer chain in its domain. A test over the
+   property grammar asserts it (the scoper reads the algebra and the
+   plan is built from the same algebra, so a disagreement is a bug in
+   one of the two walks, and the test says which).
+4. **`refine`.** Every rule, 3a/3b included. Boundary restrictions are
+   derived here and only here.
+5. **`resolve`** (new, `sparql_plan.rs`): for each `Untyped` star
+   `(D, ?v)`, the refined plan is asked one question — *is the producer
+   of `?v` at `D`'s root a `Scan` of some class `c`, in `D`?* If so the
+   star is `Typed(c)` **from the plan** (3a placed the restriction, 3b
+   carried it to the scan without meeting a stop, `FoldMatchesIntoScan`
+   folded the matches into `scan c`). If not — 3b stopped above a
+   `Slice`, or nothing ever restricted the star — the star is refused:
+   `ScopeError::Unscoped`, the same message as today, naming `?v` and
+   its domain. **This is where an unscoped refusal is final, and the
+   only place.** Then the fetch-dependent results are computed over the
+   fully typed stars. In MR1, with no 3a/3b, `resolve` finds no
+   plan-derived class for any untyped star and refuses exactly the
+   stars round 3's contract refuses — so MR1 is this pipeline with
+   step 5 typing nothing, not a different pipeline.
+6. **`lower_refined`**, then `keep_what_the_rules_proved` on a refusal,
+   merging producer-keyed narrowings into the *resolved* scoping.
+7. **`answers_alone`** → the outcome.
+
+**Why step 5's typing is sound for the fetch.** The class reached the
+scan by a 3a/3b derivation whose invariant (*a boundary restriction's
+path is a chain of 3b arms*) holds in the refined plan, so `Restrict`
+at that scan preserves the enclosing join's answers. The engine leg
+re-runs the original query over the fetched records, and 28h's
+condition for a correct fallback is `eval(Q, fetched) = eval(Q,
+complete)`; a record of `(D, ?v)` outside `c` contributes to no
+solution of the enclosing join (that is what the chain proved), so
+leaving it out of the fetch satisfies D1. That is question 10's
+widening — a restriction crossing a barrier into the fallback fetch —
+done once, in the plan, and *read* by the scoper. It ships with the
+3a/3b MR, since without 3a/3b there is nothing to read.
+
+**Naming domain versus evaluation unit.** Two things were called
+"scope", and AC2 asks for the correspondence per operator rather than
+the shared word. An *evaluation unit* (`Scope`) is any subtree SPARQL
+evaluates to a multiset before combining it with the outside: a
+sub-select, an `OPTIONAL` body, a `UNION` arm, a `NOT EXISTS`/`MINUS`
+body. A *naming domain* is where a variable name denotes one variable.
+SPARQL solution mappings are per query, and only a sub-select's
+projection makes an inner variable private (§18.2.4, the projected
+variables are the sub-query's interface): the `?a` inside an `OPTIONAL`
+body **is** the outer `?a` — compatible mappings merge on it — and so is
+the `?a` of a `UNION` arm. So stars are keyed by the innermost
+enclosing **sub-select** (`Project` off the spine), not by every unit.
+Whether a class *travels* between two mentions of one variable across
+a combining node is that node's proof, the same in the plan (3a's
+match) and in the scoper (its merging):
+
+| combining node | class travels | proof |
+|---|---|---|
+| `Join`, one side → the other | yes, both ways | semi-join reduction on a join side — op 3a |
+| `LeftJoin`, preserved side → body | yes | semi-join on the right side — op 3a |
+| `LeftJoin`, body → preserved side | **no** | restricting the preserved side deletes rows it must keep |
+| `Union`, arm ↔ arm | no | each arm is its own fetch and the fetch is their union — `union_branches` in the scoper today, for exactly this reason |
+| `Minus`/`AntiJoin`, right ↔ left | no | a `Testing` unit; shrinking the right side widens the answer |
+| `SubSelect`, exported `?v` ↔ outer `?v` | only through the export's producer | 3a at the barrier, 3b through it (a `Transfer`), read back by `resolve` |
+| `SubSelect`, private `?v` ↔ outer namesake | never | two variables |
+
+The scoper's `depth` tag and `type_depth` are its spelling of the
+`LeftJoin` rows today: a triple at depth > 0 narrows nothing, and a
+star whose only type is inside an `OPTIONAL` is fetched as optional.
+Test 8 gains the third row's case (`?a :p ?x . OPTIONAL { ?a a :C }`,
+untyped outside, typed inside) against the full-fixture oracle, so
+what today's scoper does with it is measured rather than asserted here.
+
+**Outcomes.** One enum the endpoint switches on, so a capability row
+can say which and a test can assert it — AC8's three, plus the runtime
+gate that already exists:
+
+* **`Statement`** — SQL answers alone (`Refinement::UsedAlone`; today's
+  `answers_alone` succeeds).
+* **`Fetch { why }`** — the statement narrows, the engine finishes
+  (`Refinement::Used(Some(why))`); `why` names the node that stopped
+  lowering. Correct by D1–D3: every narrowing in the fetch has its
+  justification in the ledger — the scan it was proved on, keyed by
+  producer, or step 5's resolution.
+* **`Rejected(ScopeError)`** — no plan: `unsupported_construct`,
+  `query_unscoped` (decided at step 5), `incomplete_plan`. 422, the
+  endpoint's existing vocabulary (`views.py::plan_or_error`).
+* **`FetchDeclined`** — a fetch too large to materialise
+  (`planning.fallback_can_answer`, the runtime 422 #466 hits today as
+  `aggregate_not_pushable`). Unchanged; named so a row can say "this is
+  a fetch, and on a big class the gate declines it".
+
+A `Fetch` is never a wrong answer by construction, and a shape for
+which no correct fetch exists is a `Rejected`, never a `Fetch` — the
+top-N counter-example's row in the table now says so.
+
+**Tests (test 10, full entry point).** Through `plan_query_refined`,
+not by invoking a rule: the untyped outer read — MR1 →
+`Rejected(query_unscoped)` naming the outer domain's `?s`; 3a/3b MR →
+`Statement`; #464's nested `OPTIONAL` — MR1 → `Fetch`, after items 2–4
+→ `Statement`; the top-N counter-example → `Rejected(query_unscoped)`
+in every MR; the plain projection → `Rejected`; each alpha-renamed
+variant → the identical outcome.
+
 ### The lowering target: a relation
 
 ```rust
@@ -655,8 +881,16 @@ Op::Relation {
 /// `guaranteed` is `guaranteed(body root)` for this export, carried so a
 /// consumer above the barrier reads a fact rather than re-deriving one it
 /// cannot see into.
-pub struct RelationColumn { pub var: String, pub kind: ColumnKind, pub descriptor: TermDescriptor, pub guaranteed: bool }
-pub enum ColumnKind { Identity { class_uri: String }, Slot(BindingSpec), Measure }
+pub struct RelationColumn { pub var: String, pub kind: ColumnKind, pub descriptor: Option<TermDescriptor>, pub guaranteed: bool }
+pub enum ColumnKind {
+    Identity { class_uri: String },
+    Slot(BindingSpec),
+    Measure,
+    /// An inlined element, identified by its occurrence — see "What may
+    /// cross a relation". Representable, never serialisable (`descriptor`
+    /// is `None`).
+    Structure { holder: ColumnRef, path: Vec<String>, class_uri: String },
+}
 
 /// `Op::Join` gains a key beside the reference edge it has today.
 pub enum JoinKey {
@@ -665,6 +899,9 @@ pub enum JoinKey {
     /// `left.<col> = right.<col>`: two identities of the same class, or a
     /// relation column against a star's identity.
     Identity { left: ColumnRef, right: ColumnRef },
+    /// Two `Structure` columns of one `(holder class, path)`: equal iff
+    /// holder identity and ordinal agree.
+    Element { left: ColumnRef, right: ColumnRef },
     /// `on = []`: every pair. `CROSS JOIN`, or `LEFT JOIN … ON true`.
     Cross,
 }
@@ -706,6 +943,137 @@ table: the bounded driving scan `(SELECT t0.* … ORDER BY t0.asset360_uri
 LIMIT n) t0` on the fetch route. What is new is a derived table whose body
 is a *rendered statement* rather than a bounded copy of a table — the
 recursion, not the syntax.
+
+### What may cross a relation: the column kinds, structures included
+
+Round 4's second finding. Op 1 exports every body variable, `?cs`
+included; op 4 required every export to be *renderable*; question 5
+said `SELECT *` therefore fails op 4 while `SELECT ?name ?kpFromMeter
+…` lowers — although the user's `SELECT` list does not change S1's
+interface — and the #464 walk-through pushed `SELECT *` anyway.
+`ColumnKind` had no `Structure`. Contradictory, and AC5 asks for the
+general contract, not a #464 exception. Six parts.
+
+**1. Representable and serialisable are two properties.**
+*Representable*: the value can be a column of a derived table, with an
+equality the outside may use. *Serialisable*: the final projection can
+emit it as an RDF term. Every `ColumnKind` is representable;
+`Structure` is not serialisable. Today `key_is_readable` (and
+`column_is_readable`, which delegates to it) asks `resolve_column` —
+the *term shape* — of a grouping key, which is the two conflated: an
+element could never be a column of anything, whether or not anyone
+wanted to print it. The split: `representable(n, ?v)` is
+`term_of(n, ?v) ≠ Ambiguous`; `serialisable(n, ?v)` is `representable`
+and the kind is not `Structure`. Op 4 and op 5 and `PushGrouping`'s key
+test ask the first; only the root `PushProjection` asks the second.
+
+**2. `ColumnKind::Structure` is an occurrence, not a value.** An
+inlined element is identified by `(holder identity, path, ordinal)`.
+Why occurrence: the engine leg materialises records with
+`TurtleOptions { skolem: false }` (`sparql_executor.rs`) and the
+turtle writer mints one fresh blank node per inlined structure
+*occurrence* (`State::next_subject`, a counter — two identical elements
+in one array are two blank nodes, two triples, two solutions), and a
+blank node's identity within a graph is its occurrence. The SQL
+representation: the lateral unnest gains `WITH ORDINALITY`, and a
+`Structure` column is the pair `(holder.asset360_uri, e.ordinal)`
+beside `e.value`. Equality of two `Structure` columns is equality of
+that pair on one `(holder class, path)` — bnode equality in the engine
+leg's graph, stated in the statement. `term_of` answers `Structure {
+class_at_path, path }` for an unnested element and for a relation
+column carrying one; `guaranteed` treats it as any slot read (a
+required unnest binds it in every row).
+
+**3. Its consumers**, each a place a `Structure` column may legally be
+read, and the equality each rests on:
+
+* a slot read *through* it — `e.value->>'hasEntryPointM'`
+  (`BindingSpec.containers` marks the `List` step; the `Unnest` below
+  binds it; `SlotReading::BoundElement`). This is how `?kpFromMeter`,
+  `?track` and the rest are columns of `q0` in #464;
+* op 5's join key, when **both** sides are `Structure` of one `(holder
+  class, path)` — `JoinKey::Element`, equality on the pair. SPARQL joins
+  on the blank node, which is the same occurrence, so the two agree.
+  Admitted, with its own test; it is what an element used in an
+  enclosing join needs;
+* a `GROUP BY ?cs` key — by the pair. `COUNT(?cs)` counts occurrences,
+  `COUNT(DISTINCT ?cs)` distinct pairs;
+* `BOUND(?cs)`, and a `LeftJoin` whose right side exports it —
+  presence is a `NULL` test on the holder column, as for any relation
+  column.
+
+Not a consumer: the root `Project` (no term to emit), a value
+comparison (a blank node compares equal to nothing but itself, and the
+comparison rule has no arm for it — refused, as today), `ORDER BY ?cs`
+(blank-node order is undefined in SPARQL — refused, as today).
+
+**4. Demand: an export nothing reads leaves the interface.** A new
+equivalence, `PruneUnusedExports`. **Match:** a `SubSelect { vars }`
+and a `?v ∈ vars` such that no reference above the barrier resolves to
+`?v`'s producer through this barrier — scope closure is checked on
+producer slots, so "no reference" is a fact of the closure analysis,
+not a name search — the root `Project`, every `on` list, every filter,
+sort term, key and measure included. **Edit:** `vars := vars \ {?v}`.
+**Equivalence:** SPARQL `Project` is a bag projection (§18.5, `Project`
+keeps multiplicity), so removing an unreferenced column changes no row
+count and no other column's value, and no consumer can observe the
+difference because none reads it. **Caught by:** scope closure — a
+reference the rule missed now resolves to nothing and fails at the
+rule. It runs before op 4, so op 4's "every export representable" is
+asked of the exports the query *demands*. This is demand-driven
+pruning; it is not "change the user's `SELECT` list", which changes
+the query.
+
+**Pinned results** (test 12), each through the full entry point:
+
+* `SELECT ?name ?kpFromMeter ?track ?trackName ?trackCode ?trackDiscr`
+  over #464: `?cs` is referenced by nothing above S1 → pruned → every
+  remaining export representable and serialisable → op 4, op 5 → the
+  root `PushProjection` → **`Statement`**.
+* `SELECT *` over #464: the root `Project` references `?cs` → not
+  pruned → op 4 admits it (representable) → the root `PushProjection`
+  declines (`?cs` not serialisable) → **`Fetch`** (`why`: the root
+  projection of a `Structure`), and the engine emits the blank node.
+  An explicitly unsupported *result form*: a statement cannot answer a
+  query that asks for a blank node. The widening is a term for
+  elements — the turtle writer has `skolem: true`, which mints
+  `<parent>/<part>` IRIs, and a statement can spell that from the pair
+  — but that changes what the endpoint answers for every element and
+  is the datamodel's decision, not the planner's (question 5, closed
+  that way: not blocking, the outcome is pinned).
+* an element in an enclosing join — `?a :hasCoveredSection ?cs . {
+  SELECT ?cs (COUNT(?x) AS ?n) WHERE { ?a a :CEA ; :hasCoveredSection
+  ?cs . ?cs :x ?x } GROUP BY ?cs }` with `?cs` not projected at the
+  root: `Structure` on both sides of the join, one `(CEA,
+  hasCoveredSection)` → `JoinKey::Element` → **`Statement`** (MR4,
+  with the element-held edge); projected at the root → **`Fetch`**.
+
+**5. Found while writing this: the unnest dedup is wrong for
+structures.** `_from_join_where` (`sql_builder.py`) renders every
+unnest as `SELECT DISTINCT e.value` — "one solution per *distinct*
+element", which is right for a scalar or IRI slot (an RDF graph is a
+set of triples: `["Freight", "Freight"]` is one triple) and **wrong for
+an inlined structure**: two identical elements are two blank nodes
+(point 2), two triples, two solutions, and the engine leg counts two
+where the statement counts one. It affects today's flat `GROUP BY ?a
+COUNT(?cs)`, the form #466's statement reuses. The `Unnest` contract
+states the rule per step kind: **dedup by value for a scalar step,
+by occurrence (no dedup, `WITH ORDINALITY`) for a structure step.**
+`plan_to_algebra`'s direct `Unnest` test (test 2) seeds a duplicated
+structure beside the duplicated scalar and asserts both multiplicities
+against the oracle. It goes in MR1: it is the `Unnest` node's contract,
+the same file, and #466 counts elements.
+
+**6. Question 6, closed.** `ScanSlot.path` stays rooted at the star
+(`[hasCoveredSection, isReference]`); "relative to the element" is the
+renderer's reading, which `BindingSpec.containers` already spells per
+step and `SlotReading::BoundElement` already names. What the plan must
+guarantee is that the element exists as a row where such a read
+happens: invariant **every `BoundElement` read has its unnest** — a
+read of path `p` with reading `BoundElement` has, below it in the same
+evaluation unit, an `Unnest` of `p`'s collection prefix (a sibling of
+`fanout_restored`, which walks the same pair the other way). A read
+with no such unnest is `AnyElement` or ill-formed.
 
 ### Op 1 — `EncloseOptionalBody` *(new rule; an identity projection)*
 
@@ -817,9 +1185,11 @@ and they get two rules.
 **Match.** A subtree *S* that is a side of a `Join`, or the **right**
 side of a `LeftJoin`, with `?v ∈ on`; `?v ∈ guaranteed(S.root)` and
 `?v ∈ guaranteed(other side)`; `term_of(other side, ?v) =
-Identity(class)`; *S* does not already carry a restriction of `?v` to
-`class` at its root; and **that `Join`/`LeftJoin` is *S*'s only
-consumer**. *S* is usually an `Exporting` scope — the sub-query beside
+Identity(class)`; `restriction_is_implied(S, ?v, class)` is false —
+no `o_boundary` with this canonical key in the ledger, and *S*'s root
+does not already produce `?v` as `Identity(class)`, guaranteed (see
+*Evidence that survives rewriting*); and **that `Join`/`LeftJoin` is
+*S*'s only consumer**. *S* is usually an `Exporting` scope — the sub-query beside
 a typed outer read — but the proof is about a join side, not a scope
 root, so it is also the **other** direction: the outer `?s :hasName
 ?n` beside `{ SELECT ?s WHERE { ?s a :Signal } … LIMIT 3 }` is a join
@@ -875,7 +1245,8 @@ finding, fixed in the representation rather than in the rule. The filter kind re
 (SELECT asset360_uri FROM golden_records WHERE asset_type = 'class')` —
 or, when 3b carries it to a scan, as the scan's own `asset_type`
 condition — and raises a new obligation, `o_boundary(S, ?v, class,
-at: JoinOccurrence { node, side })`, in *S*. The obligation is the
+at: JoinOccurrence { node: NodeKey, side })`, in *S* (a key, not an
+index — *Evidence that survives rewriting*). The obligation is the
 provenance the review asked for in place of `narrowed_by_interface:
 true`: it names the join occurrence and side that justified it, so it
 stays checkable when that occurrence is itself rewritten (op 5 flips
@@ -923,8 +1294,9 @@ the ones that *stop* are visible:
 | `Path`, `Service`, `Opaque` | stop |
 
 The walk records each step as the rule that took it, **on the obligation**:
-`o_boundary` carries a `path: Vec<Step>`, one `Step { rule, node }` per
-operator it passed. Where the walk stops, the filter stays: still correct
+`o_boundary` carries a `path: Vec<Step>`, one `Step { rule, node:
+NodeKey }` per operator it passed — a log the invariant checks against
+the chain it recomputes from the plan, not the proof itself (below). Where the walk stops, the filter stays: still correct
 (the boundary proof holds at any point above the stop, because every step
 preserved the multiset), just not folded into a scan.
 
@@ -990,6 +1362,117 @@ restating part of it. The obligation is what makes the check local:
 without it, the invariant could not tell a user-written filter (which
 may sit anywhere the user put it) from a derived one.
 
+#### Evidence that survives rewriting, and the progress policy
+
+Round 4's third finding. `OutputSlot`, `JoinOccurrence`, `Transfer`
+and every `Step` above hold a `NodeId`, and a `NodeId` is an index
+into `plan.nodes`: every removal renumbers — `remove_nodes`, `fold`,
+and seven more sites in `sparql_rules.rs` each build a `remap` and
+reassign `plan.nodes` — so a path validated when it was written names
+the wrong nodes after `PushProjection` absorbs the `Project` one of
+its steps passed. A check made once at creation is not the invariant
+the section above promises. Three decisions close it, and a fourth
+states progress.
+
+**Identity is a key; position is an address.** `Node` gains `key:
+NodeKey`, allocated from a counter on the `Plan` and never reused;
+`NodeId` stays the index `PlanOp::inputs()` uses. Everything the ledger
+records about a node — `OutputSlot.node`, `JoinOccurrence.node`,
+`Transfer.via`, `Split.at`, a `Step.node` — is a `NodeKey`, and
+`Plan::node(key) -> Option<NodeId>` resolves it. The nine renumbering
+sites become one primitive, `Plan::rebuild(kept, remap)`, which
+re-indexes inputs (what each of them does by hand today) and touches
+no evidence, because evidence holds keys. A rule that removes a node
+says what took over its work — `Plan::retire(key, successor:
+Option<NodeKey>)`, the fact every existing `remap` already computes
+(`remove_nodes` maps a removed node to its input, `fold` to the scan)
+— and the plan keeps `retired: BTreeMap<NodeKey, Option<NodeKey>>`.
+New invariant, **evidence resolves**: every key the ledger names is
+live, or retired with a successor; a rule that retires a key an
+obligation still names, with no successor, fails at the rule.
+
+**The proof is recomputed; the stored path is a log.** *A boundary
+restriction's path is a chain of 3b arms* reads the **plan**, not the
+recorded `path`. For each `o_boundary` with origin `(join: NodeKey,
+side, ?v, class)` and discharge site *d* — the node whose `discharges`
+holds it, which the ledger already records — walk **up** from *d*
+through consumers: the walk is a chain because the ownership rule
+gives every node on it exactly one consumer, and a node with two is
+the failure. Each node passed must be a "yes" arm of the 3b table
+*for the node as it is now*; passing a barrier that exports `?v`'s
+producer is a `Transfer`; passing a `Union` is a `Split`, and the
+ledger must show the parent discharged there with one child per arm;
+the walk must reach the origin side's root (the barrier of an
+`Exporting` scope, or the side subtree's root), resolved through
+`retired` when a later rule merged joins (the successor must be a
+join with the same side, or the check fails). The recorded `path:
+Vec<Step>` is written for the printout and `RefineLog` and, in a debug
+build, asserted equal to the recomputed chain — which is how a rule
+that records a step it did not take is caught. This is what makes it
+an invariant after every pass: `push → fold → remove → reanalyse →
+lower` is checked at each arrow against the current plan, by
+`Plan::check`, as every other invariant is.
+
+**Derived facts are recomputed, never cached across a rewrite.**
+`outputs`, `guaranteed`, `term_of`, `correlated_inputs`, `Scope::of`,
+`consumers` are functions of the plan, computed on demand by the rule
+that asks — as `Visible::below` is today — and `Plan::check`
+recomputes them. No rule stores a property on a node except what the
+*lowering* renders (`RelationColumn.guaranteed` is written after
+refinement has ended). There is therefore nothing to invalidate, and
+"property updates follow mutations" is true by construction rather
+than by discipline. The cost is linear per ask; the plans are small
+and the grammar test measures it.
+
+**"Already carries a restriction" is a key, not a position.** 3a's
+last-but-one clause is decided by `restriction_is_implied(side, ?v,
+class)`, which is true when either (a) the ledger holds an
+`o_boundary` with the **canonical key** `(origin join key, side, ?v,
+class)` — the ledger is append-only, an obligation is never removed,
+only discharged, so the answer does not depend on where 3b has since
+moved the filter; or (b) `term_of(side root, ?v) = Identity(class)`
+and `?v ∈ guaranteed(side root)` — the restriction is implied by the
+side's own scan (#466's case). Two obligations with one canonical key
+is a ledger defect, checked.
+
+**Progress.** Every rule has a measure that strictly decreases, or a
+fact it makes true once and matches against:
+
+| rule | why it fires finitely often |
+|---|---|
+| 3a | at most once per canonical key; keys are bounded by joins × variables × classes in the plan |
+| 3b | each step moves one filter one node down — its depth strictly increases in a finite tree; a `Split` replaces one obligation by *k* whose remaining depth is each strictly smaller |
+| op 1 | once per `LeftJoin`: the match excludes a right side that is already a `SubSelect` |
+| op 2 | removes a `condition`; there are finitely many |
+| ops 4, 5 | flip `[E]` → `[S]`, never back |
+| `PruneUnusedExports` | strictly shrinks a `vars` list |
+| the existing rules | keep their own: `fold` removes nodes, the push rules flip executors, the tail rules absorb a chain |
+
+So every schedule terminates in bounded steps, and `MAX_ROUNDS` (64,
+`sparql_rules.rs`) stays as the guard it is. **At the budget** the plan
+is correct: every applied rewrite was an equivalence and `Plan::check`
+held after each, so `refine` returns the plan as it is, lowering
+proceeds, and the outcome is a `Statement` or a `Fetch` — never a
+wrong answer, only a less refined one. Hitting it is a bug
+(`debug_assert!` today), and the grammar test asserts a fixpoint for
+every generated query. **Schedules:** two legal schedules may produce
+two plans (3b's `Join` arm takes the first side in input order; an
+earlier fold may change which stop is met first) and both must
+preserve answers; no rule's precondition is stated in terms of a later
+rule repairing its result, and the bad-rule tests check each rule
+alone. Confluence is not claimed and identical SQL is not required.
+
+**Tests (test 11, lifecycle).** (i) 3a, then 3b through a `Project`,
+then `PushProjection` absorbs that `Project`: the step's key resolves
+through `retired`, the recomputed chain holds, the plan lowers; (ii)
+3a offered again after 3b moved the filter: declines on the canonical
+key, no duplicate obligation; (iii) a `Split` at a `Union`, then a fold
+in one arm that removes the node that arm's step named; (iv) a
+deliberately bad rule retires a node an obligation names, with no
+successor — *evidence resolves* fails at the rule; (v) `MAX_ROUNDS`
+forced to 1 over the grammar: every plan passes `Plan::check`, lowers,
+and agrees with the oracle.
+
 **Why the body scans the class again rather than reading the outer row**
 is unchanged from revision 1: inside the derived table, `?a`'s record is a
 fresh `Scan` joined back to the outer `t0` on identity, a self-join
@@ -1000,9 +1483,11 @@ an equivalent statement and a renderer choice (open question 3).
 
 **Match.** An `Exporting` `SubSelect` that is `[E]`, whose `input` is
 `[S]`, whose `correlated_inputs` is empty, and every export's producer
-resolves through the body's `Visible` to a renderable column
-(`key_is_readable`, the grouping rule's own test, which
-`PushProjection::column_is_readable` already reuses). The barrier is the
+resolves through the body's `Visible` to a **representable** column
+(`term_of` not `Ambiguous`; a `Structure` qualifies — *What may cross a
+relation*, part 1; `key_is_readable` is that test once its term-shape
+half moves to the root `PushProjection`). `PruneUnusedExports` has run
+before, so the exports asked about are the ones the query demands. The barrier is the
 scope root by construction (it wraps the complete sub-query), so there
 is no "no modifier above it" clause to state: the sub-query's own
 `Project`, `Sort`, `Distinct`, `Slice` are nodes of `input`, and `input
@@ -1053,6 +1538,13 @@ whose `on` is **either empty or one variable `?v`**:
   an identity column that passed through a `LeftJoin` right side has the
   first and not the second, and declines.
 
+* `on = [?v]`, **both** sides `term_of(side, ?v) = Structure` of one
+  `(holder class, path)`, `?v ∈ guaranteed(side)` on both:
+  `JoinKey::Element`, equality on `(holder identity, ordinal)` — the
+  blank node's occurrence, which is what SPARQL's term equality on a
+  blank node is within one graph (*What may cross a relation*, part
+  3). MR4.
+
 A join on two or more variables is a later widening (a conjunction of
 per-variable keys, each with this proof) and not this rule.
 
@@ -1100,7 +1592,9 @@ at-most-one-row (none in this document) would have to check.
 columns are each the identity of a scan or a relation column of kind
 `Identity`, on the side the key says, of one class, **each in
 `guaranteed` of its side**, and `on` is that variable alone; a
-`JoinKey::Cross` has `on = []`.
+`JoinKey::Element`'s two columns are each a `Structure` of one `(holder
+class, path)`, guaranteed on both sides; a `JoinKey::Cross` has `on =
+[]`.
 
 ### The widening op 5 needs for #464: a reference held by an element
 
@@ -1176,7 +1670,7 @@ measure, guaranteed → `n6 [S]`.
 Op 5: `n1`'s `term_of(?a) = Identity(CEA)`, guaranteed; `n6`'s column says
 the same; one class → `n7 [S]`, key recorded. (Op 3a does not fire: S1
 already scans `?a` as CEA, so a restriction to CEA at its root adds
-nothing — the "already carries" clause.) `PushProjection`: no `Group` **in the outer
+nothing — `restriction_is_implied`, arm (b).) `PushProjection`: no `Group` **in the outer
 scope** (the one in S1 is behind a pushed barrier), body `[S]`, both
 projected variables readable (`?name` a column of `n0`, `?trackQty` a
 relation column) → `n8 [S]`. Every node `[S]`, one island per scope,
@@ -1188,7 +1682,7 @@ FROM golden_records t0
 JOIN (
   SELECT t1.asset360_uri AS a, count(*) AS track_qty
   FROM golden_records t1
-  CROSS JOIN LATERAL (SELECT DISTINCT e.value FROM jsonb_array_elements(t1.object_data->'hasCoveredSection') e) e
+  CROSS JOIN LATERAL jsonb_array_elements(t1.object_data->'hasCoveredSection') WITH ORDINALITY AS e(value, ordinal)
   WHERE t1.asset_type = 'CivilEngineeringAsset'
   GROUP BY t1.asset360_uri
 ) q0 ON q0.a = t0.asset360_uri
@@ -1198,10 +1692,12 @@ WHERE t0.asset_type = 'CivilEngineeringAsset'
 ```
 
 (The inner statement is what `PushGrouping` + the renderer already emit for
-the flat `GROUP BY ?a` form; `count(*)` over the fanned-out element is
-`COUNT(?cs)` by the existing unbound rule, since a required element is
-never `NULL`. The `SELECT DISTINCT e.value` is the existing term-set
-dedup.)
+the flat `GROUP BY ?a` form, with one correction: the unnest of an
+inlined *structure* is `WITH ORDINALITY` and **not** `SELECT DISTINCT
+e.value` — *What may cross a relation*, part 5 — because each element
+is its own blank node in the graph the engine leg answers over.
+`count(*)` over the fanned-out element is `COUNT(?cs)` by the existing
+unbound rule, since a required element is never `NULL`.)
 
 **Equivalence, the cases that matter:**
 
@@ -1213,17 +1709,25 @@ dedup.)
   `LeftJoin`, `?trackQty` unbound for that tunnel. `BIND(COALESCE(?trackQty,
   0))` on top is a `Bind` the engine keeps — a fetch, not the statement —
   unless `COALESCE` becomes an `Expr::to_sql` case, which is orthogonal.
-* **A duplicate entry in the array.** RDF holds one triple per distinct
-  value; the existing `SELECT DISTINCT e.value` dedups before the count on
-  both routes. Unchanged.
+* **A duplicate entry in the array.** Two cases, and they differ. A
+  duplicated *scalar* (`["Freight", "Freight"]`) is one triple — a
+  graph is a set — and the existing `SELECT DISTINCT e.value` dedup is
+  right. A duplicated *structure* (two identical covered sections) is
+  two blank nodes and two triples, so `COUNT(?cs)` is 2 on the engine
+  leg; the statement must count 2 too, and today's flat form counts 1.
+  The `Unnest` contract (part 5) dedups by value for a scalar step and
+  by occurrence for a structure step; the seed carries one of each.
 * **JSON `null` / absent key.** A required read excludes both; the element
   unnest of a missing array yields no rows. Unchanged.
 * **Multi-valued key.** `GROUP BY ?a` on an identity: one row per record.
-  `GROUP BY ?cs` (an element) would be a `BoundElement` key, which
-  `key_is_readable` already accepts; the join above would then need `?cs`
-  on both sides as an *identity*, which it is not (it is a structure) — op 5
-  declines, the barrier stays, the plan falls back. Correct and slow, as
-  today.
+  `GROUP BY ?cs` (an element) is a `Structure` key, grouped by
+  occurrence (*What may cross a relation*, part 3); a join above on
+  `?cs` is `JoinKey::Element` when the other side is the same
+  `(CEA, hasCoveredSection)` structure, and the outcome is a
+  `Statement` (MR4) — or a `Fetch` when `?cs` reaches the root
+  projection. Revisions 1–4 said op 5 declines here because `?cs` is
+  not an identity; it declines only when the other side is not the
+  same structure.
 * **Two records of the same URI.** Not possible: `asset360_uri` is the
   table's key within a table target. The overlay (edit-session) table is a
   merged view with the same key.
@@ -1304,20 +1808,32 @@ With the vocabulary:
    as a derived table — the same SQL as before, reached through a
    barrier, which is the phase separation composing on a real case
    rather than being asserted.
-5. **Op 4** flips S1's barrier: every node in S1 is `[S]` (S2's barrier
-   included, a leaf of S1's island), no correlated inputs, every export
-   a column (`?cs` — see open question 5; `?a` and `?track` identities;
-   the rest slots; `?trackDiscr` S2's nullable column, not guaranteed,
-   which the column records).
+5. **`PruneUnusedExports`, then op 4.** The query as #464 wrote it is
+   `SELECT *`, so the root `Project` references `?cs` and nothing is
+   pruned. Op 4 flips S1's barrier anyway: every node in S1 is `[S]`
+   (S2's barrier included, a leaf of S1's island), no correlated
+   inputs, every export **representable** — `?cs` a `Structure` of
+   `(CEA, hasCoveredSection)` by occurrence; `?a` and `?track`
+   identities; the rest slots; `?trackDiscr` S2's nullable column, not
+   guaranteed, which the column records.
 6. **Op 5** pushes `n11` as a `LeftJoin` on `?a`: `Identity(CEA)` on both
    sides, `?a ∈ guaranteed` on both — on the *outer* side because it is
    `n0`'s scan identity on the preserved side, on S1 because the derived
    property says so at S1's root; "an identity is always bound", which
    revision 1 wrote here, is not a rule — `condition: None`.
-7. `PushProjection` takes `SELECT *` over an all-`[S]` outer scope.
+7. **The root `PushProjection`** asks *serialisable* of every projected
+   variable. For `SELECT *` that includes `?cs`, a `Structure` with no
+   term: it declines, and the outcome is a **`Fetch`** — the outer scan
+   left-joined to `q0` is the fetch, the engine finishes and emits the
+   blank node. Revisions 1–4 wrote "takes `SELECT *`" here, which
+   contradicted question 5; the statement below is the outcome for the
+   **scalar projection** `SELECT ?name ?kpFromMeter ?track ?trackName
+   ?trackCode ?trackDiscr`, for which step 5 prunes `?cs` from S1's
+   exports and the root projection is all serialisable columns —
+   **`Statement`**. Both are pinned (test 12).
 
 ```sql
-SELECT t0.object_data->>'identification' AS name, q0.kp_from_meter, q0.track, q0.track_name, q0.track_code, q0.track_discr, …
+SELECT t0.object_data->>'identification' AS name, q0.kp_from_meter, q0.track, q0.track_name, q0.track_code, q0.track_discr
 FROM golden_records t0
 LEFT JOIN (
   SELECT t1.asset360_uri AS a,
@@ -1326,7 +1842,7 @@ LEFT JOIN (
          t2.object_data->>'longname' AS track_code,
          t2.object_data->>'hasTrackType' AS track_discr
   FROM golden_records t1
-  CROSS JOIN LATERAL (SELECT DISTINCT e.value FROM jsonb_array_elements(t1.object_data->'hasCoveredSection') e) e
+  CROSS JOIN LATERAL jsonb_array_elements(t1.object_data->'hasCoveredSection') WITH ORDINALITY AS e(value, ordinal)
   JOIN golden_records t2 ON t2.asset360_uri = e.value->>'belongsToTrack' AND t2.asset_type = 'Track'
   WHERE t1.asset_type = 'CivilEngineeringAsset'
     AND e.value->>'isReference' = 'true'
@@ -1376,17 +1892,17 @@ proposed suite.
 
 | shape | ops that fire | statement |
 |---|---|---|
-| `{ SELECT ?s WHERE { ?s a :Signal } ORDER BY ?s LIMIT 3 } ?s a :Signal ; :hasName ?n` — top-N, then read, **typed in both scopes** | `PushProjection` and the sort/slice rules in the scope, 4, 5 | `JOIN (SELECT … ORDER BY … LIMIT 3) q ON q.s = t0.asset360_uri` |
-| the same with the outer read **untyped** (`… } ?s :hasName ?n`) | 3a on the *outer* side (the relation column is `Identity(Signal)`, guaranteed), 3b through nothing, fold; then 4, 5 | the same statement — in the 3a/3b MR. In MR1 the outer scope leaves `?s` untyped and both routes refuse it: today's fallback answers it **wrong** (the scoper merges the outer read into the inner star, so the fetch is Signals *with a name* and the top 3 are ranked over the wrong universe) |
-| `OPTIONAL { { SELECT ?a (COUNT(?cs) AS ?n) … GROUP BY ?a } }` — #466 with zeros | `PushGrouping` in the scope, 4, 5 (left) | `LEFT JOIN (grouped) q`, `?n` unbound for a tunnel with none |
-| `OPTIONAL { ?s :ref ?t . ?t a T ; :x ?p ; :y ?q }` — 28d's declined two-read over a reference | 1, 3, `PushReferenceJoin`, 4, 5 | `LEFT JOIN (SELECT … FROM t1 JOIN t2 …) q` |
-| `OPTIONAL { ?s :ref ?t . ?t a T . FILTER(?t.x > 5) }` — the lifted condition | 1, 2, then as above | condition in the derived table's `WHERE` |
-| `{ SELECT (COUNT(*) AS ?total) WHERE { ?s a :Signal } } ?s a :Signal ; :hasName ?n` — a scalar beside every row | `PushGrouping` in the scope (no keys), 4; the outer join has `on = []` | `CROSS JOIN (SELECT count(*) …) q` — op 5 with an empty key is a cross join, which is what a natural join on no variables is; worth its own row in the tests |
-| `{ SELECT ?s (COUNT(?x) AS ?nx) WHERE { ?s a :Signal ; :x ?x } GROUP BY ?s } { SELECT ?s (COUNT(?y) AS ?ny) WHERE { ?s a :Signal ; :y ?y } GROUP BY ?s } ?s a :Signal` — two grouped sub-selects joined on one identity, **each body typed in its own scope** (an untyped body is the 3a/3b MR's) | `PushGrouping` in each scope, 4 twice, 5 twice | two derived tables joined on `s` |
-| `{ SELECT ?s ?nx ?ny WHERE { { SELECT ?s (COUNT(?x) AS ?nx) WHERE { ?s a :Signal ; :x ?x } GROUP BY ?s } { SELECT ?s (COUNT(?y) AS ?ny) WHERE { ?s a :Signal ; :y ?y } GROUP BY ?s } } } ?s :hasName ?n` — the review's case: the two joined **inside** a third sub-select, each typed locally | the row above inside S0, then 4 and 5 for S0 — the derived properties are recursive, so the outer barrier sees `?s` as `Identity`, guaranteed, and `?nx`/`?ny` as measures, without a descendant search | a derived table whose body joins two derived tables |
-| `?s a :Signal . { SELECT ?s WHERE { ?s :p ?x } ORDER BY ?s LIMIT 1 }` — the review's op-3 counter-example, **untyped** below the slice | 3a at the root (above the `Slice`, since the barrier wraps it), 3b **stops at `Slice`**; then **nothing** — the match below the slice is untyped and no rule in this document turns an unrestricted match into a scan, so op 4 has no `[S]` input and does not fire | **Refused** — correct fallback, *and today's fallback answers it wrong*: the scoper keys stars by variable name across the `Project`, so the inner `?s` joins the outer `Signal` star with `name` required, the fetch holds Signals only, and the engine's `LIMIT 1` picks the first *Signal* where SPARQL picks the first record of any class (verified on `main` with `sparql_scope`: one star, `Signal`, `required_fields: [name]`). Revision 2's row promised SQL for this, which had regained admission by importing the outer class below the slice; revision 3 refused it *for having a `Slice`*, which round 3 showed is the layout and not the cause. Under the scope-local scoper contract the inner `?s` is a star of its own scope with no class there, and is refused as any untyped subject is — the `Slice` is incidental. The already-typed top-N (first row) is the positive test; this row asserts refusal plus the oracle's answer |
-| `?s a :C . { SELECT ?x WHERE { ?s :p ?x } }` — round 3's plain projection: the inner `?s` is **private**, the join is a cross join, and the answer keeps every `:p` value of every record; also its keyed-`Group` twin `{ SELECT ?x (COUNT(*) AS ?n) WHERE { ?s :p ?x } GROUP BY ?x }` | nothing: no `Slice`, no keyless `Group`, and still no type in the inner scope | **Refused** by the same contract, for the same reason, with the same message as if the variable were spelled `?inner` — and the alpha-renamed spelling must produce the identical fetch and plan. Today's scoper merges the private `?s` into the `:C` star and loses the row; that is the bug MR1 fixes, by the contract rather than by naming this row |
-| `?s a :Signal . FILTER NOT EXISTS { ?s :ref ?t . ?t a T ; :x ?p ; :y ?q }` | a `Testing` scope: op 1 does not apply (it is not a `LeftJoin`), op 4 does not match (`correlated_inputs` non-empty, exports nothing) — the correlated `NOT EXISTS (SELECT …)` is its own op | a widening of `PushNotExists` from "exactly one scan" to "a lowered testing scope", with its own proof, left as a follow-up row |
+| `{ SELECT ?s WHERE { ?s a :Signal } ORDER BY ?s LIMIT 3 } ?s a :Signal ; :hasName ?n` — top-N, then read, **typed in both scopes** | `PushProjection` and the sort/slice rules in the scope, 4, 5 | `JOIN (SELECT … ORDER BY … LIMIT 3) q ON q.s = t0.asset360_uri` — **`Statement`** (MR1) |
+| the same with the outer read **untyped** (`… } ?s :hasName ?n`) | 3a on the *outer* side (the relation column is `Identity(Signal)`, guaranteed), 3b through nothing, fold; then 4, 5 | the same statement — **`Statement`** in the 3a/3b MR. In MR1 the outer domain leaves `?s` untyped, `resolve` finds no `Scan` for it, and the outcome is **`Rejected`** (`query_unscoped`, naming the outer `?s`); today's fallback answers it **wrong** (the scoper merges the outer read into the inner star, so the fetch is Signals *with a name* and the top 3 are ranked over the wrong universe). Test 10 |
+| `OPTIONAL { { SELECT ?a (COUNT(?cs) AS ?n) … GROUP BY ?a } }` — #466 with zeros | `PushGrouping` in the scope, 4, 5 (left) | `LEFT JOIN (grouped) q`, `?n` unbound for a tunnel with none — **`Statement`** (MR1) |
+| `OPTIONAL { ?s :ref ?t . ?t a T ; :x ?p ; :y ?q }` — 28d's declined two-read over a reference | 1, 3a/3b (the body's `?s` has no local type; typed from the preserved side), `PushReferenceJoin`, 4, 5 | `LEFT JOIN (SELECT … FROM t1 JOIN t2 …) q` — **`Statement`** after MR3; **`Fetch`** before (as today) |
+| `OPTIONAL { ?s :ref ?t . ?t a T . FILTER(?t.x > 5) }` — the lifted condition | 1, 2, then as above | condition in the derived table's `WHERE` — **`Statement`** after MR3; **`Fetch`** before |
+| `{ SELECT (COUNT(*) AS ?total) WHERE { ?s a :Signal } } ?s a :Signal ; :hasName ?n` — a scalar beside every row | `PushGrouping` in the scope (no keys), 4; the outer join has `on = []` | `CROSS JOIN (SELECT count(*) …) q` — op 5 with an empty key is a cross join, which is what a natural join on no variables is; worth its own row in the tests — **`Statement`** (MR1) |
+| `{ SELECT ?s (COUNT(?x) AS ?nx) WHERE { ?s a :Signal ; :x ?x } GROUP BY ?s } { SELECT ?s (COUNT(?y) AS ?ny) WHERE { ?s a :Signal ; :y ?y } GROUP BY ?s } ?s a :Signal` — two grouped sub-selects joined on one identity, **each body typed in its own scope** (an untyped body is the 3a/3b MR's) | `PushGrouping` in each scope, 4 twice, 5 twice | two derived tables joined on `s` — **`Statement`** (MR1) |
+| `{ SELECT ?s ?nx ?ny WHERE { { SELECT ?s (COUNT(?x) AS ?nx) WHERE { ?s a :Signal ; :x ?x } GROUP BY ?s } { SELECT ?s (COUNT(?y) AS ?ny) WHERE { ?s a :Signal ; :y ?y } GROUP BY ?s } } } ?s :hasName ?n` — the review's case: the two joined **inside** a third sub-select, each body typed locally, **the outer read `?s :hasName ?n` untyped in its own domain** | the row above inside S0, then 4 and 5 for S0 — the derived properties are recursive, so the outer barrier sees `?s` as `Identity`, guaranteed, and `?nx`/`?ny` as measures, without a descendant search; then **3a on the outer side** (S0's relation column is `Identity(Signal)`, guaranteed; the outer read is a `Join` side), 3b through nothing, fold, and 5 on the outer join | a derived table whose body joins two derived tables — **`Statement`** in the 3a/3b MR; **`Rejected`** (`query_unscoped` on the outer `?s`) in MR1, for the same reason as the second row |
+| `?s a :Signal . { SELECT ?s WHERE { ?s :p ?x } ORDER BY ?s LIMIT 1 }` — the review's op-3 counter-example, **untyped** below the slice | 3a at the root (above the `Slice`, since the barrier wraps it), 3b **stops at `Slice`**; then **nothing** — the match below the slice is untyped and no rule in this document turns an unrestricted match into a scan, so op 4 has no `[S]` input and does not fire | **`Rejected`** (`query_unscoped`, naming the inner domain's `?s`) — in MR1 and after 3a/3b alike: `resolve` finds no `Scan` for `(inner, ?s)`. Not a fallback, correct or otherwise: the inner universe is every record with `:p`, and no fetch the scoper can spell preserves the answer without fetching that universe — the property this row rests on. Revision 4 wrote "refused — correct fallback", which implied a fetch exists. *And today's fallback answers it wrong*: the scoper keys stars by variable name across the `Project`, so the inner `?s` joins the outer `Signal` star with `name` required, the fetch holds Signals only, and the engine's `LIMIT 1` picks the first *Signal* where SPARQL picks the first record of any class (verified on `main` with `sparql_scope`: one star, `Signal`, `required_fields: [name]`). Revision 2's row promised SQL for this, which had regained admission by importing the outer class below the slice; revision 3 refused it *for having a `Slice`*, which round 3 showed is the layout and not the cause. Under the scope-local scoper contract the inner `?s` is a star of its own scope with no class there, and is refused as any untyped subject is — the `Slice` is incidental. The already-typed top-N (first row) is the positive test; this row asserts the `Rejected` outcome plus the oracle's answer (empty), and no SQL |
+| `?s a :C . { SELECT ?x WHERE { ?s :p ?x } }` — round 3's plain projection: the inner `?s` is **private**, the join is a cross join, and the answer keeps every `:p` value of every record; also its keyed-`Group` twin `{ SELECT ?x (COUNT(*) AS ?n) WHERE { ?s :p ?x } GROUP BY ?x }` | nothing: no `Slice`, no keyless `Group`, and still no type in the inner domain | **`Rejected`** (`query_unscoped`) by the same contract, for the same reason, with the same message as if the variable were spelled `?inner` — and the alpha-renamed spelling must produce the identical fetch and plan. Today's scoper merges the private `?s` into the `:C` star and loses the row; that is the bug MR1 fixes, by the contract rather than by naming this row |
+| `?s a :Signal . FILTER NOT EXISTS { ?s :ref ?t . ?t a T ; :x ?p ; :y ?q }` | a `Testing` scope: op 1 does not apply (it is not a `LeftJoin`), op 4 does not match (`correlated_inputs` non-empty, exports nothing) — the correlated `NOT EXISTS (SELECT …)` is its own op | **`Fetch`** today and throughout this document; a widening of `PushNotExists` from "exactly one scan" to "a lowered testing scope", with its own proof, is the follow-up |
 
 What does **not** appear: a rule that mentions `hasCoveredSection`, a count,
 an array, a tunnel, or "sub-select joined to the driving variable".
@@ -1396,7 +1912,12 @@ an array, a tunnel, or "sub-select joined to the driving variable".
 Each is a precondition of one op, and the plan printout names the node.
 
 * **A join on a value column** (`?a :code ?c . { SELECT ?c … }`): op 5,
-  identity only. Reason: term fidelity of two stored texts.
+  identity or element only. Reason: term fidelity of two stored texts.
+* **A structure in the answer** (`SELECT *` over #464, `SELECT ?cs`):
+  the root `PushProjection`, *serialisable*. Reason: a blank node has
+  no term a statement can emit; the outcome is a `Fetch` and the engine
+  emits it. Widening: a term for elements (skolem), the datamodel's
+  call.
 * **A join key the body binds optionally** (`{ SELECT ?k … WHERE { OPTIONAL
   { ?s :key ?k } } GROUP BY ?k }`): op 5, `guaranteed`. Reason: an
   unbound key joins everything in SPARQL and nothing in SQL.
@@ -1408,14 +1929,19 @@ Each is a precondition of one op, and the plan printout names the node.
   renderer sees it.
 * **A boundary restriction under a `Slice` or a keyless `Group`**: op 3b
   stops; the restriction renders above the stop, and the scan below is
-  not narrowed. Correct, and the printout shows where it stopped.
+  not narrowed. Correct, and the printout shows where it stopped. When
+  the scan below is typed in its own domain the outcome is a
+  `Statement` (the typed top-N row); when it is not, `resolve` refuses
+  the query (`Rejected`) — a stop never leaves an untyped star to a
+  fetch.
 * **A boundary restriction whose path meets a shared node**: op 3b
   declines the step (ownership along the path); the restriction stays
   above the shared node, correct, and the printout names it.
-* **A sub-query whose star has no class in its own scope** (a private
+* **A sub-query whose star has no class in its own domain** (a private
   inner variable, whatever its name; an exported one that only the
-  outside types, until the 3a/3b MR's transfer proof): the scoper's
-  existing `Unscoped` refusal, now per scope. On the statement route the
+  outside types, until the 3a/3b MR's transfer proof reaches its scan):
+  the scoper's existing `Unscoped` refusal, per domain, decided at the
+  pipeline's `resolve` step — `Rejected`. On the statement route the
   same body has no scan and op 4 does not match.
 * **A `Join` inside a scope, on 3b's way down**: pushed to one side
   that guarantees `?v`; the other side's scan is not narrowed. Correct
@@ -1500,8 +2026,10 @@ test framework's convenience, not the semantics.
    `Scan` with a `Required` read and one with an optional read, each
    evaluated against the matches it replaced; an `Unnest` over an array
    with a duplicate entry and over an absent key, asserting
-   **multiplicity** (one row per distinct element, none for a missing
-   array) against the triple it stands for; a `Relation` against the
+   **multiplicity** against the triple it stands for — one row per
+   distinct *value* for a scalar slot, one row per *occurrence* for an
+   inlined structure (two identical structures are two blank nodes),
+   none for a missing array; a `Relation` against the
    `SubSelect` it lowers. Then for every generated query and
    every rule application in `refine`'s trace: translate the plan
    *before* and *after*, evaluate both on the in-memory oracle
@@ -1533,9 +2061,14 @@ test framework's convenience, not the semantics.
    inner and outer variable spelled the *same* and the inner one
    exported — the case where the narrowing *is* valid, through the
    boundary proof — asserting the fetch was narrowed.
-7. **The review's op-3 counter-example**, both routes and the in-memory
-   oracle: empty answer, and the SQL text shows the restriction outside
-   the `LIMIT`.
+7. **The review's op-3 counter-example**, through the full entry point:
+   the outcome is `Rejected(query_unscoped)` naming the inner domain's
+   `?s`, in MR1 and after the 3a/3b MR alike — no SQL is asserted,
+   because none is produced. The in-memory oracle's answer (empty) is
+   recorded beside it, so the day a widening admits the shape the test
+   already says what it must answer. After the 3a/3b MR the *refined
+   plan printout* additionally shows the restriction above the `Slice`
+   and the scan below it untyped.
 8. **Scope-local scoping**, each against the in-memory oracle over the
    complete fixture, since the C-only fetch is exactly what a wrong
    scoper produces and the engine leg would agree with it: the plain
@@ -1566,6 +2099,29 @@ test framework's convenience, not the semantics.
    rendered `BoundElement` in the statement and `AnyElement` in the fetch,
    asserted by reading the SQL, since the two spellings answer differently
    and only one is the statement's.
+10. **The full entry point** (`plan_query_refined`, not a rule called by
+    hand), asserting the *outcome* of the pipeline section: the untyped
+    outer read beside a typed sub-query (`Rejected` in MR1, `Statement`
+    after 3a/3b), #464's nested `OPTIONAL` (`Fetch`, then `Statement`),
+    the top-N counter-example and the plain projection (`Rejected`
+    throughout), each alpha-renamed to the identical outcome; and the
+    correspondence invariant — the scoper's naming domains and the
+    plan's barriers in bijection — over the property grammar.
+11. **Rewrite lifecycle** (the *Evidence that survives rewriting*
+    section): 3a → 3b through a `Project` → `PushProjection` absorbs it
+    → the key resolves through `retired`, the recomputed chain holds,
+    the plan lowers; 3a re-offered after 3b moved the filter declines
+    on the canonical key; a `Split` then a fold that removes a node an
+    arm's step named; a bad rule that retires a named node with no
+    successor fails *evidence resolves* at the rule; `MAX_ROUNDS = 1`
+    over the grammar still passes `Plan::check`, lowers and agrees with
+    the oracle.
+12. **The structure interface** (*What may cross a relation*): #464 as
+    a scalar projection (`Statement`, `?cs` pruned), as `SELECT *`
+    (`Fetch`, the engine emits the blank node), and an element joined
+    in an enclosing scope (`JoinKey::Element`, `Statement`); each
+    against the oracle; `COUNT(?cs)` over a duplicated structure equals
+    the oracle's 2.
 
 Where they live, in today's files: an `assert_routes_agree(…, selects=True)`
 method per named case in `sparql/tests/test_pushdown_oracle.py`; the shapes
@@ -1607,16 +2163,24 @@ one-line anchor changes in the two tail walks; new rules ops 1, 2, 3a,
 and ownership along the path; the three absorb rules moved from
 `tier_one_rules` to `lower_refined`'s choice of physical form; one
 widened rule (op 5, and the element-held edge in `foreign_key_on`);
-`Op::Relation`, `JoinKey` (`Identity`, `Cross`), `PLAN_CONTRACT` 5;
-five invariants (closure on producers, obligations stay in their scope
-with the cursor over transfers, join keys agree, an `Exporting` scope
-has one consumer, a boundary restriction's path is a chain of 3b arms
-over singly-consumed nodes); **the scoper keyed by `(scope, variable)`
-with per-scope class inference** — a change in `sparql_scoper.rs`'s
-star construction, not a new refusal kind; `plan_to_algebra` for test
-2(d) with direct tests for its non-naive nodes; the recursive FROM item
-in `sql_builder.py` and its `_OpRelation` in `plan_ops.py`; the
-in-memory oracle in `tests/support.py`. One
+`Op::Relation`, `JoinKey` (`Identity`, `Element`, `Cross`),
+`ColumnKind::Structure` and the unnest's `WITH ORDINALITY` (with the
+scalar-versus-structure dedup fix), `PruneUnusedExports`,
+`PLAN_CONTRACT` 5; `NodeKey` on every node, `Plan::rebuild` replacing
+nine hand-written renumberings, `Plan::retire`; seven invariants
+(closure on producers, obligations stay in their scope with the cursor
+over transfers, join keys agree, an `Exporting` scope has one consumer,
+a boundary restriction's path is a chain of 3b arms over
+singly-consumed nodes — recomputed from the plan, evidence resolves,
+every `BoundElement` read has its unnest); **the scoper keyed by
+`(naming domain, variable)` with per-domain class inference**, an
+`Untyped` star recorded rather than refused, and the `resolve` step in
+`sparql_plan.rs` with the outcome enum — a change in
+`sparql_scoper.rs`'s star construction and one new phase, not a new
+refusal kind; `plan_to_algebra` for test 2(d) with direct tests for
+its non-naive nodes; the recursive FROM item in `sql_builder.py` and
+its `_OpRelation` in `plan_ops.py`; the in-memory oracle in
+`tests/support.py`. One
 asset360-rust release per MR, one pin bump each. More than revision 1
 said — the derived properties and the fallback provenance are the first
 MR's cost and were missing — and about twice #463 (pepibru GitLab, N and
@@ -1699,28 +2263,28 @@ answer blocks the first MR.
     the pinned trees, op 4's match and `plan_to_algebra`'s identity
     translation rely on, and `PushProjection` absorbs it for free. *Not
     blocking.*
-12. **How the scoper represents a scope.** The scoper reads the
-    algebra, not the plan; "a star is a `(scope, variable)`" can be a
-    scope id threaded through `tag_triples_by_depth` beside `depth`, or
-    the scoper can read `Scope::of` from the naive plan. Assume the
-    first (the scoper's existing structure, one more tag) — the contract
-    is the same either way and the alpha-renaming test does not care.
-    *Not blocking; an implementation choice inside MR1.*
-5. **An element as an interface variable.** `?cs` in #464 is a structure,
-   not a term the serialiser can emit (`SELECT *` asks for it). Assume the
-   barrier exports it as a column of kind `Structure` that the outer scope
-   may join on (an element identity — see GitHub PR #37, "Wasm element-identity bindings", in this repository) but not project; `SELECT *` over it then declines op 4 and stays
-   a fetch, while `SELECT ?name ?kpFromMeter ?trackName …` (what the export
-   actually needs) lowers. If the human wants `SELECT *` to lower, the
-   element needs a term — a decision about the datamodel, not the planner.
-   *Blocking for #464's `SELECT *` spelling only.*
-6. **Reads of an element's slots as scan paths.** Assume `ScanSlot.path`
-   below a multivalued hop resolves relative to the unnested element
-   (`hasCoveredSection[each].isReference`) with `BoundElement` reading,
-   the way `BindingSpec.containers` already describes per-step containers
-   for the renderer. If the plan's `ScanSlot` cannot say "path under an
-   element" today, that is the representation change to make first, in the
-   fifth-invariant style. *Blocking for #464, not #466.*
+12. **How the scoper represents a naming domain — closed by round 4.**
+    A domain id threaded through `tag_triples_by_depth` beside `depth`,
+    opened at each off-spine `Project` (the scoper's existing
+    structure, one more tag). The class of a star the domain leaves
+    untyped comes from the refined plan at `resolve`, never from a
+    second walk. The correspondence to the plan's barriers is a tested
+    bijection (test 10). *Closed.*
+5. **An element as an interface variable — closed by round 4.**
+   `ColumnKind::Structure`, identified by occurrence (holder, path,
+   ordinal), representable and not serialisable (*What may cross a
+   relation*). `PruneUnusedExports` removes it when nothing reads it;
+   `SELECT *` over it is a pinned `Fetch`, a scalar projection a pinned
+   `Statement`, an element joined outside a pinned `Statement` by
+   `JoinKey::Element`. A *term* for elements (skolem IRIs, which the
+   turtle writer can already mint) would make `SELECT *` a statement
+   and is the datamodel's decision — question 13. *Closed; nothing
+   blocks.*
+6. **Reads of an element's slots as scan paths — closed by round 4.**
+   `ScanSlot.path` stays rooted at the star; the element step is what
+   `BindingSpec.containers` and `SlotReading::BoundElement` already
+   say; the new invariant *every `BoundElement` read has its unnest*
+   is what the plan guarantees. *Closed.*
 7. **`PushNotExists` over a barrier.** Assume out of scope; listed as a
    follow-up row so the table is honest about what the vocabulary would
    serve. *Not blocking.*
@@ -1733,14 +2297,22 @@ answer blocks the first MR.
    half — a `Bind` is never guaranteed, `COUNT` is the only guaranteed
    measure — and the rest is a widening with its own tests. #466 needs
    `COUNT` only. *Not blocking; conservative is correct.*
-10. **Carrying a restriction across a barrier into the fallback fetch.**
-    The boundary proof, read downward, lets `keep_what_the_rules_proved`
-    narrow the outer fetch by a restriction inside a mandatory sub-select
-    on an exported, guaranteed identity with no stop between. Assume the
-    first MR does **not** do this — a restriction inside a scope narrows
-    only that scope's own fetch — and the widening comes with test 6's
-    second half. *Not blocking; refusing is correct, and #466's answer is
-    the statement, not the fallback.*
+10. **Carrying a restriction across a barrier into the fallback fetch —
+    closed by round 4.** It is the pipeline's `resolve` step: a star its
+    domain leaves untyped takes the class of the refined plan's `Scan`
+    for it, which exists only when 3a placed the restriction and 3b
+    carried it to the scan with no stop between; the fetch of that
+    star is then narrowed by a proof the plan holds, read once. MR1 has
+    no 3a/3b, so `resolve` types nothing and refuses what round 3
+    refused; the 3a/3b MR brings the widening and test 6's second half
+    with it. *Closed.*
+13. **A term for elements.** The engine leg's turtle writer mints a
+    blank node per inlined structure (`skolem: false`); with `skolem:
+    true` it would mint `<parent>/<part>` IRIs, and a statement can
+    spell the same from `(holder, path, ordinal)`, which would make
+    `SELECT *` over #464 a `Statement` and change what every element
+    answers as, on every route. Assume blank nodes stay. *Not blocking;
+    the datamodel's call, and the outcomes are pinned either way.*
 
 ## Staging
 
@@ -1759,35 +2331,42 @@ on its own and is narrower than revision 2's, as the review asked.
    the five properties (`effects` exists; `guaranteed` conservative per
    question 9), scope-local `applies_to_every_answer` and producer-keyed
    `keep_what_the_rules_proved`, scope-aware `Visible`, the two anchor
-   changes, ops 4 and 5, `Op::Relation` + `JoinKey`, contract 5, the
-   invariants *closure on producers*, *obligations stay in their scope*,
-   *join keys agree* and *an `Exporting` scope has one consumer*, the
-   recursive FROM item, the builder's sub-query construction with its
-   pinned trees, `plan_to_algebra` (with direct tests for `Scan`/
-   `Unnest`) and both oracles, and **the scope-local scoper**: stars
-   keyed by `(scope, variable)`, a class inferred from a star's own
-   scope only, the existing `Unscoped` refusal for a star its scope
-   leaves untyped (the wrong answers the top-N and plain-projection
-   rows document), tested by alpha-renaming. Serves a user-written
-   sub-select **typed in its own scope** (grouped or top-N) joined on
-   an identity — every scope typing its own stars: #466, and the
-   table's typed top-N, #466-with-zeros, scalar cross join,
-   two-grouped-sub-selects and nested rows.
+   changes, ops 4 and 5 and `PruneUnusedExports`, `Op::Relation` +
+   `JoinKey` (`Identity`, `Cross`) + `ColumnKind::Structure` with the
+   unnest's ordinality and the structure dedup fix, contract 5,
+   `NodeKey`/`Plan::rebuild`/`retire`, the invariants *closure on
+   producers*, *obligations stay in their scope*, *join keys agree*,
+   *an `Exporting` scope has one consumer*, *evidence resolves* and
+   *every `BoundElement` read has its unnest*, the recursive FROM item,
+   the builder's sub-query construction with its pinned trees,
+   `plan_to_algebra` (with direct tests for `Scan`/`Unnest`) and both
+   oracles, **the pipeline**: the scoper keyed by `(naming domain,
+   variable)`, a class inferred from a star's own domain only, an
+   untyped star recorded and refused at `resolve` (which types nothing
+   in this MR), the outcome enum, tested by alpha-renaming and through
+   the full entry point. Serves a user-written sub-select **typed in
+   its own domain** (grouped or top-N) joined on an identity: #466, and
+   the table's typed top-N, #466-with-zeros, scalar cross join and
+   two-grouped-sub-selects rows. The nested row and the untyped outer
+   read are `Rejected` here and served by item 2.
 2. **Restriction at a boundary** — ops 3a and 3b with the obligation
    path (cursor-validated transfers, `Split` at a `Union`, one side at a
-   `Join`), ownership along the path, and the *chain-of-3b-arms*
-   invariant; question 10's widening of the fallback narrowing belongs
-   here too if it is ever wanted, and so does letting the scoper type
-   an exported inner star from the outside through the same proof.
-   Serves the untyped-body rows, and turns the top-N counter-example
-   from a refusal into a correct refusal-with-restriction (still no
-   lowering).
+   `Join`), ownership along the path, the canonical obligation key, the
+   *chain-of-3b-arms* invariant recomputed from the plan, and
+   `resolve` reading a plan-derived class for a star its domain left
+   untyped (question 10, the fallback narrowing across a barrier, with
+   test 6's second half); the lifecycle tests. Serves the untyped-body
+   rows, the nested row and the untyped outer read; the top-N
+   counter-example stays `Rejected`, now with the restriction visible
+   above the `Slice` in the printout.
 3. **The `OPTIONAL` body as a scope** — ops 1 and 2, and the absorb rules
    moved to the lowering's physical choice. Serves the two-read `OPTIONAL`
    over a reference and the lifted condition: the table's two `OPTIONAL`
    rows.
-4. **The element-held edge** — the `foreign_key_on` widening and the
-   `BoundElement` edge spelling on the statement route, plus whatever
-   question 6 decides. **Depends on item 2**: the nested `OPTIONAL`'s
+4. **The element-held edge** — the `foreign_key_on` widening, the
+   `BoundElement` edge spelling on the statement route, and
+   `JoinKey::Element`. **Depends on item 2**: the nested `OPTIONAL`'s
    scope in #464 names no class and is typed by 3a/3b (step 4 of the
-   walk-through). Serves #464 *as a statement*; its speed is item 0's.
+   walk-through). Serves #464 *as a statement* for its scalar
+   projection (`SELECT *` is a pinned `Fetch`, question 13) and the
+   element-joined-outside row; its speed is item 0's.
