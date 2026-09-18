@@ -6512,9 +6512,13 @@ classes:
             (
                 // A slot the schema knows but the *intermediate* class does not:
                 // claimed in Phase 1 against the schema, dropped by the walk.
+                // Reached through two slots of different ranges, because a
+                // node one slot reaches is judged by that slot's range at the
+                // parse and refused there (#459, pepibru GitLab; see
+                // `sparql_alias`).
                 Inexact::UnrepresentedTriple,
-                "SELECT ?lo WHERE { ?s a asset360:Signal ; asset360:location ?c . \
-                 ?c asset360:longitude ?lo ; asset360:name ?x }",
+                "SELECT ?lo WHERE { ?s a asset360:Signal ; asset360:location ?c ; \
+                 asset360:documents ?c . ?c asset360:longitude ?lo ; asset360:name ?x }",
             ),
             // A blank-node property list has no variable to scope, so nothing
             // can claim its triples — and the same query written with a named
@@ -6755,6 +6759,30 @@ classes:
         .unwrap();
         assert_eq!(plan.inexact, None);
         assert!(plan.path_bindings.contains_key("lo"));
+
+        // Untyped with a predicate `Coordinates` cannot carry: the class of
+        // ?c is known from the slot it was reached through, so this is
+        // refused at the parse like the typed form, naming the hop -- in the
+        // mandatory pattern and inside an OPTIONAL, where it used to be an
+        // unbound column on every row (#459, pepibru GitLab).
+        for query in [
+            format!(
+                "{prefix}SELECT ?x WHERE {{ ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c asset360:hasName ?x }}"
+            ),
+            format!(
+                "{prefix}SELECT ?x WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:location ?c . ?c asset360:hasName ?x }} }}"
+            ),
+        ] {
+            let err = sparql_scope(&query, &sv).unwrap_err();
+            assert!(
+                matches!(&err, ScopeError::UnsupportedConstruct(msg)
+                    if msg.contains("not a slot of Coordinates")
+                        && msg.contains("`?s asset360:location ?c` reaches")),
+                "a wrong predicate on a reached node is refused by name: {err:?}"
+            );
+        }
 
         // A real reference still joins.
         let plan = sparql_scope(
