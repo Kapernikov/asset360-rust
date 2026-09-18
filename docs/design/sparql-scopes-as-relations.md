@@ -1,16 +1,52 @@
 # A body is a relation: lowering a grouped sub-select and an `OPTIONAL` body as one derived table
 
 Status: **design, nothing built.** Draft PR for review; the two issues it
-answers stay parked until the design is agreed. **Revision 6**, after
-[review round 5](https://github.com/Kapernikov/asset360-rust/pull/49#issuecomment-5733890959),
-which accepted AC1–AC3 and AC6–AC10 at the architectural level and
-held AC4 and AC5 back on two contracts: demand pruning was unsound
-under an operator that observes the whole solution mapping
-(`COUNT(DISTINCT *)`), and a structure's occurrence identity kept one
-ordinal where a nested array needs the whole path. Revision 6 adds a
-sixth derived property, `demand`, and makes the occurrence one composed
-identifier. Self-assessed against the criteria (next section): all ten
-met as design contracts; round 6 decides AC4 and AC5.
+answers stay parked until the design is agreed. **Revision 7**, after
+[review round 6](https://github.com/Kapernikov/asset360-rust/pull/49#issuecomment-5734065400),
+which accepted AC5 (the whole-path occurrence) and `demand` as the
+prune's precondition, and found one gap: the post-state invariant
+*demand is exported* cannot catch a prune that bypassed its match,
+because `demand` is recomputed from the pruned plan and shrinks with
+the interface it was meant to guard. Revision 7 replaces it with a
+**transition check in the driver** — `refine` records what each
+barrier's consumers demand *before* a rule edits the plan and refuses
+the edit if a demanded export is gone after. Self-assessed against the
+criteria (next section): all ten met as design contracts; round 7
+decides AC4 (and AC9's test 3).
+
+<details><summary>What revision 7 changed, point by point</summary>
+
+* ***Demand is exported* is withdrawn as a state invariant.** Round 6's
+  table: after an invalid prune of `?y` under `COUNT(DISTINCT *)` the
+  `Group` demands `{?x}` and the barrier exports `{?x}`; the invariant
+  holds of the wrong plan. Likewise `Distinct`, and a `Minus` whose only
+  shared variable was pruned — the dependency leaves with the export.
+* **Its replacement is a transition check, *no demanded export is
+  dropped*** (*What may cross a relation*, part 4; *Evidence that
+  survives rewriting* → *One check relates two plans*). Before
+  `rule.apply`, `refine` records for every barrier *b* the set
+  `kept(b) = demand_above(b) ∩ exports(b)` on the unmodified plan,
+  keyed by *b*'s `NodeKey`; after, the node *b* resolves to (itself,
+  or its successor through `retired`) must still output every name in
+  `kept(b)`. It runs for whatever `apply` did, matcher or no matcher,
+  and is a `RuleFailure` in every build, because the end-of-`refine`
+  state check a release build relies on cannot see it. It is not a
+  cached derived fact: it lives for one application.
+* **Test 3's three bad prunes go through `refine`**, not the rule's
+  method, and each additionally asserts that `Plan::check` *passes* on
+  the pruned plan — the reason the check is a transition is itself
+  pinned. The before/after oracle (test 2(d)) stays the semantic
+  backstop.
+* **Stated consequence:** a rule may not remove an observer and prune
+  what it observed in one edit; that is two rewrites, each checked.
+* **Alternative rejected:** an immutable observer contract written on
+  the barrier at construction — the one stored property in a design
+  where every other is recomputed, and one every rule that adds or
+  removes an observer would have to maintain.
+* **The acceptance table:** AC5 met (round 6 agreed); AC4 and AC9 name
+  what revision 7 changed and wait for round 7.
+
+</details>
 
 <details><summary>What revision 6 changed, point by point</summary>
 
@@ -303,12 +339,12 @@ correct and composable and its boundaries honest.
 | **AC1** | **A relation boundary covers the complete logical unit.** Projection, grouping, `HAVING`, ordering, duplicate handling and slicing retain their algebraic order; construction does not depend on SQL admission. | "The fact: a scope" → *The boundary is the complete sub-query*; pinned trees, test 9. | Met (round 4 agreed). |
 | **AC2** | **Binding identity and scope mean the same thing in every phase.** Private-name alpha-renaming cannot change inference or answers. Class restrictions cross boundaries only through justified interfaces; scoping cannot preempt a valid optimizer derivation. | "The pipeline": the scoper records, the plan derives, `resolve` decides, in that order; *Naming domain versus evaluation unit* gives the correspondence per operator for sub-selects, `OPTIONAL` bodies and `UNION` arms; tests 8 and 10. | Met (round 5 agreed). |
 | **AC3** | **Rules consume sound operator properties.** Outputs, guaranteed bindings, term identity, correlation and effects have explicit transfer contracts. Unknown facts are handled conservatively; lexical name equality is never a substitute. | "What a relational subtree derives"; `term_of` now answers `Structure` for an element (*What may cross a relation*); Q9 keeps the conservative half; `demand` defaults to "every output" for an unknown operator. | Met (round 5 agreed). |
-| **AC4** | **Every rewrite is an equivalence under explicit preconditions and in its stated context.** Preserve RDF-term equality, bags, unboundness, expression errors/effects and modifiers. Contextual restrictions preserve the enclosing join, not necessarily the restricted child. | Ops 1, 2, 3a, 3b, 4, 5 and `PruneUnusedExports`, each with *Match / Edit / Equivalence / caught by*; 3a is proved on the enclosing join; `PruneUnusedExports` matches on `demand` (*What may cross a relation*, part 4) and is caught by *demand is exported*; test 2(d) evaluates each rewrite alone. | **Revision 6.** Round 5: insufficiently specified — the prune's precondition ignored whole-mapping observers (`COUNT(DISTINCT *)` answered `1` for `2`). Now: `demand` is the precondition, the observers are enumerated with a conservative default, the invariant catches a lie, test 12 pins the case. Self-assessed met; round 6 decides. |
-| **AC5** | **Logical interfaces and physical implementations compose.** Every supported exported value has a defined representation and valid consumers; recursive lowering and absorption preserve the same interface and multiplicity. | *What may cross a relation*: `ColumnKind` incl. `Structure` by occurrence — `(holder, hops)`, the whole path, one text column, composed per `Unnest` — its consumers and how it crosses a relation, a join, a group and a nested `Unnest`; demand pruning; pinned results for #464 and the nested fixture; the `Unnest` multiplicity contract (dedup by value for a scalar step, by occurrence for a structure step); Q5 and Q6 closed. | **Revision 6.** Round 5: insufficiently specified — `(holder, path, ordinal)` kept the last hop only and collapsed `parts[0].children[1]` with `parts[1].children[1]`. Now: the occurrence is the whole path, its representation is one scalar column that every boundary transports unchanged, `JoinKey::Element` compares all of it, test 12 pins the nested fixture. Self-assessed met; round 6 decides. |
+| **AC4** | **Every rewrite is an equivalence under explicit preconditions and in its stated context.** Preserve RDF-term equality, bags, unboundness, expression errors/effects and modifiers. Contextual restrictions preserve the enclosing join, not necessarily the restricted child. | Ops 1, 2, 3a, 3b, 4, 5 and `PruneUnusedExports`, each with *Match / Edit / Equivalence / caught by*; 3a is proved on the enclosing join; `PruneUnusedExports` matches on `demand` (*What may cross a relation*, part 4) and is caught by the transition check *no demanded export is dropped* (*Evidence that survives rewriting* → *One check relates two plans*); test 2(d) evaluates each rewrite alone. | **Revision 7.** Round 5: the precondition ignored whole-mapping observers. Round 6: precondition and equivalence accepted; the post-state invariant could not catch a prune that bypassed the match, since `demand` shrinks with the interface. Now: the check is a transition in `refine`, on the pre-edit demand, every build, and test 3 pins that a state check passes where it fails. Self-assessed met; round 7 decides. |
+| **AC5** | **Logical interfaces and physical implementations compose.** Every supported exported value has a defined representation and valid consumers; recursive lowering and absorption preserve the same interface and multiplicity. | *What may cross a relation*: `ColumnKind` incl. `Structure` by occurrence — `(holder, hops)`, the whole path, one text column, composed per `Unnest` — its consumers and how it crosses a relation, a join, a group and a nested `Unnest`; demand pruning; pinned results for #464 and the nested fixture; the `Unnest` multiplicity contract (dedup by value for a scalar step, by occurrence for a structure step); Q5 and Q6 closed. | Met (round 6 agreed). Round 5 had found `(holder, path, ordinal)` collapsing `parts[0].children[1]` with `parts[1].children[1]`; the whole-path occurrence, transported as one scalar column, closed it. |
 | **AC6** | **Contextual rewrites cannot affect another consumer, and their evidence survives composition.** Ownership is checked along mutated paths; transfers compose to arbitrary depth; splits account for every branch; later mutations cannot leave stale justification. | Op 3a's ownership rule; 3b's cursor and `Split`; *Evidence that survives rewriting*: `NodeKey`, one renumbering primitive, `retire`, the invariant recomputed from the current plan; test 11. | Met (round 5 agreed). |
 | **AC7** | **The optimizer has a defined safe progress policy.** Repeated rules are idempotent or make bounded progress; property updates and proof validation follow mutations; rule scheduling affects cost/choice, not correctness. | *Evidence that survives rewriting* → *Progress*: a measure per rule, the canonical obligation key, derived facts recomputed on demand, behaviour at `MAX_ROUNDS`, schedules; tests 2(d) and 11. | Met (round 5 agreed). |
 | **AC8** | **Lowering refusal never licenses an incorrect fallback.** The fallback fetch must preserve the original query's answers, with justification for any narrowing; otherwise report a deliberate refusal. A statement refusal, a fallback execution and a whole-query rejection must be distinguished. | "The pipeline" → *Outcomes*: `Statement` / `Fetch` / `Rejected` / `FetchDeclined`, and every capability row names its outcome; narrowing justification is the producer-keyed ledger plus `resolve`; the top-N row is a `Rejected`. | Met (round 5 agreed). |
-| **AC9** | **Equivalence is tested independently of SQL admission and of the optimized fetch.** Evaluate before/after each rewrite, use a complete-fixture oracle, compare bags of RDF terms, cover empty/unbound/duplicate and nested cases, and test the translator's new nodes directly. | "Tests that would prove equivalence": `plan_to_algebra`, the in-memory oracle, bags, the grammar; tests 10 (full entry point), 11 (lifecycle) and 12 (structure interface, whole-mapping observers, nested occurrence). | Met as a test design (round 5 agreed). |
+| **AC9** | **Equivalence is tested independently of SQL admission and of the optimized fetch.** Evaluate before/after each rewrite, use a complete-fixture oracle, compare bags of RDF terms, cover empty/unbound/duplicate and nested cases, and test the translator's new nodes directly. | "Tests that would prove equivalence": `plan_to_algebra`, the in-memory oracle, bags, the grammar; tests 10 (full entry point), 11 (lifecycle) and 12 (structure interface, whole-mapping observers, nested occurrence). | Met as a test design (round 5 agreed); round 6's correction applied — test 3's three bad prunes run through `refine` so the transition check is what rejects them, and each asserts `Plan::check` passes on the pruned plan. Round 7 confirms. |
 | **AC10** | **The complete supported domain is explicit and internally consistent.** Motivating examples follow from generic rules; unsupported cases have property-based reasons. Every claimed capability has a valid derivation and acceptance test. Staging does not excuse unresolved contracts. | "The same vocabulary" table with an outcome per row and 3a named where an outer read is untyped; "What stays refused" with the property each rests on; every open question either closed or marked not blocking with its assumption; staging delivers contracts this document already states; the "same vocabulary" table gains round 5's whole-mapping row. | Met (round 5 agreed). |
 
 ## The two shapes, and the one fact the plan cannot state
@@ -1112,14 +1148,37 @@ consumer's answer depends on that column's presence or value. The
 second half is what round 5's `SELECT (COUNT(DISTINCT *) AS ?n) WHERE
 { { SELECT ?x ?y WHERE { VALUES (?x ?y) { (1 10) (1 20) } } } }`
 needs: the `Group` demands every output of its input, `?y` stays, and
-the answer stays `2`. **Caught by:** a new invariant, *demand is
-exported* — for every `SubSelect`, every producer in
-`demand_above(barrier)` that resolves through this barrier is in
-`vars`; a prune that lied fails it at the rule, and the bad-rule test
-(test 3) drives it. It runs before op 4, so op 4's "every export
-representable" is asked of the exports the query *demands*. This is
-demand-driven pruning; it is not "change the user's `SELECT` list",
-which changes the query.
+the answer stays `2`. **Caught by:** a **transition check in the
+driver**, *no demanded export is dropped* — not a state invariant.
+Revision 6 wrote one (*demand is exported*: every producer in
+`demand_above(barrier)` is in `vars`) and round 6 showed it cannot
+work: `demand` is recomputed from the current plan, and the operators
+that observe the whole mapping demand *every output of the input* —
+so after a bad prune of `?y` under `COUNT(DISTINCT *)` the `Group`
+demands `{?x}`, the barrier exports `{?x}`, and the invariant holds of
+the wrong plan. The same under `Distinct`, and for a `Minus` whose only
+shared variable was pruned: the dependency leaves with the export, and
+nothing dangles for closure to see. A property that shrinks with the
+interface it guards cannot check that interface after the fact. So
+`refine` checks the *edit*: before `rule.apply`, for every barrier *b*
+it records `kept(b) = demand_above(b) ∩ exports(b)` on the unmodified
+plan — the variable names, each with its producer's `NodeKey` for the
+printout — keyed by *b*'s `NodeKey`; after `apply`, the node *b*
+resolves to (itself, or its successor through `retired`) must have
+every name in `kept(b)` among its `outputs`, and a retirement with no
+successor fails (*Evidence that survives rewriting* → *One check
+relates two plans*). It fails at the rule in every build, naming the
+rule and the variable, and it runs for whatever `apply` did, matcher or
+no matcher — which is what test 3's three bad prunes need, and why they
+are applied through `refine` and not by calling the rule. Two
+consequences are stated rather than left to be found: a rule may not
+remove an observer and prune what it observed in one edit — that is
+two rewrites, each checked, and a rule that wants both writes two — and
+the before/after oracle of test 2(d) stays the semantic backstop; this
+is a structural check on one class of edit. The prune runs before op 4,
+so op 4's "every export representable" is asked of the exports the
+query *demands*. This is demand-driven pruning; it is not "change the
+user's `SELECT` list", which changes the query.
 
 **Pinned results** (test 12), each through the full entry point:
 
@@ -1536,6 +1595,37 @@ refinement has ended). There is therefore nothing to invalidate, and
 "property updates follow mutations" is true by construction rather
 than by discipline. The cost is linear per ask; the plans are small
 and the grammar test measures it.
+
+**One check relates two plans.** Every invariant in this document is a
+closure property of one plan, checked by `Plan::check` after each
+application and on the result. Round 6 found a lie no such check can
+see: a demanded export pruned by a rule that skipped its own match,
+where `demand` recomputed on the smaller plan agrees with the smaller
+interface (*What may cross a relation*, part 4). The driver therefore
+holds one fact across a single application and no further. `refine`
+becomes: for each rule, `let kept = plan.kept_exports();` —
+`BTreeMap<NodeKey, BTreeSet<(Variable, NodeKey)>>`, one entry per
+barrier, `demand_above(b) ∩ exports(b)` on the plan as it is — then
+`rule.apply(plan)`, then `plan.check_transition(&kept)?`, then the
+existing `plan.check()`. `check_transition` resolves each key through
+`retired` exactly as *a boundary restriction's path* resolves its nodes,
+and fails when a kept name is not in the resolved node's `outputs` or
+the key resolved to nothing. Three things it is not. It is not a cached
+derived fact: `kept` is dead the moment the check has run and the next
+application recomputes it, so "recomputed, never cached across a
+rewrite" stands. It is not a `debug_assert!`: it is a `RuleFailure` in
+every build, because the end-of-`refine` state check a release build
+relies on cannot see a transition defect — there is no post-state that
+witnesses it. And it is not the equivalence proof: test 2(d)'s
+before/after oracle remains the semantic backstop; this catches one
+class of structural lie at the rule instead of in a result. Cost: one
+`demand_above` per barrier per application, linear like everything
+else here, measured by the grammar test. The alternative round 6
+offered — an immutable observer contract written on the barrier at
+construction — is rejected: it would be the one stored property in a
+design where every other is recomputed, and every rule that adds or
+removes an observer would have to maintain it, which is the discipline
+this section exists to avoid.
 
 **"Already carries a restriction" is a key, not a position.** 3a's
 last-but-one clause is decided by `restriction_is_implied(side, ?v,
@@ -2015,7 +2105,7 @@ proposed suite.
 | `{ SELECT ?s ?nx ?ny WHERE { { SELECT ?s (COUNT(?x) AS ?nx) WHERE { ?s a :Signal ; :x ?x } GROUP BY ?s } { SELECT ?s (COUNT(?y) AS ?ny) WHERE { ?s a :Signal ; :y ?y } GROUP BY ?s } } } ?s :hasName ?n` — the review's case: the two joined **inside** a third sub-select, each body typed locally, **the outer read `?s :hasName ?n` untyped in its own domain** | the row above inside S0, then 4 and 5 for S0 — the derived properties are recursive, so the outer barrier sees `?s` as `Identity`, guaranteed, and `?nx`/`?ny` as measures, without a descendant search; then **3a on the outer side** (S0's relation column is `Identity(Signal)`, guaranteed; the outer read is a `Join` side), 3b through nothing, fold, and 5 on the outer join | a derived table whose body joins two derived tables — **`Statement`** in the 3a/3b MR; **`Rejected`** (`query_unscoped` on the outer `?s`) in MR1, for the same reason as the second row |
 | `?s a :Signal . { SELECT ?s WHERE { ?s :p ?x } ORDER BY ?s LIMIT 1 }` — the review's op-3 counter-example, **untyped** below the slice | 3a at the root (above the `Slice`, since the barrier wraps it), 3b **stops at `Slice`**; then **nothing** — the match below the slice is untyped and no rule in this document turns an unrestricted match into a scan, so op 4 has no `[S]` input and does not fire | **`Rejected`** (`query_unscoped`, naming the inner domain's `?s`) — in MR1 and after 3a/3b alike: `resolve` finds no `Scan` for `(inner, ?s)`. Not a fallback, correct or otherwise: the inner universe is every record with `:p`, and no fetch the scoper can spell preserves the answer without fetching that universe — the property this row rests on. Revision 4 wrote "refused — correct fallback", which implied a fetch exists. *And today's fallback answers it wrong*: the scoper keys stars by variable name across the `Project`, so the inner `?s` joins the outer `Signal` star with `name` required, the fetch holds Signals only, and the engine's `LIMIT 1` picks the first *Signal* where SPARQL picks the first record of any class (verified on `main` with `sparql_scope`: one star, `Signal`, `required_fields: [name]`). Revision 2's row promised SQL for this, which had regained admission by importing the outer class below the slice; revision 3 refused it *for having a `Slice`*, which round 3 showed is the layout and not the cause. Under the scope-local scoper contract the inner `?s` is a star of its own scope with no class there, and is refused as any untyped subject is — the `Slice` is incidental. The already-typed top-N (first row) is the positive test; this row asserts the `Rejected` outcome plus the oracle's answer (empty), and no SQL |
 | `?s a :C . { SELECT ?x WHERE { ?s :p ?x } }` — round 3's plain projection: the inner `?s` is **private**, the join is a cross join, and the answer keeps every `:p` value of every record; also its keyed-`Group` twin `{ SELECT ?x (COUNT(*) AS ?n) WHERE { ?s :p ?x } GROUP BY ?x }` | nothing: no `Slice`, no keyless `Group`, and still no type in the inner domain | **`Rejected`** (`query_unscoped`) by the same contract, for the same reason, with the same message as if the variable were spelled `?inner` — and the alpha-renamed spelling must produce the identical fetch and plan. Today's scoper merges the private `?s` into the `:C` star and loses the row; that is the bug MR1 fixes, by the contract rather than by naming this row |
-| `SELECT (COUNT(DISTINCT *) AS ?n) WHERE { { SELECT ?x ?y WHERE { … } } }` — round 5's whole-mapping observer over a sub-select exporting a column nothing names; also `SELECT DISTINCT ?x` / `REDUCED` outside, and `{ SELECT ?x ?y … } MINUS { ?z :p ?y }` | `demand` at the `Group` (every output of its input), at the `Minus` (the shared `?y`): `PruneUnusedExports` does not match, `?y` stays. Under `SELECT DISTINCT ?x` the `Project` below the `Distinct` does not pass `?y`, so it *is* pruned, harmlessly. `PushGrouping` declines `COUNT(DISTINCT *)` as today | **`Fetch`** for the count (the oracle's `2` is pinned, test 12; a prune would have answered `1`, and *demand is exported* is what fails if a rule ever tries); **`Statement`** for the `DISTINCT ?x` form over a typed body |
+| `SELECT (COUNT(DISTINCT *) AS ?n) WHERE { { SELECT ?x ?y WHERE { … } } }` — round 5's whole-mapping observer over a sub-select exporting a column nothing names; also `SELECT DISTINCT ?x` / `REDUCED` outside, and `{ SELECT ?x ?y … } MINUS { ?z :p ?y }` | `demand` at the `Group` (every output of its input), at the `Minus` (the shared `?y`): `PruneUnusedExports` does not match, `?y` stays. Under `SELECT DISTINCT ?x` the `Project` below the `Distinct` does not pass `?y`, so it *is* pruned, harmlessly. `PushGrouping` declines `COUNT(DISTINCT *)` as today | **`Fetch`** for the count (the oracle's `2` is pinned, test 12; a prune would have answered `1`, and the transition check *no demanded export is dropped* is what fails in `refine` if a rule ever tries); **`Statement`** for the `DISTINCT ?x` form over a typed body |
 | `?s a :Signal . FILTER NOT EXISTS { ?s :ref ?t . ?t a T ; :x ?p ; :y ?q }` | a `Testing` scope: op 1 does not apply (it is not a `LeftJoin`), op 4 does not match (`correlated_inputs` non-empty, exports nothing) — the correlated `NOT EXISTS (SELECT …)` is its own op | **`Fetch`** today and throughout this document; a widening of `PushNotExists` from "exactly one scan" to "a lowered testing scope", with its own proof, is the follow-up |
 
 What does **not** appear: a rule that mentions `hasCoveredSection`, a count,
@@ -2175,7 +2265,11 @@ test framework's convenience, not the semantics.
    the outer scope (*obligations stay in their scope*); a boundary
    restriction pushed below a `Slice`; an export pruned under a
    `COUNT(DISTINCT *)`, under a `Distinct`, and one shared with a
-   `Minus` right side (*demand is exported*); a `Structure` join key
+   `Minus` right side — these three applied **through `refine`**, the
+   bad rule's `apply` pruning with no match, so that *no demanded
+   export is dropped* is what rejects them, and each also asserts that
+   `Plan::check` *passes* on the pruned plan, pinning why the check is
+   a transition (round 6); a `Structure` join key
    that compares the last hop only (*join keys agree*, since `term_of`
    gives the path and the key must cover every hop of it). Each must
    fail at the rule, not in a result.
@@ -2307,7 +2401,8 @@ obligations stay in their scope with the cursor over transfers, join
 keys agree, an `Exporting` scope has one consumer, a boundary
 restriction's path is a chain of 3b arms over singly-consumed nodes —
 recomputed from the plan, evidence resolves, every `BoundElement` read
-has its unnest, demand is exported, the scoper and the plan agree); **the scoper keyed by
+has its unnest, the scoper and the plan agree) plus the one transition
+check, no demanded export is dropped, in `refine`; **the scoper keyed by
 `(naming domain, variable)` with per-domain class inference**, an
 `Untyped` star recorded rather than refused, and the `resolve` step in
 `sparql_plan.rs` with the outcome enum — a change in
@@ -2479,8 +2574,9 @@ on its own and is narrower than revision 2's, as the review asked.
    `NodeKey`/`Plan::rebuild`/`retire`, the invariants *closure on
    producers*, *obligations stay in their scope*, *join keys agree*,
    *an `Exporting` scope has one consumer*, *evidence resolves*,
-   *every `BoundElement` read has its unnest*, *demand is exported* and
-   *the scoper and the plan agree*, the recursive FROM item,
+   *every `BoundElement` read has its unnest* and *the scoper and the
+   plan agree*, the transition check *no demanded export is dropped* in
+   `refine` (every build), the recursive FROM item,
    the builder's sub-query construction with its pinned trees,
    `plan_to_algebra` (with direct tests for `Scan`/`Unnest`) and both
    oracles, **the pipeline**: the scoper keyed by `(naming domain,
