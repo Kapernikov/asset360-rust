@@ -479,10 +479,77 @@ fn ids(ids: &[ObligationId]) -> String {
 /// is the tree that runs: a rewrite shows up here, and a node this does not
 /// name is a node nobody renders.
 fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
-    use crate::sparql_ops::{Enforcement, Op};
+    write_ops(f, &sql.ops, "      ")
+}
 
-    for node in &sql.ops.nodes {
+/// How a join key's column reads: the relation column's name, a star's slot
+/// path, or its identity.
+fn column_name(column: &crate::sparql_ops::ColumnRef) -> String {
+    match (&column.column, column.path.as_slice()) {
+        (Some(name), _) => name.clone(),
+        (None, []) => "<identity>".to_owned(),
+        (None, path) => path.join("."),
+    }
+}
+
+/// One operator tree, each line led by `indent`; a relation's body is
+/// printed beneath it, indented one step further.
+fn write_ops(
+    f: &mut fmt::Formatter<'_>,
+    ops: &crate::sparql_ops::OpTree,
+    indent: &str,
+) -> fmt::Result {
+    use crate::sparql_ops::{Enforcement, JoinKey, Op};
+
+    for node in &ops.nodes {
         match &node.op {
+            Op::Relation {
+                body,
+                alias,
+                columns,
+            } => {
+                writeln!(
+                    f,
+                    "{indent}relation  {alias} [{}]",
+                    columns
+                        .iter()
+                        .map(|column| format!("?{}:{}", column.var, column.kind.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )?;
+                write_ops(f, body, &format!("{indent}    "))?;
+            }
+            Op::Join {
+                key: key @ (JoinKey::Identity { left, right } | JoinKey::Element { left, right }),
+                kind,
+                ..
+            } => writeln!(
+                f,
+                "{indent}join      {} {}.{} = {}.{}{}",
+                key.as_str(),
+                left.source,
+                column_name(left),
+                right.source,
+                column_name(right),
+                match kind {
+                    crate::sparql_scoper::JoinType::Inner => "",
+                    crate::sparql_scoper::JoinType::Left => "   left",
+                    crate::sparql_scoper::JoinType::Anti => "   anti",
+                }
+            )?,
+            Op::Join {
+                key: JoinKey::Cross,
+                kind,
+                ..
+            } => writeln!(
+                f,
+                "{indent}join      cross{}",
+                match kind {
+                    crate::sparql_scoper::JoinType::Inner => "",
+                    crate::sparql_scoper::JoinType::Left => "   left",
+                    crate::sparql_scoper::JoinType::Anti => "   anti",
+                }
+            )?,
             Op::Scan {
                 star_var,
                 class_uri,
@@ -493,12 +560,12 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
             } => {
                 writeln!(
                     f,
-                    "      scan      {}  as ?{star_var}{}",
+                    "{indent}scan      {}  as ?{star_var}{}",
                     shorten(class_uri),
                     if *is_optional { "   optional" } else { "" }
                 )?;
                 if !identifier_values.is_empty() {
-                    writeln!(f, "      identity  {}", identifier_values.join(", "))?;
+                    writeln!(f, "{indent}identity  {}", identifier_values.join(", "))?;
                 }
                 // The premise of a fetch bound, one line per nested read the
                 // scan restates, with each hop's storage after its name so
@@ -517,7 +584,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                             }
                         })
                         .collect();
-                    writeln!(f, "      present   {}", steps.join("."))?;
+                    writeln!(f, "{indent}present   {}", steps.join("."))?;
                 }
             }
             Op::Filter {
@@ -528,7 +595,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 ..
             } => writeln!(
                 f,
-                "      filter    {} {condition}{}{}",
+                "{indent}filter    {} {condition}{}{}",
                 slot_path.join("."),
                 if *numeric { "   numeric" } else { "" },
                 // Says whether removing this node would change the answer or
@@ -547,17 +614,19 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 tree, enforcement, ..
             } => writeln!(
                 f,
-                "      filter    {tree}{}",
+                "{indent}filter    {tree}{}",
                 match enforcement {
                     Enforcement::Enforces => "",
                     Enforcement::Narrows => "   narrows",
                 }
             )?,
-            Op::Unnest { slot_path, .. } => writeln!(f, "      unnest    {}", slot_path.join("."))?,
+            Op::Unnest { slot_path, .. } => {
+                writeln!(f, "{indent}unnest    {}", slot_path.join("."))?
+            }
             // `ALL` spelled out, because which of the two SQL spellings this
             // is is the one thing a reader checks here: a deduplicating
             // `UNION` would drop solutions SPARQL's multiset union keeps.
-            Op::Union { left, right } => writeln!(f, "      union all n{left}, n{right}")?,
+            Op::Union { left, right } => writeln!(f, "{indent}union all n{left}, n{right}")?,
             Op::Join {
                 left_star,
                 right_star,
@@ -568,7 +637,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 ..
             } => writeln!(
                 f,
-                "      join      ?{right_star}.{}{right_slot}{} = ?{left_star}{}",
+                "{indent}join      ?{right_star}.{}{right_slot}{} = ?{left_star}{}",
                 right_path
                     .iter()
                     .map(|hop| format!("{hop}."))
@@ -590,7 +659,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                     if let Some(binding) = bindings.get(*key) {
                         writeln!(
                             f,
-                            "      group     ?{} ← {}   {}",
+                            "{indent}group     ?{} ← {}   {}",
                             binding.var,
                             if binding.slot_path.is_empty() {
                                 "<identity>".to_owned()
@@ -604,7 +673,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 for measure in measures {
                     writeln!(
                         f,
-                        "      aggregate ?{} ← {}",
+                        "{indent}aggregate ?{} ← {}",
                         measure.var,
                         measure.func.render()
                     )?;
@@ -612,13 +681,13 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
             }
             Op::Sort { terms, .. } => {
                 for term in terms {
-                    writeln!(f, "      order     {term}")?;
+                    writeln!(f, "{indent}order     {term}")?;
                 }
             }
-            Op::Distinct { .. } => writeln!(f, "      distinct")?,
+            Op::Distinct { .. } => writeln!(f, "{indent}distinct")?,
             Op::Slice { limit, offset, .. } => writeln!(
                 f,
-                "      limit     {} offset {offset}",
+                "{indent}limit     {} offset {offset}",
                 limit
                     .map(|limit| limit.to_string())
                     .unwrap_or_else(|| "-".to_owned())
@@ -630,7 +699,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
                 for binding in bindings {
                     writeln!(
                         f,
-                        "      column    ?{} ← {}   {}",
+                        "{indent}column    ?{} ← {}   {}",
                         binding.var,
                         if binding.slot_path.is_empty() {
                             "<identity>".to_owned()

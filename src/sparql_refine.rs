@@ -1898,6 +1898,40 @@ pub struct ReferenceEdge {
     pub slot: String,
 }
 
+/// The key a pushed join joins on, beside the reference edge: two columns
+/// that hold the same term (op 5 of the design), recorded rather than
+/// re-derived so a renderer reads a fact and [`Plan::join_keys_agree`] can
+/// check it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinKey {
+    /// `left.<identity> = right.<identity>`: two records of one class, each
+    /// side's `var` a scanned star's identity or a relation column carrying
+    /// one. Text equality of two IRIs is term equality.
+    Identity { var: String, class_uri: String },
+    /// Two inlined elements of one `(holder class, path)`: equal iff the
+    /// whole occurrence identifier agrees -- the blank node's identity in the
+    /// graph the engine answers over.
+    Element {
+        var: String,
+        holder_class_uri: String,
+        path: Vec<String>,
+    },
+    /// `on = []`: every pair. `CROSS JOIN`, or `LEFT JOIN … ON true`.
+    Cross,
+}
+
+impl fmt::Display for JoinKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity { var, class_uri } => {
+                write!(f, "identity ?{var} of {}", shorten(class_uri))
+            }
+            Self::Element { var, path, .. } => write!(f, "element ?{var} at {}", path.join(".")),
+            Self::Cross => f.write_str("cross"),
+        }
+    }
+}
+
 /// One step of a plan.
 ///
 /// Inputs are node indices, so the tree is a flat vector and a rewrite is an
@@ -1940,6 +1974,10 @@ pub enum PlanOp {
         /// recording one that is not is what
         /// [`Plan::reference_joins_agree`] refuses.
         reference: Option<ReferenceEdge>,
+        /// The column key this join joins on, once op 5 has pushed it: two
+        /// identities, two elements, or no key at all. Exclusive with
+        /// `reference`; [`Plan::join_keys_agree`] checks it.
+        key: Option<JoinKey>,
     },
     /// `OPTIONAL`, as an operator rather than a plan-level node.
     LeftJoin {
@@ -1951,6 +1989,8 @@ pub enum PlanOp {
         /// recorded rather than re-derived, and
         /// [`Plan::reference_joins_agree`] checks it against the scans.
         reference: Option<ReferenceEdge>,
+        /// The column key, as on [`PlanOp::Join`].
+        key: Option<JoinKey>,
         /// The condition spargebra lifts out of `OPTIONAL { ... FILTER(x) }`.
         ///
         /// Claimed by this node, per conjunct: nothing pushes it (it decides
@@ -2037,11 +2077,35 @@ pub enum PlanOp {
         input: NodeId,
         vars: Vec<String>,
     },
-    /// A sub-`SELECT`: a projection that is not the query's own, and therefore
-    /// a barrier the variables above it cannot see through.
+    /// A *barrier*: the root of a scope, a subtree SPARQL evaluates to a
+    /// solution multiset of its own and combines with the outside through
+    /// `vars` and nothing else.
+    ///
+    /// Two things put one here, and the builder constructs both, so the
+    /// logical plan has one shape for a unit whether or not anything lowers
+    /// it (`docs/design/sparql-scopes-as-relations.md`, *The fact: a scope*):
+    ///
+    /// * a sub-`SELECT`. The **complete** sub-query -- its own `Slice`,
+    ///   `Distinct`, `Project`, `Sort` included, built on a spine of its own
+    ///   -- is the input, and `vars` is its projection. The barrier is
+    ///   therefore always the direct input of the node that combines the
+    ///   sub-query with the outside, and always has every modifier beneath
+    ///   it. `domain` is the naming domain it opens: a variable inside it
+    ///   the projection does not export is private to it, and the scoper
+    ///   numbers its domains in the same walk.
+    /// * the body of an `OPTIONAL` (and an `EXISTS` block read as a left
+    ///   join side): every variable the body binds is exported, which is the
+    ///   identity projection `Project(R, vars(R)) ≡ R` -- op 1 of the
+    ///   design, applied by the builder rather than by a rule so the boundary
+    ///   never depends on rule order. It opens no naming domain: the `?a`
+    ///   inside an `OPTIONAL` *is* the outer `?a`.
     SubSelect {
         input: NodeId,
         vars: Vec<String>,
+        /// The naming domain this barrier opens, when it is a sub-`SELECT`;
+        /// `None` for an `OPTIONAL` body. Numbered from 1 in the builder's
+        /// walk order; the scoper's `__d{n}` suffix is the same number.
+        domain: Option<usize>,
     },
     Graph {
         input: NodeId,
@@ -2433,6 +2497,13 @@ pub enum PlanDefect {
     MisrecordedJoin {
         join: NodeId,
     },
+    /// A rule's edit dropped an export a consumer demanded: the one check
+    /// that relates two plans rather than inspecting one. See
+    /// [`Plan::check_transition`].
+    Transition {
+        rule: &'static str,
+        defect: crate::sparql_scopes::TransitionDefect,
+    },
 }
 
 impl fmt::Display for PlanDefect {
@@ -2476,6 +2547,7 @@ impl fmt::Display for PlanDefect {
                 "n{unnest} fans out a slot no scan below it read as multivalued, \
                  so it multiplies rows nothing asked for"
             ),
+            Self::Transition { rule, defect } => write!(f, "{rule}: {defect}"),
         }
     }
 }
@@ -2817,6 +2889,7 @@ impl Plan {
                     right,
                     on,
                     reference: Some(edge),
+                    ..
                 } => (left, right, Some(on), edge),
                 PlanOp::LeftJoin {
                     left,
@@ -2909,15 +2982,13 @@ impl Plan {
                 star_var, slots, ..
             } => {
                 out.insert(star_var.clone());
-                // A delivered read binds nothing *here*: the `match` that
-                // stayed above is what binds it, and counting it twice would
-                // put an optional variable in a mandatory join's `on`.
-                out.extend(
-                    slots
-                        .iter()
-                        .filter(|slot| slot.presence == SlotPresence::Required)
-                        .filter_map(|slot| slot.var.clone()),
-                );
+                // Every slot that *binds* a variable, whatever its presence:
+                // an absorbed optional read binds a nullable column, and a
+                // variable in scope and possibly unbound is still in scope
+                // (which is what a join's `on` is drawn from). A delivered
+                // read binds nothing -- its `var` is `None` -- and the
+                // `match` that stayed above is what binds it.
+                out.extend(slots.iter().filter_map(|slot| slot.var.clone()));
             }
             PlanOp::Match { pattern } => {
                 add_term_var(&pattern.subject, &mut out);
@@ -3076,7 +3147,7 @@ impl Plan {
             }
             // A projection can only keep a guarantee, never make one: naming a
             // variable in `SELECT` does not bind it.
-            PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars } => {
+            PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars, .. } => {
                 let below = self.definitely_bound_of(*input);
                 out.extend(vars.iter().filter(|var| below.contains(*var)).cloned());
             }
@@ -3209,8 +3280,9 @@ impl PlanOp {
                 right,
                 on,
                 reference,
+                key,
             } => format!(
-                "n{left}, n{right}  on {}{}",
+                "n{left}, n{right}  on {}{}{}",
                 on.iter()
                     .map(|var| format!("?{var}"))
                     .collect::<Vec<_>>()
@@ -3218,17 +3290,23 @@ impl PlanOp {
                 match reference {
                     Some(edge) => format!("  via ?{}.{}", edge.holder, edge.slot),
                     None => String::new(),
+                },
+                match key {
+                    Some(key) => format!("  by {key}"),
+                    None => String::new(),
                 }
             ),
             PlanOp::LeftJoin {
                 left,
                 right,
                 reference,
+                key,
                 condition,
             } => {
-                let edge = match reference {
-                    Some(edge) => format!("  via ?{}.{}", edge.holder, edge.slot),
-                    None => String::new(),
+                let edge = match (reference, key) {
+                    (Some(edge), _) => format!("  via ?{}.{}", edge.holder, edge.slot),
+                    (None, Some(key)) => format!("  by {key}"),
+                    (None, None) => String::new(),
                 };
                 match condition {
                     Some(condition) => format!("n{left}, n{right}{edge}  if {condition}"),
@@ -3290,13 +3368,22 @@ impl PlanOp {
                 Some(limit) => format!("limit {limit} offset {offset}"),
                 None => format!("offset {offset}"),
             },
-            PlanOp::Project { vars, .. }
-            | PlanOp::SubSelect { vars, .. }
-            | PlanOp::Describe { vars, .. } => vars
+            PlanOp::Project { vars, .. } | PlanOp::Describe { vars, .. } => vars
                 .iter()
                 .map(|var| format!("?{var}"))
                 .collect::<Vec<_>>()
                 .join(" "),
+            PlanOp::SubSelect { vars, domain, .. } => format!(
+                "{}{}",
+                vars.iter()
+                    .map(|var| format!("?{var}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                match domain {
+                    Some(domain) => format!("  domain {domain}"),
+                    None => String::new(),
+                }
+            ),
             PlanOp::Graph { name, .. } => name.clone(),
             PlanOp::Service { name, silent, .. } => {
                 format!("{name}{}", if *silent { " silent" } else { "" })
@@ -3456,6 +3543,7 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
         vars: Vec::new(),
         next_triple: 0,
         next_modifier: triple_count,
+        domains_opened: 0,
     };
     let mut root = builder.pattern(pattern, true);
 
@@ -3517,6 +3605,9 @@ struct Builder<'o> {
     vars: Vec<BTreeSet<String>>,
     next_triple: usize,
     next_modifier: usize,
+    /// Naming domains opened so far: each off-spine sub-`SELECT` gets the
+    /// next one, in walk order. The scoper counts the same way.
+    domains_opened: usize,
 }
 
 impl Builder<'_> {
@@ -3569,6 +3660,37 @@ impl Builder<'_> {
     /// projection; anywhere else it is a sub-`SELECT`, which is a barrier
     /// rather than a projection.
     fn pattern(&mut self, pattern: &GraphPattern, on_spine: bool) -> NodeId {
+        // A modifier met off the spine is the top of a sub-query: spargebra
+        // emits `Slice`/`Distinct`/`Reduced`/`Project` at a query's top and
+        // nowhere else. The whole of it is built on a spine of its own --
+        // its `Project` a `Project` node, its modifiers where the algebra
+        // puts them -- and wrapped in one barrier, so the barrier is the
+        // scope root and the direct input of whatever combines the sub-query
+        // with the outside. See [`PlanOp::SubSelect`].
+        if !on_spine
+            && matches!(
+                pattern,
+                GraphPattern::Slice { .. }
+                    | GraphPattern::Distinct { .. }
+                    | GraphPattern::Reduced { .. }
+                    | GraphPattern::Project { .. }
+            )
+        {
+            self.domains_opened += 1;
+            let domain = self.domains_opened;
+            let input = self.pattern(pattern, true);
+            let vars: Vec<String> = self.vars[input].iter().cloned().collect();
+            let bound = self.vars[input].clone();
+            return self.push(
+                PlanOp::SubSelect {
+                    input,
+                    vars,
+                    domain: Some(domain),
+                },
+                Vec::new(),
+                bound,
+            );
+        }
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns),
             GraphPattern::Path {
@@ -3613,6 +3735,7 @@ impl Builder<'_> {
                 }
                 let left = self.pattern(left, false);
                 let right = self.pattern(right, false);
+                let right = self.enclose(right);
                 let vars: BTreeSet<String> =
                     self.vars[left].union(&self.vars[right]).cloned().collect();
                 let node = self.push(
@@ -3620,6 +3743,7 @@ impl Builder<'_> {
                         left,
                         right,
                         reference: None,
+                        key: None,
                         condition,
                     },
                     claims,
@@ -3839,20 +3963,17 @@ impl Builder<'_> {
                 )
             }
             GraphPattern::Project { inner, variables } => {
-                // Past a projection nothing below is the query's own, so a
-                // second one is a sub-select.
+                // Past a projection nothing below is the query's own: a
+                // second one is a sub-query, and the check at the top of
+                // this function wraps it whole. So this arm only ever builds
+                // the projection of the spine it is on.
                 let input = self.pattern(inner, false);
                 let vars: Vec<String> = variables
                     .iter()
                     .map(|variable| variable.as_str().to_owned())
                     .collect();
                 let bound: BTreeSet<String> = vars.iter().cloned().collect();
-                let op = if on_spine {
-                    PlanOp::Project { input, vars }
-                } else {
-                    PlanOp::SubSelect { input, vars }
-                };
-                self.push(op, Vec::new(), bound)
+                self.push(PlanOp::Project { input, vars }, Vec::new(), bound)
             }
             GraphPattern::Graph { name, inner } => {
                 let input = self.pattern(inner, on_spine);
@@ -3924,6 +4045,7 @@ impl Builder<'_> {
         let mut current = input;
         for block in blocks {
             let right = self.pattern(block, false);
+            let right = self.enclose(right);
             let vars: BTreeSet<String> = self.vars[current]
                 .union(&self.vars[right])
                 .cloned()
@@ -3933,6 +4055,7 @@ impl Builder<'_> {
                     left: current,
                     right,
                     reference: None,
+                    key: None,
                     condition: None,
                 },
                 Vec::new(),
@@ -3940,6 +4063,26 @@ impl Builder<'_> {
             );
         }
         current
+    }
+
+    /// Wrap a left join's right side in its barrier: the identity projection
+    /// of everything the body binds (op 1). A sub-query is its own barrier
+    /// already and is not wrapped twice.
+    fn enclose(&mut self, body: NodeId) -> NodeId {
+        if matches!(self.nodes[body].op, PlanOp::SubSelect { .. }) {
+            return body;
+        }
+        let vars: Vec<String> = self.vars[body].iter().cloned().collect();
+        let bound = self.vars[body].clone();
+        self.push(
+            PlanOp::SubSelect {
+                input: body,
+                vars,
+                domain: None,
+            },
+            Vec::new(),
+            bound,
+        )
     }
 
     fn bgp(&mut self, patterns: &[TriplePattern]) -> NodeId {
@@ -3981,6 +4124,7 @@ impl Builder<'_> {
                 right,
                 on,
                 reference: None,
+                key: None,
             },
             Vec::new(),
             vars,
@@ -4313,14 +4457,128 @@ mod tests {
         }
     }
 
-    /// A sub-select is a barrier, not a projection: the outer query cannot see
-    /// through it, so the two must not be the same node kind.
+    /// **The boundary wraps the sub-query** (design, test 9): a sub-select
+    /// is built on a spine of its own and enclosed *whole* in one barrier,
+    /// so the barrier is the scope root and the direct input of whatever
+    /// combines the sub-query with the outside, with every modifier beneath
+    /// it in the algebra's order. Pinned as golden printouts, one per
+    /// modifier shape, so the claim is a test rather than a sentence.
     #[test]
-    fn a_nested_projection_is_a_subselect() {
-        let plan =
-            plan_of("SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 3 } }");
-        assert_eq!(plan.find("project").len(), 1, "{plan}");
-        assert_eq!(plan.find("subselect").len(), 1, "{plan}");
+    fn the_barrier_wraps_the_complete_sub_query() {
+        let printed = |query: &str| -> Vec<String> {
+            let plan = plan_of(query);
+            plan.check()
+                .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+            plan.nodes
+                .iter()
+                .map(|node| format!("{} {}", node.op.kind(), node.op.describe()))
+                .collect()
+        };
+        // A typed top-N: the barrier over the slice over the projection over
+        // the sort.
+        assert_eq!(
+            printed(
+                "SELECT ?s ?n WHERE { ?s asset360:name ?n . \
+                 { SELECT ?s WHERE { ?s a asset360:Signal } ORDER BY ?s LIMIT 3 } }"
+            ),
+            vec![
+                "match ?s asset360:name ?n",
+                "match ?s a asset360:Signal",
+                "sort ?s asc",
+                "project ?s",
+                "slice limit 3 offset 0",
+                "subselect ?s  domain 1",
+                "join n0, n5  on ?s",
+                "project ?s ?n",
+            ]
+        );
+        // A grouped sub-query with `HAVING`: the filter sits between the
+        // grouping and the projection, as spargebra puts it, and the barrier
+        // is above them all. The measure carries spargebra's internal name
+        // until the grouping rule renames it, so the kinds are what is
+        // pinned.
+        let kinds: Vec<String> = printed(
+            "SELECT ?s ?n WHERE { { SELECT ?s (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?k } GROUP BY ?s HAVING (COUNT(*) > 1) } }",
+        )
+        .iter()
+        .map(|line| line.split(' ').next().unwrap().to_owned())
+        .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "match",
+                "match",
+                "join",
+                "group",
+                "filter",
+                "bind",
+                "project",
+                "subselect",
+                "project"
+            ]
+        );
+        // `DISTINCT` and `OFFSET`, each beneath the barrier and above the
+        // projection.
+        assert_eq!(
+            printed("SELECT ?s WHERE { { SELECT DISTINCT ?s WHERE { ?s a asset360:Signal } } }"),
+            vec![
+                "match ?s a asset360:Signal",
+                "project ?s",
+                "distinct ",
+                "subselect ?s  domain 1",
+                "project ?s",
+            ]
+        );
+        assert_eq!(
+            printed("SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } OFFSET 2 } }"),
+            vec![
+                "match ?s a asset360:Signal",
+                "project ?s",
+                "slice offset 2",
+                "subselect ?s  domain 1",
+                "project ?s",
+            ]
+        );
+        // And for each, the barrier's one consumer is the node that combines
+        // it with the outside.
+        for query in [
+            "SELECT ?s ?n WHERE { ?s asset360:name ?n . \
+             { SELECT ?s WHERE { ?s a asset360:Signal } ORDER BY ?s LIMIT 3 } }",
+            "SELECT ?s WHERE { { SELECT DISTINCT ?s WHERE { ?s a asset360:Signal } } }",
+        ] {
+            let plan = plan_of(query);
+            let barrier = plan.find("subselect")[0];
+            let consumers: Vec<NodeId> = plan
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.op.inputs().contains(&barrier))
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(consumers.len(), 1, "{plan}");
+            assert!(
+                matches!(
+                    plan.nodes[consumers[0]].op,
+                    PlanOp::Join { .. } | PlanOp::Project { .. }
+                ),
+                "{plan}"
+            );
+        }
+        // An `OPTIONAL` body is enclosed too (op 1, applied by the builder),
+        // opening no naming domain: its `?s` is the outer `?s`.
+        assert_eq!(
+            printed(
+                "SELECT ?s ?nm WHERE { ?s a asset360:Signal . OPTIONAL { ?s asset360:name ?nm } }"
+            ),
+            vec![
+                "match ?s a asset360:Signal",
+                "match ?s asset360:name ?nm",
+                "subselect ?nm ?s",
+                "leftjoin n0, n2",
+                "project ?s ?nm",
+            ]
+        );
     }
 
     /// A `UNION` plans: obligation enumeration accepts it, both arms claim

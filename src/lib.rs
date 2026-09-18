@@ -53,7 +53,9 @@ pub mod sparql_refine;
 pub mod sparql_rules;
 pub mod sparql_schema_graph;
 pub mod sparql_schema_labels;
+pub mod sparql_scope_rules;
 pub mod sparql_scoper;
+pub mod sparql_scopes;
 pub mod sparql_terms;
 
 #[cfg(feature = "shacl-parser")]

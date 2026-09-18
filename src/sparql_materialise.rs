@@ -677,7 +677,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
             start: *offset,
             length: *limit,
         },
-        PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars } => {
+        PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars, .. } => {
             GraphPattern::Project {
                 inner: child(input)?,
                 variables: vars
