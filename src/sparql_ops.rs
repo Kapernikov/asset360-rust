@@ -1778,14 +1778,25 @@ pub fn lower_refined_with(
                 // fold makes -- it becomes a value against the indexed column
                 // rather than a slot of the payload.
                 Some(claim @ crate::sparql_plan::Obligation::Triple { predicate, .. }) => {
-                    let slot = predicate
-                        .trim_matches(['<', '>'])
-                        .rsplit(['/', '#'])
-                        .next()
-                        .unwrap_or_default();
-                    let read = slots
-                        .iter()
-                        .any(|scanned| scanned.path.iter().any(|hop| hop == slot));
+                    // The predicate names a slot through the schema, the way
+                    // every rule that folded the read resolved it -- not by
+                    // its local name. A slot whose `slot_uri` lies outside
+                    // its namespace (`Line.name` is `rsm:EAID_080C70AE…`,
+                    // read as `irsm:name`) has a local name that is not the
+                    // slot's, so a local-name comparison called every such
+                    // read unmade and the statement that made it was refused
+                    // (#462, pepibru GitLab). The local name stays as the
+                    // fallback for a predicate the schema does not know.
+                    let iri = predicate.trim_matches(['<', '>']);
+                    let slot = schema
+                        .get_slot_by_uri(iri)
+                        .ok()
+                        .flatten()
+                        .map(|slot| slot.name)
+                        .unwrap_or_else(|| {
+                            iri.rsplit(['/', '#']).next().unwrap_or_default().to_owned()
+                        });
+                    let read = slots.iter().any(|scanned| scanned.path.contains(&slot));
                     let is_the_identity = identifier_slot_of(schema, class_uri)
                         .is_some_and(|identifier| identifier == slot)
                         && !identifier_values.is_empty();

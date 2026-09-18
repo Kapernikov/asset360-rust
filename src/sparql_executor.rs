@@ -59,6 +59,17 @@ pub enum ExecuteError {
     /// The endpoint returns HTTP 422 with a suggestion to narrow the query.
     ResultLimitExceeded { count: usize, limit: usize },
 
+    /// The engine ran past the wall-clock ceiling the caller set.
+    ///
+    /// The one limit that bounds *work* rather than input or output. A query
+    /// whose evaluation is a cartesian product -- label `OPTIONAL`s written
+    /// as siblings of the slot instead of nested under it -- stays under the
+    /// triple cap (the store is small) and never reaches the row cap (the
+    /// first row is what takes minutes), so before this it pinned a worker
+    /// at 100 % CPU for as long as it took (#460, pepibru GitLab). The
+    /// endpoint returns this as HTTP 422, like the other two caps.
+    EvaluationTimeExceeded { millis: u64 },
+
     /// Oxigraph returned an error while executing the SPARQL query.
     QueryError(String),
 
@@ -80,6 +91,9 @@ impl std::fmt::Display for ExecuteError {
             }
             ExecuteError::ResultLimitExceeded { count, limit } => {
                 write!(f, "Result row count {count} exceeds limit {limit}")
+            }
+            ExecuteError::EvaluationTimeExceeded { millis } => {
+                write!(f, "Evaluation time exceeds limit of {millis} ms")
             }
             ExecuteError::QueryError(msg) => write!(f, "Query execution error: {msg}"),
             ExecuteError::StoreError(msg) => write!(f, "Store error: {msg}"),
@@ -106,6 +120,17 @@ pub struct ExecuteLimits {
     /// than this limit, execution stops and an error is returned.
     /// Default: 10,000.
     pub max_result_rows: usize,
+
+    /// Wall-clock ceiling on the engine's evaluation, in milliseconds.
+    ///
+    /// Counted from the moment the query is handed to the evaluator -- the
+    /// store is already loaded, and that phase is bounded by `max_triples`.
+    /// The caller is answered at the deadline whatever the evaluation is
+    /// doing; the evaluation itself is stopped through oxigraph's
+    /// `CancellationToken` at its next store read (see [`sparql_execute`]
+    /// for what that does and does not cover). `None` is no ceiling, which
+    /// is what a caller that has its own gets. Default: none.
+    pub max_eval_millis: Option<u64>,
 }
 
 impl Default for ExecuteLimits {
@@ -113,6 +138,7 @@ impl Default for ExecuteLimits {
         Self {
             max_triples: 500_000,
             max_result_rows: 10_000,
+            max_eval_millis: None,
         }
     }
 }
@@ -325,11 +351,85 @@ pub fn sparql_execute(
     // too. See [`crate::sparql_alias`].
     crate::sparql_alias::canonicalize(&mut parsed, schema_view)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-    let results = geosparql_evaluator()
+
+    match limits.max_eval_millis {
+        None => evaluate(parsed, &store, &limits, None),
+        // The ceiling. Evaluation runs on its own thread and the caller waits
+        // for its answer until the deadline; past it the caller gets the
+        // refusal and the thread is told to stop through the token.
+        //
+        // Why a thread and not only the token: the token is polled by the
+        // evaluator on every quad it reads from the store, and a
+        // cartesian-product evaluation spends its time *between* store reads
+        // -- spareval 0.2.7's `HashLeftJoinIterator` combines tuples in memory
+        // and never asks. Measured on the sibling-label shape of #460: with
+        // the token alone, ten label blocks stopped at the deadline and twelve
+        // ran on for minutes. So the wait is what bounds the caller, and the
+        // token is what bounds the evaluation as soon as it next touches the
+        // store. An evaluation that never does runs to completion in the
+        // background, holding its store, and its answer is dropped: the
+        // request is released, the CPU is not. That is the gap upstream
+        // owns, and it is why the planner refuses the one shape known to
+        // reach it (`crate::sparql_optional_binding`) rather than relying on
+        // this.
+        Some(millis) => {
+            let token = oxigraph::sparql::CancellationToken::new();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker_token = token.clone();
+            std::thread::spawn(move || {
+                let answer = evaluate(parsed, &store, &limits, Some(worker_token));
+                // The receiver is gone when the caller gave up waiting; the
+                // answer has nobody to go to, and that is fine.
+                let _ = sender.send(answer);
+            });
+            match receiver.recv_timeout(std::time::Duration::from_millis(millis)) {
+                Ok(answer) => answer,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    token.cancel();
+                    Err(ExecuteError::EvaluationTimeExceeded { millis })
+                }
+                // The worker panicked. Nothing to report but that.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(ExecuteError::QueryError(
+                        "the evaluation thread ended without an answer".into(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate a parsed, canonicalised query against a loaded store and
+/// serialise the answer.
+///
+/// Everything after the store is built, so that the ceiling can run it on a
+/// thread of its own: nothing here borrows the caller's schema or instances.
+/// A `SELECT` is evaluated lazily as its solutions are read, so the
+/// serialisation loop is where the work happens and the row cap is checked.
+#[cfg(feature = "sparql-endpoint")]
+fn evaluate(
+    parsed: spargebra::Query,
+    store: &Store,
+    limits: &ExecuteLimits,
+    token: Option<oxigraph::sparql::CancellationToken>,
+) -> Result<SparqlAnswer, ExecuteError> {
+    // What the engine's error means here. `Cancelled` can only come from the
+    // ceiling -- nothing else holds the token -- so it *is* the ceiling.
+    let eval_error = |e: oxigraph::sparql::QueryEvaluationError| match (e, limits.max_eval_millis) {
+        (oxigraph::sparql::QueryEvaluationError::Cancelled, Some(millis)) => {
+            ExecuteError::EvaluationTimeExceeded { millis }
+        }
+        (e, _) => ExecuteError::QueryError(e.to_string()),
+    };
+    let mut evaluator = geosparql_evaluator();
+    if let Some(token) = token {
+        evaluator = evaluator.with_cancellation_token(token);
+    }
+    let results = evaluator
         .for_query(parsed)
-        .on_store(&store)
+        .on_store(store)
         .execute()
-        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+        .map_err(eval_error)?;
 
     // Serialize results
     match results {
@@ -342,7 +442,7 @@ pub fn sparql_execute(
 
             let mut bindings: Vec<serde_json::Value> = Vec::new();
             for solution in solutions {
-                let solution = solution.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+                let solution = solution.map_err(eval_error)?;
 
                 if bindings.len() >= limits.max_result_rows {
                     return Err(ExecuteError::ResultLimitExceeded {
@@ -377,7 +477,7 @@ pub fn sparql_execute(
         QueryResults::Graph(triples) => {
             let mut buf = Vec::new();
             for triple in triples {
-                let triple = triple.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+                let triple = triple.map_err(eval_error)?;
                 use std::io::Write;
                 writeln!(
                     buf,
@@ -562,6 +662,7 @@ classes:
             ExecuteLimits {
                 max_triples: 500_000,
                 max_result_rows: 1,
+                max_eval_millis: None,
             },
             None,
         );
@@ -570,6 +671,65 @@ classes:
             result,
             Err(ExecuteError::ResultLimitExceeded { .. })
         ));
+    }
+
+    /// The ceiling answers the caller while an evaluation is still computing
+    /// its first row: a four-way cross product under an `ORDER BY`
+    /// materialises every combination before it yields one, so neither the
+    /// triple cap (a dozen triples) nor the row cap (checked per row yielded)
+    /// ever fires (#460). The abandoned evaluation finishes on its own thread
+    /// in the background -- a hundred thousand rows here, a moment of CPU.
+    #[test]
+    fn the_engine_ceiling_stops_an_evaluation_before_its_first_row() {
+        let sv = test_schema_view();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let query = "SELECT * WHERE { ?a ?p ?o . ?b ?q ?r . ?c ?x ?y . ?d ?z ?w } \
+                     ORDER BY ?a ?b ?c ?d";
+        let started = std::time::Instant::now();
+        let result = sparql_execute(
+            query,
+            &refs,
+            &sv,
+            ExecuteLimits {
+                max_triples: 500_000,
+                max_result_rows: 10,
+                max_eval_millis: Some(1),
+            },
+            None,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ExecuteError::EvaluationTimeExceeded { millis: 1 })
+            ),
+            "expected the ceiling, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the ceiling fired late: {:?}",
+            started.elapsed()
+        );
+
+        // The same store, a query that finishes: the ceiling is not a cost.
+        let answer = sparql_execute(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal }",
+            &refs,
+            &sv,
+            ExecuteLimits {
+                max_triples: 500_000,
+                max_result_rows: 10_000,
+                max_eval_millis: Some(30_000),
+            },
+            None,
+        )
+        .expect("a query under the ceiling answers");
+        let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(
+            parsed["results"]["bindings"].as_array().unwrap().len(),
+            refs.len()
+        );
     }
 
     #[test]
@@ -585,6 +745,7 @@ classes:
             ExecuteLimits {
                 max_triples: 1,
                 max_result_rows: 10_000,
+                max_eval_millis: None,
             },
             None,
         );

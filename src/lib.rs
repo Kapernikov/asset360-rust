@@ -46,6 +46,7 @@ pub mod sparql_graph_clauses;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_materialise;
 pub mod sparql_ops;
+pub mod sparql_optional_binding;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;
@@ -3511,7 +3512,7 @@ fn load_json_batch(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, instances, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None))]
+#[pyo3(signature = (query, instances, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None, max_eval_millis=None))]
 /// Execute a SPARQL query against a list of LinkML instances.
 ///
 /// Converts each instance to RDF, loads into an in-memory store (with
@@ -3532,6 +3533,14 @@ fn load_json_batch(
 ///         is built. There is deliberately no default: the correct IRI depends
 ///         on which datamodel is deployed, and guessing would put an
 ///         infrabel-named graph into an unrelated deployment.
+///     max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
+///         milliseconds, counted once the store is loaded. ``None`` (the
+///         default) is no ceiling. A query still evaluating at the deadline
+///         is cancelled and raises ``RuntimeError("Evaluation time limit
+///         exceeded: …")``. This is the only limit that bounds *work*: a
+///         cartesian product on a small store is under the triple cap and
+///         never reaches the row cap, because the first row is what takes
+///         minutes (#460, pepibru GitLab).
 ///
 /// Returns:
 ///     JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
@@ -3551,6 +3560,7 @@ fn sparql_execute(
     max_triples: usize,
     max_result_rows: usize,
     schema_graph_iri: Option<String>,
+    max_eval_millis: Option<u64>,
 ) -> PyResult<(String, String)> {
     let bound_sv = schema_view.bind(py);
     let sv_ref = bound_sv.borrow();
@@ -3567,6 +3577,7 @@ fn sparql_execute(
         crate::sparql_executor::ExecuteLimits {
             max_triples,
             max_result_rows,
+            max_eval_millis,
         },
         schema_graph_iri.as_deref(),
     ) {
@@ -3590,6 +3601,11 @@ fn sparql_execute(
         Err(crate::sparql_executor::ExecuteError::ResultLimitExceeded { count, limit }) => {
             Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "Result row limit exceeded: {count} > {limit}"
+            )))
+        }
+        Err(crate::sparql_executor::ExecuteError::EvaluationTimeExceeded { millis }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Evaluation time limit exceeded: the engine ran for more than {millis} ms"
             )))
         }
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),

@@ -1368,6 +1368,15 @@ pub fn scope_parsed_with_schema_graph(
         ));
     }
 
+    // An `OPTIONAL` joined to what precedes it only through a variable that
+    // may be unbound there is a cartesian product per the algebra, and never
+    // what the author meant. Refused for both routes, with the nested
+    // spelling; see `crate::sparql_optional_binding`.
+    if let Some(shape) = crate::sparql_optional_binding::optional_on_a_maybe_unbound_variable(query)
+    {
+        return Err(ScopeError::UnsupportedConstruct(shape.to_string()));
+    }
+
     let pattern = match query {
         Query::Select { pattern, .. } => pattern,
         Query::Construct { pattern, .. } => pattern,

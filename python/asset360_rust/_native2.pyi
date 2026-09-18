@@ -6989,7 +6989,7 @@ def refined_plan_text(query:builtins.str, schema_view:SchemaView, schema_graph_i
         ValueError: the query does not parse or cannot be represented.
     """
 
-def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None) -> tuple[builtins.str, builtins.str]:
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
     
@@ -7011,6 +7011,14 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             is built. There is deliberately no default: the correct IRI depends
             on which datamodel is deployed, and guessing would put an
             infrabel-named graph into an unrelated deployment.
+        max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
+            milliseconds, counted once the store is loaded. ``None`` (the
+            default) is no ceiling. A query still evaluating at the deadline
+            is cancelled and raises ``RuntimeError("Evaluation time limit
+            exceeded: …")``. This is the only limit that bounds *work*: a
+            cartesian product on a small store is under the triple cap and
+            never reaches the row cap, because the first row is what takes
+            minutes (#460, pepibru GitLab).
     
     Returns:
         JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
