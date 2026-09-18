@@ -922,12 +922,10 @@ pub fn representable(
     var: &str,
     serialise: bool,
 ) -> bool {
-    let terms = plan.term_of(schema, node, var);
-    let [term] = terms.as_slice() else {
-        // Two producers disagreeing, or none: not one column.
-        return terms.len() > 1 && terms.iter().all(|term| term == &terms[0]);
+    let Some(term) = resolve_terms(plan.term_of(schema, node, var)) else {
+        return false;
     };
-    match term {
+    match &term {
         TermOf::Identity { .. } | TermOf::Measure { .. } => true,
         TermOf::Slot {
             class_uri, path, ..
@@ -1255,6 +1253,37 @@ impl std::fmt::Display for ScopeDefect {
             ),
             Self::EvidenceLost { key } => {
                 write!(f, "the ledger names {key}, which resolves to no node")
+            }
+        }
+    }
+}
+
+/// The one term a variable is, from what its producers say: one kind, or
+/// an identity beside the slot that references it -- a pushed reference
+/// join binds the variable both ways, and on the join they hold the same
+/// IRI, so the identity is the column. Two identities of different classes,
+/// or two different slots, resolve to nothing.
+pub fn resolve_terms(terms: Vec<TermOf>) -> Option<TermOf> {
+    let mut distinct: Vec<TermOf> = Vec::new();
+    for term in terms {
+        if !distinct.contains(&term) {
+            distinct.push(term);
+        }
+    }
+    match distinct.as_slice() {
+        [only] => Some(only.clone()),
+        [] => None,
+        several => {
+            let identities: Vec<&TermOf> = several
+                .iter()
+                .filter(|term| matches!(term, TermOf::Identity { .. }))
+                .collect();
+            let rest_are_slots = several
+                .iter()
+                .all(|term| matches!(term, TermOf::Identity { .. } | TermOf::Slot { .. }));
+            match identities.as_slice() {
+                [identity] if rest_are_slots => Some((*identity).clone()),
+                _ => None,
             }
         }
     }

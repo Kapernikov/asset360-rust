@@ -274,7 +274,8 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                     // that had a cheaper one. Any other read of `?v` -- a
                     // slot, a second star -- is the two-read shape, which the
                     // restriction serves.
-                    if only_reference_reads(plan, self.schema, side, var)
+                    if (only_reference_reads(plan, self.schema, side, var)
+                        && absorb_reference_shape(plan, side))
                         || single_read_body(plan, side, var)
                     {
                         continue;
@@ -405,6 +406,31 @@ fn only_reference_reads(plan: &Plan, schema: &SchemaView, side: NodeId, var: &st
     any
 }
 
+/// Whether `side` is an `OPTIONAL` body of the shape `AbsorbOptionalReference`
+/// takes: under whatever left joins the body nests, a join of a match and
+/// the rest, with nothing else (no sunk condition) between.
+fn absorb_reference_shape(plan: &Plan, side: NodeId) -> bool {
+    let PlanOp::SubSelect {
+        input,
+        domain: None,
+        ..
+    } = &plan.nodes[side].op
+    else {
+        return false;
+    };
+    let mut core = *input;
+    while let PlanOp::LeftJoin { left, .. } = &plan.nodes[core].op {
+        core = *left;
+    }
+    match &plan.nodes[core].op {
+        PlanOp::Join { left, right, .. } => {
+            matches!(plan.nodes[*left].op, PlanOp::Match { .. })
+                || matches!(plan.nodes[*right].op, PlanOp::Match { .. })
+        }
+        _ => false,
+    }
+}
+
 /// Whether `side` is an `OPTIONAL` body that is exactly one match reading a
 /// slot of `var`: `AbsorbOptionalRead`'s shape, which becomes a nullable
 /// column of the preserved scan and needs no scan of its own.
@@ -473,6 +499,76 @@ fn insert_between(plan: &mut Plan, input: NodeId, consumer: NodeId, mut node: No
         remap[old] = Some(nodes.len() - 1);
     }
     plan.rebuild(nodes, &remap);
+}
+
+// ---------------------------------------------------------------------------
+// Op 2: sink a lifted condition into the unit
+// ---------------------------------------------------------------------------
+
+/// The condition spargebra lifts out of `OPTIONAL { … FILTER(c) }` moves
+/// into the body, when the body decides it alone.
+///
+/// **Match.** `LeftJoin { right: SubSelect(body), condition: Some(c) }`
+/// where every variable of `c` is in `guaranteed(body root)` **and**
+/// `c.evaluates_the_same_out_of_context()`.
+///
+/// **Edit.** `condition = None`; `body := Filter(body, c)`; the join's
+/// claims for the condition move to the new filter, inside the scope the
+/// obligation was raised in.
+///
+/// **Equivalence.** §18.5: `LeftJoin(Ω1, Ω2, c)` keeps `merge(μ1, μ2)` when
+/// compatible and `c(merge)` holds, else `μ1`. When `c` reads only variables
+/// Ω2 binds in every solution, `c(merge(μ1, μ2)) = c(μ2)`, so both sets
+/// equal those of `LeftJoin(Ω1, Filter(c, Ω2))`. A `c` reading a left-only
+/// variable, or one the body binds optionally, is not sinkable -- and a `c`
+/// with an effect (`RAND()`) is drawn once per body row instead of once per
+/// pair, so the second precondition is the rule's contract rather than a
+/// renderer's later refusal.
+pub struct SinkLiftedCondition;
+
+impl Rule for SinkLiftedCondition {
+    fn name(&self) -> &'static str {
+        "sink_lifted_condition"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            let PlanOp::LeftJoin {
+                right,
+                condition: Some(condition),
+                ..
+            } = &plan.nodes[id].op
+            else {
+                continue;
+            };
+            let (right, condition) = (*right, condition.clone());
+            let PlanOp::SubSelect { input, .. } = &plan.nodes[right].op else {
+                continue;
+            };
+            let input = *input;
+            if plan.nodes[right].executor != Executor::Engine {
+                continue;
+            }
+            let guaranteed = plan.guaranteed(input);
+            if !crate::sparql_refine::variables_used(&condition)
+                .iter()
+                .all(|var| guaranteed.contains(var))
+            {
+                continue;
+            }
+            if !condition.evaluates_the_same_out_of_context() {
+                continue;
+            }
+            let claims = std::mem::take(&mut plan.nodes[id].discharges);
+            if let PlanOp::LeftJoin { condition, .. } = &mut plan.nodes[id].op {
+                *condition = None;
+            }
+            let filter = Node::engine(PlanOp::Filter { input, condition }, claims);
+            insert_between(plan, input, right, filter);
+            return true;
+        }
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

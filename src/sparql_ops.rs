@@ -1401,11 +1401,8 @@ impl Lowering<'_> {
     /// can carry -- or not at all.
     fn column_kind(&self, body: usize, var: &str) -> Option<ColumnKind> {
         use crate::sparql_scopes::TermOf;
-        let terms = self.plan.term_of(self.schema, body, var);
-        let [term] = terms.as_slice() else {
-            return None;
-        };
-        Some(match term {
+        let term = crate::sparql_scopes::resolve_terms(self.plan.term_of(self.schema, body, var))?;
+        Some(match &term {
             TermOf::Identity { class_uri } => ColumnKind::Identity {
                 class_uri: class_uri.clone(),
             },

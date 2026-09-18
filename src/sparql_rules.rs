@@ -2134,17 +2134,20 @@ fn sole_scan_of_star(plan: &Plan, node: NodeId, star: &str) -> Option<NodeId> {
 /// Listing every variant means the next operator is a compile error here
 /// rather than a wrong answer somewhere else.
 pub(crate) fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
-    // **Scope-local.** The question is whether the constraint decides every
-    // solution *the scope emits*: the walk stops at the scope root, and an
-    // operator in an enclosing scope -- the left join a whole sub-select
-    // sits under, say -- is that scope's business. Whether a restriction
-    // also decides the enclosing scope's answers is a second question with
-    // a second proof (op 3a, read the other way), and a consumer that wants
-    // to carry one across a barrier asks both.
-    let scopes = plan.scopes();
-    let scope = scopes[node];
+    // **Local to the naming domain.** Every consumer of this answer narrows
+    // a *star* -- a scan's fetch, or the scan itself -- and a star is a
+    // `(naming domain, variable)`: the `?s` of an `OPTIONAL` body is the
+    // outer `?s`, fetched once for both, so a constraint inside the body
+    // decides a binding and not which records exist; the `?s` of a
+    // sub-select is a star of its own, so a constraint that decides every
+    // solution of the sub-select decides every read of that star. The walk
+    // therefore stops at a sub-select's barrier and looks through an
+    // `OPTIONAL` body's. Whether a restriction also decides the enclosing
+    // domain's answers is a second question with a second proof (op 3a,
+    // read the other way).
+    let domain = plan.naming_domain_of(node);
     !plan.nodes.iter().enumerate().any(|(other_id, other)| {
-        scopes[other_id] == scope
+        plan.naming_domain_of(other_id) == domain
             && match &other.op {
                 // The preserved side keeps rows the optional side did not match, so a
                 // constraint inside the optional side decides whether the *value*
@@ -4720,6 +4723,8 @@ pub fn tier_one_rules<'a>(
         // star's type when it reaches the matches.
         Box::new(crate::sparql_restrict::RestrictScopeAtBoundary::new(schema)),
         Box::new(crate::sparql_restrict::PushRestrictionDown),
+        // Op 2: a lifted condition the body decides alone moves into it.
+        Box::new(crate::sparql_restrict::SinkLiftedCondition),
         // This one knows nothing about a schema graph: it is a semi-join
         // reduction, and it is what a materialised relation is worth to the
         // planner whether the schema produced it or the client wrote it.
@@ -6281,14 +6286,18 @@ mod tests {
         println!("{plan}");
     }
 
-    /// A lifted condition is not absorbed, and this is the placement error the
-    /// rule exists to refuse.
+    /// A lifted condition is not absorbed as a nullable column, and this is
+    /// the placement error the absorb rule exists to refuse: `OPTIONAL { ?s
+    /// :name ?nm . FILTER(?nm > "A") }` decides whether the *value* binds,
+    /// not whether the row survives -- a signal named "A" is still an
+    /// answer, with `?nm` unbound, and a `WHERE` on the preserved scan would
+    /// delete it.
     ///
-    /// `OPTIONAL { ?s :name ?nm . FILTER(?nm > "A") }` decides whether the
-    /// *value* binds, not whether the row survives: a signal named "A" is
-    /// still an answer, with `?nm` unbound. Rendering the condition as a
-    /// `WHERE` would delete that row -- turning the left join into an inner
-    /// one, quietly, with a smaller answer and no error.
+    /// What serves it instead is the scope: op 2 sinks the condition into
+    /// the body, where it is the derived table's own `WHERE` (a row of the
+    /// body either exists or it does not), the body gets a scan of its own
+    /// by the boundary restriction, and the left join is on the identity.
+    /// The preserved scan reads nothing it did not before.
     #[test]
     fn a_condition_inside_the_optional_is_not_absorbed() {
         let schema = test_schema_view();
@@ -6300,15 +6309,31 @@ mod tests {
         );
 
         assert_eq!(plan.find("leftjoin").len(), 1, "{plan}");
-        assert_eq!(
-            plan.nodes[plan.find("leftjoin")[0]].executor,
-            Executor::Engine,
+        let PlanOp::LeftJoin {
+            condition: None,
+            key: Some(_),
+            ..
+        } = &plan.nodes[plan.find("leftjoin")[0]].op
+        else {
+            panic!("the condition is sunk and the join is on the identity:\n{plan}");
+        };
+        // The condition is a filter inside the body, in SQL.
+        let filter = plan.find("filter")[0];
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        assert!(plan.scope_of(filter).is_some(), "inside the body:\n{plan}");
+        // The preserved scan does not bind the optional value: the
+        // relation's column does.
+        let PlanOp::Scan { slots, .. } = &plan.nodes[plan.find("scan")[0]].op else {
+            unreachable!()
+        };
+        assert!(
+            !slots
+                .iter()
+                .any(|slot| slot.path == ["name".to_owned()] && slot.var.is_some()),
             "{plan}"
         );
-        assert_eq!(plan.find("match").len(), 1, "{plan}");
-        // The column is still delivered, so the engine has what it needs.
         assert!(
-            scan_slots(&plan).contains(&("name".to_owned(), String::new(), false)),
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
             "{plan}"
         );
         println!("{plan}");
@@ -8281,7 +8306,10 @@ mod tests {
             "{plan}"
         );
         // A lifted condition decides whether the optional side matched, and
-        // no rule builds a conditional binding.
+        // no rule builds a conditional binding: the condition is sunk into
+        // the body (op 2), the body becomes a relation of its own, and the
+        // left join is on the identity -- a derived table row exists or it
+        // does not, which is what "together or not at all" needs.
         let plan = refined(
             "SELECT ?s ?t WHERE { ?s a asset360:Signal . \
              OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
@@ -8289,7 +8317,19 @@ mod tests {
             &schema,
             false,
         );
-        assert!(!plan.find("match").is_empty(), "{plan}");
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "{plan}"
+        );
+        let PlanOp::LeftJoin {
+            condition: None,
+            key: Some(_),
+            reference: None,
+            ..
+        } = &plan.nodes[plan.find("leftjoin")[0]].op
+        else {
+            panic!("{plan}");
+        };
     }
 
     /// What the projection rule takes, and what it declines -- each decline
@@ -8401,21 +8441,18 @@ mod tests {
         );
     }
 
-    /// A lifted condition goes to the engine, and the join still pushes.
+    /// A lifted condition the body decides alone is sunk into the body (op
+    /// 2), where it is a row test of the optional side -- the derived
+    /// table's own `WHERE`, or, for a body of one scan under a reference
+    /// edge, a condition the renderer places in the `ON` -- and the join
+    /// still pushes, now with nothing given up: the ledger says the work is
+    /// done, and by which node.
     ///
-    /// The condition decides whether the optional side *matched*, which is a
-    /// conditional binding and not a row test: as a `WHERE` it deletes the row
-    /// the join exists to keep, and this renderer has no `ON` clause to put it
-    /// in. So the plan gives the condition up -- to the residual, where an
-    /// obligation nobody claims is the engine's -- and keeps the join, which
-    /// is a left join that matches too generously and therefore fetches a
-    /// superset of the records the answer needs. That is today's statement for
-    /// this query, exactly.
-    ///
-    /// Giving it up rather than carrying it unrendered is the load-bearing
-    /// part: a plan that held a condition it does not apply would have to be
-    /// read carefully to be understood, and the ledger would say the work was
-    /// accounted for.
+    /// What made this a residual before was that a `LeftJoin` carrying a
+    /// condition had nowhere to put it. Inside a scope it is a filter like
+    /// any other; SPARQL §18.5 says `LeftJoin(Ω1, Ω2, c) =
+    /// LeftJoin(Ω1, Filter(c, Ω2))` when `c` reads only what Ω2 binds in
+    /// every solution, which is the rule's precondition.
     #[test]
     fn a_lifted_condition_goes_to_the_engine_and_the_join_still_pushes() {
         let schema = test_schema_view();
@@ -8428,32 +8465,59 @@ mod tests {
         );
         let leftjoin = plan.find("leftjoin")[0];
         assert_eq!(plan.nodes[leftjoin].executor, Executor::Sql, "{plan}");
-        let PlanOp::LeftJoin { condition, .. } = &plan.nodes[leftjoin].op else {
+        let PlanOp::LeftJoin {
+            condition,
+            reference,
+            ..
+        } = &plan.nodes[leftjoin].op
+        else {
             unreachable!()
         };
         assert!(
             condition.is_none(),
-            "the plan does not carry a condition it will not apply:\n{plan}"
+            "the plan does not carry a condition on the join:\n{plan}"
         );
         assert!(
-            plan.nodes[leftjoin].discharges.is_empty(),
-            "and it claims nothing for it:\n{plan}"
+            reference.is_some(),
+            "the join is on the reference edge:\n{plan}"
         );
-        assert_eq!(
-            plan.residual.len(),
-            1,
-            "the condition is unaccounted for, which is what the residual is \
-             for:\n{plan}"
-        );
+        assert!(plan.residual.is_empty(), "nothing is given up:\n{plan}");
+        // The condition is a filter inside the body, in SQL, claiming its
+        // obligation.
+        let filter = plan
+            .find("filter")
+            .into_iter()
+            .find(|id| plan.nodes[*id].op.describe().contains("hasName"))
+            .unwrap_or_else(|| panic!("{plan}"));
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        assert!(plan.scope_of(filter).is_some(), "inside the body:\n{plan}");
         assert!(
-            plan.obligations[plan.residual[0]]
-                .to_string()
-                .contains("(?tn > \"A\")"),
+            plan.nodes[filter]
+                .discharges
+                .iter()
+                .any(|id| plan.obligations[*id].to_string().contains("(?tn > \"A\")")),
             "{plan}"
         );
-        // And the invariants hold, including the ledger: an obligation in the
-        // residual is claimed once, there.
-        plan.check().expect("the plan is well formed");
+        plan.check_with(&schema).expect("the plan is well formed");
+        // And what stays unsinkable: a condition reading an outer variable,
+        // and one with an effect. Both are given up to the residual by the
+        // left-join rule -- the engine's, as today -- rather than sunk.
+        for query in [
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:locatedOnTrack ?t . OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
+             FILTER(?tn > ?nm) } }",
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . FILTER(RAND() < 0.5) } }",
+        ] {
+            let plan = refined(query, &schema, false);
+            assert!(
+                plan.find("filter")
+                    .iter()
+                    .all(|id| plan.scope_of(*id).is_none()),
+                "not sunk into the body:\n{plan}"
+            );
+            assert_eq!(plan.residual.len(), 1, "given up:\n{plan}");
+        }
     }
 
     /// A condition inside the `OPTIONAL` is marked as belonging to the
@@ -8954,10 +9018,21 @@ mod tests {
             let naive = plan_of(query);
             let refined = refined(query, &schema, false);
 
-            assert_eq!(refined.obligations, naive.obligations, "{query}");
+            // The query's obligations are untouched; a rule may *append* a
+            // derived one (a boundary restriction, op 3a), never edit or
+            // remove one -- the ledger is append-only.
             assert_eq!(
-                refined.obligations.len(),
-                naive.obligations.len(),
+                &refined.obligations[..naive.obligations.len()],
+                &naive.obligations[..],
+                "{query}"
+            );
+            assert!(
+                refined.obligations[naive.obligations.len()..]
+                    .iter()
+                    .all(|obligation| matches!(
+                        obligation,
+                        crate::sparql_plan::Obligation::Boundary(_)
+                    )),
                 "{query}"
             );
             assert_eq!(refined.residual, naive.residual, "{query}");
@@ -8966,6 +9041,7 @@ mod tests {
                     .nodes
                     .iter()
                     .flat_map(|node| node.discharges.iter().copied())
+                    .filter(|id| *id < naive.obligations.len())
                     .collect();
                 ids.sort_unstable();
                 ids

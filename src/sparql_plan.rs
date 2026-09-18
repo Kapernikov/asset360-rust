@@ -2331,14 +2331,11 @@ mod tests {
             .iter()
             .position(|obligation| matches!(obligation, Obligation::Filter { .. }))
             .expect("the lifted condition is an obligation");
-        // Nobody pushes it -- it decides whether the optional side matched --
-        // so it must sit with the engine, said rather than assumed.
-        let engine = plan
-            .passes
-            .iter()
-            .find(|pass| matches!(pass.kind, PassKind::Engine(_)))
-            .expect("the engine finishes this");
-        assert!(engine.discharges.contains(&lifted), "{plan}");
+        // It is claimed -- by the statement, now that op 2 sinks it into the
+        // body where it is a row test of the derived table -- and the plan
+        // says so rather than letting it fall between the passes.
+        assert!(plan.sql_only(), "{plan}");
+        assert!(plan.passes[0].discharges.contains(&lifted), "{plan}");
 
         // A VALUES block the scoper cannot represent: its own obligation,
         // claimed by the engine.
