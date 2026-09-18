@@ -2264,7 +2264,35 @@ impl Lowering<'_> {
                     // columns are the exports the query demands.
                     let alias = format!("q{}", self.next_alias);
                     self.next_alias += 1;
-                    let body = self.lower_scope(Some(id), Enforcement::Enforces)?;
+                    let mut body = self.lower_scope(Some(id), Enforcement::Enforces)?;
+                    // A body with neither a grouping nor a projection of its
+                    // own -- an enclosed `OPTIONAL` body -- is still a
+                    // statement whose rows are its solutions, and it gets
+                    // the projection a sub-select would have carried: the
+                    // exports, then every fan-out, then every identity
+                    // (`scope_columns`). The root of the scope is its last
+                    // node, because a node is emitted after the nodes it
+                    // reads.
+                    let answers = body
+                        .iter()
+                        .any(|node| matches!(node.op, Op::Group { .. } | Op::Project { .. }));
+                    if !answers && !body.is_empty() {
+                        // The body's scope is the barrier's own id, and its
+                        // stars are the ones feeding the body root -- the
+                        // barrier itself is a member of the scope above, and
+                        // `classes` here is that scope's.
+                        let body_classes = classes_feeding(plan, *input);
+                        let columns =
+                            self.scope_columns(&body_classes, *input, vars, Some(id), id)?;
+                        body.push(OpNode {
+                            op: Op::Project {
+                                input: body.len() - 1,
+                                vars: vars.clone(),
+                                bindings: columns.bindings,
+                            },
+                            discharges: Vec::new(),
+                        });
+                    }
                     let mut columns = Vec::with_capacity(vars.len());
                     let guaranteed = plan.guaranteed(id);
                     for var in vars {
@@ -2460,9 +2488,8 @@ impl Lowering<'_> {
         classes: &std::collections::HashMap<String, String>,
         node: usize,
     ) -> Result<GroupedColumns, LoweringRefusal> {
-        use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp};
+        use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
         let plan = self.plan;
-        let schema = self.schema;
 
         let unrenderable = || LoweringRefusal::Unrenderable { node };
         // The projection of *this* scope: the node itself, or the one above
@@ -2481,6 +2508,39 @@ impl Lowering<'_> {
         let RefinedOp::Project { vars, .. } = &plan.nodes[project_id].op else {
             return Err(unrenderable());
         };
+        self.scope_columns(classes, project_id, vars, scope, node)
+    }
+
+    /// The column list of an ungrouped statement, anchored at `anchor` --
+    /// the scope's `Project`, or, for a body that has none, the barrier's
+    /// input: `vars` first, then the ordering's terms the answer does not
+    /// name, then every fan-out, then the identity of every scanned star and
+    /// every relation.
+    ///
+    /// The second anchor is what an enclosed `OPTIONAL` body needs. Op 1
+    /// wraps the left join's right side in a barrier and leaves no `Project`
+    /// under it (the builder's `enclose`; the absorb rules and the
+    /// transparent-barrier elision match the bare shape), so the body's
+    /// column list cannot be read off a projection node -- but the body is
+    /// still a statement of its own, whose rows are its solutions, and a
+    /// renderer that derives its laterals from the bindings needs its
+    /// fan-outs listed exactly as an answering projection lists them. Without
+    /// this the body lowered to a bare row set whose `Unnest` no binding
+    /// discharged, and consolidator-server's renderer (which cross-checks
+    /// the two) declined the whole statement.
+    fn scope_columns(
+        &self,
+        classes: &std::collections::HashMap<String, String>,
+        anchor: usize,
+        vars: &[String],
+        scope: Option<usize>,
+        node: usize,
+    ) -> Result<GroupedColumns, LoweringRefusal> {
+        use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp};
+        let plan = self.plan;
+        let schema = self.schema;
+        let unrenderable = || LoweringRefusal::Unrenderable { node };
+        let project_id = anchor;
         let in_scope = |id: usize| {
             plan.nodes[id].executor == Executor::Sql
                 && self.lowering_scope_of(id) == scope

@@ -843,6 +843,38 @@ mod tests {
                         && *right_reading == crate::sparql_ops::SlotReading::BoundElement)),
             "{plan}"
         );
+        // An enclosed body has no projection of its own (op 1 leaves none
+        // under the barrier), and is still a statement whose rows are its
+        // solutions: the lowering gives it the column list a sub-select's
+        // projection would carry -- the exports, then the fan-out `?cs` (a
+        // binding through the collection, which is what a renderer builds
+        // its lateral from, and what discharges the `unnest`), then the
+        // identities. Without it the body was a bare row set whose unnest
+        // nothing discharged.
+        let Op::Project { vars, bindings, .. } =
+            &relation.1.nodes.last().expect("a body has nodes").op
+        else {
+            panic!("the body's root is its projection:\n{plan}");
+        };
+        assert_eq!(
+            vars,
+            &relation.0.iter().map(|c| c.var.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            bindings.iter().any(|spec| spec.star_var == "a"
+                && spec.slot_path.as_slice() == ["hasCoveredSection".to_owned()]
+                && spec
+                    .containers
+                    .iter()
+                    .any(|c| *c != crate::sparql_pushdown::Container::Single)),
+            "the fan-out is a column of the body: {bindings:?}"
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|spec| spec.star_var == "track" && spec.slot_path.is_empty()),
+            "the referenced star's identity is a column of the body: {bindings:?}"
+        );
         // `SELECT *`: a fetch, since a structure has no term to emit.
         let star = format!("{prefix}SELECT * WHERE {{ {body} }}");
         assert!(
