@@ -1021,11 +1021,16 @@ impl FetchBounds {
         for star in scoped.root.all_stars() {
             // A union renames a second star of one variable `var__uN`;
             // the refined plan knows it by the query's own name.
+            // ...and a sub-select's star `?s__d1` is the plan's `?s` in that
+            // domain: the refined scan is keyed by the query's own name, and
+            // two domains scanning one class as one variable share a premise
+            // or decline the bound.
             let var = star
                 .variable
                 .split_once("__u")
                 .map_or(star.variable.as_str(), |(base, _)| base)
                 .to_owned();
+            let var = crate::sparql_domains::split(&var).0;
             let key = (var, star.class_uri.clone());
             match required_paths.get(&key) {
                 Some(existing) if *existing != star.required_paths => ambiguous = true,

@@ -191,6 +191,29 @@ impl Plan {
         scope
     }
 
+    /// The naming domain a node is in: the innermost enclosing sub-`SELECT`
+    /// barrier, or `None` for the query's own. An `OPTIONAL` body opens no
+    /// domain -- its `?a` is the outer `?a` -- so this looks through
+    /// barriers with no `domain` (design, *Naming domain versus evaluation
+    /// unit*).
+    pub fn naming_domain_of(&self, node: NodeId) -> Option<NodeId> {
+        let scopes = self.scopes();
+        let mut current = scopes[node];
+        while let Some(barrier) = current {
+            if matches!(
+                self.nodes[barrier].op,
+                PlanOp::SubSelect {
+                    domain: Some(_),
+                    ..
+                }
+            ) {
+                return Some(barrier);
+            }
+            current = scopes[barrier];
+        }
+        None
+    }
+
     /// The nodes of one scope, in index order.
     pub fn scope_members(&self, scope: Option<NodeId>) -> Vec<NodeId> {
         self.scopes()

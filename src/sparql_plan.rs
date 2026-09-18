@@ -1073,6 +1073,39 @@ impl Refinement {
         }
     }
 }
+/// What the pipeline decided for a query: the endpoint's three outcomes
+/// (design, *The pipeline* → *Outcomes*), read off [`plan_query_refined`]'s
+/// result so a test can assert one by name.
+///
+/// * `Statement` -- SQL answers alone (`Refinement::UsedAlone`).
+/// * `Fetch` -- the statement narrows and the engine finishes
+///   (`Refinement::Used` or `Fallback`), with what stopped the lowering.
+///   Correct by construction: every narrowing in the fetch has its
+///   justification, keyed by producer.
+/// * `Rejected` -- no plan: `unsupported_construct`, `query_unscoped`
+///   (decided at `resolve`), an update. The endpoint's 422.
+///
+/// The fourth, `FetchDeclined` -- a fetch too large to materialise -- is the
+/// runtime gate's (`planning.fallback_can_answer`) and never this crate's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Statement,
+    Fetch(String),
+    Rejected(String),
+}
+
+/// [`Outcome`] of planning a query.
+pub fn outcome_of(query: &str, schema: &SchemaView, schema_graph_iri: Option<&str>) -> Outcome {
+    match plan_query_refined_with_schema_graph(query, schema, schema_graph_iri) {
+        Ok(plan) => match &plan.refinement {
+            Refinement::UsedAlone(_) => Outcome::Statement,
+            Refinement::Used(why) => Outcome::Fetch(why.clone().unwrap_or_default()),
+            Refinement::Fallback { why, .. } => Outcome::Fetch(why.clone()),
+        },
+        Err(error) => Outcome::Rejected(error.to_string()),
+    }
+}
+
 /// The plan the refinement pipeline *starts* from: every node the engine's.
 ///
 /// Diagnostics, and the counterpart to [`refined_plan_text`]. Reading a refined
@@ -1193,10 +1226,19 @@ pub fn plan_query_refined_with_schema_graph(
     crate::sparql_alias::canonicalize(&mut parsed, schema_view)?;
     let parsed = parsed;
     let obligations = obligations_of(&parsed)?;
-    let scoped = crate::sparql_scoper::scope_parsed_with_schema_graph(
+    // **The pipeline** (design, *The pipeline: who decides what, and when a
+    // refusal is final*). The scoper *records* a star its own domain leaves
+    // untyped rather than refusing it; the refined plan is the one
+    // derivation of a star's class across a boundary; `resolve` below asks
+    // the refined plan for each recorded star and refuses what it did not
+    // type -- the only place an unscoped refusal is final. The refusals for
+    // what the fetch cannot represent (`UnsupportedConstruct`) stay
+    // immediate.
+    let recorded = crate::sparql_scoper::scope_parsed_as(
         &parsed,
         schema_view,
         schema_graph_iri,
+        crate::sparql_scoper::Scoping::Record,
     )?;
 
     let mut refined = match crate::sparql_refine::naive_plan(&parsed) {
@@ -1207,7 +1249,10 @@ pub fn plan_query_refined_with_schema_graph(
         // engine answer over it.
         // No refined plan exists, so there is nothing to keep: a
         // partial refusal is partial in what the *rules* proved.
-        Err(error) => return Ok(fetch_only(obligations, &scoped, error.to_string(), None)),
+        Err(error) => {
+            let scoped = resolve(&parsed, schema_view, schema_graph_iri, &recorded, None)?;
+            return Ok(fetch_only(obligations, &scoped, error.to_string(), None));
+        }
     };
     let rules = crate::sparql_rules::tier_one_rules(schema_view, schema_graph_iri);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
@@ -1216,6 +1261,7 @@ pub fn plan_query_refined_with_schema_graph(
         // A plan a rule broke is a plan whose narrowings nothing vouches
         // for -- the invariant that would have vouched for them is the one
         // that failed. Refuse them all.
+        let scoped = resolve(&parsed, schema_view, schema_graph_iri, &recorded, None)?;
         return Ok(fetch_only(
             obligations,
             &scoped,
@@ -1223,6 +1269,15 @@ pub fn plan_query_refined_with_schema_graph(
             None,
         ));
     }
+    // `resolve`: every recorded star is typed from the refined plan's scan
+    // for it in its own domain, or refused.
+    let scoped = resolve(
+        &parsed,
+        schema_view,
+        schema_graph_iri,
+        &recorded,
+        Some(&refined),
+    )?;
 
     let mut ops = match crate::sparql_ops::lower_refined_with(
         &refined,
@@ -1307,6 +1362,96 @@ pub fn plan_query_refined_with_schema_graph(
         }
     }
     Ok(plan)
+}
+
+/// **`resolve`**, the pipeline's fifth step: the scoping with every star the
+/// scoper recorded as untyped now typed from the refined plan, or refused.
+///
+/// For each recorded star `(D, ?v)` the refined plan is asked one question:
+/// is the producer of `?v` at `D`'s root a `Scan` of some class, in `D`? The
+/// scan is typed by either of two routes this does not distinguish -- the
+/// domain's own type match, which `FoldMatchesIntoScan` folded (then the
+/// scoper had a class already and the two are checked to agree), or a
+/// boundary restriction 3a placed and 3b carried to the scan. If so the star
+/// is typed *from the plan*; if not, the star is refused with the message
+/// the scoper would have given, and this is where that refusal is final.
+///
+/// Sound for the fetch because the class reached the scan by a derivation
+/// whose invariants hold in the refined plan, so a record of `(D, ?v)`
+/// outside it contributes to no solution of the enclosing join; leaving it
+/// out of the fetch satisfies D1.
+///
+/// The scoper is run a second time with the classes as hints rather than
+/// patched in place: the fetch-dependent results (`sql_limit`, `inexact`,
+/// required and optional fields) are computed by the code that computes
+/// them today, over fully typed stars.
+fn resolve(
+    parsed: &Query,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+    recorded: &crate::sparql_scoper::QueryPlan,
+    refined: Option<&crate::sparql_refine::Plan>,
+) -> Result<crate::sparql_scoper::QueryPlan, ScopeError> {
+    if recorded.untyped.is_empty() {
+        return Ok(recorded.clone());
+    }
+    let mut hints: HashMap<String, String> = HashMap::new();
+    if let Some(plan) = refined {
+        for name in &recorded.untyped {
+            if let Some(class_uri) = class_derived_for(plan, name) {
+                hints.insert(name.clone(), class_uri);
+            }
+        }
+    }
+    crate::sparql_scoper::scope_parsed_as(
+        parsed,
+        schema_view,
+        schema_graph_iri,
+        crate::sparql_scoper::Scoping::Resolve(&hints),
+    )
+}
+
+/// The class the refined plan scans a scoper star as, when it does: the
+/// `Scan` of the star's variable in the star's own naming domain.
+fn class_derived_for(plan: &crate::sparql_refine::Plan, qualified: &str) -> Option<String> {
+    use crate::sparql_refine::PlanOp as RefinedOp;
+    let (var, domain) = crate::sparql_domains::split(qualified);
+    let mut found: Option<String> = None;
+    for (id, node) in plan.nodes.iter().enumerate() {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            ..
+        } = &node.op
+        else {
+            continue;
+        };
+        if *star_var != var || domain_number_of(plan, id) != domain {
+            continue;
+        }
+        match &found {
+            // Two scans of one star in one domain, typed differently: a
+            // union's arms. Not one class.
+            Some(seen) if seen != class_uri => return None,
+            _ => found = Some(class_uri.clone()),
+        }
+    }
+    found
+}
+
+/// The naming-domain number a plan node is in: the `domain` of the innermost
+/// sub-select barrier enclosing it, `0` for the query's own.
+pub(crate) fn domain_number_of(plan: &crate::sparql_refine::Plan, node: usize) -> usize {
+    match plan.naming_domain_of(node) {
+        Some(barrier) => match &plan.nodes[barrier].op {
+            crate::sparql_refine::PlanOp::SubSelect {
+                domain: Some(domain),
+                ..
+            } => *domain,
+            _ => 0,
+        },
+        None => 0,
+    }
 }
 
 /// What a partial refusal kept, and what it refused, each with its reason.
@@ -1417,9 +1562,13 @@ fn keep_what_the_rules_proved(
     // plan read as multivalued. Both come from the refined scans, so
     // precondition 3 and 4 are answered by the plan under discussion rather
     // than by a second derivation.
-    let mut classes: HashMap<String, String> = HashMap::new();
+    // **Keyed by producer, not by name.** The scan a condition rests on is
+    // the scan in the filter's own naming domain, and the star it narrows is
+    // that domain's star in the scoper (`?s` in domain 1 is the scoper's
+    // `s__d1`). A restriction whose producer lives in another domain reaches
+    // no other star: the hidden-`?s` case of design test 6.
     let mut multivalued: HashMap<(String, String), bool> = HashMap::new();
-    for node in &refined.nodes {
+    for (id, node) in refined.nodes.iter().enumerate() {
         if let RefinedOp::Scan {
             star_var,
             class_uri,
@@ -1427,10 +1576,12 @@ fn keep_what_the_rules_proved(
             ..
         } = &node.op
         {
-            classes.insert(star_var.clone(), class_uri.clone());
+            let _ = class_uri;
+            let qualified =
+                crate::sparql_domains::qualified(star_var, domain_number_of(refined, id));
             for slot in slots {
                 if let [name] = slot.path.as_slice() {
-                    multivalued.insert((star_var.clone(), name.clone()), slot.multivalued);
+                    multivalued.insert((qualified.clone(), name.clone()), slot.multivalued);
                 }
             }
         }
@@ -1453,6 +1604,22 @@ fn keep_what_the_rules_proved(
             ));
             continue;
         }
+        // The classes of the scans this filter sees: its own scope's, and
+        // the domain they are the stars of.
+        let domain = domain_number_of(refined, id);
+        let mut classes: HashMap<String, String> = HashMap::new();
+        for (scan, below) in refined.nodes.iter().enumerate() {
+            if let RefinedOp::Scan {
+                star_var,
+                class_uri,
+                ..
+            } = &below.op
+                && refined.feeds_visibly(scan, id)
+                && domain_number_of(refined, scan) == domain
+            {
+                classes.insert(star_var.clone(), class_uri.clone());
+            }
+        }
         // Preconditions 2 and 6, in one call: `to_sql` declines both a shape it
         // cannot render and a within-star disjunction.
         let Some(conditions) = condition.to_sql(schema, &classes) else {
@@ -1462,7 +1629,7 @@ fn keep_what_the_rules_proved(
             ));
             continue;
         };
-        for condition in conditions {
+        for mut condition in conditions {
             let Some(class_uri) = classes.get(&condition.star_var).cloned() else {
                 out.refused.push(format!(
                     "n{id}: ?{} is not a star the refined plan scanned",
@@ -1470,6 +1637,8 @@ fn keep_what_the_rules_proved(
                 ));
                 continue;
             };
+            // The scoper's name for this scan's star.
+            condition.star_var = crate::sparql_domains::qualified(&condition.star_var, domain);
             let identifier = crate::sparql_ops::identifier_slot_of(schema, &class_uri);
             // Precondition 5.
             if identifier
@@ -3500,5 +3669,125 @@ mod tests {
             !narrowed.contains(&&"o".to_owned()),
             "a second role of the same class must not inherit the restriction: {plan}"
         );
+    }
+    /// **The full entry point** (design test 10): the outcome of the
+    /// pipeline for the shapes the design pins, through `plan_query_refined`
+    /// and not by invoking a rule.
+    ///
+    /// The scoper records an untyped star, the refined plan gets its one
+    /// chance to type it, and `resolve` refuses what it did not type -- so
+    /// every refusal below names the star's own domain rather than an
+    /// operator, and an alpha-renamed private variable gets the identical
+    /// outcome. Where the class travels across a boundary by op 3a/3b the
+    /// outcome changes to `Statement`; the rows note which those are.
+    #[test]
+    fn the_pipeline_decides_the_designs_outcomes() {
+        let sv = test_schema_view();
+        let outcome = |query: &str| outcome_of(&format!("{PREFIX}{query}"), &sv, None);
+        let rejected_naming = |query: &str, star: &str| {
+            let Outcome::Rejected(message) = outcome(query) else {
+                panic!("{query}\nexpected a rejection, got {:?}", outcome(query));
+            };
+            assert!(message.contains("unscoped"), "{query}\n{message}");
+            assert!(message.contains(star), "{query}\n{message}");
+            message
+        };
+
+        // #466: a count beside a row.
+        assert_eq!(
+            outcome(
+                "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+                 { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; \
+                 asset360:documents ?d } GROUP BY ?s } }"
+            ),
+            Outcome::Statement
+        );
+        // The typed top-N, #466 with zeros, the scalar beside every row and
+        // two grouped sub-selects: the table's `Statement` rows.
+        for query in [
+            "SELECT ?nm WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } ORDER BY ?s LIMIT 3 } \
+             ?s a asset360:Signal ; asset360:name ?nm }",
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm . OPTIONAL { \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:documents ?d } \
+             GROUP BY ?s } } }",
+            "SELECT ?nm ?total WHERE { { SELECT (COUNT(*) AS ?total) WHERE { ?t a asset360:Track } } \
+             ?s a asset360:Signal ; asset360:name ?nm }",
+            "SELECT ?s ?nx ?ny WHERE { { SELECT ?s (COUNT(?d) AS ?nx) WHERE { ?s a asset360:Signal ; \
+             asset360:documents ?d } GROUP BY ?s } { SELECT ?s (COUNT(?k) AS ?ny) WHERE { \
+             ?s a asset360:Signal ; asset360:trafficKinds ?k } GROUP BY ?s } ?s a asset360:Signal }",
+        ] {
+            assert_eq!(outcome(query), Outcome::Statement, "{query}");
+        }
+        // The top-N counter-example, untyped below the slice: the inner
+        // universe is every record with `:name`, and no fetch the scoper can
+        // spell preserves the answer. `Rejected`, naming the inner domain's
+        // `?s` -- and the same for `?inner`.
+        let message = rejected_naming(
+            "SELECT ?s WHERE { ?s a asset360:Signal . \
+             { SELECT ?s WHERE { ?s asset360:name ?x } ORDER BY ?s LIMIT 1 } }",
+            "?s (in sub-select 1)",
+        );
+        let renamed = rejected_naming(
+            "SELECT ?s WHERE { ?s a asset360:Signal . \
+             { SELECT ?inner WHERE { ?inner asset360:name ?x } ORDER BY ?inner LIMIT 1 } }",
+            "?inner (in sub-select 1)",
+        );
+        assert_eq!(message.replace("?s (in", "?inner (in"), renamed);
+        // The plain projection and its keyed-`Group` twin: the private inner
+        // `?s` is refused for having no class in its own domain, not for any
+        // operator above it.
+        rejected_naming(
+            "SELECT ?s ?x WHERE { ?s a asset360:Signal . { SELECT ?x WHERE { ?s asset360:name ?x } } }",
+            "?s (in sub-select 1)",
+        );
+        rejected_naming(
+            "SELECT ?s ?x ?n WHERE { ?s a asset360:Signal . \
+             { SELECT ?x (COUNT(*) AS ?n) WHERE { ?s asset360:name ?x } GROUP BY ?x } }",
+            "?s (in sub-select 1)",
+        );
+        // The untyped outer read beside a typed sub-query: `Rejected` naming
+        // the outer domain's `?s` until op 3a types it from the relation
+        // column (item 2 of the staging, in this same branch).
+        let untyped_outer = "SELECT ?nm WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } \
+             ORDER BY ?s LIMIT 3 } ?s asset360:name ?nm }";
+        match outcome(untyped_outer) {
+            Outcome::Statement => {}
+            Outcome::Rejected(message) => {
+                assert!(message.contains("?s has no rdf:type"), "{message}");
+            }
+            other => panic!("{untyped_outer}: {other:?}"),
+        }
+        // The correspondence invariant: the scoper's naming domains and the
+        // plan's sub-select barriers are in bijection.
+        for query in [
+            "SELECT ?s ?x ?n WHERE { ?s a asset360:Signal . \
+             { SELECT ?x WHERE { ?s asset360:name ?x } } \
+             { SELECT ?s (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal } GROUP BY ?s } }",
+            "SELECT ?x WHERE { { SELECT ?x WHERE { { SELECT ?x WHERE { ?s a asset360:Signal ; \
+             asset360:name ?x } } } } }",
+        ] {
+            let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
+            let plan = crate::sparql_refine::naive_plan(&parsed).unwrap();
+            let barrier_domains: std::collections::BTreeSet<usize> = plan
+                .barriers()
+                .into_iter()
+                .filter_map(|b| match &plan.nodes[b].op {
+                    crate::sparql_refine::PlanOp::SubSelect { domain, .. } => *domain,
+                    _ => None,
+                })
+                .collect();
+            let qualified = crate::sparql_domains::qualify(&parsed).to_string();
+            let mut scoper_domains: std::collections::BTreeSet<usize> = Default::default();
+            for token in qualified.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                let (_, domain) = crate::sparql_domains::split(token);
+                if domain > 0 {
+                    scoper_domains.insert(domain);
+                }
+            }
+            assert_eq!(
+                barrier_domains, scoper_domains,
+                "{query}\n{plan}\n{qualified}"
+            );
+        }
     }
 }

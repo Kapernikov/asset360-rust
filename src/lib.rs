@@ -40,6 +40,7 @@ pub mod shacl_ast;
 
 pub mod sparql_alias;
 pub mod sparql_columns;
+pub mod sparql_domains;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
 pub mod sparql_graph_clauses;

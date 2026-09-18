@@ -164,6 +164,30 @@ pub struct QueryPlan {
     /// `VALUES` on an unknown variable. Each produced a plan that claimed to be
     /// exact while counting every row of the class.
     pub inexact: Option<Inexact>,
+
+    /// Stars this scoping *recorded* as untyped rather than refused: the
+    /// qualified variable (`s`, or `s__d1` for the `?s` of naming domain 1)
+    /// of every subject its own domain leaves without a class.
+    ///
+    /// Empty unless the plan was scoped in [`Scoping::Record`] mode, which
+    /// the refinement pipeline uses so that the refined plan gets its one
+    /// chance to type such a star (a boundary restriction carried to its
+    /// scan) before `resolve` refuses it -- the only place an unscoped
+    /// refusal is final (design, *The pipeline*). Their triples are among
+    /// `unconsumed` and the plan is inexact.
+    pub untyped: Vec<String>,
+}
+
+/// What a scoping does with a star its domain leaves untyped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scoping<'h> {
+    /// Refuse it, as the scoper always has: `ScopeError::Unscoped`.
+    Refuse,
+    /// Record it in [`QueryPlan::untyped`] and scope the rest.
+    Record,
+    /// Type it from the classes the refined plan derived, keyed by qualified
+    /// variable; refuse what the plan did not type either.
+    Resolve(&'h HashMap<String, String>),
 }
 
 /// Declares [`Inexact`] together with the list of every one of its variants.
@@ -1369,6 +1393,38 @@ pub fn scope_parsed_with_schema_graph(
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> Result<QueryPlan, ScopeError> {
+    scope_parsed_as(query, schema_view, schema_graph_iri, Scoping::Refuse)
+}
+
+/// [`scope_parsed_with_schema_graph`] with a choice of what to do with an
+/// untyped star. The pipeline's entry point.
+///
+/// **A star is a `(naming domain, variable)`.** The query is first read with
+/// every variable inside a sub-select qualified by its domain
+/// ([`crate::sparql_domains::qualify`]), so the star construction below --
+/// which keys by variable name and is otherwise unchanged -- is per domain
+/// by construction: a private inner `?s` is `?s__d1`, a star of its own,
+/// typed from its own domain's triples or not at all.
+pub fn scope_parsed_as(
+    query: &Query,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+    scoping: Scoping<'_>,
+) -> Result<QueryPlan, ScopeError> {
+    let qualified = crate::sparql_domains::qualify(query);
+    scope_qualified(&qualified, schema_view, schema_graph_iri, scoping)
+}
+
+/// The scoping proper, over a query whose variables are already qualified
+/// by naming domain. A `UNION` branch re-enters here, not above: the
+/// branch is a pattern of the qualified query, and qualifying it twice would
+/// suffix a name twice.
+fn scope_qualified(
+    query: &Query,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+    scoping: Scoping<'_>,
+) -> Result<QueryPlan, ScopeError> {
     // A `FROM` / `FROM NAMED` clause redefines the dataset the query is asked
     // against, and nothing downstream of here carries it: every arm below
     // discards it with `..`, the plan has no field for it, and
@@ -1419,7 +1475,7 @@ pub fn scope_parsed_with_schema_graph(
     // cannot share one. See `union_branches` for why distributing is sound
     // for a *fetch* even though it is not a rewrite of the query.
     if let Some(branches) = union_branches(pattern)? {
-        return scope_union(query, &branches, schema_view, schema_graph_iri);
+        return scope_union(query, &branches, schema_view, schema_graph_iri, scoping);
     }
 
     // Phase 0: Depth-tag every BGP triple, rejecting unsupported
@@ -1455,6 +1511,8 @@ pub fn scope_parsed_with_schema_graph(
     // Anything dropped along the way is recorded here, at the point it is
     // dropped. The first cause wins: one actionable reason beats a list.
     let mut inexact: Option<Inexact> = None;
+    // Stars recorded as untyped, in `Scoping::Record` mode.
+    let mut untyped: Vec<String> = Vec::new();
     // Subject variables whose class could not be resolved. Cleared below by
     // whichever of them the path walk explains.
     let mut unresolved_subjects: HashSet<String> = HashSet::new();
@@ -1741,27 +1799,32 @@ pub fn scope_parsed_with_schema_graph(
         // can't scope yields `None` and is set aside for the path walk. A
         // constant-IRI subject we can't scope yields `Err` and rejects the
         // whole query — never a silent drop that returns wrong data.
-        let (class_uri, identifier_slot_name) = match resolve_star_class(builder, schema_view)? {
-            Some(resolved) => resolved,
-            None => {
-                // A variable subject whose class cannot be resolved. Two very
-                // different things look like this, and only the path walk can
-                // tell them apart: a step inside another star's nested
-                // structure (`?s :location ?loc . ?loc :longitude ?v`), which
-                // the plan *does* represent as a path, and a subject nothing
-                // accounts for (`?sig :locatedOnTrack ?t` with ?sig untyped),
-                // whose records no star fetches -- refused after the walk,
-                // with the class to add where the schema knows it.
-                //
-                // So record the name rather than the verdict, and let the path
-                // walk clear the ones it explains — and hand the triples this
-                // builder claimed back to the working set unless the walk turns
-                // out to represent every one of them.
-                unresolved_subjects.insert(builder.variable.clone());
-                discarded_claims.push(builder);
-                continue;
-            }
+        let hints: &HashMap<String, String> = match scoping {
+            Scoping::Resolve(hints) => hints,
+            _ => &HashMap::new(),
         };
+        let (class_uri, identifier_slot_name) =
+            match resolve_star_class(builder, schema_view, hints)? {
+                Some(resolved) => resolved,
+                None => {
+                    // A variable subject whose class cannot be resolved. Two very
+                    // different things look like this, and only the path walk can
+                    // tell them apart: a step inside another star's nested
+                    // structure (`?s :location ?loc . ?loc :longitude ?v`), which
+                    // the plan *does* represent as a path, and a subject nothing
+                    // accounts for (`?sig :locatedOnTrack ?t` with ?sig untyped),
+                    // whose records no star fetches -- refused after the walk,
+                    // with the class to add where the schema knows it.
+                    //
+                    // So record the name rather than the verdict, and let the path
+                    // walk clear the ones it explains — and hand the triples this
+                    // builder claimed back to the working set unless the walk turns
+                    // out to represent every one of them.
+                    unresolved_subjects.insert(builder.variable.clone());
+                    discarded_claims.push(builder);
+                    continue;
+                }
+            };
         // `type_depth` is the OPTIONAL depth of the `rdf:type` triple, and it
         // starts at `usize::MAX` for a subject that has none. A constant-IRI
         // subject usually has none — `<.../signal/A> :name ?nm` names the
@@ -2072,10 +2135,23 @@ pub fn scope_parsed_with_schema_graph(
     // either a mandatory star or transitively with another star that
     // does. Compute reachability from mandatory stars and reject any
     // orphaned optional star.
+    //
+    // A sub-select's exported variable connects the star inside it to the
+    // one outside spelled the same: `{ SELECT ?s (COUNT(?d) AS ?n) … }`
+    // inside an `OPTIONAL` joins the outer `?s` on the export, and the
+    // qualified inner star `?s__d1` is reachable through that link. Read off
+    // the qualified query, so no second walk decides what a sub-select
+    // exports.
+    let exports = crate::sparql_domains::exports(query);
     {
         let edges: Vec<(&str, &str)> = joins
             .iter()
             .map(|j| (j.left.as_str(), j.right.as_str()))
+            .chain(
+                exports
+                    .iter()
+                    .map(|(inner, outer)| (inner.as_str(), outer.as_str())),
+            )
             .collect();
         let reachable = stars_reachable_from(
             stars
@@ -2380,15 +2456,20 @@ pub fn scope_parsed_with_schema_graph(
             .collect();
         unaccounted.sort();
         if let Some(var) = unaccounted.first() {
-            return Err(untyped_subject_refusal(
-                var,
-                &star_map,
-                &var_to_class,
-                &references,
-                &path_bindings,
-                schema_view,
-                schema_graph_iri,
-            ));
+            if scoping != Scoping::Record {
+                return Err(untyped_subject_refusal(
+                    var,
+                    &star_map,
+                    &var_to_class,
+                    &references,
+                    &path_bindings,
+                    schema_view,
+                    schema_graph_iri,
+                ));
+            }
+            // Recorded, not refused: the refined plan gets its one chance to
+            // type the star, and `resolve` asks again with what it found.
+            untyped.extend(unaccounted.iter().map(|var| (*var).clone()));
         }
     }
 
@@ -2516,6 +2597,7 @@ pub fn scope_parsed_with_schema_graph(
         sql_limit_if_unioned: None,
         path_bindings,
         inexact,
+        untyped,
     })
 }
 
@@ -2571,7 +2653,31 @@ struct StarBuilder {
 fn resolve_star_class(
     builder: &StarBuilder,
     schema_view: &SchemaView,
+    hints: &HashMap<String, String>,
 ) -> Result<Option<(String, Option<String>)>, ScopeError> {
+    // A class the refined plan derived for a star its own domain left
+    // untyped -- read back at the pipeline's `resolve` step, never inferred
+    // here a second way. Consulted before the type triple so the two are
+    // checked to agree where both exist.
+    if let Some(class_uri) = hints.get(&builder.variable) {
+        if let Some(iri) = &builder.type_iri
+            && iri != class_uri
+        {
+            return Err(ScopeError::UnsupportedConstruct(format!(
+                "?{} is typed <{iri}> by its own domain and <{class_uri}> by the refined plan; \
+                 the scoper and the plan must agree",
+                builder.variable
+            )));
+        }
+        return Ok(Some((
+            class_uri.clone(),
+            schema_view
+                .get_class_by_uri(class_uri)
+                .ok()
+                .flatten()
+                .and_then(|cv| cv.identifier_slot().map(|s| s.name.clone())),
+        )));
+    }
     if let Some(iri) = &builder.type_iri {
         return match schema_view.get_class_by_uri(iri) {
             // Schema knows this class — keep the full IRI as the canonical
@@ -2907,6 +3013,7 @@ fn scope_union(
     branches: &[GraphPattern],
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
+    scoping: Scoping<'_>,
 ) -> Result<QueryPlan, ScopeError> {
     let pattern = query_pattern(query);
     let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
@@ -2953,6 +3060,7 @@ fn scope_union(
     // argument says nothing about. A cap nobody has argued for is the one
     // that answers short with no error. See `QueryPlan::sql_limit_if_unioned`.
     let mut branch_limits: Vec<Option<usize>> = Vec::new();
+    let mut untyped: Vec<String> = Vec::new();
 
     for (index, branch) in branches.iter().enumerate() {
         let branch_query = with_pattern(query, branch.clone());
@@ -2961,8 +3069,8 @@ fn scope_union(
         // rewrite it names -- `?m a <Municipality>` -- may be one the author
         // already wrote, in the other arm, and being told to add it again is
         // worse than not being told which arm is short.
-        let plan = scope_parsed_with_schema_graph(&branch_query, schema_view, schema_graph_iri)
-            .map_err(|err| match err {
+        let plan = scope_qualified(&branch_query, schema_view, schema_graph_iri, scoping).map_err(
+            |err| match err {
                 ScopeError::Unscoped { message, rewrite } => ScopeError::Unscoped {
                     message: format!(
                         "in UNION branch {} of {}: {message} Each branch is scoped on its own, \
@@ -2974,11 +3082,17 @@ fn scope_union(
                     rewrite,
                 },
                 other => other,
-            })?;
+            },
+        )?;
         branch_limits.push(
             plan.sql_limit
                 .filter(|_| plan.sql_limit_scope == Some(LimitScope::Rows)),
         );
+        for var in &plan.untyped {
+            if !untyped.contains(var) {
+                untyped.push(var.clone());
+            }
+        }
 
         // The stars this branch joins. Sharing one of them across branches is
         // how a join edge would end up narrowing another branch's fetch — see
@@ -3076,6 +3190,7 @@ fn scope_union(
         // than of one dropped triple: a branch's own cause, if it had one, is
         // a fact about a pattern this plan no longer has a node for.
         inexact: Some(Inexact::UnionBranch),
+        untyped,
     })
 }
 
@@ -4879,12 +4994,15 @@ fn untyped_subject_refusal(
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> ScopeError {
+    // The name as the query wrote it, with the sub-select it is private to:
+    // `?s__d1` is the `?s` of sub-select 1, and the author wrote `?s`.
+    let shown = display_name(var);
     // Typed with a class the schema does not know: not "add a type" but "fix
     // the one you wrote".
     if let Some(iri) = star_map.get(var).and_then(|b| b.type_iri.as_deref()) {
         return ScopeError::Unscoped {
             message: format!(
-                "?{var} has rdf:type <{iri}>, which is not a class in the schema, so no \
+                "?{shown} has rdf:type <{iri}>, which is not a class in the schema, so no \
                  records can be read for it. Check the class IRI and its prefix."
             ),
             rewrite: None,
@@ -4895,13 +5013,16 @@ fn untyped_subject_refusal(
         let path = reach.slot_path.join(".");
         return ScopeError::Unscoped {
             message: format!(
-                "?{var} is the object of `{path}` on ?{holder}, a reference to <{class}>, but \
+                "?{shown} is the object of `{path}` on ?{holder}, a reference to <{class}>, but \
                  has no rdf:type; only typed subjects are read from the database, so a triple \
-                 with ?{var} as its subject can never match.",
-                holder = reach.star_var,
+                 with ?{shown} as its subject can never match.",
+                holder = display_name(&reach.star_var),
                 class = reach.range_class_uri,
             ),
-            rewrite: Some(format!("?{var} a <{class}>", class = reach.range_class_uri)),
+            rewrite: Some(format!(
+                "?{shown} a <{class}>",
+                class = reach.range_class_uri
+            )),
         };
     }
     // Bound to a value: a literal has no triples, so the pattern is empty by
@@ -4940,14 +5061,14 @@ fn untyped_subject_refusal(
         };
         return ScopeError::Unscoped {
             message: format!(
-                "?{var} is bound to a concept of <{enum_iri}> (the value of `{slot_name}` on \
+                "?{shown} is bound to a concept of <{enum_iri}> (the value of `{slot_name}` on \
                  ?{holder}), not a record: its labels and code are in the schema graph, which \
                  a triple pattern reaches only inside a GRAPH clause -- written inside the \
                  OPTIONAL, if the pattern was optional. `skos:notation` there is the code, \
                  `rdfs:label` the name."
             ),
             rewrite: Some(format!(
-                "GRAPH {graph} {{ ?{var} <http://www.w3.org/2004/02/skos/core#prefLabel> ?label }}"
+                "GRAPH {graph} {{ ?{shown} <http://www.w3.org/2004/02/skos/core#prefLabel> ?label }}"
             )),
         };
     }
@@ -4972,7 +5093,7 @@ fn untyped_subject_refusal(
     if is_value {
         return ScopeError::Unscoped {
             message: format!(
-                "?{var} is bound to a value, not a record, so it cannot be the subject of a \
+                "?{shown} is bound to a value, not a record, so it cannot be the subject of a \
                  triple pattern. Use a variable that names a record."
             ),
             rewrite: None,
@@ -4987,11 +5108,11 @@ fn untyped_subject_refusal(
         // One class declares the combination: that is the rewrite.
         return ScopeError::Unscoped {
             message: format!(
-                "?{var} has no rdf:type; only typed subjects are read from the database, so a \
-                 triple with ?{var} as its subject can never match. The slots it reads are \
+                "?{shown} has no rdf:type; only typed subjects are read from the database, so a \
+                 triple with ?{shown} as its subject can never match. The slots it reads are \
                  declared on <{class}>."
             ),
-            rewrite: Some(format!("?{var} a <{class}>")),
+            rewrite: Some(format!("?{shown} a <{class}>")),
         };
     }
     if !declared_on.is_empty() {
@@ -5002,8 +5123,8 @@ fn untyped_subject_refusal(
             .join(", ");
         return ScopeError::Unscoped {
             message: format!(
-                "?{var} has no rdf:type; only typed subjects are read from the database, so a \
-                 triple with ?{var} as its subject can never match. Add `?{var} a <Class>`; \
+                "?{shown} has no rdf:type; only typed subjects are read from the database, so a \
+                 triple with ?{shown} as its subject can never match. Add `?{shown} a <Class>`; \
                  the slots it reads are declared on {listed}."
             ),
             rewrite: None,
@@ -5011,11 +5132,22 @@ fn untyped_subject_refusal(
     }
     ScopeError::Unscoped {
         message: format!(
-            "?{var} has no rdf:type; only typed subjects are read from the database, so a \
-             triple with ?{var} as its subject can never match. Add `?{var} a <Class>`, \
+            "?{shown} has no rdf:type; only typed subjects are read from the database, so a \
+             triple with ?{shown} as its subject can never match. Add `?{shown} a <Class>`, \
              naming the class whose records it stands for."
         ),
         rewrite: None,
+    }
+}
+
+/// A qualified variable as the author wrote it, naming the sub-select it is
+/// private to: `s__d1` reads `s (in sub-select 1)`.
+fn display_name(var: &str) -> String {
+    let (base, domain) = crate::sparql_domains::split(var);
+    if domain == 0 {
+        base
+    } else {
+        format!("{base} (in sub-select {domain})")
     }
 }
 

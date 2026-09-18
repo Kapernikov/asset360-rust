@@ -998,6 +998,12 @@ impl Rule for DeliverOptionalRead<'_> {
                 {
                     return None;
                 }
+                // And in the same naming domain: a match inside a sub-select
+                // under the `OPTIONAL` reads a variable of its own, whatever
+                // it is spelled.
+                if plan.naming_domain_of(id) != plan.naming_domain_of(scan) {
+                    return None;
+                }
                 let optional = plan.nodes.iter().any(|above| {
                     matches!(&above.op, PlanOp::LeftJoin { left, right, .. }
                         if plan.feeds(id, *right) && mandatorily_feeds(plan, scan, *left))
