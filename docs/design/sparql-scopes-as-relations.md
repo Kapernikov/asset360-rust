@@ -1,7 +1,118 @@
 # A body is a relation: lowering a grouped sub-select and an `OPTIONAL` body as one derived table
 
-Status: **design, nothing built.** Draft PR for review; the two issues it
-answers stay parked until the design is agreed. **Revision 7**, after
+Status: **implemented on this branch** (revision 8; the human chose not
+to stage). Items 1–4 of *Staging* are one body of work, in commits
+titled by item; item 0 (the oxigraph backport) is consolidator issue
+#467 and not here. Where building it showed this document wrong or
+silent, the section below says what changed and the text is amended in
+place; nothing diverges silently. The consolidator side (contract
+check, the new operator renderings, the `SELECT DISTINCT e.value`
+structure-dedup fix, pin bump) is a second MR after a release.
+
+<details><summary>What building it changed (revision 8), point by point</summary>
+
+* **Op 1 is the builder's, not a rule.** Every `LeftJoin` right side and
+  every `EXISTS` block is built already enclosed
+  (`Builder::enclose`), and an off-spine `Slice`/`Distinct`/`Reduced`/
+  `Project` builds its sub-query on a fresh spine wrapped whole in one
+  `SubSelect`. `EncloseOptionalBody` as a rewrite would have had to
+  find the body's edge after the fact; the builder has it. The pinned
+  trees (test 9, `the_barrier_wraps_the_complete_sub_query`) are the
+  contract. `PlanOp::SubSelect` carries `domain: Option<usize>` — the
+  naming domain a user-written sub-select opened, `None` for the
+  builder's own enclosure, which opens none.
+* **The absorb rules stay refinement rules; the physical choice is a
+  *transparent* barrier.** `AbsorbOptionalRead` / `AbsorbOptionalReference`
+  match *through* the barrier and unwrap it; the lowering then elides a
+  barrier of *transparent shape* (an optional body under a `LeftJoin`
+  with a recorded reference edge) and renders today's SQL, and lowers
+  every other barrier as a `Relation`. Moving absorption *into* the
+  lowering would have meant two places that know the optional's shape.
+  `PushLeftJoin` finds its edge only across transparent shapes
+  (`feeds_through_transparent_shapes`).
+* **`outputs(Scan)` includes an absorbed optional's bindings** (every
+  slot with a variable, whatever its presence). The transition check
+  fired on `AbsorbOptionalRead` otherwise: the export it kept had, by
+  the old definition, no producer.
+* **A barrier may export a variable nothing below produces** (a name
+  the sub-select projects but never binds): the export is an unbound
+  column, and *closure on producers* holds of the producers that exist.
+* **`JoinKey::Cross` is raised only when one side is a scalar relation**
+  (a keyless `Group`, or a `LIMIT` of at most one). A cross join of two
+  bags with no key is correct and made a disconnected `OPTIONAL` lower
+  as a product; the scoper's connectivity refusal is the contract there,
+  so op 5 does not compete with it.
+* **`applies_to_every_answer` is local to the naming domain and gains no
+  keyless-`Group` arm.** A narrowing proved inside an `OPTIONAL` body
+  reached the outer fetch through a shared star name in the materialise
+  corpus; keying by domain closed it, and the keyless-`Group` arm the
+  document proposed was what let *no spelling of an identity* through.
+* **Structures are keys and count arguments when not serialising.**
+  `key_is_readable` accepts a structure (`is_structure`) and a relation
+  column; `PushGrouping` requires serialisable keys only in the root
+  scope, where the key is an answer. `COUNT(?d)` over an element groups
+  by its occurrence, as *What may cross a relation* promised.
+* **Op 3a's preconditions, as built:** one side of the join is a
+  barrier (a restriction inside one scope changed constant-object
+  shapes and is never needed: the fold sees the class); `?v` is
+  guaranteed on both sides; the other side has an `identity_class` for
+  it; the restricted side binds `?v` only as `Computed` (read as a
+  star, `reads_as_a_star`), does not type it itself (`types_itself`,
+  which also needs `FoldMatchesIntoScan` to count classes per scope as
+  a *set*, so two matches of one class on one star are not "two
+  classes"), is not an absorb shape (`only_reference_reads &&
+  absorb_reference_shape`, `single_read_body`: the rule would change
+  the SQL of a query the absorb rules already serve), and the consumer
+  the filter is inserted under is a scope root (`[E]`).
+* **A restriction 3b cannot carry to a scan is an engine node**, not an
+  `IN (SELECT …)` rendering: `Expr::InClass` becomes `EXISTS { ?v a
+  <C> }` on the engine leg and the row stays whichever outcome the rest
+  of the plan earns. The `IN (SELECT …)` spelling is not built.
+* **The restriction folds only with a variable-object read beneath.**
+  `FoldMatchesIntoScan` takes an `InClass` filter as the star's type
+  source and reroutes the filter's consumers to its input; with only
+  constant-object reads under it there is no slot to fold and the rule
+  declines rather than orphan the join.
+* **The 3b log is a `Display` without the path:** the rule-order test
+  compares printouts, and two schedules that reach one plan by different
+  transfers must print the same.
+* **The scoper is keyed by an alpha-renaming:** `sparql_domains::qualify`
+  renames every variable of a sub-select to `<name>__d<n>` with the
+  builder's numbering, so `(naming domain, variable)` is one string
+  through the scoper unchanged; `resolve` reads the plan's `Scan` by
+  domain number and types an untyped star from it (`Scoping::Record`,
+  then `resolve`, then `Scoping::Resolve(&hints)` with an agreement
+  check). The `sparql_scope` linter binding still runs the scoper
+  alone, so it refuses what `resolve` would type — the linter is a
+  stricter check, deliberately, until the consolidator asks otherwise.
+* **`Obligation::Boundary(Restriction)`** joins the append-only ledger;
+  `refinement_never_changes_the_obligations` holds as a prefix
+  property (boundary obligations are appended).
+* **Contract 5's fields, beyond the document:** `Op::Join.right_reading`
+  (`any_element` is the fetch's containment, `bound_element` the
+  statement's own row), `Op::Unnest.dedup` (`by_value` / `by_occurrence`),
+  `BindingSpec.relation` and `.occurrence`; `PushNotExists` declines an
+  element-held key. On the Python side: `PlanOp.relation_alias` /
+  `relation_body` / `relation_columns`, `join_key` + `join_key_left` /
+  `join_key_right`, `right_reading`, `dedup`; `PushdownBinding.relation`
+  / `.occurrence`; `JoinColumn`, `RelationColumn`.
+* **`resolve_terms`: only identities beside slots resolve to the
+  identity.** Two `Slot` terms of one variable stay distinct; two
+  `Structure` terms agree only on `(holder class, path)`.
+* **`Op::Join`/`LeftJoin` with a reference edge demand the edge's
+  variables** (the oracle caught a barrier that had pruned the referenced
+  star, lowering as a product), and an absorbed optional collection is
+  translated as optional (the scan arm of `plan_to_algebra` skips a
+  multivalued optional read, which its `Unnest` arm renders).
+
+Test counts at the head: 536 library tests and 5 stub tests, of which
+the per-rewrite oracle runs every rule over every grammar query, three
+schedules, `MAX_ROUNDS = 1`, and every `Rejected` row of the table is a
+test asserting the refusal.
+
+</details>
+
+**Revision 7**, after
 [review round 6](https://github.com/Kapernikov/asset360-rust/pull/49#issuecomment-5734065400),
 which accepted AC5 (the whole-path occurrence) and `demand` as the
 prune's precondition, and found one gap: the post-state invariant
@@ -327,8 +438,9 @@ Two tests every section below is held to:
 ## Acceptance criteria — the definition of done
 
 Review round 4 stated these ten as the non-negotiable criteria for the
-full design. "Met" means the **design contract** is specified, not that
-unbuilt code passes a test. Each row names where the contract lives;
+full design. "Met" meant the **design contract** is specified; at
+revision 8 each row is also backed by the tests it names, on this
+branch. Each row names where the contract lives;
 a row that is not met says "not yet — see Q*n*". The criteria do not ask
 for a particular optimizer framework, a cost model, an exact SQL
 spelling, or every SPARQL construct; they ask that the chosen domain be
@@ -2553,6 +2665,9 @@ answer blocks the first MR.
 
 Four MRs, each shippable and each parity-tested; the first serves #466
 on its own and is narrower than revision 2's, as the review asked.
+*Built as one body of work on this branch, per the human's call
+("i'd not do staging"); the items survive as the commit subjects and as
+the grouping below.*
 
 0. **Not in this document, and first:** the oxigraph optimizer fix for
    #464's engine cost — PR 1733's hunk on `sparopt 0.3.7` under
