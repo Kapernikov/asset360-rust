@@ -3916,6 +3916,29 @@ class PlanOp:
         For ``"scan"``: slots that may be absent, so no existence check.
         """
     @property
+    def required_paths(self) -> builtins.list[tuple[builtins.list[builtins.str], builtins.list[builtins.str]]]:
+        r"""
+        For ``"scan"``: nested reads that must find a value, as
+        ``[(slot_path, containers), ...]`` with ``containers`` parallel to
+        ``slot_path`` (``"single"``, ``"list"`` or ``"mapping"`` per step).
+        
+        ``required_slots`` restates the first hop of ``?s :superStructure ?c .
+        ?c :hasMaterial ?v``; this restates the rest. **Not optional to
+        read**: the fetch bound (a claim-free ``slice`` on this pass) rests on
+        every fetched row yielding a solution, and a record whose structure
+        lacks the value is a fetched row that yields none -- ``LIMIT 50``
+        answered 38, silently, until the scan checked (issue #455, pepibru
+        GitLab). Render every entry of one scan as **one** predicate over the
+        record, so two leaves under one collection hop are required on the
+        same element: ``jsonb_path_exists(object_data, '$."a"[*]."b" ? (@ !=
+        null)')``, ``[*]`` at a list hop, ``.*`` at a mapping hop, and the
+        leaf not JSON ``null`` because an explicit ``null`` emits no triple.
+        
+        Empty where the scoper restated nothing -- and where it *could not*
+        restate a mandatory nested read, the pass carries no fetch bound at
+        all, so a renderer never sees a bound whose premise is missing.
+        """
+    @property
     def retrieval(self) -> typing.Optional[builtins.list[builtins.str]]:
         r"""
         What the fetch must retrieve for a scan's records.
@@ -4099,6 +4122,14 @@ class PlanOp:
     def bindings(self) -> builtins.list[PushdownBinding]:
         r"""
         For ``"group"``: one entry per projected value, addressed by position.
+        
+        For ``"project"``: the columns of an **ungrouped** statement that
+        answers -- the projected variables first, in ``SELECT`` order, then
+        the columns its ``sort`` names and the answer does not, every fan-out,
+        and the identity of every star (the row's key, which is what makes
+        its ``ORDER BY`` total and a page a partition). Empty for a projection
+        above a grouping, whose ``"group"`` carries the columns, and for a
+        fetch, which projects nothing.
         """
     @property
     def keys(self) -> builtins.list[builtins.int]:
@@ -5681,6 +5712,13 @@ class Star:
         that is a larger number reported without a warning. Every path here is
         single-valued at every hop and outside any ``OPTIONAL``; anything else
         stays with the engine.
+        """
+    @property
+    def required_paths(self) -> builtins.list[tuple[builtins.list[builtins.str], builtins.list[builtins.str]]]:
+        r"""
+        Nested reads the scan restates as presence checks, as
+        ``[(slot_path, containers), ...]`` -- the same shape and the same
+        obligation as ``PlanOp.required_paths``; see there.
         """
     @property
     def slot_variables(self) -> builtins.dict[builtins.str, builtins.str]:

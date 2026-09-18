@@ -135,6 +135,12 @@ pub enum Op {
         required_slots: Vec<String>,
         /// Slots that may be absent, so no existence check.
         optional_slots: Vec<String>,
+        /// Nested reads that must find a value: one predicate over the record
+        /// per scan -- see [`crate::sparql_scoper::RequiredPath`]. The
+        /// premise of the fetch bound, restated where the scoper could and
+        /// the bound declined where it could not; a renderer that ignores
+        /// these and applies the bound pages short, silently.
+        required_paths: Vec<crate::sparql_scoper::RequiredPath>,
         /// Whether the star itself appears only inside `OPTIONAL`.
         ///
         /// Decides both the join type above it and whether its own conditions
@@ -337,9 +343,20 @@ pub enum Op {
     /// The variables the query asked for, in `SELECT` order. Anything not
     /// listed is machinery: a variable that exists only to be grouped by, or
     /// an aggregate spargebra named internally.
+    ///
+    /// `bindings` is empty above a grouping, whose [`Op::Group`] already
+    /// carries the columns. **Non-empty, it makes the statement the answer**:
+    /// an ungrouped projection whose every row is one solution, with one
+    /// binding per column the statement selects -- the projected variables
+    /// first, in `SELECT` order, then the columns the modifiers above need
+    /// and the answer does not name (an `ORDER BY` term the query does not
+    /// select, every fan-out below, and the identity of every star, which
+    /// is what makes the row order total so that a page is a partition).
+    /// A renderer reads a `sort` above this node by index into this list.
     Project {
         input: OpId,
         vars: Vec<String>,
+        bindings: Vec<crate::sparql_pushdown::BindingSpec>,
     },
 }
 
@@ -435,6 +452,7 @@ pub fn lower_sql_pass(
                 identifier_values: star.identifier_values.clone(),
                 required_slots: star.required_fields.clone(),
                 optional_slots: star.optional_fields.clone(),
+                required_paths: star.required_paths.clone(),
                 is_optional: star.is_optional,
                 // The scoper's decomposition, used when the refinement
                 // pipeline produced nothing. Nothing here knows what the query
@@ -806,7 +824,97 @@ pub fn lower_refined(
     fetch_bound: Option<usize>,
     unioned_fetch_bound: Option<usize>,
 ) -> Result<OpTree, LoweringRefusal> {
+    lower_refined_with(
+        plan,
+        schema,
+        &FetchBounds {
+            limit: fetch_bound,
+            limit_if_unioned: unioned_fetch_bound,
+            required_paths: std::collections::HashMap::new(),
+        },
+    )
+}
+
+/// The scoper's decisions about the fetch, carried into [`lower_refined_with`]
+/// together: the bound, and the premise the bound rests on.
+///
+/// The two travel as one value because they are one decision. A bound is
+/// sound only where each fetched row of the bounded scan yields a solution,
+/// and the nested reads in `required_paths` are what makes that true of a
+/// record read through a path (`crate::sparql_scoper::RequiredPath`). A
+/// lowering handed the bound without the premise would render a statement
+/// that pages short.
+#[derive(Debug, Clone, Default)]
+pub struct FetchBounds {
+    /// [`crate::sparql_scoper::QueryPlan::sql_limit`].
+    pub limit: Option<usize>,
+    /// [`crate::sparql_scoper::QueryPlan::sql_limit_if_unioned`].
+    pub limit_if_unioned: Option<usize>,
+    /// The nested reads each scan restates, keyed by the star's variable and
+    /// class -- the two things a refined scan and a scoped star share.
+    pub required_paths:
+        std::collections::HashMap<(String, String), Vec<crate::sparql_scoper::RequiredPath>>,
+}
+
+impl FetchBounds {
+    /// What the scoper decided, read off its plan.
+    ///
+    /// A `UNION` is the one shape where a scoped star is not one refined
+    /// scan: `scope_union` merges the branches and gives a variable scanned
+    /// in two arms two stars (`?s` and `?s__u1`), while the refined plan
+    /// scans `?s` twice. Where the two arms restate the same nested reads --
+    /// or none -- the key is unambiguous. Where they differ, no key can say
+    /// which arm's reads belong to which scan, so nothing is attached to
+    /// either and the bound is declined: the union's bound rests on every
+    /// arm's rows being solutions, and one arm's premise can no longer be
+    /// stated on its scan.
+    pub fn of(scoped: &crate::sparql_scoper::QueryPlan) -> Self {
+        let mut required_paths: std::collections::HashMap<
+            (String, String),
+            Vec<crate::sparql_scoper::RequiredPath>,
+        > = std::collections::HashMap::new();
+        let mut ambiguous = false;
+        for star in scoped.root.all_stars() {
+            // A union renames a second star of one variable `var__uN`;
+            // the refined plan knows it by the query's own name.
+            let var = star
+                .variable
+                .split_once("__u")
+                .map_or(star.variable.as_str(), |(base, _)| base)
+                .to_owned();
+            let key = (var, star.class_uri.clone());
+            match required_paths.get(&key) {
+                Some(existing) if *existing != star.required_paths => ambiguous = true,
+                Some(_) => {}
+                None => {
+                    required_paths.insert(key, star.required_paths.clone());
+                }
+            }
+        }
+        if ambiguous {
+            return Self::default();
+        }
+        Self {
+            limit: scoped.sql_limit,
+            limit_if_unioned: scoped.sql_limit_if_unioned,
+            required_paths,
+        }
+    }
+}
+
+/// [`lower_refined`], with the fetch bound's premise alongside the bound.
+///
+/// This is the entry point the planner uses; the four-argument form exists
+/// for tests that build a refined plan by hand and have no scoped plan to
+/// read a premise from.
+pub fn lower_refined_with(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    bounds: &FetchBounds,
+) -> Result<OpTree, LoweringRefusal> {
     use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp, SlotPresence};
+    let fetch_bound = bounds.limit;
+    let unioned_fetch_bound = bounds.limit_if_unioned;
 
     // Before the island analysis, because a UNION the rules did not push is
     // the shape that analysis cannot see -- see
@@ -1013,6 +1121,16 @@ pub fn lower_refined(
                             .filter(|slot| Some(slot.as_str()) != identifier.as_deref())
                             .collect(),
                         optional_slots: column_slots(SlotPresence::Optional),
+                        // The scoper's, not the refined plan's: the refined
+                        // scan lists the nested reads a rule folded into it,
+                        // which is fewer than the query wrote (a read through
+                        // a collection stays with the engine), and the
+                        // premise has to cover every mandatory read.
+                        required_paths: bounds
+                            .required_paths
+                            .get(&(star_var.clone(), class_uri.clone()))
+                            .cloned()
+                            .unwrap_or_default(),
                         // Whether the query only optionally wants these rows,
                         // which is what decides how the renderer wraps every
                         // condition on them. A scan on the optional side of a
@@ -1473,11 +1591,18 @@ pub fn lower_refined(
             }
             RefinedOp::Sort { terms, .. } => {
                 let input = remap[&node.op.inputs()[0]];
-                // An ordering is only renderable over a grouped result: it
-                // sorts columns of one, and the renderer places a term inside
-                // or outside the grouping by which kind of column it names.
-                // Below a grouping an ordering is the engine's -- the rows SQL
-                // hands back there are a fetch, not an answer.
+                // An ordering is only renderable over a result whose rows
+                // are solutions: it sorts columns of one, and the renderer
+                // places a term inside or outside a grouping by which kind of
+                // column it names. Below a grouping an ordering is the
+                // engine's -- the rows SQL hands back there are a fetch, not
+                // an answer. Above one the columns are the grouping's; with
+                // no grouping they are the projection's, built here because
+                // the sort sits *below* the projection in the algebra and is
+                // lowered first.
+                if grouped.is_none() {
+                    grouped = Some(projected_columns(plan, schema, &classes, id)?);
+                }
                 let Some(columns) = &grouped else {
                     return Err(LoweringRefusal::Unrenderable { node: id });
                 };
@@ -1525,10 +1650,28 @@ pub fn lower_refined(
             }
             RefinedOp::Project { vars, .. } => {
                 let input = remap[&node.op.inputs()[0]];
+                // Above a grouping the columns are the grouping's and this
+                // node carries none. With no grouping the projection *is*
+                // the statement's column list -- built here unless a sort
+                // below already needed it -- and carrying it is what makes
+                // the statement an answer rather than a fetch.
+                let has_group = nodes.iter().any(|node| matches!(node.op, Op::Group { .. }));
+                let bindings = if has_group {
+                    Vec::new()
+                } else {
+                    if grouped.is_none() {
+                        grouped = Some(projected_columns(plan, schema, &classes, id)?);
+                    }
+                    grouped
+                        .as_ref()
+                        .map(|columns| columns.bindings.clone())
+                        .unwrap_or_default()
+                };
                 nodes.push(OpNode {
                     op: Op::Project {
                         input,
                         vars: vars.clone(),
+                        bindings,
                     },
                     discharges: node.discharges.clone(),
                 });
@@ -1832,6 +1975,152 @@ impl GroupedColumns {
     }
 }
 
+/// The columns of an **ungrouped** statement that answers: what its rows
+/// carry, in the order the statement lists them.
+///
+/// Every row is one solution here, so the list is what a renderer selects
+/// and what a serialiser reads back, and the order is a contract with both:
+///
+/// 1. the projected variables, one binding each, in `SELECT` order;
+/// 2. every `ORDER BY` term the query does not select -- a column the
+///    statement sorts on and the answer does not name;
+/// 3. every fan-out below the projection, so the statement reads the
+///    array's elements and not the array (the same reason the grouping
+///    lowering adds them -- one row per element is what SPARQL answers);
+/// 4. the identity of every star the statement scans.
+///
+/// The fourth is what makes a page a partition. An `ORDER BY ?s` over a
+/// join is not a total order -- a record with two matches is two rows with
+/// one key -- and `LIMIT`/`OFFSET` over a partial order may return a tied row
+/// on two pages and its neighbour on none. Together with the fan-outs (each
+/// unnest yields distinct elements per record) the star identities are a key
+/// of the row, so the renderer can settle every tie the query's own ordering
+/// leaves, and a walk by `OFFSET` tiles: three consecutive pages are disjoint
+/// and their union is the head of the unbounded answer. The engine's own
+/// enumeration cannot make that promise, which is why an offset is answered
+/// here or not at all.
+///
+/// `None` where a column cannot be described -- a variable no `Sql` scan
+/// binds, an inlined structure (a blank node nothing can reproduce), a
+/// projected term the renderer has no term shape for -- and the lowering
+/// refuses, which hands the query to the engine.
+fn projected_columns(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    classes: &std::collections::HashMap<String, String>,
+    node: usize,
+) -> Result<GroupedColumns, LoweringRefusal> {
+    use crate::sparql_refine::{Executor, Expr as RefinedExpr, PlanOp as RefinedOp};
+
+    let unrenderable = || LoweringRefusal::Unrenderable { node };
+    let project = plan
+        .nodes
+        .iter()
+        .find(|node| matches!(node.op, RefinedOp::Project { .. }) && node.executor == Executor::Sql)
+        .ok_or_else(unrenderable)?;
+    let RefinedOp::Project { vars, .. } = &project.op else {
+        return Err(unrenderable());
+    };
+
+    let mut bindings: Vec<crate::sparql_pushdown::BindingSpec> = Vec::new();
+    // One column per projected variable, under that variable's own name --
+    // no deduplication by address here: two variables reading one slot are
+    // two columns of the answer, whatever they hold.
+    for var in vars {
+        let (star_var, class_uri, path) = scanned_column(plan, var).ok_or_else(unrenderable)?;
+        let spec = crate::sparql_pushdown::binding_spec(schema, &star_var, &class_uri, var, path)
+            .ok_or_else(unrenderable)?;
+        bindings.push(spec);
+    }
+    // Then the ordering's terms the answer does not name.
+    for sort in plan
+        .nodes
+        .iter()
+        .filter(|node| node.executor == Executor::Sql)
+    {
+        let RefinedOp::Sort { terms, .. } = &sort.op else {
+            continue;
+        };
+        for term in terms {
+            let RefinedExpr::Var(name) = &term.expr else {
+                return Err(unrenderable());
+            };
+            if bindings.iter().any(|spec| &spec.var == name) {
+                continue;
+            }
+            let (star_var, class_uri, path) =
+                scanned_column(plan, name).ok_or_else(unrenderable)?;
+            let spec =
+                crate::sparql_pushdown::binding_spec(schema, &star_var, &class_uri, name, path)
+                    .ok_or_else(unrenderable)?;
+            bindings.push(spec);
+        }
+    }
+    // Then every fan-out, by address: an element the answer already names
+    // is one lateral, not two.
+    for fanout in plan
+        .nodes
+        .iter()
+        .filter(|node| node.executor == Executor::Sql)
+    {
+        let RefinedOp::Unnest {
+            star_var,
+            slot_path,
+            var,
+            ..
+        } = &fanout.op
+        else {
+            continue;
+        };
+        if bindings
+            .iter()
+            .any(|spec| spec.star_var == *star_var && spec.slot_path == *slot_path)
+        {
+            continue;
+        }
+        let class_uri = classes.get(star_var).ok_or_else(unrenderable)?;
+        let spec = crate::sparql_pushdown::binding_spec(
+            schema,
+            star_var,
+            class_uri,
+            var,
+            slot_path.clone(),
+        )
+        .ok_or_else(unrenderable)?;
+        bindings.push(spec);
+    }
+    // And the identity of every scanned star, by address again, so the row
+    // has a key the renderer can order by.
+    for scan in plan
+        .nodes
+        .iter()
+        .filter(|node| node.executor == Executor::Sql)
+    {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            ..
+        } = &scan.op
+        else {
+            continue;
+        };
+        if bindings
+            .iter()
+            .any(|spec| spec.star_var == *star_var && spec.slot_path.is_empty())
+        {
+            continue;
+        }
+        let spec =
+            crate::sparql_pushdown::binding_spec(schema, star_var, class_uri, star_var, Vec::new())
+                .ok_or_else(unrenderable)?;
+        bindings.push(spec);
+    }
+    Ok(GroupedColumns {
+        bindings,
+        measures: Vec::new(),
+    })
+}
+
 /// Add a binding for the column a variable reads, or return the index of the
 /// one already there.
 ///
@@ -1988,57 +2277,81 @@ fn lower_having(
     })
 }
 
-fn scanned_column(
-    plan: &crate::sparql_refine::Plan,
-    var: &str,
-) -> Option<(String, String, Vec<String>)> {
+/// A column a variable reads: `(star, class, path)`, with an empty path for
+/// a record's own identity.
+type ScannedColumn = (String, String, Vec<String>);
+
+/// The column a variable reads -- see [`ScannedColumn`].
+///
+/// A variable can be bound in two places at once -- as one star's identity
+/// and as a slot value of another, which is what a pushed reference join is
+/// -- and on a *left* join the two columns are not the same value: the one on
+/// the optional side is `NULL` wherever the join found nothing. So the column
+/// on the **preserved side** is the binding, because that is the side every
+/// solution has: `?s :ref ?t . OPTIONAL { ?t a Track }` binds `?t` by the
+/// slot (the identity is `NULL` for a signal with no track), while `?s a Port
+/// . OPTIONAL { ?o a Port ; :adjacent ?s }` binds `?s` by the identity (the
+/// slot is `NULL` for a port nothing is adjacent to). Reading the optional
+/// side's column there answered `?s` unbound for six of eight ports.
+///
+/// Among the columns on one side a slot is read before the identity: on an
+/// inner join the two hold the same value, and the slot is the column the
+/// rule resolved. The optional side is read only when nothing on the
+/// preserved side binds the variable, which is an `OPTIONAL`'s own read.
+fn scanned_column(plan: &crate::sparql_refine::Plan, var: &str) -> Option<ScannedColumn> {
     use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
-    plan.nodes
-        .iter()
-        .find_map(|node| {
-            let RefinedOp::Scan {
-                star_var,
-                class_uri,
-                slots,
-                ..
-            } = &node.op
-            else {
-                return None;
-            };
-            if node.executor != Executor::Sql {
-                return None;
-            }
-            // Either presence: a group key may be a value the record need not
-            // have. That is the missing-value bucket -- the column reads `NULL`
-            // and the bucket is a group like any other -- and the existence check
-            // is what `presence` decides, which the scan carries separately.
-            slots
-                .iter()
-                .find(|slot| slot.var.as_deref() == Some(var))
-                .map(|slot| (star_var.clone(), class_uri.clone(), slot.path.clone()))
+
+    // Whether a scan sits on the optional side of a left join this
+    // statement renders.
+    let optional_side = |scan: usize| -> bool {
+        plan.nodes.iter().any(|node| {
+            matches!(&node.op, RefinedOp::LeftJoin { right, .. }
+                if node.executor == Executor::Sql && plan.feeds(scan, *right))
         })
-        // Or the record's own identity. `GROUP BY ?t` over a scanned star groups
-        // by its URI, which the renderer reads from the identifier column at the
-        // empty path -- a column of the row rather than a value in its payload.
-        //
-        // Slots first, and that order is the resolution the rule used: a variable
-        // that is both some star's identity and another star's slot value is a
-        // value join, which `Visible` reports as ambiguous and the rule declines
-        // before reaching here.
-        .or_else(|| {
-            plan.nodes.iter().find_map(|node| {
-                let RefinedOp::Scan {
-                    star_var,
-                    class_uri,
-                    ..
-                } = &node.op
-                else {
-                    return None;
-                };
-                (node.executor == Executor::Sql && star_var == var)
-                    .then(|| (star_var.clone(), class_uri.clone(), Vec::new()))
-            })
-        })
+    };
+
+    let mut candidates: Vec<(bool, usize, ScannedColumn)> = Vec::new();
+    for (id, node) in plan.nodes.iter().enumerate() {
+        let RefinedOp::Scan {
+            star_var,
+            class_uri,
+            slots,
+            ..
+        } = &node.op
+        else {
+            continue;
+        };
+        if node.executor != Executor::Sql {
+            continue;
+        }
+        let optional = optional_side(id);
+        // Either presence: a group key may be a value the record need not
+        // have. That is the missing-value bucket -- the column reads `NULL`
+        // and the bucket is a group like any other -- and the existence check
+        // is what `presence` decides, which the scan carries separately.
+        if let Some(slot) = slots.iter().find(|slot| slot.var.as_deref() == Some(var)) {
+            candidates.push((
+                optional,
+                0,
+                (star_var.clone(), class_uri.clone(), slot.path.clone()),
+            ));
+        }
+        // Or the record's own identity. `GROUP BY ?t` over a scanned star
+        // groups by its URI, which the renderer reads from the identifier
+        // column at the empty path -- a column of the row rather than a value
+        // in its payload.
+        if star_var == var {
+            candidates.push((
+                optional,
+                1,
+                (star_var.clone(), class_uri.clone(), Vec::new()),
+            ));
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by_key(|(optional, rank, _)| (*optional, *rank))
+        .map(|(_, _, column)| column)
 }
 
 /// The scan node for a star, in a tree being built.
@@ -2206,6 +2519,52 @@ mod tests {
             .collect()
     }
 
+    /// `FetchBounds::of` keys a scoped star's nested reads by variable and
+    /// class, which a `UNION` can make ambiguous: two arms scanning `?s` as
+    /// one class with different nested reads are two scoped stars and two
+    /// refined scans of one name. Then nothing is attached and the bound is
+    /// declined; where the arms agree, the key holds and the bound stays.
+    #[test]
+    fn a_union_whose_arms_restate_different_reads_declines_the_bound() {
+        let sv = test_schema_view();
+        let scope = |query: &str| {
+            crate::sparql_scoper::sparql_scope(&format!("{PREFIX}{query}"), &sv).unwrap()
+        };
+
+        let differing = FetchBounds::of(&scope(
+            "SELECT ?s ?v WHERE { { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v } UNION { ?s a asset360:Signal ; asset360:location ?c2 . \
+             ?c2 asset360:latitude ?v } } LIMIT 10",
+        ));
+        assert_eq!(differing.limit_if_unioned, None);
+        assert!(differing.required_paths.is_empty(), "{differing:?}");
+
+        let agreeing = FetchBounds::of(&scope(
+            "SELECT ?s ?v WHERE { { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v } UNION { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v ; asset360:latitude ?la } } LIMIT 10",
+        ));
+        // The second arm reads one leaf more, so the two arms are two stars
+        // of one name again -- and they disagree, so this declines too. The
+        // key only holds where the arms restate the same reads.
+        assert_eq!(agreeing.limit_if_unioned, None);
+
+        let same = FetchBounds::of(&scope(
+            "SELECT ?s ?v WHERE { { ?s a asset360:Signal ; asset360:location ?c . \
+             ?c asset360:longitude ?v } UNION { ?s a asset360:BaliseGroup ; \
+             asset360:refersToSignal ?v } } LIMIT 10",
+        ));
+        assert_eq!(same.limit_if_unioned, Some(10), "{same:?}");
+        assert_eq!(
+            same.required_paths[&(
+                "s".to_owned(),
+                "https://data.infrabel.be/asset360/Signal".to_owned()
+            )]
+                .len(),
+            1
+        );
+    }
+
     /// Every refined plan the rules produce for these queries lowers, and the
     /// tree it lowers to is well formed -- the invariant a renderer walking
     /// the list in order depends on.
@@ -2237,6 +2596,183 @@ mod tests {
         }
     }
 
+    /// An ungrouped projection that answers carries its columns, in the
+    /// order the renderer and the serialiser both rely on: the projected
+    /// variables, then the ordering's unprojected terms, then every fan-out,
+    /// then every star's identity -- and the sort addresses them by index.
+    #[test]
+    fn an_answering_projection_carries_its_columns() {
+        let sv = test_schema_view();
+        let tree = lowered(
+            "SELECT ?nm ?k WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:trafficKinds ?k ; asset360:length ?len } \
+             ORDER BY ?len ?nm LIMIT 5 OFFSET 10",
+            &sv,
+        )
+        .expect("an answering projection lowers");
+        assert!(tree.is_well_formed());
+        let Op::Project { vars, bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        assert_eq!(vars, &["nm", "k"]);
+        let columns: Vec<(String, Vec<String>)> = bindings
+            .iter()
+            .map(|spec| (spec.var.clone(), spec.slot_path.clone()))
+            .collect();
+        assert_eq!(
+            columns,
+            vec![
+                ("nm".to_owned(), vec!["name".to_owned()]),
+                ("k".to_owned(), vec!["trafficKinds".to_owned()]),
+                ("len".to_owned(), vec!["length".to_owned()]),
+                ("s".to_owned(), Vec::new()),
+            ],
+            "projected, then the sort's own, then the identity"
+        );
+        // The fan-out is a binding whose path holds a collection -- the
+        // renderer builds its LATERAL from that, one row per element.
+        assert!(
+            bindings[1]
+                .containers
+                .iter()
+                .any(|c| *c != crate::sparql_pushdown::Container::Single),
+            "{:?}",
+            bindings[1].containers
+        );
+        let Op::Sort { terms, .. } = &tree.nodes[tree.find("sort")[0]].op else {
+            panic!("a sort node");
+        };
+        let keys: Vec<crate::sparql_pushdown::OrderKey> = terms.iter().map(|t| t.key).collect();
+        assert_eq!(
+            keys,
+            vec![
+                crate::sparql_pushdown::OrderKey::Binding(2),
+                crate::sparql_pushdown::OrderKey::Binding(0)
+            ]
+        );
+        let Op::Slice { limit, offset, .. } = &tree.nodes[tree.find("slice")[0]].op else {
+            panic!("a slice node");
+        };
+        assert_eq!((*limit, *offset), (Some(5), 10));
+        // The slice is the query's own, claimed -- not a fetch bound.
+        assert_eq!(fetch_bound_of(&tree), None);
+        assert!(!tree.nodes[tree.find("slice")[0]].discharges.is_empty());
+
+        // A reference read inside the OPTIONAL: `?t` is the referenced
+        // star's identity, never the raw reference value -- a reference to a
+        // record that is not a `Track` leaves `?t` unbound, as the `OPTIONAL`
+        // answers.
+        let tree = lowered(
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track } } \
+             ORDER BY ?s LIMIT 50 OFFSET 100",
+            &sv,
+        )
+        .expect("the export shape lowers as one answering statement");
+        let Op::Project { bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        let t = bindings
+            .iter()
+            .find(|spec| spec.var == "t")
+            .expect("?t is a column");
+        assert_eq!(
+            (t.star_var.as_str(), t.slot_path.as_slice()),
+            ("t", &[][..])
+        );
+        assert!(matches!(
+            &tree.nodes[tree.find("join")[0]].op,
+            Op::Join { kind: crate::sparql_scoper::JoinType::Left, right_slot, .. }
+                if right_slot == "locatedOnTrack"
+        ));
+
+        // The foreign key on the optional star: `?s` is the preserved star's
+        // identity, not the optional star's slot -- which is `NULL` for a
+        // port nothing is adjacent to, and answered `?s` unbound for six of
+        // eight ports.
+        let tree = lowered(
+            "SELECT ?s ?o WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?o a asset360:BaliseGroup ; asset360:refersToSignal ?s } } \
+             ORDER BY ?s LIMIT 2",
+            &sv,
+        )
+        .expect("lowers as one answering statement");
+        let Op::Project { bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        let s = bindings
+            .iter()
+            .find(|spec| spec.var == "s")
+            .expect("?s is a column");
+        assert_eq!(
+            (s.star_var.as_str(), s.slot_path.as_slice()),
+            ("s", &[][..])
+        );
+        // And the other way round: the foreign key on the preserved star
+        // binds `?t` by the slot, which every signal has; the `Track`'s
+        // identity is `NULL` where there is no track.
+        let tree = lowered(
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } } LIMIT 2",
+            &sv,
+        )
+        .expect("lowers as one answering statement");
+        let Op::Project { bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        let t = bindings
+            .iter()
+            .find(|spec| spec.var == "t")
+            .expect("?t is a column");
+        assert_eq!(
+            (t.star_var.as_str(), t.slot_path.as_slice()),
+            ("s", &["locatedOnTrack".to_owned()][..])
+        );
+
+        // Above a grouping the projection carries nothing: the columns are
+        // the grouping's.
+        let tree = lowered(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm",
+            &sv,
+        )
+        .expect("a grouping lowers");
+        let Op::Project { bindings, .. } = &tree.nodes[tree.find("project")[0]].op else {
+            panic!("a project node");
+        };
+        assert!(bindings.is_empty());
+    }
+
+    /// A group key bound on both sides of a left join reads the preserved
+    /// side -- the same resolution the projection makes, and a wrong answer
+    /// the grouped route shipped: keyed on the optional star's slot, every
+    /// record the join left unmatched fell into one `NULL` bucket.
+    #[test]
+    fn a_group_key_bound_on_both_sides_of_a_left_join_reads_the_preserved_side() {
+        let sv = test_schema_view();
+        let tree = lowered(
+            "SELECT ?s (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?o a asset360:BaliseGroup ; asset360:refersToSignal ?s } } \
+             GROUP BY ?s",
+            &sv,
+        )
+        .expect("a grouping over a pushed left join lowers");
+        let Op::Group { bindings, keys, .. } = &tree.nodes[tree.find("group")[0]].op else {
+            panic!("a group node");
+        };
+        let key = &bindings[keys[0]];
+        assert_eq!(
+            (
+                key.var.as_str(),
+                key.star_var.as_str(),
+                key.slot_path.as_slice()
+            ),
+            ("s", "s", &[][..]),
+            "{:?}",
+            bindings
+        );
+    }
+
     /// A narrowing pass drops the fan-out and weakens the element condition to
     /// a containment test.
     ///
@@ -2254,8 +2790,10 @@ mod tests {
     #[test]
     fn a_narrowing_pass_reads_the_record_and_not_the_element() {
         let sv = test_schema_view();
-        let query = "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
-                     FILTER(?k = \"m\") }";
+        let query = &format!(
+            "SELECT ?k WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             FILTER(?k = \"m\") {KEEP_A_FETCH} }}"
+        );
         let plan = refined_plan(query, &sv);
         // The refined plan itself says element: the unnest is there and the
         // condition names what it bound.
@@ -2368,7 +2906,10 @@ mod tests {
         // A containment test on a collection, which the rules render as an
         // element test.
         let mut plan = refined_plan(
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }",
+            &format!(
+                "SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds \"m\" \
+                 {KEEP_A_FETCH} }}"
+            ),
             &sv,
         );
         lower_refined(&plan, &sv, None, None).expect("as built, it lowers");
@@ -2388,7 +2929,10 @@ mod tests {
 
         // And a scan claiming to scope a subject to a class it does not scan.
         let mut plan = refined_plan(
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            &format!(
+                "SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm \
+                 {KEEP_A_FETCH} }}"
+            ),
             &sv,
         );
         let scan = plan.find("scan")[0];
@@ -2421,7 +2965,10 @@ mod tests {
         // A read the scan claims and does not make. The claim is what makes it
         // wrong: the engine was told this node answered it, so nobody does.
         let mut plan = refined_plan(
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm }",
+            &format!(
+                "SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm \
+                 {KEEP_A_FETCH} }}"
+            ),
             &sv,
         );
         let scan = plan.find("scan")[0];
@@ -2439,8 +2986,10 @@ mod tests {
         // so no ledger notices, and the engine cannot find a solution in a row
         // the fetch never returned.
         let plan = refined_plan(
-            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
-             LIMIT 10 OFFSET 5",
+            &format!(
+                "SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm \
+                 {KEEP_A_FETCH} }} LIMIT 10 OFFSET 5"
+            ),
             &sv,
         );
         lower_refined(&plan, &sv, Some(15), None).expect("exactly enough rows lowers");
@@ -2684,6 +3233,15 @@ mod tests {
         lower_refined(&refined_plan(query, sv), sv, None, None)
     }
 
+    /// A conjunct no rule pushes, to keep a query a *fetch*.
+    ///
+    /// A fully pushed `SELECT` now answers in SQL (`PushProjection`), so a
+    /// test about the fetch -- the pass an engine finishes -- needs one
+    /// construct the statement cannot take. A `REGEX` is that: it stays with
+    /// the engine, every pushable conjunct sinks below it, and the rows the
+    /// statement returns are a narrowing again.
+    const KEEP_A_FETCH: &str = " FILTER(REGEX(STR(?s), \"^x\"))";
+
     /// A condition on a multivalued slot is a test over the array's elements,
     /// and the operator has to say so.
     ///
@@ -2708,16 +3266,30 @@ mod tests {
                 .collect()
         };
 
+        // A fetch reads the record: the engine re-runs the query, so the
+        // containment test is the narrowing that selects the same records.
         assert_eq!(
-            readings("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" }"),
+            readings(&format!(
+                "SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds \"m\" \
+                 {KEEP_A_FETCH} }}"
+            )),
             vec![(vec!["trafficKinds".to_owned()], SlotReading::AnyElement)],
         );
+        assert_eq!(
+            readings(&format!(
+                "SELECT ?k WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+                 FILTER(?k = \"m\") {KEEP_A_FETCH} }}"
+            )),
+            vec![(vec!["trafficKinds".to_owned()], SlotReading::AnyElement)],
+        );
+        // A statement that answers keeps the fan-out and reads the element
+        // it bound: one row per matching value is what SPARQL answers.
         assert_eq!(
             readings(
                 "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
                  FILTER(?k = \"m\") }"
             ),
-            vec![(vec!["trafficKinds".to_owned()], SlotReading::AnyElement)],
+            vec![(vec!["trafficKinds".to_owned()], SlotReading::BoundElement)],
         );
         // A single-valued slot names a column, and so does a value inside a
         // structure: the scoper walks single-valued hops only.
@@ -2931,10 +3503,10 @@ mod tests {
 
         // The engine finishes: the same shape of filter narrows only, because
         // the engine reapplies it with SPARQL's term semantics.
-        let (_claims, ops) = sql_passes(
-            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:kind ?k ; \
-             asset360:name \"BX517\" } LIMIT 3",
-        )
+        let (_claims, ops) = sql_passes(&format!(
+            "SELECT ?s ?k WHERE {{ ?s a asset360:Signal ; asset360:kind ?k ; \
+             asset360:name \"BX517\" {KEEP_A_FETCH} }} LIMIT 3"
+        ))
         .into_iter()
         .next()
         .expect("one SQL pass");
@@ -3300,10 +3872,10 @@ mod tests {
     /// `push_filter` makes for a single condition.
     #[test]
     fn a_narrowing_filter_tree_reads_the_record_and_not_the_element() {
-        let trees = filter_trees(
-            "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k . \
-             FILTER(?k = \"m\" || ?k = \"n\") }",
-        );
+        let trees = filter_trees(&format!(
+            "SELECT ?k WHERE {{ ?s a asset360:Signal ; asset360:trafficKinds ?k . \
+             FILTER(?k = \"m\" || ?k = \"n\") {KEEP_A_FETCH} }}"
+        ));
         assert_eq!(trees.len(), 1);
         let readings: Vec<SlotReading> = trees[0]
             .1

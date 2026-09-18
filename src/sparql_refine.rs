@@ -2702,6 +2702,7 @@ impl Plan {
                         _ => None,
                     })
             };
+            let preserved = matches!(node.op, PlanOp::LeftJoin { .. });
             let holds_the_key = |side: NodeId| {
                 scanned_on(side, &edge.holder).is_some_and(|slots| {
                     slots
@@ -2712,10 +2713,21 @@ impl Plan {
                         // edge this vocabulary can express.
                         .any(|slot| {
                             slot.path.as_slice() == [edge.slot.clone()]
-                                && slot.var.as_deref() == Some(edge.referenced.as_str())
-                                // A delivered read is not a binding, so it
-                                // cannot be the key a join reads.
-                                && slot.presence == SlotPresence::Required
+                                // A bound, required read is the key a join
+                                // reads. A delivered read is not a binding --
+                                // except on the *preserved* side of a left
+                                // join, where the read sat inside the
+                                // `OPTIONAL` and the join's `ON` clause is
+                                // what binds the referenced star: the
+                                // variable is that star's identity, and the
+                                // column stays unbound on purpose
+                                // (`AbsorbOptionalReference`).
+                                && ((slot.var.as_deref() == Some(edge.referenced.as_str())
+                                    && slot.presence == SlotPresence::Required)
+                                    || (preserved
+                                        && side == *left
+                                        && slot.var.is_none()
+                                        && slot.presence == SlotPresence::Optional))
                                 // A *collection* of identifiers is not a
                                 // foreign key an equality can compare: the
                                 // renderer would emit

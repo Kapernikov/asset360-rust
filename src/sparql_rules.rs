@@ -2828,6 +2828,217 @@ impl Rule for PushReferenceJoin<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Absorb an optional reference
+// ---------------------------------------------------------------------------
+
+/// `OPTIONAL { ?s :ref ?l . ?l a Line ... }` over a star the scan below scans:
+/// the reference read becomes the left join's own edge, and the `match`
+/// disappears.
+///
+/// The shape [`PushLeftJoin`] could not see. It finds the edge by looking for
+/// a *bound* foreign key on one side -- the preserved star reading
+/// `:ref ?l` outside the `OPTIONAL`, or the optional star reading `:refersTo
+/// ?s` inside it -- and a reference read that sits inside the `OPTIONAL` on
+/// the preserved star is neither: the fold rule leaves it a `match` (folding
+/// it in as an existence check would drop the rows the `OPTIONAL` keeps), and
+/// [`DeliverOptionalRead`] only hands the column to the engine. The optional
+/// side then stays a join of a `match` and a scan, two islands fall out of it,
+/// and the query that walks a class with its reference -- the export shape of
+/// issue 457 (consolidator-server) -- is a fetch the engine finishes, so its
+/// pages die on the triple cap.
+///
+/// What the rewrite states is the SQL left join exactly: `Line` is joined on
+/// `t0.ref = t1.uri`, so a record whose reference is empty, or names a record
+/// that is not a `Line`, keeps its row with `?l` unbound -- which is what the
+/// `OPTIONAL` answers, since its inner join of the read and the type has no
+/// solution for either. The edge is recorded on the left join, whose `ON`
+/// clause is the work that discharges the triple, and the read stays a
+/// *delivered* slot of the preserved scan (unbound, optional): `?l` is bound
+/// by the referenced star's identity and by nothing else, so a projection of
+/// it is the `Line` that matched and never the raw reference value.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **No lifted condition.** Same as [`PushLeftJoin`]: a condition on the
+///   optional side decides whether it matched, and this builds no conditional
+///   binding.
+/// * **The optional side is one `match` joined to a scan of its object**, and
+///   the join is on that object alone. Any other shape is a row set this
+///   rewrite does not describe.
+/// * **The match reads a single-valued reference column of the preserved
+///   star**, resolved against the class the scan scans. A collection of
+///   references is one solution per element, which an equality cannot state.
+/// * **The preserved side takes every row from that scan**, through plain
+///   joins only -- the same condition [`AbsorbOptionalRead`] puts on its scan.
+pub struct AbsorbOptionalReference<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> AbsorbOptionalReference<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for AbsorbOptionalReference<'_> {
+    fn name(&self) -> &'static str {
+        "absorb_optional_reference"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            let PlanOp::LeftJoin {
+                left,
+                right,
+                condition,
+                reference,
+            } = &plan.nodes[id].op
+            else {
+                continue;
+            };
+            if condition.is_some() || reference.is_some() {
+                continue;
+            }
+            let (left, right) = (*left, *right);
+
+            // The optional side: a join of one match and one scan, on the
+            // match's object.
+            let PlanOp::Join {
+                left: a,
+                right: b,
+                on,
+                reference: None,
+            } = &plan.nodes[right].op
+            else {
+                continue;
+            };
+            let (a, b) = (*a, *b);
+            let (matched, other) = match (&plan.nodes[a].op, &plan.nodes[b].op) {
+                (PlanOp::Match { .. }, _) => (a, b),
+                (_, PlanOp::Match { .. }) => (b, a),
+                _ => continue,
+            };
+            let PlanOp::Match { pattern } = &plan.nodes[matched].op else {
+                continue;
+            };
+            if plan.nodes[matched].executor != Executor::Engine || is_type_pattern(pattern) {
+                continue;
+            }
+            let (Some(star), Some(predicate), Some(var)) = (
+                subject_variable(pattern),
+                predicate_iri(pattern),
+                object_variable(pattern),
+            ) else {
+                continue;
+            };
+            let (star, predicate, var) = (star.to_owned(), predicate.to_owned(), var.to_owned());
+            if on.as_slice() != [var.clone()] {
+                continue;
+            }
+            // The object is a star the other side scans, in SQL.
+            if Visible::below(plan, other).identity_of(&var).is_none() {
+                continue;
+            }
+
+            // The preserved side: a scan of the match's subject, in SQL, whose
+            // rows all reach the join.
+            let Some((scan, class_uri)) =
+                plan.nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(scan, node)| match &node.op {
+                        PlanOp::Scan {
+                            star_var,
+                            class_uri,
+                            ..
+                        } if star_var == &star
+                            && node.executor == Executor::Sql
+                            && mandatorily_feeds(plan, scan, left) =>
+                        {
+                            Some((scan, class_uri.clone()))
+                        }
+                        _ => None,
+                    })
+            else {
+                continue;
+            };
+
+            // A single-valued reference column of that class.
+            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
+                continue;
+            };
+            let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
+                continue;
+            };
+            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+                continue;
+            };
+            if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue
+                || !PushReferenceJoin::new(self.schema).stores_a_reference(&class_uri, &slot.name)
+            {
+                continue;
+            }
+            let path = vec![slot.name.clone()];
+
+            // The delivered read, so the column reaches whoever renders the
+            // join. Unbound: `?l` is the referenced record's identity.
+            if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+                let delivered = ScanSlot {
+                    path: path.clone(),
+                    var: None,
+                    multivalued: false,
+                    presence: SlotPresence::Optional,
+                };
+                if !slots.iter().any(|slot| slot.path == path) {
+                    slots.push(delivered);
+                }
+            }
+
+            // The join takes the match's claim: its `ON` clause is the work.
+            let claims = std::mem::take(&mut plan.nodes[matched].discharges);
+            plan.nodes[id].discharges.extend(claims);
+            plan.nodes[id].discharges.sort_unstable();
+            if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
+                *reference = Some(ReferenceEdge {
+                    referenced: var,
+                    holder: star,
+                    slot: slot.name.clone(),
+                });
+            }
+
+            // The optional side is the scan now: the join and the match go.
+            replace_nodes(plan, &[(right, other), (matched, other)]);
+            return true;
+        }
+        false
+    }
+}
+
+/// Remove nodes, each standing in for another that stays.
+///
+/// [`remove_nodes`] stands a removed node in for its first input, which is
+/// right for a unary node and wrong for a join whose surviving side is the
+/// other one; this says which.
+fn replace_nodes(plan: &mut Plan, replaced: &[(NodeId, NodeId)]) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len());
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        if let Some((_, by)) = replaced.iter().find(|(removed, _)| *removed == old) {
+            remap[old] = remap[*by];
+            continue;
+        }
+        nodes.push(node.clone());
+        remap[old] = Some(nodes.len() - 1);
+    }
+    for node in &mut nodes {
+        node.op
+            .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    plan.nodes = nodes;
+    refresh_join_variables(plan);
+}
+
+// ---------------------------------------------------------------------------
 // Push a left join
 // ---------------------------------------------------------------------------
 
@@ -2902,10 +3113,15 @@ impl Rule for PushLeftJoin<'_> {
                 continue;
             }
 
-            // The edge, found the same way an inner join finds it: one side
-            // scans a star, the other binds that star's identifier in a
-            // single-valued reference slot.
-            let Some(edge) = self.reference_between(plan, left, right) else {
+            // The edge: one [`AbsorbOptionalReference`] recorded, or else
+            // found the same way an inner join finds it -- one side scans a
+            // star, the other binds that star's identifier in a single-valued
+            // reference slot.
+            let recorded = match &plan.nodes[id].op {
+                PlanOp::LeftJoin { reference, .. } => reference.clone(),
+                _ => None,
+            };
+            let Some(edge) = recorded.or_else(|| self.reference_between(plan, left, right)) else {
                 continue;
             };
             plan.nodes[id].executor = Executor::Sql;
@@ -3279,6 +3495,16 @@ impl<'s> PushGrouping<'s> {
                 .is_some_and(|class_uri| {
                     crate::sparql_scoper::push_form_of_path(self.schema, class_uri, &binding.path)
                         != crate::sparql_scoper::PushForm::Tagged
+                        // And a term shape the renderer can reproduce: an
+                        // inlined structure has none (a blank node), and the
+                        // lowering would refuse the column. Asked here so the
+                        // rule declines instead of firing into a refusal.
+                        && crate::sparql_terms::resolve_column(
+                            self.schema,
+                            class_uri,
+                            &binding.path
+                        )
+                        .is_some()
                 });
         }
         // Or the record's own identity: `GROUP BY ?t` over a scanned star
@@ -3843,6 +4069,224 @@ impl Rule for PushUnion {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Push a projection
+// ---------------------------------------------------------------------------
+
+/// A `SELECT` with no grouping -- the projection, its `ORDER BY`, `DISTINCT`
+/// and `LIMIT`/`OFFSET` -- becomes `Sql`, or none of it does.
+///
+/// The second rule that moves a *collapsing* operator, and the statement it
+/// makes is the answer: every row is one solution, in the order the query
+/// asked for, sliced as the query asked. Without it a fully pushed pattern
+/// is still a fetch -- the engine re-runs the query over the fetched records
+/// and applies the modifiers itself -- and that is exactly what a page past
+/// the first cannot survive on a class above the triple cap (issue 457,
+/// consolidator-server): a fetch bounded to `OFFSET + LIMIT` records covers
+/// the window only if the engine skips `OFFSET` solutions *in the fetch's
+/// order*, and the engine enumerates the store in its own. So an offset was
+/// declined at the fetch, correctly, and the whole class was read for every
+/// page after the first. Here the order and the slice are applied by the one
+/// component that also computes the order, which is the only arrangement
+/// under which the slice is provably the query's.
+///
+/// **It collapses wholly or declines**, for the reason [`PushGrouping`] does:
+/// past a projection the rows are solutions and not triples, and there is no
+/// residual evaluator to finish half of one. And it fires only over a body
+/// that is already entirely `Sql`, so every filter, join and fan-out below it
+/// is enforced by the statement -- a row the statement returns is a row the
+/// query admits.
+///
+/// What it accepts:
+///
+/// * **A projected variable that is a column, an unnested element or a
+///   record's identity** -- the same three a grouping may key on, for the
+///   same reason: each has one value per row and a term shape the renderer
+///   can reproduce. An `AnyElement` reading (a multivalued slot with no
+///   fan-out below) has no single value and declines.
+/// * **`ORDER BY` on such variables**, ascending or descending. The renderer
+///   states the null placement (unbound sorts first ascending), compares text
+///   by codepoint (`COLLATE "C"`) and numbers by value, and settles ties on
+///   the row's key so that a page is a partition. Which is *not* the engine's
+///   tie order -- both are conforming, an `ORDER BY` on a non-unique key is a
+///   partial order in SPARQL too -- so a client that needs pages to tile
+///   sorts on the driving record, and gets the tie settled the same way on
+///   every page.
+/// * **`DISTINCT` / `REDUCED`**, when every `ORDER BY` term is projected:
+///   SQL sorts the deduplicated rows on their own columns only, and SPARQL
+///   agrees that an unprojected sort key over distinct rows has no meaning.
+/// * **`LIMIT` / `OFFSET`**, applied to those rows, in that order.
+///
+/// What it declines, each with the wrong answer it prevents:
+///
+/// * **An engine node below the projection.** The rows would be a fetch the
+///   engine has still to filter, so their order and count are nobody's.
+/// * **A `UNION` below.** `sql_builder.py` stacks a union as a fetch and its
+///   answering statement cannot state one; declining keeps the fetch bound a
+///   paged union carries today.
+/// * **A `BIND`, a sub-select, an aggregate**: work the statement would have
+///   to evaluate rather than read. A grouping is [`PushGrouping`]'s.
+/// * **An `ORDER BY` on an expression**, or on a variable no scan below
+///   binds.
+/// * **Anything but a `SELECT`**: a `CONSTRUCT`'s triples are the engine's.
+pub struct PushProjection<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> PushProjection<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+
+    /// Whether a projected or sorted variable names one value per row the
+    /// statement can render: the grouping rule's own test, unchanged.
+    fn column_is_readable(&self, plan: &Plan, body: NodeId, var: &str) -> bool {
+        PushGrouping::new(self.schema).key_is_readable(plan, body, var)
+    }
+}
+
+/// The chain of modifier nodes above an `Sql` body, when it is one this rule
+/// can take whole.
+struct ProjectionTail {
+    /// The `Sql` node the chain reads from.
+    body: NodeId,
+    /// The projected variables.
+    vars: Vec<String>,
+    /// Every `ORDER BY` term, from every sort node in the chain.
+    sorts: Vec<SortTerm>,
+    /// Whether a `DISTINCT` or `REDUCED` sits in the chain.
+    distinct: bool,
+    /// Every node of the chain, body excluded.
+    chain: Vec<NodeId>,
+}
+
+/// Walk down from the root through the modifiers a `SELECT` roots in.
+///
+/// `None` for any other shape -- a node that is not a modifier, a projection
+/// that is a sub-select, more than one projection, no projection at all --
+/// and for a body that is not `Sql`, which is the whole precondition.
+fn projection_tail(plan: &Plan) -> Option<ProjectionTail> {
+    if plan.nodes.is_empty() {
+        return None;
+    }
+    let root = plan.nodes.len() - 1;
+    let mut current = root;
+    let mut chain = Vec::new();
+    let mut vars: Option<Vec<String>> = None;
+    let mut sorts: Vec<SortTerm> = Vec::new();
+    let mut distinct = false;
+    loop {
+        let node = &plan.nodes[current];
+        if node.executor != Executor::Engine {
+            break;
+        }
+        let input = match &node.op {
+            PlanOp::Project {
+                input,
+                vars: projected,
+            } => {
+                if vars.is_some() {
+                    return None;
+                }
+                vars = Some(projected.clone());
+                *input
+            }
+            PlanOp::Sort { input, terms } => {
+                sorts.extend(terms.iter().cloned());
+                *input
+            }
+            PlanOp::Distinct { input } | PlanOp::Reduced { input } => {
+                distinct = true;
+                *input
+            }
+            PlanOp::Slice { input, .. } => *input,
+            _ => return None,
+        };
+        chain.push(current);
+        current = input;
+    }
+    // The body: an `Sql` node whose every consumer is the chain, and which
+    // everything else feeds. Otherwise the plan has a second island, or a
+    // node the chain does not account for.
+    let body = current;
+    if plan.nodes[body].executor != Executor::Sql {
+        return None;
+    }
+    let accounted = |id: NodeId| id == body || chain.contains(&id) || plan.feeds(id, body);
+    if !(0..plan.nodes.len()).all(accounted) {
+        return None;
+    }
+    Some(ProjectionTail {
+        body,
+        vars: vars?,
+        sorts,
+        distinct,
+        chain,
+    })
+}
+
+impl Rule for PushProjection<'_> {
+    fn name(&self) -> &'static str {
+        "push_projection"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        if plan.form != crate::sparql_refine::QueryForm::Select {
+            return false;
+        }
+        let Some(tail) = projection_tail(plan) else {
+            return false;
+        };
+        if tail.chain.is_empty() {
+            return false;
+        }
+        // A grouping below is the grouping rule's, and its tail went with it
+        // or stayed; a union below is a fetch the statement cannot answer.
+        if plan.nodes.iter().any(|node| {
+            matches!(
+                node.op,
+                PlanOp::Group { .. } | PlanOp::Union { .. } | PlanOp::SubSelect { .. }
+            )
+        }) {
+            return false;
+        }
+        // An identifier restriction narrows a fetch and cannot answer: the
+        // writer emits no triple for a record's identifier, so the engine's
+        // answer to `?s :id "X"` is empty and a statement that answered it
+        // would report a record the query has no solution for. The lowering
+        // refuses such a statement (`IdentityIsNotATriple`); declining here
+        // keeps the plan the fetch it was, with the identity on the scan.
+        if plan.nodes.iter().any(|node| {
+            matches!(&node.op, PlanOp::Scan { identifier_values, .. }
+                if node.executor == Executor::Sql && !identifier_values.is_empty())
+        }) {
+            return false;
+        }
+        if !tail
+            .vars
+            .iter()
+            .all(|var| self.column_is_readable(plan, tail.body, var))
+        {
+            return false;
+        }
+        for term in &tail.sorts {
+            let Expr::Var(name) = &term.expr else {
+                return false;
+            };
+            if !self.column_is_readable(plan, tail.body, name) {
+                return false;
+            }
+            if tail.distinct && !tail.vars.contains(name) {
+                return false;
+            }
+        }
+        for id in &tail.chain {
+            plan.nodes[*id].executor = Executor::Sql;
+        }
+        true
+    }
+}
+
 /// Every rule, in the order 28d lists them: scope a type, fold a nested read
 /// into a path, deliver an optional read, turn a constant object into a
 /// filter, turn a `VALUES` over a bound variable into one, push a comparison,
@@ -3878,6 +4322,7 @@ pub fn tier_one_rules<'a>(
         Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(DeliverOptionalRead::new(schema)),
         Box::new(AbsorbOptionalRead::new(schema)),
+        Box::new(AbsorbOptionalReference::new(schema)),
         Box::new(FoldIdentityConstant::new(schema)),
         Box::new(ConstantObjectBecomesFilter::new(schema)),
         Box::new(ValuesBecomesFilter::new(schema)),
@@ -3888,6 +4333,7 @@ pub fn tier_one_rules<'a>(
         Box::new(PushUnion::new()),
         Box::new(NarrowByAKeptHop::new(schema)),
         Box::new(PushGrouping::new(schema)),
+        Box::new(PushProjection::new(schema)),
         // This one knows nothing about a schema graph: it is a semi-join
         // reduction, and it is what a materialised relation is worth to the
         // planner whether the schema produced it or the client wrote it.
@@ -7237,32 +7683,26 @@ mod tests {
         }
     }
 
-    /// No rule pushes an ordering, so the `NULLS FIRST` question cannot arise
-    /// through the refined path -- and this is the test that says so rather
-    /// than leaving it to be noticed.
+    /// An ordering reaches SQL only as part of a collapse -- with a grouping,
+    /// or with a projection that answers -- and never on its own below an
+    /// engine node.
     ///
     /// SPARQL sorts unbound *before* every bound value ascending; Postgres
     /// defaults to `NULLS LAST` for `ASC`. With a missing-value bucket in play
     /// that is the difference between the "no value" row heading a report and
-    /// hiding on its last page. Today's aggregate renderer states both ends
-    /// explicitly; a refined plan never emits an ordering at all, because the
-    /// grouping rule declines any collapsing work above it and nothing else
-    /// moves a `Sort`.
-    ///
-    /// If that changes, this test fails, which is the point: an ordering that
-    /// reaches SQL through a rule has to carry the null placement with it.
+    /// hiding on its last page. The renderer states both ends explicitly for
+    /// every ordering that reaches it, and this test is what says which ones
+    /// do: an ordering under an engine node is a fetch the engine re-sorts,
+    /// and ordering it in SQL would be work with no answer attached.
     #[test]
-    fn an_ordering_reaches_sql_only_with_a_grouping() {
+    fn an_ordering_reaches_sql_only_with_a_collapse() {
         let schema = test_schema_view();
-        // No rule pushes an ordering on its own: below a grouping the rows SQL
-        // hands back are a fetch the engine re-sorts, and ordering them there
-        // would be work with no answer attached. The nullable key is where the
-        // placement would matter -- SPARQL sorts unbound before every bound
-        // value, Postgres defaults the other way -- and this is why that
-        // question only arises above a grouping.
+        // A conjunct the statement cannot take leaves the projection with the
+        // engine, and the ordering below it stays there too.
         let plan = refined(
             "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-             OPTIONAL { ?s asset360:name ?nm } } ORDER BY ?nm",
+             OPTIONAL { ?s asset360:name ?nm } FILTER(REGEX(STR(?s), \"^x\")) } \
+             ORDER BY ?nm",
             &schema,
             false,
         );
@@ -7270,12 +7710,26 @@ mod tests {
             plan.find("sort")
                 .iter()
                 .all(|id| plan.nodes[*id].executor == Executor::Engine),
-            "an ordering with no grouping is the engine's:\n{plan}"
+            "an ordering under an engine node is the engine's:\n{plan}"
         );
 
-        // Above one it is part of the collapse, and goes with it or not at
-        // all: an aggregate the engine cannot recompute, ordered by an engine
-        // that never saw it, is the partial collapse this design refuses.
+        // Fully pushed, the projection answers and takes the ordering with
+        // it -- over the nullable key, which is where the placement matters.
+        let plan = refined(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+             OPTIONAL { ?s asset360:name ?nm } } ORDER BY ?nm",
+            &schema,
+            false,
+        );
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "the projection takes its ordering with it:\n{plan}"
+        );
+
+        // Above a grouping it is part of the collapse, and goes with it or
+        // not at all: an aggregate the engine cannot recompute, ordered by an
+        // engine that never saw it, is the partial collapse this design
+        // refuses.
         let plan = refined(
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm } GROUP BY ?nm ORDER BY DESC(?n)",
@@ -7286,6 +7740,187 @@ mod tests {
             plan.nodes.iter().all(|node| node.executor == Executor::Sql),
             "the grouping takes its ordering with it:\n{plan}"
         );
+    }
+
+    /// A reference read inside the `OPTIONAL`, on the preserved star, is the
+    /// left join's edge -- the export shape of issue 457 (consolidator-server).
+    ///
+    /// Before: the match stayed a `match` on the optional side, joined to the
+    /// scan of its object, and the plan was two islands the lowering refused.
+    /// After: one left join carrying the edge, the read delivered on the
+    /// preserved scan, `?t` bound by the `Track` scan's identity, and the
+    /// projection answering with its ordering and its slice.
+    #[test]
+    fn a_reference_read_inside_the_optional_is_the_left_join_s_edge() {
+        let schema = test_schema_view();
+        let plan = refined(
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track } } \
+             ORDER BY ?s LIMIT 50 OFFSET 100",
+            &schema,
+            false,
+        );
+        plan.check()
+            .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+        assert!(
+            plan.find("match").is_empty(),
+            "the read is the edge:\n{plan}"
+        );
+        let leftjoins = plan.find("leftjoin");
+        let [leftjoin] = leftjoins.as_slice() else {
+            panic!("one left join:\n{plan}");
+        };
+        let PlanOp::LeftJoin {
+            reference: Some(edge),
+            ..
+        } = &plan.nodes[*leftjoin].op
+        else {
+            panic!("the edge is recorded:\n{plan}");
+        };
+        assert_eq!(
+            (
+                edge.holder.as_str(),
+                edge.slot.as_str(),
+                edge.referenced.as_str()
+            ),
+            ("s", "locatedOnTrack", "t")
+        );
+        // The read is delivered, not bound: `?t` is the `Track`'s identity.
+        let PlanOp::Scan { slots, .. } = &plan.nodes[plan.find("scan")[0]].op else {
+            unreachable!()
+        };
+        let read = slots
+            .iter()
+            .find(|slot| slot.path.as_slice() == ["locatedOnTrack".to_owned()])
+            .expect("the delivered read");
+        assert_eq!(
+            (read.var.as_deref(), read.presence),
+            (None, SlotPresence::Optional)
+        );
+        // The join claims the triple: its `ON` clause is the work.
+        assert!(
+            plan.nodes[*leftjoin]
+                .discharges
+                .iter()
+                .any(|id| plan.obligations[*id].to_string().contains("locatedOnTrack")),
+            "{plan}"
+        );
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "the projection answers over it:\n{plan}"
+        );
+
+        // A collection of references is one solution per element, which an
+        // equality cannot state: declined, and the plan stays a fetch.
+        let plan = refined(
+            "SELECT ?g ?l WHERE { ?g a asset360:LineGroup . \
+             OPTIONAL { ?g asset360:groupsLines ?l . ?l a asset360:Line } }",
+            &schema,
+            false,
+        );
+        assert!(!plan.find("match").is_empty(), "{plan}");
+        assert!(
+            plan.nodes
+                .iter()
+                .any(|node| node.executor == Executor::Engine),
+            "{plan}"
+        );
+        // A lifted condition decides whether the optional side matched, and
+        // no rule builds a conditional binding.
+        let plan = refined(
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
+             asset360:hasName ?tn . FILTER(?tn > \"A\") } }",
+            &schema,
+            false,
+        );
+        assert!(!plan.find("match").is_empty(), "{plan}");
+    }
+
+    /// What the projection rule takes, and what it declines -- each decline
+    /// with the answer it would have got wrong.
+    #[test]
+    fn what_the_projection_rule_takes_and_declines() {
+        let schema = test_schema_view();
+        let answers = |query: &str| -> bool {
+            let plan = refined(query, &schema, false);
+            plan.check()
+                .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql)
+        };
+
+        // Takes: a projection of columns and identities, its ordering, its
+        // slice, over one star or a pushed left join.
+        assert!(answers(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
+             ORDER BY ?s LIMIT 50 OFFSET 100"
+        ));
+        assert!(answers(
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } } \
+             ORDER BY ?tn LIMIT 5 OFFSET 5"
+        ));
+        // Projecting the optional star's identity, which is unbound where
+        // the join found nothing.
+        assert!(answers(
+            "SELECT ?s ?bg WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s } } \
+             ORDER BY ?s LIMIT 5 OFFSET 5"
+        ));
+        // A fan-out below: one row per element, which is what SPARQL answers.
+        assert!(answers(
+            "SELECT ?s ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k } \
+             ORDER BY ?k LIMIT 10"
+        ));
+        // `DISTINCT` over projected columns, ordered by one of them.
+        assert!(answers(
+            "SELECT DISTINCT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
+             ORDER BY ?nm LIMIT 10 OFFSET 10"
+        ));
+        // `SELECT *` projects everything in scope.
+        assert!(answers(
+            "SELECT * WHERE { ?s a asset360:Signal ; asset360:name ?nm } LIMIT 10"
+        ));
+
+        // Declines: an engine node below (the rows are a fetch the engine
+        // still filters).
+        assert!(!answers(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(REGEX(?nm, \"^B\")) } ORDER BY ?s LIMIT 50"
+        ));
+        // An ordering on an expression.
+        assert!(!answers(
+            "SELECT ?s ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
+             ORDER BY LCASE(?nm) LIMIT 50"
+        ));
+        // `DISTINCT` ordered by a column the query does not select: SQL
+        // cannot sort deduplicated rows on a column they no longer have.
+        assert!(!answers(
+            "SELECT DISTINCT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
+             ORDER BY ?s LIMIT 10"
+        ));
+        // An identifier restriction: the writer emits no triple for it, so the
+        // engine's answer is empty and a statement that answered would report
+        // a record the query has no solution for.
+        assert!(!answers(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
+             asset360:name ?nm }"
+        ));
+        // A projected structure: an inlined range serialises as a blank node
+        // nothing can reproduce, so the column has no term shape.
+        assert!(!answers(
+            "SELECT ?s ?loc WHERE { ?s a asset360:Signal ; asset360:location ?loc } \
+             LIMIT 5"
+        ));
+        // A `BIND`: a value the statement would have to compute.
+        assert!(!answers(
+            "SELECT ?s ?one WHERE { ?s a asset360:Signal . BIND(1 AS ?one) } LIMIT 5"
+        ));
+        // A union below: the fetch stacks it, the answering statement does not.
+        assert!(!answers(
+            "SELECT ?s WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:Track } } \
+             ORDER BY ?s LIMIT 5"
+        ));
     }
 
     /// What the left-join rule declines, and the answer each would break.
