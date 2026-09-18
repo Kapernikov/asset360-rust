@@ -629,12 +629,21 @@ impl Plan {
                 out
             }
             PlanOp::Distinct { .. } | PlanOp::Reduced { .. } => everything(),
-            PlanOp::Join { left, right, .. } => {
+            PlanOp::Join {
+                left,
+                right,
+                reference,
+                ..
+            } => {
                 let mut out: BTreeSet<String> = self
                     .variables_of(*left)
                     .intersection(&self.variables_of(*right))
                     .cloned()
                     .collect();
+                if let Some(edge) = reference {
+                    out.insert(edge.referenced.clone());
+                    out.insert(edge.holder.clone());
+                }
                 out.retain(|var| self.variables_of(input).contains(var));
                 out
             }
@@ -642,6 +651,7 @@ impl Plan {
                 left,
                 right,
                 condition,
+                reference,
                 ..
             } => {
                 let mut out: BTreeSet<String> = self
@@ -654,6 +664,12 @@ impl Plan {
                         return everything();
                     }
                     out.extend(variables_used(condition));
+                }
+                // A recorded edge joins on the referenced star's identity
+                // and the holder's slot: both observed, named or not.
+                if let Some(edge) = reference {
+                    out.insert(edge.referenced.clone());
+                    out.insert(edge.holder.clone());
                 }
                 out.retain(|var| self.variables_of(input).contains(var));
                 out

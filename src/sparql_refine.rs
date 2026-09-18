@@ -1340,7 +1340,6 @@ impl Expr {
     ///
     /// `every_expression_survives_the_round_trip` checks the rest by
     /// construction rather than by inspection.
-    #[cfg(feature = "sparql-endpoint")]
     pub(crate) fn try_as_expression(&self) -> Option<Expression> {
         let pair = |left: &Expr, right: &Expr| -> Option<(Box<Expression>, Box<Expression>)> {
             Some((
@@ -1397,13 +1396,17 @@ impl Expr {
     }
 }
 
+/// [`function_expression`], for the algebra translation.
+pub(crate) fn function_expression_of(name: &str, args: Vec<Expression>) -> Option<Expression> {
+    function_expression(name, args)
+}
+
 /// Rebuild the expression a function name and its arguments came from.
 ///
 /// The forward map spells several *expression* kinds as functions -- `BOUND`,
 /// `IF`, `COALESCE`, `sameTerm` and the arithmetic operators are variants of
 /// [`Expression`], not members of `Function` -- so those are named here, and
 /// everything else is a builtin or a custom IRI.
-#[cfg(feature = "sparql-endpoint")]
 fn function_expression(name: &str, mut args: Vec<Expression>) -> Option<Expression> {
     let one = |args: Vec<Expression>| -> Option<Box<Expression>> {
         <[Expression; 1]>::try_from(args)

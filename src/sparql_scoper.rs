@@ -5508,6 +5508,31 @@ classes:
     attributes:
       asWKT:
         range: string
+  # A two-level array of inlined structures, for the occurrence identifier:
+  # `parts[0].children[1]` and `parts[1].children[1]` are two elements.
+  Assembly:
+    class_uri: asset360:Assembly
+    attributes:
+      asset360_uri:
+        identifier: true
+      parts:
+        range: Part
+        multivalued: true
+        inlined: true
+  Part:
+    class_uri: asset360:Part
+    attributes:
+      label:
+        range: string
+      children:
+        range: Child
+        multivalued: true
+        inlined: true
+  Child:
+    class_uri: asset360:Child
+    attributes:
+      label:
+        range: string
 "#;
         let schema: SchemaDefinition =
             p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();

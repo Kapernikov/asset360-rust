@@ -38,6 +38,7 @@ pub mod predicate;
 pub mod scope_predicate;
 pub mod shacl_ast;
 
+pub mod sparql_algebra;
 pub mod sparql_alias;
 pub mod sparql_columns;
 pub mod sparql_domains;
@@ -48,6 +49,7 @@ pub mod sparql_graph_clauses;
 pub mod sparql_materialise;
 pub mod sparql_ops;
 pub mod sparql_optional_binding;
+pub mod sparql_oracle;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;

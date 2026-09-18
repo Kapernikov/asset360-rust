@@ -3191,10 +3191,20 @@ impl Rule for AbsorbOptionalReference<'_> {
             plan.nodes[id].discharges.sort_unstable();
             if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
                 *reference = Some(ReferenceEdge {
-                    referenced: var,
+                    referenced: var.clone(),
                     holder: star,
                     slot: slot.name.clone(),
                 });
+            }
+            // The edge names the referenced star, which the body's barrier
+            // must export for the join to read it -- an export the prune
+            // may have removed while nothing demanded it. Adding one back is
+            // an equivalence: the preserved side does not bind it, so the
+            // natural join gains no condition, and the edge is the join.
+            if let PlanOp::SubSelect { vars, .. } = &mut plan.nodes[right].op
+                && !vars.contains(&var)
+            {
+                vars.push(var);
             }
 
             // The optional side is the scan now (extended by whatever left
