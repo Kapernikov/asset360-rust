@@ -75,3 +75,10 @@ opt-level = "z"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+[[example]]
+name = "bench464"
+required-features = ["sparql-endpoint"]
+
+[patch.crates-io]
+sparopt = { path = "vendor/sparopt" }
