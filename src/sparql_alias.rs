@@ -86,8 +86,8 @@
 //! it: `?s :refersToLocatedNetEntity ?e` makes `?e` a `LocatedNetEntity`, or
 //! a subclass of one, because that is the slot's range and nothing else is
 //! ever written there. So `?e asset360:name ?n` — the shape #447's reporter
-//! actually wrote, and an unbound column on every row until it was — is
-//! refused naming the hop, the class, and the spelling to write. The
+//! actually wrote — is refused naming the hop, the class, and the spelling
+//! to write. The
 //! judgement covers the range's whole family: a slot only a subclass carries
 //! is accepted, and a predicate none of them carries is refused. It follows
 //! the `[ … ]` blank-node form, a second hop, and a reference whose object
