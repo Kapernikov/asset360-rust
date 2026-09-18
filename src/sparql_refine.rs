@@ -1931,6 +1931,13 @@ pub struct ReferenceEdge {
     pub holder: String,
     /// The slot on `holder` whose value is `referenced`'s identifier.
     pub slot: String,
+    /// The hops from the holder's record to the structure that holds `slot`:
+    /// empty for a column of the record, `[hasCoveredSection]` for a
+    /// reference held by an unnested element of that collection -- the
+    /// design's element-held edge, which the statement reads off the
+    /// element's row (`e.value->>'slot'`) and never as the fetch's
+    /// any-element containment.
+    pub path: Vec<String>,
 }
 
 /// The key a pushed join joins on, beside the reference edge: two columns
@@ -3004,7 +3011,14 @@ impl Plan {
                         // A reference *inside* an inlined structure is not an
                         // edge this vocabulary can express.
                         .any(|slot| {
-                            slot.path.as_slice() == [edge.slot.clone()]
+                            slot.path.as_slice()
+                                == edge
+                                    .path
+                                    .iter()
+                                    .cloned()
+                                    .chain(std::iter::once(edge.slot.clone()))
+                                    .collect::<Vec<_>>()
+                                    .as_slice()
                                 // A bound, required read is the key a join
                                 // reads. A delivered read is not a binding --
                                 // except on the *preserved* side of a left

@@ -44,6 +44,7 @@ use spargebra::term::{
 };
 
 use crate::sparql_refine::{CompareOp, Expr, NodeId, Plan, PlanOp, SlotPresence, SlotReading};
+use crate::sparql_scopes::class_at_path_of;
 
 /// The query a plan means: its root translated, as a `SELECT`.
 ///
@@ -327,7 +328,22 @@ impl Translation<'_> {
                 let mut optional: Vec<Vec<TriplePattern>> = Vec::new();
                 let mut exists: Vec<Vec<TriplePattern>> = Vec::new();
                 let mut counter = 0usize;
+                // A read *through* an unnested element -- a path whose
+                // prefix is a multivalued slot this scan fans out -- is read
+                // off the element's variable at the fan-out, not here: a
+                // fresh blank node here would be some element, not that one.
+                let through_element = |slot: &crate::sparql_refine::ScanSlot| {
+                    slot.path.len() > 1
+                        && slots.iter().any(|other| {
+                            other.multivalued
+                                && other.var.is_some()
+                                && slot.path.starts_with(&other.path)
+                        })
+                };
                 for slot in slots {
+                    if through_element(slot) {
+                        continue;
+                    }
                     match (&slot.var, slot.presence, slot.multivalued) {
                         // A delivered read binds nothing and requires nothing,
                         // and an absorbed optional collection is bound by its
@@ -435,17 +451,31 @@ impl Translation<'_> {
                 let inner = self.pattern(*input)?;
                 let class_uri = self.class_of_scan(star_var, node)?;
                 let mut counter = 100;
+                // A nested fan-out reads off the outer element's variable,
+                // not off the record through a fresh blank node.
+                let (from_var, from_class, rest) = (1..slot_path.len())
+                    .rev()
+                    .find_map(|cut| {
+                        self.bindings
+                            .get(&(star_var.clone(), slot_path[..cut].to_vec()))
+                            .cloned()
+                            .and_then(|bound| {
+                                class_at_path_of(self.schema, &class_uri, &slot_path[..cut])
+                                    .map(|class| (bound, class, slot_path[cut..].to_vec()))
+                            })
+                    })
+                    .unwrap_or((star_var.clone(), class_uri.clone(), slot_path.clone()));
                 let triples = self.read(
-                    &class_uri,
-                    star_var,
-                    slot_path,
+                    &from_class,
+                    &from_var,
+                    &rest,
                     TermPattern::Variable(Variable::new_unchecked(var.clone())),
                     &mut counter,
                 )?;
                 self.bindings
                     .insert((star_var.clone(), slot_path.clone()), var.clone());
                 let read = GraphPattern::Bgp { patterns: triples };
-                match presence {
+                let mut pattern = match presence {
                     SlotPresence::Required => GraphPattern::Join {
                         left: Box::new(inner),
                         right: Box::new(read),
@@ -455,7 +485,50 @@ impl Translation<'_> {
                         right: Box::new(read),
                         expression: None,
                     },
+                };
+                // The scan's reads through this element, off its variable.
+                let element_class = class_at_path_of(self.schema, &class_uri, slot_path);
+                let element_reads: Vec<(Vec<String>, Option<String>, SlotPresence)> = self
+                    .scan_slots_of(star_var, node)
+                    .into_iter()
+                    .filter(|(path, _, _)| {
+                        path.len() > slot_path.len() && path.starts_with(slot_path)
+                    })
+                    .collect();
+                for (path, bound, read_presence) in element_reads {
+                    let Some(element_class) = &element_class else {
+                        return None;
+                    };
+                    let target = match &bound {
+                        Some(bound) => bound.clone(),
+                        None => {
+                            self.fresh_var(&format!("{var}_{}", path[slot_path.len()..].join("_")))
+                        }
+                    };
+                    self.bindings
+                        .insert((star_var.clone(), path.clone()), target.clone());
+                    let mut counter = 400 + self.fresh;
+                    let triples = self.read(
+                        element_class,
+                        var,
+                        &path[slot_path.len()..],
+                        TermPattern::Variable(Variable::new_unchecked(target)),
+                        &mut counter,
+                    )?;
+                    let read = GraphPattern::Bgp { patterns: triples };
+                    pattern = match read_presence {
+                        SlotPresence::Required => GraphPattern::Join {
+                            left: Box::new(pattern),
+                            right: Box::new(read),
+                        },
+                        SlotPresence::Optional => GraphPattern::LeftJoin {
+                            left: Box::new(pattern),
+                            right: Box::new(read),
+                            expression: None,
+                        },
+                    };
                 }
+                pattern
             }
             PlanOp::Service { .. }
             | PlanOp::Construct { .. }
@@ -490,6 +563,31 @@ impl Translation<'_> {
                 patterns: vec![triple],
             }),
         })
+    }
+
+    /// The slots of the scan of `star` visible from `at`: `(path, variable,
+    /// presence)`.
+    fn scan_slots_of(
+        &self,
+        star: &str,
+        at: NodeId,
+    ) -> Vec<(Vec<String>, Option<String>, SlotPresence)> {
+        self.plan
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(id, node)| match &node.op {
+                PlanOp::Scan {
+                    star_var, slots, ..
+                } if star_var == star && self.plan.feeds_visibly(id, at) => Some(
+                    slots
+                        .iter()
+                        .map(|slot| (slot.path.clone(), slot.var.clone(), slot.presence))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     /// The class the scan of `star` visible from `at` reads.

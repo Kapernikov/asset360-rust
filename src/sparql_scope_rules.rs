@@ -242,22 +242,15 @@ impl<'s> PushJoinOnIdentity<'s> {
                     let terms = plan.term_of(self.schema, side, var);
                     let [
                         TermOf::Structure {
-                            class_uri: _,
-                            holder_star,
+                            holder_class_uri,
                             path,
+                            ..
                         },
                     ] = terms.as_slice()
                     else {
                         return None;
                     };
-                    let holder_class = plan
-                        .term_of(self.schema, side, holder_star)
-                        .into_iter()
-                        .find_map(|term| match term {
-                            TermOf::Identity { class_uri } => Some(class_uri),
-                            _ => None,
-                        })?;
-                    Some((holder_class, path.clone()))
+                    Some((holder_class_uri.clone(), path.clone()))
                 };
                 let (a, b) = (structure(left)?, structure(right)?);
                 (a == b).then_some(JoinKey::Element {
@@ -795,5 +788,165 @@ mod tests {
                 panic!("{name}: a state check saw it: {defect}\n{pruned}")
             });
         }
+    }
+    /// **The structure interface** (design test 12): #464 as a scalar
+    /// projection is a `Statement` with `?cs` pruned from the relation; as
+    /// `SELECT *` it is a `Fetch` -- the root projection cannot emit a blank
+    /// node, and the engine does; an element joined in an enclosing scope is
+    /// a `Statement` on `JoinKey::Element`; a `GROUP BY` on an element
+    /// groups by occurrence; and the nested occurrence fans out twice, each
+    /// step by occurrence, so `parts[0].children[1]` and
+    /// `parts[1].children[1]` are two rows.
+    #[test]
+    fn the_structure_interface() {
+        use crate::sparql_ops::{ColumnKind, JoinKey, Op, UnnestDedup};
+        use crate::sparql_plan::{Outcome, outcome_of};
+        use crate::sparql_scoper::tests::asset360_fixture_schema_view;
+        let fixture = asset360_fixture_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+        let body = "?a a asset360:TunnelComplex ; asset360:typeURI ?name . \
+             OPTIONAL { ?a asset360:hasCoveredSection ?cs . \
+             ?cs asset360:belongsToTrack ?track ; asset360:hasSequenceNumber ?seq . \
+             ?track a asset360:Track ; asset360:typeURI ?trackName }";
+        // Scalar projection: statement, `?cs` pruned.
+        let scalar = format!("{prefix}SELECT ?name ?seq ?track ?trackName WHERE {{ {body} }}");
+        assert_eq!(outcome_of(&scalar, &fixture, None), Outcome::Statement);
+        let plan = crate::sparql_plan::plan_query_refined(&scalar, &fixture).unwrap();
+        let ops = match &plan.passes[0].kind {
+            crate::sparql_plan::PassKind::Sql(sql) => &sql.ops,
+            _ => unreachable!(),
+        };
+        let relation = ops
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Op::Relation { columns, body, .. } => Some((columns, body)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{plan}"));
+        assert!(
+            !relation.0.iter().any(|column| column.var == "cs"),
+            "?cs is pruned:\n{plan}"
+        );
+        assert!(
+            relation
+                .0
+                .iter()
+                .any(|column| column.var == "seq" && matches!(column.kind, ColumnKind::Slot(_))),
+            "{plan}"
+        );
+        // The body's own join is the element-held edge, read off the element.
+        assert!(
+            relation.1.nodes.iter().any(|node| matches!(&node.op,
+                Op::Join { right_path, right_reading, .. }
+                    if right_path.as_slice() == ["hasCoveredSection".to_owned()]
+                        && *right_reading == crate::sparql_ops::SlotReading::BoundElement)),
+            "{plan}"
+        );
+        // `SELECT *`: a fetch, since a structure has no term to emit.
+        let star = format!("{prefix}SELECT * WHERE {{ {body} }}");
+        assert!(
+            matches!(outcome_of(&star, &fixture, None), Outcome::Fetch(_)),
+            "{:?}",
+            outcome_of(&star, &fixture, None)
+        );
+
+        // An element joined in an enclosing scope, on the test schema's
+        // nested arrays: the assembly's parts each with a count of their
+        // children.
+        let schema = test_schema_view();
+        let joined = "SELECT ?l ?n WHERE { ?a a asset360:Assembly ; asset360:parts ?p . \
+             ?p asset360:label ?l . \
+             { SELECT ?p (COUNT(?c) AS ?n) WHERE { ?a a asset360:Assembly ; asset360:parts ?p . \
+             ?p asset360:children ?c } GROUP BY ?p } }";
+        let plan = refined(joined);
+        let join = plan.find("join")[0];
+        assert!(
+            matches!(&plan.nodes[join].op, crate::sparql_refine::PlanOp::Join {
+                key: Some(crate::sparql_refine::JoinKey::Element { path, .. }), .. }
+                if path.as_slice() == ["parts".to_owned()]),
+            "{plan}"
+        );
+        assert_eq!(
+            outcome_of(&format!("{PREFIX}{joined}"), &schema, None),
+            Outcome::Statement
+        );
+        let lowered = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
+        assert!(
+            lowered.nodes.iter().any(|node| matches!(&node.op,
+                Op::Join { key: JoinKey::Element { left, right }, .. }
+                    if left.column.is_none() && right.column.as_deref() == Some("p"))),
+            "{lowered:?}"
+        );
+        // With the element projected at the root: a fetch.
+        assert!(matches!(
+            outcome_of(
+                &format!(
+                    "{PREFIX}SELECT ?p ?n WHERE {{ ?a a asset360:Assembly ; asset360:parts ?p . \
+                     {{ SELECT ?p (COUNT(?c) AS ?n) WHERE {{ ?a a asset360:Assembly ; \
+                     asset360:parts ?p . ?p asset360:children ?c }} GROUP BY ?p }} }}"
+                ),
+                &schema,
+                None
+            ),
+            Outcome::Fetch(_)
+        ));
+
+        // The nested occurrence: two fan-outs, each by occurrence.
+        let nested = refined(
+            "SELECT (COUNT(?c) AS ?n) WHERE { ?h a asset360:Assembly ; asset360:parts ?p . \
+             ?p asset360:children ?c }",
+        );
+        assert_eq!(
+            plan_unnests(&nested),
+            vec![vec!["parts"], vec!["parts", "children"]],
+            "{nested}"
+        );
+        let lowered = crate::sparql_ops::lower_refined(&nested, &schema, None, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{nested}"));
+        let dedups: Vec<UnnestDedup> = lowered
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Unnest { dedup, .. } => Some(*dedup),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dedups,
+            vec![UnnestDedup::ByOccurrence, UnnestDedup::ByOccurrence]
+        );
+        assert!(
+            nested
+                .nodes
+                .iter()
+                .all(|node| node.executor == Executor::Sql),
+            "{nested}"
+        );
+        // And a scalar collection dedups by value.
+        let scalar = refined(
+            "SELECT (COUNT(?k) AS ?n) WHERE { ?s a asset360:Signal ; asset360:trafficKinds ?k }",
+        );
+        let lowered = crate::sparql_ops::lower_refined(&scalar, &schema, None, None).unwrap();
+        assert!(lowered.nodes.iter().any(|node| matches!(
+            &node.op,
+            Op::Unnest {
+                dedup: UnnestDedup::ByValue,
+                ..
+            }
+        )));
+    }
+
+    fn plan_unnests(plan: &Plan) -> Vec<Vec<&str>> {
+        plan.nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                crate::sparql_refine::PlanOp::Unnest { slot_path, .. } => {
+                    Some(slot_path.iter().map(String::as_str).collect())
+                }
+                _ => None,
+            })
+            .collect()
     }
 }

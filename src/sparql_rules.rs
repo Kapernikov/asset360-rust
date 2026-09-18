@@ -855,6 +855,10 @@ impl Visible {
                         slots.insert(bound, None);
                         continue;
                     }
+                } else if element_prefix_below(plan, base, star_var, &slot.path).is_some() {
+                    // A read through an unnested element: the element is a
+                    // row, and the value is read off it.
+                    SlotReading::BoundElement
                 } else {
                     SlotReading::Column
                 };
@@ -929,6 +933,29 @@ impl Visible {
             _ => None,
         }
     }
+}
+
+/// The collection prefix of `path` whose fan-out is at or below `node`, when
+/// the path reads through an unnested element: `[hasCoveredSection]` for
+/// `[hasCoveredSection, hasEntryPointM]` under `unnest hasCoveredSection`.
+pub(crate) fn element_prefix_below(
+    plan: &Plan,
+    node: NodeId,
+    star: &str,
+    path: &[String],
+) -> Option<Vec<String>> {
+    (1..path.len()).rev().find_map(|cut| {
+        let prefix = &path[..cut];
+        plan.nodes
+            .iter()
+            .enumerate()
+            .any(|(id, above)| {
+                matches!(&above.op, PlanOp::Unnest { star_var, slot_path, .. }
+                    if star_var == star && slot_path.as_slice() == prefix)
+                    && plan.feeds_visibly(id, node)
+            })
+            .then(|| prefix.to_vec())
+    })
 }
 
 /// Whether the unnest that bound `var` to an element of `star.slot` is at or
@@ -1357,6 +1384,46 @@ fn insert_unnest_above(plan: &mut Plan, scan: NodeId, star: &str, path: Vec<Stri
     plan.rebuild(nodes, &remap);
 }
 
+/// Insert a required fan-out immediately above a node -- the outer element's
+/// fan-out a nested one rests on.
+fn insert_required_unnest_above(
+    plan: &mut Plan,
+    below: NodeId,
+    star: &str,
+    path: Vec<String>,
+    var: String,
+) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() + 1);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        let mut op = node.op.clone();
+        op.map_inputs(|input| remap[input].expect("inputs precede their node"));
+        nodes.push(Node {
+            op,
+            executor: node.executor,
+            output: node.output,
+            key: node.key,
+            discharges: node.discharges.clone(),
+        });
+        remap[old] = Some(nodes.len() - 1);
+        if old == below {
+            let input = nodes.len() - 1;
+            nodes.push(Node::sql(
+                PlanOp::Unnest {
+                    input,
+                    star_var: star.to_owned(),
+                    slot_path: path.clone(),
+                    var: var.clone(),
+                    presence: SlotPresence::Required,
+                },
+                Vec::new(),
+            ));
+            remap[old] = Some(nodes.len() - 1);
+        }
+    }
+    plan.rebuild(nodes, &remap);
+}
+
 /// Insert filters immediately below a node, in order, each reading the one
 /// before it.
 fn insert_filters_below(plan: &mut Plan, target: NodeId, filters: Vec<(Vec<ObligationId>, Expr)>) {
@@ -1454,14 +1521,21 @@ fn subject_site(plan: &Plan, other: NodeId, subject: &str) -> Option<SubjectSite
         }
         slots
             .iter()
-            // A multivalued slot's variable is one element of an array,
-            // and walking into it would address a field of that element --
-            // a third reading of the address, which nothing renders. The
-            // star decomposition walks single-valued hops only, for the
-            // same reason.
+            // A multivalued slot's variable is one element of an array, and
+            // it is a site exactly when its fan-out is below `other`: the
+            // element is then a row, and a read of its slot is the
+            // `BoundElement` reading of the address (`e.value->>'slot'`),
+            // which the renderer spells from the binding's containers. With
+            // no fan-out below there is no row to read it off, and the
+            // address would be the collection's -- the "third reading"
+            // nothing renders.
             .find(|slot| {
                 slot.var.as_deref() == Some(subject)
-                    && !slot.multivalued
+                    && (!slot.multivalued
+                        || slot
+                            .var
+                            .as_deref()
+                            .is_some_and(|var| unnest_below(plan, other, star_var, &slot.path, var)))
                     // Walking into a value that may be absent would put a
                     // condition two slots down on the preserved side of a left
                     // join, dropping the rows it exists to keep.
@@ -1601,7 +1675,15 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             if site.prefix.is_empty() {
                 continue;
             }
-            let Some(class) = class_at_path(self.schema, &site.class_uri, &site.prefix) else {
+            // The prefix may cross a collection whose element the site's
+            // fan-out made a row of (`subject_site`); a reference hop is
+            // still another record.
+            let Some(class_uri) =
+                crate::sparql_scopes::class_at_path_of(self.schema, &site.class_uri, &site.prefix)
+            else {
+                continue;
+            };
+            let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
                 continue;
             };
             let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
@@ -1610,24 +1692,64 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
                 continue;
             };
-            if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue {
-                continue;
-            }
+            let multivalued =
+                on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue;
             let mut path = site.prefix.clone();
             path.push(slot.name.clone());
+            // A multivalued hop *off an element* is a nested fan-out: the
+            // element's own collection, one row per element of it, whose
+            // occurrence is the outer element's plus one hop
+            // (`parts[0].children[1]`). It folds only where the outer
+            // element is a row (an element site), with its own unnest above
+            // the outer one; off the record itself a multivalued hop is the
+            // fold rule's, through `scan_with_fanout`.
+            if multivalued && site.prefix.is_empty() {
+                continue;
+            }
+            if multivalued
+                && !plan.nodes.iter().enumerate().any(|(unnest, node)| {
+                    matches!(&node.op, PlanOp::Unnest { star_var, slot_path, .. }
+                        if *star_var == site.star_var && *slot_path == site.prefix)
+                        && plan.feeds(unnest, other)
+                })
+            {
+                continue;
+            }
+            let scan = site.scan;
+            let star = site.star_var.clone();
+            let prefix = site.prefix.clone();
+            let scan_key = plan.key_of(scan);
             fold_into_scan(
                 plan,
                 id,
                 consumer,
                 other,
-                site.scan,
+                scan,
                 ScanSlot {
-                    path,
-                    var: Some(var),
-                    multivalued: false,
+                    path: path.clone(),
+                    var: Some(var.clone()),
+                    multivalued,
                     presence: SlotPresence::Required,
                 },
             );
+            if multivalued {
+                // Above the outer element's fan-out, which is where the
+                // element is a row: the nested unnest reads it.
+                let scan = plan.node(scan_key).expect("the scan is live");
+                let outer = plan
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .position(|(id, node)| {
+                        matches!(&node.op, PlanOp::Unnest { star_var, slot_path, .. }
+                            if *star_var == star && slot_path.as_slice() == prefix.as_slice())
+                            // *This* scan's fan-out: a star per scope has one
+                            // each.
+                            && plan.feeds(scan, id)
+                    })
+                    .expect("the outer fan-out this fold rests on");
+                insert_required_unnest_above(plan, outer, &star, path, var);
+            }
             return true;
         }
         false
@@ -1649,10 +1771,8 @@ fn fold_into_scan(
     scan: NodeId,
     slot: ScanSlot,
 ) {
-    debug_assert!(
-        !slot.multivalued,
-        "a scan built outside `scan_with_fanout` cannot owe an unnest"
-    );
+    // A multivalued slot here is a nested fan-out off an element, and the
+    // caller inserts its unnest in the same edit (`FoldNestedMatchIntoPath`).
     let mut claims = plan.nodes[matched].discharges.clone();
     claims.extend(plan.nodes[join].discharges.iter().copied());
     if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
@@ -2912,7 +3032,7 @@ impl<'s> PushReferenceJoin<'s> {
         plan: &Plan,
         holder: NodeId,
         joined: &str,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, Vec<String>)> {
         self.foreign_key_on_through(plan, holder, joined, |plan, id, holder| {
             plan.feeds_visibly(id, holder)
         })
@@ -2927,7 +3047,7 @@ impl<'s> PushReferenceJoin<'s> {
         holder: NodeId,
         joined: &str,
         reaches: impl Fn(&Plan, NodeId, NodeId) -> bool,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, Vec<String>)> {
         plan.nodes
             .iter()
             .enumerate()
@@ -2937,20 +3057,42 @@ impl<'s> PushReferenceJoin<'s> {
                     class_uri,
                     slots,
                     ..
-                } if node.executor == Executor::Sql && reaches(plan, id, holder) => slots
-                    .iter()
-                    .find(|slot| {
-                        slot.var.as_deref() == Some(joined)
-                            && slot.presence == SlotPresence::Required
-                            && !slot.multivalued
-                            // A foreign key is a column of the record. A
-                            // reference inside an inlined structure is not
-                            // something `JoinEdge`'s one slot name can
-                            // address, so it is not this rule's edge.
-                            && slot.path.len() == 1
-                            && self.stores_a_reference(class_uri, &slot.path[0])
-                    })
-                    .map(|slot| (star_var.clone(), slot.path[0].clone())),
+                } if node.executor == Executor::Sql && reaches(plan, id, holder) => {
+                    slots
+                        .iter()
+                        .find(|slot| {
+                            slot.var.as_deref() == Some(joined)
+                                && slot.presence == SlotPresence::Required
+                                && !slot.multivalued
+                                && match slot.path.as_slice() {
+                                    // A foreign key is a column of the record...
+                                    [name] => self.stores_a_reference(class_uri, name),
+                                    // ...or a column of an unnested *element*,
+                                    // when the element is a row below the
+                                    // holder (the design's element-held edge):
+                                    // `e.value->>'belongsToTrack'` where a
+                                    // column reads `t1.object_data->>'slot'`.
+                                    [.., name] => {
+                                        let (_, prefix) = slot.path.split_last().unwrap();
+                                        element_prefix_below(plan, holder, star_var, &slot.path)
+                                            .is_some_and(|fanned| fanned.as_slice() == prefix)
+                                            && crate::sparql_scopes::class_at_path_of(
+                                                self.schema,
+                                                class_uri,
+                                                prefix,
+                                            )
+                                            .is_some_and(|element_class| {
+                                                self.stores_a_reference(&element_class, name)
+                                            })
+                                    }
+                                    [] => false,
+                                }
+                        })
+                        .map(|slot| {
+                            let (name, prefix) = slot.path.split_last().unwrap();
+                            (star_var.clone(), name.clone(), prefix.to_vec())
+                        })
+                }
                 _ => None,
             })
     }
@@ -3021,7 +3163,7 @@ impl Rule for PushReferenceJoin<'_> {
                 continue;
             };
             let holder = if referenced == left { right } else { left };
-            let Some((holder_star, slot)) = self.foreign_key_on(plan, holder, &joined) else {
+            let Some((holder_star, slot, path)) = self.foreign_key_on(plan, holder, &joined) else {
                 continue;
             };
             plan.nodes[id].executor = Executor::Sql;
@@ -3033,6 +3175,7 @@ impl Rule for PushReferenceJoin<'_> {
                     referenced: joined,
                     holder: holder_star,
                     slot,
+                    path,
                 });
             }
             return true;
@@ -3256,6 +3399,7 @@ impl Rule for AbsorbOptionalReference<'_> {
                     referenced: var.clone(),
                     holder: star,
                     slot: slot.name.clone(),
+                    path: Vec::new(),
                 });
             }
             // The edge names the referenced star, which the body's barrier
@@ -3457,7 +3601,8 @@ impl PushLeftJoin<'_> {
         };
         for referenced in stars(left).into_iter().chain(stars(right)) {
             for holder in [left, right] {
-                let Some((holder_star, slot)) = self.foreign_key_on(plan, holder, &referenced)
+                let Some((holder_star, slot, path)) =
+                    self.foreign_key_on(plan, holder, &referenced)
                 else {
                     continue;
                 };
@@ -3472,6 +3617,7 @@ impl PushLeftJoin<'_> {
                     referenced,
                     holder: holder_star,
                     slot,
+                    path,
                 });
             }
         }
@@ -3485,7 +3631,7 @@ impl PushLeftJoin<'_> {
         plan: &Plan,
         holder: NodeId,
         joined: &str,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, Vec<String>)> {
         PushReferenceJoin::new(self.schema).foreign_key_on_through(
             plan,
             holder,
@@ -3635,8 +3781,13 @@ impl PushNotExists<'_> {
         let [referenced] = shared.as_slice() else {
             return None;
         };
-        let (holder, slot) =
+        let (holder, slot, path) =
             PushReferenceJoin::new(self.schema).foreign_key_on(plan, right, referenced)?;
+        // The correlated `NOT EXISTS` renders one column of the block's
+        // record; an element-held key is not that.
+        if !path.is_empty() {
+            return None;
+        }
         // `FILTER NOT EXISTS { ?c :refersTo ?c }` is a star referring to
         // itself, so the block scans the variable the outer pattern already
         // scans. Two scans of one variable is not a shape the renderer reads —
@@ -3658,6 +3809,7 @@ impl PushNotExists<'_> {
             referenced: referenced.clone(),
             holder,
             slot,
+            path: Vec::new(),
         })
     }
 }
@@ -6565,12 +6717,14 @@ mod tests {
         println!("{plan}");
     }
 
-    /// A multivalued hop does not fold. The value beyond it belongs to one
-    /// element of an array, which is a third reading of an address and one
-    /// nothing renders; and a scan owing an unnest can only be built by
-    /// `scan_with_fanout`, which this rule does not go through.
+    /// A multivalued hop is walked into exactly when its element is a row:
+    /// the fan-out the array's fold emitted is below the read, so the value
+    /// beyond the hop is read off the element (`e.value->>'title'`, the
+    /// `BoundElement` reading) rather than off the array -- the design's
+    /// element-held read. The scan keeps the array as the multivalued slot
+    /// its fan-out restores, and gains the element's slot as a path.
     #[test]
-    fn a_multivalued_hop_is_not_walked_into() {
+    fn a_multivalued_hop_is_walked_into_through_its_element() {
         let schema = test_schema_view();
         let plan = refine_with_tier_one(
             "SELECT ?ti WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
@@ -6580,12 +6734,29 @@ mod tests {
 
         assert_eq!(
             scan_slots(&plan),
-            vec![("documents".to_owned(), "d".to_owned(), true)],
+            vec![
+                ("documents".to_owned(), "d".to_owned(), true),
+                ("documents.title".to_owned(), "ti".to_owned(), false),
+            ],
             "{plan}"
         );
-        assert_eq!(plan.find("match").len(), 1, "{plan}");
-        // The array itself still folds, so its fan-out is still restored.
+        assert!(plan.find("match").is_empty(), "{plan}");
         assert_eq!(plan.find("unnest").len(), 1, "{plan}");
+        // And the read is the element's, all the way to the operator: a
+        // condition on it reads `[each]`, never the array.
+        let filtered = refine_with_tier_one(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
+             ?d asset360:title ?ti . FILTER(?ti = \"One\") }",
+            &schema,
+        );
+        let filter = filtered.find("filter")[0];
+        assert!(
+            filtered.nodes[filter]
+                .op
+                .describe()
+                .contains("?s.documents.title[each]"),
+            "{filtered}"
+        );
         println!("{plan}");
     }
 

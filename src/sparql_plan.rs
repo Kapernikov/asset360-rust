@@ -644,16 +644,24 @@ fn write_ops(
                 right_slot,
                 right_path,
                 right_multivalued,
+                right_reading,
                 kind,
                 ..
             } => writeln!(
                 f,
-                "{indent}join      ?{right_star}.{}{right_slot}{} = ?{left_star}{}",
+                "{indent}join      ?{right_star}.{}{right_slot}{}{} = ?{left_star}{}",
                 right_path
                     .iter()
                     .map(|hop| format!("{hop}."))
                     .collect::<String>(),
                 if *right_multivalued { "[]" } else { "" },
+                // Which element of a path the key is read off: the fetch's
+                // any-element containment, or the statement's bound one.
+                if right_path.is_empty() {
+                    String::new()
+                } else {
+                    right_reading.to_string()
+                },
                 match kind {
                     crate::sparql_scoper::JoinType::Inner => "",
                     crate::sparql_scoper::JoinType::Left => "   left",
@@ -2992,7 +3000,11 @@ mod tests {
             "the printout names the premise: {restated}"
         );
 
-        let declined = plan_query_refined(
+        // A read through a mapping key leaf: the scoper declines the
+        // *fetch* bound, and now the read is the statement's own -- folded
+        // through the unnested element -- so the projection answers alone
+        // and the `LIMIT` is the query's, carried with no premise to state.
+        let answered = plan_query_refined(
             &format!(
                 "{PREFIX}SELECT ?s ?k WHERE {{ ?s a asset360:Signal ; asset360:documents ?d . \
                  ?d asset360:docId ?k }} LIMIT 50"
@@ -3000,7 +3012,8 @@ mod tests {
             &sv,
         )
         .expect("should plan");
-        assert_eq!(scan_of(&declined), (None, vec![]), "{declined}");
+        assert!(answered.sql_only(), "{answered}");
+        assert_eq!(scan_of(&answered), (Some(50), vec![]), "{answered}");
     }
 
     /// A query that never asked for an aggregate is owed no explanation.

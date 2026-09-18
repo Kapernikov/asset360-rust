@@ -8418,7 +8418,7 @@ classes:
     /// elements hold a reference: `TunnelComplex.hasCoveredSection` is a list
     /// of `CoveredSection`, and `CoveredSection.belongsToTrack` references
     /// `Track`. The inline test schema has no such slot.
-    fn asset360_fixture_schema_view() -> SchemaView {
+    pub(crate) fn asset360_fixture_schema_view() -> SchemaView {
         use linkml_meta::SchemaDefinition;
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -8511,22 +8511,26 @@ classes:
         );
     }
 
-    /// Through the whole pipeline: the refined plan has no rule for a path
-    /// edge (`PushReferenceJoin` pushes column references only), so the
-    /// statement route declines and the fetch is the scoper's -- *with* the
-    /// edge, so the fetch reads the Tracks the covered sections name rather
-    /// than every Track there is, and the engine finishes the OPTIONAL over
-    /// both sides.
+    /// Through the whole pipeline: #464's shape, as a statement. The
+    /// `OPTIONAL` body is a scope of its own -- its `?s` typed by the
+    /// boundary restriction, the reference held by the unnested element
+    /// pushed as the body's own join (`PushReferenceJoin`'s element-held
+    /// edge, read off the element's row and never as the fetch's
+    /// any-element containment) -- and the body is a derived table
+    /// left-joined on the identity. SQL answers alone; nothing is left for
+    /// the engine.
     #[test]
     fn the_execution_plan_carries_the_path_edge_into_the_fetch() {
         let sv = asset360_fixture_schema_view();
         let plan = crate::sparql_plan::plan_query_refined(TUNNEL_TRACK_OPTIONAL, &sv).unwrap();
         let rendered = format!("{plan}");
         assert!(
-            rendered.contains("join      ?s.hasCoveredSection.belongsToTrack[] = ?t   left"),
-            "{rendered}"
+            rendered.contains("join      ?s.hasCoveredSection.belongsToTrack[each] = ?t"),
+            "the element-held edge, bound:\n{rendered}"
         );
-        assert!(rendered.contains("engine finishes"), "{rendered}");
+        assert!(rendered.contains("relation  q0"), "{rendered}");
+        assert!(rendered.contains("all in SQL"), "{rendered}");
+        assert!(plan.sql_only(), "{rendered}");
     }
 
     /// The other half of issue #444, and the worse one: drop `?t a

@@ -148,6 +148,7 @@ pub enum TermOf {
     /// identity and one hop per collection step on `path`.
     Structure {
         holder_star: String,
+        holder_class_uri: String,
         path: Vec<String>,
         class_uri: String,
     },
@@ -489,6 +490,7 @@ impl Plan {
                                 }
                                 _ => TermOf::Structure {
                                     holder_star: star_var.clone(),
+                                    holder_class_uri: class_uri.clone(),
                                     path: slot_path.clone(),
                                     class_uri: class_at_path_of(schema, &class_uri, slot_path)
                                         .unwrap_or_default(),
@@ -1072,32 +1074,31 @@ impl Plan {
                 } => (*left, *right, None, key),
                 _ => continue,
             };
-            let agrees = match key {
-                JoinKey::Identity { var, class_uri } => {
-                    on.as_ref().is_none_or(|on| on.as_slice() == [var.clone()])
+            let agrees =
+                match key {
+                    JoinKey::Identity { var, class_uri } => {
+                        on.as_ref().is_none_or(|on| on.as_slice() == [var.clone()])
+                            && [left, right].iter().all(|side| {
+                                self.guaranteed(*side).contains(var)
+                                    && self.identity_class(schema, *side, var).as_ref()
+                                        == Some(class_uri)
+                            })
+                    }
+                    JoinKey::Element {
+                        var,
+                        holder_class_uri,
+                        path,
+                    } => on.as_ref().is_none_or(|on| on.as_slice() == [var.clone()])
                         && [left, right].iter().all(|side| {
                             self.guaranteed(*side).contains(var)
-                                && self.identity_class(schema, *side, var).as_ref()
-                                    == Some(class_uri)
-                        })
-                }
-                JoinKey::Element {
-                    var,
-                    holder_class_uri,
-                    path,
-                } => on.as_ref().is_none_or(|on| on.as_slice() == [var.clone()])
-                    && [left, right].iter().all(|side| {
-                        self.guaranteed(*side).contains(var)
-                            && matches!(
-                                self.term_of(schema, *side, var).as_slice(),
-                                [TermOf::Structure { holder_star, path: at, .. }]
-                                    if at == path
-                                        && self.identity_class(schema, *side, holder_star).as_ref()
-                                            == Some(holder_class_uri)
-                            )
-                    }),
-                JoinKey::Cross => on.as_ref().is_none_or(|on| on.is_empty()),
-            };
+                                && matches!(
+                                    self.term_of(schema, *side, var).as_slice(),
+                                    [TermOf::Structure { holder_class_uri: holder, path: at, .. }]
+                                        if at == path && holder == holder_class_uri
+                                )
+                        }),
+                    JoinKey::Cross => on.as_ref().is_none_or(|on| on.is_empty()),
+                };
             if !agrees {
                 return Err(ScopeDefect::MisrecordedKey { join: id });
             }

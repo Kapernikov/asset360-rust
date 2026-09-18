@@ -306,6 +306,18 @@ pub enum Op {
         /// compares an array's text and matches nothing — an empty join with
         /// no error to say so.
         right_multivalued: bool,
+        /// How `right_path` is walked when it crosses a collection.
+        ///
+        /// The one place the fetch and the statement say different things
+        /// for the same edge, stated on the node so the renderer cannot pick
+        /// the wrong spelling: the fetch's path edge is an *any-element*
+        /// containment (`jsonb_path_query … [*]`), correct for a fetch that
+        /// over-fetches; a statement that binds the element reads the key
+        /// off *that element's row* (`e.value->>'slot'`, the lateral the
+        /// statement already has), and any-element there would join a track
+        /// referenced by any section to every section. `Column` when the
+        /// path is empty.
+        right_reading: SlotReading,
         kind: JoinType,
     },
     /// The arms of a `UNION`, stacked as one statement.
@@ -698,6 +710,12 @@ pub fn lower_sql_pass(
                 right_slot: join.right_slot.clone(),
                 right_path: join.right_path.clone(),
                 right_multivalued: join.right_multivalued,
+                // The fetch's spelling: some element holds the key.
+                right_reading: if join.right_path.is_empty() {
+                    SlotReading::Column
+                } else {
+                    SlotReading::AnyElement
+                },
                 kind: join.join_type,
             },
             discharges: Vec::new(),
@@ -1421,23 +1439,21 @@ impl Lowering<'_> {
             TermOf::Measure { .. } => ColumnKind::Measure,
             TermOf::Structure {
                 holder_star,
+                holder_class_uri,
                 path,
                 class_uri,
-            } => {
-                let holder_class = self.plan.identity_class(self.schema, body, holder_star)?;
-                ColumnKind::Structure {
-                    holder_star: holder_star.clone(),
-                    path: path.clone(),
-                    class_uri: class_uri.clone(),
-                    binding: crate::sparql_pushdown::occurrence_spec(
-                        self.schema,
-                        holder_star,
-                        &holder_class,
-                        var,
-                        path.clone(),
-                    )?,
-                }
-            }
+            } => ColumnKind::Structure {
+                holder_star: holder_star.clone(),
+                path: path.clone(),
+                class_uri: class_uri.clone(),
+                binding: crate::sparql_pushdown::occurrence_spec(
+                    self.schema,
+                    holder_star,
+                    holder_class_uri,
+                    var,
+                    path.clone(),
+                )?,
+            },
             TermOf::Collection { .. } | TermOf::Computed => return None,
         })
     }
@@ -1526,6 +1542,7 @@ impl Lowering<'_> {
             right_slot: String::new(),
             right_path: Vec::new(),
             right_multivalued: false,
+            right_reading: SlotReading::Column,
             kind,
         })
     }
@@ -1913,9 +1930,11 @@ impl Lowering<'_> {
                             left_star: edge.referenced.clone(),
                             right_star: edge.holder.clone(),
                             right_slot: edge.slot.clone(),
-                            // A rule only ever pushes a column reference (see
-                            // `PushReferenceJoin::foreign_key_on`).
-                            right_path: Vec::new(),
+                            // A column of the record, or of an unnested
+                            // element (the element-held edge): the statement
+                            // reads it off the element's row, never as the
+                            // fetch's any-element containment.
+                            right_path: edge.path.clone(),
                             // A *pushed* join is single-valued by construction:
                             // `PushReferenceJoin::foreign_key_on` only takes a
                             // scan slot with `!multivalued`, and
@@ -1926,6 +1945,11 @@ impl Lowering<'_> {
                             // renderer only through the scoper's own fetch, where
                             // `JoinEdge::right_multivalued` carries it.
                             right_multivalued: false,
+                            right_reading: if edge.path.is_empty() {
+                                SlotReading::Column
+                            } else {
+                                SlotReading::BoundElement
+                            },
                             kind: JoinType::Left,
                         },
                         discharges: node.discharges.clone(),
@@ -1950,14 +1974,15 @@ impl Lowering<'_> {
                             left_star: edge.referenced.clone(),
                             right_star: edge.holder.clone(),
                             right_slot: edge.slot.clone(),
-                            // A rule only ever pushes a column reference (see
-                            // `PushReferenceJoin::foreign_key_on`).
+                            // A rule only ever pushes a column reference here
+                            // (`PushNotExists::correlation` declines a path).
                             right_path: Vec::new(),
                             // Single-valued for the reason the two joins below
                             // give: `foreign_key_on` only takes a single-valued
                             // reference slot, and `reference_joins_agree` refuses
                             // a recorded edge that is not one.
                             right_multivalued: false,
+                            right_reading: SlotReading::Column,
                             kind: JoinType::Anti,
                         },
                         discharges: node.discharges.clone(),
@@ -1994,13 +2019,18 @@ impl Lowering<'_> {
                             left_star: edge.referenced.clone(),
                             right_star: edge.holder.clone(),
                             right_slot: edge.slot.clone(),
-                            // A rule only ever pushes a column reference (see
-                            // `PushReferenceJoin::foreign_key_on`).
-                            right_path: Vec::new(),
+                            // As on the left join above: a column of the
+                            // record, or of an unnested element.
+                            right_path: edge.path.clone(),
                             // Single-valued for the reason given on the left join
                             // above: `reference_joins_agree` refuses a recorded
                             // edge on a multivalued slot.
                             right_multivalued: false,
+                            right_reading: if edge.path.is_empty() {
+                                SlotReading::Column
+                            } else {
+                                SlotReading::BoundElement
+                            },
                             // No rule pushes a left join, so a pushed join is
                             // inner. The refusal above is what keeps that true.
                             kind: JoinType::Inner,
