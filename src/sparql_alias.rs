@@ -231,6 +231,85 @@ impl std::fmt::Display for NotASlotOfClass {
 
 impl std::error::Error for NotASlotOfClass {}
 
+/// A string literal written against a slot whose values are concept IRIs.
+///
+/// `?a asset360:hasCivilEngineeringAssetType "Tunnel"` is the most natural
+/// spelling of an enum filter there is, and it can never match: an
+/// enum-ranged slot is written into the data as the permissible value's
+/// concept IRI (`asset360:CEAssetType#Tunnel`), and a literal is not an IRI.
+/// Left alone it is a 200 with zero rows after reading the whole class —
+/// which is what v0.10.4 answered
+/// ([#461](https://gitlab.pp.kapernikov.com/asset360/consolidator-server/-/issues/461)),
+/// and the one outcome the refusal policy exists to prevent. So it is
+/// refused by name, with the two spellings that do match: the concept IRI,
+/// and the `skos:notation` lookup in the schema graph for a caller who only
+/// knows the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralAgainstAConcept {
+    /// The subject as the query wrote it.
+    pub subject: String,
+    /// The predicate IRI, after alias resolution.
+    pub predicate: String,
+    /// The literal's lexical form.
+    pub literal: String,
+    /// The class the subject is typed with.
+    pub class_name: String,
+    /// The enum the slot ranges over, as its IRI.
+    pub enum_iri: String,
+    /// The concept IRI of the permissible value spelled like the literal,
+    /// when there is one.
+    pub concept: Option<String>,
+    /// CURIEs for the message, where the schema's prefixes give one.
+    pub curies: HashMap<String, String>,
+}
+
+impl LiteralAgainstAConcept {
+    fn short(&self, iri: &str) -> String {
+        match self.curies.get(iri) {
+            Some(curie) => curie.clone(),
+            None => format!("<{iri}>"),
+        }
+    }
+}
+
+impl std::fmt::Display for LiteralAgainstAConcept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\"{}\" is a string, and {} on {} holds a concept of {} -- its values are \
+             concept IRIs, so `{} {} \"{}\"` can never match. ",
+            self.literal,
+            self.short(&self.predicate),
+            self.class_name,
+            self.short(&self.enum_iri),
+            self.subject,
+            self.short(&self.predicate),
+            self.literal,
+        )?;
+        match &self.concept {
+            Some(concept) => write!(
+                f,
+                "Write the concept IRI, <{concept}>, or select by code inside the schema \
+                 graph: `{} {} ?v . GRAPH <schema> {{ ?v <http://www.w3.org/2004/02/skos/core#notation> \"{}\" }}`.",
+                self.subject,
+                self.short(&self.predicate),
+                self.literal,
+            ),
+            None => write!(
+                f,
+                "No value of {} is spelled \"{}\"; its concepts are the ?v of `GRAPH <schema> \
+                 {{ ?v <http://www.w3.org/2004/02/skos/core#inScheme> <{}> ; \
+                 <http://www.w3.org/2004/02/skos/core#notation> ?code }}`.",
+                self.short(&self.enum_iri),
+                self.literal,
+                self.enum_iri,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LiteralAgainstAConcept {}
+
 /// Why a query's spellings could not be resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpellingError {
@@ -239,6 +318,8 @@ pub enum SpellingError {
     /// A predicate on a subject whose class cannot carry it. Boxed: it
     /// carries the message's spellings, and `Ok` is the common path.
     NotASlotOfClass(Box<NotASlotOfClass>),
+    /// A string literal against an enum-ranged slot.
+    LiteralAgainstAConcept(Box<LiteralAgainstAConcept>),
 }
 
 impl std::fmt::Display for SpellingError {
@@ -246,6 +327,7 @@ impl std::fmt::Display for SpellingError {
         match self {
             SpellingError::Ambiguous(inner) => inner.fmt(f),
             SpellingError::NotASlotOfClass(inner) => inner.fmt(f),
+            SpellingError::LiteralAgainstAConcept(inner) => inner.fmt(f),
         }
     }
 }
@@ -261,6 +343,12 @@ impl From<AmbiguousAlias> for SpellingError {
 impl From<Box<NotASlotOfClass>> for SpellingError {
     fn from(inner: Box<NotASlotOfClass>) -> Self {
         SpellingError::NotASlotOfClass(inner)
+    }
+}
+
+impl From<Box<LiteralAgainstAConcept>> for SpellingError {
+    fn from(inner: Box<LiteralAgainstAConcept>) -> Self {
+        SpellingError::LiteralAgainstAConcept(inner)
     }
 }
 
@@ -306,6 +394,7 @@ pub fn canonicalize(
     rewrites.extend(canonicalize_classes(query, schema_view)?);
     rewrites.sort_by(|a, b| a.from.cmp(&b.from));
     refuse_uncarried_predicates(query, schema_view)?;
+    refuse_literals_against_concepts(query, schema_view)?;
     Ok(rewrites)
 }
 
@@ -744,6 +833,10 @@ fn walk_expression_mut(expr: &mut Expression, visit: &mut dyn FnMut(&mut Vec<Tri
 struct SubjectSpellings {
     types: BTreeSet<String>,
     predicates: BTreeSet<String>,
+    /// The string literals the subject is matched against, per predicate.
+    /// Only the lexical form: a typed or language-tagged literal is no more
+    /// an IRI than a plain one.
+    literals: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// One variable scope's subjects, keyed by the subject as the query wrote it.
@@ -871,6 +964,94 @@ fn uncarried(
     }
 }
 
+/// Refuse a string literal matched against a slot whose values are concept
+/// IRIs. See [`LiteralAgainstAConcept`].
+///
+/// Runs after [`refuse_uncarried_predicates`], so every predicate it sees is
+/// one its subject's class carries. Same scope rules as that refusal: one
+/// known class per subject, instance patterns only.
+pub fn refuse_literals_against_concepts(
+    query: &Query,
+    schema_view: &SchemaView,
+) -> Result<(), Box<LiteralAgainstAConcept>> {
+    let pattern = match query {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    };
+    let mut scopes: Vec<Scope> = vec![Scope::new()];
+    collect_scopes(pattern, &mut scopes, 0, false);
+    let conv = schema_view.converter();
+
+    for scope in &scopes {
+        for (subject, spellings) in scope {
+            if spellings.literals.is_empty() {
+                continue;
+            }
+            let mut types = spellings.types.iter();
+            let (Some(class_iri), None) = (types.next(), types.next()) else {
+                continue;
+            };
+            let Some(class) = schema_view.get_class_by_uri(class_iri).ok().flatten() else {
+                continue;
+            };
+            for (predicate, literals) in &spellings.literals {
+                let Some(slot) = class.slots().iter().find(|slot| {
+                    slot.canonical_uri()
+                        .to_uri(&conv)
+                        .ok()
+                        .map(|u| u.0)
+                        .as_deref()
+                        == Some(predicate)
+                }) else {
+                    continue;
+                };
+                let Some(enum_view) = slot.get_range_enum() else {
+                    continue;
+                };
+                let enum_iri = enum_view
+                    .canonical_uri()
+                    .to_uri(&conv)
+                    .map(|u| u.0)
+                    .unwrap_or_else(|_| enum_view.canonical_uri().to_string());
+                let Some(literal) = literals.iter().next() else {
+                    continue;
+                };
+                let concept = enum_view
+                    .definition()
+                    .permissible_values
+                    .as_ref()
+                    .and_then(|values| values.get(literal.as_str()).map(|pv| (literal, pv)))
+                    .map(|(text, pv)| {
+                        linkml_schemaview::enumview::permissible_value_iri(
+                            &enum_iri, text, pv, &conv,
+                        )
+                        .unwrap_or_else(|raw| raw)
+                    });
+                let mut curies = HashMap::new();
+                for iri in [predicate.as_str(), enum_iri.as_str()] {
+                    if let Ok(curie) = conv.compress(iri)
+                        && curie != iri
+                    {
+                        curies.insert(iri.to_owned(), curie);
+                    }
+                }
+                return Err(Box::new(LiteralAgainstAConcept {
+                    subject: subject.clone(),
+                    predicate: predicate.clone(),
+                    literal: literal.clone(),
+                    class_name: class.name().to_owned(),
+                    enum_iri,
+                    concept,
+                    curies,
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The part of an IRI after its last `#` or `/`, when there is one.
 fn local_name(iri: &str) -> Option<&str> {
     let tail = &iri[iri.rfind(['#', '/'])? + 1..];
@@ -914,6 +1095,13 @@ fn collect_scopes(
                     }
                 } else {
                     entry.predicates.insert(predicate.as_str().to_owned());
+                    if let TermPattern::Literal(literal) = &triple.object {
+                        entry
+                            .literals
+                            .entry(predicate.as_str().to_owned())
+                            .or_default()
+                            .insert(literal.value().to_owned());
+                    }
                 }
             }
         }
@@ -1302,6 +1490,12 @@ prefixes:
   asset360: https://data.infrabel.be/asset360/
 default_prefix: asset360
 default_range: string
+enums:
+  ZoneKind:
+    permissible_values:
+      Tunnel:
+      Bridge:
+        meaning: asset360:BridgeConcept
 classes:
   Zone:
     class_uri: asset360:Zone
@@ -1310,6 +1504,8 @@ classes:
         identifier: true
       name:
         range: string
+      kind:
+        range: ZoneKind
 "#;
         let mut sv = SchemaView::new();
         for raw in [rsm, asset360] {
@@ -1341,6 +1537,70 @@ classes:
         match canonicalize(&mut parsed, &sv) {
             Err(SpellingError::NotASlotOfClass(refusal)) => *refusal,
             other => panic!("{query}: expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// #461: a string against an enum-ranged slot can never match a concept
+    /// IRI, and is refused naming the IRI and the `skos:notation` form.
+    #[test]
+    fn a_string_literal_against_a_concept_slot_is_refused_naming_the_iri() {
+        let sv = schema_view();
+        let query = format!(
+            "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Tunnel\" }}"
+        );
+        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let SpellingError::LiteralAgainstAConcept(refusal) =
+            canonicalize(&mut parsed, &sv).expect_err("refused")
+        else {
+            panic!("expected the literal refusal");
+        };
+        assert_eq!(refusal.literal, "Tunnel");
+        assert_eq!(
+            refusal.concept.as_deref(),
+            Some("https://data.infrabel.be/asset360/ZoneKind#Tunnel")
+        );
+        let message = refusal.to_string();
+        assert!(
+            message.contains("<https://data.infrabel.be/asset360/ZoneKind#Tunnel>"),
+            "{message}"
+        );
+        assert!(
+            message.contains("skos/core#notation> \"Tunnel\""),
+            "{message}"
+        );
+
+        // A value with a `meaning` is named by it.
+        let query = format!(
+            "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Bridge\" }}"
+        );
+        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let SpellingError::LiteralAgainstAConcept(refusal) =
+            canonicalize(&mut parsed, &sv).expect_err("refused")
+        else {
+            panic!("expected the literal refusal");
+        };
+        assert_eq!(
+            refusal.concept.as_deref(),
+            Some("https://data.infrabel.be/asset360/BridgeConcept")
+        );
+
+        // A spelling no value has says where the values are.
+        let query = format!(
+            "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Viaduct\" }}"
+        );
+        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let refusal = canonicalize(&mut parsed, &sv).expect_err("refused");
+        assert!(refusal.to_string().contains("No value of"), "{refusal}");
+
+        // The concept IRI itself, and a string on a string slot, pass.
+        for accepted in [
+            format!(
+                "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> <https://data.infrabel.be/asset360/ZoneKind#Tunnel> }}"
+            ),
+            format!("SELECT ?z WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> \"Tunnel\" }}"),
+        ] {
+            let mut parsed = crate::sparql_scoper::parse_query(&accepted).expect("parses");
+            canonicalize(&mut parsed, &sv).expect("accepted");
         }
     }
 

@@ -2356,6 +2356,7 @@ pub fn scope_parsed_with_schema_graph(
                 &references,
                 &path_bindings,
                 schema_view,
+                schema_graph_iri,
             ));
         }
     }
@@ -4842,6 +4843,7 @@ fn untyped_subject_refusal(
     references: &HashMap<String, ReferenceReach>,
     path_bindings: &HashMap<String, PathBinding>,
     schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
 ) -> ScopeError {
     // Typed with a class the schema does not know: not "add a type" but "fix
     // the one you wrote".
@@ -4864,6 +4866,46 @@ fn untyped_subject_refusal(
     }
     // Bound to a value: a literal has no triples, so the pattern is empty by
     // construction rather than for want of a fetch.
+    //
+    // A value that is a *concept* -- the object of an enum-ranged slot -- is
+    // the one case where the author's question has an answer, in another
+    // graph: an enum value is a concept IRI whose labels and code the schema
+    // graph holds (`crate::sparql_schema_graph`), unreachable without a
+    // `GRAPH` clause naming it. The message names the clause with the real
+    // IRI, because the IRI is not discoverable from the endpoint and the
+    // refusal used to suggest adding `?type a <Class>`, which leads nowhere
+    // (#465, pepibru GitLab).
+    let concept_slot = star_map.values().find_map(|builder| {
+        let class_uri = var_to_class.get(&builder.variable)?;
+        let class = schema_view.get_class_by_uri(class_uri).ok().flatten()?;
+        builder
+            .object_variables
+            .iter()
+            .find(|(_, object_var)| object_var.as_str() == var)
+            .and_then(|(slot_name, _)| {
+                let slot = class.slot(&Identifier::Name(slot_name.clone()))?;
+                let enum_view = slot.get_range_enum()?;
+                Some((
+                    builder.variable.clone(),
+                    slot_name.clone(),
+                    enum_view.canonical_uri().to_string(),
+                ))
+            })
+    });
+    if let Some((holder, slot_name, enum_iri)) = concept_slot {
+        let graph = match schema_graph_iri {
+            Some(iri) => format!("<{iri}>"),
+            None => "<schema-graph>".to_owned(),
+        };
+        return ScopeError::Unscoped(format!(
+            "?{var} is bound to a concept of <{enum_iri}> (the value of `{slot_name}` on \
+             ?{holder}), not a record: its labels and code are in the schema graph, which a \
+             triple pattern reaches only inside a GRAPH clause. Write `GRAPH {graph} {{ ?{var} \
+             <http://www.w3.org/2004/02/skos/core#prefLabel> ?label . FILTER(lang(?label) = \
+             \"nl-be\") }}` (inside the OPTIONAL, if the pattern was optional); \
+             `skos:notation` there is the code, `rdfs:label` the name."
+        ));
+    }
     let is_value = path_bindings.contains_key(var)
         || star_map.values().any(|builder| {
             let Some(class_uri) = var_to_class.get(&builder.variable) else {
@@ -5476,8 +5518,25 @@ classes:
                 "?x has no rdf:type",
                 "SELECT ?x WHERE { ?s a asset360:Signal . ?x asset360:name ?n }",
             ),
+            // A concept as a subject (#465): the label read anyone writes
+            // first. The answer is in the schema graph, and the message says
+            // the GRAPH clause with the graph's real IRI.
+            (
+                "?k is bound to a concept of <https://data.infrabel.be/asset360/SignalKind> \
+                 (the value of `kind` on ?s), not a record: its labels and code are in the \
+                 schema graph, which a triple pattern reaches only inside a GRAPH clause. \
+                 Write `GRAPH <urn:schema> { ?k <http://www.w3.org/2004/02/skos/core#prefLabel> \
+                 ?label . FILTER(lang(?label) = \"nl-be\") }`",
+                "SELECT ?l WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+                 OPTIONAL { ?k <http://www.w3.org/2004/02/skos/core#prefLabel> ?l } }",
+            ),
         ] {
-            let err = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap_err();
+            let err = sparql_scope_with_schema_graph(
+                &format!("{prefix}{query}"),
+                &sv,
+                Some("urn:schema"),
+            )
+            .unwrap_err();
             let ScopeError::Unscoped(msg) = &err else {
                 panic!("{query}: expected an unscoped refusal, got {err:?}");
             };
@@ -6829,25 +6888,27 @@ classes:
             vec![FilterCondition::Eq("KSS".to_owned())]
         );
 
-        // A literal is a term no record renders as — for any value now, not
-        // just the mapped ones. Pushing it would answer with every matching
-        // record where SPARQL answers with none.
-        for code in ["GSA", "KSS"] {
-            let plan = sparql_scope(
+        // A literal is a term no record renders as -- for any value, not just
+        // the mapped ones. It used to be `Inexact::EnumConstantUnmatched`,
+        // the engine's empty answer with a 200; since #461 it is refused at
+        // the parse, naming the concept IRI (`crate::sparql_alias`).
+        for (code, concept) in [
+            ("GSA", "http://ontorail.org/src/Eulynx/GSA"),
+            ("KSS", "https://data.infrabel.be/asset360/SignalKind#KSS"),
+        ] {
+            let err = sparql_scope(
                 &format!(
                     "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"{code}\" }}"
                 ),
                 &sv,
             )
-            .unwrap();
-            assert_eq!(
-                plan.inexact,
-                Some(Inexact::EnumConstantUnmatched),
-                "literal {code:?} matches no term"
-            );
+            .unwrap_err();
+            let ScopeError::UnsupportedConstruct(msg) = &err else {
+                panic!("literal {code:?}: expected a refusal, got {err:?}");
+            };
             assert!(
-                !plan.root.all_stars()[0].filters.contains_key("kind"),
-                "nothing is pushed for a constant no record renders as ({code})"
+                msg.contains(&format!("<{concept}>")),
+                "literal {code:?} is refused naming its concept: {msg}"
             );
         }
     }
