@@ -1780,12 +1780,10 @@ pub fn lower_refined_with(
                 Some(claim @ crate::sparql_plan::Obligation::Triple { predicate, .. }) => {
                     // The predicate names a slot through the schema, the way
                     // every rule that folded the read resolved it -- not by
-                    // its local name. A slot whose `slot_uri` lies outside
-                    // its namespace (`Line.name` is `rsm:EAID_080C70AE…`,
-                    // read as `irsm:name`) has a local name that is not the
-                    // slot's, so a local-name comparison called every such
-                    // read unmade and the statement that made it was refused
-                    // (#462, pepibru GitLab). The local name stays as the
+                    // its local name, which a slot whose `slot_uri` lies
+                    // outside its namespace (`Line.name` is
+                    // `rsm:EAID_080C70AE…`, read as `irsm:name`) does not
+                    // share (#462, pepibru GitLab). The local name is the
                     // fallback for a predicate the schema does not know.
                     let iri = predicate.trim_matches(['<', '>']);
                     let slot = schema
@@ -3763,11 +3761,9 @@ mod tests {
     /// `= "GSA"` matches no stored value. Pushing it as one branch of a
     /// disjunction would be worse than pushing it alone -- the branch is
     /// dead, so the disjunction would silently narrow to the *other* branch
-    /// and answer a different question. Until #461 the tree entry point
-    /// asked `constants_are_the_columns_terms` and declined the whole tree;
-    /// now the comparison itself is refused by name
-    /// (`crate::sparql_alias::refuse_literals_against_concepts`), before any
-    /// rule sees it, so neither leg can answer it wrong.
+    /// and answer a different question. The comparison itself is refused by
+    /// name (`crate::sparql_alias::refuse_literals_against_concepts`, #461),
+    /// before any rule sees it, so neither leg can answer it wrong.
     #[test]
     fn a_branch_whose_constant_is_not_the_columns_term_is_refused() {
         let sv = test_schema_view();

@@ -3130,12 +3130,9 @@ fn replace_nodes(plan: &mut Plan, replaced: &[(NodeId, NodeId)]) {
 ///   :ref ?i . ?i a I . OPTIONAL { ?i :ref2 ?j . ?j a J } }` is a left join
 ///   whose preserved side is the optional side of another, and rendered
 ///   flat it is the same bag as nested: `j`'s `ON` reads `i` alone, so where
-///   `i` is missing `j` is too. It used to be declined ("an order of
-///   preservation this does not reason about"), which left every nested
-///   `OPTIONAL` an engine join and the export it sat in a fetch (#463,
-///   pepibru GitLab). What the renderer needs is one non-optional `FROM`
-///   star, and the lowering marks every scan under any pushed left join's
-///   optional side, nested or not.
+///   `i` is missing `j` is too. What the renderer needs is one non-optional
+///   `FROM` star, and the lowering marks every scan under any pushed left
+///   join's optional side, nested or not (#463, pepibru GitLab).
 pub struct PushLeftJoin<'s> {
     schema: &'s SchemaView,
 }

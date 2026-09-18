@@ -3535,9 +3535,16 @@ fn load_json_batch(
 ///         infrabel-named graph into an unrelated deployment.
 ///     max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
 ///         milliseconds, counted once the store is loaded. ``None`` (the
-///         default) is no ceiling. A query still evaluating at the deadline
-///         is cancelled and raises ``RuntimeError("Evaluation time limit
-///         exceeded: …")``. This is the only limit that bounds *work*: a
+///         default) is no ceiling. The caller is answered at the deadline
+///         with ``RuntimeError("Evaluation time limit exceeded: …")``; the
+///         evaluation itself is cancelled at its next store read, and one
+///         that never reads again (a hash join, an ``ORDER BY`` over a
+///         product) runs to its end on its own thread, holding its store.
+///         So this bounds the *request*, not the worker. What bounds the
+///         worker is the backlog: while ``MAX_ABANDONED_EVALUATIONS`` such
+///         evaluations are still running, a call with a ceiling is refused
+///         before it loads a store, with ``RuntimeError("Evaluation backlog
+///         full: …")``. It is the only limit that bounds *work*: a
 ///         cartesian product on a small store is under the triple cap and
 ///         never reaches the row cap, because the first row is what takes
 ///         minutes (#460, pepibru GitLab).
@@ -3606,6 +3613,12 @@ fn sparql_execute(
         Err(crate::sparql_executor::ExecuteError::EvaluationTimeExceeded { millis }) => {
             Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "Evaluation time limit exceeded: the engine ran for more than {millis} ms"
+            )))
+        }
+        Err(crate::sparql_executor::ExecuteError::EvaluationBacklog { abandoned, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Evaluation backlog full: {abandoned} evaluations are still running past \
+                 their deadline in this process, and {limit} is the most it carries"
             )))
         }
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
