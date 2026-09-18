@@ -82,12 +82,25 @@
 //! the sibling of the untyped-subject refusal in [`crate::sparql_scoper`]: a
 //! typed subject with a predicate its class cannot carry.
 //!
+//! A node the query does not type is judged all the same when a slot reached
+//! it: `?s :refersToLocatedNetEntity ?e` makes `?e` a `LocatedNetEntity`, or
+//! a subclass of one, because that is the slot's range and nothing else is
+//! ever written there. So `?e asset360:name ?n` — the shape #447's reporter
+//! actually wrote — is refused naming the hop, the class, and the spelling
+//! to write. The
+//! judgement covers the range's whole family: a slot only a subclass carries
+//! is accepted, and a predicate none of them carries is refused. It follows
+//! the `[ … ]` blank-node form, a second hop, and a reference whose object
+//! the query leaves untyped. That is
+//! [#459](https://gitlab.pp.kapernikov.com/asset360/consolidator-server/-/issues/459).
+//!
 //! What is *not* refused, because the lookup cannot judge it: a predicate on
-//! a subject with no `rdf:type` (the scoper's, see above), on a subject typed
-//! with a class the schema does not know (also the scoper's), on a subject
-//! typed with two different classes (an intersection the scoper already
-//! handles), inside a `GRAPH` or `SERVICE` block, or reached through a
-//! property path. A sub-`SELECT` is its own scope: a variable it does not
+//! a subject with no `rdf:type` that no slot reaches (the scoper's, see
+//! above), on a subject typed with a class the schema does not know (also
+//! the scoper's), on a subject typed with two different classes (an
+//! intersection the scoper already handles) or reached through two slots of
+//! different ranges, inside a `GRAPH` or `SERVICE` block, or reached through
+//! a property path. A sub-`SELECT` is its own scope: a variable it does not
 //! project is not the outer query's, so its subjects are judged on their own.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -162,9 +175,26 @@ pub struct NotASlotOfClass {
     /// local name. Its declared IRI and, when it differs, the native spelling
     /// the schema graph publishes as its `owl:equivalentProperty`.
     pub suggestion: Option<SlotSpellings>,
+    /// How the class is known when the subject carries no `rdf:type` of its
+    /// own: the slot it was reached through, whose range it is. `None` when
+    /// the query typed the subject itself.
+    pub reached_through: Option<ReachedThrough>,
+    /// Whether the class has subclasses. A reached node may be any of them,
+    /// so the judgement covered the whole family and the message says so.
+    pub polymorphic: bool,
     /// The predicate and the suggestion as CURIEs, where the schema's prefixes
     /// can compress them. For the message only.
     pub curies: HashMap<String, String>,
+}
+
+/// The hop that tells a node's class: `?s :refersToLocatedNetEntity ?e` makes
+/// `?e` a `LocatedNetEntity`, or a subclass of it, without an `rdf:type`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachedThrough {
+    /// The subject of the hop, as the query wrote it.
+    pub subject: String,
+    /// The hop's predicate, after alias resolution.
+    pub predicate: String,
 }
 
 /// One slot's two spellings.
@@ -199,10 +229,26 @@ impl std::fmt::Display for NotASlotOfClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} is not a slot of {} (<{}>), so `{} {} …` can never match",
+            "{} is not a slot of {} (<{}>)",
             self.full(&self.predicate),
             self.class_name,
             self.class_iri,
+        )?;
+        if let Some(reach) = &self.reached_through {
+            write!(
+                f,
+                ", the class `{} {} {}` reaches",
+                reach.subject,
+                self.short(&reach.predicate),
+                self.subject
+            )?;
+        }
+        if self.polymorphic {
+            write!(f, ", nor of a subclass of it")?;
+        }
+        write!(
+            f,
+            ", so `{} {} …` can never match",
             self.subject,
             self.short(&self.predicate),
         )?;
@@ -231,6 +277,85 @@ impl std::fmt::Display for NotASlotOfClass {
 
 impl std::error::Error for NotASlotOfClass {}
 
+/// A string literal written against a slot whose values are concept IRIs.
+///
+/// `?a asset360:hasCivilEngineeringAssetType "Tunnel"` is the most natural
+/// spelling of an enum filter there is, and it can never match: an
+/// enum-ranged slot is written into the data as the permissible value's
+/// concept IRI (`asset360:CEAssetType#Tunnel`), and a literal is not an IRI.
+/// Left alone it is a 200 with zero rows after reading the whole class —
+/// which is what v0.10.4 answered
+/// ([#461](https://gitlab.pp.kapernikov.com/asset360/consolidator-server/-/issues/461)),
+/// and the one outcome the refusal policy exists to prevent. So it is
+/// refused by name, with the two spellings that do match: the concept IRI,
+/// and the `skos:notation` lookup in the schema graph for a caller who only
+/// knows the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralAgainstAConcept {
+    /// The subject as the query wrote it.
+    pub subject: String,
+    /// The predicate IRI, after alias resolution.
+    pub predicate: String,
+    /// The literal's lexical form.
+    pub literal: String,
+    /// The class the subject is typed with.
+    pub class_name: String,
+    /// The enum the slot ranges over, as its IRI.
+    pub enum_iri: String,
+    /// The concept IRI of the permissible value spelled like the literal,
+    /// when there is one.
+    pub concept: Option<String>,
+    /// CURIEs for the message, where the schema's prefixes give one.
+    pub curies: HashMap<String, String>,
+}
+
+impl LiteralAgainstAConcept {
+    fn short(&self, iri: &str) -> String {
+        match self.curies.get(iri) {
+            Some(curie) => curie.clone(),
+            None => format!("<{iri}>"),
+        }
+    }
+}
+
+impl std::fmt::Display for LiteralAgainstAConcept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\"{}\" is a string, and {} on {} holds a concept of {} -- its values are \
+             concept IRIs, so `{} {} \"{}\"` can never match. ",
+            self.literal,
+            self.short(&self.predicate),
+            self.class_name,
+            self.short(&self.enum_iri),
+            self.subject,
+            self.short(&self.predicate),
+            self.literal,
+        )?;
+        match &self.concept {
+            Some(concept) => write!(
+                f,
+                "Write the concept IRI, <{concept}>, or select by code inside the schema \
+                 graph: `{} {} ?v . GRAPH <schema> {{ ?v <http://www.w3.org/2004/02/skos/core#notation> \"{}\" }}`.",
+                self.subject,
+                self.short(&self.predicate),
+                self.literal,
+            ),
+            None => write!(
+                f,
+                "No value of {} is spelled \"{}\"; its concepts are the ?v of `GRAPH <schema> \
+                 {{ ?v <http://www.w3.org/2004/02/skos/core#inScheme> <{}> ; \
+                 <http://www.w3.org/2004/02/skos/core#notation> ?code }}`.",
+                self.short(&self.enum_iri),
+                self.literal,
+                self.enum_iri,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LiteralAgainstAConcept {}
+
 /// Why a query's spellings could not be resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpellingError {
@@ -239,6 +364,8 @@ pub enum SpellingError {
     /// A predicate on a subject whose class cannot carry it. Boxed: it
     /// carries the message's spellings, and `Ok` is the common path.
     NotASlotOfClass(Box<NotASlotOfClass>),
+    /// A string literal against an enum-ranged slot.
+    LiteralAgainstAConcept(Box<LiteralAgainstAConcept>),
 }
 
 impl std::fmt::Display for SpellingError {
@@ -246,6 +373,7 @@ impl std::fmt::Display for SpellingError {
         match self {
             SpellingError::Ambiguous(inner) => inner.fmt(f),
             SpellingError::NotASlotOfClass(inner) => inner.fmt(f),
+            SpellingError::LiteralAgainstAConcept(inner) => inner.fmt(f),
         }
     }
 }
@@ -261,6 +389,12 @@ impl From<AmbiguousAlias> for SpellingError {
 impl From<Box<NotASlotOfClass>> for SpellingError {
     fn from(inner: Box<NotASlotOfClass>) -> Self {
         SpellingError::NotASlotOfClass(inner)
+    }
+}
+
+impl From<Box<LiteralAgainstAConcept>> for SpellingError {
+    fn from(inner: Box<LiteralAgainstAConcept>) -> Self {
+        SpellingError::LiteralAgainstAConcept(inner)
     }
 }
 
@@ -306,6 +440,7 @@ pub fn canonicalize(
     rewrites.extend(canonicalize_classes(query, schema_view)?);
     rewrites.sort_by(|a, b| a.from.cmp(&b.from));
     refuse_uncarried_predicates(query, schema_view)?;
+    refuse_literals_against_concepts(query, schema_view)?;
     Ok(rewrites)
 }
 
@@ -744,10 +879,36 @@ fn walk_expression_mut(expr: &mut Expression, visit: &mut dyn FnMut(&mut Vec<Tri
 struct SubjectSpellings {
     types: BTreeSet<String>,
     predicates: BTreeSet<String>,
+    /// The string literals the subject is matched against, per predicate.
+    /// Only the lexical form: a typed or language-tagged literal is no more
+    /// an IRI than a plain one.
+    literals: BTreeMap<String, BTreeSet<String>>,
+    /// The variables the subject's slots bind, per predicate: `?s :p ?v`.
+    objects: BTreeMap<String, BTreeSet<String>>,
+    /// The nodes the subject's slots lead to, per predicate: the object of
+    /// `?s :p ?e` or `?s :p [ … ]`, keyed as a subject is (`?e`, `_:b`).
+    /// A node is what the hop's range class types when the slot holds a
+    /// structure or a reference; the same set as `objects` plus the blank
+    /// nodes, which no expression can compare.
+    reached: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// One variable scope's subjects, keyed by the subject as the query wrote it.
-type Scope = BTreeMap<String, SubjectSpellings>;
+/// A node's class as told by the hop that reached it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reach {
+    class_iri: String,
+    through: ReachedThrough,
+}
+
+/// One variable scope: its subjects, keyed as the query wrote them, and the
+/// string literals its expressions compare variables with.
+#[derive(Debug, Default)]
+struct Scope {
+    subjects: BTreeMap<String, SubjectSpellings>,
+    /// `(variable, literal)` for every `?v = "x"`, `?v != "x"`, `sameTerm`
+    /// and `?v IN ("x", …)` in a `FILTER`, `BIND` or `OPTIONAL` condition.
+    compared: Vec<(String, String)>,
+}
 
 /// Refuse a fixed predicate on a subject typed with a known class that
 /// carries no slot under that IRI.
@@ -765,32 +926,46 @@ pub fn refuse_uncarried_predicates(
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     };
-    let mut scopes: Vec<Scope> = vec![Scope::new()];
+    let mut scopes: Vec<Scope> = vec![Scope::default()];
     collect_scopes(pattern, &mut scopes, 0, false);
 
     let conv = schema_view.converter();
     // The canonical IRIs of every slot a class carries, built once per class
-    // named — most queries name one or two.
-    let mut carried: HashMap<String, Option<(String, BTreeSet<String>)>> = HashMap::new();
+    // named — most queries name one or two. For a class judged through a hop
+    // the family's slots, since the node may be any subclass.
+    let mut carried: HashMap<(String, bool), Option<Carried>> = HashMap::new();
     for scope in &scopes {
-        for (subject, spellings) in scope {
-            // Exactly one type, and one the schema knows. Two types is an
-            // intersection the scoper judges; none, or an unknown one, is the
-            // scoper's untyped-subject refusal.
-            let mut types = spellings.types.iter();
-            let (Some(class_iri), None) = (types.next(), types.next()) else {
-                continue;
+        let reached = infer_reached_classes(scope, schema_view);
+        for (subject, spellings) in &scope.subjects {
+            // Exactly one type, and one the schema knows — or, failing a
+            // type of its own, the range of the one slot it was reached
+            // through. Two types is an intersection the scoper judges; none,
+            // or an unknown one, is the scoper's untyped-subject refusal.
+            let (class_iri, reach) = match single_type(spellings) {
+                Some(class_iri) => (class_iri, None),
+                None => match reached.get(subject) {
+                    Some(reach) => (reach.class_iri.as_str(), Some(&reach.through)),
+                    None => continue,
+                },
             };
-            let entry = carried.entry(class_iri.clone()).or_insert_with(|| {
-                let class = schema_view.get_class_by_uri(class_iri).ok().flatten()?;
-                let slots: BTreeSet<String> = class
-                    .slots()
-                    .iter()
-                    .filter_map(|slot| slot.canonical_uri().to_uri(&conv).ok().map(|u| u.0))
-                    .collect();
-                Some((class.name().to_owned(), slots))
-            });
-            let Some((class_name, slots)) = entry else {
+            let family = reach.is_some();
+            let entry = carried
+                .entry((class_iri.to_owned(), family))
+                .or_insert_with(|| {
+                    let class = schema_view.get_class_by_uri(class_iri).ok().flatten()?;
+                    let mut classes = vec![class.clone()];
+                    if family {
+                        classes.extend(class.get_descendants(true, false).ok()?);
+                    }
+                    let polymorphic = classes.len() > 1;
+                    let slots: BTreeSet<String> = classes
+                        .iter()
+                        .flat_map(|class| class.slots().iter())
+                        .filter_map(|slot| slot.canonical_uri().to_uri(&conv).ok().map(|u| u.0))
+                        .collect();
+                    Some((class.name().to_owned(), slots, polymorphic))
+                });
+            let Some((class_name, slots, polymorphic)) = entry else {
                 continue;
             };
             for predicate in &spellings.predicates {
@@ -802,6 +977,8 @@ pub fn refuse_uncarried_predicates(
                     predicate,
                     class_iri,
                     class_name,
+                    reach.cloned(),
+                    *polymorphic,
                     schema_view,
                 )));
             }
@@ -810,12 +987,117 @@ pub fn refuse_uncarried_predicates(
     Ok(())
 }
 
+/// What one class, or one class and its subclasses, can carry: the class's
+/// name, the canonical IRIs of the slots, and whether subclasses were counted.
+type Carried = (String, BTreeSet<String>, bool);
+
+/// The one class the query types the subject with, when there is exactly one.
+fn single_type(spellings: &SubjectSpellings) -> Option<&str> {
+    let mut types = spellings.types.iter();
+    match (types.next(), types.next()) {
+        (Some(class_iri), None) => Some(class_iri.as_str()),
+        _ => None,
+    }
+}
+
+/// The class of every node the scope reaches through a slot, for the nodes
+/// the query does not type itself.
+///
+/// A node is the object of `?s :p ?e` where `?s` has a known class and `:p`
+/// is a slot of it — or of a subclass, since `?s` may be one — whose range
+/// is a class. `?e` is then a record or structure of that range, or of a
+/// subclass, whatever `rdf:type` the query omits. The walk repeats until it
+/// learns nothing new, so a second hop is judged from the first. A node the
+/// query types itself is left to its type; one reached through two slots
+/// with different ranges is left alone, since there is no one class to
+/// judge it by.
+fn infer_reached_classes(scope: &Scope, schema_view: &SchemaView) -> BTreeMap<String, Reach> {
+    let conv = schema_view.converter();
+    let mut known: BTreeMap<String, Reach> = BTreeMap::new();
+    let mut conflicted: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let mut learned = false;
+        for (subject, spellings) in &scope.subjects {
+            let class_iri = match single_type(spellings) {
+                Some(class_iri) => class_iri.to_owned(),
+                None => match known.get(subject) {
+                    Some(reach) => reach.class_iri.clone(),
+                    None => continue,
+                },
+            };
+            let Some(class) = schema_view.get_class_by_uri(&class_iri).ok().flatten() else {
+                continue;
+            };
+            let mut family = vec![class.clone()];
+            family.extend(class.get_descendants(true, false).unwrap_or_default());
+            for (predicate, nodes) in &spellings.reached {
+                let Some(range) = family.iter().find_map(|class| {
+                    class
+                        .slots()
+                        .iter()
+                        .find(|slot| {
+                            slot.canonical_uri()
+                                .to_uri(&conv)
+                                .ok()
+                                .map(|u| u.0)
+                                .as_deref()
+                                == Some(predicate.as_str())
+                        })
+                        .and_then(|slot| slot.get_range_class())
+                }) else {
+                    continue;
+                };
+                let range_iri = range
+                    .canonical_uri()
+                    .to_uri(&conv)
+                    .map(|u| u.0)
+                    .unwrap_or_else(|_| range.canonical_uri().to_string());
+                for node in nodes {
+                    let typed = scope
+                        .subjects
+                        .get(node)
+                        .is_some_and(|node| !node.types.is_empty());
+                    if typed || conflicted.contains(node) {
+                        continue;
+                    }
+                    match known.get(node) {
+                        Some(reach) if reach.class_iri == range_iri => {}
+                        Some(_) => {
+                            known.remove(node);
+                            conflicted.insert(node.clone());
+                            learned = true;
+                        }
+                        None => {
+                            known.insert(
+                                node.clone(),
+                                Reach {
+                                    class_iri: range_iri.clone(),
+                                    through: ReachedThrough {
+                                        subject: subject.clone(),
+                                        predicate: predicate.clone(),
+                                    },
+                                },
+                            );
+                            learned = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !learned {
+            return known;
+        }
+    }
+}
+
 /// The refusal for one predicate, with the slot the author probably meant.
 fn uncarried(
     subject: &str,
     predicate: &str,
     class_iri: &str,
     class_name: &str,
+    reached_through: Option<ReachedThrough>,
+    polymorphic: bool,
     schema_view: &SchemaView,
 ) -> NotASlotOfClass {
     let conv = schema_view.converter();
@@ -834,7 +1116,15 @@ fn uncarried(
         .flatten()
         .and_then(|class| {
             let wanted = wanted.as_deref()?;
-            let slot = class.slots().iter().find(|slot| slot.name == wanted)?;
+            // The class's own slot first; a reached node may be a subclass,
+            // whose slot is as good a guess.
+            let mut family = vec![class.clone()];
+            if polymorphic {
+                family.extend(class.get_descendants(true, false).ok()?);
+            }
+            let slot = family
+                .iter()
+                .find_map(|class| class.slots().iter().find(|slot| slot.name == wanted))?;
             let canonical = slot.canonical_uri().to_uri(&conv).ok()?.0;
             let native = schema_view
                 .get_uri(slot.schema_id(), &slot.name)
@@ -853,6 +1143,9 @@ fn uncarried(
             spelled.push(native);
         }
     }
+    if let Some(reach) = &reached_through {
+        spelled.push(&reach.predicate);
+    }
     for iri in spelled {
         if let Ok(curie) = conv.compress(iri)
             && curie != iri
@@ -867,8 +1160,122 @@ fn uncarried(
         class_iri: class_iri.to_owned(),
         class_name: class_name.to_owned(),
         suggestion,
+        reached_through,
+        polymorphic,
         curies,
     }
+}
+
+/// Refuse a string literal matched against a slot whose values are concept
+/// IRIs. See [`LiteralAgainstAConcept`].
+///
+/// Runs after [`refuse_uncarried_predicates`], so every predicate it sees is
+/// one its subject's class carries. Same scope rules as that refusal: one
+/// known class per subject, instance patterns only.
+pub fn refuse_literals_against_concepts(
+    query: &Query,
+    schema_view: &SchemaView,
+) -> Result<(), Box<LiteralAgainstAConcept>> {
+    let pattern = match query {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    };
+    let mut scopes: Vec<Scope> = vec![Scope::default()];
+    collect_scopes(pattern, &mut scopes, 0, false);
+    let conv = schema_view.converter();
+
+    for scope in &scopes {
+        let reached = infer_reached_classes(scope, schema_view);
+        for (subject, spellings) in &scope.subjects {
+            // The literals to judge on this subject: written as the object
+            // of a pattern, or compared in an expression with a variable one
+            // of the subject's slots binds. Keyed by predicate either way.
+            let mut literals: BTreeMap<&String, BTreeSet<&String>> = BTreeMap::new();
+            for (predicate, texts) in &spellings.literals {
+                literals.entry(predicate).or_default().extend(texts);
+            }
+            for (variable, text) in &scope.compared {
+                for (predicate, objects) in &spellings.objects {
+                    if objects.contains(variable) {
+                        literals.entry(predicate).or_default().insert(text);
+                    }
+                }
+            }
+            if literals.is_empty() {
+                continue;
+            }
+            // Typed by the query, or by the hop that reached it (#459); the
+            // range class carries every slot a subclass inherits, and an
+            // enum-ranged slot only a subclass declares is left alone.
+            let Some(class_iri) = single_type(spellings)
+                .or_else(|| reached.get(subject).map(|reach| reach.class_iri.as_str()))
+            else {
+                continue;
+            };
+            let Some(class) = schema_view.get_class_by_uri(class_iri).ok().flatten() else {
+                continue;
+            };
+            for (predicate, literals) in &literals {
+                let predicate: &String = predicate;
+                let Some(slot) = class.slots().iter().find(|slot| {
+                    slot.canonical_uri()
+                        .to_uri(&conv)
+                        .ok()
+                        .map(|u| u.0)
+                        .as_deref()
+                        == Some(predicate)
+                }) else {
+                    continue;
+                };
+                let Some(enum_view) = slot.get_range_enum() else {
+                    continue;
+                };
+                let enum_iri = enum_view
+                    .canonical_uri()
+                    .to_uri(&conv)
+                    .map(|u| u.0)
+                    .unwrap_or_else(|_| enum_view.canonical_uri().to_string());
+                let Some(literal) = literals.iter().next().map(|l| (*l).clone()) else {
+                    continue;
+                };
+                let concept = enum_view
+                    .definition()
+                    .permissible_values
+                    .as_ref()
+                    .and_then(|values| {
+                        values
+                            .get(literal.as_str())
+                            .map(|pv| (literal.as_str(), pv))
+                    })
+                    .map(|(text, pv)| {
+                        linkml_schemaview::enumview::permissible_value_iri(
+                            &enum_iri, text, pv, &conv,
+                        )
+                        .unwrap_or_else(|raw| raw)
+                    });
+                let mut curies = HashMap::new();
+                for iri in [predicate.as_str(), enum_iri.as_str()] {
+                    if let Ok(curie) = conv.compress(iri)
+                        && curie != iri
+                    {
+                        curies.insert(iri.to_owned(), curie);
+                    }
+                }
+                return Err(Box::new(LiteralAgainstAConcept {
+                    subject: subject.clone(),
+                    predicate: predicate.clone(),
+                    literal,
+                    class_name: class.name().to_owned(),
+                    enum_iri,
+                    concept,
+                    curies,
+                }));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The part of an IRI after its last `#` or `/`, when there is one.
@@ -907,13 +1314,42 @@ fn collect_scopes(
                 let NamedNodePattern::NamedNode(predicate) = &triple.predicate else {
                     continue;
                 };
-                let entry = scopes[scope].entry(subject).or_default();
+                let entry = scopes[scope].subjects.entry(subject).or_default();
                 if predicate.as_str() == RDF_TYPE {
                     if let TermPattern::NamedNode(class) = &triple.object {
                         entry.types.insert(class.as_str().to_owned());
                     }
                 } else {
                     entry.predicates.insert(predicate.as_str().to_owned());
+                    match &triple.object {
+                        TermPattern::Literal(literal) => {
+                            entry
+                                .literals
+                                .entry(predicate.as_str().to_owned())
+                                .or_default()
+                                .insert(literal.value().to_owned());
+                        }
+                        TermPattern::Variable(object) => {
+                            entry
+                                .objects
+                                .entry(predicate.as_str().to_owned())
+                                .or_default()
+                                .insert(object.as_str().to_owned());
+                            entry
+                                .reached
+                                .entry(predicate.as_str().to_owned())
+                                .or_default()
+                                .insert(format!("?{}", object.as_str()));
+                        }
+                        TermPattern::BlankNode(object) => {
+                            entry
+                                .reached
+                                .entry(predicate.as_str().to_owned())
+                                .or_default()
+                                .insert(format!("_:{}", object.as_str()));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -951,7 +1387,7 @@ fn collect_scopes(
         }
         GraphPattern::Project { inner, .. } => {
             if under_project {
-                scopes.push(Scope::new());
+                scopes.push(Scope::default());
                 let fresh = scopes.len() - 1;
                 collect_scopes(inner, scopes, fresh, true);
             } else {
@@ -972,6 +1408,28 @@ fn collect_scopes_expression(
     scope: usize,
     under_project: bool,
 ) {
+    // A variable compared with a string literal: what `refuse_literals_against_concepts`
+    // judges once it knows what the variable is bound to.
+    let mut compared = |a: &Expression, b: &Expression| {
+        if let (Expression::Variable(v), Expression::Literal(l))
+        | (Expression::Literal(l), Expression::Variable(v)) = (a, b)
+        {
+            scopes[scope]
+                .compared
+                .push((v.as_str().to_owned(), l.value().to_owned()));
+        }
+    };
+    match expr {
+        Expression::Equal(left, right) | Expression::SameTerm(left, right) => {
+            compared(left, right);
+        }
+        Expression::In(value, candidates) if matches!(**value, Expression::Variable(_)) => {
+            for candidate in candidates {
+                compared(value, candidate);
+            }
+        }
+        _ => {}
+    }
     match expr {
         Expression::Exists(pattern) => collect_scopes(pattern, scopes, scope, under_project),
         Expression::Or(left, right)
@@ -1284,6 +1742,11 @@ prefixes:
   irsm: https://data.infrabel.be/asset360-rsm-subset/
 default_prefix: irsm
 default_range: string
+enums:
+  Side:
+    permissible_values:
+      Left:
+      Right:
 classes:
   Track:
     class_uri: RSM:#EAID_TRACK
@@ -1293,6 +1756,30 @@ classes:
       name:
         range: string
         slot_uri: RSM:#EAID_NAME
+  LocatedNetEntity:
+    class_uri: RSM:#EAID_LNE
+    attributes:
+      name:
+        range: string
+        slot_uri: RSM:#EAID_NAME
+      side:
+        range: Side
+      location:
+        range: Location
+        inlined: true
+  NamedNetEntity:
+    is_a: LocatedNetEntity
+    class_uri: RSM:#EAID_NNE
+    attributes:
+      code:
+        range: string
+        slot_uri: RSM:#EAID_CODE
+  Location:
+    class_uri: RSM:#EAID_LOC
+    attributes:
+      mileage:
+        range: float
+        slot_uri: RSM:#EAID_MILEAGE
 "#;
         let asset360 = r#"
 id: https://data.infrabel.be/asset360
@@ -1302,6 +1789,12 @@ prefixes:
   asset360: https://data.infrabel.be/asset360/
 default_prefix: asset360
 default_range: string
+enums:
+  ZoneKind:
+    permissible_values:
+      Tunnel:
+      Bridge:
+        meaning: asset360:BridgeConcept
 classes:
   Zone:
     class_uri: asset360:Zone
@@ -1310,6 +1803,18 @@ classes:
         identifier: true
       name:
         range: string
+      kind:
+        range: ZoneKind
+      track:
+        range: Track
+  Signal:
+    class_uri: asset360:Signal
+    attributes:
+      asset360_uri:
+        identifier: true
+      refersToLocatedNetEntity:
+        range: LocatedNetEntity
+        inlined: true
 "#;
         let mut sv = SchemaView::new();
         for raw in [rsm, asset360] {
@@ -1327,6 +1832,13 @@ classes:
     const NATIVE_CLASS: &str = "https://data.infrabel.be/asset360-rsm-subset/Track";
     const CANONICAL_CLASS: &str = "http://rsm.uic.org/RSM12#EAID_TRACK";
     const ZONE: &str = "https://data.infrabel.be/asset360/Zone";
+    const SIGNAL: &str = "https://data.infrabel.be/asset360/Signal";
+    const REFERS_TO: &str = "https://data.infrabel.be/asset360/refersToLocatedNetEntity";
+    const ZONE_TRACK: &str = "https://data.infrabel.be/asset360/track";
+    const LNE: &str = "http://rsm.uic.org/RSM12#EAID_LNE";
+    const LNE_LOCATION: &str = "https://data.infrabel.be/asset360-rsm-subset/location";
+    const LOCATION: &str = "http://rsm.uic.org/RSM12#EAID_LOC";
+    const CODE: &str = "http://rsm.uic.org/RSM12#EAID_CODE";
 
     fn rewrite(query: &str) -> (Query, Vec<Rewrite>) {
         let sv = schema_view();
@@ -1341,6 +1853,117 @@ classes:
         match canonicalize(&mut parsed, &sv) {
             Err(SpellingError::NotASlotOfClass(refusal)) => *refusal,
             other => panic!("{query}: expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// #461: a string against an enum-ranged slot can never match a concept
+    /// IRI, and is refused naming the IRI and the `skos:notation` form.
+    #[test]
+    fn a_string_literal_against_a_concept_slot_is_refused_naming_the_iri() {
+        let sv = schema_view();
+        let query = format!(
+            "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Tunnel\" }}"
+        );
+        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let SpellingError::LiteralAgainstAConcept(refusal) =
+            canonicalize(&mut parsed, &sv).expect_err("refused")
+        else {
+            panic!("expected the literal refusal");
+        };
+        assert_eq!(refusal.literal, "Tunnel");
+        assert_eq!(
+            refusal.concept.as_deref(),
+            Some("https://data.infrabel.be/asset360/ZoneKind#Tunnel")
+        );
+        let message = refusal.to_string();
+        assert!(
+            message.contains("<https://data.infrabel.be/asset360/ZoneKind#Tunnel>"),
+            "{message}"
+        );
+        assert!(
+            message.contains("skos/core#notation> \"Tunnel\""),
+            "{message}"
+        );
+
+        // A value with a `meaning` is named by it.
+        let query = format!(
+            "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Bridge\" }}"
+        );
+        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let SpellingError::LiteralAgainstAConcept(refusal) =
+            canonicalize(&mut parsed, &sv).expect_err("refused")
+        else {
+            panic!("expected the literal refusal");
+        };
+        assert_eq!(
+            refusal.concept.as_deref(),
+            Some("https://data.infrabel.be/asset360/BridgeConcept")
+        );
+
+        // A spelling no value has says where the values are.
+        let query = format!(
+            "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Viaduct\" }}"
+        );
+        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let refusal = canonicalize(&mut parsed, &sv).expect_err("refused");
+        assert!(refusal.to_string().contains("No value of"), "{refusal}");
+
+        // The same comparison in a FILTER -- `=`, `!=`, `IN` -- is the same
+        // mistake: the statement compared the stored code with the string
+        // and answered rows where SPARQL, comparing a concept IRI with a
+        // literal, answers none (`=`) or every record (`!=`).
+        for filter in [
+            "FILTER(?k = \"Tunnel\")",
+            "FILTER(?k != \"Tunnel\")",
+            "FILTER(\"Tunnel\" = ?k)",
+            "FILTER(?k IN (\"Bridge\", \"Tunnel\"))",
+            "FILTER(sameTerm(?k, \"Tunnel\"))",
+        ] {
+            let query = format!(
+                "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> ?k . {filter} }}"
+            );
+            let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let refusal = canonicalize(&mut parsed, &sv).expect_err(&query);
+            assert!(
+                matches!(refusal, SpellingError::LiteralAgainstAConcept(_)),
+                "{query}: {refusal:?}"
+            );
+        }
+
+        // On a node reached through a slot the class is known the same way
+        // (#459), and the string is refused the same way.
+        let query = format!(
+            "SELECT ?s WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <https://data.infrabel.be/asset360-rsm-subset/side> \"Left\" }}"
+        );
+        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let SpellingError::LiteralAgainstAConcept(refusal) =
+            canonicalize(&mut parsed, &sv).expect_err("refused")
+        else {
+            panic!("expected the literal refusal");
+        };
+        assert_eq!(refusal.subject, "?e");
+        assert_eq!(refusal.class_name, "LocatedNetEntity");
+        assert_eq!(
+            refusal.concept.as_deref(),
+            Some("https://data.infrabel.be/asset360-rsm-subset/Side#Left")
+        );
+
+        // The concept IRI itself, and a string on a string slot, pass -- in
+        // a pattern and in a FILTER.
+        for accepted in [
+            format!(
+                "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> ?k . FILTER(?k = <https://data.infrabel.be/asset360/ZoneKind#Tunnel>) }}"
+            ),
+            format!(
+                "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> ?n . FILTER(?n != \"Tunnel\") }}"
+            ),
+            format!(
+                "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> <https://data.infrabel.be/asset360/ZoneKind#Tunnel> }}"
+            ),
+            format!("SELECT ?z WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> \"Tunnel\" }}"),
+        ] {
+            let mut parsed = crate::sparql_scoper::parse_query(&accepted).expect("parses");
+            canonicalize(&mut parsed, &sv).expect("accepted");
         }
     }
 
@@ -1588,6 +2211,145 @@ classes:
             let refusal = refuse(&query);
             assert_eq!(refusal.predicate, ZONE_NAME, "{query}");
         }
+    }
+
+    // -- #459: the same mistake on a node reached through a slot -----------
+
+    /// The shape #447's reporter actually wrote: `?e` is the `LocatedNetEntity`
+    /// a Signal's `refersToLocatedNetEntity` holds, its `name` is written under
+    /// RSM's IRI, and `asset360:name` on it answered an unbound column. The
+    /// class of `?e` is known from the slot it was reached through, so the
+    /// refusal names it, and the spelling to write -- in the mandatory
+    /// pattern and inside the `OPTIONAL` the reporter used.
+    #[test]
+    fn a_predicate_the_reached_class_cannot_carry_is_refused_with_the_spelling_to_write() {
+        for query in [
+            format!(
+                "SELECT ?s ?n WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{ZONE_NAME}> ?n }}"
+            ),
+            format!(
+                "SELECT ?s ?n WHERE {{ ?s a <{SIGNAL}> . OPTIONAL {{ ?s <{REFERS_TO}> ?e . ?e <{ZONE_NAME}> ?n }} }}"
+            ),
+            format!(
+                "SELECT ?s ?n WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . OPTIONAL {{ ?e <{ZONE_NAME}> ?n }} }}"
+            ),
+        ] {
+            let refusal = refuse(&query);
+            assert_eq!(refusal.subject, "?e", "{query}");
+            assert_eq!(refusal.predicate, ZONE_NAME, "{query}");
+            assert_eq!(refusal.class_iri, LNE, "{query}");
+            assert_eq!(refusal.class_name, "LocatedNetEntity", "{query}");
+            assert_eq!(
+                refusal.reached_through,
+                Some(ReachedThrough {
+                    subject: "?s".to_owned(),
+                    predicate: REFERS_TO.to_owned(),
+                }),
+                "{query}"
+            );
+            assert_eq!(
+                refusal.suggestion,
+                Some(SlotSpellings {
+                    canonical: CANONICAL.to_owned(),
+                    native: Some(NATIVE.to_owned()),
+                }),
+                "{query}"
+            );
+            assert_eq!(
+                refusal.to_string(),
+                format!(
+                    "asset360:name (<{ZONE_NAME}>) is not a slot of LocatedNetEntity (<{LNE}>), \
+                     the class `?s asset360:refersToLocatedNetEntity ?e` reaches, nor of a \
+                     subclass of it, so `?e asset360:name …` can never match; did you mean \
+                     irsm:name (<{NATIVE}>), written in the data as <{CANONICAL}>?"
+                ),
+                "{query}"
+            );
+        }
+    }
+
+    /// The reach follows every way a node is written and reached: the `[ … ]`
+    /// blank-node form, a second hop into a nested structure, and a reference
+    /// slot whose object carries no `rdf:type` of its own.
+    #[test]
+    fn the_reach_follows_blank_nodes_second_hops_and_references() {
+        let refusal = refuse(&format!(
+            "SELECT ?n WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> [ <{ZONE_NAME}> ?n ] }}"
+        ));
+        assert_eq!(refusal.class_name, "LocatedNetEntity");
+        assert_eq!(refusal.predicate, ZONE_NAME);
+
+        let refusal = refuse(&format!(
+            "SELECT ?m WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{LNE_LOCATION}> ?l . ?l <{ZONE_NAME}> ?m }}"
+        ));
+        assert_eq!(refusal.subject, "?l");
+        assert_eq!(refusal.class_iri, LOCATION);
+        assert_eq!(
+            refusal.reached_through,
+            Some(ReachedThrough {
+                subject: "?e".to_owned(),
+                predicate: LNE_LOCATION.to_owned(),
+            })
+        );
+        assert_eq!(refusal.suggestion, None, "Location has no name");
+
+        let refusal = refuse(&format!(
+            "SELECT ?n WHERE {{ ?z a <{ZONE}> ; <{ZONE_TRACK}> ?t . ?t <{ZONE_NAME}> ?n }}"
+        ));
+        assert_eq!(refusal.subject, "?t");
+        assert_eq!(refusal.class_name, "Track");
+        assert_eq!(
+            refusal.suggestion,
+            Some(SlotSpellings {
+                canonical: CANONICAL.to_owned(),
+                native: Some(NATIVE.to_owned()),
+            })
+        );
+    }
+
+    /// A reached node may be any subclass of the slot's range, so a slot only
+    /// a subclass carries is accepted -- and a predicate no class in the
+    /// family carries is still refused, naming the range.
+    #[test]
+    fn a_reached_node_is_judged_against_the_range_and_its_descendants() {
+        let sv = schema_view();
+        for accepted in [
+            format!("SELECT ?c WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{CODE}> ?c }}"),
+            format!(
+                "SELECT ?n WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{NATIVE}> ?n ; <{CANONICAL}> ?m }}"
+            ),
+            // An explicit type on the reached node is what is judged, not
+            // the range: a reference to a Track typed as one reads as one.
+            format!(
+                "SELECT ?n WHERE {{ ?z a <{ZONE}> ; <{ZONE_TRACK}> ?t . ?t a <{CANONICAL_CLASS}> ; <{CANONICAL}> ?n }}"
+            ),
+            // Reached through two slots with different ranges: no single
+            // class to judge by, left to the scoper.
+            format!(
+                "SELECT ?n WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?z a <{ZONE}> ; <{ZONE_TRACK}> ?e . ?e <{ZONE_NAME}> ?n }}"
+            ),
+            // A scalar slot's object is a value, not a node.
+            format!("SELECT ?n WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> ?v . ?v <{ZONE_NAME}> ?n }}"),
+        ] {
+            let mut parsed = crate::sparql_scoper::parse_query(&accepted).expect("parses");
+            canonicalize(&mut parsed, &sv).unwrap_or_else(|e| panic!("{accepted}: {e}"));
+        }
+
+        let refusal = refuse(&format!(
+            "SELECT ?x WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <urn:nothing> ?x }}"
+        ));
+        assert_eq!(refusal.class_name, "LocatedNetEntity");
+        assert_eq!(refusal.suggestion, None);
+        assert!(
+            refusal.to_string().contains("nor of a subclass of it"),
+            "{refusal}"
+        );
+        // A class without subclasses is judged alone and says nothing of them.
+        let refusal = refuse(&format!(
+            "SELECT ?x WHERE {{ ?z a <{ZONE}> ; <{ZONE_TRACK}> ?t . ?t <urn:nothing> ?x }}"
+        ));
+        assert!(!refusal.polymorphic);
+        assert!(!refusal.to_string().contains("subclass"), "{refusal}");
     }
 
     /// What the lookup cannot judge, it leaves to the scoper: no type, an

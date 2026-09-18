@@ -590,10 +590,19 @@ pub fn refresh_join_variables(plan: &mut Plan) {
 /// through plain joins, filters and unnests without any of them being able to
 /// produce a solution the scan did not contribute to.
 ///
-/// Everything else stops the walk, and the left join is the case that matters.
-/// Joining a solution that leaves `?s` unbound against a pattern that binds it
-/// keeps the row -- the two are compatible -- so a constraint moved onto the
-/// preserved side of a left join is not the constraint the join applied.
+/// Everything else stops the walk, and the *optional* side of a left join is
+/// the case that matters. Joining a solution that leaves `?s` unbound against
+/// a pattern that binds it keeps the row -- the two are compatible -- so a
+/// constraint moved onto the optional side of a left join is not the
+/// constraint the join applied.
+///
+/// The *preserved* side is the opposite: a left join keeps every row of it,
+/// bindings intact, so a scan feeding that side is bound in every solution
+/// the join produces. Walking through it is what lets a second `OPTIONAL`
+/// beside a pushed one find its preserved scan -- without it the second
+/// `OPTIONAL` stayed an engine join, the frontier was two islands, and a
+/// query with two reference `OPTIONAL`s could not page (#463, pepibru
+/// GitLab).
 fn mandatorily_feeds(plan: &Plan, lower: NodeId, upper: NodeId) -> bool {
     if lower == upper {
         return true;
@@ -602,9 +611,30 @@ fn mandatorily_feeds(plan: &Plan, lower: NodeId, upper: NodeId) -> bool {
         PlanOp::Join { left, right, .. } => {
             mandatorily_feeds(plan, lower, *left) || mandatorily_feeds(plan, lower, *right)
         }
+        PlanOp::LeftJoin { left, .. } => mandatorily_feeds(plan, lower, *left),
         PlanOp::Filter { input, .. } | PlanOp::Unnest { input, .. } => {
             mandatorily_feeds(plan, lower, *input)
         }
+        _ => false,
+    }
+}
+
+/// Whether every row of `lower` is a row of `upper`, extended: the path from
+/// one to the other runs through the *preserved* side of left joins only.
+///
+/// The question a flat left-join chain needs answered of the optional side.
+/// `A LEFT JOIN (B LEFT JOIN C ON b.c = c.id) ON a.b = b.id` and `A LEFT JOIN
+/// B ON a.b = b.id LEFT JOIN C ON b.c = c.id` are the same bag exactly when
+/// every row of `B` reaches the outer join -- an inner join `B JOIN C` on
+/// that side loses the `B` rows without a `C`, which flat rendering would
+/// keep with `?c` unbound. Stricter than [`mandatorily_feeds`], which asks
+/// the converse (that every row of `upper` came from a row of `lower`).
+fn preserves_every_row(plan: &Plan, lower: NodeId, upper: NodeId) -> bool {
+    if lower == upper {
+        return true;
+    }
+    match &plan.nodes[upper].op {
+        PlanOp::LeftJoin { left, .. } => preserves_every_row(plan, lower, *left),
         _ => false,
     }
 }
@@ -2863,13 +2893,26 @@ impl Rule for PushReferenceJoin<'_> {
 ///   optional side decides whether it matched, and this builds no conditional
 ///   binding.
 /// * **The optional side is one `match` joined to a scan of its object**, and
-///   the join is on that object alone. Any other shape is a row set this
-///   rewrite does not describe.
+///   the join is on that object alone -- possibly *under* further left joins
+///   on that side, and the scan possibly *extended* by left joins. Any other
+///   shape is a row set this rewrite does not describe. The two allowances
+///   are one fact, that a left join keeps every row of its preserved side
+///   with its bindings intact: `OPTIONAL { ?s :ref ?i . ?i a I . OPTIONAL {
+///   ?i :ref2 ?j . ?j a J } }` is `LeftJoin(Join(match, scan I), scan J)` on
+///   the optional side, its rows are the `I` rows each extended, and the
+///   match reaches them through the inner join alone. Rendered flat -- `s
+///   LEFT JOIN i ON … LEFT JOIN j ON i.ref2 = j.id` -- it is the same bag as
+///   the nested form, because `j`'s condition reads `i` only and a missing
+///   `i` leaves it false. A scan reached through an *inner* join on that
+///   side (`OPTIONAL { ?s :ref ?i . ?i :ref2 ?j . ?j a J }`) is not every
+///   row of `I`, and is declined: flat, it would keep `?i` bound where the
+///   `OPTIONAL` binds neither (#463, pepibru GitLab).
 /// * **The match reads a single-valued reference column of the preserved
 ///   star**, resolved against the class the scan scans. A collection of
 ///   references is one solution per element, which an equality cannot state.
 /// * **The preserved side takes every row from that scan**, through plain
-///   joins only -- the same condition [`AbsorbOptionalRead`] puts on its scan.
+///   joins and the preserved side of left joins only -- the same condition
+///   [`AbsorbOptionalRead`] puts on its scan.
 pub struct AbsorbOptionalReference<'s> {
     schema: &'s SchemaView,
 }
@@ -2902,13 +2945,18 @@ impl Rule for AbsorbOptionalReference<'_> {
             let (left, right) = (*left, *right);
 
             // The optional side: a join of one match and one scan, on the
-            // match's object.
+            // match's object -- at the bottom of whatever left joins the
+            // `OPTIONAL` nests, each of which keeps every row of it.
+            let mut core = right;
+            while let PlanOp::LeftJoin { left: below, .. } = &plan.nodes[core].op {
+                core = *below;
+            }
             let PlanOp::Join {
                 left: a,
                 right: b,
                 on,
                 reference: None,
-            } = &plan.nodes[right].op
+            } = &plan.nodes[core].op
             else {
                 continue;
             };
@@ -2935,8 +2983,18 @@ impl Rule for AbsorbOptionalReference<'_> {
             if on.as_slice() != [var.clone()] {
                 continue;
             }
-            // The object is a star the other side scans, in SQL.
-            if Visible::below(plan, other).identity_of(&var).is_none() {
+            // The object is a star the other side scans, in SQL, and every
+            // row of that scan reaches the join: the rows the left join
+            // keeps are the scanned records, each extended -- not a subset
+            // an inner join on that side would leave.
+            if Visible::below(plan, other).identity_of(&var).is_none()
+                || !plan.nodes.iter().enumerate().any(|(scan, node)| {
+                    matches!(&node.op, PlanOp::Scan { star_var, .. }
+                        if star_var == &var
+                            && node.executor == Executor::Sql
+                            && preserves_every_row(plan, scan, other))
+                })
+            {
                 continue;
             }
 
@@ -3006,8 +3064,9 @@ impl Rule for AbsorbOptionalReference<'_> {
                 });
             }
 
-            // The optional side is the scan now: the join and the match go.
-            replace_nodes(plan, &[(right, other), (matched, other)]);
+            // The optional side is the scan now (extended by whatever left
+            // joins sat above the core): the join and the match go.
+            replace_nodes(plan, &[(core, other), (matched, other)]);
             return true;
         }
         false
@@ -3067,9 +3126,13 @@ fn replace_nodes(plan: &mut Plan, replaced: &[(NodeId, NodeId)]) {
 /// * **Both sides in SQL, joined by a single-valued reference**, exactly as an
 ///   inner join needs -- the edge is what the renderer joins on, and a
 ///   multivalued one would have to compare an element.
-/// * **The preserved side is not itself optional.** Two nested `OPTIONAL`s are
-///   an order of preservation this does not reason about, and the renderer
-///   picks its `FROM` star from the non-optional ones.
+/// * **A preserved side that is itself optional is fine.** `OPTIONAL { ?s
+///   :ref ?i . ?i a I . OPTIONAL { ?i :ref2 ?j . ?j a J } }` is a left join
+///   whose preserved side is the optional side of another, and rendered
+///   flat it is the same bag as nested: `j`'s `ON` reads `i` alone, so where
+///   `i` is missing `j` is too. What the renderer needs is one non-optional
+///   `FROM` star, and the lowering marks every scan under any pushed left
+///   join's optional side, nested or not (#463, pepibru GitLab).
 pub struct PushLeftJoin<'s> {
     schema: &'s SchemaView,
 }
@@ -3104,12 +3167,6 @@ impl Rule for PushLeftJoin<'_> {
             if plan.nodes[left].executor != Executor::Sql
                 || plan.nodes[right].executor != Executor::Sql
             {
-                continue;
-            }
-            // The preserved side must not already be somebody's optional side.
-            if plan.nodes.iter().any(|node| {
-                matches!(&node.op, PlanOp::LeftJoin { right: other, .. } if plan.feeds(left, *other))
-            }) {
                 continue;
             }
 

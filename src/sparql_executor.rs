@@ -59,6 +59,32 @@ pub enum ExecuteError {
     /// The endpoint returns HTTP 422 with a suggestion to narrow the query.
     ResultLimitExceeded { count: usize, limit: usize },
 
+    /// The engine ran past the wall-clock ceiling the caller set.
+    ///
+    /// The one limit that bounds *work* rather than input or output. A query
+    /// whose evaluation is a cartesian product -- label `OPTIONAL`s written
+    /// as siblings of the slot instead of nested under it -- stays under the
+    /// triple cap (the store is small) and never reaches the row cap (the
+    /// first row is what takes minutes), so before this it pinned a worker
+    /// at 100 % CPU for as long as it took (#460, pepibru GitLab). The
+    /// endpoint returns this as HTTP 422, like the other two caps.
+    EvaluationTimeExceeded { millis: u64 },
+
+    /// Too many evaluations this process gave up on are still running.
+    ///
+    /// The ceiling frees the *caller*, not the worker: an evaluation past its
+    /// deadline is cancelled at its next store read, and one that never
+    /// reads again -- a hash join or an `ORDER BY` over a product -- runs to
+    /// its end in the background, holding its store. Each such evaluation is
+    /// counted until it finishes, and a request that would start another
+    /// while [`MAX_ABANDONED_EVALUATIONS`] are already running is refused
+    /// at the top of [`sparql_execute`], before it loads a store of its own,
+    /// so the backlog is bounded
+    /// instead of compounding to an OOM after every caller has been told
+    /// "gave up" (#460, pepibru GitLab). The endpoint returns this as HTTP
+    /// 503: it is the process's state, not the query's shape.
+    EvaluationBacklog { abandoned: usize, limit: usize },
+
     /// Oxigraph returned an error while executing the SPARQL query.
     QueryError(String),
 
@@ -80,6 +106,16 @@ impl std::fmt::Display for ExecuteError {
             }
             ExecuteError::ResultLimitExceeded { count, limit } => {
                 write!(f, "Result row count {count} exceeds limit {limit}")
+            }
+            ExecuteError::EvaluationTimeExceeded { millis } => {
+                write!(f, "Evaluation time exceeds limit of {millis} ms")
+            }
+            ExecuteError::EvaluationBacklog { abandoned, limit } => {
+                write!(
+                    f,
+                    "Evaluation backlog full: {abandoned} evaluations are still running past \
+                     their deadline in this process, and {limit} is the most it carries"
+                )
             }
             ExecuteError::QueryError(msg) => write!(f, "Query execution error: {msg}"),
             ExecuteError::StoreError(msg) => write!(f, "Store error: {msg}"),
@@ -106,6 +142,45 @@ pub struct ExecuteLimits {
     /// than this limit, execution stops and an error is returned.
     /// Default: 10,000.
     pub max_result_rows: usize,
+
+    /// Wall-clock ceiling on the engine's evaluation, in milliseconds.
+    ///
+    /// Counted from the moment the query is handed to the evaluator -- the
+    /// store is already loaded, and that phase is bounded by `max_triples`.
+    /// The caller is answered at the deadline whatever the evaluation is
+    /// doing; the evaluation itself is stopped through oxigraph's
+    /// `CancellationToken` at its next store read (see [`sparql_execute`]
+    /// for what that does and does not cover). `None` is no ceiling, which
+    /// is what a caller that has its own gets. Default: none.
+    pub max_eval_millis: Option<u64>,
+}
+
+/// How many evaluations past their deadline one process runs before the
+/// ceiling refuses to start another.
+///
+/// Small on purpose. An abandoned evaluation holds a store of up to
+/// `max_triples` quads plus whatever product it is computing, on a thread
+/// nothing can stop until it next reads the store; two of those is a worker
+/// under strain, a third is the request that must not start. Process-wide
+/// rather than per call because the memory is the process's.
+pub const MAX_ABANDONED_EVALUATIONS: usize = 2;
+
+/// Evaluations the ceiling gave up on that have not finished yet.
+///
+/// Counted up by the caller that stops waiting and down by the worker when
+/// it ends -- the two hand-offs are ordered by the per-evaluation state in
+/// [`sparql_execute`], so the count never goes below zero.
+#[cfg(feature = "sparql-endpoint")]
+static ABANDONED_EVALUATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Evaluations the ceiling gave up on that are still running, right now.
+///
+/// What the endpoint can log beside a refusal; what a test reads to see the
+/// count come back down.
+#[cfg(feature = "sparql-endpoint")]
+pub fn abandoned_evaluations() -> usize {
+    ABANDONED_EVALUATIONS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 impl Default for ExecuteLimits {
@@ -113,6 +188,7 @@ impl Default for ExecuteLimits {
         Self {
             max_triples: 500_000,
             max_result_rows: 10_000,
+            max_eval_millis: None,
         }
     }
 }
@@ -222,6 +298,20 @@ pub fn sparql_execute(
     limits: ExecuteLimits,
     schema_graph_iri: Option<&str>,
 ) -> Result<SparqlAnswer, ExecuteError> {
+    // The bound on the backlog, before anything is allocated: what a full
+    // backlog is bounding is memory, and the store built below is up to
+    // `max_triples` quads of it. A call without a ceiling never abandons an
+    // evaluation and is not this bound's business.
+    if limits.max_eval_millis.is_some() {
+        let abandoned = ABANDONED_EVALUATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        if abandoned >= MAX_ABANDONED_EVALUATIONS {
+            return Err(ExecuteError::EvaluationBacklog {
+                abandoned,
+                limit: MAX_ABANDONED_EVALUATIONS,
+            });
+        }
+    }
+
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
     // Load instance data
@@ -325,11 +415,126 @@ pub fn sparql_execute(
     // too. See [`crate::sparql_alias`].
     crate::sparql_alias::canonicalize(&mut parsed, schema_view)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-    let results = geosparql_evaluator()
+
+    match limits.max_eval_millis {
+        None => evaluate(parsed, &store, &limits, None),
+        // The ceiling. Evaluation runs on its own thread and the caller waits
+        // for its answer until the deadline; past it the caller gets the
+        // refusal and the thread is told to stop through the token.
+        //
+        // Why a thread and not only the token: the token is polled by the
+        // evaluator on every quad it reads from the store, and a
+        // cartesian-product evaluation spends its time *between* store reads
+        // -- spareval 0.2.7's `HashLeftJoinIterator` combines tuples in memory
+        // and never asks. Measured on the sibling-label shape of #460: with
+        // the token alone, ten label blocks stopped at the deadline and twelve
+        // ran on for minutes. So the wait is what bounds the caller, and the
+        // token is what bounds the evaluation as soon as it next touches the
+        // store. An evaluation that never does runs to completion in the
+        // background, holding its store, and its answer is dropped: the
+        // request is released, the CPU is not. That is the gap upstream
+        // owns, and it is why the planner refuses the one shape known to
+        // reach it (`crate::sparql_optional_binding`) rather than relying on
+        // this -- and why the number of such evaluations is bounded, below.
+        Some(millis) => {
+            use std::sync::atomic::{AtomicU8, Ordering};
+
+            // Who let go of this evaluation first: the caller, at the
+            // deadline, or the worker, by finishing. Exactly one of them
+            // moves the state off RUNNING, and that one owns the count --
+            // the caller counts an evaluation it abandoned, and the worker
+            // uncounts it when it ends. The caller counts *before* it
+            // claims the state and uncounts again if the claim fails, so
+            // the worker's decrement can never run ahead of the increment.
+            const RUNNING: u8 = 0;
+            const FINISHED: u8 = 1;
+            const ABANDONED: u8 = 2;
+            let state = std::sync::Arc::new(AtomicU8::new(RUNNING));
+
+            let token = oxigraph::sparql::CancellationToken::new();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker_token = token.clone();
+            let worker_state = state.clone();
+            std::thread::spawn(move || {
+                // The worker's hand-off runs on the way out whatever the
+                // way out is: a panic in the evaluator would otherwise
+                // leave an abandoned evaluation counted forever, and two of
+                // those would refuse every ceilinged call until restart.
+                struct Ended(std::sync::Arc<AtomicU8>);
+                impl Drop for Ended {
+                    fn drop(&mut self) {
+                        if self
+                            .0
+                            .compare_exchange(RUNNING, FINISHED, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            ABANDONED_EVALUATIONS.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+                let _ended = Ended(worker_state);
+                let answer = evaluate(parsed, &store, &limits, Some(worker_token));
+                // The receiver is gone when the caller gave up waiting; the
+                // answer has nobody to go to, and that is fine.
+                let _ = sender.send(answer);
+            });
+            match receiver.recv_timeout(std::time::Duration::from_millis(millis)) {
+                Ok(answer) => answer,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    token.cancel();
+                    ABANDONED_EVALUATIONS.fetch_add(1, Ordering::SeqCst);
+                    if state
+                        .compare_exchange(RUNNING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                    {
+                        // Finished between the timeout and the claim: the
+                        // answer is a moment late, and nothing is running.
+                        ABANDONED_EVALUATIONS.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    Err(ExecuteError::EvaluationTimeExceeded { millis })
+                }
+                // The worker panicked. Nothing to report but that.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(ExecuteError::QueryError(
+                        "the evaluation thread ended without an answer".into(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate a parsed, canonicalised query against a loaded store and
+/// serialise the answer.
+///
+/// Everything after the store is built, so that the ceiling can run it on a
+/// thread of its own: nothing here borrows the caller's schema or instances.
+/// A `SELECT` is evaluated lazily as its solutions are read, so the
+/// serialisation loop is where the work happens and the row cap is checked.
+#[cfg(feature = "sparql-endpoint")]
+fn evaluate(
+    parsed: spargebra::Query,
+    store: &Store,
+    limits: &ExecuteLimits,
+    token: Option<oxigraph::sparql::CancellationToken>,
+) -> Result<SparqlAnswer, ExecuteError> {
+    // What the engine's error means here. `Cancelled` can only come from the
+    // ceiling -- nothing else holds the token -- so it *is* the ceiling.
+    let eval_error = |e: oxigraph::sparql::QueryEvaluationError| match (e, limits.max_eval_millis) {
+        (oxigraph::sparql::QueryEvaluationError::Cancelled, Some(millis)) => {
+            ExecuteError::EvaluationTimeExceeded { millis }
+        }
+        (e, _) => ExecuteError::QueryError(e.to_string()),
+    };
+    let mut evaluator = geosparql_evaluator();
+    if let Some(token) = token {
+        evaluator = evaluator.with_cancellation_token(token);
+    }
+    let results = evaluator
         .for_query(parsed)
-        .on_store(&store)
+        .on_store(store)
         .execute()
-        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+        .map_err(eval_error)?;
 
     // Serialize results
     match results {
@@ -342,7 +547,7 @@ pub fn sparql_execute(
 
             let mut bindings: Vec<serde_json::Value> = Vec::new();
             for solution in solutions {
-                let solution = solution.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+                let solution = solution.map_err(eval_error)?;
 
                 if bindings.len() >= limits.max_result_rows {
                     return Err(ExecuteError::ResultLimitExceeded {
@@ -377,7 +582,7 @@ pub fn sparql_execute(
         QueryResults::Graph(triples) => {
             let mut buf = Vec::new();
             for triple in triples {
-                let triple = triple.map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+                let triple = triple.map_err(eval_error)?;
                 use std::io::Write;
                 writeln!(
                     buf,
@@ -562,6 +767,7 @@ classes:
             ExecuteLimits {
                 max_triples: 500_000,
                 max_result_rows: 1,
+                max_eval_millis: None,
             },
             None,
         );
@@ -570,6 +776,137 @@ classes:
             result,
             Err(ExecuteError::ResultLimitExceeded { .. })
         ));
+    }
+
+    /// The two ceiling tests share the process-wide backlog count, and one of
+    /// them fills it on purpose; they take turns.
+    static BACKLOG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The ceiling answers the caller while an evaluation is still computing
+    /// its first row: a four-way cross product under an `ORDER BY`
+    /// materialises every combination before it yields one, so neither the
+    /// triple cap (a dozen triples) nor the row cap (checked per row yielded)
+    /// ever fires (#460). The abandoned evaluation finishes on its own thread
+    /// in the background -- a hundred thousand rows here, a moment of CPU --
+    /// and is counted for exactly as long as it runs.
+    #[test]
+    fn the_engine_ceiling_stops_an_evaluation_before_its_first_row() {
+        let _turn = BACKLOG.lock().unwrap_or_else(|e| e.into_inner());
+        let sv = test_schema_view();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let query = "SELECT * WHERE { ?a ?p ?o . ?b ?q ?r . ?c ?x ?y . ?d ?z ?w } \
+                     ORDER BY ?a ?b ?c ?d";
+        let started = std::time::Instant::now();
+        let result = sparql_execute(
+            query,
+            &refs,
+            &sv,
+            ExecuteLimits {
+                max_triples: 500_000,
+                max_result_rows: 10,
+                max_eval_millis: Some(1),
+            },
+            None,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ExecuteError::EvaluationTimeExceeded { millis: 1 })
+            ),
+            "expected the ceiling, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the ceiling fired late: {:?}",
+            started.elapsed()
+        );
+        // The abandoned evaluation was counted, and is uncounted when it
+        // ends: at most one is running, and within a few seconds none.
+        assert!(abandoned_evaluations() <= 1, "{}", abandoned_evaluations());
+        let settled = std::time::Instant::now();
+        while abandoned_evaluations() > 0 {
+            assert!(
+                settled.elapsed() < std::time::Duration::from_secs(30),
+                "the abandoned evaluation never uncounted itself"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // The same store, a query that finishes: the ceiling is not a cost.
+        let answer = sparql_execute(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal }",
+            &refs,
+            &sv,
+            ExecuteLimits {
+                max_triples: 500_000,
+                max_result_rows: 10_000,
+                max_eval_millis: Some(30_000),
+            },
+            None,
+        )
+        .expect("a query under the ceiling answers");
+        let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(
+            parsed["results"]["bindings"].as_array().unwrap().len(),
+            refs.len()
+        );
+    }
+
+    /// A process already carrying `MAX_ABANDONED_EVALUATIONS` runaway
+    /// evaluations refuses to start another under a ceiling, by name and
+    /// before it loads a store; a call without a ceiling is not its business.
+    #[test]
+    fn the_engine_leg_is_refused_while_the_backlog_is_full() {
+        use std::sync::atomic::Ordering;
+        let _turn = BACKLOG.lock().unwrap_or_else(|e| e.into_inner());
+        let sv = test_schema_view();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let query = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                     SELECT ?s WHERE { ?s a asset360:Signal }";
+        // A triple cap no store can meet: were the store loaded first, its
+        // refusal would win, so the backlog refusal winning is the proof
+        // that nothing was loaded.
+        let with_ceiling = ExecuteLimits {
+            max_triples: 0,
+            max_result_rows: 10_000,
+            max_eval_millis: Some(30_000),
+        };
+
+        // Stand in for evaluations the ceiling gave up on and that are still
+        // running; undone below whatever the assertions say.
+        ABANDONED_EVALUATIONS.fetch_add(MAX_ABANDONED_EVALUATIONS, Ordering::SeqCst);
+        let refused = sparql_execute(query, &refs, &sv, with_ceiling, None);
+        let unbounded = sparql_execute(query, &refs, &sv, ExecuteLimits::default(), None);
+        ABANDONED_EVALUATIONS.fetch_sub(MAX_ABANDONED_EVALUATIONS, Ordering::SeqCst);
+
+        assert!(
+            matches!(
+                refused,
+                Err(ExecuteError::EvaluationBacklog {
+                    abandoned: MAX_ABANDONED_EVALUATIONS,
+                    limit: MAX_ABANDONED_EVALUATIONS
+                })
+            ),
+            "expected the backlog refusal, got {refused:?}"
+        );
+        assert!(unbounded.is_ok(), "no ceiling, no backlog: {unbounded:?}");
+
+        // The backlog gone, the same call answers.
+        let answered = sparql_execute(
+            query,
+            &refs,
+            &sv,
+            ExecuteLimits {
+                max_triples: 500_000,
+                max_result_rows: 10_000,
+                max_eval_millis: Some(30_000),
+            },
+            None,
+        );
+        assert!(answered.is_ok(), "{answered:?}");
     }
 
     #[test]
@@ -585,6 +922,7 @@ classes:
             ExecuteLimits {
                 max_triples: 1,
                 max_result_rows: 10_000,
+                max_eval_millis: None,
             },
             None,
         );

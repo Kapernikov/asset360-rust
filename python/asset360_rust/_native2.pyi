@@ -6,6 +6,7 @@ import builtins
 import datetime
 import typing
 
+UNSCOPED_REWRITE_NAMED: builtins.str
 class AltDescription:
     @property
     def alt_description_source(self) -> builtins.str: ...
@@ -6989,7 +6990,7 @@ def refined_plan_text(query:builtins.str, schema_view:SchemaView, schema_graph_i
         ValueError: the query does not parse or cannot be represented.
     """
 
-def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None) -> tuple[builtins.str, builtins.str]:
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
     
@@ -7011,6 +7012,21 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             is built. There is deliberately no default: the correct IRI depends
             on which datamodel is deployed, and guessing would put an
             infrabel-named graph into an unrelated deployment.
+        max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
+            milliseconds, counted once the store is loaded. ``None`` (the
+            default) is no ceiling. The caller is answered at the deadline
+            with ``RuntimeError("Evaluation time limit exceeded: …")``; the
+            evaluation itself is cancelled at its next store read, and one
+            that never reads again (a hash join, an ``ORDER BY`` over a
+            product) runs to its end on its own thread, holding its store.
+            So this bounds the *request*, not the worker. What bounds the
+            worker is the backlog: while ``MAX_ABANDONED_EVALUATIONS`` such
+            evaluations are still running, a call with a ceiling is refused
+            before it loads a store, with ``RuntimeError("Evaluation backlog
+            full: …")``. It is the only limit that bounds *work*: a
+            cartesian product on a small store is under the triple cap and
+            never reaches the row cap, because the first row is what takes
+            minutes (#460, pepibru GitLab).
     
     Returns:
         JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).

@@ -1196,7 +1196,20 @@ pub enum ScopeError {
     /// The SPARQL query could not be parsed (syntax error).
     ParseError(String),
     /// The query has no `rdf:type` constraint and cannot be scoped.
-    Unscoped(String),
+    ///
+    /// `rewrite` is the clause to add, when the schema can spell it whole --
+    /// `?t a <Class>` for the object of a reference, the `GRAPH` clause for
+    /// a concept's labels -- and `None` when the best advice is the generic
+    /// one (name a class; here is the namespace), which the endpoint owns
+    /// because it knows the deployment's IRIs. Carried as data rather than
+    /// as a sentence so the endpoint can tell the two apart without reading
+    /// the prose: the `Display` puts [`UNSCOPED_REWRITE_NAMED`] in front of
+    /// a refusal that names its rewrite, and that token is the whole
+    /// contract.
+    Unscoped {
+        message: String,
+        rewrite: Option<String>,
+    },
     /// The input is a SPARQL Update (INSERT/DELETE), not supported.
     UpdateRejected,
     /// The query uses a SPARQL construct the scoper recognises but does
@@ -1206,11 +1219,28 @@ pub enum ScopeError {
     UnsupportedConstruct(String),
 }
 
+/// What an unscoped refusal that names its own rewrite opens with.
+///
+/// The endpoint attaches its generic "add a class" suggestion to a
+/// `query_unscoped` refusal unless the message opens with this, because a
+/// generic suggestion beside a spelled rewrite contradicts it -- for a
+/// concept's labels there is no class to add (#465, pepibru GitLab). The
+/// message is prose and may be reworded; this token is the one string the
+/// endpoint depends on.
+pub const UNSCOPED_REWRITE_NAMED: &str = "Query is unscoped (rewrite named):";
+
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ScopeError::ParseError(msg) => write!(f, "SPARQL parse error: {msg}"),
-            ScopeError::Unscoped(msg) => write!(f, "Query is unscoped: {msg}"),
+            ScopeError::Unscoped {
+                message,
+                rewrite: None,
+            } => write!(f, "Query is unscoped: {message}"),
+            ScopeError::Unscoped {
+                message,
+                rewrite: Some(rewrite),
+            } => write!(f, "{UNSCOPED_REWRITE_NAMED} {message} Add `{rewrite}`."),
             ScopeError::UpdateRejected => {
                 write!(
                     f,
@@ -1366,6 +1396,15 @@ pub fn scope_parsed_with_schema_graph(
              the clause on one route and not the other would answer a different question"
                 .into(),
         ));
+    }
+
+    // An `OPTIONAL` joined to what precedes it only through a variable that
+    // may be unbound there is a cartesian product per the algebra, and never
+    // what the author meant. Refused for both routes, with the nested
+    // spelling; see `crate::sparql_optional_binding`.
+    if let Some(shape) = crate::sparql_optional_binding::optional_on_a_maybe_unbound_variable(query)
+    {
+        return Err(ScopeError::UnsupportedConstruct(shape.to_string()));
     }
 
     let pattern = match query {
@@ -1885,10 +1924,11 @@ pub fn scope_parsed_with_schema_graph(
     }
 
     if stars.is_empty() {
-        return Err(ScopeError::Unscoped(
-            "Add a triple pattern like '?s rdf:type asset360:Signal' to scope the query."
+        return Err(ScopeError::Unscoped {
+            message: "Add a triple pattern like '?s rdf:type asset360:Signal' to scope the query."
                 .to_owned(),
-        ));
+            rewrite: None,
+        });
     }
 
     // Sort stars deterministically: mandatory ones first (so the SQL
@@ -2347,6 +2387,7 @@ pub fn scope_parsed_with_schema_graph(
                 &references,
                 &path_bindings,
                 schema_view,
+                schema_graph_iri,
             ));
         }
     }
@@ -2922,13 +2963,16 @@ fn scope_union(
         // worse than not being told which arm is short.
         let plan = scope_parsed_with_schema_graph(&branch_query, schema_view, schema_graph_iri)
             .map_err(|err| match err {
-                ScopeError::Unscoped(msg) => ScopeError::Unscoped(format!(
-                    "in UNION branch {} of {}: {msg} Each branch is scoped on its own, so a \
-                     type written in another branch does not carry over; the triple has to be \
-                     in every branch that uses the variable.",
-                    index + 1,
-                    branches.len()
-                )),
+                ScopeError::Unscoped { message, rewrite } => ScopeError::Unscoped {
+                    message: format!(
+                        "in UNION branch {} of {}: {message} Each branch is scoped on its own, \
+                         so a type written in another branch does not carry over; the triple \
+                         has to be in every branch that uses the variable.",
+                        index + 1,
+                        branches.len()
+                    ),
+                    rewrite,
+                },
                 other => other,
             })?;
         branch_limits.push(
@@ -4833,28 +4877,80 @@ fn untyped_subject_refusal(
     references: &HashMap<String, ReferenceReach>,
     path_bindings: &HashMap<String, PathBinding>,
     schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
 ) -> ScopeError {
     // Typed with a class the schema does not know: not "add a type" but "fix
     // the one you wrote".
     if let Some(iri) = star_map.get(var).and_then(|b| b.type_iri.as_deref()) {
-        return ScopeError::Unscoped(format!(
-            "?{var} has rdf:type <{iri}>, which is not a class in the schema, so no records \
-             can be read for it. Check the class IRI and its prefix."
-        ));
+        return ScopeError::Unscoped {
+            message: format!(
+                "?{var} has rdf:type <{iri}>, which is not a class in the schema, so no \
+                 records can be read for it. Check the class IRI and its prefix."
+            ),
+            rewrite: None,
+        };
     }
     // Reached through a reference: the class is known, so say it.
     if let Some(reach) = references.get(var) {
         let path = reach.slot_path.join(".");
-        return ScopeError::Unscoped(format!(
-            "?{var} is the object of `{path}` on ?{holder}, a reference to <{class}>, but has \
-             no rdf:type; only typed subjects are read from the database, so a triple with \
-             ?{var} as its subject can never match. Add `?{var} a <{class}>`.",
-            holder = reach.star_var,
-            class = reach.range_class_uri,
-        ));
+        return ScopeError::Unscoped {
+            message: format!(
+                "?{var} is the object of `{path}` on ?{holder}, a reference to <{class}>, but \
+                 has no rdf:type; only typed subjects are read from the database, so a triple \
+                 with ?{var} as its subject can never match.",
+                holder = reach.star_var,
+                class = reach.range_class_uri,
+            ),
+            rewrite: Some(format!("?{var} a <{class}>", class = reach.range_class_uri)),
+        };
     }
     // Bound to a value: a literal has no triples, so the pattern is empty by
     // construction rather than for want of a fetch.
+    //
+    // A value that is a *concept* -- the object of an enum-ranged slot -- is
+    // the one case where the author's question has an answer, in another
+    // graph: an enum value is a concept IRI whose labels and code the schema
+    // graph holds (`crate::sparql_schema_graph`), unreachable without a
+    // `GRAPH` clause naming it. The rewrite names the clause with the real
+    // IRI, because the IRI is not discoverable from the endpoint (#465,
+    // pepibru GitLab). It names no language: which tag the labels carry is
+    // the datamodel's, and this function refuses to guess the graph IRI for
+    // the same reason.
+    let concept_slot = star_map.values().find_map(|builder| {
+        let class_uri = var_to_class.get(&builder.variable)?;
+        let class = schema_view.get_class_by_uri(class_uri).ok().flatten()?;
+        builder
+            .object_variables
+            .iter()
+            .find(|(_, object_var)| object_var.as_str() == var)
+            .and_then(|(slot_name, _)| {
+                let slot = class.slot(&Identifier::Name(slot_name.clone()))?;
+                let enum_view = slot.get_range_enum()?;
+                Some((
+                    builder.variable.clone(),
+                    slot_name.clone(),
+                    enum_view.canonical_uri().to_string(),
+                ))
+            })
+    });
+    if let Some((holder, slot_name, enum_iri)) = concept_slot {
+        let graph = match schema_graph_iri {
+            Some(iri) => format!("<{iri}>"),
+            None => "<schema-graph>".to_owned(),
+        };
+        return ScopeError::Unscoped {
+            message: format!(
+                "?{var} is bound to a concept of <{enum_iri}> (the value of `{slot_name}` on \
+                 ?{holder}), not a record: its labels and code are in the schema graph, which \
+                 a triple pattern reaches only inside a GRAPH clause -- written inside the \
+                 OPTIONAL, if the pattern was optional. `skos:notation` there is the code, \
+                 `rdfs:label` the name."
+            ),
+            rewrite: Some(format!(
+                "GRAPH {graph} {{ ?{var} <http://www.w3.org/2004/02/skos/core#prefLabel> ?label }}"
+            )),
+        };
+    }
     let is_value = path_bindings.contains_key(var)
         || star_map.values().any(|builder| {
             let Some(class_uri) = var_to_class.get(&builder.variable) else {
@@ -4874,33 +4970,53 @@ fn untyped_subject_refusal(
                 })
         });
     if is_value {
-        return ScopeError::Unscoped(format!(
-            "?{var} is bound to a value, not a record, so it cannot be the subject of a \
-             triple pattern. Use a variable that names a record."
-        ));
+        return ScopeError::Unscoped {
+            message: format!(
+                "?{var} is bound to a value, not a record, so it cannot be the subject of a \
+                 triple pattern. Use a variable that names a record."
+            ),
+            rewrite: None,
+        };
     }
     // The holder of a reference to a typed object: the schema knows which
     // classes declare such a slot, so the message can list them rather than
     // leave `<Class>` for the author to look up — the mirror of the reference
     // arm above, where the slot's range names the object's class.
     let declared_on = holder_candidates(var, star_map, var_to_class, schema_view);
+    if let [class] = declared_on.as_slice() {
+        // One class declares the combination: that is the rewrite.
+        return ScopeError::Unscoped {
+            message: format!(
+                "?{var} has no rdf:type; only typed subjects are read from the database, so a \
+                 triple with ?{var} as its subject can never match. The slots it reads are \
+                 declared on <{class}>."
+            ),
+            rewrite: Some(format!("?{var} a <{class}>")),
+        };
+    }
     if !declared_on.is_empty() {
         let listed = declared_on
             .iter()
             .map(|class| format!("<{class}>"))
             .collect::<Vec<_>>()
             .join(", ");
-        return ScopeError::Unscoped(format!(
-            "?{var} has no rdf:type; only typed subjects are read from the database, so a \
-             triple with ?{var} as its subject can never match. Add `?{var} a <Class>`; the \
-             slots it reads are declared on {listed}."
-        ));
+        return ScopeError::Unscoped {
+            message: format!(
+                "?{var} has no rdf:type; only typed subjects are read from the database, so a \
+                 triple with ?{var} as its subject can never match. Add `?{var} a <Class>`; \
+                 the slots it reads are declared on {listed}."
+            ),
+            rewrite: None,
+        };
     }
-    ScopeError::Unscoped(format!(
-        "?{var} has no rdf:type; only typed subjects are read from the database, so a triple \
-         with ?{var} as its subject can never match. Add `?{var} a <Class>`, naming the \
-         class whose records it stands for."
-    ))
+    ScopeError::Unscoped {
+        message: format!(
+            "?{var} has no rdf:type; only typed subjects are read from the database, so a \
+             triple with ?{var} as its subject can never match. Add `?{var} a <Class>`, \
+             naming the class whose records it stands for."
+        ),
+        rewrite: None,
+    }
 }
 
 /// The classes an untyped subject could be, read off the references it holds.
@@ -5394,9 +5510,10 @@ classes:
         )
         .unwrap_err();
 
-        let ScopeError::Unscoped(msg) = err else {
+        let ScopeError::Unscoped { .. } = err else {
             panic!("expected an unscoped refusal, got {err:?}");
         };
+        let msg = err.to_string();
         assert!(
             msg.contains("?t is the object of `locatedOnTrack` on ?s")
                 && msg.contains("Add `?t a <https://data.infrabel.be/asset360/Track>`"),
@@ -5423,8 +5540,8 @@ classes:
             // fetched, the holder never is. The schema knows which classes
             // declare the slot, so the message lists them.
             (
-                "Add `?sig a <Class>`; the slots it reads are declared on \
-                 <https://data.infrabel.be/asset360/Signal>.",
+                "declared on <https://data.infrabel.be/asset360/Signal>. \
+                 Add `?sig a <https://data.infrabel.be/asset360/Signal>`.",
                 "SELECT ?t WHERE { ?sig asset360:locatedOnTrack ?t . ?t a asset360:Track }",
             ),
             // The same subject in one arm of a UNION, typed in the other: the
@@ -5467,11 +5584,30 @@ classes:
                 "?x has no rdf:type",
                 "SELECT ?x WHERE { ?s a asset360:Signal . ?x asset360:name ?n }",
             ),
+            // A concept as a subject (#465): the label read anyone writes
+            // first. The answer is in the schema graph, and the message says
+            // the GRAPH clause with the graph's real IRI.
+            (
+                "?k is bound to a concept of <https://data.infrabel.be/asset360/SignalKind> \
+                 (the value of `kind` on ?s), not a record: its labels and code are in the \
+                 schema graph, which a triple pattern reaches only inside a GRAPH clause -- \
+                 written inside the OPTIONAL, if the pattern was optional. `skos:notation` \
+                 there is the code, `rdfs:label` the name. Add `GRAPH <urn:schema> { ?k \
+                 <http://www.w3.org/2004/02/skos/core#prefLabel> ?label }`.",
+                "SELECT ?l WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
+                 OPTIONAL { ?k <http://www.w3.org/2004/02/skos/core#prefLabel> ?l } }",
+            ),
         ] {
-            let err = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap_err();
-            let ScopeError::Unscoped(msg) = &err else {
+            let err = sparql_scope_with_schema_graph(
+                &format!("{prefix}{query}"),
+                &sv,
+                Some("urn:schema"),
+            )
+            .unwrap_err();
+            let ScopeError::Unscoped { .. } = &err else {
                 panic!("{query}: expected an unscoped refusal, got {err:?}");
             };
+            let msg = err.to_string();
             assert!(msg.contains(expected), "{query}: {msg}");
         }
     }
@@ -6444,9 +6580,13 @@ classes:
             (
                 // A slot the schema knows but the *intermediate* class does not:
                 // claimed in Phase 1 against the schema, dropped by the walk.
+                // Reached through two slots of different ranges, because a
+                // node one slot reaches is judged by that slot's range at the
+                // parse and refused there (#459, pepibru GitLab; see
+                // `sparql_alias`).
                 Inexact::UnrepresentedTriple,
-                "SELECT ?lo WHERE { ?s a asset360:Signal ; asset360:location ?c . \
-                 ?c asset360:longitude ?lo ; asset360:name ?x }",
+                "SELECT ?lo WHERE { ?s a asset360:Signal ; asset360:location ?c ; \
+                 asset360:documents ?c . ?c asset360:longitude ?lo ; asset360:name ?x }",
             ),
             // A blank-node property list has no variable to scope, so nothing
             // can claim its triples — and the same query written with a named
@@ -6517,7 +6657,7 @@ classes:
             &sv,
         );
         assert!(
-            matches!(result, Err(ScopeError::Unscoped(_))),
+            matches!(result, Err(ScopeError::Unscoped { .. })),
             "expected Unscoped, got {result:?}"
         );
     }
@@ -6688,6 +6828,30 @@ classes:
         assert_eq!(plan.inexact, None);
         assert!(plan.path_bindings.contains_key("lo"));
 
+        // Untyped with a predicate `Coordinates` cannot carry: the class of
+        // ?c is known from the slot it was reached through, so this is
+        // refused at the parse like the typed form, naming the hop -- in the
+        // mandatory pattern and inside an OPTIONAL, where it used to be an
+        // unbound column on every row (#459, pepibru GitLab).
+        for query in [
+            format!(
+                "{prefix}SELECT ?x WHERE {{ ?s a asset360:Signal ; asset360:location ?c . \
+                 ?c asset360:hasName ?x }}"
+            ),
+            format!(
+                "{prefix}SELECT ?x WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:location ?c . ?c asset360:hasName ?x }} }}"
+            ),
+        ] {
+            let err = sparql_scope(&query, &sv).unwrap_err();
+            assert!(
+                matches!(&err, ScopeError::UnsupportedConstruct(msg)
+                    if msg.contains("not a slot of Coordinates")
+                        && msg.contains("`?s asset360:location ?c` reaches")),
+                "a wrong predicate on a reached node is refused by name: {err:?}"
+            );
+        }
+
         // A real reference still joins.
         let plan = sparql_scope(
             &format!(
@@ -6820,25 +6984,26 @@ classes:
             vec![FilterCondition::Eq("KSS".to_owned())]
         );
 
-        // A literal is a term no record renders as — for any value now, not
-        // just the mapped ones. Pushing it would answer with every matching
-        // record where SPARQL answers with none.
-        for code in ["GSA", "KSS"] {
-            let plan = sparql_scope(
+        // A literal is a term no record renders as -- for any value, not just
+        // the mapped ones -- and is refused at the parse, naming the concept
+        // IRI (`crate::sparql_alias`, #461).
+        for (code, concept) in [
+            ("GSA", "http://ontorail.org/src/Eulynx/GSA"),
+            ("KSS", "https://data.infrabel.be/asset360/SignalKind#KSS"),
+        ] {
+            let err = sparql_scope(
                 &format!(
                     "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"{code}\" }}"
                 ),
                 &sv,
             )
-            .unwrap();
-            assert_eq!(
-                plan.inexact,
-                Some(Inexact::EnumConstantUnmatched),
-                "literal {code:?} matches no term"
-            );
+            .unwrap_err();
+            let ScopeError::UnsupportedConstruct(msg) = &err else {
+                panic!("literal {code:?}: expected a refusal, got {err:?}");
+            };
             assert!(
-                !plan.root.all_stars()[0].filters.contains_key("kind"),
-                "nothing is pushed for a constant no record renders as ({code})"
+                msg.contains(&format!("<{concept}>")),
+                "literal {code:?} is refused naming its concept: {msg}"
             );
         }
     }
@@ -7349,7 +7514,7 @@ classes:
     fn test_unscoped_query_rejected() {
         let sv = test_schema_view();
         let result = sparql_scope("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", &sv);
-        assert!(matches!(result, Err(ScopeError::Unscoped(_))));
+        assert!(matches!(result, Err(ScopeError::Unscoped { .. })));
     }
 
     #[test]
@@ -7716,7 +7881,7 @@ classes:
             &sv,
         );
         assert!(
-            matches!(result, Err(ScopeError::Unscoped(_))),
+            matches!(result, Err(ScopeError::Unscoped { .. })),
             "an unscopable arm refuses the query, got {result:?}"
         );
     }
@@ -8224,9 +8389,10 @@ classes:
                           ?t asset360:typeURI ?tn } }",
             &sv,
         );
-        let Err(ScopeError::Unscoped(msg)) = result else {
+        let Err(ScopeError::Unscoped { .. }) = &result else {
             panic!("expected an unscoped refusal, got {result:?}");
         };
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("?t is the object of `hasCoveredSection.belongsToTrack` on ?s")
                 && msg.contains("Add `?t a <https://data.infrabel.be/asset360/Track>`"),

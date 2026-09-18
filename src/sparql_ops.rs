@@ -1778,14 +1778,23 @@ pub fn lower_refined_with(
                 // fold makes -- it becomes a value against the indexed column
                 // rather than a slot of the payload.
                 Some(claim @ crate::sparql_plan::Obligation::Triple { predicate, .. }) => {
-                    let slot = predicate
-                        .trim_matches(['<', '>'])
-                        .rsplit(['/', '#'])
-                        .next()
-                        .unwrap_or_default();
-                    let read = slots
-                        .iter()
-                        .any(|scanned| scanned.path.iter().any(|hop| hop == slot));
+                    // The predicate names a slot through the schema, the way
+                    // every rule that folded the read resolved it -- not by
+                    // its local name, which a slot whose `slot_uri` lies
+                    // outside its namespace (`Line.name` is
+                    // `rsm:EAID_080C70AE…`, read as `irsm:name`) does not
+                    // share (#462, pepibru GitLab). The local name is the
+                    // fallback for a predicate the schema does not know.
+                    let iri = predicate.trim_matches(['<', '>']);
+                    let slot = schema
+                        .get_slot_by_uri(iri)
+                        .ok()
+                        .flatten()
+                        .map(|slot| slot.name)
+                        .unwrap_or_else(|| {
+                            iri.rsplit(['/', '#']).next().unwrap_or_default().to_owned()
+                        });
+                    let read = slots.iter().any(|scanned| scanned.path.contains(&slot));
                     let is_the_identity = identifier_slot_of(schema, class_uri)
                         .is_some_and(|identifier| identifier == slot)
                         && !identifier_values.is_empty();
@@ -3746,24 +3755,29 @@ mod tests {
     }
 
     /// A branch whose constant is not the term its column's values render as
-    /// declines the *whole* tree, the same way it declines a single
-    /// condition.
+    /// never reaches the tree: the query is refused at the parse.
     ///
     /// `kind` is an enum column: it stores `GSA` and renders as `eul:GSA`, so
     /// `= "GSA"` matches no stored value. Pushing it as one branch of a
-    /// disjunction is worse than pushing it alone -- the branch is dead, so
-    /// the disjunction silently narrows to the *other* branch and answers a
-    /// different question. The tree entry point therefore asks
-    /// `constants_are_the_columns_terms` first, exactly as `to_sql` does.
+    /// disjunction would be worse than pushing it alone -- the branch is
+    /// dead, so the disjunction would silently narrow to the *other* branch
+    /// and answer a different question. The comparison itself is refused by
+    /// name (`crate::sparql_alias::refuse_literals_against_concepts`, #461),
+    /// before any rule sees it, so neither leg can answer it wrong.
     #[test]
-    fn a_branch_whose_constant_is_not_the_columns_term_does_not_lift() {
+    fn a_branch_whose_constant_is_not_the_columns_term_is_refused() {
+        let sv = test_schema_view();
+        let err = plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm ; \
+                 asset360:kind ?k . FILTER(?nm = \"BX517\" || ?k = \"GSA\") }}"
+            ),
+            &sv,
+        )
+        .expect_err("a string against a concept is refused");
         assert!(
-            filter_trees(
-                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
-                 asset360:kind ?k . FILTER(?nm = \"BX517\" || ?k = \"GSA\") }",
-            )
-            .is_empty(),
-            "a dead branch would narrow to the other one"
+            err.to_string().contains("\"GSA\" is a string"),
+            "refused by name: {err}"
         );
     }
 

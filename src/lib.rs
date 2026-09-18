@@ -46,6 +46,7 @@ pub mod sparql_graph_clauses;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_materialise;
 pub mod sparql_ops;
+pub mod sparql_optional_binding;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;
@@ -99,6 +100,13 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(py_naive_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
+        // The token an unscoped refusal opens with when it names its own
+        // rewrite (`sparql_scoper::UNSCOPED_REWRITE_NAMED`): exported so the
+        // endpoint reads the constant instead of carrying a copy of it.
+        m.add(
+            "UNSCOPED_REWRITE_NAMED",
+            crate::sparql_scoper::UNSCOPED_REWRITE_NAMED,
+        )?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_ntriples, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_skipped, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_reads_only_the_schema_graph, m)?)?;
@@ -3511,7 +3519,7 @@ fn load_json_batch(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, instances, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None))]
+#[pyo3(signature = (query, instances, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None, max_eval_millis=None))]
 /// Execute a SPARQL query against a list of LinkML instances.
 ///
 /// Converts each instance to RDF, loads into an in-memory store (with
@@ -3532,6 +3540,21 @@ fn load_json_batch(
 ///         is built. There is deliberately no default: the correct IRI depends
 ///         on which datamodel is deployed, and guessing would put an
 ///         infrabel-named graph into an unrelated deployment.
+///     max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
+///         milliseconds, counted once the store is loaded. ``None`` (the
+///         default) is no ceiling. The caller is answered at the deadline
+///         with ``RuntimeError("Evaluation time limit exceeded: …")``; the
+///         evaluation itself is cancelled at its next store read, and one
+///         that never reads again (a hash join, an ``ORDER BY`` over a
+///         product) runs to its end on its own thread, holding its store.
+///         So this bounds the *request*, not the worker. What bounds the
+///         worker is the backlog: while ``MAX_ABANDONED_EVALUATIONS`` such
+///         evaluations are still running, a call with a ceiling is refused
+///         before it loads a store, with ``RuntimeError("Evaluation backlog
+///         full: …")``. It is the only limit that bounds *work*: a
+///         cartesian product on a small store is under the triple cap and
+///         never reaches the row cap, because the first row is what takes
+///         minutes (#460, pepibru GitLab).
 ///
 /// Returns:
 ///     JSON string (for SELECT/ASK) or Turtle string (for CONSTRUCT/DESCRIBE).
@@ -3551,6 +3574,7 @@ fn sparql_execute(
     max_triples: usize,
     max_result_rows: usize,
     schema_graph_iri: Option<String>,
+    max_eval_millis: Option<u64>,
 ) -> PyResult<(String, String)> {
     let bound_sv = schema_view.bind(py);
     let sv_ref = bound_sv.borrow();
@@ -3567,6 +3591,7 @@ fn sparql_execute(
         crate::sparql_executor::ExecuteLimits {
             max_triples,
             max_result_rows,
+            max_eval_millis,
         },
         schema_graph_iri.as_deref(),
     ) {
@@ -3592,6 +3617,13 @@ fn sparql_execute(
                 "Result row limit exceeded: {count} > {limit}"
             )))
         }
+        Err(crate::sparql_executor::ExecuteError::EvaluationTimeExceeded { millis }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Evaluation time limit exceeded: the engine ran for more than {millis} ms"
+            )))
+        }
+        // `EvaluationBacklog` reaches Python as its own `Display`, through
+        // the arm below: one text, the one `sparql/engine.py` matches on.
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }
@@ -3666,6 +3698,13 @@ fn sparql_schema_graph_skipped(
 fn sparql_reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<String>) -> bool {
     crate::sparql_graph_clauses::reads_only_the_schema_graph(query, schema_graph_iri.as_deref())
 }
+
+#[cfg(all(
+    feature = "python-bindings",
+    feature = "stubgen",
+    feature = "sparql-endpoint"
+))]
+pyo3_stub_gen::module_variable!("asset360_rust._native2", "UNSCOPED_REWRITE_NAMED", String);
 
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
 define_stub_info_gatherer!(stub_info);
