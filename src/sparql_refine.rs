@@ -2433,6 +2433,10 @@ pub struct Plan {
     pub residual: Vec<ObligationId>,
     /// The next [`NodeKey`] to hand out. Keys are never reused.
     pub next_key: usize,
+    /// Where each obligation was raised: the barrier of the scope the node
+    /// that first claimed it was in, `None` for the outermost scope. What
+    /// *obligations stay in their scope* checks a discharge against.
+    pub origin: Vec<Option<NodeKey>>,
     /// Nodes a rule removed, each with the node that took its work over --
     /// the input a dropped unary node stood in for, the scan a folded match
     /// became -- or `None` when nothing did. What lets evidence recorded by
@@ -2504,6 +2508,9 @@ pub enum PlanDefect {
         rule: &'static str,
         defect: crate::sparql_scopes::TransitionDefect,
     },
+    /// One of the invariants a scope makes local. See
+    /// [`crate::sparql_scopes::ScopeDefect`].
+    Scope(crate::sparql_scopes::ScopeDefect),
 }
 
 impl fmt::Display for PlanDefect {
@@ -2548,6 +2555,7 @@ impl fmt::Display for PlanDefect {
                  so it multiplies rows nothing asked for"
             ),
             Self::Transition { rule, defect } => write!(f, "{rule}: {defect}"),
+            Self::Scope(defect) => write!(f, "{defect}"),
         }
     }
 }
@@ -2568,10 +2576,27 @@ impl Plan {
             nodes: Vec::new(),
             residual: Vec::new(),
             next_key: 1,
+            origin: Vec::new(),
             retired: BTreeMap::new(),
         };
         plan.install(nodes);
+        plan.record_origins();
         plan
+    }
+
+    /// Record where each obligation was raised: the scope of the node that
+    /// claims it now. Called once, on the plan as built.
+    fn record_origins(&mut self) {
+        let scopes = self.scopes();
+        let mut origin: Vec<Option<NodeKey>> = vec![None; self.obligations.len()];
+        for (id, node) in self.nodes.iter().enumerate() {
+            for claim in &node.discharges {
+                if let Some(slot) = origin.get_mut(*claim) {
+                    *slot = scopes[id].map(|barrier| self.nodes[barrier].key);
+                }
+            }
+        }
+        self.origin = origin;
     }
 
     /// Install a node list, giving every unkeyed node a fresh key.
@@ -2670,7 +2695,26 @@ impl Plan {
         self.frontier_is_a_cut()?;
         self.root_matches_form()?;
         self.fanout_restored()?;
-        self.reference_joins_agree()
+        self.reference_joins_agree()?;
+        // The scope invariants (design, *The invariants that make it
+        // local*): closure on producers, one consumer per exporting scope,
+        // element reads fanned out, obligations in their scope, evidence
+        // resolving. `join_keys_agree` needs the schema and is checked by
+        // the driver that has one ([`Plan::check_with`]).
+        self.scope_closure().map_err(PlanDefect::Scope)?;
+        self.exporting_scope_has_one_consumer()
+            .map_err(PlanDefect::Scope)?;
+        self.bound_element_reads_have_their_unnest()
+            .map_err(PlanDefect::Scope)?;
+        self.obligations_stay_in_scope()
+            .map_err(PlanDefect::Scope)?;
+        self.evidence_resolves().map_err(PlanDefect::Scope)
+    }
+
+    /// [`Plan::check`], plus the invariants that need the schema.
+    pub fn check_with(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
+        self.check()?;
+        self.join_keys_agree(schema).map_err(PlanDefect::Scope)
     }
 
     /// **Invariant 1.** Every obligation appears exactly once, in a node or in
@@ -3581,15 +3625,7 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
     debug_assert_eq!(root, builder.nodes.len() - 1, "the root is the last node");
 
     let nodes = builder.nodes;
-    let mut plan = Plan {
-        form,
-        obligations,
-        nodes: Vec::new(),
-        residual: Vec::new(),
-        next_key: 1,
-        retired: BTreeMap::new(),
-    };
-    plan.install(nodes);
+    let plan = Plan::from_nodes(form, obligations, nodes);
     plan.check().map_err(RefineError::Defect)?;
     Ok(plan)
 }

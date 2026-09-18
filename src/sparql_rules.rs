@@ -8822,7 +8822,7 @@ mod tests {
                     if rule.apply(&mut plan) {
                         changed = true;
                         applications += 1;
-                        plan.check().unwrap_or_else(|defect| {
+                        plan.check_with(&schema).unwrap_or_else(|defect| {
                             panic!(
                                 "{}, application {applications}: {defect} for {query}\n{plan}",
                                 rule.name()
@@ -8921,7 +8921,7 @@ mod tests {
                     if rule.apply(&mut plan) {
                         changed = true;
                         applications += 1;
-                        plan.check().unwrap_or_else(|defect| {
+                        plan.check_with(&schema).unwrap_or_else(|defect| {
                             panic!(
                                 "{}, application {applications}: {defect} for {query}\n{plan}",
                                 rule.name()

@@ -920,3 +920,326 @@ pub fn representable(
         TermOf::Collection { .. } | TermOf::Computed => false,
     }
 }
+
+// ---------------------------------------------------------------------------
+// The invariants a scope makes local
+// ---------------------------------------------------------------------------
+
+/// Every [`crate::sparql_refine::Expr::Slot`] an expression names, with the
+/// star and reading it addresses.
+fn slots_named(expr: &Expr, out: &mut Vec<(String, Vec<String>, SlotReading)>) {
+    match expr {
+        Expr::Slot {
+            star_var,
+            slot_path,
+            reading,
+            ..
+        } => out.push((star_var.clone(), slot_path.clone(), *reading)),
+        Expr::Compare { left, right, .. } => {
+            slots_named(left, out);
+            slots_named(right, out);
+        }
+        Expr::In { value, candidates } => {
+            slots_named(value, out);
+            for candidate in candidates {
+                slots_named(candidate, out);
+            }
+        }
+        Expr::And(parts) | Expr::Or(parts) | Expr::Function { args: parts, .. } => {
+            for part in parts {
+                slots_named(part, out);
+            }
+        }
+        Expr::Not(inner) => slots_named(inner, out),
+        Expr::Var(_) | Expr::Literal(_) | Expr::Opaque(_) => {}
+    }
+}
+
+/// The expressions a node evaluates, for a check over what they name.
+fn expressions_of(node: &crate::sparql_refine::Node) -> Vec<&Expr> {
+    match &node.op {
+        PlanOp::Filter { condition, .. } => vec![condition],
+        PlanOp::Bind { expr, .. } => vec![expr],
+        PlanOp::Sort { terms, .. } => terms.iter().map(|term| &term.expr).collect(),
+        PlanOp::Group { having, .. } => having.iter().collect(),
+        PlanOp::LeftJoin {
+            condition: Some(condition),
+            ..
+        } => vec![condition],
+        _ => Vec::new(),
+    }
+}
+
+impl Plan {
+    /// **Scope closure, on producer slots.** A pushed node that names a
+    /// star's slot must have that star's scan visibly below it -- in its own
+    /// scope, or through a transparent barrier -- and a pushed node that
+    /// names a variable must have a producer it can see, or none at all: a
+    /// variable bound only inside a barrier that does not export it is a
+    /// reference into a scope, which no rule may resolve. Comparing name
+    /// strings against a name list cannot tell an exported relation column
+    /// from the inner scan that happens to bind the same name; the producer
+    /// can.
+    pub fn scope_closure(&self) -> Result<(), ScopeDefect> {
+        for (id, node) in self.nodes.iter().enumerate() {
+            if node.executor != Executor::Sql {
+                continue;
+            }
+            let inputs = node.op.inputs();
+            for expr in expressions_of(node) {
+                let mut slots = Vec::new();
+                slots_named(expr, &mut slots);
+                for (star_var, _, _) in slots {
+                    let visible = self.nodes.iter().enumerate().any(|(scan, below)| {
+                        matches!(&below.op, PlanOp::Scan { star_var: scanned, .. } if *scanned == star_var)
+                            && inputs.iter().any(|input| self.feeds_visibly(scan, *input))
+                    });
+                    if !visible {
+                        return Err(ScopeDefect::SlotOutOfScope {
+                            node: id,
+                            star: star_var,
+                        });
+                    }
+                }
+                for var in variables_used(expr) {
+                    let seen = inputs
+                        .iter()
+                        .any(|input| !self.producers_of(*input, &var).is_empty());
+                    let hidden = !seen
+                        && inputs
+                            .iter()
+                            .any(|input| self.bound_anywhere_below(*input, &var));
+                    if hidden {
+                        return Err(ScopeDefect::ReferenceIntoScope { node: id, var });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// **An `Exporting` scope has one consumer.** A contextual rewrite may
+    /// edit a barrier only if one node reads it, and a barrier the builder
+    /// wrote has exactly one; a rule that makes two nodes read one barrier
+    /// -- `fold` makes two read one *scan*, which is fine -- has to say what
+    /// that means for the restriction it may carry.
+    pub fn exporting_scope_has_one_consumer(&self) -> Result<(), ScopeDefect> {
+        for barrier in self.barriers() {
+            let consumers = crate::sparql_rules::consumers_of(self, barrier).len();
+            if consumers != 1 {
+                return Err(ScopeDefect::BarrierConsumers { barrier, consumers });
+            }
+        }
+        Ok(())
+    }
+
+    /// **Join keys agree.** A recorded [`crate::sparql_refine::JoinKey`]
+    /// says what the sides say: an `Identity` key's variable is the identity
+    /// of one class on both sides, guaranteed on both, and the join is on
+    /// that variable alone; an `Element` key's variable is a structure of
+    /// one `(holder class, path)`, guaranteed on both; a `Cross` key joins on
+    /// nothing.
+    pub fn join_keys_agree(&self, schema: &SchemaView) -> Result<(), ScopeDefect> {
+        use crate::sparql_refine::JoinKey;
+        for (id, node) in self.nodes.iter().enumerate() {
+            let (left, right, on, key) = match &node.op {
+                PlanOp::Join {
+                    left,
+                    right,
+                    on,
+                    key: Some(key),
+                    ..
+                } => (*left, *right, Some(on.clone()), key),
+                PlanOp::LeftJoin {
+                    left,
+                    right,
+                    key: Some(key),
+                    ..
+                } => (*left, *right, None, key),
+                _ => continue,
+            };
+            let agrees = match key {
+                JoinKey::Identity { var, class_uri } => {
+                    on.as_ref().is_none_or(|on| on.as_slice() == [var.clone()])
+                        && [left, right].iter().all(|side| {
+                            self.guaranteed(*side).contains(var)
+                                && self.identity_class(schema, *side, var).as_ref()
+                                    == Some(class_uri)
+                        })
+                }
+                JoinKey::Element {
+                    var,
+                    holder_class_uri,
+                    path,
+                } => on.as_ref().is_none_or(|on| on.as_slice() == [var.clone()])
+                    && [left, right].iter().all(|side| {
+                        self.guaranteed(*side).contains(var)
+                            && matches!(
+                                self.term_of(schema, *side, var).as_slice(),
+                                [TermOf::Structure { holder_star, path: at, .. }]
+                                    if at == path
+                                        && self.identity_class(schema, *side, holder_star).as_ref()
+                                            == Some(holder_class_uri)
+                            )
+                    }),
+                JoinKey::Cross => on.as_ref().is_none_or(|on| on.is_empty()),
+            };
+            if !agrees {
+                return Err(ScopeDefect::MisrecordedKey { join: id });
+            }
+        }
+        Ok(())
+    }
+
+    /// **Every `BoundElement` read has its unnest.** A pushed condition that
+    /// reads an element of a collection -- `?cs :isReference true` as
+    /// `hasCoveredSection[each].isReference` -- has, visibly below it, the
+    /// fan-out of that collection. Without it the element is not a row and
+    /// the condition has nothing to be evaluated against.
+    pub fn bound_element_reads_have_their_unnest(&self) -> Result<(), ScopeDefect> {
+        for (id, node) in self.nodes.iter().enumerate() {
+            if node.executor != Executor::Sql {
+                continue;
+            }
+            let inputs = node.op.inputs();
+            for expr in expressions_of(node) {
+                let mut slots = Vec::new();
+                slots_named(expr, &mut slots);
+                for (star_var, path, reading) in slots {
+                    if reading != SlotReading::BoundElement {
+                        continue;
+                    }
+                    let fanned_out = self.nodes.iter().enumerate().any(|(unnest, below)| {
+                        matches!(&below.op, PlanOp::Unnest { star_var: fanned, slot_path, .. }
+                            if *fanned == star_var && path.starts_with(slot_path))
+                            && inputs
+                                .iter()
+                                .any(|input| self.feeds_visibly(unnest, *input))
+                    });
+                    if !fanned_out {
+                        return Err(ScopeDefect::ElementReadWithoutUnnest {
+                            node: id,
+                            star: star_var,
+                            path: path.join("."),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// **Obligations stay in their scope.** An obligation raised in scope
+    /// *S* is discharged by a node in *S* or by the node that combines *S*
+    /// with the outside, never above and never below into a nested scope.
+    /// The origin is the scope of the node that claimed the obligation when
+    /// the plan was built, held by the barrier's key, and resolved through
+    /// `retired`: a barrier a rule dissolved (an absorbed `OPTIONAL`) has
+    /// its preserved side as successor, and the obligation may then be
+    /// discharged in that side's scope.
+    pub fn obligations_stay_in_scope(&self) -> Result<(), ScopeDefect> {
+        let scopes = self.scopes();
+        for (id, node) in self.nodes.iter().enumerate() {
+            for claim in &node.discharges {
+                let Some(origin) = self.origin.get(*claim).copied().flatten() else {
+                    // Raised in the outermost scope, or a derived obligation:
+                    // anywhere outside a nested scope will do -- a nested
+                    // scope's claim of an outer obligation is a restriction
+                    // pushed *into* it, which is the transfer op 3b records
+                    // (checked by its own invariant).
+                    continue;
+                };
+                let Some(barrier) = self.resolve(origin) else {
+                    return Err(ScopeDefect::EvidenceLost { key: origin });
+                };
+                let allowed = if matches!(self.nodes[barrier].op, PlanOp::SubSelect { .. }) {
+                    scopes[id] == Some(barrier)
+                        || scopes[id].is_some_and(|inner| self.feeds(inner, barrier))
+                        || crate::sparql_rules::consumers_of(self, barrier).contains(&id)
+                } else {
+                    // The scope was dissolved into the one its successor is
+                    // in.
+                    scopes[id] == scopes[barrier]
+                        || scopes[id].is_some_and(|inner| self.feeds(inner, barrier))
+                };
+                if !allowed {
+                    return Err(ScopeDefect::ObligationLeftItsScope {
+                        node: id,
+                        obligation: *claim,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// **Evidence resolves.** Every key the ledger names is live, or retired
+    /// with a successor.
+    pub fn evidence_resolves(&self) -> Result<(), ScopeDefect> {
+        for key in self.origin.iter().flatten() {
+            if self.resolve(*key).is_none() {
+                return Err(ScopeDefect::EvidenceLost { key: *key });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A plan that violates one of the scope invariants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeDefect {
+    /// A pushed node names a slot of a star no scan visibly below it scans:
+    /// a rule resolved an inner scan's column from outside its barrier.
+    SlotOutOfScope { node: NodeId, star: String },
+    /// A pushed node names a variable bound only inside a barrier that does
+    /// not export it.
+    ReferenceIntoScope { node: NodeId, var: String },
+    /// A barrier with other than one consumer.
+    BarrierConsumers { barrier: NodeId, consumers: usize },
+    /// A recorded join key the sides do not support.
+    MisrecordedKey { join: NodeId },
+    /// A condition reads an element of a collection nothing fanned out.
+    ElementReadWithoutUnnest {
+        node: NodeId,
+        star: String,
+        path: String,
+    },
+    /// An obligation discharged outside the scope it was raised in.
+    ObligationLeftItsScope { node: NodeId, obligation: usize },
+    /// A key the ledger names resolves to nothing.
+    EvidenceLost { key: NodeKey },
+}
+
+impl std::fmt::Display for ScopeDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SlotOutOfScope { node, star } => write!(
+                f,
+                "n{node} reads a slot of ?{star}, whose scan is behind a barrier it cannot see through"
+            ),
+            Self::ReferenceIntoScope { node, var } => write!(
+                f,
+                "n{node} references ?{var}, which is bound only inside a scope that does not export it"
+            ),
+            Self::BarrierConsumers { barrier, consumers } => write!(
+                f,
+                "barrier n{barrier} has {consumers} consumers, and an exporting scope has exactly one"
+            ),
+            Self::MisrecordedKey { join } => write!(
+                f,
+                "n{join} records a join key the sides below it do not support"
+            ),
+            Self::ElementReadWithoutUnnest { node, star, path } => write!(
+                f,
+                "n{node} reads an element of ?{star}.{path} with no fan-out of that collection below it"
+            ),
+            Self::ObligationLeftItsScope { node, obligation } => write!(
+                f,
+                "n{node} discharges o{obligation} outside the scope it was raised in"
+            ),
+            Self::EvidenceLost { key } => {
+                write!(f, "the ledger names {key}, which resolves to no node")
+            }
+        }
+    }
+}

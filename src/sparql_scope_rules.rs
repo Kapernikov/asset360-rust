@@ -414,4 +414,386 @@ mod tests {
             "{printed}"
         );
     }
+    /// **Invariants driven by a bad rule** (design test 3): each lie a rule
+    /// could tell about a scope fails at the rule, not in a result. Every
+    /// case builds a sound plan, edits it the way a wrong rule would, and
+    /// names the invariant that refuses it.
+    #[test]
+    fn a_bad_rule_fails_the_scope_invariant_that_catches_it() {
+        use crate::sparql_refine::{JoinKey, PlanDefect, PlanOp};
+        use crate::sparql_scopes::ScopeDefect;
+        let schema = test_schema_view();
+
+        // A join key on a slot column: `?nm` is a value, not an identity.
+        let mut plan = refined(
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:documents ?d } GROUP BY ?s } }",
+        );
+        let join = plan.find("join")[0];
+        if let PlanOp::Join { key, .. } = &mut plan.nodes[join].op {
+            *key = Some(JoinKey::Identity {
+                var: "nm".to_owned(),
+                class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
+            });
+        }
+        assert!(
+            matches!(
+                plan.check_with(&schema),
+                Err(PlanDefect::Scope(ScopeDefect::MisrecordedKey { .. }))
+            ),
+            "{plan}"
+        );
+
+        // An identity join on a key `term_of` accepts and `guaranteed` does
+        // not: the relation's `?s` comes through a left join, so an inner
+        // join above keyed on it lies about boundness.
+        let mut plan = refined(
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm . OPTIONAL { \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:documents ?d } \
+             GROUP BY ?s } } }",
+        );
+        let leftjoin = plan.find("leftjoin")[0];
+        let (left, right) = match &plan.nodes[leftjoin].op {
+            PlanOp::LeftJoin { left, right, .. } => (*left, *right),
+            _ => unreachable!(),
+        };
+        // Swap the sides: the relation becomes the *preserved* side and the
+        // outer scan the optional one, so `?s` is no longer guaranteed on
+        // the right -- and the recorded key now lies.
+        if let PlanOp::LeftJoin {
+            left: l, right: r, ..
+        } = &mut plan.nodes[leftjoin].op
+        {
+            *l = right;
+            *r = left;
+        }
+        crate::sparql_rules::refresh_join_variables(&mut plan);
+        let _ = plan.check_with(&schema); // may or may not agree on the swap itself
+        // The clean version of the same lie: key the join on a variable the
+        // right side binds optionally.
+        let mut plan = refined(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track } }",
+        );
+        let root = plan.nodes.len() - 1;
+        let input = plan.nodes[root].op.inputs()[0];
+        // Wrap the root's input in a join with itself keyed on `?t`, which
+        // the optional side binds and nothing guarantees.
+        let bad = crate::sparql_refine::Node::sql(
+            PlanOp::Join {
+                left: input,
+                right: input,
+                on: vec!["t".to_owned()],
+                reference: None,
+                key: Some(JoinKey::Identity {
+                    var: "t".to_owned(),
+                    class_uri: "https://data.infrabel.be/asset360/Track".to_owned(),
+                }),
+            },
+            Vec::new(),
+        );
+        let mut nodes = plan.nodes.clone();
+        nodes.insert(root, bad);
+        nodes[root + 1].op.map_inputs(|_| root);
+        let remap: Vec<Option<usize>> = (0..plan.nodes.len())
+            .map(|old| Some(if old == root { root + 1 } else { old }))
+            .collect();
+        plan.rebuild(nodes, &remap);
+        assert!(
+            matches!(
+                plan.check_with(&schema),
+                Err(PlanDefect::Scope(ScopeDefect::MisrecordedKey { .. }))
+            ),
+            "{plan}"
+        );
+
+        // An optional-side filter reparented to the outer scope: the
+        // obligation was raised inside the `OPTIONAL`, and a node outside
+        // may not discharge it.
+        // (Written as a sub-select inside the `OPTIONAL`, since spargebra
+        // lifts a body's own `FILTER` into the left join's condition.)
+        let mut plan = refined(
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { { SELECT ?t ?tn WHERE { ?t a asset360:Track ; asset360:hasName ?tn . \
+             FILTER(REGEX(?tn, \"^A\")) } } } }",
+        );
+        let filter = plan.find("filter")[0];
+        let claims = std::mem::take(&mut plan.nodes[filter].discharges);
+        let root = plan.nodes.len() - 1;
+        plan.nodes[root].discharges.extend(claims);
+        assert!(
+            matches!(
+                plan.check(),
+                Err(PlanDefect::Scope(
+                    ScopeDefect::ObligationLeftItsScope { .. }
+                ))
+            ),
+            "{plan}"
+        );
+
+        // A barrier read by two nodes: not one relation any more.
+        let mut plan = refined(
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:documents ?d } GROUP BY ?s } }",
+        );
+        let barrier = plan.barriers()[0];
+        let root = plan.nodes.len() - 1;
+        plan.nodes[root].op.map_inputs(|_| barrier);
+        assert!(
+            matches!(
+                plan.check(),
+                Err(PlanDefect::Scope(ScopeDefect::BarrierConsumers {
+                    consumers: 2,
+                    ..
+                }))
+            ),
+            "{plan}"
+        );
+
+        // A pushed filter naming a slot of the star inside the relation:
+        // resolved from outside its barrier.
+        let mut plan = refined(
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:documents ?d } GROUP BY ?s } }",
+        );
+        let join = plan.find("join")[0];
+        let root = plan.nodes.len() - 1;
+        let bad = crate::sparql_refine::Node::sql(
+            PlanOp::Filter {
+                input: join,
+                condition: crate::sparql_refine::Expr::Compare {
+                    op: crate::sparql_refine::CompareOp::Eq,
+                    left: Box::new(crate::sparql_refine::Expr::Slot {
+                        // The inner scan's star is also `?s`, and its slot
+                        // `documents` is one the outer scan does not read --
+                        // but closure is about the *scan*, so name a star no
+                        // visible scan has.
+                        star_var: "d".to_owned(),
+                        slot_path: vec!["docId".to_owned()],
+                        reading: crate::sparql_refine::SlotReading::Column,
+                        presence: crate::sparql_refine::SlotPresence::Required,
+                    }),
+                    right: Box::new(crate::sparql_refine::Expr::Literal(
+                        spargebra::term::Term::Literal(
+                            spargebra::term::Literal::new_simple_literal("x"),
+                        ),
+                    )),
+                },
+            },
+            Vec::new(),
+        );
+        let mut nodes = plan.nodes.clone();
+        nodes.insert(root, bad);
+        nodes[root + 1].op.map_inputs(|_| root);
+        let remap: Vec<Option<usize>> = (0..plan.nodes.len())
+            .map(|old| Some(if old == root { root + 1 } else { old }))
+            .collect();
+        plan.rebuild(nodes, &remap);
+        assert!(
+            matches!(
+                plan.check(),
+                Err(PlanDefect::Scope(ScopeDefect::SlotOutOfScope { .. }))
+            ),
+            "{plan}"
+        );
+
+        // A rule that retires a key the ledger names with no successor.
+        let mut plan = refined(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             OPTIONAL { { SELECT ?t ?tn WHERE { ?t a asset360:Track ; asset360:hasName ?tn . \
+             FILTER(REGEX(?tn, \"^A\")) } } } }",
+        );
+        let barrier = plan.barriers()[0];
+        let key = plan.key_of(barrier);
+        plan.retire(key, None);
+        // Still live, so it resolves; now drop it from the node list the
+        // way a careless rule would, with no successor recorded.
+        plan.nodes[barrier].key = crate::sparql_refine::NodeKey(plan.next_key + 100);
+        assert!(
+            matches!(
+                plan.check(),
+                Err(PlanDefect::Scope(ScopeDefect::EvidenceLost { .. }))
+            ),
+            "{plan}"
+        );
+    }
+
+    /// **The transition check** (design test 3, round 6): an export pruned
+    /// under `COUNT(DISTINCT *)`, under `DISTINCT *`, and one shared with a
+    /// `MINUS` right side, each applied *through `refine`* by a rule that
+    /// prunes with no match -- so *no demanded export is dropped* is what
+    /// rejects them -- and each asserting that `Plan::check` *passes* on
+    /// the pruned plan, which is why the check is a transition and not a
+    /// state invariant: `demand` recomputed on the pruned plan agrees with
+    /// the pruned interface.
+    #[test]
+    fn a_prune_past_its_match_fails_at_the_rule_and_nowhere_after() {
+        use crate::sparql_refine::{Node, PlanDefect, PlanOp, QueryForm};
+        use crate::sparql_rules::Rule;
+        use spargebra::term::{GroundTerm, Literal, Variable};
+
+        struct PrunesY;
+        impl Rule for PrunesY {
+            fn name(&self) -> &'static str {
+                "prunes_y_without_looking"
+            }
+            fn apply(&self, plan: &mut Plan) -> bool {
+                for barrier in plan.barriers() {
+                    if let PlanOp::SubSelect { vars, .. } = &mut plan.nodes[barrier].op
+                        && vars.iter().any(|var| var == "y")
+                    {
+                        vars.retain(|var| var != "y");
+                        crate::sparql_rules::refresh_join_variables(plan);
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+
+        let values = || {
+            let one = |value: &str| {
+                Some(GroundTerm::Literal(Literal::new_typed_literal(
+                    value,
+                    spargebra::term::NamedNode::new_unchecked(
+                        "http://www.w3.org/2001/XMLSchema#integer",
+                    ),
+                )))
+            };
+            PlanOp::Values {
+                variables: vec![Variable::new_unchecked("x"), Variable::new_unchecked("y")],
+                rows: vec![vec![one("1"), one("10")], vec![one("1"), one("20")]],
+            }
+        };
+        let sub_select = |nodes: &mut Vec<Node>| -> usize {
+            nodes.push(Node::engine(values(), Vec::new()));
+            nodes.push(Node::engine(
+                PlanOp::Project {
+                    input: 0,
+                    vars: vec!["x".to_owned(), "y".to_owned()],
+                },
+                Vec::new(),
+            ));
+            nodes.push(Node::engine(
+                PlanOp::SubSelect {
+                    input: 1,
+                    vars: vec!["x".to_owned(), "y".to_owned()],
+                    domain: Some(1),
+                },
+                Vec::new(),
+            ));
+            2
+        };
+
+        // `SELECT (COUNT(DISTINCT *) AS ?n) WHERE { { SELECT ?x ?y … } }`
+        let mut nodes = Vec::new();
+        let barrier = sub_select(&mut nodes);
+        nodes.push(Node::engine(
+            PlanOp::Group {
+                input: barrier,
+                keys: Vec::new(),
+                measures: vec![crate::sparql_refine::Measure {
+                    var: "n".to_owned(),
+                    aggregate: spargebra::algebra::AggregateExpression::CountSolutions {
+                        distinct: true,
+                    },
+                }],
+                having: Vec::new(),
+            },
+            Vec::new(),
+        ));
+        nodes.push(Node::engine(
+            PlanOp::Project {
+                input: barrier + 1,
+                vars: vec!["n".to_owned()],
+            },
+            Vec::new(),
+        ));
+        let count_distinct = Plan::from_nodes(QueryForm::Select, Vec::new(), nodes);
+
+        // `SELECT DISTINCT * WHERE { { SELECT ?x ?y … } }`
+        let mut nodes = Vec::new();
+        let barrier = sub_select(&mut nodes);
+        nodes.push(Node::engine(
+            PlanOp::Distinct { input: barrier },
+            Vec::new(),
+        ));
+        nodes.push(Node::engine(
+            PlanOp::Project {
+                input: barrier + 1,
+                vars: vec!["x".to_owned(), "y".to_owned()],
+            },
+            Vec::new(),
+        ));
+        let distinct_star = Plan::from_nodes(QueryForm::Select, Vec::new(), nodes);
+
+        // `SELECT ?x WHERE { { SELECT ?x ?y … } MINUS { ?z :p ?y } }`
+        let mut nodes = Vec::new();
+        let barrier = sub_select(&mut nodes);
+        let triple = spargebra::term::TriplePattern {
+            subject: spargebra::term::TermPattern::Variable(Variable::new_unchecked("z")),
+            predicate: spargebra::term::NamedNodePattern::NamedNode(
+                spargebra::term::NamedNode::new_unchecked("https://data.infrabel.be/asset360/p"),
+            ),
+            object: spargebra::term::TermPattern::Variable(Variable::new_unchecked("y")),
+        };
+        nodes.push(Node::engine(
+            PlanOp::Match {
+                pattern: Box::new(triple),
+            },
+            Vec::new(),
+        ));
+        nodes.push(Node::engine(
+            PlanOp::Minus {
+                left: barrier,
+                right: barrier + 1,
+            },
+            Vec::new(),
+        ));
+        nodes.push(Node::engine(
+            PlanOp::Project {
+                input: barrier + 2,
+                vars: vec!["x".to_owned()],
+            },
+            Vec::new(),
+        ));
+        let minus = Plan::from_nodes(QueryForm::Select, Vec::new(), nodes);
+
+        for (name, plan) in [
+            ("COUNT(DISTINCT *)", count_distinct),
+            ("DISTINCT *", distinct_star),
+            ("MINUS on ?y", minus),
+        ] {
+            plan.check()
+                .unwrap_or_else(|defect| panic!("{name}: {defect}\n{plan}"));
+            // The legitimate rule does not touch `?y`: it is demanded.
+            let mut untouched = plan.clone();
+            assert!(
+                !super::PruneUnusedExports.apply(&mut untouched),
+                "{name}\n{untouched}"
+            );
+            // The bad rule prunes it anyway, and the driver refuses the edit
+            // -- while the pruned plan passes every state check, which is
+            // the point.
+            let mut pruned = plan.clone();
+            let failure = refine(&mut pruned, &[&PrunesY]).expect_err(name);
+            assert!(
+                matches!(
+                    failure.defect,
+                    PlanDefect::Transition {
+                        rule: "prunes_y_without_looking",
+                        ..
+                    }
+                ),
+                "{name}: {failure}"
+            );
+            assert!(failure.to_string().contains("?y"), "{name}: {failure}");
+            pruned.check().unwrap_or_else(|defect| {
+                panic!("{name}: a state check saw it: {defect}\n{pruned}")
+            });
+        }
+    }
 }
