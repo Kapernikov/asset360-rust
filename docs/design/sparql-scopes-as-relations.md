@@ -1,13 +1,74 @@
 # A body is a relation: lowering a grouped sub-select and an `OPTIONAL` body as one derived table
 
-Status: **implemented on this branch** (revision 8; the human chose not
+Status: **implemented on this branch** (revision 9; the human chose not
 to stage). Items 1–4 of *Staging* are one body of work, in commits
 titled by item; item 0 (the oxigraph backport) is consolidator issue
 #467 and not here. Where building it showed this document wrong or
 silent, the section below says what changed and the text is amended in
 place; nothing diverges silently. The consolidator side (contract
 check, the new operator renderings, the `SELECT DISTINCT e.value`
-structure-dedup fix, pin bump) is a second MR after a release.
+structure-dedup fix, pin bump) is a second MR after a release — built
+against this branch unreleased, which is what revision 9 records.
+
+<details><summary>What the consolidator renderer changed (revision 9), two points</summary>
+
+Building the renderer against this branch found two places where the
+plan said less than the renderer needs, both fixed here and both
+amended below in place.
+
+* **A projection-less relation body gets the answering projection's
+  column list.** Op 1 leaves *no* `Project` under the barrier it
+  wraps (`enclose`; the absorb rules and the transparent-barrier
+  elision match the bare shape), so the lowering of an enclosed
+  `OPTIONAL` body had no projection to anchor `projected_columns` on
+  and emitted a bare row set — scan, unnest, join — whose `Unnest` no
+  binding discharged. The renderer derives its laterals from the
+  bindings and cross-checks them against the unnests (it has to: a
+  lateral is spliced where a binding is projected), so it declined the
+  whole statement. `scope_columns` now builds the list from an anchor
+  node, a variable list and a scope, and the `SubSelect` arm gives a
+  body with neither a grouping nor a projection the projection a
+  sub-select would have carried — the exports, then every fan-out, then
+  every identity — anchored at the body root, in the body's own scope.
+  The worked case's `n9` was the design's word for this; it is the
+  lowering's, not the builder's.
+* **A relation's measure column carries the term it is.** Every measure
+  export was described as an integer literal (`measure_descriptor()`),
+  so the outer statement serialised `AVG(?seq)` as
+  `"1.5"^^xsd:integer` beside the engine's `xsd:decimal`. `TermOf::
+  Measure` now carries a descriptor derived from the aggregate and its
+  argument's term — `COUNT` an integer; `SUM` the argument's datatype;
+  `AVG` the division's (`xsd:decimal`, or the argument's IEEE type);
+  `MIN`/`MAX` the argument's descriptor as it stands, an IRI for an
+  IRI-valued slot — and `ColumnKind::Measure { descriptor }` carries it
+  to the relation column. The renderer serialises the column from that
+  descriptor and nothing else.
+
+What the renderer built, for the record (consolidator-server, the
+`sparql` package): `plan_ops.PLAN_CONTRACT = 5` checked at the plan;
+`row_source_from_ops` (stars, joins with `key` / `left_column` /
+`right_column` / `right_reading`, relations) beside the fetch's
+`stars_and_joins_from_ops`, which reads a relation *flat* — the body's
+stars fetched whole under `<var>__<alias>`, the keyed join dropped, the
+fetch bound voided — because an engine re-runs the query over the
+fetch; `_from_join_where` with a relation as a FROM item (`( <body> )
+AS q0`, the body rendered by the same renderer recursively), the three
+keys, and laterals spliced after the item that introduces their star so
+an element key and a `bound_element` edge can read them; one lateral
+per collection hop shared by every binding that walks it; the occurrence
+identifier as a JSON pointer over the holder's identity (every hop
+written, single-valued ones too); `by_occurrence` as `WITH ORDINALITY`
+and no `DISTINCT`; a required value read *off* an element as an `IS NOT
+NULL` (the element's existence never covered it — a section without the
+slot was an extra unbound solution, on the plain statement route too);
+and records deduplicated **by identifier** across every fetch of a
+plan, merging projections — a record boxed twice put two sets of blank
+nodes in the store, and the engine leg counted every section twice.
+Every table row is an oracle case against the engine over the same
+rows, and the `Rejected` rows are endpoint tests naming `?s (in
+sub-select 1)`.
+
+</details>
 
 <details><summary>What building it changed (revision 8), point by point</summary>
 
@@ -1078,12 +1139,16 @@ Op::Relation {
 }
 /// `guaranteed` is `guaranteed(body root)` for this export, carried so a
 /// consumer above the barrier reads a fact rather than re-deriving one it
-/// cannot see into.
+/// cannot see into. `descriptor` is the term the column *is*: an identity's
+/// IRI, a slot's own, and — revision 9 — a measure's from its aggregate
+/// (`COUNT` an integer, `SUM` the argument's datatype, `AVG` the
+/// division's, `MIN`/`MAX` the argument's descriptor); `None` for a
+/// structure.
 pub struct RelationColumn { pub var: String, pub kind: ColumnKind, pub descriptor: Option<TermDescriptor>, pub guaranteed: bool }
 pub enum ColumnKind {
     Identity { class_uri: String },
     Slot(BindingSpec),
-    Measure,
+    Measure { descriptor: TermDescriptor },
     /// An inlined element, identified by its occurrence — see "What may
     /// cross a relation". Representable, never serialisable (`descriptor`
     /// is `None`).
@@ -1360,6 +1425,14 @@ evaluation unit, an `Unnest` of `p`'s collection prefix (a sibling of
 with no such unnest is `AnyElement` or ill-formed.
 
 ### Op 1 — `EncloseOptionalBody` *(new rule; an identity projection)*
+
+> **As built (revision 9).** The builder's `enclose` wraps the body in a
+> `SubSelect` and leaves *no* `Project` under it; the identity projection
+> the worked cases write as `n9` is supplied by the *lowering*, which gives
+> a body with neither a grouping nor a projection the answering
+> projection's column list (`scope_columns`: exports, fan-outs,
+> identities). A body's `unnest` is thereby a binding the renderer can
+> discharge, which the bare row set was not.
 
 **Match.** A `LeftJoin { right }` whose `right` is not already a `SubSelect`.
 
