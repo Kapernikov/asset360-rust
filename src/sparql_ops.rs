@@ -484,8 +484,11 @@ pub enum ColumnKind {
     Identity { class_uri: String },
     /// A slot value, read by the body's binding.
     Slot(BindingSpec),
-    /// An aggregate's result, under its own name in the body's grouping.
-    Measure,
+    /// An aggregate's result, under its own name in the body's grouping,
+    /// with the term it is (see [`crate::sparql_scopes::TermOf::Measure`]).
+    Measure {
+        descriptor: crate::sparql_terms::TermDescriptor,
+    },
     /// An inlined element, identified by its occurrence: the holder's
     /// identity concatenated with one hop per collection step, composed in
     /// the body from each lateral's ordinal -- one text column, so it
@@ -505,7 +508,7 @@ impl ColumnKind {
         match self {
             Self::Identity { .. } => "identity",
             Self::Slot(_) => "slot",
-            Self::Measure => "measure",
+            Self::Measure { .. } => "measure",
             Self::Structure { .. } => "structure",
         }
     }
@@ -1436,7 +1439,9 @@ impl Lowering<'_> {
                 var,
                 path.clone(),
             )?),
-            TermOf::Measure { .. } => ColumnKind::Measure,
+            TermOf::Measure { descriptor, .. } => ColumnKind::Measure {
+                descriptor: descriptor.clone(),
+            },
             TermOf::Structure {
                 holder_star,
                 holder_class_uri,
@@ -2309,7 +2314,7 @@ impl Lowering<'_> {
                                 Some(crate::sparql_terms::TermDescriptor::subject_iri())
                             }
                             ColumnKind::Slot(binding) => Some(binding.descriptor.clone()),
-                            ColumnKind::Measure => Some(measure_descriptor()),
+                            ColumnKind::Measure { descriptor } => Some(descriptor.clone()),
                             ColumnKind::Structure { .. } => None,
                         };
                         columns.push(RelationColumn {
@@ -3063,16 +3068,6 @@ fn push_filter(
 /// `Measure` does not know -- so a measure crossing a relation is described
 /// as a number, and only the count-like aggregates are pushed into a body
 /// today (`PushGrouping`'s vocabulary, unchanged).
-fn measure_descriptor() -> crate::sparql_terms::TermDescriptor {
-    crate::sparql_terms::TermDescriptor {
-        kind: crate::sparql_terms::TermKind::Literal,
-        datatype: Some("http://www.w3.org/2001/XMLSchema#integer".to_owned()),
-        lang: None,
-        enum_map: Vec::new(),
-        numeric: true,
-    }
-}
-
 /// The name of a class's identifier slot, when it has one.
 pub(crate) fn identifier_slot_of(
     schema: &linkml_schemaview::schemaview::SchemaView,

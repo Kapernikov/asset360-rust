@@ -925,6 +925,48 @@ mod tests {
             Outcome::Fetch(_)
         ));
 
+        // A measure exported by a relation carries the term it is, from
+        // what it aggregates: `COUNT` an integer whatever it counts; `SUM`
+        // the argument's datatype; `AVG` the division's (`xsd:decimal` for
+        // an integer argument); `MIN`/`MAX` the argument's own descriptor, a
+        // plain string for `?nm`. The outer statement serialises the column
+        // from this descriptor and nothing else, so an `AVG` described as an
+        // integer answered `"1.5"^^xsd:integer` beside the engine's decimal.
+        let measured = refined(
+            "SELECT ?s ?n ?total ?mean ?top WHERE { ?s a asset360:Signal . \
+             { SELECT ?s (COUNT(?d) AS ?n) (SUM(?len) AS ?total) (AVG(?len) AS ?mean) \
+             (MAX(?nm) AS ?top) WHERE { ?s a asset360:Signal ; asset360:documents ?d ; \
+             asset360:length ?len ; asset360:name ?nm } GROUP BY ?s } }",
+        );
+        let lowered = crate::sparql_ops::lower_refined(&measured, &schema, None, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{measured}"));
+        let columns = lowered
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Op::Relation { columns, .. } => Some(columns),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{lowered:?}"));
+        let datatype = |var: &str| {
+            let column = columns
+                .iter()
+                .find(|column| column.var == var)
+                .unwrap_or_else(|| panic!("?{var} is exported: {columns:?}"));
+            assert!(
+                matches!(column.kind, ColumnKind::Measure { .. }),
+                "{column:?}"
+            );
+            let descriptor = column.descriptor.as_ref().expect("a measure has a term");
+            (descriptor.kind, descriptor.datatype.clone())
+        };
+        use crate::sparql_terms::TermKind;
+        let xsd = |name: &str| Some(format!("http://www.w3.org/2001/XMLSchema#{name}"));
+        assert_eq!(datatype("n"), (TermKind::Literal, xsd("integer")));
+        assert_eq!(datatype("total"), (TermKind::Literal, xsd("integer")));
+        assert_eq!(datatype("mean"), (TermKind::Literal, xsd("decimal")));
+        assert_eq!(datatype("top"), (TermKind::Literal, None));
+
         // The nested occurrence: two fan-outs, each by occurrence.
         let nested = refined(
             "SELECT (COUNT(?c) AS ?n) WHERE { ?h a asset360:Assembly ; asset360:parts ?p . \

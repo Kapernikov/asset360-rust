@@ -143,7 +143,17 @@ pub enum TermOf {
         presence: SlotPresence,
     },
     /// An aggregate's result.
-    Measure { guaranteed: bool },
+    Measure {
+        guaranteed: bool,
+        /// How the aggregate's value becomes a term: an integer for `COUNT`;
+        /// the argument's own descriptor for `SUM`, `MIN` and `MAX` (a
+        /// `MIN` over an IRI-valued slot is an IRI); the division's for
+        /// `AVG` -- `xsd:decimal`, or the argument's IEEE type. Derived here
+        /// so a relation exports the measure under the term it is, rather
+        /// than the integer every measure used to be given: the outer
+        /// statement serialises the column from this and nothing else.
+        descriptor: crate::sparql_terms::TermDescriptor,
+    },
     /// An inlined element, identified by its occurrence: the holder's
     /// identity and one hop per collection step on `path`.
     Structure {
@@ -500,13 +510,16 @@ impl Plan {
                         None => TermOf::Computed,
                     }
                 }
-                PlanOp::Group { measures, .. } => {
+                PlanOp::Group {
+                    input, measures, ..
+                } => {
                     let measure = measures
                         .iter()
                         .find(|measure| measure.var == var)
                         .expect("binds_here said so");
                     TermOf::Measure {
                         guaranteed: aggregate_guarantees_a_value(&measure.aggregate),
+                        descriptor: self.measure_descriptor(schema, *input, &measure.aggregate),
                     }
                 }
                 PlanOp::Bind {
@@ -876,6 +889,78 @@ impl std::fmt::Display for TransitionDefect {
 }
 
 /// Whether an aggregate is bound in every group: `COUNT` is `0` over nothing.
+impl Plan {
+    /// The term an aggregate's value is, from what it aggregates: see
+    /// [`TermOf::Measure`]. `COUNT` is an integer whatever it counts; an
+    /// aggregate whose argument is not one variable with one term (an
+    /// expression, a disputed producer) falls back to the integer literal,
+    /// which is what every measure was described as before this existed.
+    fn measure_descriptor(
+        &self,
+        schema: &SchemaView,
+        input: NodeId,
+        aggregate: &AggregateExpression,
+    ) -> crate::sparql_terms::TermDescriptor {
+        use crate::sparql_terms::{TermDescriptor, TermKind};
+        let integer = || TermDescriptor {
+            kind: TermKind::Literal,
+            datatype: Some("http://www.w3.org/2001/XMLSchema#integer".to_owned()),
+            lang: None,
+            enum_map: Vec::new(),
+            numeric: true,
+        };
+        let AggregateExpression::FunctionCall { name, expr, .. } = aggregate else {
+            return integer();
+        };
+        if matches!(name, AggregateFunction::Count) {
+            return integer();
+        }
+        let spargebra::algebra::Expression::Variable(variable) = expr else {
+            return integer();
+        };
+        let argument = match resolve_terms(self.term_of(schema, input, variable.as_str())) {
+            Some(TermOf::Identity { .. }) => TermDescriptor::subject_iri(),
+            Some(TermOf::Slot {
+                class_uri, path, ..
+            }) => match crate::sparql_terms::resolve_column(schema, &class_uri, &path) {
+                Some((descriptor, _)) => descriptor,
+                None => return integer(),
+            },
+            Some(TermOf::Measure { descriptor, .. }) => descriptor,
+            _ => return integer(),
+        };
+        match name {
+            AggregateFunction::Min | AggregateFunction::Max => argument,
+            AggregateFunction::Sum => TermDescriptor {
+                kind: TermKind::Literal,
+                datatype: argument.datatype.clone().or_else(|| integer().datatype),
+                lang: None,
+                enum_map: Vec::new(),
+                numeric: true,
+            },
+            AggregateFunction::Avg => {
+                let ieee = matches!(
+                    argument.datatype.as_deref(),
+                    Some("http://www.w3.org/2001/XMLSchema#float")
+                        | Some("http://www.w3.org/2001/XMLSchema#double")
+                );
+                TermDescriptor {
+                    kind: TermKind::Literal,
+                    datatype: if ieee {
+                        argument.datatype.clone()
+                    } else {
+                        Some("http://www.w3.org/2001/XMLSchema#decimal".to_owned())
+                    },
+                    lang: None,
+                    enum_map: Vec::new(),
+                    numeric: true,
+                }
+            }
+            _ => integer(),
+        }
+    }
+}
+
 pub fn aggregate_guarantees_a_value(aggregate: &AggregateExpression) -> bool {
     match aggregate {
         AggregateExpression::CountSolutions { .. } => true,
