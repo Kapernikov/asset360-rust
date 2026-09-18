@@ -1068,12 +1068,14 @@ pub fn plan_query_refined_with_schema_graph(
     schema_graph_iri: Option<&str>,
 ) -> Result<ExecutionPlan, ScopeError> {
     let mut parsed = crate::sparql_scoper::parse_query(query_str)?;
-    // Before anything reads a predicate: one slot has two legitimate IRIs when
-    // it declares a `slot_uri`, and both routes have to be looking at the same
-    // one. Resolved here, on the plan, rather than by rewriting the query text
-    // the client sent. See [`crate::sparql_alias`].
-    crate::sparql_alias::canonicalize_predicates(&mut parsed, schema_view)
-        .map_err(|e| ScopeError::UnsupportedConstruct(e.to_string()))?;
+    // Before anything reads a predicate or a type: one slot has two
+    // legitimate IRIs when it declares a `slot_uri`, one class when it declares
+    // a `class_uri`, and both routes have to be looking at the same one.
+    // Resolved here, on the plan, rather than by rewriting the query text the
+    // client sent -- and a predicate the subject's class cannot carry is
+    // refused here, before the scoper could resolve it by local name onto a
+    // slot it does not name. See [`crate::sparql_alias`].
+    crate::sparql_alias::canonicalize(&mut parsed, schema_view)?;
     let parsed = parsed;
     let obligations = obligations_of(&parsed)?;
     let scoped = crate::sparql_scoper::scope_parsed_with_schema_graph(

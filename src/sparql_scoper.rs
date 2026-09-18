@@ -1208,7 +1208,12 @@ pub fn sparql_scope_with_schema_graph(
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> Result<QueryPlan, ScopeError> {
-    let query = parse_query(query_str)?;
+    let mut query = parse_query(query_str)?;
+    // The same spelling pass every other entry point runs, so a caller that
+    // only scopes -- the config linter, through the `sparql_scope` binding --
+    // accepts and refuses exactly what the planner and the engine leg do. See
+    // [`crate::sparql_alias`].
+    crate::sparql_alias::canonicalize(&mut query, schema_view)?;
     scope_parsed_with_schema_graph(&query, schema_view, schema_graph_iri)
 }
 
@@ -5272,7 +5277,7 @@ classes:
             (
                 "in UNION branch 2 of 2: ?t is the object of `locatedOnTrack` on ?s",
                 "SELECT ?n WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
-                 { ?t a asset360:Track ; asset360:name ?n } UNION { ?t asset360:name ?n } }",
+                 { ?t a asset360:Track ; asset360:hasName ?n } UNION { ?t asset360:hasName ?n } }",
             ),
             // The object of a reference, untyped: the schema knows the class.
             (
@@ -5925,10 +5930,9 @@ classes:
                 "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(REGEX(?nm, \"^BX\")) } LIMIT 10",
             ),
-            (
-                "unknown predicate",
-                "SELECT ?s WHERE { ?s a asset360:Signal . ?s <urn:unknown> \"x\" } LIMIT 10",
-            ),
+            // An unknown predicate on a typed subject used to be a fourth
+            // case here; it is refused at the parse now (see
+            // `crate::sparql_alias`), so there is no plan to bound.
             (
                 "variable predicate",
                 "SELECT ?s WHERE { ?s a asset360:Signal . ?s ?p \"x\" } LIMIT 10",
@@ -6019,9 +6023,13 @@ classes:
         let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
         for (expected, query) in [
+            // On a subject with one known type this is refused at the parse
+            // (see `crate::sparql_alias`); the drop site is still reachable
+            // through a subject the refusal leaves to the scoper, such as one
+            // typed twice.
             (
                 Inexact::UnknownPredicate,
-                "SELECT ?s WHERE { ?s a asset360:Signal . ?s <urn:unknown> \"x\" }",
+                "SELECT ?s WHERE { ?s a asset360:Signal ; a asset360:Track . ?s <urn:unknown> \"x\" }",
             ),
             (
                 Inexact::VariablePredicate,
@@ -6381,19 +6389,20 @@ classes:
             "an inlined slot is not a foreign key"
         );
 
-        // A wrong type on the nested variable is the same shape, not a
-        // different one — it used to emit the same bogus edge.
-        let plan = sparql_scope(
+        // A wrong type on the nested variable used to be the same shape, and
+        // emitted the same bogus edge; it is refused at the parse now, because
+        // `Track` carries no `longitude` (see `crate::sparql_alias`).
+        let err = sparql_scope(
             &format!(
                 "{prefix}SELECT ?lo WHERE {{ ?s a asset360:Signal ; asset360:location ?c . \
                  ?c a asset360:Track ; asset360:longitude ?lo }}"
             ),
             &sv,
         )
-        .unwrap();
+        .unwrap_err();
         assert!(
-            plan.inexact.is_some(),
-            "a wrong nested type is still a loss"
+            matches!(&err, ScopeError::UnsupportedConstruct(msg) if msg.contains("not a slot of Track")),
+            "a wrong nested type is refused by name: {err:?}"
         );
 
         // Untyped: the path, exact.
@@ -7412,14 +7421,14 @@ classes:
         let plan = sparql_scope(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { ?s a asset360:Signal . \
-             { ?s asset360:name ?n } UNION { ?s asset360:trackCode ?t } }",
+             { ?s asset360:name ?n } UNION { ?s asset360:length ?t } }",
             &sv,
         )
         .expect("a UNION is scopable");
         for star in plan.root.all_stars() {
             assert!(
                 !(star.required_fields.contains(&"name".to_owned())
-                    && star.required_fields.contains(&"trackCode".to_owned())),
+                    && star.required_fields.contains(&"length".to_owned())),
                 "one branch's read is not the other's: {star:?}"
             );
         }
