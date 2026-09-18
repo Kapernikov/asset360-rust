@@ -122,6 +122,16 @@ pub enum Obligation {
     /// apply it as a `WHERE` and answer a narrower question than the query
     /// asked.
     Values { variables: Vec<String>, rows: usize },
+    /// A *derived* obligation: a boundary restriction op 3a raised on a join
+    /// side -- `?v` is the identity of a record of `class_iri` -- with the
+    /// join occurrence and side that justified it, and the path op 3b took
+    /// it down (a log; the invariant recomputes the chain from the plan).
+    ///
+    /// The one kind a rule appends to the ledger, which is append-only: it
+    /// is never removed, only discharged, so "already carries a restriction"
+    /// is a question about its canonical key `(join, side, ?v, class)`
+    /// wherever 3b has since moved the filter.
+    Boundary(Box<crate::sparql_restrict::Restriction>),
 }
 
 impl fmt::Display for Obligation {
@@ -158,6 +168,7 @@ impl fmt::Display for Obligation {
                 "values    VALUES {} × {rows} row(s)",
                 variables.join(" ")
             ),
+            Self::Boundary(restriction) => write!(f, "boundary  {restriction}"),
         }
     }
 }
@@ -3745,18 +3756,11 @@ mod tests {
              { SELECT ?x (COUNT(*) AS ?n) WHERE { ?s asset360:name ?x } GROUP BY ?x } }",
             "?s (in sub-select 1)",
         );
-        // The untyped outer read beside a typed sub-query: `Rejected` naming
-        // the outer domain's `?s` until op 3a types it from the relation
-        // column (item 2 of the staging, in this same branch).
+        // The untyped outer read beside a typed sub-query: op 3a types it
+        // from the relation column, and `resolve` reads the class back.
         let untyped_outer = "SELECT ?nm WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } \
              ORDER BY ?s LIMIT 3 } ?s asset360:name ?nm }";
-        match outcome(untyped_outer) {
-            Outcome::Statement => {}
-            Outcome::Rejected(message) => {
-                assert!(message.contains("?s has no rdf:type"), "{message}");
-            }
-            other => panic!("{untyped_outer}: {other:?}"),
-        }
+        assert_eq!(outcome(untyped_outer), Outcome::Statement);
         // The correspondence invariant: the scoper's naming domains and the
         // plan's sub-select barriers are in bijection.
         for query in [

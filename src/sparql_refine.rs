@@ -355,6 +355,15 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// A boundary restriction (op 3a): `?var` is the identity of a record
+    /// of `class_uri`. Not an expression a query can contain -- it is what
+    /// a rule places at a scope root with the semi-join proof and what op
+    /// 3b carries down to the scan, where the fold reads it as the star's
+    /// type. Written back for the oracle as `EXISTS { ?var a <class> }`.
+    InClass {
+        var: String,
+        class_uri: String,
+    },
     /// An expression carrying a graph pattern -- `EXISTS`, `NOT EXISTS` --
     /// kept as the text the query wrote.
     ///
@@ -947,9 +956,12 @@ impl Expr {
             // no rule that renders it as one. `Not` has its own arm above --
             // it is not always a decline, since `!=` is one -- so it does not
             // belong in this group.
-            Self::Or(_) | Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::Opaque(_) => {
-                None
-            }
+            Self::Or(_)
+            | Self::Var(_)
+            | Self::Literal(_)
+            | Self::Slot { .. }
+            | Self::InClass { .. }
+            | Self::Opaque(_) => None,
         }
     }
 
@@ -1043,6 +1055,7 @@ impl Expr {
             | Self::Var(_)
             | Self::Literal(_)
             | Self::Slot { .. }
+            | Self::InClass { .. }
             | Self::Function { .. }
             | Self::Opaque(_) => false,
         }
@@ -1075,7 +1088,7 @@ impl Expr {
                 value.contains_an_opaque_subquery()
                     || candidates.iter().any(Self::contains_an_opaque_subquery)
             }
-            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } => false,
+            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::InClass { .. } => false,
         }
     }
 
@@ -1157,7 +1170,7 @@ impl Expr {
                         .iter()
                         .all(Self::evaluates_the_same_out_of_context)
             }
-            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } => true,
+            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::InClass { .. } => true,
         }
     }
 
@@ -1250,6 +1263,11 @@ pub fn variables_used(expr: &Expr) -> Vec<String> {
                 }
             }
             Expr::Not(inner) => walk(inner, out),
+            Expr::InClass { var, .. } => {
+                if !out.contains(var) {
+                    out.push(var.clone());
+                }
+            }
             Expr::Literal(_) | Expr::Slot { .. } | Expr::Opaque(_) => {}
         }
     }
@@ -1390,6 +1408,19 @@ impl Expr {
                     .collect::<Option<Vec<_>>>()?;
                 function_expression(name, arguments)?
             }
+            // `?v` is the identity of a record of the class: exactly the
+            // records with that type.
+            Self::InClass { var, class_uri } => Expression::Exists(Box::new(GraphPattern::Bgp {
+                patterns: vec![TriplePattern {
+                    subject: TermPattern::Variable(Variable::new_unchecked(var.clone())),
+                    predicate: NamedNodePattern::NamedNode(
+                        spargebra::term::NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?,
+                    ),
+                    object: TermPattern::NamedNode(
+                        spargebra::term::NamedNode::new(class_uri.clone()).ok()?,
+                    ),
+                }],
+            })),
             Self::Slot { .. } => return None,
             Self::Opaque(_) => return None,
         })
@@ -1670,6 +1701,7 @@ impl fmt::Display for Expr {
             Self::Or(parts) => write!(f, "({})", join_exprs(parts, " || ")),
             Self::Not(inner) => write!(f, "!{inner}"),
             Self::Function { name, args } => write!(f, "{name}({})", join_exprs(args, ", ")),
+            Self::InClass { var, class_uri } => write!(f, "?{var} ∈ {}", shorten(class_uri)),
             Self::Opaque(text) => f.write_str(text),
         }
     }
@@ -2514,6 +2546,9 @@ pub enum PlanDefect {
     /// One of the invariants a scope makes local. See
     /// [`crate::sparql_scopes::ScopeDefect`].
     Scope(crate::sparql_scopes::ScopeDefect),
+    /// A boundary restriction whose chain of 3b arms does not hold. See
+    /// [`Plan::restriction_chains_hold`].
+    Chain(crate::sparql_restrict::ChainDefect),
 }
 
 impl fmt::Display for PlanDefect {
@@ -2559,6 +2594,7 @@ impl fmt::Display for PlanDefect {
             ),
             Self::Transition { rule, defect } => write!(f, "{rule}: {defect}"),
             Self::Scope(defect) => write!(f, "{defect}"),
+            Self::Chain(defect) => write!(f, "{defect}"),
         }
     }
 }
@@ -2711,7 +2747,8 @@ impl Plan {
             .map_err(PlanDefect::Scope)?;
         self.obligations_stay_in_scope()
             .map_err(PlanDefect::Scope)?;
-        self.evidence_resolves().map_err(PlanDefect::Scope)
+        self.evidence_resolves().map_err(PlanDefect::Scope)?;
+        self.restriction_chains_hold().map_err(PlanDefect::Chain)
     }
 
     /// [`Plan::check`], plus the invariants that need the schema.
@@ -4288,10 +4325,19 @@ pub fn inner_join_groups(plan: &Plan) -> Vec<usize> {
     };
     for (id, node) in plan.nodes.iter().enumerate() {
         // Everything but a plain join is a boundary on purpose: only a join
-        // makes two node sets one mandatory row set.
-        if let PlanOp::Join { left, right, .. } = &node.op {
-            unite(&mut group, id, *left);
-            unite(&mut group, id, *right);
+        // makes two node sets one mandatory row set -- and a boundary
+        // restriction (op 3a), which is a row test on the same row set and
+        // the type the fold reads when it reaches the matches.
+        match &node.op {
+            PlanOp::Join { left, right, .. } => {
+                unite(&mut group, id, *left);
+                unite(&mut group, id, *right);
+            }
+            PlanOp::Filter {
+                input,
+                condition: Expr::InClass { .. },
+            } => unite(&mut group, id, *input),
+            _ => {}
         }
     }
     (0..plan.nodes.len())
@@ -4419,6 +4465,8 @@ mod tests {
                 Obligation::Slice { .. } => "slice",
                 Obligation::Distinct => "distinct",
                 Obligation::Values { .. } => "values",
+                // Never in a naive plan: raised by a rule.
+                Obligation::Boundary(_) => "filter",
             };
             assert_eq!(claimant.op.kind(), expected, "o{id} ({obligation})\n{plan}");
         }

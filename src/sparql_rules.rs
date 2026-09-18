@@ -354,25 +354,40 @@ impl Rule for FoldMatchesIntoScan<'_> {
             if node.executor != Executor::Engine {
                 continue;
             }
-            let PlanOp::Match { pattern } = &node.op else {
-                continue;
-            };
-            // A constant subject is a star of one record: the query named the
-            // identity, so the scan carries it as an identifier value and the
-            // statement reads one row against the indexed column. Without
-            // this the plan scanned the whole class and left the narrowing to
-            // the engine -- correct, and the wrong statement.
-            let identifier_values: Vec<String> = subject_iri(pattern)
-                .map(|iri| vec![iri.to_owned()])
-                .into_iter()
-                .flatten()
-                .collect();
-            let (Some(star), Some(class_uri)) =
-                (subject_star(&keys, pattern), type_class_iri(pattern))
-            else {
-                continue;
+            // Two sources of a star's type: its `rdf:type` match, or a
+            // boundary restriction op 3b carried down to it -- the same
+            // fact, derived by 3a from the other side of a join. A
+            // restriction is read exactly where a type match is, so an
+            // untyped body gets its scan by the same edit as a typed one.
+            let (identifier_values, star, class_uri): (Vec<String>, String, String) = match &node.op
+            {
+                PlanOp::Match { pattern } => {
+                    // A constant subject is a star of one record: the
+                    // query named the identity, so the scan carries it as
+                    // an identifier value and the statement reads one row
+                    // against the indexed column. Without this the plan
+                    // scanned the whole class and left the narrowing to
+                    // the engine -- correct, and the wrong statement.
+                    let identifier_values: Vec<String> = subject_iri(pattern)
+                        .map(|iri| vec![iri.to_owned()])
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    let (Some(star), Some(class_uri)) =
+                        (subject_star(&keys, pattern), type_class_iri(pattern))
+                    else {
+                        continue;
+                    };
+                    (identifier_values, star, class_uri.to_owned())
+                }
+                PlanOp::Filter {
+                    condition: crate::sparql_refine::Expr::InClass { var, class_uri },
+                    ..
+                } => (Vec::new(), var.clone(), class_uri.clone()),
+                _ => continue,
             };
             let star = star.as_str();
+            let class_uri = class_uri.as_str();
             // An intersection of classes is not a scan of one class:
             // `?s a :Signal ; a :Track` matches nothing unless one subclasses
             // the other, and a statement holding one of them counts every
@@ -405,20 +420,30 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // (design, *What a relational subtree derives*). Two types on one
             // variable *in one scope* still decline.
             let scopes = plan.scopes();
-            let classes_on_star = plan
+            // Counted as *classes*, not as nodes: a restriction beside a
+            // type match of the same class is one class said twice.
+            let classes_on_star: BTreeSet<String> = plan
                 .nodes
                 .iter()
                 .enumerate()
-                .filter(|(other_id, other)| match &other.op {
-                    PlanOp::Match { pattern } => {
-                        type_class_iri(pattern).is_some()
-                            && subject_star(&keys, pattern).as_deref() == Some(star)
-                            && scopes[*other_id] == scopes[type_node]
-                            && !in_other_union_arm(plan, type_node, *other_id)
-                    }
-                    _ => false,
+                .filter(|(other_id, _)| {
+                    scopes[*other_id] == scopes[type_node]
+                        && !in_other_union_arm(plan, type_node, *other_id)
                 })
-                .count();
+                .filter_map(|(_, other)| match &other.op {
+                    PlanOp::Match { pattern }
+                        if subject_star(&keys, pattern).as_deref() == Some(star) =>
+                    {
+                        type_class_iri(pattern).map(str::to_owned)
+                    }
+                    PlanOp::Filter {
+                        condition: crate::sparql_refine::Expr::InClass { var, class_uri },
+                        ..
+                    } if var == star => Some(class_uri.clone()),
+                    _ => None,
+                })
+                .collect();
+            let classes_on_star = classes_on_star.len();
             if classes_on_star != 1 {
                 continue;
             }
@@ -437,6 +462,15 @@ impl Rule for FoldMatchesIntoScan<'_> {
             let class_uri = class_uri.to_owned();
             let slots =
                 self.foldable_slots(plan, &keys, &star, &class_uri, &groups, groups[type_node]);
+            // A restriction with nothing of the star's to fold beneath it --
+            // no variable-object match on the star in its group -- is not a
+            // scan yet: it stays where 3b left it. (A star read only through
+            // constant objects under a restriction is the one shape this
+            // leaves to the engine; the fold replaces leaves, and a scan
+            // with no read has no leaf to replace.)
+            if slots.is_empty() && matches!(plan.nodes[type_node].op, PlanOp::Filter { .. }) {
+                continue;
+            }
             fold(plan, type_node, &star, &class_uri, identifier_values, slots);
             return true;
         }
@@ -483,12 +517,23 @@ fn fold(
     slots: Vec<(NodeId, ScanSlot)>,
 ) {
     let mut folded: Vec<NodeId> = slots.iter().map(|(id, _)| *id).collect();
-    folded.push(type_node);
+    // A restriction filter as the type source is not a leaf: it sits above
+    // the matches (and whatever joins them), and its consumers must read
+    // its input once it is gone, not the scan. Its claim moves to the scan
+    // like a type match's; its position does not.
+    let restriction = match &plan.nodes[type_node].op {
+        PlanOp::Filter { input, .. } => Some((type_node, *input)),
+        _ => None,
+    };
+    if restriction.is_none() {
+        folded.push(type_node);
+    }
     folded.sort_unstable();
-    let first = folded[0];
+    let first = folded.first().copied().unwrap_or(type_node);
 
     let mut claims: Vec<ObligationId> = folded
         .iter()
+        .chain(restriction.iter().map(|(filter, _)| filter))
         .flat_map(|id| plan.nodes[*id].discharges.clone())
         .collect();
     claims.sort_unstable();
@@ -521,6 +566,12 @@ fn fold(
             continue;
         }
         if folded.contains(&old) {
+            continue;
+        }
+        if let Some((filter, input)) = restriction
+            && old == filter
+        {
+            remap[old] = remap[input];
             continue;
         }
         let mut op = node.op.clone();
@@ -1226,7 +1277,9 @@ fn drop_optional_pair(
     for (old, node) in plan.nodes.iter().enumerate() {
         if old == matched || old == barrier || old == leftjoin {
             // Everything that read the left join reads the preserved side:
-            // the optional value is a column of it now.
+            // the optional value is a column of it now. (Set again below,
+            // once `left` has certainly been placed: the match may precede
+            // the preserved side in index order.)
             remap[old] = remap[left];
             continue;
         }
@@ -1236,6 +1289,9 @@ fn drop_optional_pair(
     for node in &mut nodes {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
+    }
+    for old in [matched, barrier, leftjoin] {
+        remap[old] = remap[left];
     }
     plan.rebuild(nodes, &remap);
 }
@@ -2789,6 +2845,9 @@ fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
         // A graph pattern in an expression position. Nothing renders it, and a
         // rewrite of the text would be a rewrite of a query, not of a plan.
         Expr::Opaque(_) => return None,
+        // A boundary restriction is carried by its own rules, never rendered
+        // as a comparison.
+        Expr::InClass { .. } => return None,
     })
 }
 
@@ -4656,6 +4715,11 @@ pub fn tier_one_rules<'a>(
         Box::new(crate::sparql_scope_rules::PruneUnusedExports),
         Box::new(crate::sparql_scope_rules::PushBarrier::new(schema)),
         Box::new(crate::sparql_scope_rules::PushJoinOnIdentity::new(schema)),
+        // Op 3: a restriction at a join side with the semi-join proof, then
+        // pushed down one operator at a time; the fold reads it as the
+        // star's type when it reaches the matches.
+        Box::new(crate::sparql_restrict::RestrictScopeAtBoundary::new(schema)),
+        Box::new(crate::sparql_restrict::PushRestrictionDown),
         // This one knows nothing about a schema graph: it is a semi-join
         // reduction, and it is what a materialised relation is worth to the
         // planner whether the schema produced it or the client wrote it.
@@ -6293,17 +6357,20 @@ mod tests {
             "{joined}"
         );
 
-        // And a nested read is not walked into through one.
+        // And a nested read is not walked into through one: the *preserved*
+        // scan reads no path. (The optional body gets a scan of its own, by
+        // the boundary restriction, which reads the path inside the body --
+        // that is the derived table, and the preserved rows stay whole.)
         let nested = refined(
             "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL { ?s asset360:location ?loc . ?loc asset360:longitude ?lon } }",
             &schema,
             false,
         );
+        let preserved = nested.find("scan")[0];
         assert!(
-            !scan_slots(&nested)
-                .iter()
-                .any(|(path, _, _)| path.contains('.')),
+            !matches!(&nested.nodes[preserved].op, PlanOp::Scan { slots, .. }
+                if slots.iter().any(|slot| slot.path.len() > 1)),
             "{nested}"
         );
     }
@@ -8197,18 +8264,20 @@ mod tests {
         );
 
         // A collection of references is one solution per element, which an
-        // equality cannot state: declined, and the plan stays a fetch.
+        // equality cannot state: declined, and the plan stays a fetch -- the
+        // join on the element is the engine's, whatever the boundary
+        // restriction made of the body's own reads.
         let plan = refined(
             "SELECT ?g ?l WHERE { ?g a asset360:LineGroup . \
              OPTIONAL { ?g asset360:groupsLines ?l . ?l a asset360:Line } }",
             &schema,
             false,
         );
-        assert!(!plan.find("match").is_empty(), "{plan}");
         assert!(
-            plan.nodes
+            plan.find("join")
                 .iter()
-                .any(|node| node.executor == Executor::Engine),
+                .chain(plan.find("leftjoin").iter())
+                .any(|id| plan.nodes[*id].executor == Executor::Engine),
             "{plan}"
         );
         // A lifted condition decides whether the optional side matched, and

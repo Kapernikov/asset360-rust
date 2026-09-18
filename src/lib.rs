@@ -53,6 +53,7 @@ pub mod sparql_oracle;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;
+pub mod sparql_restrict;
 pub mod sparql_rules;
 pub mod sparql_schema_graph;
 pub mod sparql_schema_labels;

@@ -967,7 +967,7 @@ fn slots_named(expr: &Expr, out: &mut Vec<(String, Vec<String>, SlotReading)>) {
             }
         }
         Expr::Not(inner) => slots_named(inner, out),
-        Expr::Var(_) | Expr::Literal(_) | Expr::Opaque(_) => {}
+        Expr::Var(_) | Expr::Literal(_) | Expr::Opaque(_) | Expr::InClass { .. } => {}
     }
 }
 

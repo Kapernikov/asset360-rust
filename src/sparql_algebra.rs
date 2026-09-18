@@ -573,7 +573,9 @@ impl Translation<'_> {
                 let var = self.variable_for(star_var, slot_path, *reading, at, reads)?;
                 Expr::Var(var)
             }
-            Expr::Var(_) | Expr::Literal(_) | Expr::Opaque(_) => condition.clone(),
+            Expr::Var(_) | Expr::Literal(_) | Expr::Opaque(_) | Expr::InClass { .. } => {
+                condition.clone()
+            }
             Expr::Compare { op, left, right } => Expr::Compare {
                 op: *op,
                 left: Box::new(self.substitute(left, at, reads)?),
@@ -706,6 +708,7 @@ impl Expr {
                     .collect::<Option<Vec<_>>>()?;
                 crate::sparql_refine::function_expression_of(name, arguments)?
             }
+            Self::InClass { .. } => self.try_as_expression()?,
             Self::Slot { .. } | Self::Opaque(_) => return None,
         })
     }
