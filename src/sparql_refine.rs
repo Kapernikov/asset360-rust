@@ -2233,14 +2233,23 @@ impl PlanOp {
     /// The inputs this node consumes, for a walk that does not match on the
     /// variant.
     pub fn inputs(&self) -> Vec<NodeId> {
-        match self {
-            Self::Unit | Self::Match { .. } | Self::Path { .. } | Self::Values { .. } => Vec::new(),
-            Self::Scan { .. } => Vec::new(),
+        self.input_ids().collect()
+    }
+
+    /// [`PlanOp::inputs`] without the allocation, for the walks that ask it
+    /// of every node on every step -- [`Plan::feeds`] and what is built on
+    /// it. A node has at most two inputs, so the answer fits in a pair.
+    pub fn input_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        let (first, second): (Option<NodeId>, Option<NodeId>) = match self {
+            Self::Unit | Self::Match { .. } | Self::Path { .. } | Self::Values { .. } => {
+                (None, None)
+            }
+            Self::Scan { .. } => (None, None),
             Self::Join { left, right, .. }
             | Self::LeftJoin { left, right, .. }
             | Self::AntiJoin { left, right, .. }
             | Self::Union { left, right }
-            | Self::Minus { left, right } => vec![*left, *right],
+            | Self::Minus { left, right } => (Some(*left), Some(*right)),
             Self::Filter { input, .. }
             | Self::Bind { input, .. }
             | Self::Group { input, .. }
@@ -2255,8 +2264,9 @@ impl PlanOp {
             | Self::Unnest { input, .. }
             | Self::Construct { input, .. }
             | Self::Describe { input, .. }
-            | Self::Ask { input } => vec![*input],
-        }
+            | Self::Ask { input } => (Some(*input), None),
+        };
+        first.into_iter().chain(second)
     }
 
     /// Renumber this node's inputs. What a rule that drops or inserts a node
@@ -3070,10 +3080,40 @@ impl Plan {
     /// which variables the two sides shared. See
     /// [`crate::sparql_rules::refresh_join_variables`].
     pub fn variables_of(&self, node: NodeId) -> BTreeSet<String> {
+        let mut memo = vec![None; self.nodes.len()];
+        self.variables_memo(node, &mut memo).clone()
+    }
+
+    /// [`Plan::variables_of`] for every node at once, for a caller that
+    /// asks it of one node after another: a chain of `n` joins answered
+    /// one node at a time is `n` walks of the chain, this is one.
+    pub fn variables_table(&self) -> Vec<BTreeSet<String>> {
+        let mut memo = vec![None; self.nodes.len()];
+        for id in 0..self.nodes.len() {
+            self.variables_memo(id, &mut memo);
+        }
+        memo.into_iter().map(Option::unwrap_or_default).collect()
+    }
+
+    /// The transfer function behind [`Plan::variables_of`], remembering each
+    /// subtree's answer within one question so a join asks its sides once.
+    fn variables_memo<'m>(
+        &self,
+        node: NodeId,
+        memo: &'m mut Vec<Option<BTreeSet<String>>>,
+    ) -> &'m BTreeSet<String> {
+        // An index past the end has no node and binds nothing; the memo has
+        // no slot for it either, so the empty answer lives here.
+        static NOTHING: BTreeSet<String> = BTreeSet::new();
+        if node >= self.nodes.len() {
+            return &NOTHING;
+        }
+        if memo[node].is_some() {
+            return memo[node].as_ref().expect("checked");
+        }
+        let id = node;
         let mut out = BTreeSet::new();
-        let Some(node) = self.nodes.get(node) else {
-            return out;
-        };
+        let node = &self.nodes[id];
         match &node.op {
             PlanOp::Scan {
                 star_var, slots, ..
@@ -3111,17 +3151,20 @@ impl Plan {
             | PlanOp::SubSelect { vars, .. }
             | PlanOp::Describe { vars, .. } => out.extend(vars.iter().cloned()),
             PlanOp::Bind { input, var, .. } => {
-                out.extend(self.variables_of(*input));
+                out.extend(self.variables_memo(*input, memo).iter().cloned());
                 out.insert(var.clone());
             }
-            PlanOp::Minus { left, .. } => out.extend(self.variables_of(*left)),
+            PlanOp::Minus { left, .. } => {
+                out.extend(self.variables_memo(*left, memo).iter().cloned())
+            }
             other => {
-                for input in other.inputs() {
-                    out.extend(self.variables_of(input));
+                for input in other.input_ids() {
+                    out.extend(self.variables_memo(input, memo).iter().cloned());
                 }
             }
         }
-        out
+        memo[id] = Some(out);
+        memo[id].as_ref().expect("just stored")
     }
 
     /// The variables this node binds **in every solution it emits**.
@@ -3271,6 +3314,11 @@ impl Plan {
     }
 
     /// Whether `lower`'s rows reach `upper`, following inputs.
+    ///
+    /// A walk down from `upper` that allocates nothing: it is the primitive
+    /// every scope question is built on, and the planner asks it of every
+    /// node for every barrier after every rule (pepibru GitLab issue #468,
+    /// where a `Vec` per step made the tunnel row's plan take minutes).
     pub fn feeds(&self, lower: NodeId, upper: NodeId) -> bool {
         if lower == upper {
             return true;
@@ -3278,10 +3326,28 @@ impl Plan {
         let Some(node) = self.nodes.get(upper) else {
             return false;
         };
-        node.op
-            .inputs()
-            .into_iter()
-            .any(|input| self.feeds(lower, input))
+        node.op.input_ids().any(|input| self.feeds(lower, input))
+    }
+
+    /// Every node whose rows reach `upper`, `upper` included: one walk down,
+    /// visiting each node once, for the questions that would otherwise ask
+    /// [`Plan::feeds`] of every node in turn. Indexed by [`NodeId`].
+    pub fn reaching(&self, upper: NodeId) -> Vec<bool> {
+        let mut reaches = vec![false; self.nodes.len()];
+        self.mark_reaching(upper, &mut reaches);
+        reaches
+    }
+
+    fn mark_reaching(&self, upper: NodeId, reaches: &mut [bool]) {
+        let Some(slot) = reaches.get_mut(upper) else {
+            return;
+        };
+        if std::mem::replace(slot, true) {
+            return;
+        }
+        for input in self.nodes[upper].op.input_ids() {
+            self.mark_reaching(input, reaches);
+        }
     }
 
     /// Nodes of one kind, for a rule that looks for its own shape.

@@ -1998,6 +1998,92 @@ mod tests {
         }
     }
 
+    /// The Infragis tunnel row: one mandatory star and a few dozen
+    /// `OPTIONAL` blocks, each its own scope. Planning it took 2.3 s on
+    /// v0.10.5 and 144 s on v0.10.7 (pepibru GitLab issue #468), all of it in
+    /// the refined planner: `scopes()` re-derived every barrier's membership
+    /// by a recursive, allocating `feeds` walk for every (barrier × node)
+    /// pair, and a rule asked it once per node per candidate -- about the
+    /// fifth power of the number of scopes.
+    ///
+    /// Pinned by wall clock against a generous ceiling rather than by an
+    /// operation count, because the count is the implementation and the
+    /// ceiling is the promise: a debug build of the fixed planner takes
+    /// about eight seconds here, the unfixed one over twenty minutes. A
+    /// regression to that order fails; a slow CI runner does not.
+    #[test]
+    fn a_query_of_many_optional_scopes_plans_in_bounded_time() {
+        // A hub with one reference per island, so every `OPTIONAL` is a
+        // scan of its own under a left join -- the tunnel row's shape.
+        // Generated rather than added to the shared fixture: 36 slots that
+        // exist for one test would be noise in every other printout.
+        const ISLANDS: usize = 36;
+        let mut schema_yaml = String::from(
+            r#"
+id: https://data.infrabel.be/asset360
+name: asset360
+prefixes:
+  asset360:
+    prefix_reference: https://data.infrabel.be/asset360/
+default_prefix: asset360
+default_range: string
+classes:
+  Leaf:
+    class_uri: asset360:Leaf
+    attributes:
+      asset360_uri:
+        identifier: true
+      name:
+        range: string
+      next:
+        range: Leaf
+  Hub:
+    class_uri: asset360:Hub
+    attributes:
+      asset360_uri:
+        identifier: true
+      name:
+        range: string
+"#,
+        );
+        for i in 0..ISLANDS {
+            schema_yaml.push_str(&format!("      r{i}:\n        range: Leaf\n"));
+        }
+        let schema: linkml_meta::SchemaDefinition =
+            serde_path_to_error::deserialize(serde_yml::Deserializer::from_str(&schema_yaml))
+                .expect("the generated schema parses");
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+
+        let mut body = String::from("?s a asset360:Hub ; asset360:name ?name .");
+        for i in 0..ISLANDS {
+            // Every third island nests a further optional read, as the
+            // tunnel row's inspection and sub-zone blocks do.
+            let nested = if i % 3 == 0 {
+                format!(
+                    " OPTIONAL {{ ?x{i} asset360:next ?y{i} . \
+                     ?y{i} a asset360:Leaf ; asset360:name ?m{i} }}"
+                )
+            } else {
+                String::new()
+            };
+            body.push_str(&format!(
+                " OPTIONAL {{ ?s asset360:r{i} ?x{i} . \
+                 ?x{i} a asset360:Leaf ; asset360:name ?n{i} .{nested} }}"
+            ));
+        }
+        let query = format!("{PREFIX}SELECT * WHERE {{ {body} }} ORDER BY ?name");
+        let started = std::time::Instant::now();
+        let plan = plan_query_refined(&query, &sv).expect("the wide query plans");
+        let elapsed = started.elapsed();
+        assert!(plan.is_accounted(), "{plan}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "planning {ISLANDS} OPTIONAL scopes took {elapsed:?}; the planner is \
+             super-linear in the number of scopes again (pepibru GitLab issue #468)"
+        );
+    }
+
     /// The payoff, and the thing issue #410 (pepibru GitLab) measured as
     /// missing: a `LIMIT` above an all-SQL union reaches the statement.
     ///

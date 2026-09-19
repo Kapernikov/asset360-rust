@@ -137,15 +137,19 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
     for _ in 0..MAX_ROUNDS {
         log.rounds += 1;
         let mut changed = false;
+        // **One check relates two plans.** What every barrier's consumers
+        // demand of it, recorded before a rule edits the plan and checked
+        // after: a demanded export that is gone is a rule that pruned past
+        // its own match, which no state check can see because `demand`
+        // shrinks with the interface it guards. Held for one application and
+        // no further, and a failure in every build -- there is no post-state
+        // that witnesses it.
+        //
+        // Recorded once per plan rather than once per rule: a rule that did
+        // not fire did not edit, so the record taken before it still
+        // describes the plan the next rule sees. Re-taken after every edit.
+        let mut kept = plan.kept_exports();
         for rule in rules {
-            // **One check relates two plans.** What every barrier's
-            // consumers demand of it, recorded before the rule edits the
-            // plan and checked after: a demanded export that is gone is a
-            // rule that pruned past its own match, which no state check can
-            // see because `demand` shrinks with the interface it guards.
-            // Held for one application and no further, and a failure in
-            // every build -- there is no post-state that witnesses it.
-            let kept = plan.kept_exports();
             if rule.apply(plan) {
                 changed = true;
                 log.applied.push(rule.name());
@@ -158,6 +162,7 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
                         log,
                     });
                 }
+                kept = plan.kept_exports();
                 debug_assert!(
                     plan.check().is_ok(),
                     "rule '{}' broke an invariant: {}\n{plan}",
@@ -984,7 +989,7 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
     plan.nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.op.inputs().contains(&id))
+        .filter(|(_, node)| node.op.input_ids().any(|input| input == id))
         .map(|(consumer, _)| consumer)
         .collect()
 }
@@ -1036,6 +1041,9 @@ impl Rule for DeliverOptionalRead<'_> {
     }
 
     fn apply(&self, plan: &mut Plan) -> bool {
+        // Read once: the plan is not edited before a match is delivered, and
+        // delivering one returns.
+        let scopes = plan.scopes();
         for id in 0..plan.nodes.len() {
             if plan.nodes[id].executor != Executor::Engine {
                 continue;
@@ -1079,7 +1087,7 @@ impl Rule for DeliverOptionalRead<'_> {
                 // And in the same naming domain: a match inside a sub-select
                 // under the `OPTIONAL` reads a variable of its own, whatever
                 // it is spelled.
-                if plan.naming_domain_of(id) != plan.naming_domain_of(scan) {
+                if plan.naming_domain_in(&scopes, id) != plan.naming_domain_in(&scopes, scan) {
                     return None;
                 }
                 let optional = plan.nodes.iter().any(|above| {
@@ -2265,9 +2273,10 @@ pub(crate) fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
     // `OPTIONAL` body's. Whether a restriction also decides the enclosing
     // domain's answers is a second question with a second proof (op 3a,
     // read the other way).
-    let domain = plan.naming_domain_of(node);
+    let scopes = plan.scopes();
+    let domain = plan.naming_domain_in(&scopes, node);
     !plan.nodes.iter().enumerate().any(|(other_id, other)| {
-        plan.naming_domain_of(other_id) == domain
+        plan.naming_domain_in(&scopes, other_id) == domain
             && match &other.op {
                 // The preserved side keeps rows the optional side did not match, so a
                 // constraint inside the optional side decides whether the *value*
@@ -2434,6 +2443,15 @@ impl Rule for FoldIdentityConstant<'_> {
         // it, a `FILTER` is unary -- while what it *decides* is shared.
         for id in 0..plan.nodes.len() {
             if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            // A constraint on a star's identity, or nothing to do: asked
+            // before the scope walk below, which costs a pass over the plan
+            // and is owed only to a candidate.
+            if !matches!(
+                &plan.nodes[id].op,
+                PlanOp::Filter { .. } | PlanOp::Values { .. }
+            ) {
                 continue;
             }
             // The constraint has to hold of every answer. Inside an

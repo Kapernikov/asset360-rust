@@ -48,8 +48,12 @@ impl Rule for PruneUnusedExports {
     }
 
     fn apply(&self, plan: &mut Plan) -> bool {
+        // What is demanded of every barrier, derived once: a barrier's
+        // exports are its outputs, so what its consumers demand of it is
+        // exactly what `kept_exports` records per barrier.
+        let demands = plan.kept_exports();
         for barrier in plan.barriers() {
-            let demanded = plan.demand_above(barrier);
+            let demanded = &demands[&plan.key_of(barrier)];
             let PlanOp::SubSelect { vars, .. } = &plan.nodes[barrier].op else {
                 continue;
             };

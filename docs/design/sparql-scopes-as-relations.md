@@ -1798,14 +1798,21 @@ and fails when a kept name is not in the resolved node's `outputs` or
 the key resolved to nothing. Three things it is not. It is not a cached
 derived fact: `kept` is dead the moment the check has run and the next
 application recomputes it, so "recomputed, never cached across a
-rewrite" stands. It is not a `debug_assert!`: it is a `RuleFailure` in
+rewrite" stands. (A rule that declines edits nothing, so the record
+taken before it still describes the plan the next rule sees; the
+driver re-takes it after every *edit* rather than before every *try*
+— the same fact, derived once per plan state. Pepibru GitLab issue
+#468 measured the per-try form at most of the planner's time.) It is not a `debug_assert!`: it is a `RuleFailure` in
 every build, because the end-of-`refine` state check a release build
 relies on cannot see a transition defect — there is no post-state that
 witnesses it. And it is not the equivalence proof: test 2(d)'s
 before/after oracle remains the semantic backstop; this catches one
 class of structural lie at the rule instead of in a result. Cost: one
-`demand_above` per barrier per application, linear like everything
-else here, measured by the grammar test. The alternative round 6
+`demand_above` per barrier per application, over one `outputs` table
+and one `demand_above` memo shared by the barriers of that one
+derivation (a chain of `n` joins asked per barrier is `n` walks, asked
+once is one), linear like everything else here, measured by the
+grammar test and pinned by the wide-`OPTIONAL` timing test. The alternative round 6
 offered — an immutable observer contract written on the barrier at
 construction — is rejected: it would be the one stored property in a
 design where every other is recomputed, and every rule that adds or

@@ -185,6 +185,12 @@ impl Plan {
     }
 
     /// [`Plan::scope_of`] for every node at once.
+    ///
+    /// One walk down per barrier, rather than one [`Plan::feeds`] per
+    /// (barrier, node) pair: a rule asks this once per node it considers,
+    /// after every application, and the pair form made the planner's time
+    /// grow as the fifth power of the number of `OPTIONAL` blocks (pepibru
+    /// GitLab issue #468).
     pub fn scopes(&self) -> Vec<Option<NodeId>> {
         let mut scope: Vec<Option<NodeId>> = vec![None; self.nodes.len()];
         // Inner barriers precede outer ones, so the first barrier to claim a
@@ -193,22 +199,18 @@ impl Plan {
             let PlanOp::SubSelect { input, .. } = &self.nodes[barrier].op else {
                 continue;
             };
-            for (id, slot) in scope.iter_mut().enumerate() {
-                if slot.is_none() && self.feeds(id, *input) {
-                    *slot = Some(barrier);
+            for (id, reached) in self.reaching(*input).into_iter().enumerate() {
+                if reached && scope[id].is_none() {
+                    scope[id] = Some(barrier);
                 }
             }
         }
         scope
     }
 
-    /// The naming domain a node is in: the innermost enclosing sub-`SELECT`
-    /// barrier, or `None` for the query's own. An `OPTIONAL` body opens no
-    /// domain -- its `?a` is the outer `?a` -- so this looks through
-    /// barriers with no `domain` (design, *Naming domain versus evaluation
-    /// unit*).
-    pub fn naming_domain_of(&self, node: NodeId) -> Option<NodeId> {
-        let scopes = self.scopes();
+    /// [`Plan::naming_domain_of`], read off a [`Plan::scopes`] table already
+    /// in hand -- for a caller asking it of every node.
+    pub fn naming_domain_in(&self, scopes: &[Option<NodeId>], node: NodeId) -> Option<NodeId> {
         let mut current = scopes[node];
         while let Some(barrier) = current {
             if matches!(
@@ -223,6 +225,15 @@ impl Plan {
             current = scopes[barrier];
         }
         None
+    }
+
+    /// The naming domain a node is in: the innermost enclosing sub-`SELECT`
+    /// barrier, or `None` for the query's own. An `OPTIONAL` body opens no
+    /// domain -- its `?a` is the outer `?a` -- so this looks through
+    /// barriers with no `domain` (design, *Naming domain versus evaluation
+    /// unit*).
+    pub fn naming_domain_of(&self, node: NodeId) -> Option<NodeId> {
+        self.naming_domain_in(&self.scopes(), node)
     }
 
     /// The nodes of one scope, in index order.
@@ -250,8 +261,7 @@ impl Plan {
             return false;
         }
         node.op
-            .inputs()
-            .into_iter()
+            .input_ids()
             .any(|input| self.feeds_within_scope(lower, input))
     }
 
@@ -269,8 +279,7 @@ impl Plan {
             return false;
         }
         node.op
-            .inputs()
-            .into_iter()
+            .input_ids()
             .any(|input| self.feeds_visibly(lower, input))
     }
 
@@ -281,7 +290,7 @@ impl Plan {
             return None;
         }
         let node = self.nodes.get(upper)?;
-        for input in node.op.inputs() {
+        for input in node.op.input_ids() {
             if !self.feeds(lower, input) {
                 continue;
             }
@@ -384,7 +393,10 @@ impl Plan {
     /// reference with no visible producer *and* a hidden one is a reference
     /// into a scope.
     pub fn bound_anywhere_below(&self, node: NodeId, var: &str) -> bool {
-        (0..self.nodes.len()).any(|id| self.feeds(id, node) && self.binds_here(id, var))
+        self.reaching(node)
+            .into_iter()
+            .enumerate()
+            .any(|(id, reached)| reached && self.binds_here(id, var))
     }
 
     /// The variables a node binds in every solution it emits: the
@@ -597,7 +609,17 @@ impl Plan {
     /// the design's, and an operator the table does not name observes
     /// everything.
     pub fn demand(&self, id: NodeId, input: NodeId) -> BTreeSet<String> {
-        let everything = || self.variables_of(input);
+        self.demand_in(&self.variables_table(), id, input)
+    }
+
+    /// [`Plan::demand`] over a [`Plan::variables_table`] already in hand.
+    fn demand_in(
+        &self,
+        variables: &[BTreeSet<String>],
+        id: NodeId,
+        input: NodeId,
+    ) -> BTreeSet<String> {
+        let everything = || variables[input].clone();
         let node = &self.nodes[id];
         match &node.op {
             PlanOp::Project { vars, .. } | PlanOp::SubSelect { vars, .. } => {
@@ -650,16 +672,15 @@ impl Plan {
                 reference,
                 ..
             } => {
-                let mut out: BTreeSet<String> = self
-                    .variables_of(*left)
-                    .intersection(&self.variables_of(*right))
+                let mut out: BTreeSet<String> = variables[*left]
+                    .intersection(&variables[*right])
                     .cloned()
                     .collect();
                 if let Some(edge) = reference {
                     out.insert(edge.referenced.clone());
                     out.insert(edge.holder.clone());
                 }
-                out.retain(|var| self.variables_of(input).contains(var));
+                out.retain(|var| variables[input].contains(var));
                 out
             }
             PlanOp::LeftJoin {
@@ -669,9 +690,8 @@ impl Plan {
                 reference,
                 ..
             } => {
-                let mut out: BTreeSet<String> = self
-                    .variables_of(*left)
-                    .intersection(&self.variables_of(*right))
+                let mut out: BTreeSet<String> = variables[*left]
+                    .intersection(&variables[*right])
                     .cloned()
                     .collect();
                 if let Some(condition) = condition {
@@ -686,16 +706,15 @@ impl Plan {
                     out.insert(edge.referenced.clone());
                     out.insert(edge.holder.clone());
                 }
-                out.retain(|var| self.variables_of(input).contains(var));
+                out.retain(|var| variables[input].contains(var));
                 out
             }
             PlanOp::Minus { left, right } => {
-                let mut out: BTreeSet<String> = self
-                    .variables_of(*left)
-                    .intersection(&self.variables_of(*right))
+                let mut out: BTreeSet<String> = variables[*left]
+                    .intersection(&variables[*right])
                     .cloned()
                     .collect();
-                out.retain(|var| self.variables_of(input).contains(var));
+                out.retain(|var| variables[input].contains(var));
                 out
             }
             PlanOp::AntiJoin { .. } => self.correlated_inputs(id).into_iter().collect(),
@@ -730,14 +749,25 @@ impl Plan {
 
     /// The outputs of `input` that pass through the node at `id` unchanged,
     /// so a demand above it on them is a demand on `input`.
-    fn passes_through(&self, id: NodeId, input: NodeId) -> BTreeSet<String> {
-        let inputs_outputs = self.variables_of(input);
+    fn passes_through(
+        &self,
+        variables: &[BTreeSet<String>],
+        id: NodeId,
+        input: NodeId,
+    ) -> BTreeSet<String> {
+        let inputs_outputs = &variables[input];
         let node = &self.nodes[id];
-        let own: BTreeSet<String> = match &node.op {
-            PlanOp::Project { vars, .. } | PlanOp::SubSelect { vars, .. } => {
-                vars.iter().cloned().collect()
-            }
-            PlanOp::Group { keys, .. } => keys.iter().cloned().collect(),
+        match &node.op {
+            PlanOp::Project { vars, .. } | PlanOp::SubSelect { vars, .. } => vars
+                .iter()
+                .filter(|var| inputs_outputs.contains(*var))
+                .cloned()
+                .collect(),
+            PlanOp::Group { keys, .. } => keys
+                .iter()
+                .filter(|key| inputs_outputs.contains(*key))
+                .cloned()
+                .collect(),
             PlanOp::Minus { left, .. } | PlanOp::AntiJoin { left, .. } => {
                 if *left == input {
                     inputs_outputs.clone()
@@ -749,38 +779,60 @@ impl Plan {
                 BTreeSet::new()
             }
             _ => inputs_outputs.clone(),
-        };
-        own.intersection(&inputs_outputs).cloned().collect()
+        }
     }
 
     /// Everything the consumers of `node` demand of it, transitively: each
     /// consumer's own demand plus what is demanded of the consumer on the
     /// variables it passes through.
     pub fn demand_above(&self, node: NodeId) -> BTreeSet<String> {
+        let mut memo = vec![None; self.nodes.len()];
+        self.demand_above_in(&self.variables_table(), &mut memo, node)
+            .clone()
+    }
+
+    /// [`Plan::demand_above`] over a [`Plan::variables_table`], remembering
+    /// each node's answer: every barrier under one root asks the same
+    /// consumers the same question, and asked afresh per barrier after
+    /// every rule this was most of the planner's time (pepibru GitLab
+    /// issue #468).
+    fn demand_above_in<'m>(
+        &self,
+        variables: &[BTreeSet<String>],
+        memo: &'m mut Vec<Option<BTreeSet<String>>>,
+        node: NodeId,
+    ) -> &'m BTreeSet<String> {
+        if memo[node].is_some() {
+            return memo[node].as_ref().expect("checked");
+        }
         let mut out = BTreeSet::new();
         for consumer in crate::sparql_rules::consumers_of(self, node) {
-            out.extend(self.demand(consumer, node));
-            let passed = self.passes_through(consumer, node);
+            out.extend(self.demand_in(variables, consumer, node));
+            let passed = self.passes_through(variables, consumer, node);
             if !passed.is_empty() {
-                let above = self.demand_above(consumer);
+                let above = self.demand_above_in(variables, memo, consumer);
                 out.extend(passed.into_iter().filter(|var| above.contains(var)));
             }
         }
-        out
+        memo[node] = Some(out);
+        memo[node].as_ref().expect("just stored")
     }
 
     /// What every barrier's consumers demand of it, as it stands: the fact
     /// the driver records before a rule edits the plan and checks after.
     /// One entry per barrier, keyed by its [`NodeKey`].
     pub fn kept_exports(&self) -> BTreeMap<NodeKey, BTreeSet<String>> {
+        let variables = self.variables_table();
+        let mut memo = vec![None; self.nodes.len()];
         self.barriers()
             .into_iter()
             .map(|barrier| {
-                let outputs = self.variables_of(barrier);
+                let outputs = &variables[barrier];
                 let kept: BTreeSet<String> = self
-                    .demand_above(barrier)
-                    .into_iter()
-                    .filter(|var| outputs.contains(var))
+                    .demand_above_in(&variables, &mut memo, barrier)
+                    .iter()
+                    .filter(|var| outputs.contains(*var))
+                    .cloned()
                     .collect();
                 (self.key_of(barrier), kept)
             })
@@ -850,10 +902,11 @@ impl Plan {
         else {
             return false;
         };
-        let input = *input;
-        (0..self.nodes.len())
-            .filter(|id| self.feeds(*id, input))
-            .all(|id| {
+        self.reaching(*input)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, reached)| *reached)
+            .all(|(id, _)| {
                 matches!(
                     &self.nodes[id].op,
                     PlanOp::Scan { .. }
