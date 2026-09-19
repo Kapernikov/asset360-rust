@@ -4,20 +4,26 @@
 //! the semi-join argument licenses restricting the *completed* relation at
 //! the join and says nothing about restricting a scan under a `Slice`:
 //!
-//! * [`RestrictScopeAtBoundary`] (3a) places `?v ∈ Identity(class)` at the
+//! * [`RestrictScopeAtBoundary`] (3a) places a [`Predicate`] of `?v` at the
 //!   root of a join side whose partner binds `?v` as the identity of
 //!   `class`, guaranteed on both sides, with the proof made where the
-//!   relation is complete. It raises a derived obligation -- the provenance
-//!   the review asked for in place of a flag -- keyed by the join
-//!   occurrence and side.
+//!   relation is complete: the class, `?v ∈ Identity(class)`, when the
+//!   side does not type `?v` itself; and, once it does, each row test the
+//!   partner applies to every row it hands the join and that reads
+//!   nothing but `?v`'s record (`?v.kind = 'GSA'`). It raises a derived
+//!   obligation per predicate -- the provenance the review asked for in
+//!   place of a flag -- keyed by the join occurrence, side and predicate.
 //! * [`PushRestrictionDown`] (3b) carries the filter one operator down at a
 //!   time, each step a commutation rule of the table, stopping at a `Slice`,
 //!   a keyless `Group`, a `Path`, and anything it does not know. Through a
 //!   barrier the step is a *transfer* into the nested scope, recorded on
-//!   the obligation; at a `Union` it *splits*, one obligation per arm.
+//!   the obligation; at a `Union` it *splits*, one obligation per arm. A
+//!   row test that can move no further becomes SQL there, by this rule
+//!   and no other.
 //!
-//! `FoldMatchesIntoScan` reads the restriction as the star's type when it
-//! reaches the matches, which is how an untyped body gets its scan.
+//! `FoldMatchesIntoScan` reads a class restriction as the star's type when
+//! it reaches the matches, which is how an untyped body gets its scan; a
+//! row test rests above that scan as the body's own filter.
 //!
 //! **Would a bad application be caught?** [`Plan::restriction_chains_hold`]
 //! walks the *plan* from each restriction's discharge up to the join that
@@ -61,11 +67,34 @@ pub enum Step {
     Split { at: NodeKey },
 }
 
+/// What a boundary restriction says of `?v`: the class of the record it
+/// names, or a row test the other side applies to every row and that reads
+/// nothing but that record.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predicate {
+    /// `?v` is the identity of a record of this class. The fold reads it
+    /// as the star's type when 3b carries it to the matches.
+    Class(String),
+    /// A condition over slots of `?v`'s record -- `?v.kind = 'GSA'` -- that
+    /// the other side's every row satisfies. It lands as a filter above
+    /// the side's scan of `?v`, where SQL applies it; it is never the type.
+    Condition(Expr),
+}
+
+impl std::fmt::Display for Predicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Class(class_uri) => write!(f, "∈ {}", crate::sparql_plan::shorten(class_uri)),
+            Self::Condition(condition) => write!(f, "where {condition}"),
+        }
+    }
+}
+
 /// A boundary restriction: the derived obligation op 3a raises.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Restriction {
     pub var: String,
-    pub class_uri: String,
+    pub predicate: Predicate,
     pub at: JoinOccurrence,
     /// The obligation this one was split from, at a `Union`.
     pub parent: Option<ObligationId>,
@@ -73,9 +102,38 @@ pub struct Restriction {
 }
 
 impl Restriction {
-    /// The canonical key: what makes two restrictions the same one.
-    pub fn key(&self) -> (NodeKey, Side, &str, &str) {
-        (self.at.node, self.at.side, &self.var, &self.class_uri)
+    /// The canonical key: what makes two restrictions the same one. The
+    /// predicate by its text, so a condition's key is the condition and
+    /// not the node that holds it.
+    pub fn key(&self) -> (NodeKey, Side, &str, String) {
+        (
+            self.at.node,
+            self.at.side,
+            &self.var,
+            match &self.predicate {
+                Predicate::Class(class_uri) => class_uri.clone(),
+                Predicate::Condition(condition) => format!("{condition}"),
+            },
+        )
+    }
+
+    /// The class this restriction carries, when it is one.
+    pub fn class_uri(&self) -> Option<&str> {
+        match &self.predicate {
+            Predicate::Class(class_uri) => Some(class_uri),
+            Predicate::Condition(_) => None,
+        }
+    }
+
+    /// The filter condition that spells this restriction in a plan.
+    pub fn condition(&self) -> Expr {
+        match &self.predicate {
+            Predicate::Class(class_uri) => Expr::InClass {
+                var: self.var.clone(),
+                class_uri: class_uri.clone(),
+            },
+            Predicate::Condition(condition) => condition.clone(),
+        }
     }
 }
 
@@ -83,11 +141,8 @@ impl std::fmt::Display for Restriction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "?{} ∈ {} at {} {:?}",
-            self.var,
-            crate::sparql_plan::shorten(&self.class_uri),
-            self.at.node,
-            self.at.side
+            "?{} {} at {} {:?}",
+            self.var, self.predicate, self.at.node, self.at.side
         )?;
         if let Some(parent) = self.parent {
             write!(f, " (split from o{parent})")?;
@@ -115,7 +170,7 @@ impl Restriction {
     }
 }
 
-/// The restriction filter's condition, when a node is one.
+/// The class restriction a node spells, when it is one.
 pub fn restriction_of(plan: &Plan, node: NodeId) -> Option<(String, String)> {
     match &plan.nodes[node].op {
         PlanOp::Filter {
@@ -123,6 +178,31 @@ pub fn restriction_of(plan: &Plan, node: NodeId) -> Option<(String, String)> {
             ..
         } => Some((var.clone(), class_uri.clone())),
         _ => None,
+    }
+}
+
+/// The boundary restriction a filter node carries -- its one claim is a
+/// `Boundary` obligation -- as the obligation, the variable and the
+/// condition the filter holds.
+pub fn restriction_filter(plan: &Plan, node: NodeId) -> Option<(ObligationId, String, Expr)> {
+    let PlanOp::Filter { condition, .. } = &plan.nodes[node].op else {
+        return None;
+    };
+    let [claim] = plan.nodes[node].discharges.as_slice() else {
+        return None;
+    };
+    match &plan.obligations[*claim] {
+        Obligation::Boundary(restriction) => {
+            Some((*claim, restriction.var.clone(), condition.clone()))
+        }
+        _ => None,
+    }
+}
+
+impl Plan {
+    /// Whether a node is the filter that spells a boundary restriction.
+    pub fn is_restriction_filter(&self, node: NodeId) -> bool {
+        restriction_filter(self, node).is_some()
     }
 }
 
@@ -134,28 +214,43 @@ pub fn restriction_of(plan: &Plan, node: NodeId) -> Option<(String, String)> {
 ///
 /// **Match.** A subtree *S* that is a side of a `Join`, or the **right**
 /// side of a `LeftJoin`, with `?v` shared; `?v ∈ guaranteed(S)` and
-/// `guaranteed(other)`; `identity_class(other, ?v) = class`; *S* binds `?v`
-/// as nothing a column can carry (a match's binding -- a side that already
-/// binds it as an identity of `class` carries the restriction, and one that
-/// binds it as a slot is a reference join, the edge rules' business);
-/// no restriction with this canonical key in the ledger; and the join is
-/// *S*'s only consumer.
+/// `guaranteed(other)`; `identity_class(other, ?v) = class`; the join is
+/// *S*'s only consumer; and one of two predicates is not yet carried:
 ///
-/// **Edit.** When *S* is a barrier, `input := Filter(input, ?v ∈ class)` --
-/// inside the boundary node, so the scope root stays the barrier and the
-/// filter lands above the sub-query's `Slice`, where the semi-join proof is
-/// made; otherwise `S := Filter(S, …)` in the enclosing scope. The filter
-/// claims the new obligation.
+/// * **the class**, when *S* binds `?v` as nothing a column can carry (a
+///   match's binding -- a side that already binds it as an identity of
+///   `class` carries the restriction, and one that binds it as a slot is a
+///   reference join, the edge rules' business), and no restriction with
+///   this canonical key is in the ledger;
+/// * **a row test of the other side**, when *S* already produces `?v` as
+///   `Identity(class)` with a scan of it visible at the insertion point:
+///   each condition the other side applies to *every* row it hands the
+///   join ([`conditions_on`]) and that reads nothing but `?v`'s own record
+///   ([`is_record_predicate`]) -- `?v.kind = 'GSA'` -- unless *S* already
+///   applies the same one or the ledger already holds it.
+///
+/// **Edit.** When *S* is a barrier, `input := Filter(input, p)` -- inside
+/// the boundary node, so the scope root stays the barrier and the filter
+/// lands above the sub-query's `Slice`, where the semi-join proof is made;
+/// otherwise `S := Filter(S, p)` in the enclosing scope. The filter claims
+/// the new obligation. A row test is inserted as `Sql` where the frontier
+/// already is (a pushed barrier), as the engine's otherwise; 3b flips it
+/// where it comes to rest.
 ///
 /// **Equivalence.** Rows of *S* whose `?v` no row of the other side carries
 /// contribute nothing to a `Join`, and nothing to a `LeftJoin` when *S* is
 /// the right side (a left row with no partner is kept unchanged either
 /// way). Every `?v` the other side carries is an IRI of `class`, bound in
-/// every row; records of one URI in two classes do not exist. So the filter
-/// removes only rows that joined nothing.
+/// every row, and satisfies every row test the other side applies on the
+/// way to the join; a row test that reads only the record's own slots has
+/// one value per record, so it says the same of `?v` on either side. So
+/// the filter removes only rows that joined nothing.
 ///
 /// **What it declines.** The left side of a `LeftJoin`; `Minus` and
-/// `AntiJoin`; a `Union` arm as a side; a `?v` either side binds optionally.
+/// `AntiJoin`; a `Union` arm as a side; a `?v` either side binds optionally;
+/// a row test applied under the other side's own `OPTIONAL` or in one arm
+/// of its `UNION`, on another star, on an element the other side fanned
+/// out, or through a function.
 pub struct RestrictScopeAtBoundary<'s> {
     schema: &'s SchemaView,
 }
@@ -166,8 +261,16 @@ impl<'s> RestrictScopeAtBoundary<'s> {
     }
 }
 
-/// Whether the ledger already holds a restriction with this key, or the
-/// side's root already produces `?v` as the identity of `class`.
+/// Whether the ledger already holds a restriction with this key.
+fn restriction_is_recorded(plan: &Plan, key: (NodeKey, Side, &str, String)) -> bool {
+    plan.obligations.iter().any(|obligation| {
+        matches!(obligation, Obligation::Boundary(restriction)
+            if restriction.key() == key)
+    })
+}
+
+/// Whether the ledger already holds the class restriction, or the side's
+/// root already produces `?v` as the identity of `class`.
 fn restriction_is_implied(
     plan: &Plan,
     schema: &SchemaView,
@@ -177,13 +280,123 @@ fn restriction_is_implied(
     var: &str,
     class_uri: &str,
 ) -> bool {
-    let recorded = plan.obligations.iter().any(|obligation| {
-        matches!(obligation, Obligation::Boundary(restriction)
-            if restriction.key() == (join, which, var, class_uri))
-    });
-    recorded
+    restriction_is_recorded(plan, (join, which, var, class_uri.to_owned()))
         || (plan.guaranteed(side).contains(var)
             && plan.identity_class(schema, side, var).as_deref() == Some(class_uri))
+}
+
+/// Whether a scan of `var` as a record of `class_uri` is visible from
+/// `at`: what a row test on `?var` lands on, and what the oracle reads it
+/// back through.
+pub(crate) fn scan_visible(plan: &Plan, at: NodeId, var: &str, class_uri: &str) -> bool {
+    plan.nodes.iter().enumerate().any(|(id, node)| {
+        matches!(&node.op, PlanOp::Scan { star_var, class_uri: scanned, .. }
+            if star_var == var && scanned == class_uri)
+            && plan.feeds_visibly(id, at)
+    })
+}
+
+/// Whether an expression reads nothing but slots of `var`'s own record --
+/// a value with one reading per record, the same on every scan of it.
+///
+/// A `BoundElement` reading is a row of the fan-out, not the record; an
+/// `AnyElement` test is one the oracle cannot yet spell back, so it is not
+/// carried either. A variable is not a column, a function is not audited
+/// for its arguments' presence, a pattern is not an expression, and a
+/// class restriction is carried by its own arm.
+pub(crate) fn is_record_predicate(expr: &Expr, var: &str) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Slot {
+            star_var,
+            slot_path,
+            reading,
+            ..
+        } => {
+            star_var == var
+                && !slot_path.is_empty()
+                && *reading == crate::sparql_ops::SlotReading::Column
+        }
+        Expr::Compare { left, right, .. } => {
+            is_record_predicate(left, var) && is_record_predicate(right, var)
+        }
+        Expr::In { value, candidates } => {
+            is_record_predicate(value, var)
+                && candidates.iter().all(|c| is_record_predicate(c, var))
+        }
+        Expr::And(parts) | Expr::Or(parts) => parts.iter().all(|p| is_record_predicate(p, var)),
+        Expr::Not(inner) => is_record_predicate(inner, var),
+        Expr::Var(_) | Expr::Function { .. } | Expr::Opaque(_) | Expr::InClass { .. } => false,
+    }
+}
+
+/// The row tests on `var`'s record that every row `node` produces
+/// satisfies: the record predicates of the filters on every path from a
+/// scan of `var` up to `node`, through the operators that pass their
+/// input's rows on.
+///
+/// | operator | rows below reach every row above |
+/// |---|---|
+/// | `Filter`, `Sort`, `Distinct`, `Reduced`, `Slice`, `Unnest` | yes: a subset, an order, a dedup, a fan-out |
+/// | `Bind` not binding `?v` | yes |
+/// | `Project`, `SubSelect` keeping `?v` | yes |
+/// | `Group` with `?v` among its keys | yes: every group is rows of one `?v` |
+/// | `Join` | yes, from each side that guarantees `?v` |
+/// | `LeftJoin` | from the left side only |
+/// | `Minus`, `AntiJoin` | from the left side only |
+/// | `Union`, a `Bind` of `?v`, a keyless `Group`, anything else | stop |
+///
+/// A conjunction is split into its conjuncts, so a body that spells one
+/// of them is not asked for the whole.
+pub(crate) fn conditions_on(plan: &Plan, node: NodeId, var: &str) -> Vec<Expr> {
+    let mut out: Vec<Expr> = Vec::new();
+    let mut push = |expr: &Expr| {
+        let parts: Vec<&Expr> = match expr {
+            Expr::And(parts) => parts.iter().collect(),
+            other => vec![other],
+        };
+        for part in parts {
+            if is_record_predicate(part, var) && !out.contains(part) {
+                out.push(part.clone());
+            }
+        }
+    };
+    let below: Vec<NodeId> = match &plan.nodes[node].op {
+        PlanOp::Filter { input, condition } => {
+            push(condition);
+            vec![*input]
+        }
+        PlanOp::Sort { input, .. }
+        | PlanOp::Distinct { input }
+        | PlanOp::Reduced { input }
+        | PlanOp::Slice { input, .. }
+        | PlanOp::Unnest { input, .. } => vec![*input],
+        PlanOp::Bind {
+            input, var: bound, ..
+        } if bound != var => vec![*input],
+        PlanOp::Project { input, vars, .. } | PlanOp::SubSelect { input, vars, .. }
+            if vars.iter().any(|v| v == var) =>
+        {
+            vec![*input]
+        }
+        PlanOp::Group { input, keys, .. } if keys.iter().any(|k| k == var) => vec![*input],
+        PlanOp::Join { left, right, .. } => [*left, *right]
+            .into_iter()
+            .filter(|side| plan.guaranteed(*side).contains(var))
+            .collect(),
+        PlanOp::LeftJoin { left, .. }
+        | PlanOp::Minus { left, .. }
+        | PlanOp::AntiJoin { left, .. } => {
+            vec![*left]
+        }
+        _ => Vec::new(),
+    };
+    for input in below {
+        for condition in conditions_on(plan, input, var) {
+            push(&condition);
+        }
+    }
+    out
 }
 
 impl Rule for RestrictScopeAtBoundary<'_> {
@@ -250,17 +463,49 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                     let Some(class_uri) = plan.identity_class(self.schema, other, var) else {
                         continue;
                     };
-                    // The side binds `?v` as a match's binding, not as a
-                    // column: an identity of `class` is implied, another
-                    // identity is a contradiction the engine answers, and a
-                    // slot is a reference join.
+                    let join_key = plan.key_of(id);
+                    // The insertion point: inside the barrier, or above the
+                    // side.
+                    let (input, consumer) = match &plan.nodes[side].op {
+                        PlanOp::SubSelect { input, .. } => (*input, side),
+                        _ => (side, id),
+                    };
+                    let placed = |plan: &mut Plan, predicate: Predicate, node: Node| {
+                        let restriction = Restriction {
+                            var: var.clone(),
+                            predicate,
+                            at: JoinOccurrence {
+                                node: join_key,
+                                side: which,
+                            },
+                            parent: None,
+                            path: Vec::new(),
+                        };
+                        let obligation = plan.obligations.len();
+                        plan.obligations
+                            .push(Obligation::Boundary(Box::new(restriction)));
+                        let mut node = node;
+                        node.discharges = vec![obligation];
+                        insert_between(plan, input, consumer, node);
+                        // The origin scope of the new obligation: where the
+                        // filter now is.
+                        let filter_id = plan
+                            .nodes
+                            .iter()
+                            .position(|node| node.discharges.contains(&obligation))
+                            .expect("the filter this rule inserted");
+                        let origin = plan.scope_of(filter_id).map(|barrier| plan.key_of(barrier));
+                        plan.origin.push(origin);
+                    };
+
+                    // **The class.** The side binds `?v` as a match's
+                    // binding, not as a column: an identity of `class` is
+                    // implied, another identity is a contradiction the
+                    // engine answers, and a slot is a reference join.
                     let binds_as_column = plan
                         .term_of(self.schema, side, var)
                         .iter()
                         .any(|term| !matches!(term, TermOf::Computed));
-                    if binds_as_column {
-                        continue;
-                    }
                     // A side that types `?v` itself -- an `rdf:type` match
                     // the fold has not reached yet -- needs no restriction:
                     // the fold will make the scan, and a restriction beside
@@ -269,9 +514,7 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                     // match -- and never as a value: an object binding is a
                     // slot once folded, and a slot against an identity is
                     // the reference join's edge, not a restriction.
-                    if types_itself(plan, side, var) || !reads_as_a_star(plan, side, var) {
-                        continue;
-                    }
+                    //
                     // A side that reads `?v` only through references to
                     // stars it scans -- `OPTIONAL { ?v :ref ?t . ?t a T … }`
                     // -- is the absorb rules' shape: the reference becomes
@@ -283,68 +526,93 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                     // that had a cheaper one. Any other read of `?v` -- a
                     // slot, a second star -- is the two-read shape, which the
                     // restriction serves.
-                    if (only_reference_reads(plan, self.schema, side, var)
+                    //
+                    // Either insertion point must be the engine's, or the
+                    // frontier would break.
+                    let absorb_shape = (only_reference_reads(plan, self.schema, side, var)
                         && absorb_reference_shape(plan, side))
-                        || single_read_body(plan, side, var)
+                        || single_read_body(plan, side, var);
+                    let class_wanted = !binds_as_column
+                        && !types_itself(plan, side, var)
+                        && reads_as_a_star(plan, side, var)
+                        && !absorb_shape;
+                    if class_wanted
+                        && !restriction_is_implied(
+                            plan,
+                            self.schema,
+                            side,
+                            join_key,
+                            which,
+                            var,
+                            &class_uri,
+                        )
+                        && plan.nodes[consumer].executor == Executor::Engine
+                    {
+                        let filter = Node::engine(
+                            PlanOp::Filter {
+                                input,
+                                condition: Expr::InClass {
+                                    var: var.clone(),
+                                    class_uri: class_uri.clone(),
+                                },
+                            },
+                            Vec::new(),
+                        );
+                        placed(plan, Predicate::Class(class_uri), filter);
+                        return true;
+                    }
+
+                    // **A row test of the other side.** Only once the side
+                    // produces `?v` as the identity of the same class, with
+                    // its scan visible where the test lands: a test on a
+                    // record needs the record's scan to be applied to, and
+                    // to be read back by the oracle.
+                    if plan.identity_class(self.schema, side, var).as_deref() != Some(&class_uri)
+                        || !scan_visible(plan, input, var, &class_uri)
                     {
                         continue;
                     }
-                    let join_key = plan.key_of(id);
-                    if restriction_is_implied(
-                        plan,
-                        self.schema,
-                        side,
-                        join_key,
-                        which,
-                        var,
-                        &class_uri,
-                    ) {
-                        continue;
+                    let applied = conditions_on(plan, input, var);
+                    for condition in conditions_on(plan, other, var) {
+                        if applied.contains(&condition)
+                            || restriction_is_recorded(
+                                plan,
+                                (join_key, which, var, format!("{condition}")),
+                            )
+                        {
+                            continue;
+                        }
+                        // Where the frontier already is, the filter must be
+                        // `Sql` and must render there; elsewhere it is the
+                        // engine's until 3b brings it to rest.
+                        let filter = if plan.nodes[consumer].executor == Executor::Sql {
+                            let Some(rendered) = crate::sparql_rules::render_condition_below(
+                                self.schema,
+                                plan,
+                                input,
+                                &condition,
+                            ) else {
+                                continue;
+                            };
+                            Node::sql(
+                                PlanOp::Filter {
+                                    input,
+                                    condition: rendered,
+                                },
+                                Vec::new(),
+                            )
+                        } else {
+                            Node::engine(
+                                PlanOp::Filter {
+                                    input,
+                                    condition: condition.clone(),
+                                },
+                                Vec::new(),
+                            )
+                        };
+                        placed(plan, Predicate::Condition(condition), filter);
+                        return true;
                     }
-                    // The insertion point: inside the barrier, or above the
-                    // side. Either must be the engine's, or the frontier
-                    // would break.
-                    let (input, consumer) = match &plan.nodes[side].op {
-                        PlanOp::SubSelect { input, .. } => (*input, side),
-                        _ => (side, id),
-                    };
-                    if plan.nodes[consumer].executor != Executor::Engine {
-                        continue;
-                    }
-                    let restriction = Restriction {
-                        var: var.clone(),
-                        class_uri: class_uri.clone(),
-                        at: JoinOccurrence {
-                            node: join_key,
-                            side: which,
-                        },
-                        parent: None,
-                        path: Vec::new(),
-                    };
-                    let obligation = plan.obligations.len();
-                    plan.obligations
-                        .push(Obligation::Boundary(Box::new(restriction)));
-                    let filter = Node::engine(
-                        PlanOp::Filter {
-                            input,
-                            condition: Expr::InClass {
-                                var: var.clone(),
-                                class_uri,
-                            },
-                        },
-                        vec![obligation],
-                    );
-                    insert_between(plan, input, consumer, filter);
-                    // The origin scope of the new obligation: where the
-                    // filter now is.
-                    let filter_id = plan
-                        .nodes
-                        .iter()
-                        .position(|node| node.discharges.contains(&obligation))
-                        .expect("the filter this rule inserted");
-                    let origin = plan.scope_of(filter_id).map(|barrier| plan.key_of(barrier));
-                    plan.origin.push(origin);
-                    return true;
                 }
             }
         }
@@ -591,7 +859,7 @@ impl Rule for SinkLiftedCondition {
 /// |---|---|
 /// | `Filter`, `Bind` (not binding `?v`), `Sort`, `Distinct`, `Reduced` | yes |
 /// | `Project`, `SubSelect` exporting `?v` | yes, to the input; a barrier is a transfer |
-/// | `Join` | yes, to the first side with `?v ∈ guaranteed(side)` |
+/// | `Join` | yes, to the first side with `?v ∈ guaranteed(side)` -- for a row test, the side whose scan of `?v` is visible |
 /// | `LeftJoin` | to the left side only, if `?v ∈ guaranteed(left)` |
 /// | `Union` | to both arms: a split |
 /// | `Minus`, `AntiJoin` | to the left side only |
@@ -602,30 +870,66 @@ impl Rule for SinkLiftedCondition {
 /// Ownership: every node the filter passes must have exactly one consumer,
 /// or the step declines and the restriction stays above it -- still
 /// correct, since every step preserved the multiset.
-pub struct PushRestrictionDown;
+///
+/// **Where a row test comes to rest it becomes SQL.** A class restriction
+/// is read by the fold and never rendered; a row test (`Predicate::
+/// Condition`) is a filter like any other once it can move no further, and
+/// this rule -- not `PushComparisonFilter`, which leaves restriction
+/// filters alone -- flips it to `Sql` when the node below runs in SQL and
+/// the condition renders over the scans visible there. One rule owns the
+/// filter's position, so no schedule can land it above a grouping the walk
+/// would have passed.
+pub struct PushRestrictionDown<'s> {
+    schema: &'s SchemaView,
+}
 
-impl Rule for PushRestrictionDown {
+impl<'s> PushRestrictionDown<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for PushRestrictionDown<'_> {
     fn name(&self) -> &'static str {
         "push_restriction_down"
     }
 
     fn apply(&self, plan: &mut Plan) -> bool {
         for filter in 0..plan.nodes.len() {
-            let Some((var, class_uri)) = restriction_of(plan, filter) else {
+            let Some((claim, var, condition)) = restriction_filter(plan, filter) else {
                 continue;
             };
-            if plan.nodes[filter].executor != Executor::Engine {
-                continue;
-            }
+            let is_class = matches!(condition, Expr::InClass { .. });
             let below = plan.nodes[filter].op.inputs()[0];
             if crate::sparql_rules::consumers_of(plan, below).len() != 1 {
                 continue;
             }
-            let [claim] = plan.nodes[filter].discharges.as_slice() else {
-                continue;
-            };
-            let claim = *claim;
             let below_key = plan.key_of(below);
+            // A row test that sits directly above the frontier and can move
+            // no further along an arm below is at rest; whether it is is
+            // decided after the arms, so a stop is one place.
+            let rest = |plan: &mut Plan| -> bool {
+                if is_class
+                    || plan.nodes[filter].executor == Executor::Sql
+                    || plan.nodes[below].executor != Executor::Sql
+                {
+                    return false;
+                }
+                let Some(rendered) = crate::sparql_rules::render_condition_below(
+                    self.schema,
+                    plan,
+                    below,
+                    &condition,
+                ) else {
+                    return false;
+                };
+                plan.nodes[filter].op = PlanOp::Filter {
+                    input: below,
+                    condition: rendered,
+                };
+                plan.nodes[filter].executor = Executor::Sql;
+                true
+            };
             // Where the filter goes: one target, or one per arm.
             let targets: Vec<NodeId> = match &plan.nodes[below].op {
                 PlanOp::Filter { input, .. }
@@ -642,12 +946,21 @@ impl Rule for PushRestrictionDown {
                 }
                 PlanOp::Group { input, keys, .. } if keys.contains(&var) => vec![*input],
                 PlanOp::Join { left, right, .. } => {
-                    let side = [*left, *right]
-                        .into_iter()
-                        .find(|side| plan.guaranteed(*side).contains(&var));
+                    let side = [*left, *right].into_iter().find(|side| {
+                        plan.guaranteed(*side).contains(&var)
+                            && (is_class
+                                || plan
+                                    .identity_class(self.schema, *side, &var)
+                                    .is_some_and(|class| scan_visible(plan, *side, &var, &class)))
+                    });
                     match side {
                         Some(side) => vec![side],
-                        None => continue,
+                        None => {
+                            if rest(plan) {
+                                return true;
+                            }
+                            continue;
+                        }
                     }
                 }
                 PlanOp::LeftJoin { left, .. } if plan.guaranteed(*left).contains(&var) => {
@@ -655,7 +968,12 @@ impl Rule for PushRestrictionDown {
                 }
                 PlanOp::Minus { left, .. } | PlanOp::AntiJoin { left, .. } => vec![*left],
                 PlanOp::Union { left, right } => vec![*left, *right],
-                _ => continue,
+                _ => {
+                    if rest(plan) {
+                        return true;
+                    }
+                    continue;
+                }
             };
             let is_barrier = matches!(plan.nodes[below].op, PlanOp::SubSelect { .. });
             let is_union = matches!(plan.nodes[below].op, PlanOp::Union { .. });
@@ -675,6 +993,52 @@ impl Rule for PushRestrictionDown {
                 PlanOp::Union { .. } => "split",
                 _ => unreachable!("not a target"),
             };
+            // A filter moved below an `Sql` node sits on an `Sql` input and
+            // must be `Sql` itself, or the frontier is no cut: a row test
+            // renders over the scans visible from its new input, and a
+            // class restriction -- which nothing renders -- declines the
+            // step and stays above the frontier. Below an engine node the
+            // filter stays the engine's.
+            let moved_node =
+                |plan: &Plan, input: NodeId, claims: Vec<ObligationId>| -> Option<Node> {
+                    if plan.nodes[below].executor == Executor::Sql {
+                        let rendered = crate::sparql_rules::render_condition_below(
+                            self.schema,
+                            plan,
+                            input,
+                            &condition,
+                        )?;
+                        Some(Node::sql(
+                            PlanOp::Filter {
+                                input,
+                                condition: rendered,
+                            },
+                            claims,
+                        ))
+                    } else {
+                        Some(Node::engine(
+                            PlanOp::Filter {
+                                input,
+                                condition: condition.clone(),
+                            },
+                            claims,
+                        ))
+                    }
+                };
+            let mut moved: Vec<(NodeId, Node)> = Vec::with_capacity(targets.len());
+            let mut declined = false;
+            for target in &targets {
+                match moved_node(plan, *target, Vec::new()) {
+                    Some(node) => moved.push((*target, node)),
+                    None => {
+                        declined = true;
+                        break;
+                    }
+                }
+            }
+            if declined {
+                continue;
+            }
 
             if is_union {
                 // Split: the parent is discharged at the union, and one
@@ -695,23 +1059,12 @@ impl Rule for PushRestrictionDown {
                 // The union takes the parent's claim; the filter goes.
                 plan.nodes[below].discharges.push(claim);
                 plan.nodes[below].discharges.sort_unstable();
-                let filters: Vec<(NodeId, Node)> = targets
-                    .iter()
+                let filters: Vec<(NodeId, Node)> = moved
+                    .into_iter()
                     .zip(children)
-                    .map(|(target, child)| {
-                        (
-                            *target,
-                            Node::engine(
-                                PlanOp::Filter {
-                                    input: *target,
-                                    condition: Expr::InClass {
-                                        var: var.clone(),
-                                        class_uri: class_uri.clone(),
-                                    },
-                                },
-                                vec![child],
-                            ),
-                        )
+                    .map(|((target, mut node), child)| {
+                        node.discharges = vec![child];
+                        (target, node)
                     })
                     .collect();
                 remove_and_insert_below(plan, filter, below, filters);
@@ -733,13 +1086,10 @@ impl Rule for PushRestrictionDown {
                     }
                 });
             }
-            let moved = Node::engine(
-                PlanOp::Filter {
-                    input: target,
-                    condition: Expr::InClass { var, class_uri },
-                },
-                vec![claim],
-            );
+            let Some((_, mut moved)) = moved.pop() else {
+                unreachable!("one target, one moved filter");
+            };
+            moved.discharges = vec![claim];
             remove_and_insert_below(plan, filter, below, vec![(target, moved)]);
             return true;
         }
@@ -1261,5 +1611,163 @@ mod tests {
             2,
             "the inner star is scanned:\n{plan}"
         );
+    }
+
+    /// The condition the other side's every row satisfies, on the same
+    /// record. Shared by the three shapes below.
+    fn restriction_filters(plan: &Plan) -> Vec<String> {
+        plan.nodes
+            .iter()
+            .filter(|node| {
+                matches!(&node.op, PlanOp::Filter { .. })
+                    && node
+                        .discharges
+                        .iter()
+                        .any(|id| matches!(plan.obligations[*id], Obligation::Boundary(_)))
+            })
+            .map(|node| match &node.op {
+                PlanOp::Filter { condition, .. } => format!("{condition}"),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// **#470 / #466 with an outer restriction.** The body is typed in its
+    /// own domain, so the class adds nothing; what crosses the barrier is
+    /// the outer scan's row test on the shared identity, `kind = GSA`,
+    /// which lands as the body's own filter above its scan. Both the
+    /// mandatory and the `OPTIONAL { { SELECT … } }` spelling; the outcome
+    /// is a `Statement` whose relation reads the restricted class only.
+    #[test]
+    fn an_outer_row_test_crosses_into_a_typed_body() {
+        let schema = test_schema_view();
+        for (spelling, side) in [
+            (
+                "{ SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:documents ?d } GROUP BY ?s }",
+                Side::Right,
+            ),
+            (
+                "OPTIONAL { { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:documents ?d } GROUP BY ?s } }",
+                Side::Right,
+            ),
+        ] {
+            let query = format!(
+                "SELECT ?nm ?n WHERE {{ ?s a asset360:Signal ; asset360:kind <http://ontorail.org/src/Eulynx/GSA> ; asset360:name ?nm . {spelling} }}"
+            );
+            let plan = refined(&query);
+            let found = restrictions(&plan);
+            let [restriction] = found.as_slice() else {
+                panic!("one restriction, the row test:\n{plan}");
+            };
+            assert_eq!((restriction.var.as_str(), restriction.at.side), ("s", side));
+            assert!(
+                matches!(&restriction.predicate, Predicate::Condition(_)),
+                "{restriction}\n{plan}"
+            );
+            // Two filters spell the row test: the outer one and the copy in
+            // the body, both `Sql`, and the copy sits above the body's scan.
+            let filters = restriction_filters(&plan);
+            assert_eq!(filters.len(), 1, "{plan}");
+            assert!(filters[0].contains("kind"), "{filters:?}\n{plan}");
+            assert!(
+                plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+                "{plan}"
+            );
+            assert_eq!(
+                outcome_of(&format!("{PREFIX}{query}"), &schema, None),
+                Outcome::Statement,
+                "{plan}"
+            );
+        }
+    }
+
+    /// The other direction: an untyped outer read beside a sub-select whose
+    /// body filters the identity it exports. The class crosses first (the
+    /// existing 3a), then the body's row test, and the outer scan carries
+    /// both.
+    #[test]
+    fn a_body_row_test_crosses_out_to_the_outer_read() {
+        let plan = refined(
+            "SELECT ?nm WHERE { { SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . FILTER(?len > 2) } } \
+             ?s asset360:name ?nm }",
+        );
+        let found = restrictions(&plan);
+        assert_eq!(found.len(), 2, "class and row test:\n{plan}");
+        assert!(
+            found.iter().any(
+                |r| matches!(&r.predicate, Predicate::Condition(_)) && r.at.side == Side::Right
+            ),
+            "{plan}"
+        );
+        assert_eq!(restriction_filters(&plan).len(), 1, "{plan}");
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "{plan}"
+        );
+    }
+
+    /// What is **not** carried: a row test the other side applies only
+    /// conditionally -- inside its own `OPTIONAL`, in one `UNION` arm --
+    /// a test on another star, and the preserved side of a `LeftJoin`
+    /// (which never receives a restriction). And a body that already
+    /// spells the same test gets no second copy.
+    #[test]
+    fn a_conditional_row_test_stays_on_its_side() {
+        for query in [
+            // The outer test is under the outer's own OPTIONAL.
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm . OPTIONAL { ?s asset360:kind <http://ontorail.org/src/Eulynx/GSA> } \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:documents ?d } GROUP BY ?s } }",
+            // The outer test is in one union arm.
+            "SELECT ?nm ?n WHERE { { ?s a asset360:Signal ; asset360:name ?nm ; asset360:kind <http://ontorail.org/src/Eulynx/GSA> } UNION { ?s a asset360:Signal ; asset360:name ?nm ; asset360:length 3 } \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:documents ?d } GROUP BY ?s } }",
+            // The outer test is on another star.
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm ; asset360:locatedOnTrack ?t . ?t a asset360:Track ; asset360:hasName \"Main\" . \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:documents ?d } GROUP BY ?s } }",
+            // The body already spells the test: no second copy.
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:kind <http://ontorail.org/src/Eulynx/GSA> ; asset360:name ?nm . \
+             { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:kind <http://ontorail.org/src/Eulynx/GSA> ; asset360:documents ?d } GROUP BY ?s } }",
+        ] {
+            let plan = refined(query);
+            assert!(
+                restrictions(&plan)
+                    .iter()
+                    .all(|r| !matches!(&r.predicate, Predicate::Condition(_))),
+                "{query}\n{plan}"
+            );
+        }
+        // The body's test never reaches the preserved side of a left join.
+        let plan = refined(
+            "SELECT ?nm ?n WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             OPTIONAL { { SELECT ?s (COUNT(?d) AS ?n) WHERE { ?s a asset360:Signal ; asset360:kind <http://ontorail.org/src/Eulynx/GSA> ; asset360:documents ?d } GROUP BY ?s } } }",
+        );
+        assert!(restrictions(&plan).is_empty(), "{plan}");
+    }
+
+    /// **#464 with the constant on the element.** The body's `?s` is typed
+    /// by the class restriction, its reads fold into a scan with the
+    /// fan-out, and the constant object on the unnested element becomes a
+    /// `BoundElement` filter above the unnest -- so the block is one
+    /// derived table and the outcome a `Statement`. On the real schema,
+    /// where the element holds the reference (its `isReference` flag is
+    /// not in the fixture; `hasSequenceNumber 1` is the same shape, a
+    /// constant on a slot of the element beside a reference read off it).
+    #[test]
+    fn a_constant_on_an_unnested_element_is_a_row_test_of_the_element() {
+        use crate::sparql_scoper::tests::asset360_fixture_schema_view;
+        let schema = asset360_fixture_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?tn WHERE {{ ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+             OPTIONAL {{ ?s asset360:hasCoveredSection ?cs . ?cs asset360:hasSequenceNumber 1 ; asset360:belongsToTrack ?t ; \
+             asset360:belongsToLine ?line . ?t a asset360:Track ; asset360:typeURI ?tn . \
+             OPTIONAL {{ ?t asset360:refersToLine ?l2 }} }} }}"
+        );
+        assert_eq!(outcome_of(&query, &schema, None), Outcome::Statement);
+        let plan = crate::sparql_plan::plan_query_refined(&query, &schema).unwrap();
+        let rendered = format!("{plan}");
+        assert!(
+            rendered.contains("filter    hasCoveredSection.hasSequenceNumber = '1'"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("all in SQL"), "{rendered}");
     }
 }

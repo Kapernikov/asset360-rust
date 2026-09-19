@@ -4412,10 +4412,9 @@ pub fn inner_join_groups(plan: &Plan) -> Vec<usize> {
                 unite(&mut group, id, *left);
                 unite(&mut group, id, *right);
             }
-            PlanOp::Filter {
-                input,
-                condition: Expr::InClass { .. },
-            } => unite(&mut group, id, *input),
+            PlanOp::Filter { input, .. } if plan.is_restriction_filter(id) => {
+                unite(&mut group, id, *input)
+            }
             _ => {}
         }
     }

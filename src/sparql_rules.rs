@@ -1586,6 +1586,27 @@ fn class_at_path(
     Some(class)
 }
 
+/// Whether a path from a record's root walks through a multivalued hop --
+/// so its end names a value of an *element*, not of the record.
+fn prefix_crosses_a_collection(schema: &SchemaView, class_uri: &str, path: &[String]) -> bool {
+    let Ok(Some(mut class)) = schema.get_class_by_uri(class_uri) else {
+        return false;
+    };
+    for name in path {
+        let Some(slot) = class.slot(&Identifier::Name(name.clone())) else {
+            return false;
+        };
+        if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
+            return true;
+        }
+        let Some(range) = slot.get_range_class() else {
+            return false;
+        };
+        class = range;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Fold a nested match into a path
 // ---------------------------------------------------------------------------
@@ -1870,7 +1891,20 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
     /// obtain a condition and asks it, so a constant no record spells declines
     /// at the same place for this rule as for every other.
     fn condition_for(&self, site: &SubjectSite, predicate: &str, term: &Term) -> Option<Read> {
-        let class = class_at_path(self.schema, &site.class_uri, &site.prefix)?;
+        // The prefix may cross a collection whose element the site's
+        // fan-out made a row of (`subject_site` admits the site only then);
+        // the value is then read off the element, `BoundElement`, as a
+        // variable read of the same slot would be. A reference hop is
+        // still another record.
+        let element_site = prefix_crosses_a_collection(self.schema, &site.class_uri, &site.prefix);
+        let class_uri = if element_site {
+            crate::sparql_scopes::class_at_path_of(self.schema, &site.class_uri, &site.prefix)?
+        } else {
+            class_at_path(self.schema, &site.class_uri, &site.prefix)?
+                .canonical_uri()
+                .to_string()
+        };
+        let class = self.schema.get_class_by_uri(&class_uri).ok().flatten()?;
         let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
         let on_class = class.slot(&Identifier::Name(slot.name.clone()))?;
         // Identity is [`FoldIdentityConstant`]'s, and the two rules have to be
@@ -1895,11 +1929,16 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         // values it holds. That is what makes replacing the match with a
         // filter cardinality-preserving here, and it is the reading the star
         // decomposition's renderer already performs.
-        let reading = if on_class.determine_slot_container_mode() == SlotContainerMode::SingleValue
-        {
-            SlotReading::Column
-        } else {
-            SlotReading::AnyElement
+        let single_valued =
+            on_class.determine_slot_container_mode() == SlotContainerMode::SingleValue;
+        let reading = match (element_site, single_valued) {
+            (false, true) => SlotReading::Column,
+            (false, false) => SlotReading::AnyElement,
+            (true, true) => SlotReading::BoundElement,
+            // A containment test on an element's own collection has no
+            // reading a renderer spells today: the element is a row, and
+            // the third reading nothing renders is its array.
+            (true, false) => return None,
         };
         let mut slot_path = site.prefix.clone();
         slot_path.push(slot.name.clone());
@@ -1923,7 +1962,7 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         Some(Read {
             condition,
             slot: slot.name.clone(),
-            multivalued: reading != SlotReading::Column,
+            multivalued: !single_valued,
         })
     }
 }
@@ -2749,6 +2788,18 @@ impl<'s> PushComparisonFilter<'s> {
     }
 }
 
+/// [`rendered_condition`] over what the `Sql` scans below `base` bind: what
+/// op 3b asks when a row test comes to rest above the frontier
+/// ([`crate::sparql_restrict::PushRestrictionDown`]).
+pub(crate) fn render_condition_below(
+    schema: &SchemaView,
+    plan: &Plan,
+    base: NodeId,
+    condition: &Expr,
+) -> Option<Expr> {
+    rendered_condition(schema, condition, &Visible::below(plan, base))
+}
+
 /// The condition with its variables resolved to slots, when SQL can express
 /// the result.
 ///
@@ -2799,6 +2850,14 @@ impl Rule for PushComparisonFilter<'_> {
             let PlanOp::Filter { input, condition } = &plan.nodes[id].op else {
                 continue;
             };
+            // A boundary restriction's position is op 3b's: it walks the
+            // filter down one operator at a time and flips it where it
+            // rests. Taking it here would land it wherever the frontier
+            // happens to be when this rule runs -- above a grouping the
+            // walk would have passed -- and make the plan the schedule's.
+            if plan.is_restriction_filter(id) {
+                continue;
+            }
             let (input, condition) = (*input, condition.clone());
             let Some(base) = landing_site(plan, id) else {
                 continue;
@@ -4892,7 +4951,7 @@ pub fn tier_one_rules<'a>(
         // pushed down one operator at a time; the fold reads it as the
         // star's type when it reaches the matches.
         Box::new(crate::sparql_restrict::RestrictScopeAtBoundary::new(schema)),
-        Box::new(crate::sparql_restrict::PushRestrictionDown),
+        Box::new(crate::sparql_restrict::PushRestrictionDown::new(schema)),
         // Op 2: a lifted condition the body decides alone moves into it.
         Box::new(crate::sparql_restrict::SinkLiftedCondition),
         // This one knows nothing about a schema graph: it is a semi-join
