@@ -1,6 +1,6 @@
 # A body is a relation: lowering a grouped sub-select and an `OPTIONAL` body as one derived table
 
-Status: **implemented** (revision 10; the human chose not to stage).
+Status: **implemented** (revision 11; the human chose not to stage).
 Items 1–4 of *Staging* are one body of work, in commits titled by item;
 item 0 (the oxigraph backport) is consolidator issue #467 and not here.
 Where building it showed this document wrong or silent, the sections
@@ -93,6 +93,47 @@ naming domain and so admits a row test inside the sub-select's domain
 `isReference true` lowers as one derived table; the top-N
 counter-example and every other `Rejected` row stay refused, each
 still a test.
+
+</details>
+
+<details><summary>What revision 11 changed (consolidator #472): the fallback merge keeps a reading through a collection, and connectivity reads the triples</summary>
+
+Two defects on one shape — #464's block as a *sub-select body* beside
+the outer scan, the track as its own typed scan — both silent about
+the plan's own facts.
+
+* **The fallback merge read an element narrowing as a column.**
+  `keep_what_the_rules_proved` applied precondition 4 (the reading
+  agrees with what the scan holds) to a one-slot path only; a nested
+  path became a scoper `PathFilter`, which carried no reading, and
+  `lower_sql_pass` stated every path filter as `Column` on the
+  argument that the scoper pushes single-valued hops only. True of the
+  scoper's own filters; not of a narrowing the refined plan proved
+  under an unnest (`?cs :isReference true`, a `BoundElement` read of
+  `hasCoveredSection.isReference`). Rendered as the scalar walk it is
+  NULL on the array, the narrowed body fetch held no record, and a
+  query the engine finishes (a `BIND` under an `OPTIONAL` beside the
+  body: two islands) answered 0 rows with a 200. Now `PathFilter`
+  carries `multivalued`, the schema's fact (some hop a list or a
+  mapping, `resolve_column`); the merge refuses a reading that
+  disagrees with it either way, as it does for a column; the lowering
+  reads a multivalued path filter as `AnyElement`; and the scan
+  restates the path in `required_paths`, so a consumer knows which
+  hop holds the elements (the presence is implied by the condition;
+  restating it narrows nothing further).
+* **The connectivity refusal fired before the class could cross.**
+  The same block under `OPTIONAL { { SELECT … } }` with the body's
+  `?s` untyped in its own domain: no star walks the body's path on the
+  recording pass, so `?t__d1` had no edge and was refused as
+  *disconnected* — before the refined plan typed `?s__d1` from the
+  outer restriction (3a) and `resolve` scoped it again with the edge.
+  The refusal is about sharing a variable, and a triple shares its
+  subject with its object whether or not a star walks it yet, so the
+  reachability now includes every builder's subject–object links
+  beside the join edges and the exports. A block that shares nothing
+  is refused as before; one reached only through an untyped subject
+  is judged at `resolve`, where an untyped star is refused as unscoped
+  if the plan did not type it.
 
 </details>
 

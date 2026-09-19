@@ -676,11 +676,21 @@ pub fn lower_sql_pass(
                         enforcement,
                         numeric: path_filter.numeric,
                         optional_side: star.is_optional,
-                        // Only single-valued hops become a path filter, and
-                        // only a single-valued value at the end of one -- the
-                        // scoper leaves an array to the engine, so a path
-                        // condition names a column.
-                        reading: SlotReading::Column,
+                        // The scoper's own path filters walk single-valued
+                        // hops only -- it leaves an array to the engine --
+                        // so those name a column. A narrowing the fallback
+                        // merged from the refined plan may walk a collection
+                        // (`?cs :isReference true` under an unnest), and the
+                        // filter says so: a test over the elements, which as
+                        // a scalar walk is NULL on the array and answered no
+                        // row (#472, pepibru GitLab). The same fact
+                        // `multivalued_fields` decides for a column, one
+                        // level down.
+                        reading: if path_filter.multivalued {
+                            SlotReading::AnyElement
+                        } else {
+                            SlotReading::Column
+                        },
                         broken_out_column,
                     },
                     discharges: Vec::new(),

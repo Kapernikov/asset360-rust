@@ -1756,6 +1756,51 @@ fn keep_what_the_rules_proved(
                 // `numeric_fields` for a nested value.
                 path => {
                     let numeric = crate::sparql_scoper::numeric_at_path(schema, &class_uri, path);
+                    // Precondition 4 for a path: whether the record holds
+                    // several values at it is the schema's fact -- some hop
+                    // a list or a mapping -- and the condition's reading has
+                    // to agree with it. A `Column` reading of a path through
+                    // a collection, or an element reading of a path through
+                    // none, is a condition the lowering would state as the
+                    // wrong test; refused rather than merged, like a column
+                    // read against `multivalued_fields` above.
+                    let Some((_, modes)) =
+                        crate::sparql_terms::resolve_column(schema, &class_uri, path)
+                    else {
+                        out.refused.push(format!(
+                            "n{id}: the schema does not walk ?{}.{}",
+                            condition.star_var,
+                            path.join(".")
+                        ));
+                        continue;
+                    };
+                    let multivalued = modes.iter().any(|mode| {
+                        *mode != linkml_schemaview::slotview::SlotContainerMode::SingleValue
+                    });
+                    let says_several = matches!(
+                        condition.reading,
+                        crate::sparql_ops::SlotReading::AnyElement
+                            | crate::sparql_ops::SlotReading::BoundElement
+                    );
+                    if says_several != multivalued {
+                        out.refused.push(format!(
+                            "n{id}: reads ?{}.{} as {} and the schema holds {} there, so the \
+                             comparison would be against the wrong thing",
+                            condition.star_var,
+                            path.join("."),
+                            if says_several {
+                                "an element"
+                            } else {
+                                "a column"
+                            },
+                            if multivalued {
+                                "several values"
+                            } else {
+                                "one value"
+                            },
+                        ));
+                        continue;
+                    }
                     if let Some(existing) = star
                         .path_filters
                         .iter_mut()
@@ -1770,7 +1815,21 @@ fn keep_what_the_rules_proved(
                             slot_path: path.to_vec(),
                             conditions: vec![condition.condition.clone()],
                             numeric,
+                            multivalued,
                         });
+                    }
+                    // A test over the elements needs its hops named: the
+                    // consumer reads which step holds the elements off the
+                    // scan's `required_paths` (or an unnest, which a fetch
+                    // has none of). The condition requires an element with
+                    // the value, so the presence of the path is implied by
+                    // it -- restating it narrows nothing further.
+                    if multivalued
+                        && let Some(required) =
+                            crate::sparql_scoper::nested_presence_of(schema, &class_uri, path)
+                        && !star.required_paths.contains(&required)
+                    {
+                        star.required_paths.push(required);
                     }
                     out.kept.push(format!(
                         "n{id}: ?{}.{} -- the constraint reaches every answer",
@@ -3581,6 +3640,81 @@ classes:
             vec![crate::sparql_ops::SlotReading::AnyElement],
             "a condition on an array is a containment test: {plan}"
         );
+    }
+
+    /// The same defect one level down: a narrowing on a value *inside a
+    /// collection* -- `?cs asset360:isDirect true` on an unnested element of
+    /// `hasAccessibleTracks` -- proved by the refined plan as a
+    /// `BoundElement` read and merged into the fallback as a path filter,
+    /// which the lowering then read as a column: the scalar walk
+    /// `object_data->'hasAccessibleTracks'->>'isDirect'`, NULL on the
+    /// array, so the narrowed fetch held no record and a sub-select body
+    /// answered 0 rows with a 200 (#472, pepibru GitLab). The path filter
+    /// now carries the schema's fact, the lowering reads it as a
+    /// containment test, and the scan restates the hops so a consumer
+    /// knows which step holds the elements.
+    ///
+    /// Two islands (the body and a `BIND` inside an `OPTIONAL`), so the
+    /// statement declines and the fallback is the route; the body typed
+    /// and untyped in its own domain, because the untyped one answered by
+    /// luck (the engine still held the sections from the outer fetch) and
+    /// the typed one did not.
+    #[test]
+    fn a_narrowing_through_a_collection_keeps_its_element_reading_and_names_the_hops() {
+        use crate::sparql_scoper::tests::asset360_fixture_schema_view;
+        let sv = asset360_fixture_schema_view();
+        for typed in [true, false] {
+            let type_triple = if typed { "?t a asset360:Track . " } else { "" };
+            let query = format!(
+                "{PREFIX}SELECT ?s ?n ?t ?inv WHERE {{ ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+                 {{ SELECT ?s ?t WHERE {{ ?s a asset360:TunnelComplex ; asset360:hasAccessibleTracks ?cs . \
+                 ?cs asset360:isDirect true ; asset360:belongsToTrack ?t . {type_triple}}} }} \
+                 OPTIONAL {{ ?s asset360:typeURI ?nm . BIND(STRAFTER(STR(?nm), \"x\") AS ?inv) }} }}"
+            );
+            let plan = plan_query_refined(&query, &sv).expect("plans");
+            let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
+                panic!("{plan}");
+            };
+            assert_eq!(narrowings.kept.len(), 1, "typed={typed}: {plan}");
+            let Some(PassKind::Sql(sql)) = plan.passes.first().map(|pass| &pass.kind) else {
+                panic!("{plan}");
+            };
+            let filters: Vec<(String, crate::sparql_ops::SlotReading)> = sql
+                .ops
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    crate::sparql_ops::Op::Filter {
+                        slot_path, reading, ..
+                    } => Some((slot_path.join("."), *reading)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                filters,
+                vec![(
+                    "hasAccessibleTracks.isDirect".to_owned(),
+                    crate::sparql_ops::SlotReading::AnyElement
+                )],
+                "typed={typed}: a condition through a list is a test over the elements: {plan}"
+            );
+            let restated = sql.ops.nodes.iter().any(|node| {
+                matches!(&node.op, crate::sparql_ops::Op::Scan { star_var, required_paths, .. }
+                if star_var == "s__d1"
+                    && required_paths.iter().any(|path| {
+                        path.slot_path == ["hasAccessibleTracks", "isDirect"]
+                            && path.containers
+                                == [
+                                    crate::sparql_pushdown::Container::List,
+                                    crate::sparql_pushdown::Container::Single
+                                ]
+                    }))
+            });
+            assert!(
+                restated,
+                "typed={typed}: the body's scan names the hops the condition walks: {plan}"
+            );
+        }
     }
 
     /// **The refusal half, and it is the half that matters.**
