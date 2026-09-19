@@ -104,7 +104,7 @@ pub type ObligationId = usize;
 /// having to split a claim. Finer than a conjunct would let a pass discharge
 /// half a comparison, which "exactly once" cannot check for no benefit anyone
 /// has needed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Obligation {
     /// `?s a asset360:Signal` -- the pattern that scopes a subject to a class.
     Type { subject: String, class_iri: String },

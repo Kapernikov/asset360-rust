@@ -77,10 +77,13 @@ pub fn plan_to_algebra(plan: &Plan, schema: &SchemaView, node: NodeId) -> Option
 struct Translation<'a> {
     plan: &'a Plan,
     schema: &'a SchemaView,
-    /// `(star, path)` → the variable that reads it, once the scan or unnest
+    /// `(scan, path)` → the variable that reads it, once the scan or unnest
     /// that binds it has been translated. Filled bottom-up: a scan is
-    /// translated before any condition above it.
-    bindings: HashMap<(String, Vec<String>), String>,
+    /// translated before any condition above it. Keyed by the scan node and
+    /// not the star's name: two scopes scan one variable as two scans, and
+    /// a condition in one must read that scope's own binding -- a name
+    /// shared across a sub-select's barrier is unbound inside it.
+    bindings: HashMap<(NodeId, Vec<String>), String>,
     fresh: usize,
 }
 
@@ -367,8 +370,7 @@ impl Translation<'_> {
                             )?);
                         }
                         (Some(var), SlotPresence::Required, false) => {
-                            self.bindings
-                                .insert((star_var.clone(), slot.path.clone()), var.clone());
+                            self.bindings.insert((node, slot.path.clone()), var.clone());
                             required.extend(self.read(
                                 class_uri,
                                 star_var,
@@ -378,8 +380,7 @@ impl Translation<'_> {
                             )?);
                         }
                         (Some(var), SlotPresence::Optional, false) => {
-                            self.bindings
-                                .insert((star_var.clone(), slot.path.clone()), var.clone());
+                            self.bindings.insert((node, slot.path.clone()), var.clone());
                             optional.push(self.read(
                                 class_uri,
                                 star_var,
@@ -395,8 +396,7 @@ impl Translation<'_> {
                         (None, SlotPresence::Required, false) => {
                             let var =
                                 self.fresh_var(&format!("{star_var}_{}", slot.path.join("_")));
-                            self.bindings
-                                .insert((star_var.clone(), slot.path.clone()), var.clone());
+                            self.bindings.insert((node, slot.path.clone()), var.clone());
                             required.extend(self.read(
                                 class_uri,
                                 star_var,
@@ -449,6 +449,7 @@ impl Translation<'_> {
                 presence,
             } => {
                 let inner = self.pattern(*input)?;
+                let scan = self.scan_of(star_var, node)?;
                 let class_uri = self.class_of_scan(star_var, node)?;
                 let mut counter = 100;
                 // A nested fan-out reads off the outer element's variable,
@@ -457,7 +458,7 @@ impl Translation<'_> {
                     .rev()
                     .find_map(|cut| {
                         self.bindings
-                            .get(&(star_var.clone(), slot_path[..cut].to_vec()))
+                            .get(&(scan, slot_path[..cut].to_vec()))
                             .cloned()
                             .and_then(|bound| {
                                 class_at_path_of(self.schema, &class_uri, &slot_path[..cut])
@@ -472,8 +473,7 @@ impl Translation<'_> {
                     TermPattern::Variable(Variable::new_unchecked(var.clone())),
                     &mut counter,
                 )?;
-                self.bindings
-                    .insert((star_var.clone(), slot_path.clone()), var.clone());
+                self.bindings.insert((scan, slot_path.clone()), var.clone());
                 let read = GraphPattern::Bgp { patterns: triples };
                 let mut pattern = match presence {
                     SlotPresence::Required => GraphPattern::Join {
@@ -505,8 +505,7 @@ impl Translation<'_> {
                             self.fresh_var(&format!("{var}_{}", path[slot_path.len()..].join("_")))
                         }
                     };
-                    self.bindings
-                        .insert((star_var.clone(), path.clone()), target.clone());
+                    self.bindings.insert((scan, path.clone()), target.clone());
                     let mut counter = 400 + self.fresh;
                     let triples = self.read(
                         element_class,
@@ -588,6 +587,22 @@ impl Translation<'_> {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    /// The scan of `star` visible from `at`.
+    fn scan_of(&self, star: &str, at: NodeId) -> Option<NodeId> {
+        self.plan
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(id, node)| match &node.op {
+                PlanOp::Scan { star_var, .. }
+                    if star_var == star && self.plan.feeds_visibly(id, at) =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
     }
 
     /// The class the scan of `star` visible from `at` reads.
@@ -703,8 +718,23 @@ impl Translation<'_> {
         at: NodeId,
         reads: &mut Vec<TriplePattern>,
     ) -> Option<String> {
-        if let Some(var) = self.bindings.get(&(star.to_owned(), path.to_vec())) {
-            return Some(var.clone());
+        let scan = self.scan_of(star, at)?;
+        if let Some(var) = self.bindings.get(&(scan, path.to_vec())) {
+            // A binding is reused only where it is still in scope: a
+            // projection or a grouping between the scan and `at` drops it,
+            // and a condition written on the dropped name tests unbound. A
+            // single-valued slot read again is the same triple joined
+            // again, so a fresh read is the same answer; a bound element
+            // has no second read (it is the fan-out's row) and is reused
+            // where it was bound.
+            let visible = self.plan.nodes[at]
+                .op
+                .inputs()
+                .iter()
+                .any(|input| self.plan.variables_of(*input).contains(var));
+            if visible || reading != SlotReading::Column || at == scan {
+                return Some(var.clone());
+            }
         }
         let class_uri = self.class_of_scan(star, at)?;
         match reading {
@@ -718,8 +748,7 @@ impl Translation<'_> {
                     TermPattern::Variable(Variable::new_unchecked(var.clone())),
                     &mut counter,
                 )?);
-                self.bindings
-                    .insert((star.to_owned(), path.to_vec()), var.clone());
+                self.bindings.insert((scan, path.to_vec()), var.clone());
                 Some(var)
             }
             // A read *through* the element the fan-out bound: the longest
@@ -727,7 +756,7 @@ impl Translation<'_> {
             SlotReading::BoundElement => {
                 let (prefix, element) = (0..path.len()).rev().find_map(|cut| {
                     self.bindings
-                        .get(&(star.to_owned(), path[..cut].to_vec()))
+                        .get(&(scan, path[..cut].to_vec()))
                         .map(|var| (cut, var.clone()))
                 })?;
                 let element_class = self.class_at(&class_uri, &path[..prefix])?;
@@ -740,8 +769,7 @@ impl Translation<'_> {
                     TermPattern::Variable(Variable::new_unchecked(var.clone())),
                     &mut counter,
                 )?);
-                self.bindings
-                    .insert((star.to_owned(), path.to_vec()), var.clone());
+                self.bindings.insert((scan, path.to_vec()), var.clone());
                 Some(var)
             }
             // Some element of the collection: a test the statement makes
@@ -1173,6 +1201,14 @@ mod equivalence {
             ("REDUCED ?n", "?s a asset360:Signal . ", ""),
             ("?s ?n", "?s a asset360:Signal . ", " FILTER(?n > 1)"),
             ("?s ?nm", "", " ?s asset360:name ?nm ."),
+            // An outer row test on the shared identity, as a constant and
+            // as a `FILTER`: op 3a carries it into a typed body.
+            ("?s ?n", "?s a asset360:Signal ; asset360:length 3 . ", ""),
+            (
+                "?s ?n",
+                "?s a asset360:Signal ; asset360:length ?l . FILTER(?l > 2) ",
+                "",
+            ),
         ];
         for (select, body) in &bodies {
             for (outer_select, before, after) in &outers {
@@ -1197,6 +1233,9 @@ mod equivalence {
             "?s asset360:locatedOnTrack ?tr . ?tr a asset360:Track ; asset360:hasName ?tn . OPTIONAL { ?tr asset360:rsmName ?rn }",
             "?s asset360:locatedOnTrack ?tr . ?tr a asset360:Track ; asset360:hasName \"Main\"",
             "?s asset360:documents ?d . ?d asset360:title ?t",
+            // A constant on the unnested element, alone and beside a read.
+            "?s asset360:documents ?d . ?d asset360:title \"One\"",
+            "?s asset360:documents ?d . ?d asset360:title \"One\" ; asset360:docId ?id",
             "?s a asset360:Signal ; asset360:length ?len . FILTER(?len > 2)",
             "?s asset360:name ?nm . FILTER(?nm = \"Alpha\")",
         ] {

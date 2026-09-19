@@ -1,14 +1,100 @@
 # A body is a relation: lowering a grouped sub-select and an `OPTIONAL` body as one derived table
 
-Status: **implemented on this branch** (revision 9; the human chose not
-to stage). Items 1–4 of *Staging* are one body of work, in commits
-titled by item; item 0 (the oxigraph backport) is consolidator issue
-#467 and not here. Where building it showed this document wrong or
-silent, the section below says what changed and the text is amended in
-place; nothing diverges silently. The consolidator side (contract
-check, the new operator renderings, the `SELECT DISTINCT e.value`
-structure-dedup fix, pin bump) is a second MR after a release — built
-against this branch unreleased, which is what revision 9 records.
+Status: **implemented** (revision 10; the human chose not to stage).
+Items 1–4 of *Staging* are one body of work, in commits titled by item;
+item 0 (the oxigraph backport) is consolidator issue #467 and not here.
+Where building it showed this document wrong or silent, the sections
+below say what changed and the text is amended in place; nothing
+diverges silently. The consolidator side (contract check, the new
+operator renderings, the `SELECT DISTINCT e.value` structure-dedup fix,
+pin bump) shipped as a second MR after a release — built against the
+branch unreleased, which is what revision 9 records. Revision 10 is
+the last deferred piece, consolidator issue #471: op 3a widened from
+the class to the other side's row tests, and the fold under it
+finishing for a constant object on an element.
+
+<details><summary>What revision 10 changed (consolidator #471): op 3a carries a row test, the fold takes a constant on an element</summary>
+
+Two gaps revision 8 recorded as built, both closed here and both
+amended below in place.
+
+* **Op 3a carries the other side's row tests, not the class alone.**
+  As built through revision 9, `RestrictScopeAtBoundary` placed
+  `?v ∈ Identity(class)` and nothing else, so a body already typed in
+  its own domain (#466's, #470's `?asset a CEA … GROUP BY ?asset`) got
+  nothing from the outside and read the whole class where the outer
+  scan read 130 tunnels. A `Restriction` now carries a `Predicate`:
+  `Class(uri)`, as before, or `Condition(expr)` — a filter condition
+  the other side applies to *every* row it hands the join
+  (`conditions_on`: the record predicates of the filters on every path
+  from a scan of `?v` up to the side's root, through the operators
+  that pass their input's rows on — its table is in *Op 3a*) and that
+  reads nothing but `?v`'s own record (`is_record_predicate`: `Column`
+  readings of `?v`'s slots, literals, comparisons, `IN`, `AND`/`OR`/
+  `NOT`; never a variable, a function, a bound element, a containment
+  test or a pattern). The semi-join proof is the same sentence with one
+  more clause: every `?v` the other side carries satisfies the test,
+  and a test with one value per record says the same of `?v` on either
+  side. The row-test arm fires only once the side already produces
+  `?v` as `Identity(class)` with its scan visible at the insertion
+  point — a test on a record needs the record's scan to land on, and
+  the oracle reads it back through that scan — so the class arm and
+  the row-test arm are one rule in two stages, and a body the user
+  already restricted by hand gets no second copy (`applied` in the
+  rule). One obligation per predicate, keyed by its text; the ledger
+  stays append-only.
+* **Op 3b brings a row test to rest and flips it.** A class
+  restriction is read by the fold and never rendered; a row test is a
+  filter like any other once it can move no further, and 3b — not
+  `PushComparisonFilter`, which now leaves every restriction filter
+  alone — flips it to `Sql` when the node below runs in SQL and the
+  condition renders over the scans visible there. One rule owns the
+  filter's position, which is what keeps the plan the plan's and not
+  the schedule's: a row test above a keyed `Group` is passed below it
+  before it is rendered, never rendered above it. At a `Join` a row
+  test goes to the side whose scan of `?v` is visible (a class
+  restriction still takes the first side that guarantees `?v`), and a
+  filter moved below an `Sql` node is `Sql` on its new input or the
+  step declines. `inner_join_groups` unites every restriction filter
+  with its input, not only a class one, so a row test between the
+  class restriction and the matches does not hide the matches from the
+  fold.
+* **A constant object on an unnested element is a `BoundElement`
+  filter.** Revision 8 recorded "the restriction folds only with a
+  variable-object read beneath" — #464's `?cs :isReference true` left
+  the block on the engine as three islands. The fold was never the
+  problem: `ConstantObjectBecomesFilter` resolved the element's site
+  through `subject_site` and then declined it in `condition_for`,
+  whose `class_at_path` refuses a collection hop. It now walks the
+  prefix with `class_at_path_of` when the prefix crosses a collection
+  (the site exists only when that collection's fan-out is below the
+  join, so the element is a row there) and reads the slot as
+  `BoundElement`, the reading a variable read of the same slot already
+  had; the existence half is the nested path, single-valued. A
+  containment test on an element's own collection (a multivalued slot
+  off an element) still declines: the element is a row, and the third
+  reading nothing renders is its array.
+* **The oracle keyed a slot's binding by the star's name.** Two scopes
+  scanning one variable are two scans, and a condition inside a
+  sub-select that reused the outer scope's variable tested unbound; and
+  a binding reused above a `GROUP BY` that dropped it did the same.
+  `plan_to_algebra` now keys bindings by the scan node, and reuses a
+  `Column` binding only where the variable is still in scope at the
+  condition (a single-valued slot read again is the same triple joined
+  again). The grammar gains the outer row test as a constant and as a
+  `FILTER`, and the constant on an element alone and beside a read.
+
+What this changes for the three user shapes, on the consolidator side:
+#470's grouped sub-select under an outer tunnel restriction reads the
+body over the restricted class, as a derived table on the statement
+route and — through `keep_what_the_rules_proved`, which is local to the
+naming domain and so admits a row test inside the sub-select's domain
+— as a narrowed star on the fetch route; #464's `OPTIONAL` with
+`isReference true` lowers as one derived table; the top-N
+counter-example and every other `Rejected` row stay refused, each
+still a test.
+
+</details>
 
 <details><summary>What the consolidator renderer changed (revision 9), two points</summary>
 
@@ -124,7 +210,10 @@ sub-select 1)`.
   classes"), is not an absorb shape (`only_reference_reads &&
   absorb_reference_shape`, `single_read_body`: the rule would change
   the SQL of a query the absorb rules already serve), and the consumer
-  the filter is inserted under is a scope root (`[E]`).
+  the filter is inserted under is a scope root (`[E]`). *Revision 10:*
+  those are the **class** arm's preconditions; the **row-test** arm
+  (*What revision 10 changed*) fires once the side produces `?v` as
+  the identity of that class, and needs none of them.
 * **A restriction 3b cannot carry to a scan is an engine node**, not an
   `IN (SELECT …)` rendering: `Expr::InClass` becomes `EXISTS { ?v a
   <C> }` on the engine leg and the row stays whichever outcome the rest
@@ -133,7 +222,11 @@ sub-select 1)`.
   `FoldMatchesIntoScan` takes an `InClass` filter as the star's type
   source and reroutes the filter's consumers to its input; with only
   constant-object reads under it there is no slot to fold and the rule
-  declines rather than orphan the join.
+  declines rather than orphan the join. *Revision 10:* this was read
+  as the reason #464's `isReference true` block stayed on the engine;
+  it was not — the body has a variable-object read (`hasCoveredSection
+  ?cs`) and folds, and it was the constant on the *element* that
+  declined, in `ConstantObjectBecomesFilter`. Closed there.
 * **The 3b log is a `Display` without the path:** the rule-order test
   compares printouts, and two schedules that reach one plan by different
   transfers must print the same.
@@ -1542,11 +1635,44 @@ and they get two rules.
 **Match.** A subtree *S* that is a side of a `Join`, or the **right**
 side of a `LeftJoin`, with `?v ∈ on`; `?v ∈ guaranteed(S.root)` and
 `?v ∈ guaranteed(other side)`; `term_of(other side, ?v) =
-Identity(class)`; `restriction_is_implied(S, ?v, class)` is false —
-no `o_boundary` with this canonical key in the ledger, and *S*'s root
-does not already produce `?v` as `Identity(class)`, guaranteed (see
-*Evidence that survives rewriting*); and **that `Join`/`LeftJoin` is
-*S*'s only consumer**. *S* is usually an `Exporting` scope — the sub-query beside
+Identity(class)`; **that `Join`/`LeftJoin` is *S*'s only consumer**;
+and a *predicate* of `?v` the other side proves and *S* does not yet
+carry. Two predicates, one rule (revision 10):
+
+* **the class**, `?v ∈ Identity(class)`, when
+  `restriction_is_implied(S, ?v, class)` is false — no `o_boundary`
+  with this canonical key in the ledger, and *S*'s root does not
+  already produce `?v` as `Identity(class)`, guaranteed (see *Evidence
+  that survives rewriting*);
+* **a row test**, once *S* produces `?v` as `Identity(class)` with a
+  scan of it visible at the insertion point: each condition *c* in
+  `conditions_on(other side, ?v)` — the record predicates of the
+  filters on every path from a scan of `?v` up to the other side's
+  root, through the operators that pass every input row on (the table
+  below) — that *S* does not already apply (`conditions_on(S, ?v)`)
+  and the ledger does not hold. A **record predicate** reads nothing
+  but `?v`'s own record: `Column` readings of `?v`'s slots (a
+  single-valued path from the record root), literals, comparisons,
+  `IN`, `AND`/`OR`/`NOT`. Not a variable (not a column), not a
+  function (its arguments' presence is not audited), not a
+  `BoundElement` (a row of the fan-out, not the record), not a
+  containment test (`AnyElement`, which the oracle cannot yet spell
+  back), not a pattern, and not a class restriction (its own arm).
+
+  | operator on the way from the scan of `?v` to the other side's root | every row above satisfies the filters below it? |
+  |---|---|
+  | `Filter`, `Sort`, `Distinct`, `Reduced`, `Slice`, `Unnest` | yes: a subset, an order, a dedup, a fan-out |
+  | `Bind` not binding `?v` | yes |
+  | `Project`, `SubSelect` keeping `?v` | yes |
+  | `Group` with `?v` among its keys | yes: every group is rows of one `?v` |
+  | `Join` | yes, from each side that guarantees `?v` |
+  | `LeftJoin`, `Minus`, `AntiJoin` | from the left side only |
+  | `Union`, a `Bind` of `?v`, a keyless `Group`, anything else | **stop**: the rows above are not all rows below |
+
+  A row test inside the other side's own `OPTIONAL` or in one arm of
+  its `UNION` therefore never crosses (it decides a binding, not which
+  `?v` reach the join), and the same table read from *S*'s side is
+  what says a test is already applied. *S* is usually an `Exporting` scope — the sub-query beside
 a typed outer read — but the proof is about a join side, not a scope
 root, so it is also the **other** direction: the outer `?s :hasName
 ?n` beside `{ SELECT ?s WHERE { ?s a :Signal } … LIMIT 3 }` is a join
@@ -1594,7 +1720,10 @@ a scope boundary stays identifiable by its node kind rather than by
 whatever operator happens to be on top; and because the barrier wraps
 the modifiers, the filter lands *above* the sub-query's `Slice` and
 `Distinct`, where the semi-join proof is made, and 3b meets the `Slice`
-going down. Revision 2 wrote `S.root := Filter(S.root, …)`, which would
+going down. A row test is inserted `Sql` where the frontier already is
+(the barrier is pushed, so the filter must render there and does, over
+the same class) and the engine's elsewhere; 3b flips it where it comes
+to rest. Revision 2 wrote `S.root := Filter(S.root, …)`, which would
 have put a filter above the barrier and broken op 4's match; revision 3
 wrote this edit against today's tree, where the barrier is the bare
 projection and the same edit lands *below* the limit — round 3's
@@ -1618,15 +1747,26 @@ so restricting the *right* relation cannot delete or alter a left row,
 while restricting the *left* relation would delete preserved rows. Every
 `?v` the other side carries is an IRI of `class` (`term_of`), bound in
 every row (`guaranteed`); records of one URI in two classes do not exist
-(the identifier column is the table's key). So the filter removes only
-rows that joined nothing. This is `ValuesNarrowTheJoinedScan`'s argument
+(the identifier column is the table's key). And every `?v` the other
+side carries satisfies each row test on the way to its root (the table
+above: every operator passed keeps only rows that passed the filter);
+a record predicate has one value per record, read off the same JSON
+row by either scan, so it says the same of `?v` on *S*'s side. So the
+filter — the class, or the test — removes only rows that joined
+nothing. This is `ValuesNarrowTheJoinedScan`'s argument
 with a scan in place of the `VALUES` block, and it is made at the root of
 *S*, where the relation is complete.
 
 **What it declines.** The left side of a `LeftJoin`; `Minus` and
 `AntiJoin` (a `MINUS` keeps rows with *no* partner, so shrinking the right
 side widens the answer); a `Union` arm as a side (the arm is not the
-relation the join sees); a `?v` either side binds optionally.
+relation the join sees); a `?v` either side binds optionally; a row test
+the other side applies conditionally, on another star, on an element,
+or through a function; and a row test for a side whose `?v` is a
+relation column of a nested barrier with no scan of its own visible
+(the nested case of the table below) — the class still crosses there,
+the test does not, and the nested barriers' own joins carry nothing
+across because neither side filters.
 
 #### Op 3b — `PushFilterThroughOperator` *(one rule per operator; the family exists)*
 
@@ -1641,7 +1781,7 @@ the ones that *stop* are visible:
 |---|---|
 | `Filter`, `Bind` (not binding `?v`), `Sort`, `Distinct`, `Reduced` | yes: a row test commutes with another row test, with a binding it does not read, with an order, and with dedup |
 | `Project`, `SubSelect` exporting `?v` | yes, to the input |
-| `Join` | yes, to **each** side that has `?v ∈ guaranteed(side)`; a side where `?v` is not guaranteed keeps rows whose `?v` is unbound, which the filter must not test |
+| `Join` | yes, to **each** side that has `?v ∈ guaranteed(side)`; a side where `?v` is not guaranteed keeps rows whose `?v` is unbound, which the filter must not test. A row test goes to the side whose scan of `?v` is visible — on a side that binds `?v` as a slot (the reference edge's other end) it would never render — and stops above the join when neither has one |
 | `LeftJoin` | to the **left** side only, and only if `?v ∈ guaranteed(left)`; never to the right (that deletes bindings, not rows) |
 | `Union` | to both arms, each on its own guarantee |
 | `Minus`, `AntiJoin` | to the left side only |
@@ -1649,6 +1789,20 @@ the ones that *stop* are visible:
 | `Group` **without `?v` as a key** (a keyless aggregate, or `?v` only inside a measure) | **stop.** The aggregate's value depends on the rows removed |
 | `Slice` | **stop.** Which rows the offset/limit keep depends on the rows removed — the counter-example above |
 | `Path`, `Service`, `Opaque` | stop |
+
+**Where a row test comes to rest it becomes SQL** (revision 10). A class
+restriction is read by the fold and never rendered. A row test is a
+filter like any other once it can move no further, and 3b — not
+`PushComparisonFilter`, which leaves every restriction filter alone —
+flips it to `Sql` when the node below runs in SQL and the condition
+renders over the scans visible there. One rule owns the filter's
+position: taken by the comparison rule it would land wherever the
+frontier happened to be when that rule ran, above a keyed `Group` the
+walk would have passed, and the plan would be the schedule's. The same
+holds on the way down: a filter moved below an `Sql` node is `Sql` on
+its new input (it renders there or the step declines, which for a class
+restriction — that nothing renders — means it stays above the frontier),
+and below an engine node it stays the engine's.
 
 The walk records each step as the rule that took it, **on the obligation**:
 `o_boundary` carries a `path: Vec<Step>`, one `Step { rule, node:
@@ -2063,9 +2217,15 @@ and is guaranteed there (a scan identity, through a keyed `Group` whose
 key it is, through a projection that keeps it), `?trackQty` to a `COUNT`
 measure, guaranteed → `n6 [S]`.
 Op 5: `n1`'s `term_of(?a) = Identity(CEA)`, guaranteed; `n6`'s column says
-the same; one class → `n7 [S]`, key recorded. (Op 3a does not fire: S1
-already scans `?a` as CEA, so a restriction to CEA at its root adds
-nothing — `restriction_is_implied`, arm (b).) `PushProjection`: no `Group` **in the outer
+the same; one class → `n7 [S]`, key recorded. (Op 3a's class arm does
+not fire: S1 already scans `?a` as CEA, so a restriction to CEA at its
+root adds nothing — `restriction_is_implied`, arm (b). Its **row-test
+arm** does, from revision 10: `n1`'s `hasCivilEngineeringAssetType =
+<Tunnel>` is a record predicate on `?a` that every outer row satisfies,
+so `?a.hasCivilEngineeringAssetType = <Tunnel>` is placed at S1's root,
+3b passes it through the projection and the keyed `Group` to rest above
+`n3`, and the derived table below reads 130 tunnels' sections, not
+20 517 assets' — consolidator #470.) `PushProjection`: no `Group` **in the outer
 scope** (the one in S1 is behind a pushed barrier), body `[S]`, both
 projected variables readable (`?name` a column of `n0`, `?trackQty` a
 relation column) → `n8 [S]`. Every node `[S]`, one island per scope,
@@ -2079,6 +2239,7 @@ JOIN (
   FROM golden_records t1
   CROSS JOIN LATERAL jsonb_array_elements(t1.object_data->'hasCoveredSection') WITH ORDINALITY AS e(value, ordinal)
   WHERE t1.asset_type = 'CivilEngineeringAsset'
+    AND t1.object_data->>'hasCivilEngineeringAssetType' = '…Tunnel'
   GROUP BY t1.asset360_uri
 ) q0 ON q0.a = t0.asset360_uri
 WHERE t0.asset_type = 'CivilEngineeringAsset'
@@ -2171,7 +2332,13 @@ With the vocabulary:
    with `unnest hasCoveredSection as ?cs`, `?cs`'s three reads as element
    paths (`hasCoveredSection[each].isReference` etc.). `FoldMatchesIntoScan`
    folds `n5`–`n7` into `scan :Track as ?track`. `ConstantObjectBecomesFilter`
-   makes `isReference = true` a `BoundElement` filter above the unnest.
+   makes `isReference = true` a `BoundElement` filter above the unnest
+   (as built from revision 10: through revision 9 its `condition_for`
+   refused the collection hop and the block stayed on the engine as
+   three islands — consolidator #464, #471). With the outer
+   `belongsToSubZone <Z>` beside it, op 3a's row-test arm then places
+   `?a.belongsToSubZone = <Z>` at S1's root too, and 3b brings it to
+   rest above the body's scan.
 3. **The element-held edge** lets `PushReferenceJoin` push `n8`'s join on
    `?track` between the element and the Track scan.
 4. **The nested `OPTIONAL`, recursively.** Op 1 has already wrapped
@@ -2290,6 +2457,7 @@ proposed suite.
 | `{ SELECT ?s WHERE { ?s a :Signal } ORDER BY ?s LIMIT 3 } ?s a :Signal ; :hasName ?n` — top-N, then read, **typed in both scopes** | `PushProjection` and the sort/slice rules in the scope, 4, 5 | `JOIN (SELECT … ORDER BY … LIMIT 3) q ON q.s = t0.asset360_uri` — **`Statement`** (MR1) |
 | the same with the outer read **untyped** (`… } ?s :hasName ?n`) | 3a on the *outer* side (the relation column is `Identity(Signal)`, guaranteed), 3b through nothing, fold; then 4, 5 | the same statement — **`Statement`** in the 3a/3b MR. In MR1 the outer domain leaves `?s` untyped, `resolve` finds no `Scan` for it, and the outcome is **`Rejected`** (`query_unscoped`, naming the outer `?s`); today's fallback answers it **wrong** (the scoper merges the outer read into the inner star, so the fetch is Signals *with a name* and the top 3 are ranked over the wrong universe). Test 10 |
 | `OPTIONAL { { SELECT ?a (COUNT(?cs) AS ?n) … GROUP BY ?a } }` — #466 with zeros | `PushGrouping` in the scope, 4, 5 (left) | `LEFT JOIN (grouped) q`, `?n` unbound for a tunnel with none — **`Statement`** (MR1) |
+| `?a a :CEA ; :hasCivilEngineeringAssetType <Tunnel> . { SELECT ?a (COUNT(?cs) AS ?n) WHERE { ?a a :CEA ; :hasCoveredSection ?cs } GROUP BY ?a }` — #470: the body typed in its own domain, the **outer row test** on the shared identity; also under `OPTIONAL { { … } }`, and the mirror `{ SELECT ?s WHERE { ?s a :Signal ; :length ?l FILTER(?l > 2) } } ?s :name ?nm` where the body's test crosses **out** to the untyped outer read after its class | 3a's row-test arm (revision 10), 3b through the projection and the keyed `Group` to rest above the scan, then 4, 5 | the derived table's `WHERE` carries the test; the body reads the restricted class — **`Statement`**; on the fetch route the sub-select's star is narrowed the same way (`keep_what_the_rules_proved` is local to the naming domain). A test the outer side applies under its own `OPTIONAL`, in one `UNION` arm, on another star or on an element stays where it is, and a body that already spells it gets no copy — each a test |
 | `OPTIONAL { ?s :ref ?t . ?t a T ; :x ?p ; :y ?q }` — 28d's declined two-read over a reference | 1, 3a/3b (the body's `?s` has no local type; typed from the preserved side), `PushReferenceJoin`, 4, 5 | `LEFT JOIN (SELECT … FROM t1 JOIN t2 …) q` — **`Statement`** after MR3; **`Fetch`** before (as today) |
 | `OPTIONAL { ?s :ref ?t . ?t a T . FILTER(?t.x > 5) }` — the lifted condition | 1, 2, then as above | condition in the derived table's `WHERE` — **`Statement`** after MR3; **`Fetch`** before |
 | `{ SELECT (COUNT(*) AS ?total) WHERE { ?s a :Signal } } ?s a :Signal ; :hasName ?n` — a scalar beside every row | `PushGrouping` in the scope (no keys), 4; the outer join has `on = []` | `CROSS JOIN (SELECT count(*) …) q` — op 5 with an empty key is a cross join, which is what a natural join on no variables is; worth its own row in the tests — **`Statement`** (MR1) |
@@ -2333,6 +2501,13 @@ Each is a precondition of one op, and the plan printout names the node.
 * **A boundary restriction whose path meets a shared node**: op 3b
   declines the step (ownership along the path); the restriction stays
   above the shared node, correct, and the printout names it.
+* **A row test that is not a record predicate, or not applied to every
+  row** (revision 10): a test under the other side's `OPTIONAL` or in
+  one `UNION` arm, on an element of its fan-out, on another star,
+  through a function, or a containment test on a collection: op 3a's
+  row-test arm does not carry it. The class still crosses; the body
+  reads the whole class under the test it did not get, which is what it
+  did before. Widening: `AnyElement` once the oracle can spell it back.
 * **A sub-query whose star has no class in its own domain** (a private
   inner variable, whatever its name; an exported one that only the
   outside types, until the 3a/3b MR's transfer proof reaches its scan):
@@ -2383,7 +2558,11 @@ test framework's convenience, not the semantics.
    of three slots (all unbound together); three reference sections (three
    rows); the duplicate array entry; the nested `OPTIONAL` bound alone; the
    outer `FILTER` on a relation column; the lifted condition sunk; the
-   scalar sub-select cross join; the top-N-then-read.
+   scalar sub-select cross join; the top-N-then-read; (revision 10) the
+   outer row test crossing into a typed body, mandatory and under
+   `OPTIONAL`, and out to an untyped outer read; the four tests that do
+   not cross; the constant on an unnested element as a `Statement` on
+   the real schema.
 2. **Property-style**, in the spirit of `the_rule_order_does_not_decide_the_fixpoint`:
    generate bodies from a small grammar — a driving class; 0–2 reads of it;
    an optional or mandatory array hop with 1–3 element reads; an optional
@@ -2398,7 +2577,10 @@ test framework's convenience, not the semantics.
    observers, each a `demand` arm); **a two-level array hop**
    (`parts/children`) with 1–2 element reads; **nesting** one generated
    body inside another, one level; placed as a mandatory sub-select, an
-   `OPTIONAL` body, or `OPTIONAL { { SELECT … } }`. The seed has an
+   `OPTIONAL` body, or `OPTIONAL { { SELECT … } }`; (revision 10) an
+   outer row test on the shared identity as a constant and as a
+   `FILTER`, and a constant on the unnested element alone and beside a
+   read. The seed has an
    empty class, a record with a duplicate array entry, a record with
    identical elements at the same index of two sibling nested arrays
    (`parts[0].children[1]` = `parts[1].children[1]`), and two records
