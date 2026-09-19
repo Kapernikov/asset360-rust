@@ -68,7 +68,7 @@
 //! [`Plan::fanout_restored`] catches the missing unnest that would otherwise
 //! only show up as a count of 1 where the answer was 3.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use linkml_schemaview::schemaview::SchemaView;
@@ -86,6 +86,31 @@ use crate::sparql_scoper::{FilterCondition, LikeAnchor, PushForm, ScopeError, li
 /// Index into [`Plan::nodes`]. Printed as `n0`, `n1`, ... so a reader can
 /// follow a node's inputs by eye, the way `o0`, `o1` work for obligations.
 pub type NodeId = usize;
+
+/// A node's identity, which survives renumbering.
+///
+/// [`NodeId`] is a *position*: an index into [`Plan::nodes`] that every
+/// removal renumbers. Evidence a rule records about a node -- an obligation's
+/// provenance, a join occurrence, a transfer step -- has to outlive the next
+/// rewrite, so it names the node by this key instead. Allocated from a
+/// counter on the plan and never reused; [`Plan::node`] resolves it to the
+/// current position, or through [`Plan::retired`] to the node that took its
+/// work over. Zero is "not yet assigned": a node built by a rule gets its key
+/// when [`Plan::rebuild`] installs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeKey(pub usize);
+
+impl NodeKey {
+    /// The placeholder a freshly built node carries until the plan installs
+    /// it. Never the key of a node in a plan.
+    pub const UNASSIGNED: NodeKey = NodeKey(0);
+}
+
+impl fmt::Display for NodeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "k{}", self.0)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Executor, output kind, query form
@@ -329,6 +354,15 @@ pub enum Expr {
     Function {
         name: String,
         args: Vec<Expr>,
+    },
+    /// A boundary restriction (op 3a): `?var` is the identity of a record
+    /// of `class_uri`. Not an expression a query can contain -- it is what
+    /// a rule places at a scope root with the semi-join proof and what op
+    /// 3b carries down to the scan, where the fold reads it as the star's
+    /// type. Written back for the oracle as `EXISTS { ?var a <class> }`.
+    InClass {
+        var: String,
+        class_uri: String,
     },
     /// An expression carrying a graph pattern -- `EXISTS`, `NOT EXISTS` --
     /// kept as the text the query wrote.
@@ -922,9 +956,12 @@ impl Expr {
             // no rule that renders it as one. `Not` has its own arm above --
             // it is not always a decline, since `!=` is one -- so it does not
             // belong in this group.
-            Self::Or(_) | Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::Opaque(_) => {
-                None
-            }
+            Self::Or(_)
+            | Self::Var(_)
+            | Self::Literal(_)
+            | Self::Slot { .. }
+            | Self::InClass { .. }
+            | Self::Opaque(_) => None,
         }
     }
 
@@ -1018,6 +1055,7 @@ impl Expr {
             | Self::Var(_)
             | Self::Literal(_)
             | Self::Slot { .. }
+            | Self::InClass { .. }
             | Self::Function { .. }
             | Self::Opaque(_) => false,
         }
@@ -1050,7 +1088,7 @@ impl Expr {
                 value.contains_an_opaque_subquery()
                     || candidates.iter().any(Self::contains_an_opaque_subquery)
             }
-            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } => false,
+            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::InClass { .. } => false,
         }
     }
 
@@ -1132,7 +1170,7 @@ impl Expr {
                         .iter()
                         .all(Self::evaluates_the_same_out_of_context)
             }
-            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } => true,
+            Self::Var(_) | Self::Literal(_) | Self::Slot { .. } | Self::InClass { .. } => true,
         }
     }
 
@@ -1225,6 +1263,11 @@ pub fn variables_used(expr: &Expr) -> Vec<String> {
                 }
             }
             Expr::Not(inner) => walk(inner, out),
+            Expr::InClass { var, .. } => {
+                if !out.contains(var) {
+                    out.push(var.clone());
+                }
+            }
             Expr::Literal(_) | Expr::Slot { .. } | Expr::Opaque(_) => {}
         }
     }
@@ -1315,7 +1358,6 @@ impl Expr {
     ///
     /// `every_expression_survives_the_round_trip` checks the rest by
     /// construction rather than by inspection.
-    #[cfg(feature = "sparql-endpoint")]
     pub(crate) fn try_as_expression(&self) -> Option<Expression> {
         let pair = |left: &Expr, right: &Expr| -> Option<(Box<Expression>, Box<Expression>)> {
             Some((
@@ -1366,10 +1408,28 @@ impl Expr {
                     .collect::<Option<Vec<_>>>()?;
                 function_expression(name, arguments)?
             }
+            // `?v` is the identity of a record of the class: exactly the
+            // records with that type.
+            Self::InClass { var, class_uri } => Expression::Exists(Box::new(GraphPattern::Bgp {
+                patterns: vec![TriplePattern {
+                    subject: TermPattern::Variable(Variable::new_unchecked(var.clone())),
+                    predicate: NamedNodePattern::NamedNode(
+                        spargebra::term::NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?,
+                    ),
+                    object: TermPattern::NamedNode(
+                        spargebra::term::NamedNode::new(class_uri.clone()).ok()?,
+                    ),
+                }],
+            })),
             Self::Slot { .. } => return None,
             Self::Opaque(_) => return None,
         })
     }
+}
+
+/// [`function_expression`], for the algebra translation.
+pub(crate) fn function_expression_of(name: &str, args: Vec<Expression>) -> Option<Expression> {
+    function_expression(name, args)
 }
 
 /// Rebuild the expression a function name and its arguments came from.
@@ -1378,7 +1438,6 @@ impl Expr {
 /// `IF`, `COALESCE`, `sameTerm` and the arithmetic operators are variants of
 /// [`Expression`], not members of `Function` -- so those are named here, and
 /// everything else is a builtin or a custom IRI.
-#[cfg(feature = "sparql-endpoint")]
 fn function_expression(name: &str, mut args: Vec<Expression>) -> Option<Expression> {
     let one = |args: Vec<Expression>| -> Option<Box<Expression>> {
         <[Expression; 1]>::try_from(args)
@@ -1642,6 +1701,7 @@ impl fmt::Display for Expr {
             Self::Or(parts) => write!(f, "({})", join_exprs(parts, " || ")),
             Self::Not(inner) => write!(f, "!{inner}"),
             Self::Function { name, args } => write!(f, "{name}({})", join_exprs(args, ", ")),
+            Self::InClass { var, class_uri } => write!(f, "?{var} ∈ {}", shorten(class_uri)),
             Self::Opaque(text) => f.write_str(text),
         }
     }
@@ -1871,6 +1931,47 @@ pub struct ReferenceEdge {
     pub holder: String,
     /// The slot on `holder` whose value is `referenced`'s identifier.
     pub slot: String,
+    /// The hops from the holder's record to the structure that holds `slot`:
+    /// empty for a column of the record, `[hasCoveredSection]` for a
+    /// reference held by an unnested element of that collection -- the
+    /// design's element-held edge, which the statement reads off the
+    /// element's row (`e.value->>'slot'`) and never as the fetch's
+    /// any-element containment.
+    pub path: Vec<String>,
+}
+
+/// The key a pushed join joins on, beside the reference edge: two columns
+/// that hold the same term (op 5 of the design), recorded rather than
+/// re-derived so a renderer reads a fact and [`Plan::join_keys_agree`] can
+/// check it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinKey {
+    /// `left.<identity> = right.<identity>`: two records of one class, each
+    /// side's `var` a scanned star's identity or a relation column carrying
+    /// one. Text equality of two IRIs is term equality.
+    Identity { var: String, class_uri: String },
+    /// Two inlined elements of one `(holder class, path)`: equal iff the
+    /// whole occurrence identifier agrees -- the blank node's identity in the
+    /// graph the engine answers over.
+    Element {
+        var: String,
+        holder_class_uri: String,
+        path: Vec<String>,
+    },
+    /// `on = []`: every pair. `CROSS JOIN`, or `LEFT JOIN … ON true`.
+    Cross,
+}
+
+impl fmt::Display for JoinKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity { var, class_uri } => {
+                write!(f, "identity ?{var} of {}", shorten(class_uri))
+            }
+            Self::Element { var, path, .. } => write!(f, "element ?{var} at {}", path.join(".")),
+            Self::Cross => f.write_str("cross"),
+        }
+    }
 }
 
 /// One step of a plan.
@@ -1915,6 +2016,10 @@ pub enum PlanOp {
         /// recording one that is not is what
         /// [`Plan::reference_joins_agree`] refuses.
         reference: Option<ReferenceEdge>,
+        /// The column key this join joins on, once op 5 has pushed it: two
+        /// identities, two elements, or no key at all. Exclusive with
+        /// `reference`; [`Plan::join_keys_agree`] checks it.
+        key: Option<JoinKey>,
     },
     /// `OPTIONAL`, as an operator rather than a plan-level node.
     LeftJoin {
@@ -1926,6 +2031,8 @@ pub enum PlanOp {
         /// recorded rather than re-derived, and
         /// [`Plan::reference_joins_agree`] checks it against the scans.
         reference: Option<ReferenceEdge>,
+        /// The column key, as on [`PlanOp::Join`].
+        key: Option<JoinKey>,
         /// The condition spargebra lifts out of `OPTIONAL { ... FILTER(x) }`.
         ///
         /// Claimed by this node, per conjunct: nothing pushes it (it decides
@@ -2012,11 +2119,35 @@ pub enum PlanOp {
         input: NodeId,
         vars: Vec<String>,
     },
-    /// A sub-`SELECT`: a projection that is not the query's own, and therefore
-    /// a barrier the variables above it cannot see through.
+    /// A *barrier*: the root of a scope, a subtree SPARQL evaluates to a
+    /// solution multiset of its own and combines with the outside through
+    /// `vars` and nothing else.
+    ///
+    /// Two things put one here, and the builder constructs both, so the
+    /// logical plan has one shape for a unit whether or not anything lowers
+    /// it (`docs/design/sparql-scopes-as-relations.md`, *The fact: a scope*):
+    ///
+    /// * a sub-`SELECT`. The **complete** sub-query -- its own `Slice`,
+    ///   `Distinct`, `Project`, `Sort` included, built on a spine of its own
+    ///   -- is the input, and `vars` is its projection. The barrier is
+    ///   therefore always the direct input of the node that combines the
+    ///   sub-query with the outside, and always has every modifier beneath
+    ///   it. `domain` is the naming domain it opens: a variable inside it
+    ///   the projection does not export is private to it, and the scoper
+    ///   numbers its domains in the same walk.
+    /// * the body of an `OPTIONAL` (and an `EXISTS` block read as a left
+    ///   join side): every variable the body binds is exported, which is the
+    ///   identity projection `Project(R, vars(R)) ≡ R` -- op 1 of the
+    ///   design, applied by the builder rather than by a rule so the boundary
+    ///   never depends on rule order. It opens no naming domain: the `?a`
+    ///   inside an `OPTIONAL` *is* the outer `?a`.
     SubSelect {
         input: NodeId,
         vars: Vec<String>,
+        /// The naming domain this barrier opens, when it is a sub-`SELECT`;
+        /// `None` for an `OPTIONAL` body. Numbered from 1 in the builder's
+        /// walk order; the scoper's `__d{n}` suffix is the same number.
+        domain: Option<usize>,
     },
     Graph {
         input: NodeId,
@@ -2230,6 +2361,8 @@ impl PlanOp {
 pub struct Node {
     pub op: PlanOp,
     pub executor: Executor,
+    /// The node's identity across rewrites. See [`NodeKey`].
+    pub key: NodeKey,
     /// What this node produces. Redundant with
     /// [`PlanOp::output_kind`] and kept as a field because 28d asks every node
     /// to *declare* it; [`Plan::well_formed`] checks the two agree, so a hand
@@ -2246,6 +2379,7 @@ impl Node {
             output: op.output_kind(),
             op,
             executor: Executor::Engine,
+            key: NodeKey::UNASSIGNED,
             discharges,
         }
     }
@@ -2256,6 +2390,7 @@ impl Node {
             output: op.output_kind(),
             op,
             executor: Executor::Sql,
+            key: NodeKey::UNASSIGNED,
             discharges,
         }
     }
@@ -2338,6 +2473,17 @@ pub struct Plan {
     /// Obligations no node discharges. Empty in a naive plan, which is why a
     /// naive plan is already an answer.
     pub residual: Vec<ObligationId>,
+    /// The next [`NodeKey`] to hand out. Keys are never reused.
+    pub next_key: usize,
+    /// Where each obligation was raised: the barrier of the scope the node
+    /// that first claimed it was in, `None` for the outermost scope. What
+    /// *obligations stay in their scope* checks a discharge against.
+    pub origin: Vec<Option<NodeKey>>,
+    /// Nodes a rule removed, each with the node that took its work over --
+    /// the input a dropped unary node stood in for, the scan a folded match
+    /// became -- or `None` when nothing did. What lets evidence recorded by
+    /// key resolve after the node it named is gone. See [`Plan::retire`].
+    pub retired: BTreeMap<NodeKey, Option<NodeKey>>,
 }
 
 /// A plan that violates one of the invariants.
@@ -2397,6 +2543,19 @@ pub enum PlanDefect {
     MisrecordedJoin {
         join: NodeId,
     },
+    /// A rule's edit dropped an export a consumer demanded: the one check
+    /// that relates two plans rather than inspecting one. See
+    /// [`Plan::check_transition`].
+    Transition {
+        rule: &'static str,
+        defect: crate::sparql_scopes::TransitionDefect,
+    },
+    /// One of the invariants a scope makes local. See
+    /// [`crate::sparql_scopes::ScopeDefect`].
+    Scope(crate::sparql_scopes::ScopeDefect),
+    /// A boundary restriction whose chain of 3b arms does not hold. See
+    /// [`Plan::restriction_chains_hold`].
+    Chain(crate::sparql_restrict::ChainDefect),
 }
 
 impl fmt::Display for PlanDefect {
@@ -2440,6 +2599,9 @@ impl fmt::Display for PlanDefect {
                 "n{unnest} fans out a slot no scan below it read as multivalued, \
                  so it multiplies rows nothing asked for"
             ),
+            Self::Transition { rule, defect } => write!(f, "{rule}: {defect}"),
+            Self::Scope(defect) => write!(f, "{defect}"),
+            Self::Chain(defect) => write!(f, "{defect}"),
         }
     }
 }
@@ -2448,6 +2610,122 @@ impl Plan {
     /// The root: the node every other node feeds.
     pub fn root(&self) -> Option<&Node> {
         self.nodes.last()
+    }
+
+    /// A plan over these nodes, keyed from scratch. For a builder or a test
+    /// that assembles nodes by hand; a rule edits an existing plan through
+    /// [`Plan::rebuild`].
+    pub fn from_nodes(form: QueryForm, obligations: Vec<Obligation>, nodes: Vec<Node>) -> Self {
+        let mut plan = Plan {
+            form,
+            obligations,
+            nodes: Vec::new(),
+            residual: Vec::new(),
+            next_key: 1,
+            origin: Vec::new(),
+            retired: BTreeMap::new(),
+        };
+        plan.install(nodes);
+        plan.record_origins();
+        plan
+    }
+
+    /// Record where each obligation was raised: the scope of the node that
+    /// claims it now. Called once, on the plan as built.
+    fn record_origins(&mut self) {
+        let scopes = self.scopes();
+        let mut origin: Vec<Option<NodeKey>> = vec![None; self.obligations.len()];
+        for (id, node) in self.nodes.iter().enumerate() {
+            for claim in &node.discharges {
+                if let Some(slot) = origin.get_mut(*claim) {
+                    *slot = scopes[id].map(|barrier| self.nodes[barrier].key);
+                }
+            }
+        }
+        self.origin = origin;
+    }
+
+    /// Install a node list, giving every unkeyed node a fresh key.
+    fn install(&mut self, nodes: Vec<Node>) {
+        self.nodes = nodes;
+        for node in &mut self.nodes {
+            if node.key == NodeKey::UNASSIGNED {
+                node.key = NodeKey(self.next_key);
+                self.next_key += 1;
+            }
+        }
+    }
+
+    /// The current position of a node, by key.
+    ///
+    /// `None` for a key that is retired or was never issued; a caller that
+    /// wants the successor of a retired node asks [`Plan::resolve`].
+    pub fn node(&self, key: NodeKey) -> Option<NodeId> {
+        self.nodes.iter().position(|node| node.key == key)
+    }
+
+    /// The node a key stands for now: itself while it is live, or the node
+    /// its work went to when it was retired, followed through any number of
+    /// retirements. `None` when the chain ends in a retirement with no
+    /// successor.
+    pub fn resolve(&self, key: NodeKey) -> Option<NodeId> {
+        let mut current = key;
+        for _ in 0..=self.retired.len() {
+            if let Some(id) = self.node(current) {
+                return Some(id);
+            }
+            match self.retired.get(&current) {
+                Some(Some(successor)) => current = *successor,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The key at a position.
+    pub fn key_of(&self, id: NodeId) -> NodeKey {
+        self.nodes[id].key
+    }
+
+    /// **The one renumbering primitive.** Replace the node list with one a
+    /// rule rebuilt, given where each old position went.
+    ///
+    /// `remap[old]` is the new position of the old node, or of the node that
+    /// took its work over when the rule dropped it -- what every rule already
+    /// computes to renumber the inputs above its edit. This reads that same
+    /// table to keep the evidence straight: a node whose key is gone from the
+    /// new list is *retired* to the key at `remap[old]`, a fresh node gets a
+    /// key, and every join's `on` is recomputed from the bindings its sides
+    /// now have ([`crate::sparql_rules::refresh_join_variables`]).
+    ///
+    /// The rules used to do the first and last of these by hand at nine
+    /// sites, and none of them did the middle one, because nothing held a
+    /// key. Now the ledger can name a node and still be right after the rule
+    /// that removes it.
+    pub fn rebuild(&mut self, nodes: Vec<Node>, remap: &[Option<NodeId>]) {
+        let before = std::mem::take(&mut self.nodes);
+        // Keys first, so a node the rule built can be a successor.
+        self.install(nodes);
+        let live: BTreeSet<NodeKey> = self.nodes.iter().map(|node| node.key).collect();
+        for (old, node) in before.iter().enumerate() {
+            if live.contains(&node.key) {
+                continue;
+            }
+            let successor = remap
+                .get(old)
+                .copied()
+                .flatten()
+                .and_then(|new| self.nodes.get(new))
+                .map(|node| node.key);
+            self.retired.insert(node.key, successor);
+        }
+        crate::sparql_rules::refresh_join_variables(self);
+    }
+
+    /// Retire a key by hand, for a rule that removes a node without
+    /// rebuilding the list. `successor` is the node that took its work over.
+    pub fn retire(&mut self, key: NodeKey, successor: Option<NodeKey>) {
+        self.retired.insert(key, successor);
     }
 
     /// All six invariants, in the order a reader of 28d expects them: its four,
@@ -2463,7 +2741,27 @@ impl Plan {
         self.frontier_is_a_cut()?;
         self.root_matches_form()?;
         self.fanout_restored()?;
-        self.reference_joins_agree()
+        self.reference_joins_agree()?;
+        // The scope invariants (design, *The invariants that make it
+        // local*): closure on producers, one consumer per exporting scope,
+        // element reads fanned out, obligations in their scope, evidence
+        // resolving. `join_keys_agree` needs the schema and is checked by
+        // the driver that has one ([`Plan::check_with`]).
+        self.scope_closure().map_err(PlanDefect::Scope)?;
+        self.exporting_scope_has_one_consumer()
+            .map_err(PlanDefect::Scope)?;
+        self.bound_element_reads_have_their_unnest()
+            .map_err(PlanDefect::Scope)?;
+        self.obligations_stay_in_scope()
+            .map_err(PlanDefect::Scope)?;
+        self.evidence_resolves().map_err(PlanDefect::Scope)?;
+        self.restriction_chains_hold().map_err(PlanDefect::Chain)
+    }
+
+    /// [`Plan::check`], plus the invariants that need the schema.
+    pub fn check_with(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
+        self.check()?;
+        self.join_keys_agree(schema).map_err(PlanDefect::Scope)
     }
 
     /// **Invariant 1.** Every obligation appears exactly once, in a node or in
@@ -2682,6 +2980,7 @@ impl Plan {
                     right,
                     on,
                     reference: Some(edge),
+                    ..
                 } => (left, right, Some(on), edge),
                 PlanOp::LeftJoin {
                     left,
@@ -2712,7 +3011,14 @@ impl Plan {
                         // A reference *inside* an inlined structure is not an
                         // edge this vocabulary can express.
                         .any(|slot| {
-                            slot.path.as_slice() == [edge.slot.clone()]
+                            slot.path.as_slice()
+                                == edge
+                                    .path
+                                    .iter()
+                                    .cloned()
+                                    .chain(std::iter::once(edge.slot.clone()))
+                                    .collect::<Vec<_>>()
+                                    .as_slice()
                                 // A bound, required read is the key a join
                                 // reads. A delivered read is not a binding --
                                 // except on the *preserved* side of a left
@@ -2774,15 +3080,13 @@ impl Plan {
                 star_var, slots, ..
             } => {
                 out.insert(star_var.clone());
-                // A delivered read binds nothing *here*: the `match` that
-                // stayed above is what binds it, and counting it twice would
-                // put an optional variable in a mandatory join's `on`.
-                out.extend(
-                    slots
-                        .iter()
-                        .filter(|slot| slot.presence == SlotPresence::Required)
-                        .filter_map(|slot| slot.var.clone()),
-                );
+                // Every slot that *binds* a variable, whatever its presence:
+                // an absorbed optional read binds a nullable column, and a
+                // variable in scope and possibly unbound is still in scope
+                // (which is what a join's `on` is drawn from). A delivered
+                // read binds nothing -- its `var` is `None` -- and the
+                // `match` that stayed above is what binds it.
+                out.extend(slots.iter().filter_map(|slot| slot.var.clone()));
             }
             PlanOp::Match { pattern } => {
                 add_term_var(&pattern.subject, &mut out);
@@ -2941,7 +3245,7 @@ impl Plan {
             }
             // A projection can only keep a guarantee, never make one: naming a
             // variable in `SELECT` does not bind it.
-            PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars } => {
+            PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars, .. } => {
                 let below = self.definitely_bound_of(*input);
                 out.extend(vars.iter().filter(|var| below.contains(*var)).cloned());
             }
@@ -3074,8 +3378,9 @@ impl PlanOp {
                 right,
                 on,
                 reference,
+                key,
             } => format!(
-                "n{left}, n{right}  on {}{}",
+                "n{left}, n{right}  on {}{}{}",
                 on.iter()
                     .map(|var| format!("?{var}"))
                     .collect::<Vec<_>>()
@@ -3083,17 +3388,23 @@ impl PlanOp {
                 match reference {
                     Some(edge) => format!("  via ?{}.{}", edge.holder, edge.slot),
                     None => String::new(),
+                },
+                match key {
+                    Some(key) => format!("  by {key}"),
+                    None => String::new(),
                 }
             ),
             PlanOp::LeftJoin {
                 left,
                 right,
                 reference,
+                key,
                 condition,
             } => {
-                let edge = match reference {
-                    Some(edge) => format!("  via ?{}.{}", edge.holder, edge.slot),
-                    None => String::new(),
+                let edge = match (reference, key) {
+                    (Some(edge), _) => format!("  via ?{}.{}", edge.holder, edge.slot),
+                    (None, Some(key)) => format!("  by {key}"),
+                    (None, None) => String::new(),
                 };
                 match condition {
                     Some(condition) => format!("n{left}, n{right}{edge}  if {condition}"),
@@ -3155,13 +3466,22 @@ impl PlanOp {
                 Some(limit) => format!("limit {limit} offset {offset}"),
                 None => format!("offset {offset}"),
             },
-            PlanOp::Project { vars, .. }
-            | PlanOp::SubSelect { vars, .. }
-            | PlanOp::Describe { vars, .. } => vars
+            PlanOp::Project { vars, .. } | PlanOp::Describe { vars, .. } => vars
                 .iter()
                 .map(|var| format!("?{var}"))
                 .collect::<Vec<_>>()
                 .join(" "),
+            PlanOp::SubSelect { vars, domain, .. } => format!(
+                "{}{}",
+                vars.iter()
+                    .map(|var| format!("?{var}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                match domain {
+                    Some(domain) => format!("  domain {domain}"),
+                    None => String::new(),
+                }
+            ),
             PlanOp::Graph { name, .. } => name.clone(),
             PlanOp::Service { name, silent, .. } => {
                 format!("{name}{}", if *silent { " silent" } else { "" })
@@ -3321,6 +3641,7 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
         vars: Vec::new(),
         next_triple: 0,
         next_modifier: triple_count,
+        domains_opened: 0,
     };
     let mut root = builder.pattern(pattern, true);
 
@@ -3358,12 +3679,7 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
     debug_assert_eq!(root, builder.nodes.len() - 1, "the root is the last node");
 
     let nodes = builder.nodes;
-    let plan = Plan {
-        form,
-        obligations,
-        nodes,
-        residual: Vec::new(),
-    };
+    let plan = Plan::from_nodes(form, obligations, nodes);
     plan.check().map_err(RefineError::Defect)?;
     Ok(plan)
 }
@@ -3379,6 +3695,9 @@ struct Builder<'o> {
     vars: Vec<BTreeSet<String>>,
     next_triple: usize,
     next_modifier: usize,
+    /// Naming domains opened so far: each off-spine sub-`SELECT` gets the
+    /// next one, in walk order. The scoper counts the same way.
+    domains_opened: usize,
 }
 
 impl Builder<'_> {
@@ -3431,6 +3750,37 @@ impl Builder<'_> {
     /// projection; anywhere else it is a sub-`SELECT`, which is a barrier
     /// rather than a projection.
     fn pattern(&mut self, pattern: &GraphPattern, on_spine: bool) -> NodeId {
+        // A modifier met off the spine is the top of a sub-query: spargebra
+        // emits `Slice`/`Distinct`/`Reduced`/`Project` at a query's top and
+        // nowhere else. The whole of it is built on a spine of its own --
+        // its `Project` a `Project` node, its modifiers where the algebra
+        // puts them -- and wrapped in one barrier, so the barrier is the
+        // scope root and the direct input of whatever combines the sub-query
+        // with the outside. See [`PlanOp::SubSelect`].
+        if !on_spine
+            && matches!(
+                pattern,
+                GraphPattern::Slice { .. }
+                    | GraphPattern::Distinct { .. }
+                    | GraphPattern::Reduced { .. }
+                    | GraphPattern::Project { .. }
+            )
+        {
+            self.domains_opened += 1;
+            let domain = self.domains_opened;
+            let input = self.pattern(pattern, true);
+            let vars: Vec<String> = self.vars[input].iter().cloned().collect();
+            let bound = self.vars[input].clone();
+            return self.push(
+                PlanOp::SubSelect {
+                    input,
+                    vars,
+                    domain: Some(domain),
+                },
+                Vec::new(),
+                bound,
+            );
+        }
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns),
             GraphPattern::Path {
@@ -3475,6 +3825,7 @@ impl Builder<'_> {
                 }
                 let left = self.pattern(left, false);
                 let right = self.pattern(right, false);
+                let right = self.enclose(right);
                 let vars: BTreeSet<String> =
                     self.vars[left].union(&self.vars[right]).cloned().collect();
                 let node = self.push(
@@ -3482,6 +3833,7 @@ impl Builder<'_> {
                         left,
                         right,
                         reference: None,
+                        key: None,
                         condition,
                     },
                     claims,
@@ -3701,20 +4053,17 @@ impl Builder<'_> {
                 )
             }
             GraphPattern::Project { inner, variables } => {
-                // Past a projection nothing below is the query's own, so a
-                // second one is a sub-select.
+                // Past a projection nothing below is the query's own: a
+                // second one is a sub-query, and the check at the top of
+                // this function wraps it whole. So this arm only ever builds
+                // the projection of the spine it is on.
                 let input = self.pattern(inner, false);
                 let vars: Vec<String> = variables
                     .iter()
                     .map(|variable| variable.as_str().to_owned())
                     .collect();
                 let bound: BTreeSet<String> = vars.iter().cloned().collect();
-                let op = if on_spine {
-                    PlanOp::Project { input, vars }
-                } else {
-                    PlanOp::SubSelect { input, vars }
-                };
-                self.push(op, Vec::new(), bound)
+                self.push(PlanOp::Project { input, vars }, Vec::new(), bound)
             }
             GraphPattern::Graph { name, inner } => {
                 let input = self.pattern(inner, on_spine);
@@ -3786,6 +4135,7 @@ impl Builder<'_> {
         let mut current = input;
         for block in blocks {
             let right = self.pattern(block, false);
+            let right = self.enclose(right);
             let vars: BTreeSet<String> = self.vars[current]
                 .union(&self.vars[right])
                 .cloned()
@@ -3795,6 +4145,7 @@ impl Builder<'_> {
                     left: current,
                     right,
                     reference: None,
+                    key: None,
                     condition: None,
                 },
                 Vec::new(),
@@ -3802,6 +4153,26 @@ impl Builder<'_> {
             );
         }
         current
+    }
+
+    /// Wrap a left join's right side in its barrier: the identity projection
+    /// of everything the body binds (op 1). A sub-query is its own barrier
+    /// already and is not wrapped twice.
+    fn enclose(&mut self, body: NodeId) -> NodeId {
+        if matches!(self.nodes[body].op, PlanOp::SubSelect { .. }) {
+            return body;
+        }
+        let vars: Vec<String> = self.vars[body].iter().cloned().collect();
+        let bound = self.vars[body].clone();
+        self.push(
+            PlanOp::SubSelect {
+                input: body,
+                vars,
+                domain: None,
+            },
+            Vec::new(),
+            bound,
+        )
     }
 
     fn bgp(&mut self, patterns: &[TriplePattern]) -> NodeId {
@@ -3843,6 +4214,7 @@ impl Builder<'_> {
                 right,
                 on,
                 reference: None,
+                key: None,
             },
             Vec::new(),
             vars,
@@ -3967,10 +4339,19 @@ pub fn inner_join_groups(plan: &Plan) -> Vec<usize> {
     };
     for (id, node) in plan.nodes.iter().enumerate() {
         // Everything but a plain join is a boundary on purpose: only a join
-        // makes two node sets one mandatory row set.
-        if let PlanOp::Join { left, right, .. } = &node.op {
-            unite(&mut group, id, *left);
-            unite(&mut group, id, *right);
+        // makes two node sets one mandatory row set -- and a boundary
+        // restriction (op 3a), which is a row test on the same row set and
+        // the type the fold reads when it reaches the matches.
+        match &node.op {
+            PlanOp::Join { left, right, .. } => {
+                unite(&mut group, id, *left);
+                unite(&mut group, id, *right);
+            }
+            PlanOp::Filter {
+                input,
+                condition: Expr::InClass { .. },
+            } => unite(&mut group, id, *input),
+            _ => {}
         }
     }
     (0..plan.nodes.len())
@@ -4098,6 +4479,8 @@ mod tests {
                 Obligation::Slice { .. } => "slice",
                 Obligation::Distinct => "distinct",
                 Obligation::Values { .. } => "values",
+                // Never in a naive plan: raised by a rule.
+                Obligation::Boundary(_) => "filter",
             };
             assert_eq!(claimant.op.kind(), expected, "o{id} ({obligation})\n{plan}");
         }
@@ -4175,14 +4558,128 @@ mod tests {
         }
     }
 
-    /// A sub-select is a barrier, not a projection: the outer query cannot see
-    /// through it, so the two must not be the same node kind.
+    /// **The boundary wraps the sub-query** (design, test 9): a sub-select
+    /// is built on a spine of its own and enclosed *whole* in one barrier,
+    /// so the barrier is the scope root and the direct input of whatever
+    /// combines the sub-query with the outside, with every modifier beneath
+    /// it in the algebra's order. Pinned as golden printouts, one per
+    /// modifier shape, so the claim is a test rather than a sentence.
     #[test]
-    fn a_nested_projection_is_a_subselect() {
-        let plan =
-            plan_of("SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 3 } }");
-        assert_eq!(plan.find("project").len(), 1, "{plan}");
-        assert_eq!(plan.find("subselect").len(), 1, "{plan}");
+    fn the_barrier_wraps_the_complete_sub_query() {
+        let printed = |query: &str| -> Vec<String> {
+            let plan = plan_of(query);
+            plan.check()
+                .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+            plan.nodes
+                .iter()
+                .map(|node| format!("{} {}", node.op.kind(), node.op.describe()))
+                .collect()
+        };
+        // A typed top-N: the barrier over the slice over the projection over
+        // the sort.
+        assert_eq!(
+            printed(
+                "SELECT ?s ?n WHERE { ?s asset360:name ?n . \
+                 { SELECT ?s WHERE { ?s a asset360:Signal } ORDER BY ?s LIMIT 3 } }"
+            ),
+            vec![
+                "match ?s asset360:name ?n",
+                "match ?s a asset360:Signal",
+                "sort ?s asc",
+                "project ?s",
+                "slice limit 3 offset 0",
+                "subselect ?s  domain 1",
+                "join n0, n5  on ?s",
+                "project ?s ?n",
+            ]
+        );
+        // A grouped sub-query with `HAVING`: the filter sits between the
+        // grouping and the projection, as spargebra puts it, and the barrier
+        // is above them all. The measure carries spargebra's internal name
+        // until the grouping rule renames it, so the kinds are what is
+        // pinned.
+        let kinds: Vec<String> = printed(
+            "SELECT ?s ?n WHERE { { SELECT ?s (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:trafficKinds ?k } GROUP BY ?s HAVING (COUNT(*) > 1) } }",
+        )
+        .iter()
+        .map(|line| line.split(' ').next().unwrap().to_owned())
+        .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "match",
+                "match",
+                "join",
+                "group",
+                "filter",
+                "bind",
+                "project",
+                "subselect",
+                "project"
+            ]
+        );
+        // `DISTINCT` and `OFFSET`, each beneath the barrier and above the
+        // projection.
+        assert_eq!(
+            printed("SELECT ?s WHERE { { SELECT DISTINCT ?s WHERE { ?s a asset360:Signal } } }"),
+            vec![
+                "match ?s a asset360:Signal",
+                "project ?s",
+                "distinct ",
+                "subselect ?s  domain 1",
+                "project ?s",
+            ]
+        );
+        assert_eq!(
+            printed("SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal } OFFSET 2 } }"),
+            vec![
+                "match ?s a asset360:Signal",
+                "project ?s",
+                "slice offset 2",
+                "subselect ?s  domain 1",
+                "project ?s",
+            ]
+        );
+        // And for each, the barrier's one consumer is the node that combines
+        // it with the outside.
+        for query in [
+            "SELECT ?s ?n WHERE { ?s asset360:name ?n . \
+             { SELECT ?s WHERE { ?s a asset360:Signal } ORDER BY ?s LIMIT 3 } }",
+            "SELECT ?s WHERE { { SELECT DISTINCT ?s WHERE { ?s a asset360:Signal } } }",
+        ] {
+            let plan = plan_of(query);
+            let barrier = plan.find("subselect")[0];
+            let consumers: Vec<NodeId> = plan
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.op.inputs().contains(&barrier))
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(consumers.len(), 1, "{plan}");
+            assert!(
+                matches!(
+                    plan.nodes[consumers[0]].op,
+                    PlanOp::Join { .. } | PlanOp::Project { .. }
+                ),
+                "{plan}"
+            );
+        }
+        // An `OPTIONAL` body is enclosed too (op 1, applied by the builder),
+        // opening no naming domain: its `?s` is the outer `?s`.
+        assert_eq!(
+            printed(
+                "SELECT ?s ?nm WHERE { ?s a asset360:Signal . OPTIONAL { ?s asset360:name ?nm } }"
+            ),
+            vec![
+                "match ?s a asset360:Signal",
+                "match ?s asset360:name ?nm",
+                "subselect ?nm ?s",
+                "leftjoin n0, n2",
+                "project ?s ?nm",
+            ]
+        );
     }
 
     /// A `UNION` plans: obligation enumeration accepts it, both arms claim
@@ -4289,12 +4786,7 @@ mod tests {
                 root: OutputKind::Solutions,
             })
         );
-        let empty = Plan {
-            form: QueryForm::Select,
-            obligations: Vec::new(),
-            nodes: Vec::new(),
-            residual: Vec::new(),
-        };
+        let empty = Plan::from_nodes(QueryForm::Select, Vec::new(), Vec::new());
         assert_eq!(empty.check(), Err(PlanDefect::Empty));
 
         // 5. A scan that folded a multivalued slot without its unnest. The

@@ -243,7 +243,7 @@ impl SparqlAnswer {
 /// so the function returns unbound and the filter is false — silently. That is
 /// the failure mode to watch for when a geo query matches nothing.
 #[cfg(feature = "sparql-endpoint")]
-fn geosparql_evaluator() -> oxigraph::sparql::SparqlEvaluator {
+pub(crate) fn geosparql_evaluator() -> oxigraph::sparql::SparqlEvaluator {
     let mut evaluator = oxigraph::sparql::SparqlEvaluator::new();
     for (name, function) in spargeo::GEOSPARQL_EXTENSION_FUNCTIONS {
         evaluator = evaluator.with_custom_function(name.into_owned(), function);

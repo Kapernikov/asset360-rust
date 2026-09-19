@@ -309,8 +309,15 @@ pub fn replace_subtree(plan: &mut Plan, root: NodeId, op: PlanOp) {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    crate::sparql_rules::refresh_join_variables(plan);
+    // The nodes inside the subtree are retired to the replacement: it is what
+    // took their work over.
+    let replaced_at = remap[root];
+    for id in &inside {
+        if *id != root {
+            remap[*id] = replaced_at;
+        }
+    }
+    plan.rebuild(nodes, &remap);
 }
 
 /// Whether a `PlanOp::Graph`'s name reads the schema graph.
@@ -670,7 +677,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
             start: *offset,
             length: *limit,
         },
-        PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars } => {
+        PlanOp::Project { input, vars } | PlanOp::SubSelect { input, vars, .. } => {
             GraphPattern::Project {
                 inner: child(input)?,
                 variables: vars

@@ -138,9 +138,26 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
         log.rounds += 1;
         let mut changed = false;
         for rule in rules {
+            // **One check relates two plans.** What every barrier's
+            // consumers demand of it, recorded before the rule edits the
+            // plan and checked after: a demanded export that is gone is a
+            // rule that pruned past its own match, which no state check can
+            // see because `demand` shrinks with the interface it guards.
+            // Held for one application and no further, and a failure in
+            // every build -- there is no post-state that witnesses it.
+            let kept = plan.kept_exports();
             if rule.apply(plan) {
                 changed = true;
                 log.applied.push(rule.name());
+                if let Err(defect) = plan.check_transition(&kept) {
+                    return Err(RuleFailure {
+                        defect: crate::sparql_refine::PlanDefect::Transition {
+                            rule: rule.name(),
+                            defect,
+                        },
+                        log,
+                    });
+                }
                 debug_assert!(
                     plan.check().is_ok(),
                     "rule '{}' broke an invariant: {}\n{plan}",
@@ -337,25 +354,40 @@ impl Rule for FoldMatchesIntoScan<'_> {
             if node.executor != Executor::Engine {
                 continue;
             }
-            let PlanOp::Match { pattern } = &node.op else {
-                continue;
-            };
-            // A constant subject is a star of one record: the query named the
-            // identity, so the scan carries it as an identifier value and the
-            // statement reads one row against the indexed column. Without
-            // this the plan scanned the whole class and left the narrowing to
-            // the engine -- correct, and the wrong statement.
-            let identifier_values: Vec<String> = subject_iri(pattern)
-                .map(|iri| vec![iri.to_owned()])
-                .into_iter()
-                .flatten()
-                .collect();
-            let (Some(star), Some(class_uri)) =
-                (subject_star(&keys, pattern), type_class_iri(pattern))
-            else {
-                continue;
+            // Two sources of a star's type: its `rdf:type` match, or a
+            // boundary restriction op 3b carried down to it -- the same
+            // fact, derived by 3a from the other side of a join. A
+            // restriction is read exactly where a type match is, so an
+            // untyped body gets its scan by the same edit as a typed one.
+            let (identifier_values, star, class_uri): (Vec<String>, String, String) = match &node.op
+            {
+                PlanOp::Match { pattern } => {
+                    // A constant subject is a star of one record: the
+                    // query named the identity, so the scan carries it as
+                    // an identifier value and the statement reads one row
+                    // against the indexed column. Without this the plan
+                    // scanned the whole class and left the narrowing to
+                    // the engine -- correct, and the wrong statement.
+                    let identifier_values: Vec<String> = subject_iri(pattern)
+                        .map(|iri| vec![iri.to_owned()])
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    let (Some(star), Some(class_uri)) =
+                        (subject_star(&keys, pattern), type_class_iri(pattern))
+                    else {
+                        continue;
+                    };
+                    (identifier_values, star, class_uri.to_owned())
+                }
+                PlanOp::Filter {
+                    condition: crate::sparql_refine::Expr::InClass { var, class_uri },
+                    ..
+                } => (Vec::new(), var.clone(), class_uri.clone()),
+                _ => continue,
             };
             let star = star.as_str();
+            let class_uri = class_uri.as_str();
             // An intersection of classes is not a scan of one class:
             // `?s a :Signal ; a :Track` matches nothing unless one subclasses
             // the other, and a statement holding one of them counts every
@@ -380,19 +412,38 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // the pipeline has to tolerate rather than collapse; see
             // `sparql_ops::classes_feeding`, which resolves a star's class per
             // node for exactly this reason.
-            let classes_on_star = plan
+            //
+            // **And a star variable is a star per scope.** `?a` outside a
+            // sub-select and `?a` inside it are two rows of one table that
+            // the join makes equal, so a type match in another scope is not
+            // a second class on this star: each scope gets its own scan
+            // (design, *What a relational subtree derives*). Two types on one
+            // variable *in one scope* still decline.
+            let scopes = plan.scopes();
+            // Counted as *classes*, not as nodes: a restriction beside a
+            // type match of the same class is one class said twice.
+            let classes_on_star: BTreeSet<String> = plan
                 .nodes
                 .iter()
                 .enumerate()
-                .filter(|(other_id, other)| match &other.op {
-                    PlanOp::Match { pattern } => {
-                        type_class_iri(pattern).is_some()
-                            && subject_star(&keys, pattern).as_deref() == Some(star)
-                            && !in_other_union_arm(plan, type_node, *other_id)
-                    }
-                    _ => false,
+                .filter(|(other_id, _)| {
+                    scopes[*other_id] == scopes[type_node]
+                        && !in_other_union_arm(plan, type_node, *other_id)
                 })
-                .count();
+                .filter_map(|(_, other)| match &other.op {
+                    PlanOp::Match { pattern }
+                        if subject_star(&keys, pattern).as_deref() == Some(star) =>
+                    {
+                        type_class_iri(pattern).map(str::to_owned)
+                    }
+                    PlanOp::Filter {
+                        condition: crate::sparql_refine::Expr::InClass { var, class_uri },
+                        ..
+                    } if var == star => Some(class_uri.clone()),
+                    _ => None,
+                })
+                .collect();
+            let classes_on_star = classes_on_star.len();
             if classes_on_star != 1 {
                 continue;
             }
@@ -411,6 +462,15 @@ impl Rule for FoldMatchesIntoScan<'_> {
             let class_uri = class_uri.to_owned();
             let slots =
                 self.foldable_slots(plan, &keys, &star, &class_uri, &groups, groups[type_node]);
+            // A restriction with nothing of the star's to fold beneath it --
+            // no variable-object match on the star in its group -- is not a
+            // scan yet: it stays where 3b left it. (A star read only through
+            // constant objects under a restriction is the one shape this
+            // leaves to the engine; the fold replaces leaves, and a scan
+            // with no read has no leaf to replace.)
+            if slots.is_empty() && matches!(plan.nodes[type_node].op, PlanOp::Filter { .. }) {
+                continue;
+            }
             fold(plan, type_node, &star, &class_uri, identifier_values, slots);
             return true;
         }
@@ -457,12 +517,23 @@ fn fold(
     slots: Vec<(NodeId, ScanSlot)>,
 ) {
     let mut folded: Vec<NodeId> = slots.iter().map(|(id, _)| *id).collect();
-    folded.push(type_node);
+    // A restriction filter as the type source is not a leaf: it sits above
+    // the matches (and whatever joins them), and its consumers must read
+    // its input once it is gone, not the scan. Its claim moves to the scan
+    // like a type match's; its position does not.
+    let restriction = match &plan.nodes[type_node].op {
+        PlanOp::Filter { input, .. } => Some((type_node, *input)),
+        _ => None,
+    };
+    if restriction.is_none() {
+        folded.push(type_node);
+    }
     folded.sort_unstable();
-    let first = folded[0];
+    let first = folded.first().copied().unwrap_or(type_node);
 
     let mut claims: Vec<ObligationId> = folded
         .iter()
+        .chain(restriction.iter().map(|(filter, _)| filter))
         .flat_map(|id| plan.nodes[*id].discharges.clone())
         .collect();
     claims.sort_unstable();
@@ -495,6 +566,12 @@ fn fold(
             continue;
         }
         if folded.contains(&old) {
+            continue;
+        }
+        if let Some((filter, input)) = restriction
+            && old == filter
+        {
+            remap[old] = remap[input];
             continue;
         }
         let mut op = node.op.clone();
@@ -539,13 +616,13 @@ fn fold(
             op,
             executor: node.executor,
             output: node.output,
+            key: node.key,
             discharges: node.discharges.clone(),
         });
         remap[old] = Some(nodes.len() - 1);
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 /// Recompute every plain join's `on` from the variables its sides now bind.
@@ -691,6 +768,8 @@ struct SlotBinding {
 struct Visible {
     slots: HashMap<String, Option<SlotBinding>>,
     class_of_star: HashMap<String, String>,
+    /// Variables a pushed barrier below exports, and which barrier.
+    relations: HashMap<String, NodeId>,
 }
 
 impl Visible {
@@ -726,10 +805,13 @@ impl Visible {
             else {
                 continue;
             };
+            // Never through a barrier the lowering keeps: a scan inside one
+            // is a column of the relation, addressed through the barrier's
+            // exports (below) and never as a table alias.
             let reaches = if mandatory {
                 mandatorily_feeds(plan, id, base)
             } else {
-                plan.feeds(id, base)
+                plan.feeds_visibly(id, base)
             };
             if node.executor != Executor::Sql || !reaches {
                 continue;
@@ -773,6 +855,10 @@ impl Visible {
                         slots.insert(bound, None);
                         continue;
                     }
+                } else if element_prefix_below(plan, base, star_var, &slot.path).is_some() {
+                    // A read through an unnested element: the element is a
+                    // row, and the value is read off it.
+                    SlotReading::BoundElement
                 } else {
                     SlotReading::Column
                 };
@@ -792,10 +878,38 @@ impl Visible {
                 }
             }
         }
+        // What a pushed barrier below exports, as columns of the relation
+        // it lowers to. An identity is one -- `identity_of` answers the
+        // body's class, which is what lets a join key on it -- and every
+        // other export is entered as ambiguous, so a filter on it declines
+        // rather than resolving to the inner scan's slot.
+        let mut relations: HashMap<String, NodeId> = HashMap::new();
+        for (id, node) in plan.nodes.iter().enumerate() {
+            let PlanOp::SubSelect { vars, .. } = &node.op else {
+                continue;
+            };
+            if node.executor != Executor::Sql
+                || plan.transparent(id)
+                || !plan.feeds_visibly(id, base)
+                || (mandatory && !mandatorily_feeds(plan, id, base))
+            {
+                continue;
+            }
+            for var in vars {
+                slots.entry(var.clone()).or_insert(None);
+                relations.insert(var.clone(), id);
+            }
+        }
         Self {
             slots,
             class_of_star,
+            relations,
         }
+    }
+
+    /// The pushed barrier whose relation exports `var`, when one does.
+    fn relation_of(&self, var: &str) -> Option<NodeId> {
+        self.relations.get(var).copied()
     }
 
     /// The class of the record whose *identity* a variable names, when an
@@ -821,6 +935,29 @@ impl Visible {
     }
 }
 
+/// The collection prefix of `path` whose fan-out is at or below `node`, when
+/// the path reads through an unnested element: `[hasCoveredSection]` for
+/// `[hasCoveredSection, hasEntryPointM]` under `unnest hasCoveredSection`.
+pub(crate) fn element_prefix_below(
+    plan: &Plan,
+    node: NodeId,
+    star: &str,
+    path: &[String],
+) -> Option<Vec<String>> {
+    (1..path.len()).rev().find_map(|cut| {
+        let prefix = &path[..cut];
+        plan.nodes
+            .iter()
+            .enumerate()
+            .any(|(id, above)| {
+                matches!(&above.op, PlanOp::Unnest { star_var, slot_path, .. }
+                    if star_var == star && slot_path.as_slice() == prefix)
+                    && plan.feeds_visibly(id, node)
+            })
+            .then(|| prefix.to_vec())
+    })
+}
+
 /// Whether the unnest that bound `var` to an element of `star.slot` is at or
 /// below `node`.
 fn unnest_below(plan: &Plan, node: NodeId, star: &str, path: &[String], var: &str) -> bool {
@@ -829,7 +966,7 @@ fn unnest_below(plan: &Plan, node: NodeId, star: &str, path: &[String], var: &st
             &above.op,
             PlanOp::Unnest { star_var, slot_path, var: bound, .. }
                 if star_var == star && slot_path.as_slice() == path && bound == var
-        ) && plan.feeds(id, node)
+        ) && plan.feeds_visibly(id, node)
     })
 }
 
@@ -839,6 +976,10 @@ fn unnest_below(plan: &Plan, node: NodeId, star: &str, path: &[String], var: &st
 /// a join makes two nodes read one -- [`fold`] does exactly that -- so
 /// "the node above this one" is a question with several answers and a rule that
 /// assumes one has to check.
+pub(crate) fn consumers_of(plan: &Plan, id: NodeId) -> Vec<NodeId> {
+    consumers(plan, id)
+}
+
 fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
     plan.nodes
         .iter()
@@ -933,6 +1074,12 @@ impl Rule for DeliverOptionalRead<'_> {
                     .iter()
                     .any(|slot| slot.var.as_deref() == Some(var.as_str()))
                 {
+                    return None;
+                }
+                // And in the same naming domain: a match inside a sub-select
+                // under the `OPTIONAL` reads a variable of its own, whatever
+                // it is spelled.
+                if plan.naming_domain_of(id) != plan.naming_domain_of(scan) {
                     return None;
                 }
                 let optional = plan.nodes.iter().any(|above| {
@@ -1044,9 +1191,23 @@ impl Rule for AbsorbOptionalRead<'_> {
             if condition.is_some() {
                 continue;
             }
-            let (left, right) = (*left, *right);
+            let (left, barrier) = (*left, *right);
 
-            // The optional side: one match, reading one slot of one star.
+            // The optional side, behind its barrier: one match, reading one
+            // slot of one star. The barrier is the body's identity
+            // projection (op 1), and it goes with the join.
+            let PlanOp::SubSelect {
+                input: right,
+                domain: None,
+                ..
+            } = &plan.nodes[barrier].op
+            else {
+                continue;
+            };
+            let right = *right;
+            if consumers(plan, barrier).len() != 1 || consumers(plan, right).len() != 1 {
+                continue;
+            }
             let PlanOp::Match { pattern } = &plan.nodes[right].op else {
                 continue;
             };
@@ -1098,7 +1259,7 @@ impl Rule for AbsorbOptionalRead<'_> {
             plan.nodes[scan].discharges.extend(claims);
             plan.nodes[scan].discharges.sort_unstable();
 
-            drop_optional_pair(plan, id, right, left);
+            drop_optional_pair(plan, id, barrier, right, left);
 
             // A collection read this way owes a fan-out, and an *optional*
             // one: the record with no elements answers once with the variable
@@ -1128,18 +1289,24 @@ impl Rule for AbsorbOptionalRead<'_> {
     }
 }
 
-/// Remove the left join and the match it made optional, leaving the preserved
-/// side in their place.
-fn drop_optional_pair(plan: &mut Plan, leftjoin: NodeId, matched: NodeId, left: NodeId) {
-    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() - 2);
+/// Remove the left join, the barrier and the match it made optional, leaving
+/// the preserved side in their place. All three are retired to the preserved
+/// side: it is what took their work over.
+fn drop_optional_pair(
+    plan: &mut Plan,
+    leftjoin: NodeId,
+    barrier: NodeId,
+    matched: NodeId,
+    left: NodeId,
+) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() - 3);
     let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
     for (old, node) in plan.nodes.iter().enumerate() {
-        if old == matched {
-            continue;
-        }
-        if old == leftjoin {
+        if old == matched || old == barrier || old == leftjoin {
             // Everything that read the left join reads the preserved side:
-            // the optional value is a column of it now.
+            // the optional value is a column of it now. (Set again below,
+            // once `left` has certainly been placed: the match may precede
+            // the preserved side in index order.)
             remap[old] = remap[left];
             continue;
         }
@@ -1150,8 +1317,10 @@ fn drop_optional_pair(plan: &mut Plan, leftjoin: NodeId, matched: NodeId, left: 
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    for old in [matched, barrier, leftjoin] {
+        remap[old] = remap[left];
+    }
+    plan.rebuild(nodes, &remap);
 }
 
 /// One `HAVING` conjunct as a condition on a column, when the variable it
@@ -1191,6 +1360,7 @@ fn insert_unnest_above(plan: &mut Plan, scan: NodeId, star: &str, path: Vec<Stri
             op,
             executor: node.executor,
             output: node.output,
+            key: node.key,
             discharges: node.discharges.clone(),
         });
         remap[old] = Some(nodes.len() - 1);
@@ -1211,8 +1381,47 @@ fn insert_unnest_above(plan: &mut Plan, scan: NodeId, star: &str, path: Vec<Stri
             remap[old] = Some(nodes.len() - 1);
         }
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
+}
+
+/// Insert a required fan-out immediately above a node -- the outer element's
+/// fan-out a nested one rests on.
+fn insert_required_unnest_above(
+    plan: &mut Plan,
+    below: NodeId,
+    star: &str,
+    path: Vec<String>,
+    var: String,
+) {
+    let mut nodes: Vec<Node> = Vec::with_capacity(plan.nodes.len() + 1);
+    let mut remap: Vec<Option<NodeId>> = vec![None; plan.nodes.len()];
+    for (old, node) in plan.nodes.iter().enumerate() {
+        let mut op = node.op.clone();
+        op.map_inputs(|input| remap[input].expect("inputs precede their node"));
+        nodes.push(Node {
+            op,
+            executor: node.executor,
+            output: node.output,
+            key: node.key,
+            discharges: node.discharges.clone(),
+        });
+        remap[old] = Some(nodes.len() - 1);
+        if old == below {
+            let input = nodes.len() - 1;
+            nodes.push(Node::sql(
+                PlanOp::Unnest {
+                    input,
+                    star_var: star.to_owned(),
+                    slot_path: path.clone(),
+                    var: var.clone(),
+                    presence: SlotPresence::Required,
+                },
+                Vec::new(),
+            ));
+            remap[old] = Some(nodes.len() - 1);
+        }
+    }
+    plan.rebuild(nodes, &remap);
 }
 
 /// Insert filters immediately below a node, in order, each reading the one
@@ -1239,6 +1448,7 @@ fn insert_filters_below(plan: &mut Plan, target: NodeId, filters: Vec<(Vec<Oblig
                 op,
                 executor: node.executor,
                 output: node.output,
+                key: node.key,
                 discharges: node.discharges.clone(),
             });
             remap[old] = Some(nodes.len() - 1);
@@ -1250,12 +1460,12 @@ fn insert_filters_below(plan: &mut Plan, target: NodeId, filters: Vec<(Vec<Oblig
             op,
             executor: node.executor,
             output: node.output,
+            key: node.key,
             discharges: node.discharges.clone(),
         });
         remap[old] = Some(nodes.len() - 1);
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,14 +1521,21 @@ fn subject_site(plan: &Plan, other: NodeId, subject: &str) -> Option<SubjectSite
         }
         slots
             .iter()
-            // A multivalued slot's variable is one element of an array,
-            // and walking into it would address a field of that element --
-            // a third reading of the address, which nothing renders. The
-            // star decomposition walks single-valued hops only, for the
-            // same reason.
+            // A multivalued slot's variable is one element of an array, and
+            // it is a site exactly when its fan-out is below `other`: the
+            // element is then a row, and a read of its slot is the
+            // `BoundElement` reading of the address (`e.value->>'slot'`),
+            // which the renderer spells from the binding's containers. With
+            // no fan-out below there is no row to read it off, and the
+            // address would be the collection's -- the "third reading"
+            // nothing renders.
             .find(|slot| {
                 slot.var.as_deref() == Some(subject)
-                    && !slot.multivalued
+                    && (!slot.multivalued
+                        || slot
+                            .var
+                            .as_deref()
+                            .is_some_and(|var| unnest_below(plan, other, star_var, &slot.path, var)))
                     // Walking into a value that may be absent would put a
                     // condition two slots down on the preserved side of a left
                     // join, dropping the rows it exists to keep.
@@ -1458,7 +1675,15 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             if site.prefix.is_empty() {
                 continue;
             }
-            let Some(class) = class_at_path(self.schema, &site.class_uri, &site.prefix) else {
+            // The prefix may cross a collection whose element the site's
+            // fan-out made a row of (`subject_site`); a reference hop is
+            // still another record.
+            let Some(class_uri) =
+                crate::sparql_scopes::class_at_path_of(self.schema, &site.class_uri, &site.prefix)
+            else {
+                continue;
+            };
+            let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
                 continue;
             };
             let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
@@ -1467,24 +1692,64 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
                 continue;
             };
-            if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue {
-                continue;
-            }
+            let multivalued =
+                on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue;
             let mut path = site.prefix.clone();
             path.push(slot.name.clone());
+            // A multivalued hop *off an element* is a nested fan-out: the
+            // element's own collection, one row per element of it, whose
+            // occurrence is the outer element's plus one hop
+            // (`parts[0].children[1]`). It folds only where the outer
+            // element is a row (an element site), with its own unnest above
+            // the outer one; off the record itself a multivalued hop is the
+            // fold rule's, through `scan_with_fanout`.
+            if multivalued && site.prefix.is_empty() {
+                continue;
+            }
+            if multivalued
+                && !plan.nodes.iter().enumerate().any(|(unnest, node)| {
+                    matches!(&node.op, PlanOp::Unnest { star_var, slot_path, .. }
+                        if *star_var == site.star_var && *slot_path == site.prefix)
+                        && plan.feeds(unnest, other)
+                })
+            {
+                continue;
+            }
+            let scan = site.scan;
+            let star = site.star_var.clone();
+            let prefix = site.prefix.clone();
+            let scan_key = plan.key_of(scan);
             fold_into_scan(
                 plan,
                 id,
                 consumer,
                 other,
-                site.scan,
+                scan,
                 ScanSlot {
-                    path,
-                    var: Some(var),
-                    multivalued: false,
+                    path: path.clone(),
+                    var: Some(var.clone()),
+                    multivalued,
                     presence: SlotPresence::Required,
                 },
             );
+            if multivalued {
+                // Above the outer element's fan-out, which is where the
+                // element is a row: the nested unnest reads it.
+                let scan = plan.node(scan_key).expect("the scan is live");
+                let outer = plan
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .position(|(id, node)| {
+                        matches!(&node.op, PlanOp::Unnest { star_var, slot_path, .. }
+                            if *star_var == star && slot_path.as_slice() == prefix.as_slice())
+                            // *This* scan's fan-out: a star per scope has one
+                            // each.
+                            && plan.feeds(scan, id)
+                    })
+                    .expect("the outer fan-out this fold rests on");
+                insert_required_unnest_above(plan, outer, &star, path, var);
+            }
             return true;
         }
         false
@@ -1506,10 +1771,8 @@ fn fold_into_scan(
     scan: NodeId,
     slot: ScanSlot,
 ) {
-    debug_assert!(
-        !slot.multivalued,
-        "a scan built outside `scan_with_fanout` cannot owe an unnest"
-    );
+    // A multivalued slot here is a nested fan-out off an element, and the
+    // caller inserts its unnest in the same edit (`FoldNestedMatchIntoPath`).
     let mut claims = plan.nodes[matched].discharges.clone();
     claims.extend(plan.nodes[join].discharges.iter().copied());
     if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
@@ -1537,8 +1800,7 @@ fn fold_into_scan(
             .map_inputs(|input| remap[input].expect("nothing reads the match but the join"));
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,8 +2069,7 @@ fn replace_match_with_filter(
             .map_inputs(|input| remap[input].expect("nothing reads the match but the join"));
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -1993,49 +2254,73 @@ fn sole_scan_of_star(plan: &Plan, node: NodeId, star: &str) -> Option<NodeId> {
 /// Listing every variant means the next operator is a compile error here
 /// rather than a wrong answer somewhere else.
 pub(crate) fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
-    !plan.nodes.iter().any(|other| match &other.op {
-        // The preserved side keeps rows the optional side did not match, so a
-        // constraint inside the optional side decides whether the *value*
-        // binds -- not whether the row survives.
-        PlanOp::LeftJoin { right, .. } => plan.feeds(node, *right),
-        // Either branch of a union is an alternative, so narrowing one is not
-        // narrowing the answer.
-        PlanOp::Union { left, right } => plan.feeds(node, *left) || plan.feeds(node, *right),
-        // Narrowing what is subtracted *widens* the answer.
-        PlanOp::Minus { right, .. } => plan.feeds(node, *right),
-        // **The same, and it was missing.** An anti join is a negated
-        // existence test: a constraint inside its right side says what must
-        // *not* be there, so it constrains nothing about the rows that survive
-        // -- and turning it into a requirement on the outer record inverts the
-        // query. See the doc comment above.
-        PlanOp::AntiJoin { right, .. } => plan.feeds(node, *right),
-        // A `SERVICE` subtree is somebody else's dataset. A constraint in it
-        // says nothing about the records fetched here.
-        PlanOp::Service { input, .. } => plan.feeds(node, *input),
-        // Everything else passes its input's rows through, so a constraint
-        // below it still decides which answers there are. Spelled out rather
-        // than defaulted, so adding an operator forces the question to be
-        // asked here.
-        PlanOp::Unit
-        | PlanOp::Match { .. }
-        | PlanOp::Path { .. }
-        | PlanOp::Values { .. }
-        | PlanOp::Join { .. }
-        | PlanOp::Filter { .. }
-        | PlanOp::Bind { .. }
-        | PlanOp::Group { .. }
-        | PlanOp::Sort { .. }
-        | PlanOp::Distinct { .. }
-        | PlanOp::Reduced { .. }
-        | PlanOp::Slice { .. }
-        | PlanOp::Project { .. }
-        | PlanOp::SubSelect { .. }
-        | PlanOp::Graph { .. }
-        | PlanOp::Scan { .. }
-        | PlanOp::Unnest { .. }
-        | PlanOp::Construct { .. }
-        | PlanOp::Describe { .. }
-        | PlanOp::Ask { .. } => false,
+    // **Local to the naming domain.** Every consumer of this answer narrows
+    // a *star* -- a scan's fetch, or the scan itself -- and a star is a
+    // `(naming domain, variable)`: the `?s` of an `OPTIONAL` body is the
+    // outer `?s`, fetched once for both, so a constraint inside the body
+    // decides a binding and not which records exist; the `?s` of a
+    // sub-select is a star of its own, so a constraint that decides every
+    // solution of the sub-select decides every read of that star. The walk
+    // therefore stops at a sub-select's barrier and looks through an
+    // `OPTIONAL` body's. Whether a restriction also decides the enclosing
+    // domain's answers is a second question with a second proof (op 3a,
+    // read the other way).
+    let domain = plan.naming_domain_of(node);
+    !plan.nodes.iter().enumerate().any(|(other_id, other)| {
+        plan.naming_domain_of(other_id) == domain
+            && match &other.op {
+                // The preserved side keeps rows the optional side did not match, so a
+                // constraint inside the optional side decides whether the *value*
+                // binds -- not whether the row survives.
+                PlanOp::LeftJoin { right, .. } => plan.feeds(node, *right),
+                // A keyless grouping is *not* here, although it emits one row
+                // whether or not its input has any: every consumer of this answer
+                // either narrows a fetch the engine re-runs the whole query over,
+                // or restricts the scan the grouping aggregates, and in both the
+                // constraint is the query's own, applied to the rows the aggregate
+                // is over. The design's *applies_to_every_answer* listed it; the
+                // implementation found no consumer for which it is needed.
+                // Either branch of a union is an alternative, so narrowing one is not
+                // narrowing the answer.
+                PlanOp::Union { left, right } => {
+                    plan.feeds(node, *left) || plan.feeds(node, *right)
+                }
+                // Narrowing what is subtracted *widens* the answer.
+                PlanOp::Minus { right, .. } => plan.feeds(node, *right),
+                // **The same, and it was missing.** An anti join is a negated
+                // existence test: a constraint inside its right side says what must
+                // *not* be there, so it constrains nothing about the rows that survive
+                // -- and turning it into a requirement on the outer record inverts the
+                // query. See the doc comment above.
+                PlanOp::AntiJoin { right, .. } => plan.feeds(node, *right),
+                // A `SERVICE` subtree is somebody else's dataset. A constraint in it
+                // says nothing about the records fetched here.
+                PlanOp::Service { input, .. } => plan.feeds(node, *input),
+                // Everything else passes its input's rows through, so a constraint
+                // below it still decides which answers there are. Spelled out rather
+                // than defaulted, so adding an operator forces the question to be
+                // asked here.
+                PlanOp::Unit
+                | PlanOp::Match { .. }
+                | PlanOp::Path { .. }
+                | PlanOp::Values { .. }
+                | PlanOp::Join { .. }
+                | PlanOp::Filter { .. }
+                | PlanOp::Bind { .. }
+                | PlanOp::Group { .. }
+                | PlanOp::Sort { .. }
+                | PlanOp::Distinct { .. }
+                | PlanOp::Reduced { .. }
+                | PlanOp::Slice { .. }
+                | PlanOp::Project { .. }
+                | PlanOp::SubSelect { .. }
+                | PlanOp::Graph { .. }
+                | PlanOp::Scan { .. }
+                | PlanOp::Unnest { .. }
+                | PlanOp::Construct { .. }
+                | PlanOp::Describe { .. }
+                | PlanOp::Ask { .. } => false,
+            }
     })
 }
 
@@ -2056,8 +2341,7 @@ fn remove_nodes(plan: &mut Plan, removed: &[NodeId]) {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 impl Rule for FoldIdentityConstant<'_> {
@@ -2265,8 +2549,7 @@ fn collapse_leaf_into(plan: &mut Plan, leaf: NodeId, join: NodeId, other: NodeId
         node.op
             .map_inputs(|input| remap[input].expect("nothing reads the leaf but the join"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -2639,8 +2922,7 @@ fn sink_below_engine_filters(plan: &mut Plan, filter: NodeId, base: NodeId, cond
         });
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 /// The condition with every variable rewritten into the slot that binds it.
@@ -2686,6 +2968,9 @@ fn substitute_slots(expr: &Expr, visible: &Visible) -> Option<Expr> {
         // A graph pattern in an expression position. Nothing renders it, and a
         // rewrite of the text would be a rewrite of a query, not of a plan.
         Expr::Opaque(_) => return None,
+        // A boundary restriction is carried by its own rules, never rendered
+        // as a comparison.
+        Expr::InClass { .. } => return None,
     })
 }
 
@@ -2747,7 +3032,22 @@ impl<'s> PushReferenceJoin<'s> {
         plan: &Plan,
         holder: NodeId,
         joined: &str,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, Vec<String>)> {
+        self.foreign_key_on_through(plan, holder, joined, |plan, id, holder| {
+            plan.feeds_visibly(id, holder)
+        })
+    }
+
+    /// [`Self::foreign_key_on`], with the caller's notion of which scans are
+    /// below `holder`: the left-join rule looks through the optional body's
+    /// barrier *before* it has recorded the edge that makes it transparent.
+    fn foreign_key_on_through(
+        &self,
+        plan: &Plan,
+        holder: NodeId,
+        joined: &str,
+        reaches: impl Fn(&Plan, NodeId, NodeId) -> bool,
+    ) -> Option<(String, String, Vec<String>)> {
         plan.nodes
             .iter()
             .enumerate()
@@ -2757,20 +3057,42 @@ impl<'s> PushReferenceJoin<'s> {
                     class_uri,
                     slots,
                     ..
-                } if node.executor == Executor::Sql && plan.feeds(id, holder) => slots
-                    .iter()
-                    .find(|slot| {
-                        slot.var.as_deref() == Some(joined)
-                            && slot.presence == SlotPresence::Required
-                            && !slot.multivalued
-                            // A foreign key is a column of the record. A
-                            // reference inside an inlined structure is not
-                            // something `JoinEdge`'s one slot name can
-                            // address, so it is not this rule's edge.
-                            && slot.path.len() == 1
-                            && self.stores_a_reference(class_uri, &slot.path[0])
-                    })
-                    .map(|slot| (star_var.clone(), slot.path[0].clone())),
+                } if node.executor == Executor::Sql && reaches(plan, id, holder) => {
+                    slots
+                        .iter()
+                        .find(|slot| {
+                            slot.var.as_deref() == Some(joined)
+                                && slot.presence == SlotPresence::Required
+                                && !slot.multivalued
+                                && match slot.path.as_slice() {
+                                    // A foreign key is a column of the record...
+                                    [name] => self.stores_a_reference(class_uri, name),
+                                    // ...or a column of an unnested *element*,
+                                    // when the element is a row below the
+                                    // holder (the design's element-held edge):
+                                    // `e.value->>'belongsToTrack'` where a
+                                    // column reads `t1.object_data->>'slot'`.
+                                    [.., name] => {
+                                        let (_, prefix) = slot.path.split_last().unwrap();
+                                        element_prefix_below(plan, holder, star_var, &slot.path)
+                                            .is_some_and(|fanned| fanned.as_slice() == prefix)
+                                            && crate::sparql_scopes::class_at_path_of(
+                                                self.schema,
+                                                class_uri,
+                                                prefix,
+                                            )
+                                            .is_some_and(|element_class| {
+                                                self.stores_a_reference(&element_class, name)
+                                            })
+                                    }
+                                    [] => false,
+                                }
+                        })
+                        .map(|slot| {
+                            let (name, prefix) = slot.path.split_last().unwrap();
+                            (star_var.clone(), name.clone(), prefix.to_vec())
+                        })
+                }
                 _ => None,
             })
     }
@@ -2822,11 +3144,15 @@ impl Rule for PushReferenceJoin<'_> {
             // Which side scans the joined variable as a star. `feeds` rather
             // than [`mandatorily_feeds`] for the reason given in
             // [`Visible::below`]: an `Sql` subtree holds no left join.
+            //
+            // Within the scope: a scan behind a barrier is a column of the
+            // relation the barrier lowers to, and this edge names a table
+            // alias. Joining a star to a relation's identity is op 5's.
             let scans_the_star = |side: NodeId| {
                 plan.nodes.iter().enumerate().any(|(scan, node)| {
                     matches!(&node.op, PlanOp::Scan { star_var, .. } if star_var == &joined)
                         && node.executor == Executor::Sql
-                        && plan.feeds(scan, side)
+                        && plan.feeds_visibly(scan, side)
                 })
             };
             let referenced = if scans_the_star(left) {
@@ -2837,7 +3163,7 @@ impl Rule for PushReferenceJoin<'_> {
                 continue;
             };
             let holder = if referenced == left { right } else { left };
-            let Some((holder_star, slot)) = self.foreign_key_on(plan, holder, &joined) else {
+            let Some((holder_star, slot, path)) = self.foreign_key_on(plan, holder, &joined) else {
                 continue;
             };
             plan.nodes[id].executor = Executor::Sql;
@@ -2849,6 +3175,7 @@ impl Rule for PushReferenceJoin<'_> {
                     referenced: joined,
                     holder: holder_star,
                     slot,
+                    path,
                 });
             }
             return true;
@@ -2935,6 +3262,7 @@ impl Rule for AbsorbOptionalReference<'_> {
                 right,
                 condition,
                 reference,
+                ..
             } = &plan.nodes[id].op
             else {
                 continue;
@@ -2944,10 +3272,19 @@ impl Rule for AbsorbOptionalReference<'_> {
             }
             let (left, right) = (*left, *right);
 
-            // The optional side: a join of one match and one scan, on the
-            // match's object -- at the bottom of whatever left joins the
-            // `OPTIONAL` nests, each of which keeps every row of it.
-            let mut core = right;
+            // The optional side, behind its barrier: a join of one match and
+            // one scan, on the match's object -- at the bottom of whatever
+            // left joins the `OPTIONAL` nests, each of which keeps every row
+            // of it.
+            let PlanOp::SubSelect {
+                input: body,
+                domain: None,
+                ..
+            } = &plan.nodes[right].op
+            else {
+                continue;
+            };
+            let mut core = *body;
             while let PlanOp::LeftJoin { left: below, .. } = &plan.nodes[core].op {
                 core = *below;
             }
@@ -2956,6 +3293,7 @@ impl Rule for AbsorbOptionalReference<'_> {
                 right: b,
                 on,
                 reference: None,
+                ..
             } = &plan.nodes[core].op
             else {
                 continue;
@@ -3058,10 +3396,21 @@ impl Rule for AbsorbOptionalReference<'_> {
             plan.nodes[id].discharges.sort_unstable();
             if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
                 *reference = Some(ReferenceEdge {
-                    referenced: var,
+                    referenced: var.clone(),
                     holder: star,
                     slot: slot.name.clone(),
+                    path: Vec::new(),
                 });
+            }
+            // The edge names the referenced star, which the body's barrier
+            // must export for the join to read it -- an export the prune
+            // may have removed while nothing demanded it. Adding one back is
+            // an equivalence: the preserved side does not bind it, so the
+            // natural join gains no condition, and the edge is the join.
+            if let PlanOp::SubSelect { vars, .. } = &mut plan.nodes[right].op
+                && !vars.contains(&var)
+            {
+                vars.push(var);
             }
 
             // The optional side is the scan now (extended by whatever left
@@ -3093,8 +3442,7 @@ fn replace_nodes(plan: &mut Plan, replaced: &[(NodeId, NodeId)]) {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -3178,7 +3526,15 @@ impl Rule for PushLeftJoin<'_> {
                 PlanOp::LeftJoin { reference, .. } => reference.clone(),
                 _ => None,
             };
-            let Some(edge) = recorded.or_else(|| self.reference_between(plan, left, right)) else {
+            // An edge found by looking into the optional side is an edge
+            // the flat `LEFT JOIN … ON` renders, which is what a body of
+            // one scan and its filters lowers to; any other body is a
+            // relation, joined by op 5 on a column key.
+            let Some(edge) = recorded.or_else(|| {
+                plan.transparent_shape(right)
+                    .then(|| self.reference_between(plan, left, right))
+                    .flatten()
+            }) else {
                 continue;
             };
             plan.nodes[id].executor = Executor::Sql;
@@ -3223,6 +3579,10 @@ impl Rule for PushLeftJoin<'_> {
 
 impl PushLeftJoin<'_> {
     /// The reference edge between two sides, whichever of them holds the key.
+    ///
+    /// Reads through the optional body's barrier when its shape is the one
+    /// the flat `LEFT JOIN` renders (`Plan::transparent_shape`), and through
+    /// nothing else: an edge into a relation is not this join's.
     fn reference_between(&self, plan: &Plan, left: NodeId, right: NodeId) -> Option<ReferenceEdge> {
         let stars = |side: NodeId| -> Vec<String> {
             plan.nodes
@@ -3230,7 +3590,8 @@ impl PushLeftJoin<'_> {
                 .enumerate()
                 .filter_map(|(scan, node)| match &node.op {
                     PlanOp::Scan { star_var, .. }
-                        if node.executor == Executor::Sql && plan.feeds(scan, side) =>
+                        if node.executor == Executor::Sql
+                            && feeds_through_transparent_shapes(plan, scan, side) =>
                     {
                         Some(star_var.clone())
                     }
@@ -3240,7 +3601,8 @@ impl PushLeftJoin<'_> {
         };
         for referenced in stars(left).into_iter().chain(stars(right)) {
             for holder in [left, right] {
-                let Some((holder_star, slot)) = self.foreign_key_on(plan, holder, &referenced)
+                let Some((holder_star, slot, path)) =
+                    self.foreign_key_on(plan, holder, &referenced)
                 else {
                     continue;
                 };
@@ -3255,6 +3617,7 @@ impl PushLeftJoin<'_> {
                     referenced,
                     holder: holder_star,
                     slot,
+                    path,
                 });
             }
         }
@@ -3268,9 +3631,33 @@ impl PushLeftJoin<'_> {
         plan: &Plan,
         holder: NodeId,
         joined: &str,
-    ) -> Option<(String, String)> {
-        PushReferenceJoin::new(self.schema).foreign_key_on(plan, holder, joined)
+    ) -> Option<(String, String, Vec<String>)> {
+        PushReferenceJoin::new(self.schema).foreign_key_on_through(
+            plan,
+            holder,
+            joined,
+            feeds_through_transparent_shapes,
+        )
     }
+}
+
+/// Whether `lower` reaches `upper` crossing only barriers of the shape the
+/// flat left join renders -- what the left-join rule may read before its
+/// edge is recorded.
+fn feeds_through_transparent_shapes(plan: &Plan, lower: NodeId, upper: NodeId) -> bool {
+    if lower == upper {
+        return true;
+    }
+    let Some(node) = plan.nodes.get(upper) else {
+        return false;
+    };
+    if matches!(node.op, PlanOp::SubSelect { .. }) && !plan.transparent_shape(upper) {
+        return false;
+    }
+    node.op
+        .inputs()
+        .into_iter()
+        .any(|input| feeds_through_transparent_shapes(plan, lower, input))
 }
 
 // ---------------------------------------------------------------------------
@@ -3394,8 +3781,13 @@ impl PushNotExists<'_> {
         let [referenced] = shared.as_slice() else {
             return None;
         };
-        let (holder, slot) =
+        let (holder, slot, path) =
             PushReferenceJoin::new(self.schema).foreign_key_on(plan, right, referenced)?;
+        // The correlated `NOT EXISTS` renders one column of the block's
+        // record; an element-held key is not that.
+        if !path.is_empty() {
+            return None;
+        }
         // `FILTER NOT EXISTS { ?c :refersTo ?c }` is a star referring to
         // itself, so the block scans the variable the outer pattern already
         // scans. Two scans of one variable is not a shape the renderer reads —
@@ -3417,6 +3809,7 @@ impl PushNotExists<'_> {
             referenced: referenced.clone(),
             holder,
             slot,
+            path: Vec::new(),
         })
     }
 }
@@ -3535,7 +3928,15 @@ impl<'s> PushGrouping<'s> {
     }
 
     /// Whether a key names something a grouped statement can key on.
-    fn key_is_readable(&self, plan: &Plan, input: NodeId, key: &str) -> bool {
+    ///
+    /// `serialise` asks for a term the answer can emit. Without it a
+    /// *structure* -- an unnested inlined element, identified by its
+    /// occurrence -- qualifies too: `GROUP BY ?cs` groups by the occurrence
+    /// and `COUNT(?cs)` counts them, which is what the engine does with the
+    /// element's blank node. It is representable and never serialisable
+    /// (design, *What may cross a relation*, parts 1 and 3), so the query's
+    /// own projection asks with `serialise` and declines it.
+    fn key_is_readable(&self, plan: &Plan, input: NodeId, key: &str, serialise: bool) -> bool {
         let visible = Visible::below(plan, input);
         if let Some(binding) = visible.slot_of(key) {
             if !matches!(
@@ -3550,6 +3951,14 @@ impl<'s> PushGrouping<'s> {
                 .class_of_star
                 .get(&binding.star_var)
                 .is_some_and(|class_uri| {
+                    // An element's occurrence, where no answer is asked for:
+                    // it has no term and needs none.
+                    if !serialise
+                        && binding.reading == SlotReading::BoundElement
+                        && crate::sparql_scopes::is_structure(self.schema, class_uri, &binding.path)
+                    {
+                        return true;
+                    }
                     crate::sparql_scoper::push_form_of_path(self.schema, class_uri, &binding.path)
                         != crate::sparql_scoper::PushForm::Tagged
                         // And a term shape the renderer can reproduce: an
@@ -3566,7 +3975,12 @@ impl<'s> PushGrouping<'s> {
         }
         // Or the record's own identity: `GROUP BY ?t` over a scanned star
         // groups by its URI, which is a column of the row.
-        visible.identity_of(key).is_some()
+        if visible.identity_of(key).is_some() {
+            return true;
+        }
+        // Or a column a pushed relation below exports.
+        visible.relation_of(key).is_some()
+            && crate::sparql_scopes::representable(self.schema, plan, input, key, serialise)
     }
 
     /// Whether an aggregate is one a grouped statement can compute, and its
@@ -3598,7 +4012,7 @@ impl<'s> PushGrouping<'s> {
                     // reproduce.
                     return false;
                 };
-                let readable = self.key_is_readable(plan, input, &var);
+                let readable = self.key_is_readable(plan, input, &var, false);
                 match name {
                     AggregateFunction::Count | AggregateFunction::Min | AggregateFunction::Max => {
                         readable
@@ -3643,9 +4057,14 @@ impl Rule for PushGrouping<'_> {
             if plan.nodes[input].executor != Executor::Sql {
                 continue;
             }
+            // A key must serialise when the grouping's tail is the query's
+            // own projection -- it answers with the key's term -- and need
+            // only be representable inside a sub-query, where the barrier
+            // carries it on as a column.
+            let serialise = plan.scope_of(id).is_none();
             if !keys
                 .iter()
-                .all(|key| self.key_is_readable(plan, input, key))
+                .all(|key| self.key_is_readable(plan, input, key, serialise))
             {
                 continue;
             }
@@ -3739,7 +4158,16 @@ fn grouping_tail(plan: &Plan, group: NodeId, measures: &[Measure]) -> Option<Gro
         sorts: Vec::new(),
         chain: Vec::new(),
     };
+    // The walk ends at the scope root: the plan root, or the barrier that
+    // wraps the sub-query this grouping is in. A grouping inside a sub-select
+    // is taken exactly as the query's own, with the sub-query's own
+    // projection and modifiers as its tail -- the one anchor change the
+    // design asks of this rule.
+    let scope_root = plan.scope_of(group);
     let mut current = single_consumer(plan, group)?;
+    if Some(current) == scope_root {
+        return None;
+    }
     let mut projected = false;
     loop {
         match &plan.nodes[current].op {
@@ -3769,7 +4197,11 @@ fn grouping_tail(plan: &Plan, group: NodeId, measures: &[Measure]) -> Option<Gro
         if current == plan.nodes.len() - 1 {
             break;
         }
-        current = single_consumer(plan, current)?;
+        let next = single_consumer(plan, current)?;
+        if Some(next) == scope_root {
+            break;
+        }
+        current = next;
     }
     // A `SELECT` roots in its projection (possibly under a slice), and a plan
     // with no projection at all is a shape this does not push.
@@ -3901,8 +4333,7 @@ fn push_grouping(plan: &mut Plan, group: NodeId, tail: GroupingTail) {
         node.op
             .map_inputs(|input| remap[input].expect("inputs precede their node"));
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
     // Below the grouping, which is now wherever the renumbering put it.
     if !sinks.is_empty() {
         let group = plan
@@ -3989,7 +4420,7 @@ impl Rule for NarrowByAKeptHop<'_> {
                 // one and the wrong one here: an existence check is not an
                 // identity, and a query naming one record may still read a
                 // path off it.
-                scan_of_star(plan, &star)
+                scan_of_star(plan, id, &star)
             }) else {
                 continue;
             };
@@ -4045,11 +4476,15 @@ impl Rule for NarrowByAKeptHop<'_> {
     }
 }
 
-/// The `Sql` scan of a star, wherever it is in the plan.
-fn scan_of_star(plan: &Plan, star: &str) -> Option<NodeId> {
-    plan.nodes.iter().position(|node| {
+/// The `Sql` scan of a star in the same scope as `at`. A star variable is a
+/// star per scope, so the scan of an outer `?s` says nothing about a read
+/// of the inner one.
+fn scan_of_star(plan: &Plan, at: NodeId, star: &str) -> Option<NodeId> {
+    let scopes = plan.scopes();
+    plan.nodes.iter().enumerate().position(|(id, node)| {
         matches!(&node.op, PlanOp::Scan { star_var, .. } if star_var == star)
             && node.executor == Executor::Sql
+            && scopes[id] == scopes[at]
     })
 }
 
@@ -4196,9 +4631,12 @@ impl<'s> PushProjection<'s> {
     }
 
     /// Whether a projected or sorted variable names one value per row the
-    /// statement can render: the grouping rule's own test, unchanged.
-    fn column_is_readable(&self, plan: &Plan, body: NodeId, var: &str) -> bool {
-        PushGrouping::new(self.schema).key_is_readable(plan, body, var)
+    /// statement can render: the grouping rule's own test, plus the columns a
+    /// pushed barrier below exports. `serialise` asks for a term the answer
+    /// can emit; without it a structure -- representable, never serialisable
+    /// -- passes too.
+    fn column_is_readable(&self, plan: &Plan, body: NodeId, var: &str, serialise: bool) -> bool {
+        PushGrouping::new(self.schema).key_is_readable(plan, body, var, serialise)
     }
 }
 
@@ -4222,11 +4660,20 @@ struct ProjectionTail {
 /// `None` for any other shape -- a node that is not a modifier, a projection
 /// that is a sub-select, more than one projection, no projection at all --
 /// and for a body that is not `Sql`, which is the whole precondition.
-fn projection_tail(plan: &Plan) -> Option<ProjectionTail> {
+fn projection_tail(plan: &Plan, scope: Option<NodeId>) -> Option<ProjectionTail> {
     if plan.nodes.is_empty() {
         return None;
     }
-    let root = plan.nodes.len() - 1;
+    // From the scope root down: the plan root, or the input of the barrier
+    // that wraps a sub-query -- whose own `Project`, `Sort`, `Distinct` and
+    // `Slice` are then the chain, exactly as the query's own would be.
+    let root = match scope {
+        None => plan.nodes.len() - 1,
+        Some(barrier) => match &plan.nodes[barrier].op {
+            PlanOp::SubSelect { input, .. } => *input,
+            _ => return None,
+        },
+    };
     let mut current = root;
     let mut chain = Vec::new();
     let mut vars: Option<Vec<String>> = None;
@@ -4263,14 +4710,14 @@ fn projection_tail(plan: &Plan) -> Option<ProjectionTail> {
         current = input;
     }
     // The body: an `Sql` node whose every consumer is the chain, and which
-    // everything else feeds. Otherwise the plan has a second island, or a
-    // node the chain does not account for.
+    // everything else *in this scope* feeds. Otherwise the scope has a second
+    // island, or a node the chain does not account for.
     let body = current;
     if plan.nodes[body].executor != Executor::Sql {
         return None;
     }
     let accounted = |id: NodeId| id == body || chain.contains(&id) || plan.feeds(id, body);
-    if !(0..plan.nodes.len()).all(accounted) {
+    if !plan.scope_members(scope).into_iter().all(accounted) {
         return None;
     }
     Some(ProjectionTail {
@@ -4291,18 +4738,37 @@ impl Rule for PushProjection<'_> {
         if plan.form != crate::sparql_refine::QueryForm::Select {
             return false;
         }
-        let Some(tail) = projection_tail(plan) else {
+        // Once per scope: the query's own projection, and the projection of
+        // every sub-query, each anchored at its scope root.
+        let scopes: Vec<Option<NodeId>> = std::iter::once(None)
+            .chain(plan.barriers().into_iter().map(Some))
+            .collect();
+        for scope in scopes {
+            if self.apply_in(plan, scope) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl PushProjection<'_> {
+    fn apply_in(&self, plan: &mut Plan, scope: Option<NodeId>) -> bool {
+        let Some(tail) = projection_tail(plan, scope) else {
             return false;
         };
         if tail.chain.is_empty() {
             return false;
         }
-        // A grouping below is the grouping rule's, and its tail went with it
-        // or stayed; a union below is a fetch the statement cannot answer.
-        if plan.nodes.iter().any(|node| {
+        let members = plan.scope_members(scope);
+        // A grouping in this scope is the grouping rule's, and its tail went
+        // with it or stayed; a union is a fetch the statement cannot answer.
+        // Behind a pushed barrier neither is in this scope: the barrier is a
+        // relation the statement joins.
+        if members.iter().any(|id| {
             matches!(
-                node.op,
-                PlanOp::Group { .. } | PlanOp::Union { .. } | PlanOp::SubSelect { .. }
+                plan.nodes[*id].op,
+                PlanOp::Group { .. } | PlanOp::Union { .. }
             )
         }) {
             return false;
@@ -4319,10 +4785,15 @@ impl Rule for PushProjection<'_> {
         }) {
             return false;
         }
+        // The query's own projection must *serialise* every variable: a
+        // structure has no term a statement can emit. A sub-query's
+        // projection need only *represent* it -- an element crosses a
+        // relation by its occurrence (design, *What may cross a relation*).
+        let serialise = scope.is_none();
         if !tail
             .vars
             .iter()
-            .all(|var| self.column_is_readable(plan, tail.body, var))
+            .all(|var| self.column_is_readable(plan, tail.body, var, serialise))
         {
             return false;
         }
@@ -4330,7 +4801,7 @@ impl Rule for PushProjection<'_> {
             let Expr::Var(name) = &term.expr else {
                 return false;
             };
-            if !self.column_is_readable(plan, tail.body, name) {
+            if !self.column_is_readable(plan, tail.body, name, true) {
                 return false;
             }
             if tail.distinct && !tail.vars.contains(name) {
@@ -4391,6 +4862,21 @@ pub fn tier_one_rules<'a>(
         Box::new(NarrowByAKeptHop::new(schema)),
         Box::new(PushGrouping::new(schema)),
         Box::new(PushProjection::new(schema)),
+        // The scope rules: an export nothing demands leaves the interface,
+        // a scope whose body is SQL becomes a relation, a join on two
+        // identities becomes SQL. Ordered after the projection rule so a
+        // sub-query's own projection is taken before its barrier is asked
+        // about; the fixpoint does not depend on it.
+        Box::new(crate::sparql_scope_rules::PruneUnusedExports),
+        Box::new(crate::sparql_scope_rules::PushBarrier::new(schema)),
+        Box::new(crate::sparql_scope_rules::PushJoinOnIdentity::new(schema)),
+        // Op 3: a restriction at a join side with the semi-join proof, then
+        // pushed down one operator at a time; the fold reads it as the
+        // star's type when it reaches the matches.
+        Box::new(crate::sparql_restrict::RestrictScopeAtBoundary::new(schema)),
+        Box::new(crate::sparql_restrict::PushRestrictionDown),
+        // Op 2: a lifted condition the body decides alone moves into it.
+        Box::new(crate::sparql_restrict::SinkLiftedCondition),
         // This one knows nothing about a schema graph: it is a semi-join
         // reduction, and it is what a materialised relation is worth to the
         // planner whether the schema produced it or the client wrote it.
@@ -4616,8 +5102,7 @@ fn insert_filter_above(plan: &mut Plan, side: NodeId, consumer: NodeId, conditio
             }
         });
     }
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -4851,8 +5336,7 @@ fn move_filter_onto(
         });
     }
 
-    plan.nodes = nodes;
-    refresh_join_variables(plan);
+    plan.rebuild(nodes, &remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -4985,6 +5469,68 @@ mod tests {
             "{plan}"
         );
         println!("{plan}");
+    }
+
+    /// A node's key outlives the rewrite that removes it: a folded match is
+    /// *retired* to the scan that took its work, and a key recorded before the
+    /// fold still resolves after it. The evidence the obligation ledger holds
+    /// is keys, so this is what lets it stay right across renumbering.
+    #[test]
+    fn a_folded_node_s_key_resolves_to_the_scan_that_took_its_work() {
+        use crate::sparql_refine::NodeKey;
+        let schema = test_schema_view();
+        let rule = FoldMatchesIntoScan::new(&schema);
+        let mut plan = plan_of(
+            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
+             FILTER(REGEX(?nm, \"^A\")) }",
+        );
+        let keys: Vec<NodeKey> = plan.nodes.iter().map(|node| node.key).collect();
+        assert!(
+            keys.iter().all(|key| *key != NodeKey::UNASSIGNED),
+            "every node of a built plan is keyed:\n{plan}"
+        );
+        assert_eq!(
+            keys.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            keys.len(),
+            "keys are unique:\n{plan}"
+        );
+        let type_match = plan.find("match")[0];
+        let type_key = plan.key_of(type_match);
+        let filter_key = plan.key_of(plan.find("filter")[0]);
+        let root_key = plan.key_of(plan.nodes.len() - 1);
+
+        refine(&mut plan, &[&rule]).unwrap();
+
+        let scan = plan.find("scan")[0];
+        assert_eq!(plan.node(type_key), None, "the match is gone:\n{plan}");
+        assert_eq!(
+            plan.resolve(type_key),
+            Some(scan),
+            "…and resolves to the scan that took its work:\n{plan}"
+        );
+        assert_eq!(
+            plan.node(filter_key),
+            Some(plan.find("filter")[0]),
+            "a node the rule kept keeps its key at its new position:\n{plan}"
+        );
+        assert_eq!(plan.node(root_key), Some(plan.nodes.len() - 1), "{plan}");
+        assert!(
+            plan.nodes
+                .iter()
+                .all(|node| node.key != NodeKey::UNASSIGNED),
+            "a node a rule built is keyed on install:\n{plan}"
+        );
+        // A retirement with no successor resolves to nothing, and says so
+        // rather than pointing at a stale position.
+        plan.retire(root_key, None);
+        assert_eq!(
+            plan.resolve(root_key),
+            Some(plan.nodes.len() - 1),
+            "live wins"
+        );
+        let gone = NodeKey(plan.next_key + 7);
+        plan.retire(gone, None);
+        assert_eq!(plan.resolve(gone), None);
     }
 
     /// The rule moves claims, it does not create or drop them. Stated as the
@@ -5522,6 +6068,10 @@ mod tests {
             &[
                 &FoldMatchesIntoScan::new(&schema),
                 &PushReferenceJoin::new(&schema),
+                // The optional body's barrier, pushed so both sides of the
+                // left join are SQL and the inner-join rule's decline is
+                // what is being tested.
+                &crate::sparql_scope_rules::PushBarrier::new(&schema),
             ],
         )
         .expect("every invariant holds");
@@ -5888,14 +6438,18 @@ mod tests {
         println!("{plan}");
     }
 
-    /// A lifted condition is not absorbed, and this is the placement error the
-    /// rule exists to refuse.
+    /// A lifted condition is not absorbed as a nullable column, and this is
+    /// the placement error the absorb rule exists to refuse: `OPTIONAL { ?s
+    /// :name ?nm . FILTER(?nm > "A") }` decides whether the *value* binds,
+    /// not whether the row survives -- a signal named "A" is still an
+    /// answer, with `?nm` unbound, and a `WHERE` on the preserved scan would
+    /// delete it.
     ///
-    /// `OPTIONAL { ?s :name ?nm . FILTER(?nm > "A") }` decides whether the
-    /// *value* binds, not whether the row survives: a signal named "A" is
-    /// still an answer, with `?nm` unbound. Rendering the condition as a
-    /// `WHERE` would delete that row -- turning the left join into an inner
-    /// one, quietly, with a smaller answer and no error.
+    /// What serves it instead is the scope: op 2 sinks the condition into
+    /// the body, where it is the derived table's own `WHERE` (a row of the
+    /// body either exists or it does not), the body gets a scan of its own
+    /// by the boundary restriction, and the left join is on the identity.
+    /// The preserved scan reads nothing it did not before.
     #[test]
     fn a_condition_inside_the_optional_is_not_absorbed() {
         let schema = test_schema_view();
@@ -5907,15 +6461,31 @@ mod tests {
         );
 
         assert_eq!(plan.find("leftjoin").len(), 1, "{plan}");
-        assert_eq!(
-            plan.nodes[plan.find("leftjoin")[0]].executor,
-            Executor::Engine,
+        let PlanOp::LeftJoin {
+            condition: None,
+            key: Some(_),
+            ..
+        } = &plan.nodes[plan.find("leftjoin")[0]].op
+        else {
+            panic!("the condition is sunk and the join is on the identity:\n{plan}");
+        };
+        // The condition is a filter inside the body, in SQL.
+        let filter = plan.find("filter")[0];
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        assert!(plan.scope_of(filter).is_some(), "inside the body:\n{plan}");
+        // The preserved scan does not bind the optional value: the
+        // relation's column does.
+        let PlanOp::Scan { slots, .. } = &plan.nodes[plan.find("scan")[0]].op else {
+            unreachable!()
+        };
+        assert!(
+            !slots
+                .iter()
+                .any(|slot| slot.path == ["name".to_owned()] && slot.var.is_some()),
             "{plan}"
         );
-        assert_eq!(plan.find("match").len(), 1, "{plan}");
-        // The column is still delivered, so the engine has what it needs.
         assert!(
-            scan_slots(&plan).contains(&("name".to_owned(), String::new(), false)),
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
             "{plan}"
         );
         println!("{plan}");
@@ -5964,17 +6534,20 @@ mod tests {
             "{joined}"
         );
 
-        // And a nested read is not walked into through one.
+        // And a nested read is not walked into through one: the *preserved*
+        // scan reads no path. (The optional body gets a scan of its own, by
+        // the boundary restriction, which reads the path inside the body --
+        // that is the derived table, and the preserved rows stay whole.)
         let nested = refined(
             "SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL { ?s asset360:location ?loc . ?loc asset360:longitude ?lon } }",
             &schema,
             false,
         );
+        let preserved = nested.find("scan")[0];
         assert!(
-            !scan_slots(&nested)
-                .iter()
-                .any(|(path, _, _)| path.contains('.')),
+            !matches!(&nested.nodes[preserved].op, PlanOp::Scan { slots, .. }
+                if slots.iter().any(|slot| slot.path.len() > 1)),
             "{nested}"
         );
     }
@@ -6144,12 +6717,14 @@ mod tests {
         println!("{plan}");
     }
 
-    /// A multivalued hop does not fold. The value beyond it belongs to one
-    /// element of an array, which is a third reading of an address and one
-    /// nothing renders; and a scan owing an unnest can only be built by
-    /// `scan_with_fanout`, which this rule does not go through.
+    /// A multivalued hop is walked into exactly when its element is a row:
+    /// the fan-out the array's fold emitted is below the read, so the value
+    /// beyond the hop is read off the element (`e.value->>'title'`, the
+    /// `BoundElement` reading) rather than off the array -- the design's
+    /// element-held read. The scan keeps the array as the multivalued slot
+    /// its fan-out restores, and gains the element's slot as a path.
     #[test]
-    fn a_multivalued_hop_is_not_walked_into() {
+    fn a_multivalued_hop_is_walked_into_through_its_element() {
         let schema = test_schema_view();
         let plan = refine_with_tier_one(
             "SELECT ?ti WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
@@ -6159,12 +6734,29 @@ mod tests {
 
         assert_eq!(
             scan_slots(&plan),
-            vec![("documents".to_owned(), "d".to_owned(), true)],
+            vec![
+                ("documents".to_owned(), "d".to_owned(), true),
+                ("documents.title".to_owned(), "ti".to_owned(), false),
+            ],
             "{plan}"
         );
-        assert_eq!(plan.find("match").len(), 1, "{plan}");
-        // The array itself still folds, so its fan-out is still restored.
+        assert!(plan.find("match").is_empty(), "{plan}");
         assert_eq!(plan.find("unnest").len(), 1, "{plan}");
+        // And the read is the element's, all the way to the operator: a
+        // condition on it reads `[each]`, never the array.
+        let filtered = refine_with_tier_one(
+            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:documents ?d . \
+             ?d asset360:title ?ti . FILTER(?ti = \"One\") }",
+            &schema,
+        );
+        let filter = filtered.find("filter")[0];
+        assert!(
+            filtered.nodes[filter]
+                .op
+                .describe()
+                .contains("?s.documents.title[each]"),
+            "{filtered}"
+        );
         println!("{plan}");
     }
 
@@ -7868,22 +8460,27 @@ mod tests {
         );
 
         // A collection of references is one solution per element, which an
-        // equality cannot state: declined, and the plan stays a fetch.
+        // equality cannot state: declined, and the plan stays a fetch -- the
+        // join on the element is the engine's, whatever the boundary
+        // restriction made of the body's own reads.
         let plan = refined(
             "SELECT ?g ?l WHERE { ?g a asset360:LineGroup . \
              OPTIONAL { ?g asset360:groupsLines ?l . ?l a asset360:Line } }",
             &schema,
             false,
         );
-        assert!(!plan.find("match").is_empty(), "{plan}");
         assert!(
-            plan.nodes
+            plan.find("join")
                 .iter()
-                .any(|node| node.executor == Executor::Engine),
+                .chain(plan.find("leftjoin").iter())
+                .any(|id| plan.nodes[*id].executor == Executor::Engine),
             "{plan}"
         );
         // A lifted condition decides whether the optional side matched, and
-        // no rule builds a conditional binding.
+        // no rule builds a conditional binding: the condition is sunk into
+        // the body (op 2), the body becomes a relation of its own, and the
+        // left join is on the identity -- a derived table row exists or it
+        // does not, which is what "together or not at all" needs.
         let plan = refined(
             "SELECT ?s ?t WHERE { ?s a asset360:Signal . \
              OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
@@ -7891,7 +8488,19 @@ mod tests {
             &schema,
             false,
         );
-        assert!(!plan.find("match").is_empty(), "{plan}");
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "{plan}"
+        );
+        let PlanOp::LeftJoin {
+            condition: None,
+            key: Some(_),
+            reference: None,
+            ..
+        } = &plan.nodes[plan.find("leftjoin")[0]].op
+        else {
+            panic!("{plan}");
+        };
     }
 
     /// What the projection rule takes, and what it declines -- each decline
@@ -8003,21 +8612,18 @@ mod tests {
         );
     }
 
-    /// A lifted condition goes to the engine, and the join still pushes.
+    /// A lifted condition the body decides alone is sunk into the body (op
+    /// 2), where it is a row test of the optional side -- the derived
+    /// table's own `WHERE`, or, for a body of one scan under a reference
+    /// edge, a condition the renderer places in the `ON` -- and the join
+    /// still pushes, now with nothing given up: the ledger says the work is
+    /// done, and by which node.
     ///
-    /// The condition decides whether the optional side *matched*, which is a
-    /// conditional binding and not a row test: as a `WHERE` it deletes the row
-    /// the join exists to keep, and this renderer has no `ON` clause to put it
-    /// in. So the plan gives the condition up -- to the residual, where an
-    /// obligation nobody claims is the engine's -- and keeps the join, which
-    /// is a left join that matches too generously and therefore fetches a
-    /// superset of the records the answer needs. That is today's statement for
-    /// this query, exactly.
-    ///
-    /// Giving it up rather than carrying it unrendered is the load-bearing
-    /// part: a plan that held a condition it does not apply would have to be
-    /// read carefully to be understood, and the ledger would say the work was
-    /// accounted for.
+    /// What made this a residual before was that a `LeftJoin` carrying a
+    /// condition had nowhere to put it. Inside a scope it is a filter like
+    /// any other; SPARQL §18.5 says `LeftJoin(Ω1, Ω2, c) =
+    /// LeftJoin(Ω1, Filter(c, Ω2))` when `c` reads only what Ω2 binds in
+    /// every solution, which is the rule's precondition.
     #[test]
     fn a_lifted_condition_goes_to_the_engine_and_the_join_still_pushes() {
         let schema = test_schema_view();
@@ -8030,32 +8636,59 @@ mod tests {
         );
         let leftjoin = plan.find("leftjoin")[0];
         assert_eq!(plan.nodes[leftjoin].executor, Executor::Sql, "{plan}");
-        let PlanOp::LeftJoin { condition, .. } = &plan.nodes[leftjoin].op else {
+        let PlanOp::LeftJoin {
+            condition,
+            reference,
+            ..
+        } = &plan.nodes[leftjoin].op
+        else {
             unreachable!()
         };
         assert!(
             condition.is_none(),
-            "the plan does not carry a condition it will not apply:\n{plan}"
+            "the plan does not carry a condition on the join:\n{plan}"
         );
         assert!(
-            plan.nodes[leftjoin].discharges.is_empty(),
-            "and it claims nothing for it:\n{plan}"
+            reference.is_some(),
+            "the join is on the reference edge:\n{plan}"
         );
-        assert_eq!(
-            plan.residual.len(),
-            1,
-            "the condition is unaccounted for, which is what the residual is \
-             for:\n{plan}"
-        );
+        assert!(plan.residual.is_empty(), "nothing is given up:\n{plan}");
+        // The condition is a filter inside the body, in SQL, claiming its
+        // obligation.
+        let filter = plan
+            .find("filter")
+            .into_iter()
+            .find(|id| plan.nodes[*id].op.describe().contains("hasName"))
+            .unwrap_or_else(|| panic!("{plan}"));
+        assert_eq!(plan.nodes[filter].executor, Executor::Sql, "{plan}");
+        assert!(plan.scope_of(filter).is_some(), "inside the body:\n{plan}");
         assert!(
-            plan.obligations[plan.residual[0]]
-                .to_string()
-                .contains("(?tn > \"A\")"),
+            plan.nodes[filter]
+                .discharges
+                .iter()
+                .any(|id| plan.obligations[*id].to_string().contains("(?tn > \"A\")")),
             "{plan}"
         );
-        // And the invariants hold, including the ledger: an obligation in the
-        // residual is claimed once, there.
-        plan.check().expect("the plan is well formed");
+        plan.check_with(&schema).expect("the plan is well formed");
+        // And what stays unsinkable: a condition reading an outer variable,
+        // and one with an effect. Both are given up to the residual by the
+        // left-join rule -- the engine's, as today -- rather than sunk.
+        for query in [
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
+             asset360:locatedOnTrack ?t . OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . \
+             FILTER(?tn > ?nm) } }",
+            "SELECT ?s ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
+             OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn . FILTER(RAND() < 0.5) } }",
+        ] {
+            let plan = refined(query, &schema, false);
+            assert!(
+                plan.find("filter")
+                    .iter()
+                    .all(|id| plan.scope_of(*id).is_none()),
+                "not sunk into the body:\n{plan}"
+            );
+            assert_eq!(plan.residual.len(), 1, "given up:\n{plan}");
+        }
     }
 
     /// A condition inside the `OPTIONAL` is marked as belonging to the
@@ -8503,7 +9136,7 @@ mod tests {
                     if rule.apply(&mut plan) {
                         changed = true;
                         applications += 1;
-                        plan.check().unwrap_or_else(|defect| {
+                        plan.check_with(&schema).unwrap_or_else(|defect| {
                             panic!(
                                 "{}, application {applications}: {defect} for {query}\n{plan}",
                                 rule.name()
@@ -8556,10 +9189,21 @@ mod tests {
             let naive = plan_of(query);
             let refined = refined(query, &schema, false);
 
-            assert_eq!(refined.obligations, naive.obligations, "{query}");
+            // The query's obligations are untouched; a rule may *append* a
+            // derived one (a boundary restriction, op 3a), never edit or
+            // remove one -- the ledger is append-only.
             assert_eq!(
-                refined.obligations.len(),
-                naive.obligations.len(),
+                &refined.obligations[..naive.obligations.len()],
+                &naive.obligations[..],
+                "{query}"
+            );
+            assert!(
+                refined.obligations[naive.obligations.len()..]
+                    .iter()
+                    .all(|obligation| matches!(
+                        obligation,
+                        crate::sparql_plan::Obligation::Boundary(_)
+                    )),
                 "{query}"
             );
             assert_eq!(refined.residual, naive.residual, "{query}");
@@ -8568,6 +9212,7 @@ mod tests {
                     .nodes
                     .iter()
                     .flat_map(|node| node.discharges.iter().copied())
+                    .filter(|id| *id < naive.obligations.len())
                     .collect();
                 ids.sort_unstable();
                 ids
@@ -8602,7 +9247,7 @@ mod tests {
                     if rule.apply(&mut plan) {
                         changed = true;
                         applications += 1;
-                        plan.check().unwrap_or_else(|defect| {
+                        plan.check_with(&schema).unwrap_or_else(|defect| {
                             panic!(
                                 "{}, application {applications}: {defect} for {query}\n{plan}",
                                 rule.name()

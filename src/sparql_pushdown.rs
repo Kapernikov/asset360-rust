@@ -55,6 +55,17 @@ pub struct BindingSpec {
     /// (numeric) or compares under `COLLATE "C"` (text, matching SPARQL's
     /// codepoint ordering rather than the database's locale collation).
     pub descriptor: TermDescriptor,
+    /// The relation this column is read from, by alias, when it is a column
+    /// of a derived table rather than of a star: `star_var` is then the
+    /// alias and `slot_path` the one column name. `None` for a star's own
+    /// column, which is every binding that existed before relations did.
+    pub relation: Option<String>,
+    /// Whether the column is an inlined element's *occurrence identifier*
+    /// rather than a value: the holder's identity concatenated with one hop
+    /// per collection step of `slot_path`, composed from each lateral's
+    /// ordinal. Representable and never serialisable; `descriptor` is a
+    /// placeholder for it.
+    pub occurrence: bool,
 }
 
 /// How one step of a path is stored, mirroring the schema's own three-way
@@ -361,5 +372,63 @@ pub(crate) fn binding_spec(
         containers: container_modes.iter().map(Container::from_mode).collect(),
         class_uri: class_uri.to_owned(),
         descriptor,
+        relation: None,
+        occurrence: false,
     })
+}
+
+/// A binding for an inlined element's occurrence: the walk from the record
+/// root to the element, one container per step, with no term at the end.
+///
+/// The counterpart of [`binding_spec`] for the one column kind that has no
+/// descriptor. `None` when the path does not reach an inlined class.
+pub(crate) fn occurrence_spec(
+    schema_view: &SchemaView,
+    star_var: &str,
+    class_uri: &str,
+    var_name: &str,
+    slot_path: Vec<String>,
+) -> Option<BindingSpec> {
+    use linkml_schemaview::identifier::Identifier;
+    use linkml_schemaview::slotview::SlotInlineMode;
+    let mut class_view = schema_view.get_class_by_uri(class_uri).ok()??;
+    let mut containers = Vec::with_capacity(slot_path.len());
+    for name in &slot_path {
+        let slot = class_view.slot(&Identifier::Name(name.clone()))?;
+        if slot.determine_slot_inline_mode() == SlotInlineMode::Reference {
+            return None;
+        }
+        containers.push(Container::from_mode(&slot.determine_slot_container_mode()));
+        class_view = slot.get_range_class()?;
+    }
+    Some(BindingSpec {
+        var: var_name.to_owned(),
+        star_var: star_var.to_owned(),
+        slot_path,
+        containers,
+        class_uri: class_uri.to_owned(),
+        descriptor: TermDescriptor::subject_iri(),
+        relation: None,
+        occurrence: true,
+    })
+}
+
+/// A binding for a column of a relation, by alias and column name.
+pub(crate) fn relation_spec(
+    alias: &str,
+    var_name: &str,
+    column: &str,
+    descriptor: TermDescriptor,
+    occurrence: bool,
+) -> BindingSpec {
+    BindingSpec {
+        var: var_name.to_owned(),
+        star_var: alias.to_owned(),
+        slot_path: vec![column.to_owned()],
+        containers: vec![Container::Single],
+        class_uri: String::new(),
+        descriptor,
+        relation: Some(alias.to_owned()),
+        occurrence,
+    }
 }

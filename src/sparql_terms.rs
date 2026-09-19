@@ -52,7 +52,7 @@ pub enum TermKind {
 }
 
 /// How to render one column's stored text as an RDF term.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TermDescriptor {
     pub kind: TermKind,
     /// Datatype IRI for a typed literal. `None` means a plain literal.
