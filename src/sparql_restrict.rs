@@ -193,24 +193,25 @@ impl Rule for RestrictScopeAtBoundary<'_> {
 
     fn apply(&self, plan: &mut Plan) -> bool {
         for id in 0..plan.nodes.len() {
-            let (left, right, shared, sides): (NodeId, NodeId, Vec<String>, Vec<Side>) =
+            // A left join's shared variables are derived from both sides,
+            // which is a walk of each: taken once the join is known to be
+            // at a boundary, not for every join in the plan.
+            let (left, right, shared, sides): (NodeId, NodeId, Option<Vec<String>>, Vec<Side>) =
                 match &plan.nodes[id].op {
                     PlanOp::Join {
                         left, right, on, ..
-                    } => (*left, *right, on.clone(), vec![Side::Left, Side::Right]),
+                    } => (
+                        *left,
+                        *right,
+                        Some(on.clone()),
+                        vec![Side::Left, Side::Right],
+                    ),
                     PlanOp::LeftJoin {
                         left,
                         right,
                         condition: None,
                         ..
-                    } => {
-                        let shared: Vec<String> = plan
-                            .variables_of(*left)
-                            .intersection(&plan.variables_of(*right))
-                            .cloned()
-                            .collect();
-                        (*left, *right, shared, vec![Side::Right])
-                    }
+                    } => (*left, *right, None, vec![Side::Right]),
                     _ => continue,
                 };
             for which in sides {
@@ -218,9 +219,6 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                     Side::Left => (left, right),
                     Side::Right => (right, left),
                 };
-                if crate::sparql_rules::consumers_of(plan, side).len() != 1 {
-                    continue;
-                }
                 // A restriction *at a boundary*: one side of the join is a
                 // scope's barrier -- the sub-query beside a typed read, or
                 // the untyped read beside a sub-query. A join inside one
@@ -233,6 +231,17 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                 if !boundary {
                     continue;
                 }
+                if crate::sparql_rules::consumers_of(plan, side).len() != 1 {
+                    continue;
+                }
+                let shared: Vec<String> = match &shared {
+                    Some(on) => on.clone(),
+                    None => plan
+                        .variables_of(left)
+                        .intersection(&plan.variables_of(right))
+                        .cloned()
+                        .collect(),
+                };
                 for var in &shared {
                     if !plan.guaranteed(side).contains(var) || !plan.guaranteed(other).contains(var)
                     {
