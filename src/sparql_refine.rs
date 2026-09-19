@@ -1289,7 +1289,6 @@ pub fn variables_used(expr: &Expr) -> Vec<String> {
 /// they cannot be parsed either -- and a name that does not match any of these
 /// simply declines, which is the safe direction: the subplan is left for the
 /// engine rather than evaluated from a guess.
-#[cfg(feature = "sparql-endpoint")]
 const BUILTIN_FUNCTIONS: [spargebra::algebra::Function; 46] = {
     use spargebra::algebra::Function::*;
     [
