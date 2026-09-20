@@ -985,6 +985,20 @@ pub struct PathFilter {
     /// a nested number compares text, where `'9' >= '10'` is true -- the same
     /// wrong answer that `numeric_fields` was added to prevent one level up.
     pub numeric: bool,
+    /// Whether some hop of the path holds a collection, so the record holds
+    /// *several* values at this path and the condition is a test over the
+    /// elements -- the nested twin of `Star::multivalued_fields`, and for the
+    /// same reason: the scalar walk `object_data->'a'->>'b'` is NULL on an
+    /// array and matches nothing, so a consumer told only the path would
+    /// render a condition that answers no row (#472, pepibru GitLab).
+    ///
+    /// `false` for every path filter the scoper derives itself, which
+    /// [`path_push_form`] admits only through single-valued hops. `true` is
+    /// what the fallback merge (`sparql_plan::keep_what_the_rules_proved`)
+    /// records for a narrowing the refined plan proved on an element read
+    /// -- `?cs :isReference true` under an unnest of `hasCoveredSection` --
+    /// where the scan's `required_paths` then restate the hops.
+    pub multivalued: bool,
 }
 
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
@@ -2142,6 +2156,19 @@ fn scope_qualified(
     // qualified inner star `?s__d1` is reachable through that link. Read off
     // the qualified query, so no second walk decides what a sub-select
     // exports.
+    //
+    // And the triples themselves: a triple links its subject to its object
+    // variable, and that is the sharing the refusal is about, whether or
+    // not the plan has an edge for it yet. `OPTIONAL { { SELECT ?s ?t WHERE
+    // { ?s :hasCoveredSection ?cs . ?cs :belongsToTrack ?t . ?t a :Track }
+    // } }` introduces `?t__d1`, reached from `?s__d1` through `?cs__d1` --
+    // and `?s__d1` is the outer `?s` across the barrier. The body leaves
+    // `?s__d1` untyped, so no star walks the path and no edge is raised
+    // here; the refined plan types it from the outer restriction and
+    // `resolve` scopes again with that class, when the edge exists. Refused
+    // on the recording pass, that second chance never came (#472, pepibru
+    // GitLab). A star that shares a variable only through such a chain is
+    // connected; a star that shares none still is not.
     let exports = crate::sparql_domains::exports(query);
     {
         let edges: Vec<(&str, &str)> = joins
@@ -2151,6 +2178,17 @@ fn scope_qualified(
                 exports
                     .iter()
                     .map(|(inner, outer)| (inner.as_str(), outer.as_str())),
+            )
+            .chain(
+                star_map
+                    .values()
+                    .chain(discarded_claims.iter().copied())
+                    .flat_map(|builder| {
+                        builder
+                            .object_variables
+                            .values()
+                            .map(move |object| (builder.variable.as_str(), object.as_str()))
+                    }),
             )
             .collect();
         let reachable = stars_reachable_from(
@@ -2282,6 +2320,11 @@ fn scope_qualified(
                             slot_path,
                             conditions: conds,
                             numeric,
+                            // `path_push_form` admits a path through
+                            // single-valued hops only; a collection hop
+                            // declines the push, so every path here is a
+                            // scalar walk.
+                            multivalued: false,
                         });
                         continue;
                     }
@@ -4156,7 +4199,7 @@ fn path_push_form(
 /// no predicate over the payload can say whether the triple exists. Every
 /// other shape is restated: single-valued, list and mapping hops, a
 /// single- or multivalued leaf, and several leaves under one element.
-fn nested_presence_of(
+pub(crate) fn nested_presence_of(
     schema_view: &SchemaView,
     class_uri: &str,
     slot_path: &[String],
@@ -7070,6 +7113,7 @@ classes:
                 slot_path: vec!["location".to_owned(), "longitude".to_owned()],
                 conditions: vec![FilterCondition::Eq("4".to_owned())],
                 numeric: true,
+                multivalued: false,
             }],
             "the condition names the path, not a column"
         );
@@ -7098,6 +7142,7 @@ classes:
                 slot_path: vec!["location".to_owned(), "longitude".to_owned()],
                 conditions: vec![FilterCondition::Eq("4".to_owned())],
                 numeric: true,
+                multivalued: false,
             }]
         );
     }
@@ -8409,6 +8454,42 @@ classes:
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("disconnected")),
             "expected UnsupportedConstruct with disconnected, got {result:?}"
+        );
+    }
+
+    /// A star is connected by the triples it shares, whether or not a star
+    /// walks them yet: the body's `?s` is the outer `?s` across the barrier
+    /// and its own domain leaves it untyped, so on the recording pass no
+    /// path walk reaches `?t` and no edge is raised -- and `?t` was refused
+    /// as disconnected before the refined plan could type `?s` from the
+    /// outer restriction (#472, pepibru GitLab). The typed body is the
+    /// control: the same block with `?s a asset360:TunnelComplex` inside
+    /// was never refused, and the two must plan alike. And a block that
+    /// shares nothing is still refused, above.
+    #[test]
+    fn an_optional_sub_select_reached_through_an_untyped_subject_is_connected() {
+        let sv = asset360_fixture_schema_view();
+        let untyped = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?n ?t WHERE { ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+             OPTIONAL { { SELECT ?s ?t WHERE { ?s asset360:hasAccessibleTracks ?cs . \
+             ?cs asset360:belongsToTrack ?t . ?t a asset360:Track } } } }";
+        let typed = untyped.replace(
+            "{ ?s asset360:hasAccessibleTracks",
+            "{ ?s a asset360:TunnelComplex ; asset360:hasAccessibleTracks",
+        );
+        let untyped_plan = crate::sparql_plan::plan_query_refined(untyped, &sv)
+            .unwrap_or_else(|error| panic!("refused: {error}"));
+        let typed_plan = crate::sparql_plan::plan_query_refined(&typed, &sv).unwrap();
+        // The passes, not the ledger: the typed body owes one more type
+        // obligation, and that is the only difference there may be.
+        let passes = |plan: &crate::sparql_plan::ExecutionPlan| {
+            let text = plan.to_string();
+            text[..text.find("\nobligations").unwrap_or(text.len())].to_owned()
+        };
+        assert_eq!(passes(&untyped_plan), passes(&typed_plan));
+        assert!(
+            untyped_plan.to_string().contains("all in SQL"),
+            "{untyped_plan}"
         );
     }
 
