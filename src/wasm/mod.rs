@@ -264,6 +264,13 @@ impl SchemaViewHandle {
     /// reusing the engine on the frontend).
     ///
     /// `treat_missing_as_null` mirrors [`DiffOptions::treat_missing_as_null`].
+    ///
+    /// `treat_changed_identifier_as_new_object` mirrors the option of the same
+    /// name and defaults to `true`, which is what this binding did before the
+    /// parameter existed. Pass `false` on a live edit form: with it on, typing
+    /// in the identity slot itself reads as remove + add, so the row flashes as
+    /// deleted and re-added mid-keystroke instead of simply updating.
+    ///
     /// Returns `Delta[]` (`{ path, op, old?, new? }`).
     #[wasm_bindgen(js_name = diffJson)]
     pub fn diff_json(
@@ -272,13 +279,18 @@ impl SchemaViewHandle {
         base: JsValue,
         current: JsValue,
         treat_missing_as_null: bool,
+        treat_changed_identifier_as_new_object: Option<bool>,
     ) -> Result<JsValue, JsValue> {
         let base_handle = self.create_instance(class_name, base)?;
         let current_handle = self.create_instance(class_name, current)?;
         let deltas = diff(
             &base_handle.inner,
             &current_handle.inner,
-            DiffOptions::new(treat_missing_as_null),
+            DiffOptions {
+                treat_changed_identifier_as_new_object: treat_changed_identifier_as_new_object
+                    .unwrap_or(true),
+                ..DiffOptions::new(treat_missing_as_null)
+            },
         );
         // A `Delta`'s `old`/`new` are `serde_json::Value`s; object payloads (e.g.
         // a removed inlined row) serialise to maps. The default serde_wasm_bindgen
@@ -582,6 +594,24 @@ impl SlotViewHandle {
 
 #[wasm_bindgen]
 impl SlotViewHandle {
+    /// Can the elements of this slot be told apart by identity at all?
+    ///
+    /// A question about the *schema*, not the data: true when this is an
+    /// element-addressable multivalued slot whose declared range class carries
+    /// a key/identifier or any `unique_keys`. It stays true when the data fails
+    /// to honour that declaration — a row with its key still empty, or two rows
+    /// sharing one — which is exactly the state a caller guarding against
+    /// missing or duplicate keys wants to reject, so the answer must not go
+    /// false underneath it.
+    ///
+    /// Deliberately the declared range class only, not the class family: a
+    /// polymorphic list ranged on a class declaring nothing still answers
+    /// `false`, even where its descendants declare `unique_keys`.
+    #[wasm_bindgen(js_name = declaresElementIdentity)]
+    pub fn declares_element_identity(&self) -> bool {
+        linkml_runtime::slot_declares_element_identity(&self.inner)
+    }
+
     #[wasm_bindgen(js_name = name)]
     pub fn name(&self) -> String {
         self.inner.name.clone()
@@ -971,6 +1001,21 @@ impl LinkMLInstanceHandle {
             also_include_id_slots.unwrap_or(false),
         );
         to_js(&refs)
+    }
+
+    /// This element's identity label, or `undefined` when it has none.
+    ///
+    /// Per-element by design: it answers for *this* element and never consults
+    /// its siblings. A whole-list rule cannot, because it goes positional the
+    /// moment one element's identity slot is empty or duplicates a neighbour —
+    /// so a row the user has just added would blank the provenance of every
+    /// other row in the table at the same time.
+    ///
+    /// Translating a path needs a keyed-shaped list anyway, where this call and
+    /// a whole-list one agree element for element.
+    #[wasm_bindgen(js_name = elementIdentityLabel)]
+    pub fn element_identity_label(&self) -> Option<String> {
+        linkml_runtime::element_identity_label(&self.inner)
     }
 }
 
