@@ -22,7 +22,7 @@ serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true, features = ["serde-serialize"] }
 js-sys = { version = "0.3", optional = true }
 fragile = { version = "2.0", optional = true }
-minijinja = { version = "2.12.0", features = ["loader", "json", "fuel"], optional = true }
+minijinja = { version = "2.12.0", features = ["loader", "json", "fuel", "urlencode"], optional = true }
 minijinja-contrib = { version = "2.12.0", optional = true, features = ["pycompat"] }
 console_error_panic_hook = { version = "0.1", optional = true }
 getrandom = { version = "0.2", optional = true, features = ["js"] }
