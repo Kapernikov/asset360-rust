@@ -2396,23 +2396,41 @@ fn scope_qualified(
     {
         // Sorted, so the order of `required_paths` (and so the rendered
         // predicate) does not depend on hash order.
-        let mut mandatory_reads: Vec<&PathBinding> = path_bindings
+        //
+        // A *reference* reached through the structure is the same obligation.
+        // `?c :onTrack ?t` with ?t untyped binds the identifier stored two
+        // slots down, and a record whose structure holds none has no
+        // solution -- but the walk files it under `references`, because it
+        // is a value the walk cannot enter, and not under `path_bindings`.
+        // Read from only the latter, this restated nothing for it, and a
+        // pushed `COUNT(?s)` with ?t unprojected -- no binding for the
+        // renderer to null-test, no premise on the scan -- counted every
+        // record (#476, pepibru GitLab). A *typed* reference is a join edge
+        // (Phase 2a), and the join decides the row.
+        let mut mandatory_reads: Vec<(&String, &Vec<String>)> = path_bindings
             .values()
             .filter(|binding| !binding.optional)
+            .map(|binding| (&binding.star_var, &binding.slot_path))
+            .chain(
+                references
+                    .iter()
+                    .filter(|(var, reach)| {
+                        !var_to_class.contains_key(*var)
+                            && reach.slot_path.len() > 1
+                            && !reach.optional
+                    })
+                    .map(|(_, reach)| (&reach.star_var, &reach.slot_path)),
+            )
             .collect();
-        mandatory_reads
-            .sort_by(|a, b| (&a.star_var, &a.slot_path).cmp(&(&b.star_var, &b.slot_path)));
-        for binding in mandatory_reads {
-            let Some(star) = stars
-                .iter_mut()
-                .find(|star| star.variable == binding.star_var)
-            else {
+        mandatory_reads.sort();
+        for (star_var, slot_path) in mandatory_reads {
+            let Some(star) = stars.iter_mut().find(|star| star.variable == *star_var) else {
                 continue;
             };
             if star.is_optional {
                 continue;
             }
-            match nested_presence_of(schema_view, &star.class_uri, &binding.slot_path) {
+            match nested_presence_of(schema_view, &star.class_uri, slot_path) {
                 Some(required) => {
                     if !star.required_paths.contains(&required) {
                         star.required_paths.push(required);
@@ -5426,6 +5444,13 @@ classes:
       detail:
         range: Detail
         inlined: true
+      # A *reference* inside the structure -- another record's identifier
+      # stored two slots down, as `Signal.locationInfo.yard` is in the real
+      # datamodel. The walk cannot enter it, so it is a value read that is
+      # not a `path_binding`; #476 (pepibru GitLab) is what that omission
+      # cost.
+      onTrack:
+        range: Track
   Detail:
     class_uri: asset360:Detail
     attributes:
@@ -6579,6 +6604,90 @@ classes:
             assert_eq!(star.required_paths, expected, "restated, for: {label}");
             assert_eq!(plan.sql_limit, limit, "bound, for: {label}");
         }
+    }
+
+    /// A *reference* inside the structure is the same obligation as a scalar
+    /// there. `?c :onTrack ?t` with ?t untyped binds the identifier stored two
+    /// slots down, and a record whose structure holds none has no solution --
+    /// but the walk files it under `references`, not `path_bindings`, so
+    /// Phase 3b restated nothing and a pushed `COUNT(?s)` with ?t unprojected
+    /// counted every record (#476, pepibru GitLab).
+    ///
+    /// The star decomposition still does not *represent* the triple (the
+    /// plan is inexact and carries no bound); the refined plan answers it,
+    /// and reads the scan's premise off this star through `FetchBounds::of`
+    /// -- which is why the obligation has to be stated here whether or not
+    /// this plan is the one that answers.
+    #[test]
+    fn an_untyped_reference_inside_a_structure_is_restated_on_the_scan() {
+        use crate::sparql_pushdown::Container::Single;
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+        let path = |slots: &[&str]| RequiredPath {
+            slot_path: slots.iter().map(|s| (*s).to_owned()).collect(),
+            containers: vec![Single; slots.len()],
+        };
+
+        let mandatory = sparql_scope(
+            &format!(
+                "{prefix}SELECT (COUNT(?s) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+                 asset360:location ?c . ?c asset360:onTrack ?t }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(
+            find_star(&mandatory, "s").required_paths,
+            vec![path(&["location", "onTrack"])],
+            "the record must hold the identifier"
+        );
+
+        // Beside a scalar leaf under the same structure: both, in path order.
+        let both = sparql_scope(
+            &format!(
+                "{prefix}SELECT (COUNT(?s) AS ?n) WHERE {{ ?s a asset360:Signal ; \
+                 asset360:location ?c . ?c asset360:onTrack ?t ; asset360:longitude ?lo }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(
+            find_star(&both, "s").required_paths,
+            vec![
+                path(&["location", "longitude"]),
+                path(&["location", "onTrack"])
+            ],
+        );
+
+        // Inside OPTIONAL a missing value leaves ?t unbound and keeps the row.
+        let optional = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?s ?t WHERE {{ ?s a asset360:Signal ; asset360:name ?n . \
+                 OPTIONAL {{ ?s asset360:location ?c . ?c asset360:onTrack ?t }} }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert!(
+            find_star(&optional, "s").required_paths.is_empty(),
+            "an optional read costs no row"
+        );
+
+        // Typed, the reference is a join edge (Phase 2a) and the join decides
+        // the row: nothing to restate on the scan.
+        let typed = sparql_scope(
+            &format!(
+                "{prefix}SELECT ?s ?t WHERE {{ ?s a asset360:Signal ; \
+                 asset360:location ?c . ?c asset360:onTrack ?t . ?t a asset360:Track }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert!(
+            find_star(&typed, "s").required_paths.is_empty(),
+            "a join, not a read"
+        );
+        assert_eq!(all_joins(&typed).len(), 1);
     }
 
     /// The same premise on the driving scan of a rooted `OPTIONAL` join: the
