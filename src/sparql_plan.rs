@@ -3173,6 +3173,51 @@ classes:
         assert_eq!(scan_of(&answered), (Some(50), vec![]), "{answered}");
     }
 
+    /// The statement's scan states the presence of a reference read through a
+    /// structure, projected or not -- the shape #476 (pepibru GitLab) found:
+    /// `?c :onTrack ?t` with ?t unprojected left no binding for the renderer
+    /// to null-test and no premise on the scan, so the pushed `COUNT(?s)`
+    /// counted the records whose structure holds no reference at all.
+    #[test]
+    fn a_pushed_count_over_a_nested_reference_states_its_presence() {
+        let sv = test_schema_view();
+        let paths_of = |plan: &ExecutionPlan| -> Vec<Vec<String>> {
+            plan.passes
+                .iter()
+                .find_map(|pass| match &pass.kind {
+                    PassKind::Sql(sql) => Some(&sql.ops),
+                    PassKind::Engine(_) => None,
+                })
+                .expect("a SQL pass")
+                .nodes
+                .iter()
+                .find_map(|node| match &node.op {
+                    crate::sparql_ops::Op::Scan { required_paths, .. } => Some(
+                        required_paths
+                            .iter()
+                            .map(|path| path.slot_path.clone())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .expect("a scan")
+        };
+        let on_track = vec![vec!["location".to_owned(), "onTrack".to_owned()]];
+
+        for query in [
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:location ?c . ?c asset360:onTrack ?t }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
+             asset360:location ?c . ?c asset360:onTrack ?t }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Signal ; \
+             asset360:location ?c . ?c asset360:onTrack ?t }",
+        ] {
+            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            assert!(plan.sql_only(), "{plan}");
+            assert_eq!(paths_of(&plan), on_track, "{plan}");
+        }
+    }
+
     /// A query that never asked for an aggregate is owed no explanation.
     #[test]
     fn an_ordinary_query_names_no_unpushed_aggregate() {
