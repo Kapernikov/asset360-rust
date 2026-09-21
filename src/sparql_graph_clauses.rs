@@ -22,6 +22,8 @@
 //! query came back refused as *unscoped*: a parse failure reported as a
 //! question about scope.
 
+use linkml_schemaview::schemaview::SchemaView;
+
 /// Whether a query could observe a named graph at all.
 ///
 /// A named graph is invisible unless the query says `GRAPH`: oxigraph's default
@@ -34,7 +36,7 @@
 /// algebra walked for a `GRAPH` node. A query that does not parse is treated as
 /// *possibly* reading it, so the schema graph is built and oxigraph is left to
 /// report the real parse error rather than this function inventing one.
-pub fn query_reads_named_graphs(query: &str) -> bool {
+pub fn query_reads_named_graphs(query: &str, schema_view: &SchemaView) -> bool {
     use spargebra::Query;
     use spargebra::algebra::GraphPattern;
 
@@ -73,7 +75,7 @@ pub fn query_reads_named_graphs(query: &str) -> bool {
         }
     }
 
-    let Ok(parsed) = crate::sparql_scoper::sparql_parser().parse_query(query) else {
+    let Ok(parsed) = crate::sparql_scoper::parse_query_for(query, schema_view) else {
         return true;
     };
     let pattern = match &parsed {
@@ -100,7 +102,11 @@ pub fn query_reads_named_graphs(query: &str) -> bool {
 ///
 /// A query that does not parse is not schema-only: the real parse error must
 /// surface, not be turned into an empty answer.
-pub fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
+pub fn reads_only_the_schema_graph(
+    query: &str,
+    schema_graph_iri: Option<&str>,
+    schema_view: &SchemaView,
+) -> bool {
     use spargebra::Query;
     use spargebra::algebra::GraphPattern;
     use spargebra::term::NamedNodePattern;
@@ -183,7 +189,7 @@ pub fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) 
         }
     }
 
-    let Ok(parsed) = crate::sparql_scoper::sparql_parser().parse_query(query) else {
+    let Ok(parsed) = crate::sparql_scoper::parse_query_for(query, schema_view) else {
         return false;
     };
     let pattern = match &parsed {
@@ -205,11 +211,35 @@ pub fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::sparql_scoper::tests::test_schema_view;
 
     /// The graph the asset360 datamodel configures. A test value: production
     /// reads it from `asset360_model/datamodels/asset360.yaml`.
     const SCHEMA_GRAPH: &str = "https://data.infrabel.be/asset360/schema";
+
+    /// The production functions over the shared test schema, so the cases
+    /// below read as the questions they ask rather than as plumbing.
+    fn query_reads_named_graphs(query: &str) -> bool {
+        super::query_reads_named_graphs(query, &test_schema_view())
+    }
+
+    fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
+        super::reads_only_the_schema_graph(query, schema_graph_iri, &test_schema_view())
+    }
+
+    #[test]
+    fn the_datamodels_own_prefix_needs_no_declaration_here_either() {
+        // The planner parses with the schema-seeded parser and refuses this
+        // as unscoped; the endpoint then asks whether it is schema-only. A
+        // bare parser here would fail on `asset360:` and answer "no" — a
+        // parse failure reported as a question about scope, again.
+        assert!(reads_only_the_schema_graph(
+            &format!(
+                "SELECT ?l WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ asset360:Signal rdfs:label ?l }} }}"
+            ),
+            Some(SCHEMA_GRAPH)
+        ));
+    }
 
     #[test]
     fn only_a_graph_clause_can_reach_the_schema_graph() {

@@ -3649,9 +3649,18 @@ impl From<ScopeError> for RefineError {
     }
 }
 
-/// Parse a query and build its naive plan.
+/// Parse a query with the schema-less parser and build its naive plan.
+///
+/// Diagnostics and tests; a query here declares the datamodel's prefixes
+/// itself. See [`crate::sparql_scoper::sparql_parser`].
 pub fn naive_plan_of(query_str: &str) -> Result<Plan, RefineError> {
     let parsed = crate::sparql_scoper::parse_query(query_str)?;
+    naive_plan(&parsed)
+}
+
+/// Parse a query with the schema-seeded parser and build its naive plan.
+pub fn naive_plan_for(query_str: &str, schema_view: &SchemaView) -> Result<Plan, RefineError> {
+    let parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
     naive_plan(&parsed)
 }
 

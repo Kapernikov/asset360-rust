@@ -116,6 +116,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sparql_schema_graph_ntriples, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_schema_graph_skipped, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_reads_only_the_schema_graph, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_predeclared_prefixes, m)?)?;
         m.add_function(wrap_pyfunction!(py_broken_out_column, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
@@ -4014,7 +4015,7 @@ fn sparql_schema_graph_skipped(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, schema_graph_iri=None))]
+#[pyo3(signature = (query, schema_graph_iri, schema_view))]
 /// Whether every triple pattern in the query reads the schema graph.
 ///
 /// Such a query asks about the datamodel and about no golden record, so the
@@ -4027,8 +4028,47 @@ fn sparql_schema_graph_skipped(
 ///     schema_graph_iri: The named graph the active datamodel serves its
 ///         schema in, or ``None`` when it serves none — in which case no
 ///         query reads only it.
-fn sparql_reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<String>) -> bool {
-    crate::sparql_graph_clauses::reads_only_the_schema_graph(query, schema_graph_iri.as_deref())
+///     schema_view: The LinkML schema, whose prefixes seed the parser — the
+///         same parser the planner used, so a query the planner refused as
+///         unscoped parses here too rather than being reported as not
+///         schema-only because a datamodel prefix was left undeclared.
+fn sparql_reads_only_the_schema_graph(
+    py: Python<'_>,
+    query: &str,
+    schema_graph_iri: Option<String>,
+    schema_view: Py<PySchemaView>,
+) -> bool {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    crate::sparql_graph_clauses::reads_only_the_schema_graph(
+        query,
+        schema_graph_iri.as_deref(),
+        sv_ref.as_rust(),
+    )
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (schema_view))]
+/// The prefixes a SPARQL query here may leave undeclared, label to namespace.
+///
+/// What the endpoint's parser seeds: the W3C vocabularies (``rdf``, ``rdfs``,
+/// ``owl``, ``xsd``, ``skos``, ``schema``) and every prefix the datamodel's
+/// own schemas declare (``asset360``, ``irsm``, …). A query may declare any
+/// of them again; its own declaration wins. Read this rather than keeping a
+/// copy: it is the parser's own map, so documentation built from it cannot
+/// drift from what the parser accepts.
+///
+/// Args:
+///     schema_view: The LinkML schema whose ``prefixes:`` seed the parser.
+fn sparql_predeclared_prefixes(
+    py: Python<'_>,
+    schema_view: Py<PySchemaView>,
+) -> std::collections::BTreeMap<String, String> {
+    let bound = schema_view.bind(py);
+    let sv_ref = bound.borrow();
+    crate::sparql_scoper::predeclared_prefixes(sv_ref.as_rust())
 }
 
 #[cfg(all(

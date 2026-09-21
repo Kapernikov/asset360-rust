@@ -371,7 +371,7 @@ pub fn sparql_execute(
     // datamodel's configuration: `None` means this datamodel serves no schema
     // graph, and then there is nothing to insert.
     if let Some(schema_graph_iri) = schema_graph_iri
-        && crate::sparql_graph_clauses::query_reads_named_graphs(query_str)
+        && crate::sparql_graph_clauses::query_reads_named_graphs(query_str, schema_view)
     {
         let schema_graph =
             crate::sparql_schema_graph::SchemaGraph::build(schema_view, schema_graph_iri)
@@ -401,7 +401,7 @@ pub fn sparql_execute(
     // `spargebra =0.3.5`), and what crossed instead was the query *rendered
     // back to SPARQL* for oxigraph's own parser to read again — a round trip
     // whose only job was to bridge two versions of one crate.
-    let mut parsed = crate::sparql_scoper::parse_query(query_str)
+    let mut parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
     // One slot, two spellings -- and one class, two spellings. The data
