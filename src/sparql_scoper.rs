@@ -1325,7 +1325,7 @@ pub fn sparql_scope_with_schema_graph(
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> Result<QueryPlan, ScopeError> {
-    let mut query = parse_query(query_str)?;
+    let mut query = parse_query_for(query_str, schema_view)?;
     // The same spelling pass every other entry point runs, so a caller that
     // only scopes -- the config linter, through the `sparql_scope` binding --
     // accepts and refuses exactly what the planner and the engine leg do. See
@@ -1334,7 +1334,78 @@ pub fn sparql_scope_with_schema_graph(
     scope_parsed_with_schema_graph(&query, schema_view, schema_graph_iri)
 }
 
-/// The parser every entry point must use.
+/// The vocabularies the parser seeds whatever the datamodel says.
+///
+/// The four W3C vocabularies every SPARQL engine pre-registers plus the two
+/// the datamodel's own schema graph is written in — `skos` for enum values
+/// (`skos:notation`, `skos:inScheme`) and `schema` for slot domains
+/// (`schema:domainIncludes`). Without those, the only way to write a discovery
+/// query is with declarations that the query it is discovering *for* does not
+/// need, which is a difference no caller can be expected to guess.
+///
+/// These win over the schema's own binding of the same label: asset360's
+/// LinkML declares `schema:` as `http://schema.org/`, and the schema graph
+/// ([`crate::sparql_schema_graph`]) writes `https://schema.org/domainIncludes`.
+/// A parser that took the schema's spelling would parse a discovery query
+/// into IRIs the graph never carries — a silent empty answer.
+pub const ENDPOINT_PREFIXES: [(&str, &str); 6] = [
+    ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+    ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
+    ("owl", "http://www.w3.org/2002/07/owl#"),
+    ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+    ("skos", "http://www.w3.org/2004/02/skos/core#"),
+    ("schema", "https://schema.org/"),
+];
+
+/// The datamodel's own `prefixes:`, label to namespace, over every schema in
+/// the view — `irsm:` is declared in `rsm.yaml` and nowhere else.
+///
+/// Sorted, so the parser is seeded in one order whatever the hash seed, and a
+/// label two schemas bind differently resolves the same way in every process
+/// (the last in label order wins; the schema linter is where such a clash
+/// belongs). LinkML's metamodel prefixes (`linkml`, `shex`, `jsonld`) are
+/// left out: they name no class, slot or value a query could bind.
+pub fn schema_prefixes(schema_view: &SchemaView) -> std::collections::BTreeMap<String, String> {
+    const METAMODEL: [&str; 3] = ["linkml", "shex", "jsonld"];
+    schema_view.with_schema_definitions(|schemas| {
+        let mut out = std::collections::BTreeMap::new();
+        // Schemas in id order, so two schemas binding one label disagree the
+        // same way every time.
+        let mut ids: Vec<&String> = schemas.keys().collect();
+        ids.sort();
+        for id in ids {
+            if let Some(prefixes) = &schemas[id].prefixes {
+                let mut labels: Vec<&String> = prefixes.keys().collect();
+                labels.sort();
+                for label in labels {
+                    if METAMODEL.contains(&label.as_str()) {
+                        continue;
+                    }
+                    out.insert(label.clone(), prefixes[label].prefix_reference.clone());
+                }
+            }
+        }
+        out
+    })
+}
+
+/// The prefixes a query against `schema_view` may leave implicit, label to
+/// namespace: [`ENDPOINT_PREFIXES`] over [`schema_prefixes`].
+///
+/// What [`sparql_parser_for`] seeds, in one map so a caller documenting the
+/// endpoint (the `writing-sparql` skill) lists exactly what the parser
+/// accepts rather than a copy that drifts.
+pub fn predeclared_prefixes(
+    schema_view: &SchemaView,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = schema_prefixes(schema_view);
+    for (label, namespace) in ENDPOINT_PREFIXES {
+        out.insert(label.to_owned(), namespace.to_owned());
+    }
+    out
+}
+
+/// The parser every entry point must use, seeded from the datamodel.
 ///
 /// It preloads the prefixes a caller may leave implicit, which makes it part of
 /// the endpoint's contract rather than a convenience: a query that omits
@@ -1346,44 +1417,68 @@ pub fn sparql_scope_with_schema_graph(
 /// and a schema-graph discovery query was refused as *unscoped* because it did
 /// not parse there.
 ///
-/// The set is the four W3C vocabularies every SPARQL engine pre-registers plus
-/// the two the datamodel's own schema graph is written in — `skos` for enum
-/// values (`skos:notation`, `skos:inScheme`) and `schema` for slot domains
-/// (`schema:domainIncludes`). Without those, the only way to write a discovery
-/// query is with declarations that the query it is discovering *for* does not
-/// need, which is a difference no caller can be expected to guess.
+/// The set is [`ENDPOINT_PREFIXES`] plus the datamodel's own `prefixes:`
+/// ([`schema_prefixes`]) — read off the schema rather than hardcoded, so a
+/// refusal's "did you mean `irsm:longname`" can be pasted as written, and a
+/// second datamodel (`DATAMODEL=rinf`) describes itself instead of being
+/// handed asset360's namespace. `asset360:` used to be the one hardcoded
+/// datamodel prefix here; it is now seeded like any other because the schema
+/// declares it.
 ///
 /// These are defaults, not overrides: a query that declares a label itself wins
 /// (the parser's in-query declaration overwrites the seeded one), so a caller
 /// who binds `rdf:` to something else gets the query they wrote.
-pub fn sparql_parser() -> SparqlParser {
-    SparqlParser::new()
-        .with_prefix("asset360", "https://data.infrabel.be/asset360/")
-        .expect("hardcoded prefix")
-        .with_prefix("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
-        .expect("hardcoded prefix")
-        .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#")
-        .expect("hardcoded prefix")
-        .with_prefix("owl", "http://www.w3.org/2002/07/owl#")
-        .expect("hardcoded prefix")
-        .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#")
-        .expect("hardcoded prefix")
-        .with_prefix("skos", "http://www.w3.org/2004/02/skos/core#")
-        .expect("hardcoded prefix")
-        .with_prefix("schema", "https://schema.org/")
-        .expect("hardcoded prefix")
+pub fn sparql_parser_for(schema_view: &SchemaView) -> SparqlParser {
+    let mut parser = SparqlParser::new();
+    for (label, namespace) in predeclared_prefixes(schema_view) {
+        // A namespace that is not an IRI cannot be a prefix of any IRI in
+        // the data either; leaving it unseeded loses nothing a query could
+        // have matched. The schema linter is where a malformed `prefixes:`
+        // entry gets reported.
+        if let Ok(seeded) = parser.clone().with_prefix(label, namespace) {
+            parser = seeded;
+        }
+    }
+    parser
 }
 
-/// Parse a query, rejecting SPARQL Update.
+/// The parser for a caller with no schema in hand: [`ENDPOINT_PREFIXES`] only.
+///
+/// Diagnostics ([`crate::sparql_plan::naive_plan_text`]) and tests. Production
+/// entry points have a schema and use [`sparql_parser_for`]; a query that
+/// leaves the datamodel's own prefix undeclared does not parse here, which is
+/// the difference between the two and why every entry point that serves a
+/// client takes the other one.
+pub fn sparql_parser() -> SparqlParser {
+    let mut parser = SparqlParser::new();
+    for (label, namespace) in ENDPOINT_PREFIXES {
+        parser = parser
+            .with_prefix(label, namespace)
+            .expect("hardcoded prefix");
+    }
+    parser
+}
+
+/// Parse a query with [`sparql_parser_for`], rejecting SPARQL Update.
+pub fn parse_query_for(query_str: &str, schema_view: &SchemaView) -> Result<Query, ScopeError> {
+    parse_with(&sparql_parser_for(schema_view), query_str)
+}
+
+/// Parse a query with [`sparql_parser`], rejecting SPARQL Update.
 pub fn parse_query(query_str: &str) -> Result<Query, ScopeError> {
+    parse_with(&sparql_parser(), query_str)
+}
+
+fn parse_with(parser: &SparqlParser, query_str: &str) -> Result<Query, ScopeError> {
     // An Update parses as an Update and not as a Query, so this check has to
     // precede the query parse to give the specific error rather than a syntax
     // one.
-    if sparql_parser().parse_update(query_str).is_ok() {
+    if parser.clone().parse_update(query_str).is_ok() {
         return Err(ScopeError::UpdateRejected);
     }
 
-    sparql_parser()
+    parser
+        .clone()
         .parse_query(query_str)
         .map_err(|e| ScopeError::ParseError(e.to_string()))
 }
@@ -8749,5 +8844,135 @@ classes:
                 && msg.contains("Add `?t a <https://data.infrabel.be/asset360/Track>`"),
             "{msg}"
         );
+    }
+
+    /// Two schemas, two datamodel prefixes — the shape `irsm:` has in
+    /// asset360, where `rsm.yaml` declares it and `tunnels.yaml` does not —
+    /// plus the datamodel binding `schema:` to the spelling the schema graph
+    /// does *not* use.
+    fn two_schema_view() -> SchemaView {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+
+        let rsm = r#"
+id: https://w3id.org/infrabel/rsm
+name: rsm
+prefixes:
+  linkml: https://w3id.org/linkml/
+  irsm: https://data.infrabel.be/asset360-rsm-subset/
+default_prefix: irsm
+default_range: string
+classes:
+  Track:
+    attributes:
+      asset360_uri:
+        identifier: true
+      name:
+        range: string
+"#;
+        let asset360 = r#"
+id: https://data.infrabel.be/asset360
+name: asset360
+prefixes:
+  linkml: https://w3id.org/linkml/
+  shex: http://www.w3.org/ns/shex#
+  asset360: https://data.infrabel.be/asset360/
+  schema: http://schema.org/
+default_prefix: asset360
+default_range: string
+classes:
+  Signal:
+    attributes:
+      asset360_uri:
+        identifier: true
+"#;
+        let mut sv = SchemaView::new();
+        for raw in [rsm, asset360] {
+            let schema: SchemaDefinition =
+                p2e::deserialize(yml::Deserializer::from_str(raw)).unwrap();
+            sv.add_schema(schema).unwrap();
+        }
+        sv
+    }
+
+    fn first_type_iri(query: &Query) -> String {
+        let Query::Select { pattern, .. } = query else {
+            panic!("a SELECT");
+        };
+        let GraphPattern::Project { inner, .. } = pattern else {
+            panic!("a projection, got {pattern:?}");
+        };
+        let GraphPattern::Bgp { patterns } = inner.as_ref() else {
+            panic!("a bgp, got {inner:?}");
+        };
+        match &patterns[0].object {
+            TermPattern::NamedNode(node) => node.as_str().to_owned(),
+            other => panic!("a named node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_parser_is_seeded_from_every_schema_in_the_view() {
+        // `irsm:` is declared in the rsm schema only; `asset360:` in the
+        // other. Neither is hardcoded any more, and both parse undeclared —
+        // which is what lets a refusal's "did you mean `irsm:name`" be pasted
+        // as written (#478, pepibru GitLab issue).
+        let sv = two_schema_view();
+        let query = "SELECT ?n WHERE { ?t a irsm:Track ; irsm:name ?n . ?s a asset360:Signal }";
+        let parsed = parse_query_for(query, &sv).expect("both datamodel prefixes are seeded");
+        assert_eq!(
+            first_type_iri(&parsed),
+            "https://data.infrabel.be/asset360-rsm-subset/Track"
+        );
+        // The schema-less parser knows the W3C six and nothing of the
+        // datamodel: the same text is a parse error there, which is the
+        // difference between the two parsers and why every entry point that
+        // serves a client takes the seeded one.
+        assert!(matches!(parse_query(query), Err(ScopeError::ParseError(_))));
+    }
+
+    #[test]
+    fn the_endpoints_vocabularies_win_over_the_schemas_binding_of_the_same_label() {
+        let sv = two_schema_view();
+        let predeclared = predeclared_prefixes(&sv);
+        // The datamodel says `http://schema.org/`; the schema graph is
+        // written under `https://`, and a parser taking the datamodel's
+        // spelling would turn every discovery query into a silent miss.
+        assert_eq!(predeclared["schema"], "https://schema.org/");
+        assert_eq!(
+            predeclared["irsm"],
+            "https://data.infrabel.be/asset360-rsm-subset/"
+        );
+        assert_eq!(
+            predeclared["asset360"],
+            "https://data.infrabel.be/asset360/"
+        );
+        // The metamodel's own prefixes name nothing a query could bind.
+        assert!(!predeclared.contains_key("linkml"));
+        assert!(!predeclared.contains_key("shex"));
+        for (label, _) in ENDPOINT_PREFIXES {
+            assert!(predeclared.contains_key(label), "{label}");
+        }
+        let parsed =
+            parse_query_for("SELECT ?c WHERE { ?p schema:domainIncludes ?c }", &sv).unwrap();
+        let Query::Select { pattern, .. } = &parsed else {
+            panic!()
+        };
+        assert!(
+            format!("{pattern:?}").contains("https://schema.org/domainIncludes"),
+            "{pattern:?}"
+        );
+    }
+
+    #[test]
+    fn an_in_query_declaration_still_wins_over_the_seed() {
+        let sv = two_schema_view();
+        let parsed = parse_query_for(
+            "PREFIX asset360: <urn:elsewhere/> SELECT ?s WHERE { ?s a asset360:Signal }",
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(first_type_iri(&parsed), "urn:elsewhere/Signal");
     }
 }

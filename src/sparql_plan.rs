@@ -1171,7 +1171,7 @@ pub fn refined_plan_text(
     schema: &linkml_schemaview::schemaview::SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> Result<String, String> {
-    let naive = crate::sparql_refine::naive_plan_of(query).map_err(|e| e.to_string())?;
+    let naive = crate::sparql_refine::naive_plan_for(query, schema).map_err(|e| e.to_string())?;
     let rules = crate::sparql_rules::tier_one_rules(schema, schema_graph_iri);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
         rules.iter().map(|rule| rule.as_ref()).collect();
@@ -1246,7 +1246,7 @@ pub fn plan_query_refined_with_schema_graph(
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> Result<ExecutionPlan, ScopeError> {
-    let mut parsed = crate::sparql_scoper::parse_query(query_str)?;
+    let mut parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
     // Before anything reads a predicate or a type: one slot has two
     // legitimate IRIs when it declares a `slot_uri`, one class when it declares
     // a `class_uri`, and both routes have to be looking at the same one.

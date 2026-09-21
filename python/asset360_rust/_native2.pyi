@@ -7229,7 +7229,22 @@ def sparql_inexact_reasons() -> builtins.list[builtins.str]:
     that could.
     """
 
-def sparql_reads_only_the_schema_graph(query:builtins.str, schema_graph_iri:typing.Optional[builtins.str]=None) -> builtins.bool:
+def sparql_predeclared_prefixes(schema_view:SchemaView) -> builtins.dict[builtins.str, builtins.str]:
+    r"""
+    The prefixes a SPARQL query here may leave undeclared, label to namespace.
+    
+    What the endpoint's parser seeds: the W3C vocabularies (``rdf``, ``rdfs``,
+    ``owl``, ``xsd``, ``skos``, ``schema``) and every prefix the datamodel's
+    own schemas declare (``asset360``, ``irsm``, …). A query may declare any
+    of them again; its own declaration wins. Read this rather than keeping a
+    copy: it is the parser's own map, so documentation built from it cannot
+    drift from what the parser accepts.
+    
+    Args:
+        schema_view: The LinkML schema whose ``prefixes:`` seed the parser.
+    """
+
+def sparql_reads_only_the_schema_graph(query:builtins.str, schema_graph_iri:typing.Optional[builtins.str], schema_view:SchemaView) -> builtins.bool:
     r"""
     Whether every triple pattern in the query reads the schema graph.
     
@@ -7243,6 +7258,10 @@ def sparql_reads_only_the_schema_graph(query:builtins.str, schema_graph_iri:typi
         schema_graph_iri: The named graph the active datamodel serves its
             schema in, or ``None`` when it serves none — in which case no
             query reads only it.
+        schema_view: The LinkML schema, whose prefixes seed the parser — the
+            same parser the planner used, so a query the planner refused as
+            unscoped parses here too rather than being reported as not
+            schema-only because a datamodel prefix was left undeclared.
     """
 
 def sparql_schema_graph_ntriples(schema_view:SchemaView, schema_graph_iri:builtins.str) -> builtins.str:
