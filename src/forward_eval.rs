@@ -5,15 +5,16 @@
 
 use crate::shacl_ast::*;
 
-/// Evaluate a SHACL AST against object data (flattened JSON object).
+/// Evaluate a shape against object data (flattened JSON object).
 ///
-/// Returns a list of violations. Empty list means the data satisfies the constraint.
-pub fn evaluate_forward(
-    ast: &ShaclAst,
-    data: &serde_json::Value,
-    message: &str,
-    enforcement_level: &EnforcementLevel,
-) -> Vec<Violation> {
+/// Returns a list of violations. Empty list means the data satisfies the
+/// constraint, or the shape carries no AST to evaluate. The whole shape is
+/// passed rather than its parts because a violation has to carry its origin
+/// (message, level and identity) back to the caller.
+pub fn evaluate_forward(shape: &ShapeResult, data: &serde_json::Value) -> Vec<Violation> {
+    let Some(ast) = shape.ast.as_ref() else {
+        return vec![];
+    };
     if eval_node(ast, data) {
         vec![]
     } else {
@@ -21,9 +22,10 @@ pub fn evaluate_forward(
         let fields = collect_violation_fields(ast, data);
         vec![Violation {
             fields,
-            message: message.to_owned(),
-            enforcement_level: enforcement_level.clone(),
+            message: shape.message.clone(),
+            enforcement_level: shape.enforcement_level.clone(),
             suggested_fix: None,
+            shape_uri: shape.stable_shape_uri().map(str::to_owned),
         }]
     }
 }
@@ -262,6 +264,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Wrap an AST in the shape that carries its identity, message and level.
+    fn test_shape(ast: ShaclAst, message: &str) -> ShapeResult {
+        ShapeResult {
+            shape_uri: "https://data.infrabel.be/asset360/TestShape".into(),
+            target_class: "TunnelComponent".into(),
+            enforcement_level: EnforcementLevel::Serious,
+            message: message.into(),
+            affected_fields: vec![],
+            introspectable: true,
+            ast: Some(ast),
+            sparql: None,
+        }
+    }
+
     fn status_combo_ast() -> ShaclAst {
         // Not(Or(And(P=In_voorbereiding, S=Verkocht), ..9 combos))
         let forbidden_combos = vec![
@@ -318,18 +334,23 @@ mod tests {
             ("Uit_opvolging", "In_dienst"),
         ];
 
+        let shape = test_shape(ast, "Forbidden combo");
         for (primary, secondary) in &forbidden {
             let data = json!({
                 "ceAssetPrimaryStatus": primary,
                 "ceAssetSecondaryStatus": secondary,
             });
-            let violations =
-                evaluate_forward(&ast, &data, "Forbidden combo", &EnforcementLevel::Serious);
+            let violations = evaluate_forward(&shape, &data);
             assert!(
                 !violations.is_empty(),
                 "Expected violation for {primary}/{secondary}"
             );
             assert_eq!(violations[0].enforcement_level, EnforcementLevel::Serious);
+            assert_eq!(
+                violations[0].shape_uri.as_deref(),
+                Some("https://data.infrabel.be/asset360/TestShape"),
+                "violation must carry the identity of the shape that produced it"
+            );
         }
     }
 
@@ -343,13 +364,13 @@ mod tests {
             ("Uit_opvolging", "Afgebroken"),
         ];
 
+        let shape = test_shape(ast, "Forbidden combo");
         for (primary, secondary) in &valid {
             let data = json!({
                 "ceAssetPrimaryStatus": primary,
                 "ceAssetSecondaryStatus": secondary,
             });
-            let violations =
-                evaluate_forward(&ast, &data, "Forbidden combo", &EnforcementLevel::Serious);
+            let violations = evaluate_forward(&shape, &data);
             assert!(
                 violations.is_empty(),
                 "Unexpected violation for {primary}/{secondary}: {:?}",
@@ -365,7 +386,7 @@ mod tests {
         // So missing fields should NOT produce a violation (the constraint is vacuously satisfied)
         let ast = status_combo_ast();
         let data = json!({"ceAssetPrimaryStatus": "In_voorbereiding"});
-        let violations = evaluate_forward(&ast, &data, "test", &EnforcementLevel::Serious);
+        let violations = evaluate_forward(&test_shape(ast, "test"), &data);
         assert!(
             violations.is_empty(),
             "Missing secondary should not violate"
@@ -422,7 +443,7 @@ mod tests {
             path_b: PropertyPath::iri("https://data.infrabel.be/asset360/belongsToLine"),
         };
         let data = json!({ "belongsToTrack": "Track-1", "belongsToLine": "Line-9" });
-        let violations = evaluate_forward(&ast, &data, "msg", &EnforcementLevel::Serious);
+        let violations = evaluate_forward(&test_shape(ast, "msg"), &data);
         assert!(
             violations.is_empty(),
             "cross-ref path-equality must be a forward no-op"
@@ -436,14 +457,15 @@ mod tests {
             path_a: PropertyPath::iri("https://data.infrabel.be/asset360/fieldX"),
             path_b: PropertyPath::iri("https://data.infrabel.be/asset360/fieldY"),
         };
+        let shape = test_shape(ast, "m");
         let mismatch = json!({ "fieldX": "a", "fieldY": "b" });
         assert!(
-            !evaluate_forward(&ast, &mismatch, "m", &EnforcementLevel::Serious).is_empty(),
+            !evaluate_forward(&shape, &mismatch).is_empty(),
             "mismatched same-node equals must still violate"
         );
         let matching = json!({ "fieldX": "a", "fieldY": "a" });
         assert!(
-            evaluate_forward(&ast, &matching, "m", &EnforcementLevel::Serious).is_empty(),
+            evaluate_forward(&shape, &matching).is_empty(),
             "matching same-node equals must pass"
         );
     }

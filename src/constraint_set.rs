@@ -93,15 +93,7 @@ impl ConstraintSet {
             if !shape.introspectable {
                 continue;
             }
-            if let Some(ref ast) = shape.ast {
-                let vs = crate::forward_eval::evaluate_forward(
-                    ast,
-                    object_data,
-                    &shape.message,
-                    &shape.enforcement_level,
-                );
-                violations.extend(vs);
-            }
+            violations.extend(crate::forward_eval::evaluate_forward(shape, object_data));
         }
         violations
     }
@@ -579,6 +571,25 @@ mod tests {
         let violations = cs.evaluate(&data);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].message, "Forbidden status combination");
+        // The consumer groups findings per rule, so the shape identity has to
+        // survive evaluation — the message is localized and cannot serve.
+        assert_eq!(
+            violations[0].shape_uri.as_deref(),
+            Some("asset360:StatusComboShape")
+        );
+
+        // A blank-node shape has no identity worth propagating: renumbered on
+        // every parse, so an id here would be worse than none.
+        let mut anonymous = status_combo_shape();
+        anonymous.shape_uri = "_:b7".into();
+        let cs = ConstraintSet {
+            shapes: vec![anonymous],
+            schema_view: None,
+            target_class: None,
+        };
+        let violations = cs.evaluate(&data);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].shape_uri, None);
     }
 
     #[test]
@@ -618,6 +629,10 @@ mod tests {
         let violations2 = cs.evaluate(&data2);
         assert_eq!(violations2.len(), 1);
         assert_eq!(violations2[0].message, "Another rule");
+        assert_eq!(
+            violations2[0].shape_uri.as_deref(),
+            Some("asset360:AnotherShape")
+        );
     }
 
     #[test]
