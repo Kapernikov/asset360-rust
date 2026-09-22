@@ -140,6 +140,21 @@ pub struct ShapeResult {
     pub sparql: Option<String>,
 }
 
+impl ShapeResult {
+    /// The shape IRI, if it is one a consumer can group or reconcile on.
+    ///
+    /// A shape declared as a blank node gets a parser-assigned `_:bN` label
+    /// that is renumbered on every parse. Handing that out as an identity is
+    /// worse than handing out nothing, so it reports `None`.
+    pub fn stable_shape_uri(&self) -> Option<&str> {
+        if self.shape_uri.is_empty() || self.shape_uri.starts_with("_:") {
+            None
+        } else {
+            Some(&self.shape_uri)
+        }
+    }
+}
+
 /// A violation produced by forward evaluation.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Violation {
@@ -152,6 +167,13 @@ pub struct Violation {
     /// Optional suggested fix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_fix: Option<String>,
+    /// IRI of the shape that produced this violation, when it has a stable one.
+    ///
+    /// This is the only cross-run identity a violation carries: `message` is
+    /// localized and `fields` do not distinguish two rules over one field.
+    /// `None` for a blank-node shape — see [`ShapeResult::stable_shape_uri`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_uri: Option<String>,
 }
 
 #[cfg(test)]
@@ -226,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_violation_json() {
-        let v = Violation {
+        let mut v = Violation {
             fields: vec![
                 "ceAssetPrimaryStatus".into(),
                 "ceAssetSecondaryStatus".into(),
@@ -234,8 +256,44 @@ mod tests {
             message: "Forbidden status combination".into(),
             enforcement_level: EnforcementLevel::Serious,
             suggested_fix: Some("Change secondary status".into()),
+            shape_uri: Some("https://data.infrabel.be/asset360/StatusComboShape".into()),
         };
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains("\"enforcement_level\":\"serious\""));
+        // The consumer reads this key by name to group findings per rule.
+        assert!(
+            json.contains("\"shape_uri\":\"https://data.infrabel.be/asset360/StatusComboShape\"")
+        );
+
+        // No stable identity: the key is absent rather than empty or fabricated.
+        v.shape_uri = None;
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(!json.contains("shape_uri"));
+    }
+
+    #[test]
+    fn test_stable_shape_uri_rejects_blank_nodes() {
+        let mut shape = ShapeResult {
+            shape_uri: "https://data.infrabel.be/asset360/TestShape".into(),
+            target_class: "TunnelComponent".into(),
+            enforcement_level: EnforcementLevel::Serious,
+            message: "Test violation".into(),
+            affected_fields: vec![],
+            introspectable: true,
+            ast: None,
+            sparql: None,
+        };
+        assert_eq!(
+            shape.stable_shape_uri(),
+            Some("https://data.infrabel.be/asset360/TestShape")
+        );
+
+        // A blank-node subject is renumbered on every parse, so it is not an
+        // identity a consumer can group or reconcile on.
+        shape.shape_uri = "_:b0".into();
+        assert_eq!(shape.stable_shape_uri(), None);
+
+        shape.shape_uri = String::new();
+        assert_eq!(shape.stable_shape_uri(), None);
     }
 }

@@ -1515,6 +1515,17 @@ asset360:AllowedTypesShape
             cs.evaluate(&data).is_empty(),
             "non-introspectable sh:in shape must not be evaluated by the Rust engine"
         );
+
+        // A real violation carries the parsed shape IRI end to end: the
+        // consumer groups its findings per rule on this, and the parser's
+        // full IRI is what it has to receive.
+        let bad = serde_json::json!({"primary": "TSI", "secondary": "SST", "docType": "A"});
+        let violations = cs.evaluate(&bad);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0].shape_uri.as_deref(),
+            Some("https://data.infrabel.be/asset360/StatusComboShape")
+        );
     }
 
     #[test]
