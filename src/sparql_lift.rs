@@ -2796,3 +2796,66 @@ mod r4 {
         );
     }
 }
+
+/// **Alpha-renaming** (design, *Scopes, barriers and renaming*): renaming a
+/// sub-select's private variables leaves the refined plan identical up to
+/// the names -- which rules fired, which declined, and why.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod alpha_renaming {
+    use super::tests::{PREFIX, printout};
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    /// `?name` as a whole variable, replaced by `?_`, and the printout's
+    /// column padding collapsed -- a longer name shifts the columns.
+    fn normalised(text: &str, name: &str) -> String {
+        let needle = format!("?{name}");
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find(&needle) {
+            let after = &rest[at + needle.len()..];
+            let whole = !after
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            out.push_str(&rest[..at]);
+            out.push_str(if whole { "?_" } else { &needle });
+            rest = after;
+        }
+        out.push_str(rest);
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn same_up_to(original: &str, renamed: &str, from: &str, to: &str) {
+        let schema = test_schema_view();
+        let a = normalised(&printout(&format!("{PREFIX}{original}"), &schema), from);
+        let b = normalised(&printout(&format!("{PREFIX}{renamed}"), &schema), to);
+        assert_eq!(a, b, "renaming ?{from} to ?{to} changed the plan");
+    }
+
+    #[test]
+    fn a_private_variable_renamed_plans_the_same() {
+        // M1 inside a sub-select body (P5): the private key `?k`.
+        same_up_to(
+            "SELECT ?s ?lbl WHERE { ?s a asset360:Signal . OPTIONAL { { SELECT ?s ?lbl WHERE { \
+             ?s a asset360:Signal ; asset360:name ?k . \
+             VALUES (?k ?lbl) { (\"Alpha\" \"a\") (\"Echo\" \"e\") } } } } }",
+            "SELECT ?s ?lbl WHERE { ?s a asset360:Signal . OPTIONAL { { SELECT ?s ?lbl WHERE { \
+             ?s a asset360:Signal ; asset360:name ?kprivate . \
+             VALUES (?kprivate ?lbl) { (\"Alpha\" \"a\") (\"Echo\" \"e\") } } } } }",
+            "k",
+            "kprivate",
+        );
+        // R2 declines a sub-select body, whatever its private names (P5's
+        // decline): the private `?e`.
+        same_up_to(
+            "SELECT ?s ?tail WHERE { ?s a asset360:Signal . OPTIONAL { { SELECT ?s ?tail WHERE { \
+             ?s a asset360:Signal ; asset360:locatedOnTrack ?e . \
+             BIND(STR(?e) AS ?tail) } } } }",
+            "SELECT ?s ?tail WHERE { ?s a asset360:Signal . OPTIONAL { { SELECT ?s ?tail WHERE { \
+             ?s a asset360:Signal ; asset360:locatedOnTrack ?eprivate . \
+             BIND(STR(?eprivate) AS ?tail) } } } }",
+            "e",
+            "eprivate",
+        );
+    }
+}
