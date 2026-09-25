@@ -1,7 +1,36 @@
 # Schema relations in the statement, and an engine that finishes over rows
 
-Status: **proposed, for review** (revision 2). No code yet. Asset360
+Status: **proposed, for review** (revision 3). No code yet. Asset360
 issue #494 (pepibru GitLab, asset360/consolidator-server), item A.
+
+<details><summary>What revision 3 changed: an effects guard on R1, a progress measure instead of the island-count gate, the ordinal through every projection</summary>
+
+The review of revision 2 accepted the revision 1 findings as addressed
+and raised two blockers and one ordering detail. Both counterexamples
+reproduce on PyOxigraph 0.5.11 (*Appendix*).
+
+| finding | revision 2 | revision 3 | kind |
+|---|---|---|---|
+| **R1** a volatile condition `f` (`RAND()`) | G1c checked `f`'s inputs and `Opaque`, not its effects. The lift evaluates `f` once per `(a, b, c)` instead of once per `(b, c)` | **G1d**: `f` and every expression inside `C` are effect-free (`evaluates_the_same_out_of_context`), or R1 declines. Regression `r1_volatile_condition` asserts the decline, deterministically | narrowing |
+| **island-count gate** discards R3 | "a rewrite that does not reduce the island count is not kept" | the gate is withdrawn. R1–R3 are accepted by a **progress measure** Φ = (islands, pending barriers, query modifiers above the engine), lexicographic, which every application lowers strictly. R3 moves the query's own `Sort`/`Slice` into an existing island (islands 1 → 1, modifiers 2 → 0). The restoring `Sort(?__ord)` has `origin: Ordinal`, counts in no measure and matches no rule | construction |
+| **R1, R2** lift over an engine-side `B` | allowed | **G1e / G2e**: `A` and `B` are SQL. Needed for the measure to drop, and a lift that unites no islands makes no statement possible | narrowing |
+| **ordinal** through `Project` / `SubSelect∅` | not stated | every `Project` and `SubSelect∅` between the island root and the restoring sort exports `?__ord`, the witness-cleanup projections of R1/R2 included. A rule builds its projections as "scope minus what it drops", never as a list. The transition check `ordinal_reaches_its_sort` verifies this. Only the query's final projection drops it | construction |
+
+The review also asked whether the effects flaw appears in the other rules
+that move an expression. **R2**: no, since G2c already required
+effect-free. **R3**: no. It moves no expression, only `Sort`/`Slice` with
+variable terms (G3b). Each expression of `E` is still evaluated once per
+row it keeps, over the same input row (see R3, *Effects*). **M2**: it
+moves the region into another evaluator. It is safe because the island
+evaluates no expression that is not effect-free, and that is now an
+explicit eligibility check (check 5), not an accident of what SQL
+lowering supports today. So `NOW()` is evaluated in one evaluation only.
+
+Also new: R1–R3 are kept only when placement reaches `UsedRows`. On
+`Used` the engine re-runs the whole query over fetched records, and a
+`Slice` pushed into that fetch would drop records its `ORDER BY` needs.
+
+</details>
 
 <details><summary>What revision 2 changed: five soundness blockers, the ordering contract, printouts and scopes</summary>
 
@@ -379,7 +408,7 @@ the engine finishes over them. The planner prefers outcomes in this order:
 
 ### When the planner chooses it
 
-At plan time, from the plan alone. **All four must hold, and any doubt
+At plan time, from the plan alone. **All five must hold, and any doubt
 declines to `Used`**, which is today's route and always correct.
 
 1. **The statement emits solutions.** The SQL nodes form one island, and
@@ -424,6 +453,20 @@ declines to `Used`**, which is today's route and always correct.
    `sparql_execute`: the same custom-function registry (spargeo), the same
    limits. A query with a dataset clause (`FROM`, `FROM NAMED`) declines,
    since the plan does not carry the dataset (review finding 4).
+5. **Every volatile expression is evaluated in the finish query, and
+   only there.** M2 splits one evaluation into two: the statement and the
+   finish query. A `NOW()` must return one value within a query, so a
+   `NOW()` evaluated in SQL and another in the finish query would be two
+   evaluations. `RAND`/`BNODE`/`STRUUID` also count once per row on each
+   side. The check: every expression the island lowers passes
+   `evaluates_the_same_out_of_context`. Today that holds by construction.
+   SQL lowers slot comparisons and memberships against literals, and
+   `PushProjection` declines a `BIND`. But the check makes it a stated
+   precondition, not an accident of what lowering happens to support. A
+   future lowering of `NOW()` would then decline `UsedRows` instead of
+   splitting the timestamp. Schema regions materialised at plan time are
+   a third evaluation, and they already pass the same check
+   (`sparql_materialise.rs`).
 
 The partition itself, "island below, engine region above", is what R1–R3
 produce.
@@ -482,6 +525,23 @@ where:
   must be pinned by every B row.
 * **G1c**: the inner condition `f` has no `Opaque`, and
   `vars(f) ∩ scope(A) ⊆ bound(B) ∪ bound(C)`.
+* **G1d (effects)**: `f.evaluates_the_same_out_of_context()`, and the
+  same for every expression on every node of `C`. G1c fixes `f`'s
+  *inputs*. It does not fix its *value*. In the original, the inner join
+  evaluates `f` once per `(b, c)` pair, and every `a` that joins that
+  pair shares the one result. After the lift, `f` is evaluated once per
+  `(a, b, c)`. With `f = RAND() < 0.5`, the original gives every `a` the
+  same decision, and the rewrite mixes them (regression
+  `r1_volatile_condition`: 40 left rows, 40 or 0 labels originally, 22,
+  20, 21 … after the lift). `C`'s own expressions are covered too, as a
+  precaution rather than a proof. SPARQL evaluates `C` once on both routes, and Oxigraph
+  does too (`r1_volatile_inside_c`). But the proof should not rest on how
+  an engine schedules a right side, and declining costs nothing:
+  a materialised schema region already passes this check
+  (`sparql_materialise.rs`, `every_expression_evaluates_the_same_out_of_context`).
+* **G1e**: `A` and `B` are SQL. The rule exists to join them in one
+  statement, and the progress measure depends on it (*Evidence and
+  progress*).
 
 **Equivalence.** Fix a left row `a`. For a pair `(b, c)`: in the
 original, `b ⊕ c` is produced when `c ~ b` and `f(b ⊕ c)`, and it is kept
@@ -493,7 +553,9 @@ and extended by `c` when `c ~ a ⊕ b` and `f(a ⊕ b ⊕ c)`.
   so `c ~ b` and `a ~ b` give `a ~ c`. The condition takes the same value
   on both routes: by G1c, every variable of `f` that `a` could supply is
   already bound by `b` or `c`, with the same term, since the mappings are
-  compatible.
+  compatible. By G1d, the same inputs give the same value, however many
+  times `f` is evaluated. Revision 2's argument stopped at the inputs,
+  and that is the gap the review found.
 * The unmatched cases are the same. In the original, a `b` with no
   qualifying `c` yields `b` alone. In the rewrite, `a ⊕ b ⊕ m` finds no
   qualifying `c` for the same reason and is kept alone. A left row with no
@@ -514,12 +576,19 @@ path. Its modifiers (`LIMIT`, `DISTINCT`, `GROUP`) would count different
 rows, and C could reference a private `?v__d{n}`. An outer condition
 (G1a). A variable of C that A binds and B may not (G1b, regression
 `r1_c_shares_with_a_not_pinned_by_b`). A condition reading what only A
-supplies (G1c, regression `r1_inner_condition_reads_a`).
+supplies (G1c, regression `r1_inner_condition_reads_a`). A volatile `f`,
+or a volatile expression inside `C` (G1d, regression
+`r1_volatile_condition`). An `A` or `B` that is not SQL (G1e).
 
 **Regressions.** `r1_bound_j_tests_merged_mapping` (the review's),
-`r1_empty_shared_set`, and the two decline cases above. Each is evaluated
+`r1_empty_shared_set`, and the three decline cases above. Each is evaluated
 before and after on the oracle (bag equality), and each decline case
-asserts that the rule did not fire.
+asserts that the rule did not fire. `r1_volatile_condition` is the one
+exception to "evaluate the rejected rewrite and assert it differs". Its
+automated assertion is only that R1 declines and that the `declined` line
+names G1d. The random draw is recorded in the appendix and never runs in
+CI. `r1_effect_free_condition` is its twin with `STRLEN(?label) = 5` in
+place of `RAND() < 0.5`. It must fire, and it is compared as a bag.
 
 #### R2 — an extension over an optional side moves up
 
@@ -548,6 +617,7 @@ directly over a `Bind`, where:
   `r2_bnode_once_per_b_row`).
 * **G2d**: the `LeftJoin` has no condition. The original evaluates it with
   `?x` available.
+* **G2e**: `A` and `B` are SQL, as G1e.
 
 **Equivalence.** Take a row `a` matched by `b`. By G2b, every variable of
 `e` has the same binding in `a ⊕ b` as in `b`: it is either unbound in
@@ -567,7 +637,7 @@ the witness. `vars(e)` are exactly what the naive barrier exported (an
 `PruneUnusedExports` was entitled to make and no longer is, and its
 demand check runs again after the edit.
 
-**Declines.** A sub-`SELECT` barrier. G2a–G2d. A `Bind` that is not
+**Declines.** A sub-`SELECT` barrier. G2a–G2e. A `Bind` that is not
 directly under the barrier. That covers a `BIND` followed by a `FILTER`,
 which spargebra lifts into the left-join condition (G2d), and a `BIND`
 under a join inside the body (this rule does not move it past that
@@ -595,8 +665,16 @@ first ascending, ties settled on the row key. The outer `Sort(?__ord)` is
 the ordering contract (next section). `?__ord` is projected away by the
 query's own `Project`.
 
-**Match.** The root scope's modifier chain (not a sub-`SELECT`'s) over a
-chain `E` of engine nodes above the island, where:
+The two sorts are different operators, and the plan says so. A `Sort`
+carries `origin: Query` (the query's `ORDER BY`, the one R3 moves) or
+`origin: Ordinal` (the one R3 inserts). R3 matches only `origin: Query`,
+and no progress measure counts an `Ordinal` sort. So R3 cannot match its
+own output, and the restoring sort cannot look like unfinished work
+(*Evidence and progress*).
+
+**Match.** The root scope's modifier chain (not a sub-`SELECT`'s), whose
+`Sort` has `origin: Query`, over a chain `E` of engine nodes above the
+island, where:
 
 * **G3a (one-to-one)**: every node of `E` gives **exactly one output row
   per input row**. Revision 1 said "one output per input, in input
@@ -638,10 +716,42 @@ SQL's tie order may differ from the engine's. Both are conforming (an
 `ORDER BY` on a non-unique key is a partial order in SPARQL too), and
 `PushProjection` already documents this.
 
+**Effects.** R3 moves no expression. The sort terms are variables (G3b),
+and `Slice` has none. What changes is *which* rows `E` is evaluated over:
+the page, not the full input. Every expression of `E` is still evaluated
+exactly once per row that reaches the answer, over the same input row
+(G3a, G3b). So a volatile expression in `E` gets one fresh draw per
+answer row on both routes, and every answer of the rewrite is an answer
+the original can give. That is why R3 needs no effects guard, while R1
+does: R1 changes *how many times* `f` is evaluated for one result, and R3
+does not. Pinned by `r3_volatile_bind_in_e`, which must fire. Its
+assertion compares the `?id` sequence, never the drawn values.
+
+**Edit, the ordinal's path.** The executor binds `?__ord` at the island
+root. The restoring `Sort(?__ord)` consumes it. Every node between them
+must therefore keep it in scope. G3a lets `E` contain `Project` and
+`SubSelect∅` nodes, and R1/R2 put their witness-cleanup projections `π₋ₘ`
+there too. So:
+
+* R3 adds `?__ord` to the `vars` of every `Project` and `SubSelect∅` on
+  the path from the island root to the restoring sort. Its demand is that
+  sort, so `PruneUnusedExports` keeps it.
+* Every projection a rule introduces, `π₋ₘ` included, is built as
+  **scope minus what it drops**, never as a list of what it keeps. An R1
+  or R2 application in a later round therefore passes `?__ord` through
+  without knowing about it.
+* Only the query's final `Project`, above the restoring sort, drops it.
+* The transition check `ordinal_reaches_its_sort` runs after every
+  application (R1–R3 and every other rule): `?__ord ∈ scope(n)` for every
+  node `n` on that path. A failure is a `PlanDefect::Transition`, as a
+  lost demanded export already is.
+
 **Regressions.** `r3_undef_left_key_fans_out` (the review's),
 `r3_duplicate_key_in_c` (declines), and `r3_qualifying_page` (fires). The
 last is compared as a **sequence**, and as page membership over
 `OFFSET 0, 2, 4, …` tiling the full ordered answer on a total-order key.
+Two composition regressions (*Tests*):
+`r3_after_r2_one_island` and `r3_ordinal_through_projections`.
 
 #### The ordering contract across the SQL/engine boundary
 
@@ -658,7 +768,9 @@ So order is data:
   to `1, 2, …` in the order the statement's rows arrive. For a
   statement with a top-level `ORDER BY`, SQL guarantees that order.
 * The finish query ends in `ORDER BY ?__ord` below its projection, and the
-  projection drops `?__ord`.
+  projection drops `?__ord`. No projection between the island and that
+  `ORDER BY` may drop it, including the witness-cleanup ones (R3,
+  *Edit, the ordinal's path*).
 * The finish query has no `LIMIT`/`OFFSET` of its own after R3. Page
   membership is decided once, in SQL.
 * **VALUES versus an injected iterator is now contract-neutral, and
@@ -728,11 +840,65 @@ the check that catches a rule that left both copies, or none.
 as `PruneUnusedExports` does: R1/R2 check that the witness is fresh and
 bound by one node only, and that the dropping projection sits above its
 last consumer. R3 re-derives the compatible-mapping proof on the
-post-edit plan. The measure that makes each bounded is "the number of
-`domain: None` right sides enclosing an engine node" for R1/R2 (each
-application lowers it by one), and "the number of engine nodes below the
-root's `Sort`/`Slice`" for R3. A rewrite that does not reduce the island
-count is not kept, as in revision 1.
+post-edit plan.
+
+**Progress is a measure, not the island count.** Revision 2 kept a
+rewrite only if it reduced the island count. The review showed that this
+discards R3 exactly where it is wanted. In P4, R2 has already made the
+SQL part one island, and R3 moves the query's `Sort`/`Slice` *into* that
+island. The count stays at one, so the gate discarded it. The existing
+`refine` driver has no such gate either: a rule fires when it matches,
+and the driver runs to a fixpoint under `MAX_ROUNDS`. So the gate is
+withdrawn. R1–R3 are accepted by a measure that every application
+strictly lowers:
+
+    Φ = ( I, D, S )   compared lexicographically
+
+* `I`: the number of SQL islands.
+* `D`: the sum, over engine nodes `n`, of the number of `domain: None`
+  barriers above `n`. That is how deep engine work sits inside `OPTIONAL`
+  bodies.
+* `S`: the number of `Sort`/`Slice` nodes with `origin: Query` that have
+  an engine node between them and the island. An `origin: Ordinal` sort
+  is counted nowhere.
+
+Each application lowers Φ, and none raises an earlier component. `k` is
+the number of `domain: None` barriers above the outer left join:
+
+| rule | `I` | `D` | `S` |
+|---|---|---|---|
+| R1 | lowered by one: A and B were two islands (the engine inner join separated them), and `A ⟕ₘ B` is one (G1e) | lowered by `k + 2 + \|C\|` for a lift at depth `k`: C's nodes lose a barrier, and the inner join and its barrier leave the engine | unchanged: C stays below the same modifiers |
+| R2 | lowered by one, as for R1 (G2e) | lowered by `k + 1`: the `Bind` loses its barrier, and the barrier and the left join become SQL | unchanged |
+| R3 | unchanged: `Sort`/`Slice` join the island directly below them | unchanged: they leave the engine, and the new `Sort(?__ord)` sits in the root scope, at depth 0 | lowered by the number of modifiers moved (2 in P4) |
+
+R1 and R2 lower `I` on their own, so for them the revision 2 gate was
+harmless. R3 is the rule that only `S` sees. G1e and G2e are new in
+revision 3, and the measure is why they are needed. Lifting over an
+engine-side `B` unites no islands, and at depth `k ≥ 2` it can *raise*
+`D`: the new `π₋ₘ` and the joins sit at depth `k`, while `B` stays at
+`k + 1`. Such a lift also makes no statement possible. The inner rules
+fire first, bottom up, and make `B` SQL where they can.
+
+`Φ` lives in ℕ³, which is well-ordered lexicographically, so R1–R3 can
+fire only finitely often. The transition check computes Φ before and after
+each R-rule application and fails the plan with a `PlanDefect::Transition`
+if Φ did not drop. It is the same shape as the existing export check: a
+statement about two plans, computed fresh. `MAX_ROUNDS` and the fixpoint
+assertion remain the backstop for the rule set as a whole.
+
+Φ answers "does this rewrite make progress?" It does not answer "is it
+worth keeping?" The outcome answers that. R1–R3 exist to make `UsedRows`
+possible. If placement does not reach `UsedRows`, the planner refines
+again without R1–R3 and places that plan. On `Used`, the engine re-runs
+the whole query over the fetched records, and a `Slice` in the fetch
+would drop records that its `ORDER BY` needs. The second refine happens
+only when an R-rule fired, and planning costs milliseconds.
+
+Pinned in composition, not only per rule (*Tests*):
+`r3_after_r2_one_island` is P4 end to end. R2 fires, leaving one island,
+and then R3 fires with `I` 1 → 1 and `S` 2 → 0 and is **retained**. The
+statement carries `ORDER BY` / `LIMIT`, and the finish query ends in
+`ORDER BY ?__ord`. The answer equals the oracle's as a sequence.
 
 **Alpha-renaming.** M1 matches on producers, not names, so a private
 `?t__d1` inside a sub-`SELECT` lowers exactly as a root-scope `?t`. R1–R3
@@ -850,11 +1016,11 @@ ORDER BY ?name LIMIT 10
   n5   slice     limit 10 offset 0                            [S]  claims o4
   n6   project   ?s ?name ?e ?__m1  ordinal ?__ord            [S]
   n7   bind      ?tail ← IF(BOUND(?__m1), STRAFTER(STR(?e), "#"), ?__never)  [E]
-  n8   sort      ?__ord asc                                   [E]
+  n8   sort      ?__ord asc  origin ordinal                   [E]
   n9   project   ?s ?name ?tail                               [E]
   rewrites
       R2  n7  lifted from under n3; inputs {?e} ⊆ bound(n1); effect-free; witness ?__m1
-      R3  n4 n5  moved below n7 (bind: one-to-one); sort key ?name ∈ scope(n0)
+      R3  n4 n5  moved below n7 (bind: one-to-one); sort key ?name ∈ scope(n0); islands 1 → 1, query modifiers above the engine 2 → 0; ?__ord in scope n6 → n8
 === execution (projected)
 ExecutionPlan (contract 6, SQL answers, engine finishes over rows)
   pass 0  SQL     asset360:Signal   → ?s ?name ?e ?__m1  (numbered ?__ord)
@@ -894,7 +1060,7 @@ For each query, the planner goes through these steps:
    meets K1–K7 to `Sql`.
 4. **M2**: R1–R3 lift what is still engine-only above the SQL nodes.
 5. Placement and outcome: `UsedAlone` if nothing is left for the engine,
-   `UsedRows` if what is left passes the four eligibility checks, `Used`
+   `UsedRows` if what is left passes the five eligibility checks, `Used`
    if it does not, and `Fallback` if no statement is possible.
 
 M1 before M2 because an SQL join is cheaper than an engine join over
@@ -1025,6 +1191,27 @@ Consolidator side (asset360/consolidator-server):
   equal the oracle's full sequence. With a non-unique key, each page's
   multiset of sort-key values must equal the oracle's, which is page
   membership up to ties.
+* **Composition, not only rules in isolation.** Two full-pipeline
+  regressions run `plan_query_refined` with the whole rule list and
+  check the printout as well as the answer:
+  * `r3_after_r2_one_island`: P4. R2 fires first and leaves one island.
+    R3 then fires with `I` 1 → 1 and `S` 2 → 0, and **it is retained**.
+    The statement carries the `ORDER BY` and `LIMIT`. The finish query
+    has neither, and ends in `ORDER BY ?__ord`. Answers equal the
+    oracle's as a sequence, and the refine log shows R2 before R3 with
+    `reached_fixpoint`.
+  * `r3_ordinal_through_projections`: P4 with its `E` widened so that
+    the path from the island root to the restoring sort holds R2's `π₋ₘ`
+    and a `SubSelect∅` over a qualifying `LeftJoin` with a `Values`
+    (G3a). It asserts `?__ord ∈ scope(n)` for every node on that path.
+    Only the final projection drops it. The answer equals the oracle's
+    as a sequence. Its mutation twin builds `π₋ₘ` as an explicit keep
+    list, and must fail `ordinal_reaches_its_sort` with a
+    `PlanDefect::Transition` naming R2.
+* **Effects.** `r1_volatile_condition` asserts that R1 declines on G1d,
+  and nothing about random values. `r1_effect_free_condition` and
+  `r3_volatile_bind_in_e` must fire. The second compares only the
+  deterministic columns.
 * **Eligibility.** `m2_exists_in_bind_reads_instances` must plan `Used`,
   with a reason. A region whose write-back is `None` must plan `Used`,
   never `UsedRows` followed by a failure. A `BASE` query using `IRI()` in
@@ -1114,8 +1301,12 @@ unless the reviewer says otherwise).
 
 Every probe runs on PyOxigraph **0.5.11**, the version this crate
 declares, with no data unless stated. "Original" is the query as written.
-"Rewrite" is what the named guard admitted, or what the revision 2
-construction produces. Each row is a planned regression.
+"Rewrite" is what the named guard admitted, or what the revision 2/3
+construction produces. Each row is a planned regression. The revision 3
+rows (`r1_volatile_*`, `r1_effect_free_condition`,
+`r3_volatile_bind_in_e`) were each run five times, because what they show
+is the spread of a random draw. The table cites those draws. The planned
+tests assert only the decline, or the deterministic columns.
 
 | regression | rule | original | rewrite | result on Oxigraph |
 |---|---|---|---|---|
@@ -1133,6 +1324,10 @@ construction produces. Each row is a planned regression.
 | `r3_undef_left_key_fans_out` | R3 G3a | `VALUES (?id ?j) {(1 UNDEF) (2 3)} OPTIONAL { VALUES (?j ?label) {(1 "a") (2 "b") (3 "c")} } ORDER BY ?id LIMIT 1` | `{ SELECT … ORDER BY ?id LIMIT 1 } OPTIONAL { … }` | differ: 1 row vs 3 rows |
 | `r3_qualifying_page` | R3 rev 2 | `VALUES (?id ?j) {(3 2) (1 3) (2 1)} OPTIONAL { VALUES (?j ?label) {…} } ORDER BY ?id LIMIT 2` | `VALUES (?__ord ?id ?j) {(1 1 3) (2 2 1)} OPTIONAL { … } ORDER BY ?__ord` | equal as a **sequence** |
 | `p2_join_reorders_values` | ordering | 40 rows `VALUES (?id ?k)` in descending `?id` | the same rows inner-joined to a 7-row `VALUES (?k ?label)`, no `ORDER BY` | differ as a sequence: grouped by `?k`. Through an `OPTIONAL` the order happened to survive, which is not a contract |
+| `r1_volatile_condition` | R1 G1d | `VALUES ?a {1 … 40} OPTIONAL { VALUES ?j {2} OPTIONAL { VALUES (?j ?label) {(2 "label")} FILTER(RAND() < 0.5) } }` | witness rewrite: `OPTIONAL { VALUES ?j {2} BIND(true AS ?m) } OPTIONAL { VALUES (?j ?label) {(2 "label")} FILTER(BOUND(?m) && RAND() < 0.5) }` | bound labels over five runs. Original: 0, 40, 40, 0, 40, always all or none. Rewrite: 22, 20, 21, 23, 27, which the original cannot produce. So G1d must decline (the review's counterexample) |
+| `r1_volatile_inside_c` | R1 G1d | the same, with the `FILTER(RAND() < 0.5)` inside a group in `C`: `OPTIONAL { { VALUES … FILTER(RAND() < 0.5) } }` | witness rewrite, `C` unchanged | both all or none (40, 0, 0, 40, 40 vs 40, 0, 40, 40, 0). Oxigraph evaluates `C` once on both routes, which is what SPARQL says. G1d declines anyway, so that the proof does not rest on it |
+| `r1_effect_free_condition` | R1 G1d | the same, with `FILTER(STRLEN(?label) = 5)` | witness rewrite | equal: 40 bound labels every run. Must fire |
+| `r3_volatile_bind_in_e` | R3 | `VALUES ?id {3 1 2 4} BIND(RAND() AS ?r) ORDER BY ?id LIMIT 2` | `{ SELECT ?id { VALUES ?id {3 1 2 4} } ORDER BY ?id LIMIT 2 } BIND(RAND() AS ?r)` | `?id` sequence `1, 2` on both, with a fresh `?r` per row on both. R3 changes which rows `E` evaluates, not how often per row. No flaw, and it must fire |
 | `m2_exists_in_bind_reads_instances` | M2 | data `<urn:s1> <urn:p> <urn:v>`. `VALUES ?s {<urn:s1>} BIND(EXISTS { ?s <urn:p> ?v } AS ?found)` | the same query over a store without the instance triple (the finish store) | differ: `found=true` vs `found=false` |
 
 A `r3_duplicate_key_in_c` regression (two `C` rows with the same key)
