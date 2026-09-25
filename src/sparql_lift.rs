@@ -1078,24 +1078,38 @@ impl LiftExtensionOverJoin {
         if node.executor != Executor::Engine {
             return None;
         }
-        let (sides, condition): (Vec<(NodeId, NodeId)>, Option<&Expr>) = match &node.op {
+        // A recorded reference edge is part of what the join compares: its
+        // holder and its referenced star, like the variables the sides
+        // share (checked by H1 and H5 below).
+        let (sides, condition, edge): (Vec<(NodeId, NodeId)>, Option<&Expr>, _) = match &node.op {
             PlanOp::Join {
                 left,
                 right,
-                reference: None,
+                reference,
                 key: None,
                 ..
-            } => (vec![(*left, *right), (*right, *left)], None),
+            } => (
+                vec![(*left, *right), (*right, *left)],
+                None,
+                reference.as_ref(),
+            ),
             PlanOp::LeftJoin {
                 left,
                 right,
-                reference: None,
+                reference,
                 key: None,
                 condition,
                 ..
-            } => (vec![(*left, *right)], condition.as_ref()),
+            } => (
+                vec![(*left, *right)],
+                condition.as_ref(),
+                reference.as_ref(),
+            ),
             _ => return None,
         };
+        let on_edge: BTreeSet<String> = edge
+            .map(|edge| [edge.holder.clone(), edge.referenced.clone()].into())
+            .unwrap_or_default();
         let (side, c, projection, bind) = sides.into_iter().find_map(|(side, c)| {
             if plan.nodes[side].executor != Executor::Engine {
                 return None;
@@ -1124,6 +1138,9 @@ impl LiftExtensionOverJoin {
             let scope_c = plan.variables_of(c);
             if scope_c.contains(var) {
                 return Err(format!("H1: ?{var} is in scope in n{c}"));
+            }
+            if on_edge.contains(var) {
+                return Err(format!("H1: ?{var} is an end of the join's reference edge"));
             }
             if expr.contains_an_opaque_subquery() {
                 return Err("H2: the expression reads a pattern (EXISTS)".to_owned());
@@ -1165,7 +1182,11 @@ impl LiftExtensionOverJoin {
                     .collect();
                 let compared: BTreeSet<String> = dropped
                     .iter()
-                    .filter(|v| scope_c.contains(*v) || read_by_condition.contains(*v))
+                    .filter(|v| {
+                        scope_c.contains(*v)
+                            || read_by_condition.contains(*v)
+                            || on_edge.contains(*v)
+                    })
                     .cloned()
                     .collect();
                 if !compared.is_empty() {
@@ -2738,6 +2759,25 @@ mod r4 {
         for rule in ["R2  ", "R4  ", "R3  "] {
             assert!(refined.contains(rule), "{rule}\n{refined}");
         }
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        assert_eq!(as_bag(&rows), as_bag(&oracle_rows(&query, &oracle)));
+    }
+
+    /// Over a left join whose reference edge a tier-one rule recorded before
+    /// the extension got there (`AbsorbOptionalReference`): the edge's ends
+    /// are what the join compares, and the extension is neither.
+    #[test]
+    fn an_extension_climbs_over_a_recorded_reference() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = format!(
+            "{PREFIX}SELECT ?s ?tail ?tn WHERE {{ ?s a asset360:Signal ; asset360:length ?len . \
+             OPTIONAL {{ ?s asset360:name ?n2 . BIND(STRLEN(?n2) AS ?tail) }} \
+             OPTIONAL {{ ?s asset360:locatedOnTrack ?t2 . ?t2 a asset360:Track ; asset360:hasName ?tn }} }}"
+        );
+        let refined = printout(&query, &schema);
+        assert!(refined.contains("R4  "), "{refined}");
+        assert!(refined.contains("via ?s.locatedOnTrack"), "{refined}");
         let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
         assert_eq!(as_bag(&rows), as_bag(&oracle_rows(&query, &oracle)));
     }
