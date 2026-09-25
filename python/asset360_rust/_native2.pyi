@@ -7225,7 +7225,7 @@ def naive_plan_text(query:builtins.str) -> builtins.str:
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None) -> ExecutionPlan:
+def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None, rows_route:builtins.bool=True) -> ExecutionPlan:
     r"""
     Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
     
@@ -7246,9 +7246,18 @@ def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_
       fetch is used instead, with ``refinement_reason`` saying why. No shape in
       the frozen inventory does this.
     
+    * ``"used_rows"`` — the statement answers every data read and emits
+      solution rows; the engine finishes over them and the schema graph
+      (``sparql_finish``) and loads no record.
+    
     Args:
         query: SPARQL query string.
         schema_view: The LinkML schema.
+        schema_graph_iri: The active datamodel's schema graph, or ``None``.
+        rows_route: ``False`` plans without the rows route (``"used_rows"``):
+            what a caller asks for when it cannot render that route's
+            statement. The records route answers every query the rows route
+            does, more slowly, so declining one is never a wrong answer.
     
     Returns:
         ExecutionPlan. Check ``is_accounted`` before running it — a plan with a

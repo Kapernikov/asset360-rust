@@ -3814,7 +3814,7 @@ impl ExecutionPlan {
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "plan_query_refined")]
-#[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
+#[pyo3(signature = (query, schema_view, schema_graph_iri=None, rows_route=true))]
 /// Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
 ///
 /// The only planner. A naive plan of the whole query is refined by rules to a
@@ -3834,9 +3834,18 @@ impl ExecutionPlan {
 ///   fetch is used instead, with ``refinement_reason`` saying why. No shape in
 ///   the frozen inventory does this.
 ///
+/// * ``"used_rows"`` — the statement answers every data read and emits
+///   solution rows; the engine finishes over them and the schema graph
+///   (``sparql_finish``) and loads no record.
+///
 /// Args:
 ///     query: SPARQL query string.
 ///     schema_view: The LinkML schema.
+///     schema_graph_iri: The active datamodel's schema graph, or ``None``.
+///     rows_route: ``False`` plans without the rows route (``"used_rows"``):
+///         what a caller asks for when it cannot render that route's
+///         statement. The records route answers every query the rows route
+///         does, more slowly, so declining one is never a wrong answer.
 ///
 /// Returns:
 ///     ExecutionPlan. Check ``is_accounted`` before running it — a plan with a
@@ -3851,14 +3860,20 @@ fn py_plan_query_refined(
     query: &str,
     schema_view: Py<PySchemaView>,
     schema_graph_iri: Option<String>,
+    rows_route: bool,
 ) -> PyResult<ExecutionPlan> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    crate::sparql_plan::plan_query_refined_with_schema_graph(query, sv, schema_graph_iri.as_deref())
-        .map(|inner| ExecutionPlan { inner })
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    crate::sparql_plan::plan_query_refined_with_options(
+        query,
+        sv,
+        schema_graph_iri.as_deref(),
+        rows_route,
+    )
+    .map(|inner| ExecutionPlan { inner })
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]

@@ -1383,6 +1383,21 @@ pub fn plan_query_refined_with_schema_graph(
     schema_view: &SchemaView,
     schema_graph_iri: Option<&str>,
 ) -> Result<ExecutionPlan, ScopeError> {
+    plan_query_refined_with_options(query_str, schema_view, schema_graph_iri, true)
+}
+
+/// [`plan_query_refined_with_schema_graph`], with the rows route
+/// (`Refinement::UsedRows`) switched off when `rows_route` is `false`: the
+/// plan the records route would run. What a consumer asks for when it cannot
+/// render the rows route's statement -- the records route answers every
+/// query the rows route does, more slowly, so declining one is never a wrong
+/// answer. The lifts R1–R3 go with it, since they are kept only for it.
+pub fn plan_query_refined_with_options(
+    query_str: &str,
+    schema_view: &SchemaView,
+    schema_graph_iri: Option<&str>,
+    rows_route: bool,
+) -> Result<ExecutionPlan, ScopeError> {
     let mut parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
     // Before anything reads a predicate or a type: one slot has two
     // legitimate IRIs when it declares a `slot_uri`, one class when it declares
@@ -1437,7 +1452,7 @@ pub fn plan_query_refined_with_schema_graph(
     // as it stands rather than refined a second time.
     let mut settled: Option<crate::sparql_refine::Plan> = None;
     #[cfg(feature = "sparql-endpoint")]
-    {
+    if rows_route {
         let rules = refine_rules(schema_view, schema_graph_iri, true);
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
@@ -1453,7 +1468,7 @@ pub fn plan_query_refined_with_schema_graph(
                     &recorded,
                     Some(&lifted),
                 )?;
-                if let Ok(plan) = rows_route(
+                if let Ok(plan) = self::rows_route(
                     &obligations,
                     &lifted,
                     &parsed,
@@ -1556,16 +1571,22 @@ pub fn plan_query_refined_with_schema_graph(
             // Before the records route: can the engine finish over the
             // statement's rows instead? The same plan, lowered as an answer.
             #[cfg(feature = "sparql-endpoint")]
-            let why = match rows_route(
-                &plan.obligations,
-                &refined,
-                &parsed,
-                schema_view,
-                schema_graph_iri,
-                &scoped,
-            ) {
-                Ok(rows) => return Ok(rows),
-                Err(rows_why) => format!("{why}; the engine cannot finish over rows: {rows_why}"),
+            let why = if rows_route {
+                match self::rows_route(
+                    &plan.obligations,
+                    &refined,
+                    &parsed,
+                    schema_view,
+                    schema_graph_iri,
+                    &scoped,
+                ) {
+                    Ok(rows) => return Ok(rows),
+                    Err(rows_why) => {
+                        format!("{why}; the engine cannot finish over rows: {rows_why}")
+                    }
+                }
+            } else {
+                why
             };
             // A fetch, and the engine finishes. What the statement does not
             // claim is the engine's, computed rather than assumed, because
