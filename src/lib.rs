@@ -41,6 +41,7 @@ pub mod shacl_ast;
 pub mod sparql_algebra;
 pub mod sparql_alias;
 pub mod sparql_columns;
+pub mod sparql_constant;
 pub mod sparql_domains;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
@@ -130,6 +131,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PushdownBinding>()?;
         m.add_class::<JoinColumn>()?;
         m.add_class::<RelationColumn>()?;
+        m.add_class::<ConstantColumn>()?;
         m.add_class::<PushdownMeasure>()?;
         m.add_class::<PushdownOrder>()?;
         m.add_class::<PushdownHaving>()?;
@@ -2557,6 +2559,68 @@ impl JoinColumn {
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass]
 #[derive(Clone)]
+/// One column of a ``"constant"``: an inline table the statement joins.
+pub struct ConstantColumn {
+    inner: crate::sparql_ops::ConstantColumn,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl ConstantColumn {
+    /// The variable, which is also the column's name in the table.
+    #[getter]
+    fn var(&self) -> String {
+        self.inner.var.clone()
+    }
+
+    /// How a cell becomes an RDF term: ``"iri"``, ``"literal"`` or
+    /// ``"enum_iri"`` (a key column compared with an enum slot holds that
+    /// slot's stored codes).
+    #[getter]
+    fn term_kind(&self) -> &'static str {
+        use crate::sparql_terms::TermKind;
+        match self.inner.descriptor.kind {
+            TermKind::Iri => "iri",
+            TermKind::Literal => "literal",
+            TermKind::EnumIri => "enum_iri",
+        }
+    }
+
+    /// Datatype IRI for a typed literal column, or ``None``.
+    #[getter]
+    fn datatype(&self) -> Option<String> {
+        self.inner.descriptor.datatype.clone()
+    }
+
+    /// Language tag of a language-tagged literal column, or ``None``.
+    #[getter]
+    fn lang(&self) -> Option<String> {
+        self.inner.descriptor.lang.clone()
+    }
+
+    /// On the key column: ``"identity"``, ``"enum→code"`` or ``"lexical"``,
+    /// the translation from a concept or literal to the other side's stored
+    /// text. ``None`` on every other column.
+    #[getter]
+    fn key_translation(&self) -> Option<&'static str> {
+        self.inner.key.as_ref().map(|key| key.translation.as_str())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ConstantColumn(var={:?}, term_kind={:?}, key={:?})",
+            self.inner.var,
+            self.term_kind(),
+            self.key_translation()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
+#[derive(Clone)]
 /// One export of a ``"relation"``: what the outside reads of the derived
 /// table, under the variable's name as the column's.
 pub struct RelationColumn {
@@ -2575,6 +2639,8 @@ impl RelationColumn {
 
     /// ``"identity"`` (a scanned record's ``asset360_uri``, under
     /// ``holder_star``), ``"slot"`` (a value the body's ``binding`` reads),
+    /// ``"constant"`` (a column of an inline table in the body, read by the
+    /// body's ``binding``, whose ``relation`` is the table's alias),
     /// ``"measure"`` (an aggregate under its own name in the body's
     /// grouping) or ``"structure"`` (an inlined element's occurrence
     /// identifier, composed in the body from ``binding``'s hops).
@@ -2624,11 +2690,11 @@ impl RelationColumn {
     fn binding(&self) -> Option<PushdownBinding> {
         use crate::sparql_ops::ColumnKind;
         match &self.inner.kind {
-            ColumnKind::Slot(binding) | ColumnKind::Structure { binding, .. } => {
-                Some(PushdownBinding {
-                    inner: binding.clone(),
-                })
-            }
+            ColumnKind::Slot(binding)
+            | ColumnKind::Structure { binding, .. }
+            | ColumnKind::Constant(binding) => Some(PushdownBinding {
+                inner: binding.clone(),
+            }),
             _ => None,
         }
     }
@@ -3119,14 +3185,21 @@ impl PlanOp {
         }
     }
 
-    /// For a ``"join"`` on ``"identity"`` or ``"element"``: the left column,
-    /// as [`JoinColumn`].
+    /// For a ``"join"`` on ``"identity"``, ``"element"`` or ``"value"``: the
+    /// left column, as [`JoinColumn`]. For ``"value"`` one side is a
+    /// ``"constant"``'s key column (``source`` its alias, ``column`` the
+    /// variable) and the other a star's identity (empty ``path``), a star's
+    /// single-valued slot (``path`` the slot path, read as text:
+    /// ``object_data #>> path``) or a relation column.
     #[getter]
     fn join_key_left(&self) -> Option<JoinColumn> {
         use crate::sparql_ops::{JoinKey, Op};
         match &self.inner.op {
             Op::Join {
-                key: JoinKey::Identity { left, .. } | JoinKey::Element { left, .. },
+                key:
+                    JoinKey::Identity { left, .. }
+                    | JoinKey::Element { left, .. }
+                    | JoinKey::Value { left, .. },
                 ..
             } => Some(JoinColumn {
                 inner: left.clone(),
@@ -3135,13 +3208,17 @@ impl PlanOp {
         }
     }
 
-    /// For a ``"join"`` on ``"identity"`` or ``"element"``: the right column.
+    /// For a ``"join"`` on ``"identity"``, ``"element"`` or ``"value"``: the
+    /// right column.
     #[getter]
     fn join_key_right(&self) -> Option<JoinColumn> {
         use crate::sparql_ops::{JoinKey, Op};
         match &self.inner.op {
             Op::Join {
-                key: JoinKey::Identity { right, .. } | JoinKey::Element { right, .. },
+                key:
+                    JoinKey::Identity { right, .. }
+                    | JoinKey::Element { right, .. }
+                    | JoinKey::Value { right, .. },
                 ..
             } => Some(JoinColumn {
                 inner: right.clone(),
@@ -3180,13 +3257,46 @@ impl PlanOp {
         }
     }
 
-    /// For ``"relation"``: the alias the derived table is joined under.
+    /// For ``"relation"`` and ``"constant"``: the alias the derived table is
+    /// joined under.
     #[getter]
     fn relation_alias(&self) -> Option<String> {
         use crate::sparql_ops::Op;
         match &self.inner.op {
-            Op::Relation { alias, .. } => Some(alias.clone()),
+            Op::Relation { alias, .. } | Op::Constant { alias, .. } => Some(alias.clone()),
             _ => None,
+        }
+    }
+
+    /// For ``"constant"``: one entry per column of the inline table, in
+    /// column order -- the variable (also the column's name), how a cell
+    /// becomes a term, and, on the key column, the translation that made
+    /// its cells the other side's stored text.
+    #[getter]
+    fn constant_columns(&self) -> Vec<ConstantColumn> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Constant { columns, .. } => columns
+                .iter()
+                .map(|column| ConstantColumn {
+                    inner: column.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"constant"``: every row, duplicates included (the table is a
+    /// bag, never rendered under ``DISTINCT``), one stored text per column
+    /// in ``constant_columns`` order; ``None`` is ``NULL``. Render as
+    /// ``(VALUES (…), …) AS <alias>(<vars>)``, every cell ``text``; an
+    /// empty list is a table with no rows.
+    #[getter]
+    fn constant_rows(&self) -> Vec<Vec<Option<String>>> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Constant { rows, .. } => rows.clone(),
+            _ => Vec::new(),
         }
     }
 

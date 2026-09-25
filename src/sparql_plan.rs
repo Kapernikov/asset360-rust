@@ -542,8 +542,38 @@ fn write_ops(
                 )?;
                 write_ops(f, body, &format!("{indent}    "))?;
             }
+            Op::Constant {
+                alias,
+                columns,
+                rows,
+            } => writeln!(
+                f,
+                "{indent}constant  {alias} ({}) × {}   {}",
+                columns
+                    .iter()
+                    .map(|column| column.var.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                rows.len(),
+                columns
+                    .iter()
+                    .map(|column| match &column.key {
+                        Some(key) => format!(
+                            "{}: {} of {}",
+                            column.var,
+                            key.translation.as_str(),
+                            column_name(&key.other)
+                        ),
+                        None => format!("{}: {}", column.var, column.descriptor.shape()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?,
             Op::Join {
-                key: key @ (JoinKey::Identity { left, right } | JoinKey::Element { left, right }),
+                key:
+                    key @ (JoinKey::Identity { left, right }
+                    | JoinKey::Element { left, right }
+                    | JoinKey::Value { left, right }),
                 kind,
                 ..
             } => writeln!(
@@ -1177,7 +1207,26 @@ pub fn refined_plan_text(
         rules.iter().map(|rule| rule.as_ref()).collect();
     let mut plan = naive;
     crate::sparql_rules::refine(&mut plan, &borrowed).map_err(|failure| failure.to_string())?;
-    Ok(plan.to_string())
+    Ok(with_declined(&plan, schema))
+}
+
+/// A refined plan's printout with its `declined` section: every rule whose
+/// match succeeded where a guard stopped it, with the guard. Computed from
+/// the plan as it stands, so it never reports a decline a later rule undid.
+pub fn with_declined(plan: &crate::sparql_refine::Plan, schema: &SchemaView) -> String {
+    let text = plan.to_string();
+    let declined = crate::sparql_rules::declined(plan, schema);
+    if declined.is_empty() {
+        return text;
+    }
+    let mut section = String::from("  declined\n");
+    for (rule, node, why) in declined {
+        section.push_str(&format!("      {rule}  n{node}  {why}\n"));
+    }
+    match text.find("\nobligations\n") {
+        Some(at) => format!("{}{section}{}", &text[..at], &text[at..]),
+        None => format!("{text}{section}"),
+    }
 }
 
 /// Plan a query: one parse, one scope, one refinement, one artifact.

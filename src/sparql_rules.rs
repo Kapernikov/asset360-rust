@@ -4958,6 +4958,12 @@ pub fn tier_one_rules<'a>(
         // reduction, and it is what a materialised relation is worth to the
         // planner whether the schema produced it or the client wrote it.
         Box::new(ValuesNarrowTheJoinedScan::new(schema)),
+        // M1: an inline table the narrowing rules leave standing -- one that
+        // adds a column -- becomes a constant derived table the statement
+        // joins, under the preconditions that make SQL equality SPARQL
+        // compatibility. Like the rule above it knows nothing about where
+        // the table came from.
+        Box::new(crate::sparql_constant::LowerConstantRelation::new(schema)),
     ];
     // Only for a deployment that serves a schema graph: without one, no
     // subplan can depend on nothing but the schema, so the rule would ask a
@@ -4978,6 +4984,19 @@ pub fn tier_one_rules<'a>(
     #[cfg(not(feature = "sparql-endpoint"))]
     let _ = schema_graph_iri;
     rules
+}
+
+/// Every decline the rules can explain on a refined plan: `(rule, node,
+/// guard)`, for the `declined` section of a printout. A rule's match
+/// succeeded there and one of its guards stopped it; the guard is named in
+/// the words of the design that states it.
+pub fn declined(plan: &Plan, schema: &SchemaView) -> Vec<(&'static str, NodeId, String)> {
+    let mut out = Vec::new();
+    let lower = crate::sparql_constant::LowerConstantRelation::new(schema);
+    for (node, why) in lower.declined(plan) {
+        out.push((lower.name(), node, why));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

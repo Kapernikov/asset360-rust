@@ -206,3 +206,33 @@ pub fn fixture(schema: &SchemaView) -> Oracle {
         ],
     )
 }
+
+/// A design probe: `query` over a store holding exactly `turtle` (N-Triples
+/// or Turtle, no records), as a bag. What the appendix of
+/// `docs/design/sparql-schema-relations-and-row-finish.md` ran on
+/// PyOxigraph, kept as a regression so a counterexample stays honest if the
+/// engine changes: each one asserts that a rewrite a guard rejects really
+/// does answer differently.
+pub fn probe(turtle: &str, query: &str) -> Bag {
+    let store = Store::new().unwrap();
+    if !turtle.is_empty() {
+        store
+            .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
+            .unwrap_or_else(|e| panic!("{e}\n{turtle}"));
+    }
+    Oracle { store }.answers_to(query)
+}
+
+/// [`probe`], as the sequence the engine emitted.
+pub fn probe_sequence(turtle: &str, query: &str) -> Vec<BTreeMap<String, String>> {
+    let store = Store::new().unwrap();
+    if !turtle.is_empty() {
+        store
+            .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
+            .unwrap_or_else(|e| panic!("{e}\n{turtle}"));
+    }
+    ordered_answers(
+        &Oracle { store },
+        crate::sparql_scoper::parse_query(query).unwrap(),
+    )
+}

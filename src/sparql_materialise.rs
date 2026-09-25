@@ -987,9 +987,16 @@ mod tests {
              GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:notation ?code }} \
              FILTER(CONTAINS(?code, \"GS\")) }} }}"
         ));
+        // The outer scan is not narrowed: the condition lives inside the
+        // `OPTIONAL` body's relation (M1 lowers the table there), which is
+        // where it decides whether the optional side matched.
         assert!(
-            !plan.contains("filter    signalType"),
+            !plan.contains("\n      filter    signalType"),
             "an optional match must not narrow the fetch:\n{plan}"
+        );
+        assert!(
+            plan.contains("relation  q0") && plan.contains("          filter    signalType"),
+            "the narrowing is the optional body's own:\n{plan}"
         );
     }
 
@@ -1031,10 +1038,13 @@ mod tests {
     /// would be a wrong answer, a wide one is only a slow right one. `main`
     /// fetches both classes whole for this query too, so nothing got worse.
     ///
-    /// Closing the gap means lowering the materialised `VALUES` into the
-    /// statement so the arm becomes all-SQL. That is neither PR's scope.
+    /// Closing the gap meant lowering the materialised `VALUES` into the
+    /// statement so the arm becomes all-SQL, which is what M1
+    /// ([`crate::sparql_constant`], asset360 #494) does: the test now pins
+    /// the closed gap, each arm's narrowing on its own arm of a stacked
+    /// union.
     #[test]
-    fn a_union_of_schema_filtered_arms_narrows_each_arm_but_not_the_fetch() {
+    fn a_union_of_schema_filtered_arms_narrows_each_arm_and_the_fetch() {
         let body = format!(
             "SELECT ?s WHERE {{ \
              {{ ?s a asset360:Signal ; asset360:signalType ?t . \
@@ -1063,19 +1073,27 @@ mod tests {
             );
         }
 
-        // The gap, pinned so that closing it fails this test rather than
-        // passing unnoticed: the union is not lowered, so neither narrowing
-        // reaches the fetch.
+        // The gap this test used to pin is closed by M1 (asset360 #494): the
+        // materialised `VALUES` of each arm lowers as a constant table, so
+        // each arm is all-SQL, the union is stacked, and each narrowing
+        // reaches the fetch on its own arm -- and only there.
         let lowered = plan_for(&body);
         assert!(
-            lowered.contains("not lowerable: the plan contains a UNION"),
-            "a schema-filtered arm keeps an engine-side VALUES, so the union \
-             is not all-SQL and is not stacked:\n{lowered}"
+            lowered.contains("union all"),
+            "each arm is all-SQL, so the union is stacked:\n{lowered}"
+        );
+        let (signal_arm, balise_arm) = lowered
+            .split_once("scan      asset360:BaliseGroup")
+            .expect("the BaliseGroup arm");
+        assert!(
+            signal_arm.contains("filter    signalType = 'GSA'")
+                && !signal_arm.contains("baliseGroupType"),
+            "the Signal arm carries its own narrowing and no other:\n{lowered}"
         );
         assert!(
-            !lowered.contains("signalType IN") && !lowered.contains("baliseGroupType IN"),
-            "and a condition under an unlowered union is refused rather than \
-             applied to the wrong branch:\n{lowered}"
+            balise_arm.contains("filter    baliseGroupType = 'SwBG'")
+                && !balise_arm.contains("signalType ="),
+            "the BaliseGroup arm carries its own narrowing and no other:\n{lowered}"
         );
     }
 

@@ -1569,6 +1569,41 @@ class CommonMetadata:
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     def __new__(cls, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> CommonMetadata: ...
 
+class ConstantColumn:
+    r"""
+    One column of a ``"constant"``: an inline table the statement joins.
+    """
+    @property
+    def var(self) -> builtins.str:
+        r"""
+        The variable, which is also the column's name in the table.
+        """
+    @property
+    def term_kind(self) -> builtins.str:
+        r"""
+        How a cell becomes an RDF term: ``"iri"``, ``"literal"`` or
+        ``"enum_iri"`` (a key column compared with an enum slot holds that
+        slot's stored codes).
+        """
+    @property
+    def datatype(self) -> typing.Optional[builtins.str]:
+        r"""
+        Datatype IRI for a typed literal column, or ``None``.
+        """
+    @property
+    def lang(self) -> typing.Optional[builtins.str]:
+        r"""
+        Language tag of a language-tagged literal column, or ``None``.
+        """
+    @property
+    def key_translation(self) -> typing.Optional[builtins.str]:
+        r"""
+        On the key column: ``"identity"``, ``"enum→code"`` or ``"lexical"``,
+        the translation from a concept or literal to the other side's stored
+        text. ``None`` on every other column.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class ConstraintSet:
     @staticmethod
     def from_json(json:builtins.str) -> ConstraintSet:
@@ -4161,13 +4196,18 @@ class PlanOp:
     @property
     def join_key_left(self) -> typing.Optional[JoinColumn]:
         r"""
-        For a ``"join"`` on ``"identity"`` or ``"element"``: the left column,
-        as [`JoinColumn`].
+        For a ``"join"`` on ``"identity"``, ``"element"`` or ``"value"``: the
+        left column, as [`JoinColumn`]. For ``"value"`` one side is a
+        ``"constant"``'s key column (``source`` its alias, ``column`` the
+        variable) and the other a star's identity (empty ``path``), a star's
+        single-valued slot (``path`` the slot path, read as text:
+        ``object_data #>> path``) or a relation column.
         """
     @property
     def join_key_right(self) -> typing.Optional[JoinColumn]:
         r"""
-        For a ``"join"`` on ``"identity"`` or ``"element"``: the right column.
+        For a ``"join"`` on ``"identity"``, ``"element"`` or ``"value"``: the
+        right column.
         """
     @property
     def right_reading(self) -> typing.Optional[builtins.str]:
@@ -4192,7 +4232,25 @@ class PlanOp:
     @property
     def relation_alias(self) -> typing.Optional[builtins.str]:
         r"""
-        For ``"relation"``: the alias the derived table is joined under.
+        For ``"relation"`` and ``"constant"``: the alias the derived table is
+        joined under.
+        """
+    @property
+    def constant_columns(self) -> builtins.list[ConstantColumn]:
+        r"""
+        For ``"constant"``: one entry per column of the inline table, in
+        column order -- the variable (also the column's name), how a cell
+        becomes a term, and, on the key column, the translation that made
+        its cells the other side's stored text.
+        """
+    @property
+    def constant_rows(self) -> builtins.list[builtins.list[typing.Optional[builtins.str]]]:
+        r"""
+        For ``"constant"``: every row, duplicates included (the table is a
+        bag, never rendered under ``DISTINCT``), one stored text per column
+        in ``constant_columns`` order; ``None`` is ``NULL``. Render as
+        ``(VALUES (…), …) AS <alias>(<vars>)``, every cell ``text``; an
+        empty list is a table with no rows.
         """
     @property
     def relation_body(self) -> builtins.list[PlanOp]:
@@ -4689,6 +4747,8 @@ class RelationColumn:
         r"""
         ``"identity"`` (a scanned record's ``asset360_uri``, under
         ``holder_star``), ``"slot"`` (a value the body's ``binding`` reads),
+        ``"constant"`` (a column of an inline table in the body, read by the
+        body's ``binding``, whose ``relation`` is the table's alias),
         ``"measure"`` (an aggregate under its own name in the body's
         grouping) or ``"structure"`` (an inlined element's occurrence
         identifier, composed in the body from ``binding``'s hops).

@@ -1031,7 +1031,7 @@ mod tests {
 /// the per-rewrite oracle, and the direct tests for the nodes a naive plan
 /// does not have.
 #[cfg(all(test, feature = "sparql-endpoint"))]
-mod equivalence {
+pub(crate) mod equivalence {
     use super::*;
     use crate::sparql_oracle::{Oracle, fixture};
     use crate::sparql_rules::{Rule, tier_one_rules};
@@ -1049,7 +1049,7 @@ mod equivalence {
     /// Refine one query one application at a time, translating the plan
     /// before and after each and holding both to the oracle. Returns the
     /// refined plan.
-    fn each_rewrite_preserves_answers(
+    pub(crate) fn each_rewrite_preserves_answers(
         query: &str,
         schema: &SchemaView,
         oracle: &Oracle,

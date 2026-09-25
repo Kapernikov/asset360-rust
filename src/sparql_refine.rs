@@ -1959,6 +1959,57 @@ pub enum JoinKey {
     },
     /// `on = []`: every pair. `CROSS JOIN`, or `LEFT JOIN … ON true`.
     Cross,
+    /// One side is a [`PlanOp::Values`] lowered as a constant table (M1 of
+    /// `docs/design/sparql-schema-relations-and-row-finish.md`), and the
+    /// join is SQL equality between its key column and the other side's
+    /// column for `var` -- which is SPARQL compatibility *only* under the
+    /// preconditions [`crate::sparql_constant::LowerConstantRelation`]
+    /// checks (K1–K7), and [`Plan::join_keys_agree`] checks again.
+    ///
+    /// `translation` is how a cell becomes the stored text the other
+    /// column holds; `column` names that column for a reader; `kept` and
+    /// `dropped` count the table's rows after the translation -- a dropped
+    /// row is one whose term lies outside the other column's image, which
+    /// matches nothing because the other side binds `var` in every solution.
+    Value {
+        var: String,
+        translation: KeyTranslation,
+        column: String,
+        kept: usize,
+        dropped: usize,
+    },
+}
+
+/// How a constant table's key cell becomes the stored text of the column it
+/// is compared with: the inverse image of that column's stored-to-term map,
+/// which is what makes SQL equality `sameTerm` (M1's K4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTranslation {
+    /// A record's identity: the IRI's own text.
+    Identity,
+    /// An enum slot: a concept IRI → the stored code(s) that mean it.
+    EnumCode,
+    /// A string slot (plain, or of one fixed language): the lexical form.
+    Lexical,
+}
+
+impl KeyTranslation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::EnumCode => "enum→code",
+            Self::Lexical => "lexical",
+        }
+    }
+
+    /// What a dropped cell is, for a printout: what it lies outside of.
+    pub fn outside(&self) -> &'static str {
+        match self {
+            Self::Identity => "not an IRI",
+            Self::EnumCode => "outside enum",
+            Self::Lexical => "of another kind",
+        }
+    }
 }
 
 impl fmt::Display for JoinKey {
@@ -1969,6 +2020,12 @@ impl fmt::Display for JoinKey {
             }
             Self::Element { var, path, .. } => write!(f, "element ?{var} at {}", path.join(".")),
             Self::Cross => f.write_str("cross"),
+            Self::Value {
+                var,
+                translation,
+                column,
+                ..
+            } => write!(f, "value ?{var} ({column}, {})", translation.as_str()),
         }
     }
 }
@@ -3385,11 +3442,15 @@ impl fmt::Display for Plan {
                         .join(" ")
                 )
             };
+            let mut describe = node.op.describe();
+            if let Some(note) = crate::sparql_constant::lowered_note(self, id) {
+                describe = format!("{describe}  {note}");
+            }
             writeln!(
                 f,
                 "  n{id:<3} {:<9} {:<44} {}{claims}",
                 node.op.kind(),
-                node.op.describe(),
+                describe,
                 node.executor.tag()
             )?;
         }

@@ -165,6 +165,13 @@ pub enum TermOf {
     /// A multivalued slot whose fan-out has not happened below this node, so
     /// the variable stands for no single value here.
     Collection { star_var: String, path: Vec<String> },
+    /// A column of a constant table: a [`PlanOp::Values`] that runs in SQL
+    /// (M1, [`crate::sparql_constant`]), whose cells are all one kind of
+    /// term -- `descriptor` says which. Absent for a `VALUES` the engine
+    /// evaluates, which is [`TermOf::Computed`].
+    Constant {
+        descriptor: crate::sparql_terms::TermDescriptor,
+    },
     /// A value the engine computes: a `BIND` of an expression, a triple
     /// pattern's binding, a `VALUES` cell. Not a column.
     Computed,
@@ -542,6 +549,21 @@ impl Plan {
                     out.extend(self.term_of(schema, *input, renamed));
                     continue;
                 }
+                // A constant table's column, once the table is SQL's: the
+                // one kind its cells are. A mixed column is no column.
+                PlanOp::Values { variables, rows }
+                    if self.nodes[producer].executor == Executor::Sql =>
+                {
+                    match variables
+                        .iter()
+                        .position(|variable| variable.as_str() == var)
+                        .and_then(|column| {
+                            crate::sparql_constant::uniform_descriptor(rows, column).ok()
+                        }) {
+                        Some(descriptor) => TermOf::Constant { descriptor },
+                        None => TermOf::Computed,
+                    }
+                }
                 _ => TermOf::Computed,
             };
             if !out.contains(&term) {
@@ -881,7 +903,23 @@ impl Plan {
     /// derived table for it, and both ask this one function so the two
     /// cannot disagree.
     pub fn transparent(&self, barrier: NodeId) -> bool {
-        if self.nodes[barrier].executor != Executor::Sql || !self.transparent_shape(barrier) {
+        if self.nodes[barrier].executor != Executor::Sql {
+            return false;
+        }
+        // An `OPTIONAL`-body barrier over a lowered constant table (M1): a
+        // bag projection of the table, which the statement joins flat --
+        // the constant is the relation, and the barrier adds nothing to it.
+        if let PlanOp::SubSelect {
+            input,
+            domain: None,
+            ..
+        } = &self.nodes[barrier].op
+            && matches!(self.nodes[*input].op, PlanOp::Values { .. })
+            && crate::sparql_constant::keyed_consumer(self, *input).is_some()
+        {
+            return true;
+        }
+        if !self.transparent_shape(barrier) {
             return false;
         }
         self.nodes.iter().any(|node| {
@@ -1071,6 +1109,7 @@ pub fn representable(
             class_uri, path, ..
         } => crate::sparql_terms::resolve_column(schema, class_uri, path).is_some(),
         TermOf::Structure { .. } => !serialise,
+        TermOf::Constant { .. } => true,
         TermOf::Collection { .. } | TermOf::Computed => false,
     }
 }
@@ -1236,6 +1275,22 @@ impl Plan {
                                 )
                         }),
                     JoinKey::Cross => on.as_ref().is_none_or(|on| on.is_empty()),
+                    // Re-derived from the plan as it stands, never trusted:
+                    // K1 (the other side binds the key in every solution) is
+                    // the fact a later rule could invalidate, and the
+                    // translation is what the statement will compare.
+                    JoinKey::Value {
+                        var,
+                        translation,
+                        kept,
+                        dropped,
+                        ..
+                    } => crate::sparql_constant::key_facts(schema, self, id).is_ok_and(|facts| {
+                        facts.var == *var
+                            && facts.translation == *translation
+                            && facts.kept() == *kept
+                            && facts.dropped == *dropped
+                    }),
                 };
             if !agrees {
                 return Err(ScopeDefect::MisrecordedKey { join: id });
@@ -1408,6 +1463,18 @@ pub fn resolve_terms(terms: Vec<TermOf>) -> Option<TermOf> {
         if !distinct.contains(&term) {
             distinct.push(term);
         }
+    }
+    // A constant table's key column beside the column it was joined on:
+    // under M1's preconditions the two hold the same term in every joined
+    // row, and the stored column is the one that says how it is spelled --
+    // the constant's cells were translated *into* that column's text. So a
+    // constant defers to whatever else produces the variable.
+    if distinct.len() > 1
+        && distinct
+            .iter()
+            .any(|t| !matches!(t, TermOf::Constant { .. }))
+    {
+        distinct.retain(|t| !matches!(t, TermOf::Constant { .. }));
     }
     match distinct.as_slice() {
         [only] => Some(only.clone()),
