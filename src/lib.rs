@@ -108,6 +108,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(py_naive_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_finish, m)?)?;
         // The token an unscoped refusal opens with when it names its own
         // rewrite (`sparql_scoper::UNSCOPED_REWRITE_NAMED`): exported so the
         // endpoint reads the constant instead of carrying a copy of it.
@@ -2067,6 +2068,16 @@ impl PushdownBinding {
         self.inner.occurrence
     }
 
+    /// ``True`` when the column is a left join's *match witness*: render
+    /// ``CASE WHEN <column> IS NULL THEN NULL ELSE 'true' END`` over the
+    /// column the binding otherwise names (a relation column, a star's
+    /// identity, a constant's key column) -- ``true`` exactly where that
+    /// join's right side matched. Its term is ``xsd:boolean``.
+    #[getter]
+    fn witness(&self) -> bool {
+        self.inner.witness
+    }
+
     /// ``True`` when the slot's values are numbers.
     ///
     /// The renderer needs this twice over: a numeric column is cast before
@@ -3543,6 +3554,84 @@ impl PlanPass {
         }
     }
 
+    /// For ``kind == "engine"``: what the engine reads. ``"records"``: the
+    /// SQL pass fetched records, load them and re-run the whole query over
+    /// them (``sparql_execute``). ``"solutions"``: the SQL pass is a
+    /// statement whose rows are solutions over ``solution_vars``; the engine
+    /// evaluates ``finish`` over those rows and the schema graph and loads
+    /// no record (``sparql_finish``). ``None`` for an SQL pass. Closed set:
+    /// refuse a value you do not know.
+    #[getter]
+    fn engine_input(&self) -> Option<&'static str> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(engine) => Some(match engine.input {
+                crate::sparql_plan::EngineInput::Records => "records",
+                crate::sparql_plan::EngineInput::Solutions { .. } => "solutions",
+            }),
+            crate::sparql_plan::PassKind::Sql(_) => None,
+        }
+    }
+
+    /// For ``engine_input == "solutions"``: the statement's columns, as the
+    /// variables they bind, in the statement's projection order.
+    #[getter]
+    fn solution_vars(&self) -> Vec<String> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(crate::sparql_plan::EnginePass {
+                input: crate::sparql_plan::EngineInput::Solutions { vars, .. },
+                ..
+            }) => vars.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``engine_input == "solutions"``: the variable ``sparql_finish``
+    /// numbers the rows in, ``1..`` in the order they are handed over --
+    /// the order the statement returned them, which a caller must keep.
+    /// ``None`` when the finish needs no order.
+    #[getter]
+    fn ordinal(&self) -> Option<String> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(crate::sparql_plan::EnginePass {
+                input: crate::sparql_plan::EngineInput::Solutions { ordinal, .. },
+                ..
+            }) => ordinal.clone(),
+            _ => None,
+        }
+    }
+
+    /// For ``engine_input == "solutions"``: the engine region as the SPARQL
+    /// query ``sparql_finish`` evaluates, written at plan time.
+    #[getter]
+    fn finish(&self) -> Option<String> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(crate::sparql_plan::EnginePass {
+                input: crate::sparql_plan::EngineInput::Solutions { finish, .. },
+                ..
+            }) => Some(finish.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``engine_input == "solutions"``: whether the finish answers
+    /// exactly one row per statement row. Then the row cap applies to the
+    /// statement itself; otherwise the answer may be smaller than the rows,
+    /// so the statement is bounded by the cell budget and the cap applies to
+    /// the finish's answer.
+    #[getter]
+    fn preserves_rows(&self) -> bool {
+        matches!(
+            &self.inner.kind,
+            crate::sparql_plan::PassKind::Engine(crate::sparql_plan::EnginePass {
+                input: crate::sparql_plan::EngineInput::Solutions {
+                    preserves_rows: true,
+                    ..
+                },
+                ..
+            })
+        )
+    }
+
     /// For ``kind == "engine"``: why the engine is needed, as stable cause
     /// codes. Useful in a log line or an explain output — the reader wants to
     /// know what stopped SQL from answering alone.
@@ -3614,9 +3703,14 @@ impl ExecutionPlan {
             .collect()
     }
 
-    /// Where these operators came from: ``"used"``, ``"used_alone"`` or
-    /// ``"fallback"``. Every plan comes from :func:`plan_query_refined`, the
-    /// only planner, so these three are the whole vocabulary.
+    /// Where these operators came from: ``"used"``, ``"used_rows"``,
+    /// ``"used_alone"`` or ``"fallback"``. Every plan comes from
+    /// :func:`plan_query_refined`, the only planner, so these four are the
+    /// whole vocabulary.
+    ///
+    /// ``"used_rows"``: the statement answers every data read and emits
+    /// solution rows, and the engine finishes over them and the schema
+    /// graph -- see ``PlanPass.engine_input``.
     ///
     /// ``"used"`` and ``"used_alone"`` are different risks and read
     /// differently on purpose. ``"used"`` is a *fetch*: the statement narrows
@@ -4068,6 +4162,82 @@ fn sparql_execute(
         }
         // `EvaluationBacklog` reaches Python as its own `Display`, through
         // the arm below: one text, the one `sparql/engine.py` matches on.
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (plan, solutions_json, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None, max_eval_millis=None))]
+/// Finish a ``refinement == "used_rows"`` plan over its statement's rows.
+///
+/// The engine pass's ``finish`` query is evaluated with the rows in place of
+/// its placeholder ``VALUES``, over a store holding only the schema graph
+/// (built only when the finish reads a named graph). No record is loaded.
+///
+/// Args:
+///     plan: The ``used_rows`` plan the statement was rendered from.
+///     solutions_json: The statement's rows as SPARQL Query Results JSON
+///         over the pass's ``solution_vars`` -- **in the order the
+///         statement returned them**: when the pass names an ``ordinal``,
+///         row *i* is numbered *i* here and the answer is ordered by it.
+///     schema_view: The active datamodel.
+///     max_triples: The budget of *cells* handed over (rows × bound
+///         columns, the ordinal included): a cell costs no more than the
+///         triple it would have been on the records route. Over it, the
+///         call raises ``RuntimeError("Triple limit exceeded: …")``.
+///     max_result_rows: Maximum rows of the answer.
+///     schema_graph_iri: As for ``sparql_execute``.
+///     max_eval_millis: As for ``sparql_execute``.
+///
+/// Returns:
+///     ``(content_type, body)``, as ``sparql_execute``.
+///
+/// Raises:
+///     RuntimeError: a limit exceeded, a plan that finishes over records, or
+///         an evaluation error -- the same texts ``sparql_execute`` raises.
+#[allow(clippy::too_many_arguments)]
+fn sparql_finish(
+    py: Python<'_>,
+    plan: &ExecutionPlan,
+    solutions_json: &str,
+    schema_view: Py<PySchemaView>,
+    max_triples: usize,
+    max_result_rows: usize,
+    schema_graph_iri: Option<String>,
+    max_eval_millis: Option<u64>,
+) -> PyResult<(String, String)> {
+    let bound_sv = schema_view.bind(py);
+    let sv_ref = bound_sv.borrow();
+    let sv = sv_ref.as_rust();
+    match crate::sparql_executor::sparql_finish(
+        &plan.inner,
+        solutions_json,
+        sv,
+        crate::sparql_executor::ExecuteLimits {
+            max_triples,
+            max_result_rows,
+            max_eval_millis,
+        },
+        schema_graph_iri.as_deref(),
+    ) {
+        Ok(answer) => Ok((answer.content_type, answer.body)),
+        Err(crate::sparql_executor::ExecuteError::TripleLimitExceeded { count, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Triple limit exceeded: {count} > {limit} (cells handed to the engine)"
+            )))
+        }
+        Err(crate::sparql_executor::ExecuteError::ResultLimitExceeded { count, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Result row limit exceeded: {count} > {limit}"
+            )))
+        }
+        Err(crate::sparql_executor::ExecuteError::EvaluationTimeExceeded { millis }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Evaluation time limit exceeded: the engine ran for more than {millis} ms"
+            )))
+        }
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }

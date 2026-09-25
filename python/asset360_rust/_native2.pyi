@@ -2717,9 +2717,14 @@ class ExecutionPlan:
     @property
     def refinement(self) -> builtins.str:
         r"""
-        Where these operators came from: ``"used"``, ``"used_alone"`` or
-        ``"fallback"``. Every plan comes from :func:`plan_query_refined`, the
-        only planner, so these three are the whole vocabulary.
+        Where these operators came from: ``"used"``, ``"used_rows"``,
+        ``"used_alone"`` or ``"fallback"``. Every plan comes from
+        :func:`plan_query_refined`, the only planner, so these four are the
+        whole vocabulary.
+        
+        ``"used_rows"``: the statement answers every data read and emits
+        solution rows, and the engine finishes over them and the schema
+        graph -- see ``PlanPass.engine_input``.
         
         ``"used"`` and ``"used_alone"`` are different risks and read
         differently on purpose. ``"used"`` is a *fetch*: the statement narrows
@@ -4368,6 +4373,46 @@ class PlanPass:
         descriptions of one pass is how a reader comes to use the stale one.
         """
     @property
+    def engine_input(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``kind == "engine"``: what the engine reads. ``"records"``: the
+        SQL pass fetched records, load them and re-run the whole query over
+        them (``sparql_execute``). ``"solutions"``: the SQL pass is a
+        statement whose rows are solutions over ``solution_vars``; the engine
+        evaluates ``finish`` over those rows and the schema graph and loads
+        no record (``sparql_finish``). ``None`` for an SQL pass. Closed set:
+        refuse a value you do not know.
+        """
+    @property
+    def solution_vars(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``engine_input == "solutions"``: the statement's columns, as the
+        variables they bind, in the statement's projection order.
+        """
+    @property
+    def ordinal(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``engine_input == "solutions"``: the variable ``sparql_finish``
+        numbers the rows in, ``1..`` in the order they are handed over --
+        the order the statement returned them, which a caller must keep.
+        ``None`` when the finish needs no order.
+        """
+    @property
+    def finish(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``engine_input == "solutions"``: the engine region as the SPARQL
+        query ``sparql_finish`` evaluates, written at plan time.
+        """
+    @property
+    def preserves_rows(self) -> builtins.bool:
+        r"""
+        For ``engine_input == "solutions"``: whether the finish answers
+        exactly one row per statement row. Then the row cap applies to the
+        statement itself; otherwise the answer may be smaller than the rows,
+        so the statement is bounded by the cell budget and the cap applies to
+        the finish's answer.
+        """
+    @property
     def causes(self) -> builtins.list[builtins.str]:
         r"""
         For ``kind == "engine"``: why the engine is needed, as stable cause
@@ -4452,6 +4497,15 @@ class PushdownBinding:
         representable -- a relation exports it, a join compares it, a
         ``GROUP BY`` groups by it -- and never serialisable; ``term_kind`` is
         a placeholder for it and a renderer must not emit it as an answer.
+        """
+    @property
+    def witness(self) -> builtins.bool:
+        r"""
+        ``True`` when the column is a left join's *match witness*: render
+        ``CASE WHEN <column> IS NULL THEN NULL ELSE 'true' END`` over the
+        column the binding otherwise names (a relation column, a star's
+        identity, a constant's key column) -- ``true`` exactly where that
+        join's right side matched. Its term is ``xsd:boolean``.
         """
     @property
     def numeric(self) -> builtins.bool:
@@ -7275,6 +7329,37 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
     Raises:
         RuntimeError: Conversion failure (with object URI), limit exceeded,
             or query execution error.
+    """
+
+def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
+    r"""
+    Finish a ``refinement == "used_rows"`` plan over its statement's rows.
+    
+    The engine pass's ``finish`` query is evaluated with the rows in place of
+    its placeholder ``VALUES``, over a store holding only the schema graph
+    (built only when the finish reads a named graph). No record is loaded.
+    
+    Args:
+        plan: The ``used_rows`` plan the statement was rendered from.
+        solutions_json: The statement's rows as SPARQL Query Results JSON
+            over the pass's ``solution_vars`` -- **in the order the
+            statement returned them**: when the pass names an ``ordinal``,
+            row *i* is numbered *i* here and the answer is ordered by it.
+        schema_view: The active datamodel.
+        max_triples: The budget of *cells* handed over (rows × bound
+            columns, the ordinal included): a cell costs no more than the
+            triple it would have been on the records route. Over it, the
+            call raises ``RuntimeError("Triple limit exceeded: …")``.
+        max_result_rows: Maximum rows of the answer.
+        schema_graph_iri: As for ``sparql_execute``.
+        max_eval_millis: As for ``sparql_execute``.
+    
+    Returns:
+        ``(content_type, body)``, as ``sparql_execute``.
+    
+    Raises:
+        RuntimeError: a limit exceeded, a plan that finishes over records, or
+            an evaluation error -- the same texts ``sparql_execute`` raises.
     """
 
 def sparql_inexact_reasons() -> builtins.list[builtins.str]:
