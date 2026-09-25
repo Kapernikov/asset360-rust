@@ -904,6 +904,29 @@ pub(crate) mod tests {
         }
     }
 
+    /// The key of a lowered table read through a structure, inside an
+    /// `OPTIONAL` body: nothing but the scan's own premise says the record
+    /// holds the value -- the left join to the table keeps the row either
+    /// way -- so the answering statement states it as a presence check (the
+    /// consolidator's guard refused the #494 superStructure material label
+    /// for its absence, and bypassing the guard answered a year where the
+    /// engine answers none).
+    #[test]
+    fn a_nested_key_is_a_stated_premise() {
+        let schema = test_schema_view();
+        let query = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?lat ?lbl WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:location ?loc . ?loc asset360:latitude ?lat ; asset360:detail ?d . \
+             ?d asset360:value ?v . OPTIONAL { VALUES (?v ?lbl) { (\"x\" \"X\") } } } }";
+        let plan = crate::sparql_plan::plan_query_refined(query, &schema).unwrap();
+        assert_eq!(plan.refinement.as_str(), "used_alone", "{plan}");
+        let printed = plan.to_string();
+        assert!(
+            printed.contains("present   location.detail.value"),
+            "{printed}"
+        );
+    }
+
     /// **`m1_unbound_key_joins_every_row`** (design appendix): K1. The key
     /// is an optional read, so an unbound `?k` is compatible with every row
     /// of the table, and SQL's `NULL = v` matches none.

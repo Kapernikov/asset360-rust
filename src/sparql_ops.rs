@@ -1806,11 +1806,31 @@ impl Lowering<'_> {
                             // which is fewer than the query wrote (a read through
                             // a collection stays with the engine), and the
                             // premise has to cover every mandatory read.
-                            required_paths: bounds
-                                .required_paths
-                                .get(&(star_var.clone(), class_uri.clone()))
-                                .cloned()
-                                .unwrap_or_default(),
+                            required_paths: {
+                                let mut paths = bounds
+                                    .required_paths
+                                    .get(&(star_var.clone(), class_uri.clone()))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                // A statement that answers states its own
+                                // premise too: every nested read the scan
+                                // *requires*. Nothing else is bound to test
+                                // it -- a left join to a constant keyed on
+                                // it keeps the row whether or not the
+                                // value is there -- and a record holding the
+                                // structure without the value is no solution.
+                                if enforcement == Enforcement::Enforces {
+                                    for path in restated_required_paths(schema, class_uri, slots) {
+                                        if !paths
+                                            .iter()
+                                            .any(|stated| stated.slot_path == path.slot_path)
+                                        {
+                                            paths.push(path);
+                                        }
+                                    }
+                                }
+                                paths
+                            },
                             // Whether the query only optionally wants these rows,
                             // which is what decides how the renderer wraps every
                             // condition on them. A scan on the optional side of a
@@ -2535,6 +2555,34 @@ impl Lowering<'_> {
         }
         Ok(nodes)
     }
+}
+
+/// The nested reads a scan requires, as the presence checks a statement
+/// that answers must state: every `Required` slot at least two hops deep,
+/// under no hop the scan reads optionally. A read under an optional hop
+/// constrains nothing about the record -- the hop may be missing and the
+/// row still an answer -- so it is left to the bindings that read it.
+fn restated_required_paths(
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    class_uri: &str,
+    slots: &[crate::sparql_refine::ScanSlot],
+) -> Vec<crate::sparql_scoper::RequiredPath> {
+    use crate::sparql_refine::SlotPresence;
+    slots
+        .iter()
+        .filter(|slot| slot.presence == SlotPresence::Required && slot.path.len() >= 2)
+        .filter(|slot| {
+            !(1..slot.path.len()).any(|hop| {
+                slots.iter().any(|other| {
+                    other.path.as_slice() == &slot.path[..hop]
+                        && other.presence == SlotPresence::Optional
+                })
+            })
+        })
+        // The scoper's own presence check, and its one refusal: a mapping
+        // element's key leaf, which the stored JSON need not carry.
+        .filter_map(|slot| crate::sparql_scoper::nested_presence_of(schema, class_uri, &slot.path))
+        .collect()
 }
 
 /// **A comparator clause, promoted: claims backed by rendered work.**
