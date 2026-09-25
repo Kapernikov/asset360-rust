@@ -2899,3 +2899,39 @@ mod alpha_renaming {
         );
     }
 }
+
+/// **The route differential over the whole property grammar**: every
+/// grammar query the planner sends down the rows route answers what the
+/// oracle answers, through the statement's rows and `sparql_finish`.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod grammar_differential {
+    use super::tests::{PREFIX, as_bag, oracle_rows, rows_route_answer};
+    use crate::sparql_oracle::fixture;
+    use crate::sparql_plan::Refinement;
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    #[test]
+    fn every_rows_route_of_the_grammar_answers_the_oracle() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let mut routed = 0;
+        for body in crate::sparql_algebra::equivalence::grammar() {
+            let query = format!("{PREFIX}{body}");
+            let Ok(plan) = crate::sparql_plan::plan_query_refined(&query, &schema) else {
+                continue;
+            };
+            if !matches!(plan.refinement, Refinement::UsedRows(_)) {
+                continue;
+            }
+            routed += 1;
+            let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+            assert_eq!(
+                as_bag(&rows),
+                as_bag(&oracle_rows(&query, &oracle)),
+                "{body}\n{plan}"
+            );
+        }
+        assert!(routed > 0, "no grammar query took the rows route");
+        println!("{routed} grammar queries through the rows route");
+    }
+}

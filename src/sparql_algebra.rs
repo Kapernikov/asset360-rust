@@ -1158,7 +1158,7 @@ pub(crate) mod equivalence {
     /// whole-mapping observers, a two-level array hop, and one level of
     /// nesting; each placed as a mandatory sub-select, an `OPTIONAL` body,
     /// or `OPTIONAL { { SELECT … } }`. Small enough to enumerate.
-    fn grammar() -> Vec<String> {
+    pub(crate) fn grammar() -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
 
         // The bodies a sub-select may have, each with its projection list.
