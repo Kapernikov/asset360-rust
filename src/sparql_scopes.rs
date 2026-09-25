@@ -321,6 +321,13 @@ impl Plan {
             }
             PlanOp::Bind { var: bound, .. } => bound == var,
             PlanOp::Group { measures, .. } => measures.iter().any(|measure| measure.var == var),
+            // The match witness and the ordinal are bound by the node that
+            // carries them, and nowhere else.
+            PlanOp::LeftJoin {
+                witness: Some(witness),
+                ..
+            } => witness == var,
+            PlanOp::Number { var: bound, .. } => bound == var,
             _ => false,
         }
     }
@@ -383,6 +390,7 @@ impl Plan {
             }
             PlanOp::Filter { input, .. }
             | PlanOp::Sort { input, .. }
+            | PlanOp::Number { input, .. }
             | PlanOp::Distinct { input }
             | PlanOp::Reduced { input }
             | PlanOp::Slice { input, .. }
@@ -440,6 +448,7 @@ impl Plan {
         }
         if let PlanOp::Filter { input, .. }
         | PlanOp::Sort { input, .. }
+        | PlanOp::Number { input, .. }
         | PlanOp::Distinct { input }
         | PlanOp::Reduced { input }
         | PlanOp::Slice { input, .. } = &self.nodes[node].op
@@ -740,7 +749,7 @@ impl Plan {
                 out
             }
             PlanOp::AntiJoin { .. } => self.correlated_inputs(id).into_iter().collect(),
-            PlanOp::Union { .. } | PlanOp::Slice { .. } => BTreeSet::new(),
+            PlanOp::Union { .. } | PlanOp::Slice { .. } | PlanOp::Number { .. } => BTreeSet::new(),
             PlanOp::Unnest { .. } => BTreeSet::new(),
             PlanOp::Ask { .. } => BTreeSet::new(),
             PlanOp::Construct { template, .. } => {
@@ -884,7 +893,21 @@ impl Plan {
                 return Err(TransitionDefect::BarrierGone { barrier: *key });
             };
             let outputs = self.variables_of(now);
-            if let Some(var) = vars.iter().find(|var| !outputs.contains(*var)) {
+            // An export a lifting rule moved above the barrier: the variable
+            // is produced there now, and the consumer still sees it.
+            let lifted = |var: &str| {
+                self.lifted_exports.iter().any(|lifted| {
+                    lifted.barrier == *key
+                        && lifted.var == var
+                        && self
+                            .resolve(lifted.producer)
+                            .is_some_and(|producer| self.variables_of(producer).contains(var))
+                })
+            };
+            if let Some(var) = vars
+                .iter()
+                .find(|var| !outputs.contains(*var) && !lifted(var))
+            {
                 return Err(TransitionDefect::ExportDropped {
                     barrier: *key,
                     var: var.clone(),
@@ -960,8 +983,27 @@ impl Plan {
 /// A rule's edit dropped an export its consumers demanded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionDefect {
-    BarrierGone { barrier: NodeKey },
-    ExportDropped { barrier: NodeKey, var: String },
+    BarrierGone {
+        barrier: NodeKey,
+    },
+    ExportDropped {
+        barrier: NodeKey,
+        var: String,
+    },
+    /// A lifting rule (R1–R3) whose application did not lower the progress
+    /// measure Φ = (islands, engine barrier depth, query modifiers above the
+    /// engine): the argument that the rules terminate, failed.
+    NoProgress {
+        before: (usize, usize, usize),
+        after: (usize, usize, usize),
+    },
+    /// The ordinal is out of scope at a node between the statement that
+    /// numbers the rows and the sort that restores their order: a
+    /// projection dropped it before it was consumed.
+    OrdinalLost {
+        node: NodeKey,
+        var: String,
+    },
 }
 
 impl std::fmt::Display for TransitionDefect {
@@ -974,6 +1016,16 @@ impl std::fmt::Display for TransitionDefect {
             Self::ExportDropped { barrier, var } => write!(
                 f,
                 "barrier {barrier} no longer outputs ?{var}, which a consumer demanded before the edit"
+            ),
+            Self::NoProgress { before, after } => write!(
+                f,
+                "the progress measure did not drop: {before:?} → {after:?} (islands, engine \
+                 barrier depth, query modifiers above the engine)"
+            ),
+            Self::OrdinalLost { node, var } => write!(
+                f,
+                "?{var} is out of scope at {node}, between the statement that numbers the rows \
+                 and the sort that restores their order"
             ),
         }
     }
@@ -1360,16 +1412,26 @@ impl Plan {
                 let Some(barrier) = self.resolve(origin) else {
                     return Err(ScopeDefect::EvidenceLost { key: origin });
                 };
-                let allowed = if matches!(self.nodes[barrier].op, PlanOp::SubSelect { .. }) {
-                    scopes[id] == Some(barrier)
-                        || scopes[id].is_some_and(|inner| self.feeds(inner, barrier))
-                        || crate::sparql_rules::consumers_of(self, barrier).contains(&id)
-                } else {
-                    // The scope was dissolved into the one its successor is
-                    // in.
-                    scopes[id] == scopes[barrier]
-                        || scopes[id].is_some_and(|inner| self.feeds(inner, barrier))
-                };
+                // Moved one scope up by a rule, and still one step up: the
+                // node that claims it now combines the scope it was raised
+                // in (below its left input) with the outside.
+                let transferred = self.transfers.iter().any(|transfer| {
+                    transfer.obligation == *claim
+                        && self.resolve(transfer.via) == Some(id)
+                        && matches!(&self.nodes[id].op,
+                            PlanOp::LeftJoin { left, .. } if self.feeds(barrier, *left))
+                });
+                let allowed = transferred
+                    || if matches!(self.nodes[barrier].op, PlanOp::SubSelect { .. }) {
+                        scopes[id] == Some(barrier)
+                            || scopes[id].is_some_and(|inner| self.feeds(inner, barrier))
+                            || crate::sparql_rules::consumers_of(self, barrier).contains(&id)
+                    } else {
+                        // The scope was dissolved into the one its successor is
+                        // in.
+                        scopes[id] == scopes[barrier]
+                            || scopes[id].is_some_and(|inner| self.feeds(inner, barrier))
+                    };
                 if !allowed {
                     return Err(ScopeDefect::ObligationLeftItsScope {
                         node: id,

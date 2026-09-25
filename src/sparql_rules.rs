@@ -77,6 +77,13 @@ pub trait Rule {
     /// A rule that cannot fire must leave the plan untouched and return
     /// `false`, or the driver never reaches a fixpoint.
     fn apply(&self, plan: &mut Plan) -> bool;
+    /// Whether every application must lower the progress measure of
+    /// `crate::sparql_lift` -- the lifting rules R1–R3, whose termination
+    /// argument is that measure rather than the monotonicity the tier-one
+    /// rules have.
+    fn measured(&self) -> bool {
+        false
+    }
 }
 
 /// How many passes over the rule list the driver will make.
@@ -149,18 +156,47 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
         // not fire did not edit, so the record taken before it still
         // describes the plan the next rule sees. Re-taken after every edit.
         let mut kept = plan.kept_exports();
+        // Φ of the plan as it stands, computed only when a measured rule
+        // asks and forgotten whenever any rule edits the plan.
+        let mut phi: Option<(usize, usize, usize)> = None;
         for rule in rules {
+            let before = if rule.measured() {
+                Some(*phi.get_or_insert_with(|| crate::sparql_lift::progress(plan)))
+            } else {
+                None
+            };
             if rule.apply(plan) {
+                phi = None;
                 changed = true;
                 log.applied.push(rule.name());
-                if let Err(defect) = plan.check_transition(&kept) {
-                    return Err(RuleFailure {
+                let fail = |defect, log| {
+                    Err(RuleFailure {
                         defect: crate::sparql_refine::PlanDefect::Transition {
                             rule: rule.name(),
                             defect,
                         },
                         log,
-                    });
+                    })
+                };
+                if let Err(defect) = plan.check_transition(&kept) {
+                    return fail(defect, log);
+                }
+                // The lifting rules' termination argument, checked per
+                // application: Φ drops strictly, lexicographically.
+                if let Some(before) = before {
+                    let after = crate::sparql_lift::progress(plan);
+                    if after >= before {
+                        return fail(
+                            crate::sparql_scopes::TransitionDefect::NoProgress { before, after },
+                            log,
+                        );
+                    }
+                    phi = Some(after);
+                }
+                // After every application, whoever made it: a rule that
+                // builds a projection as a keep list drops the ordinal.
+                if let Err(defect) = crate::sparql_lift::ordinal_reaches_its_sort(plan) {
+                    return fail(defect, log);
                 }
                 kept = plan.kept_exports();
                 debug_assert!(
@@ -2367,6 +2403,7 @@ pub(crate) fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
                 | PlanOp::Unnest { .. }
                 | PlanOp::Construct { .. }
                 | PlanOp::Describe { .. }
+                | PlanOp::Number { .. }
                 | PlanOp::Ask { .. } => false,
             }
     })
@@ -4013,7 +4050,13 @@ impl<'s> PushGrouping<'s> {
     /// element's blank node. It is representable and never serialisable
     /// (design, *What may cross a relation*, parts 1 and 3), so the query's
     /// own projection asks with `serialise` and declines it.
-    fn key_is_readable(&self, plan: &Plan, input: NodeId, key: &str, serialise: bool) -> bool {
+    pub(crate) fn key_is_readable(
+        &self,
+        plan: &Plan,
+        input: NodeId,
+        key: &str,
+        serialise: bool,
+    ) -> bool {
         let visible = Visible::below(plan, input);
         if let Some(binding) = visible.slot_of(key) {
             if !matches!(
@@ -4056,8 +4099,15 @@ impl<'s> PushGrouping<'s> {
             return true;
         }
         // Or a column a pushed relation below exports.
-        visible.relation_of(key).is_some()
-            && crate::sparql_scopes::representable(self.schema, plan, input, key, serialise)
+        if visible.relation_of(key).is_some() {
+            return crate::sparql_scopes::representable(self.schema, plan, input, key, serialise);
+        }
+        // Or a column of a constant table the statement joins (M1): one kind
+        // of term per column, so it both represents and serialises.
+        matches!(
+            crate::sparql_scopes::resolve_terms(plan.term_of(self.schema, input, key)),
+            Some(crate::sparql_scopes::TermOf::Constant { .. })
+        )
     }
 
     /// Whether an aggregate is one a grouped statement can compute, and its
@@ -4772,7 +4822,7 @@ fn projection_tail(plan: &Plan, scope: Option<NodeId>) -> Option<ProjectionTail>
                 vars = Some(projected.clone());
                 *input
             }
-            PlanOp::Sort { input, terms } => {
+            PlanOp::Sort { input, terms, .. } => {
                 sorts.extend(terms.iter().cloned());
                 *input
             }
@@ -4990,12 +5040,17 @@ pub fn tier_one_rules<'a>(
 /// guard)`, for the `declined` section of a printout. A rule's match
 /// succeeded there and one of its guards stopped it; the guard is named in
 /// the words of the design that states it.
-pub fn declined(plan: &Plan, schema: &SchemaView) -> Vec<(&'static str, NodeId, String)> {
+pub fn declined(
+    plan: &Plan,
+    schema: &SchemaView,
+    schema_graph_iri: Option<&str>,
+) -> Vec<(&'static str, NodeId, String)> {
     let mut out = Vec::new();
     let lower = crate::sparql_constant::LowerConstantRelation::new(schema);
     for (node, why) in lower.declined(plan) {
         out.push((lower.name(), node, why));
     }
+    out.extend(crate::sparql_lift::declined(plan, schema, schema_graph_iri));
     out
 }
 

@@ -1145,6 +1145,28 @@ pub fn lower_refined_with(
     schema: &linkml_schemaview::schemaview::SchemaView,
     bounds: &FetchBounds,
 ) -> Result<OpTree, LoweringRefusal> {
+    lower_island(plan, schema, bounds, false)
+}
+
+/// The statement of a plan whose engine region finishes over the
+/// statement's *rows* (`Refinement::UsedRows`): the SQL island lowered as
+/// an answer -- its conditions enforce, its fan-outs are kept, and no fetch
+/// bound is added -- because its rows are solutions the engine reads as
+/// they are, not records it re-runs the query over.
+pub fn lower_rows_statement(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    bounds: &FetchBounds,
+) -> Result<OpTree, LoweringRefusal> {
+    lower_island(plan, schema, bounds, true)
+}
+
+fn lower_island(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    bounds: &FetchBounds,
+    answers_rows: bool,
+) -> Result<OpTree, LoweringRefusal> {
     use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
     let fetch_bound = bounds.limit;
     let unioned_fetch_bound = bounds.limit_if_unioned;
@@ -1269,7 +1291,7 @@ pub fn lower_refined_with(
     // A pass that answers the query enforces its filters; one that feeds the
     // engine only narrows. The refined plan says which by whether anything
     // above the frontier is left.
-    let enforcement = if plan.nodes.len() == sql.len() {
+    let enforcement = if answers_rows || plan.nodes.len() == sql.len() {
         Enforcement::Enforces
     } else {
         Enforcement::Narrows
@@ -1436,7 +1458,9 @@ pub fn lower_refined_with(
     // against the *query*, which is the thing that decides how many rows an
     // answer can need, rather than against whatever the other planner
     // happened to compute.
-    if let Some(bound) = fetch_bound {
+    if enforcement == Enforcement::Narrows
+        && let Some(bound) = fetch_bound
+    {
         let demanded = plan.obligations.iter().find_map(|obligation| {
             match obligation {
                 crate::sparql_plan::Obligation::Slice { limit, offset } => {
@@ -1560,6 +1584,8 @@ impl Lowering<'_> {
                 path: Vec::new(),
                 column: Some(column.var.clone()),
             },
+            // A witness is never a key: it is a fresh name nothing else binds.
+            Column::Witness { .. } => return None,
         })
     }
 
@@ -2837,7 +2863,15 @@ impl Lowering<'_> {
         var: &str,
         name: &str,
     ) -> Option<crate::sparql_pushdown::BindingSpec> {
-        match self.scanned_column(node, var)? {
+        self.binding_of_column(self.scanned_column(node, var)?, name)
+    }
+
+    fn binding_of_column(
+        &self,
+        column: Column,
+        name: &str,
+    ) -> Option<crate::sparql_pushdown::BindingSpec> {
+        match column {
             Column::Star {
                 star_var,
                 class_uri,
@@ -2853,6 +2887,50 @@ impl Lowering<'_> {
                     .unwrap_or_else(crate::sparql_terms::TermDescriptor::subject_iri),
                 column.descriptor.is_none(),
             )),
+            Column::Witness { anchor } => {
+                let mut binding = self.binding_of_column(*anchor, name)?;
+                binding.witness = true;
+                binding.occurrence = false;
+                binding.descriptor = crate::sparql_terms::TermDescriptor {
+                    kind: crate::sparql_terms::TermKind::Literal,
+                    datatype: Some("http://www.w3.org/2001/XMLSchema#boolean".to_owned()),
+                    lang: None,
+                    enum_map: Vec::new(),
+                    numeric: false,
+                };
+                Some(binding)
+            }
+        }
+    }
+
+    /// The column a left join's witness is read off: one of its right
+    /// side's that is non-`NULL` exactly on a joined row -- the right side's
+    /// key column for a keyed join (bound on both sides of a match, by the
+    /// key's own precondition), the right star's identity for a reference
+    /// edge. `None` for a join with no such column (a cross join).
+    fn witness_anchor(&self, join: usize) -> Option<Column> {
+        use crate::sparql_refine::{JoinKey as PlanKey, PlanOp as RefinedOp};
+        let RefinedOp::LeftJoin {
+            right,
+            key,
+            reference,
+            ..
+        } = &self.plan.nodes[join].op
+        else {
+            return None;
+        };
+        match (key, reference) {
+            (Some(PlanKey::Identity { var, .. } | PlanKey::Value { var, .. }), _) => {
+                self.scanned_column(*right, var)
+            }
+            (None, Some(edge)) => [&edge.holder, &edge.referenced]
+                .into_iter()
+                .find_map(|star| match self.scanned_column(*right, star)? {
+                    column @ Column::Star { .. } => Some(column),
+                    _ => None,
+                })
+                .filter(|column| matches!(column, Column::Star { path, .. } if path.is_empty())),
+            _ => None,
         }
     }
 
@@ -2983,6 +3061,20 @@ impl Lowering<'_> {
                 continue;
             }
             match &scan.op {
+                // A left join's match witness, which only that join binds.
+                RefinedOp::LeftJoin {
+                    witness: Some(witness),
+                    ..
+                } if witness == var => {
+                    let anchor = self.witness_anchor(id)?;
+                    candidates.push((
+                        optional_side(id),
+                        0,
+                        Column::Witness {
+                            anchor: Box::new(anchor),
+                        },
+                    ));
+                }
                 RefinedOp::Scan {
                     star_var,
                     class_uri,
@@ -3151,6 +3243,10 @@ enum Column {
         alias: String,
         column: Box<RelationColumn>,
     },
+    /// A left join's match witness, read off `anchor`: a column of the
+    /// join's right side that is non-`NULL` on every row the right side
+    /// joined.
+    Witness { anchor: Box<Column> },
 }
 
 /// A binding for a value at a path: a term, or -- when the path ends in an
@@ -4069,8 +4165,11 @@ mod tests {
     /// test about the fetch -- the pass an engine finishes -- needs one
     /// construct the statement cannot take. A `REGEX` is that: it stays with
     /// the engine, every pushable conjunct sinks below it, and the rows the
-    /// statement returns are a narrowing again.
-    const KEEP_A_FETCH: &str = " FILTER(REGEX(STR(?s), \"^x\"))";
+    /// statement returns are a narrowing again. And since the engine can
+    /// finish over a statement's *rows* where its region reads nothing but
+    /// them (`Refinement::UsedRows`), the fetch also needs a region that
+    /// reads instance data: an `EXISTS` does, whatever its pattern.
+    const KEEP_A_FETCH: &str = " FILTER(REGEX(STR(?s), \"^x\")) FILTER(EXISTS { })";
 
     /// A condition on a multivalued slot is a test over the array's elements,
     /// and the operator has to say so.

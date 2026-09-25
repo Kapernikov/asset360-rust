@@ -236,3 +236,37 @@ pub fn probe_sequence(turtle: &str, query: &str) -> Vec<BTreeMap<String, String>
         crate::sparql_scoper::parse_query(query).unwrap(),
     )
 }
+
+impl Oracle {
+    /// The answer as SPARQL Query Results JSON rows, in evaluation order:
+    /// what a statement's rows look like to `sparql_finish`, and what its
+    /// answer is compared against.
+    pub fn json_rows(&self, query: spargebra::Query) -> (Vec<String>, Vec<serde_json::Value>) {
+        let results = crate::sparql_executor::geosparql_evaluator()
+            .for_query(query.clone())
+            .on_store(&self.store)
+            .execute()
+            .unwrap_or_else(|e| panic!("{e}\n{query}"));
+        let QueryResults::Solutions(solutions) = results else {
+            panic!("expected solutions for {query}");
+        };
+        let vars: Vec<String> = solutions
+            .variables()
+            .iter()
+            .map(|v| v.as_str().to_owned())
+            .collect();
+        let rows = solutions
+            .map(|solution| {
+                let solution = solution.unwrap();
+                let mut row = serde_json::Map::new();
+                for var in &vars {
+                    if let Some(term) = solution.get(var.as_str()) {
+                        row.insert(var.clone(), crate::sparql_executor::term_to_json(term));
+                    }
+                }
+                serde_json::Value::Object(row)
+            })
+            .collect();
+        (vars, rows)
+    }
+}

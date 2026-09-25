@@ -278,6 +278,7 @@ fn join_sides(plan: &Plan, join: NodeId) -> Result<(NodeId, NodeId, NodeId, bool
             reference: None,
             key: None | Some(JoinKey::Value { .. }),
             condition,
+            ..
         } => {
             let Some(table) = table_under(plan, *right) else {
                 return Err(if table_under(plan, *left).is_some() {
@@ -795,7 +796,7 @@ pub(crate) mod tests {
         let rules = rules(schema);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
-        crate::sparql_plan::with_declined(&plan, schema)
+        crate::sparql_plan::with_declined(&plan, schema, None)
     }
 
     fn lowered_tables(plan: &Plan) -> usize {
@@ -999,7 +1000,7 @@ pub(crate) mod tests {
             *condition = Some(crate::sparql_refine::Expr::Var("s".to_owned()));
         }
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
-        let refined = crate::sparql_plan::with_declined(&plan, &schema);
+        let refined = crate::sparql_plan::with_declined(&plan, &schema, None);
         assert!(
             refined.contains("K6: the left join carries a condition"),
             "{refined}"

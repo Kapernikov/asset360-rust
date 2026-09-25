@@ -61,6 +61,16 @@ pub fn plan_to_query(plan: &Plan, schema: &SchemaView) -> Option<Query> {
     })
 }
 
+/// A left join's right side with its match witness: `BIND(true AS ?m)`
+/// appended, so `?m` is bound exactly where the right side matched.
+pub fn with_witness(right: GraphPattern, witness: &str) -> GraphPattern {
+    GraphPattern::Extend {
+        inner: Box::new(right),
+        variable: Variable::new_unchecked(witness.to_owned()),
+        expression: Expression::Literal(spargebra::term::Literal::from(true)),
+    }
+}
+
 /// The algebra of the subtree rooted at `node`.
 pub fn plan_to_algebra(plan: &Plan, schema: &SchemaView, node: NodeId) -> Option<GraphPattern> {
     let mut translation = Translation {
@@ -183,11 +193,16 @@ impl Translation<'_> {
                 right,
                 condition,
                 reference,
+                witness,
                 ..
             } => {
                 let left = self.pattern(*left)?;
                 let right = self.pattern(*right)?;
                 let right = self.with_edge(right, reference.as_ref(), node)?;
+                let right = match witness {
+                    Some(witness) => with_witness(right, witness),
+                    None => right,
+                };
                 let expression = match condition {
                     Some(condition) => Some(self.expression(condition, node)?),
                     None => None,
@@ -257,7 +272,7 @@ impl Translation<'_> {
                 }
                 pattern
             }
-            PlanOp::Sort { input, terms } => {
+            PlanOp::Sort { input, terms, .. } => {
                 let inner = self.pattern(*input)?;
                 let mut expression = Vec::with_capacity(terms.len());
                 for term in terms {
@@ -529,7 +544,11 @@ impl Translation<'_> {
                 }
                 pattern
             }
+            // Row numbering has no algebra: the finish query reads the
+            // ordinal as a column of the rows it is handed, never computes
+            // it (see `crate::sparql_lift`).
             PlanOp::Service { .. }
+            | PlanOp::Number { .. }
             | PlanOp::Construct { .. }
             | PlanOp::Describe { .. }
             | PlanOp::Ask { .. } => return None,

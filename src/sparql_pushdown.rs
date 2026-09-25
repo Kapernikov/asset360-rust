@@ -66,6 +66,12 @@ pub struct BindingSpec {
     /// ordinal. Representable and never serialisable; `descriptor` is a
     /// placeholder for it.
     pub occurrence: bool,
+    /// Whether the column is a left join's **match witness** rather than
+    /// the value it reads: `true` exactly where the column is non-`NULL`
+    /// -- `CASE WHEN <column> IS NULL THEN NULL ELSE 'true' END` -- read off
+    /// a column of the join's right side that is non-`NULL` on every joined
+    /// row (its identity, or its key). `descriptor` is `xsd:boolean`.
+    pub witness: bool,
 }
 
 /// How one step of a path is stored, mirroring the schema's own three-way
@@ -374,6 +380,7 @@ pub(crate) fn binding_spec(
         descriptor,
         relation: None,
         occurrence: false,
+        witness: false,
     })
 }
 
@@ -410,6 +417,7 @@ pub(crate) fn occurrence_spec(
         descriptor: TermDescriptor::subject_iri(),
         relation: None,
         occurrence: true,
+        witness: false,
     })
 }
 
@@ -430,5 +438,6 @@ pub(crate) fn relation_spec(
         descriptor,
         relation: Some(alias.to_owned()),
         occurrence,
+        witness: false,
     }
 }

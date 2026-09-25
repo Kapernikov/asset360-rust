@@ -276,6 +276,7 @@ fn expressions_of(op: &PlanOp) -> Vec<&crate::sparql_refine::Expr> {
         | PlanOp::Unnest { .. }
         | PlanOp::Construct { .. }
         | PlanOp::Describe { .. }
+        | PlanOp::Number { .. }
         | PlanOp::Ask { .. } => Vec::new(),
     }
 }
@@ -419,12 +420,35 @@ fn aggregate_evaluates_the_same_out_of_context(
 pub fn materialisable_root(plan: &Plan, pass: &dyn Materialisation) -> Option<NodeId> {
     (0..plan.nodes.len()).rev().find(|&node| {
         !matches!(plan.nodes[node].op, PlanOp::Values { .. })
+            // A region already placed in SQL is a relation the statement
+            // joins (a constant table M1 lowered, with its barrier):
+            // re-evaluating it would hand the engine back what SQL holds.
+            && subtree(plan, node)
+                .iter()
+                .all(|id| plan.nodes[*id].executor == crate::sparql_refine::Executor::Engine)
+            // And a region that is only barriers over a table already *is*
+            // the relation it would evaluate to: nothing to evaluate.
+            && !is_a_table_already(plan, node)
             && plan.nodes[node].output == crate::sparql_refine::OutputKind::Solutions
             && is_an_evaluable_region(plan, node, pass)
             && is_the_top_of_its_region(plan, node, pass)
             && subtree_is_private(plan, node)
             && nothing_is_still_sinking_into_it(plan, node)
     })
+}
+
+/// Whether the subtree at `node` is a `Values` under nothing but
+/// `OPTIONAL`-body barriers: already the relation evaluation would produce.
+fn is_a_table_already(plan: &Plan, node: NodeId) -> bool {
+    match &plan.nodes[node].op {
+        PlanOp::Values { .. } => true,
+        PlanOp::SubSelect {
+            input,
+            domain: None,
+            ..
+        } => is_a_table_already(plan, *input),
+        _ => false,
+    }
 }
 
 /// Whether a filter above this subplan is still on its way *into* it.
@@ -588,10 +612,16 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
             left,
             right,
             condition,
+            witness,
             ..
         } => GraphPattern::LeftJoin {
             left: child(left)?,
-            right: child(right)?,
+            right: match witness {
+                Some(witness) => {
+                    Box::new(crate::sparql_algebra::with_witness(*child(right)?, witness))
+                }
+                None => child(right)?,
+            },
             expression: match condition {
                 Some(condition) => Some(condition.try_as_expression()?),
                 None => None,
@@ -648,7 +678,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
             }
             pattern
         }
-        PlanOp::Sort { input, terms } => GraphPattern::OrderBy {
+        PlanOp::Sort { input, terms, .. } => GraphPattern::OrderBy {
             inner: child(input)?,
             expression: terms
                 .iter()
@@ -697,6 +727,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
         PlanOp::Service { .. }
         | PlanOp::Scan { .. }
         | PlanOp::Unnest { .. }
+        | PlanOp::Number { .. }
         | PlanOp::Construct { .. }
         | PlanOp::Describe { .. }
         | PlanOp::Ask { .. } => return None,

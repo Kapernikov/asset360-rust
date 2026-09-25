@@ -292,6 +292,7 @@ impl Rule for PushJoinOnIdentity<'_> {
                     reference: None,
                     key: None,
                     condition: None,
+                    ..
                 } => {
                     let on: Vec<String> = plan
                         .variables_of(*left)
