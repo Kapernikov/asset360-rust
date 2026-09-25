@@ -975,6 +975,14 @@ impl Plan {
                         | PlanOp::Filter { .. }
                         | PlanOp::LeftJoin { .. }
                         | PlanOp::SubSelect { domain: None, .. }
+                ) || (
+                    // A constant table M1 lowered, left-joined in the body:
+                    // flat, `B LEFT JOIN c ON b.k = c.k` reads `B` alone, so
+                    // where `B` is missing `c` is too -- the nested left
+                    // join's argument (#463), for a table instead of a star.
+                    // An inner join to one is a `Join`, which is not here.
+                    matches!(self.nodes[id].op, PlanOp::Values { .. })
+                        && self.nodes[id].executor == Executor::Sql
                 )
             })
     }
@@ -993,9 +1001,10 @@ pub enum TransitionDefect {
     /// A lifting rule (R1–R3) whose application did not lower the progress
     /// measure Φ = (islands, engine barrier depth, query modifiers above the
     /// engine): the argument that the rules terminate, failed.
+    /// `[before, after]`, boxed: the measure is four numbers twice, and a
+    /// defect travels by value through every rule application.
     NoProgress {
-        before: (usize, usize, usize),
-        after: (usize, usize, usize),
+        measures: Box<[(usize, usize, usize, usize); 2]>,
     },
     /// The ordinal is out of scope at a node between the statement that
     /// numbers the rows and the sort that restores their order: a
@@ -1017,10 +1026,11 @@ impl std::fmt::Display for TransitionDefect {
                 f,
                 "barrier {barrier} no longer outputs ?{var}, which a consumer demanded before the edit"
             ),
-            Self::NoProgress { before, after } => write!(
+            Self::NoProgress { measures } => write!(
                 f,
-                "the progress measure did not drop: {before:?} → {after:?} (islands, engine \
-                 barrier depth, query modifiers above the engine)"
+                "the progress measure did not drop: {:?} → {:?} (islands, engine \
+                 barrier depth, query modifiers above the engine, joins above engine work)",
+                measures[0], measures[1]
             ),
             Self::OrdinalLost { node, var } => write!(
                 f,

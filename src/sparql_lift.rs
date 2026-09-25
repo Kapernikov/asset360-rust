@@ -46,6 +46,7 @@ use crate::sparql_rules::Rule;
 pub const R1: &str = "lift_optional_right_side";
 pub const R2: &str = "lift_optional_extension";
 pub const R3: &str = "page_below_one_to_one";
+pub const R4: &str = "lift_extension_over_join";
 
 // ---------------------------------------------------------------------------
 // Facts shared by the rules
@@ -234,8 +235,8 @@ fn bookkeeping(op: &PlanOp) -> bool {
     )
 }
 
-/// **Φ = (I, D, S)**, compared lexicographically, which every application
-/// of R1–R3 lowers strictly:
+/// **Φ = (I, D, S, J)**, compared lexicographically, which every
+/// application of R1–R4 lowers strictly:
 ///
 /// * `I`, the number of SQL islands (an SQL node no SQL node reads roots
 ///   one);
@@ -246,14 +247,19 @@ fn bookkeeping(op: &PlanOp) -> bool {
 ///   witness-dropping projection, and counting it would charge the rule for
 ///   its own bookkeeping;
 /// * `S`, the number of the query's own `Sort` and `Slice` nodes the engine
-///   evaluates.
+///   evaluates;
+/// * `J`, the sum over the same evaluating engine nodes of the number of
+///   joins and left joins above each -- how many joins engine work keeps
+///   in the engine. The fourth component is not the design's: it is what
+///   [`LiftExtensionOverJoin`] lowers, the lift the integration found the
+///   design's composition needed (see there).
 ///
 /// R2 moves one `Bind` up one barrier (`D` − 1); R1 moves `C` up a barrier
 /// and removes the inner left join (`D` − 2 at least); R3 moves the query's
-/// `Sort`/`Slice` into the statement (`S` − 1 or − 2). `Φ` lives in ℕ³,
-/// which is well-ordered lexicographically, so the rules fire finitely
-/// often.
-pub fn progress(plan: &Plan) -> (usize, usize, usize) {
+/// `Sort`/`Slice` into the statement (`S` − 1 or − 2); R4 moves a `Bind`
+/// above one join (`J` − 1). `Φ` lives in ℕ⁴, which is well-ordered
+/// lexicographically, so the rules fire finitely often.
+pub fn progress(plan: &Plan) -> (usize, usize, usize, usize) {
     let islands = (0..plan.nodes.len())
         .filter(|id| {
             plan.nodes[*id].executor == Executor::Sql
@@ -262,23 +268,32 @@ pub fn progress(plan: &Plan) -> (usize, usize, usize) {
                     .any(|consumer| plan.nodes[*consumer].executor == Executor::Sql)
         })
         .count();
+    let evaluating = |id: NodeId| {
+        plan.nodes[id].executor == Executor::Engine && !bookkeeping(&plan.nodes[id].op)
+    };
     let mut depth = 0usize;
-    for (barrier, node) in plan.nodes.iter().enumerate() {
-        let PlanOp::SubSelect {
-            input,
-            domain: None,
-            ..
-        } = &node.op
-        else {
-            continue;
-        };
-        let _ = barrier;
-        depth += subtree(plan, *input)
-            .into_iter()
-            .filter(|id| {
-                plan.nodes[*id].executor == Executor::Engine && !bookkeeping(&plan.nodes[*id].op)
-            })
-            .count();
+    let mut under_joins = 0usize;
+    for node in &plan.nodes {
+        match &node.op {
+            PlanOp::SubSelect {
+                input,
+                domain: None,
+                ..
+            } => {
+                depth += subtree(plan, *input)
+                    .into_iter()
+                    .filter(|id| evaluating(*id))
+                    .count();
+            }
+            PlanOp::Join { left, right, .. } | PlanOp::LeftJoin { left, right, .. } => {
+                let below: BTreeSet<NodeId> = subtree(plan, *left)
+                    .into_iter()
+                    .chain(subtree(plan, *right))
+                    .collect();
+                under_joins += below.into_iter().filter(|id| evaluating(*id)).count();
+            }
+            _ => {}
+        }
     }
     let modifiers = plan
         .nodes
@@ -294,7 +309,7 @@ pub fn progress(plan: &Plan) -> (usize, usize, usize) {
                 )
         })
         .count();
-    (islands, depth, modifiers)
+    (islands, depth, modifiers, under_joins)
 }
 
 /// **The ordinal reaches its sort.** For every [`PlanOp::Number`], each node
@@ -722,12 +737,19 @@ impl Rule for LiftOptionalExtension {
 /// scope up, to the new join: recorded as a [`ScopeTransfer`], which *an
 /// obligation stays in its scope* validates.
 pub struct LiftOptionalRightSide<'a> {
+    schema: &'a linkml_schemaview::schemaview::SchemaView,
     schema_graph_iri: Option<&'a str>,
 }
 
 impl<'a> LiftOptionalRightSide<'a> {
-    pub fn new(schema_graph_iri: Option<&'a str>) -> Self {
-        Self { schema_graph_iri }
+    pub fn new(
+        schema: &'a linkml_schemaview::schemaview::SchemaView,
+        schema_graph_iri: Option<&'a str>,
+    ) -> Self {
+        Self {
+            schema,
+            schema_graph_iri,
+        }
     }
 }
 
@@ -776,6 +798,13 @@ impl LiftOptionalRightSide<'_> {
             return None;
         }
         let (a, barrier, b, c) = (*left, *right, *b, *c);
+        // A table M1 can lower is M1's: an SQL join is cheaper than an
+        // engine one over every row, and R1 is for what M1 declines.
+        if crate::sparql_constant::table_under(plan, c).is_some()
+            && crate::sparql_constant::key_facts(self.schema, plan, inner).is_ok()
+        {
+            return None;
+        }
         let c_nodes = subtree(plan, c);
         // Engine-only: every node of `C` is the engine's. A side with SQL
         // in it is not R1's -- lifting it would split that island.
@@ -987,6 +1016,276 @@ impl Rule for LiftOptionalRightSide<'_> {
              by B; condition and C effect-free; witness ?{witness}{}",
             lifted_key.reference(),
             if reused { " (reused)" } else { "" }
+        ));
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R4: an extension moves above a join it does not affect
+// ---------------------------------------------------------------------------
+
+/// **R4** -- not one of the design's three, and the reason is on this doc.
+/// `J(π?(Extend(X, ?x, e)), C)` → `π'?(Extend(J(X, C), ?x, e))`, for `J` a
+/// join or a left join with the extension on its preserved side.
+///
+/// **Why it exists.** R2 lifts a `BIND` out of its `OPTIONAL` to *directly
+/// above* the left join. In the #494 query fifteen more `OPTIONAL`s sit above
+/// that one, and each left join's preserved side is now the engine's lifted
+/// `BIND`, so none of them can be pushed and the SQL part stays fifteen
+/// islands. The design's worked example assumed the `BIND` reached the top;
+/// its three rules do not take it there. This rule does, one join at a time,
+/// and nothing about it is specific to that query: it is the classic
+/// extension pull-up.
+///
+/// **Match.** An engine join or left join whose (preserved) input is an
+/// engine `Bind` -- or an engine `Project` directly over one, R2's
+/// witness-dropping projection -- over an SQL `X`.
+///
+/// **Guards.** **H1** `?x ∉ scope(C)`: a `C` that binds `?x` joins on it.
+/// **H2** `e` holds no `EXISTS` and `vars(e) ∩ scope(C) ⊆ bound(X)`: `C`
+/// cannot supply an input `e` did not have. **H3** `e` is effect-free: it is
+/// evaluated once per joined row instead of once per row of `X`. **H4** the
+/// join's condition reads neither `?x` nor a pattern. **H5** what the
+/// projection drops is neither in `scope(C)` nor read by the condition.
+/// **H6** `X` is SQL: the lift exists to let the join be pushed.
+///
+/// **Equivalence.** Fix a row `x` of `X`, extended to `x' = x ⊕ {?x ↦
+/// e(x)}` (or `x` where `e` errors). By H1, `c ~ x'` iff `c ~ x`, and the
+/// merge is `x ⊕ c` extended. By H4 the condition takes the same value
+/// either way. By H2 every variable of `e` that `c` could bind is already
+/// bound in `x` with the same term, so `e(x ⊕ c) = e(x)` in inputs, and by
+/// H3 in value. An unmatched `x` of a left join is kept alone on both sides
+/// and extended once. Multiplicity: one row per compatible `(x, c)`, or one.
+/// The projection commutes by H5: what it drops is not compared by the join.
+pub struct LiftExtensionOverJoin;
+
+struct R4Match {
+    join: NodeId,
+    /// The join's input the extension is: the `Bind`, or the projection over
+    /// it.
+    side: NodeId,
+    projection: Option<NodeId>,
+    bind: NodeId,
+    x: NodeId,
+    var: String,
+    expr: Expr,
+}
+
+impl LiftExtensionOverJoin {
+    fn candidate(plan: &Plan, join: NodeId) -> Option<Result<R4Match, String>> {
+        let node = &plan.nodes[join];
+        if node.executor != Executor::Engine {
+            return None;
+        }
+        let (sides, condition): (Vec<(NodeId, NodeId)>, Option<&Expr>) = match &node.op {
+            PlanOp::Join {
+                left,
+                right,
+                reference: None,
+                key: None,
+                ..
+            } => (vec![(*left, *right), (*right, *left)], None),
+            PlanOp::LeftJoin {
+                left,
+                right,
+                reference: None,
+                key: None,
+                condition,
+                ..
+            } => (vec![(*left, *right)], condition.as_ref()),
+            _ => return None,
+        };
+        let (side, c, projection, bind) = sides.into_iter().find_map(|(side, c)| {
+            if plan.nodes[side].executor != Executor::Engine {
+                return None;
+            }
+            match &plan.nodes[side].op {
+                PlanOp::Bind { .. } => Some((side, c, None, side)),
+                PlanOp::Project { input, .. }
+                    if matches!(plan.nodes[*input].op, PlanOp::Bind { .. })
+                        && plan.nodes[*input].executor == Executor::Engine =>
+                {
+                    Some((side, c, Some(side), *input))
+                }
+                _ => None,
+            }
+        })?;
+        let PlanOp::Bind {
+            input: x,
+            var,
+            expr,
+        } = &plan.nodes[bind].op
+        else {
+            unreachable!("matched a bind");
+        };
+        let x = *x;
+        Some((|| {
+            let scope_c = plan.variables_of(c);
+            if scope_c.contains(var) {
+                return Err(format!("H1: ?{var} is in scope in n{c}"));
+            }
+            if expr.contains_an_opaque_subquery() {
+                return Err("H2: the expression reads a pattern (EXISTS)".to_owned());
+            }
+            let bound_x = plan.definitely_bound_of(x);
+            let supplied: BTreeSet<String> = variables_used(expr)
+                .into_iter()
+                .filter(|used| scope_c.contains(used) && !bound_x.contains(used))
+                .collect();
+            if !supplied.is_empty() {
+                return Err(format!(
+                    "H2: {} in scope in n{c} and not bound in every solution of n{x}",
+                    var_list(&supplied)
+                ));
+            }
+            if !expr.evaluates_the_same_out_of_context() {
+                return Err("H3: the expression is not effect-free".to_owned());
+            }
+            let read_by_condition: BTreeSet<String> = match condition {
+                Some(condition) => {
+                    if condition.contains_an_opaque_subquery() {
+                        return Err("H4: the join's condition reads a pattern (EXISTS)".to_owned());
+                    }
+                    variables_used(condition).into_iter().collect()
+                }
+                None => BTreeSet::new(),
+            };
+            if read_by_condition.contains(var) {
+                return Err(format!("H4: the join's condition reads ?{var}"));
+            }
+            if let Some(projection) = projection {
+                let PlanOp::Project { vars, .. } = &plan.nodes[projection].op else {
+                    unreachable!("matched a projection");
+                };
+                let dropped: BTreeSet<String> = plan
+                    .variables_of(bind)
+                    .into_iter()
+                    .filter(|v| !vars.contains(v))
+                    .collect();
+                let compared: BTreeSet<String> = dropped
+                    .iter()
+                    .filter(|v| scope_c.contains(*v) || read_by_condition.contains(*v))
+                    .cloned()
+                    .collect();
+                if !compared.is_empty() {
+                    return Err(format!(
+                        "H5: the projection n{projection} drops {}, which the join compares",
+                        var_list(&compared)
+                    ));
+                }
+            }
+            if plan.nodes[x].executor != Executor::Sql {
+                return Err(format!("H6: n{x} is not SQL"));
+            }
+            Ok(R4Match {
+                join,
+                side,
+                projection,
+                bind,
+                x,
+                var: var.clone(),
+                expr: expr.clone(),
+            })
+        })())
+    }
+
+    pub fn declined(plan: &Plan) -> Vec<(NodeId, String)> {
+        (0..plan.nodes.len())
+            .filter_map(|join| match Self::candidate(plan, join)? {
+                Err(why) => Some((join, why)),
+                Ok(_) => None,
+            })
+            .collect()
+    }
+}
+
+impl Rule for LiftExtensionOverJoin {
+    fn name(&self) -> &'static str {
+        R4
+    }
+
+    fn measured(&self) -> bool {
+        true
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        let Some(found) =
+            (0..plan.nodes.len()).find_map(|join| Self::candidate(plan, join).and_then(Result::ok))
+        else {
+            return false;
+        };
+        let R4Match {
+            join,
+            side,
+            projection,
+            bind,
+            x,
+            var,
+            expr,
+        } = found;
+        let join_key = plan.key_of(join);
+        let bind_key = plan.key_of(bind);
+        let projection_key = projection.map(|projection| plan.key_of(projection));
+        let bind_claims = plan.nodes[bind].discharges.clone();
+        // What the projection dropped, dropped again above the join: scope
+        // minus what it drops, never a keep list.
+        let dropped: BTreeSet<String> = match projection {
+            Some(projection) => match &plan.nodes[projection].op {
+                PlanOp::Project { vars, .. } => plan
+                    .variables_of(bind)
+                    .into_iter()
+                    .filter(|v| !vars.contains(v))
+                    .collect(),
+                _ => unreachable!("matched a projection"),
+            },
+            None => BTreeSet::new(),
+        };
+        let mut inserted = vec![Node::engine(
+            PlanOp::Bind {
+                input: PREVIOUS,
+                var: var.clone(),
+                expr,
+            },
+            bind_claims,
+        )];
+        if projection.is_some() {
+            let mut scope = plan.variables_of(join);
+            scope.extend(plan.variables_of(bind));
+            for gone in &dropped {
+                scope.remove(gone);
+            }
+            inserted.push(Node::engine(
+                PlanOp::Project {
+                    input: PREVIOUS,
+                    vars: scope.into_iter().collect(),
+                },
+                Vec::new(),
+            ));
+        }
+        let mut removed = vec![(bind, x)];
+        if let Some(projection) = projection {
+            removed.push((projection, x));
+        }
+        let _ = side;
+        let at = apply_edit(
+            plan,
+            Edit {
+                removed,
+                after: join,
+                inserted,
+            },
+        );
+        let lifted_key = plan.key_of(at[0]);
+        plan.retire(bind_key, Some(lifted_key));
+        if let (Some(key), Some(new)) = (projection_key, at.get(1)) {
+            plan.retire(key, Some(plan.key_of(*new)));
+        }
+        plan.rewrites.push(format!(
+            "R4  {}  ?{var} lifted above {}; ?{var} ∉ scope of the other side; its inputs \
+             bound below; effect-free",
+            lifted_key.reference(),
+            join_key.reference(),
         ));
         true
     }
@@ -1427,7 +1726,7 @@ impl Rule for PageBelowOneToOne<'_> {
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        let (_, _, modifiers) = progress(plan);
+        let (_, _, modifiers, _) = progress(plan);
         let order = match (&ordinal, number) {
             (Some(ordinal), Some(number)) => format!(
                 "; ?{ordinal} in scope {} → {}, dropped at {}",
@@ -1467,7 +1766,8 @@ pub fn lifting_rules<'a>(
 ) -> Vec<Box<dyn Rule + 'a>> {
     vec![
         Box::new(LiftOptionalExtension),
-        Box::new(LiftOptionalRightSide::new(schema_graph_iri)),
+        Box::new(LiftOptionalRightSide::new(schema, schema_graph_iri)),
+        Box::new(LiftExtensionOverJoin),
         Box::new(PageBelowOneToOne::new(schema)),
     ]
 }
@@ -1482,8 +1782,11 @@ pub fn declined(
     for (node, why) in LiftOptionalExtension::declined(plan) {
         out.push((R2, node, why));
     }
-    for (node, why) in LiftOptionalRightSide::new(schema_graph_iri).declined(plan) {
+    for (node, why) in LiftOptionalRightSide::new(schema, schema_graph_iri).declined(plan) {
         out.push((R1, node, why));
+    }
+    for (node, why) in LiftExtensionOverJoin::declined(plan) {
+        out.push((R4, node, why));
     }
     for (node, why) in PageBelowOneToOne::new(schema).declined(plan) {
         out.push((R3, node, why));
@@ -2407,5 +2710,89 @@ mod composition {
             &schema,
         );
         assert!(printed.contains("witness ?__m2"), "{printed}");
+    }
+}
+
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod r4 {
+    use super::tests::{PREFIX, as_bag, oracle_rows, printout, rows_route_answer};
+    use crate::sparql_oracle::{fixture, probe};
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    /// The #494 composition in miniature: a `BIND` in one `OPTIONAL` and a
+    /// reference in the next. R2 lifts the `BIND` above its own left join,
+    /// R4 above the next one, and R3 pages the statement; the answer is the
+    /// oracle's.
+    #[test]
+    fn an_extension_climbs_the_left_joins_above_it() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = format!(
+            "{PREFIX}SELECT ?s ?name ?tail ?bg WHERE {{ ?s a asset360:Signal ; asset360:name ?name . \
+             OPTIONAL {{ ?s asset360:locatedOnTrack ?e . \
+             BIND(STRAFTER(STR(?e), \"/track/\") AS ?tail) }} \
+             OPTIONAL {{ ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s }} }} \
+             ORDER BY ?name LIMIT 10"
+        );
+        let refined = printout(&query, &schema);
+        for rule in ["R2  ", "R4  ", "R3  "] {
+            assert!(refined.contains(rule), "{rule}\n{refined}");
+        }
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        assert_eq!(as_bag(&rows), as_bag(&oracle_rows(&query, &oracle)));
+    }
+
+    /// **H2**: the other side supplies an input the extension did not have.
+    #[test]
+    fn an_input_the_other_side_supplies_declines() {
+        assert_ne!(
+            probe(
+                "",
+                "SELECT * { { VALUES ?a {1} BIND(COALESCE(?y, 0) AS ?x) } OPTIONAL { VALUES (?a ?y) {(1 5)} } }"
+            ),
+            probe(
+                "",
+                "SELECT * { VALUES ?a {1} OPTIONAL { VALUES (?a ?y) {(1 5)} } BIND(COALESCE(?y, 0) AS ?x) }"
+            ),
+        );
+        let schema = test_schema_view();
+        let refined = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?tail ?nm2 WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:locatedOnTrack ?e . BIND(COALESCE(?nm2, STR(?e)) AS ?tail) }} \
+                 OPTIONAL {{ ?s asset360:locatedOnTrack ?t2 . ?t2 a asset360:Track ; asset360:hasName ?nm2 }} }}"
+            ),
+            &schema,
+        );
+        assert!(refined.contains("H2: ?nm2 in scope in"), "{refined}");
+    }
+
+    /// **H1** and **H4**: the other side binds the extension's variable, or
+    /// the join's condition reads it.
+    #[test]
+    fn a_join_on_the_extension_declines() {
+        let schema = test_schema_view();
+        let binds = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?tail WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:locatedOnTrack ?e . BIND(STR(?e) AS ?tail) }} \
+                 OPTIONAL {{ ?s asset360:locatedOnTrack ?t2 . ?t2 a asset360:Track ; asset360:hasName ?tail }} }}"
+            ),
+            &schema,
+        );
+        assert!(binds.contains("H1: ?tail is in scope in"), "{binds}");
+        let reads = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?tail ?n2 WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:locatedOnTrack ?e . BIND(STR(?e) AS ?tail) }} \
+                 OPTIONAL {{ ?s asset360:locatedOnTrack ?t2 . ?t2 a asset360:Track ; asset360:hasName ?n2 \
+                 FILTER(?n2 != ?tail) }} }}"
+            ),
+            &schema,
+        );
+        assert!(
+            reads.contains("H4: the join's condition reads ?tail"),
+            "{reads}"
+        );
     }
 }

@@ -569,9 +569,36 @@ impl Translation<'_> {
             return Some(side);
         };
         let class_uri = self.class_of_scan(&edge.holder, at)?;
+        // An element-held edge reads the key off the element the holder's
+        // unnest binds: `?element <slot> ?referenced`, the element's own
+        // triple, where a record's is `?holder <slot> ?referenced`.
+        let (subject, class_uri) = if edge.path.is_empty() {
+            (edge.holder.clone(), class_uri)
+        } else {
+            let element =
+                self.plan
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(id, node)| match &node.op {
+                        PlanOp::Unnest {
+                            star_var,
+                            slot_path,
+                            var,
+                            ..
+                        } if *star_var == edge.holder
+                            && *slot_path == edge.path
+                            && self.plan.feeds(id, at) =>
+                        {
+                            Some(var.clone())
+                        }
+                        _ => None,
+                    })?;
+            (element, self.class_at(&class_uri, &edge.path)?)
+        };
         let predicate = self.predicate(&class_uri, &edge.slot)?;
         let triple = TriplePattern {
-            subject: TermPattern::Variable(Variable::new_unchecked(edge.holder.clone())),
+            subject: TermPattern::Variable(Variable::new_unchecked(subject)),
             predicate: NamedNodePattern::NamedNode(predicate),
             object: TermPattern::Variable(Variable::new_unchecked(edge.referenced.clone())),
         };

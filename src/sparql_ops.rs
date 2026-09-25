@@ -2436,8 +2436,16 @@ impl Lowering<'_> {
                         // barrier itself is a member of the scope above, and
                         // `classes` here is that scope's.
                         let body_classes = classes_feeding(plan, *input);
+                        // An export nothing in the body binds is unbound in
+                        // every row -- no column, and nothing to render (the
+                        // column loop below skips it for the same reason).
+                        let bound: Vec<String> = vars
+                            .iter()
+                            .filter(|var| !plan.producers_of(*input, var).is_empty())
+                            .cloned()
+                            .collect();
                         let columns =
-                            self.scope_columns(&body_classes, *input, vars, Some(id), id)?;
+                            self.scope_columns(&body_classes, *input, &bound, Some(id), id)?;
                         body.push(OpNode {
                             op: Op::Project {
                                 input: body.len() - 1,

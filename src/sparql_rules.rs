@@ -158,7 +158,7 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
         let mut kept = plan.kept_exports();
         // Φ of the plan as it stands, computed only when a measured rule
         // asks and forgotten whenever any rule edits the plan.
-        let mut phi: Option<(usize, usize, usize)> = None;
+        let mut phi: Option<(usize, usize, usize, usize)> = None;
         for rule in rules {
             let before = if rule.measured() {
                 Some(*phi.get_or_insert_with(|| crate::sparql_lift::progress(plan)))
@@ -187,7 +187,9 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
                     let after = crate::sparql_lift::progress(plan);
                     if after >= before {
                         return fail(
-                            crate::sparql_scopes::TransitionDefect::NoProgress { before, after },
+                            crate::sparql_scopes::TransitionDefect::NoProgress {
+                                measures: Box::new([before, after]),
+                            },
                             log,
                         );
                     }
@@ -3451,8 +3453,12 @@ impl Rule for AbsorbOptionalReference<'_> {
             }
 
             // The preserved side: a scan of the match's subject, in SQL, whose
-            // rows all reach the join.
-            let Some((scan, class_uri)) =
+            // rows all reach the join -- or, for a subject that is an
+            // *element* of a collection the preserved side unnests, that
+            // unnest, and the scan it fans out (the element-held edge: the
+            // reference sits in the element, and the statement reads it off
+            // the element's own row).
+            let scan_of = |star: &str| {
                 plan.nodes
                     .iter()
                     .enumerate()
@@ -3461,7 +3467,7 @@ impl Rule for AbsorbOptionalReference<'_> {
                             star_var,
                             class_uri,
                             ..
-                        } if star_var == &star
+                        } if star_var == star
                             && node.executor == Executor::Sql
                             && mandatorily_feeds(plan, scan, left) =>
                         {
@@ -3469,7 +3475,37 @@ impl Rule for AbsorbOptionalReference<'_> {
                         }
                         _ => None,
                     })
-            else {
+            };
+            let holder = match scan_of(&star) {
+                Some((scan, class_uri)) => Some((scan, class_uri, star.clone(), Vec::new())),
+                None => plan.nodes.iter().enumerate().find_map(|(unnest, node)| {
+                    let PlanOp::Unnest {
+                        star_var,
+                        slot_path,
+                        var: element,
+                        ..
+                    } = &node.op
+                    else {
+                        return None;
+                    };
+                    if *element != star
+                        || node.executor != Executor::Sql
+                        || !mandatorily_feeds(plan, unnest, left)
+                    {
+                        return None;
+                    }
+                    let (scan, class_uri) = scan_of(star_var)?;
+                    // An inlined structure, whose elements are the rows the
+                    // unnest produces -- the class the slot is read on.
+                    if !crate::sparql_scopes::is_structure(self.schema, &class_uri, slot_path) {
+                        return None;
+                    }
+                    let element_class =
+                        crate::sparql_scopes::class_at_path_of(self.schema, &class_uri, slot_path)?;
+                    Some((scan, element_class, star_var.clone(), slot_path.clone()))
+                }),
+            };
+            let Some((scan, class_uri, holder_star, prefix)) = holder else {
                 continue;
             };
 
@@ -3488,7 +3524,11 @@ impl Rule for AbsorbOptionalReference<'_> {
             {
                 continue;
             }
-            let path = vec![slot.name.clone()];
+            let path: Vec<String> = prefix
+                .iter()
+                .cloned()
+                .chain(std::iter::once(slot.name.clone()))
+                .collect();
 
             // The delivered read, so the column reaches whoever renders the
             // join. Unbound: `?l` is the referenced record's identity.
@@ -3511,9 +3551,9 @@ impl Rule for AbsorbOptionalReference<'_> {
             if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
                 *reference = Some(ReferenceEdge {
                     referenced: var.clone(),
-                    holder: star,
+                    holder: holder_star,
                     slot: slot.name.clone(),
-                    path: Vec::new(),
+                    path: prefix,
                 });
             }
             // The edge names the referenced star, which the body's barrier
@@ -9627,5 +9667,75 @@ mod tests {
         assert!(log.reached_fixpoint);
         assert!(log.applied.is_empty());
         assert_eq!(before, plan.to_string());
+    }
+}
+
+/// Staging step 0 of `docs/design/sparql-schema-relations-and-row-finish.md`:
+/// an optional reference read off an *element* of a collection the
+/// preserved side unnests -- the #494 query's
+/// `OPTIONAL { ?section :isLocatedInStation ?station . ?station a :Station }`
+/// nested under the `hasCoveredSection` unnest.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod element_held_optional_reference {
+    use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+    use crate::sparql_oracle::Oracle;
+    use crate::sparql_refine::{Executor, PlanOp};
+    use crate::sparql_rules::{Rule, tier_one_rules};
+    use crate::sparql_scoper::tests::asset360_fixture_schema_view;
+
+    #[test]
+    fn the_nested_reference_is_the_left_join_s_element_held_edge() {
+        let schema = asset360_fixture_schema_view();
+        let oracle = Oracle::new(
+            &schema,
+            &[
+                (
+                    "Track",
+                    r#"{"id": "https://data.infrabel.be/asset360/track/T1", "typeURI": "https://example.org/Main"}"#,
+                ),
+                (
+                    "Line",
+                    r#"{"id": "https://data.infrabel.be/asset360/line/L1", "typeURI": "https://example.org/L"}"#,
+                ),
+                // A section with both references, one whose line is not a
+                // record, one with no line, and a complex with no sections.
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/1", "typeURI": "https://example.org/TC",
+                        "hasCoveredSection": [
+                          {"hasSequenceNumber": 1, "belongsToTrack": "https://data.infrabel.be/asset360/track/T1",
+                           "belongsToLine": "https://data.infrabel.be/asset360/line/L1"},
+                          {"hasSequenceNumber": 2, "belongsToTrack": "https://data.infrabel.be/asset360/track/T1",
+                           "belongsToLine": "https://data.infrabel.be/asset360/line/L-missing"},
+                          {"hasSequenceNumber": 3, "belongsToTrack": "https://data.infrabel.be/asset360/track/T1"}]}"#,
+                ),
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/2", "typeURI": "https://example.org/TC"}"#,
+                ),
+            ],
+        );
+        let rules = tier_one_rules(&schema, None);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let query = "SELECT ?s ?t ?tn ?l WHERE { ?s a asset360:TunnelComplex . \
+             OPTIONAL { ?s asset360:hasCoveredSection ?cs . ?cs asset360:belongsToTrack ?t . \
+             ?t a asset360:Track ; asset360:typeURI ?tn . \
+             OPTIONAL { ?cs asset360:belongsToLine ?l . ?l a asset360:Line } } }";
+        let plan = each_rewrite_preserves_answers(query, &schema, &oracle, &borrowed);
+        let edge = plan.nodes.iter().find_map(|node| match &node.op {
+            PlanOp::LeftJoin {
+                reference: Some(edge),
+                ..
+            } if edge.slot == "belongsToLine" => Some(edge.clone()),
+            _ => None,
+        });
+        let edge = edge.unwrap_or_else(|| panic!("the nested reference is an edge:\n{plan}"));
+        assert_eq!(edge.path, vec!["hasCoveredSection".to_owned()], "{plan}");
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "one statement:\n{plan}"
+        );
+        crate::sparql_ops::lower_refined(&plan, &schema, None, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
     }
 }
