@@ -1413,13 +1413,18 @@ impl Plan {
                     return Err(ScopeDefect::EvidenceLost { key: origin });
                 };
                 // Moved one scope up by a rule, and still one step up: the
-                // node that claims it now combines the scope it was raised
-                // in (below its left input) with the outside.
+                // node the transfer went via combines the scope it was
+                // raised in (below its left input) with what moved (its
+                // right input), and the claim is that node's or inside that
+                // right input.
                 let transferred = self.transfers.iter().any(|transfer| {
                     transfer.obligation == *claim
-                        && self.resolve(transfer.via) == Some(id)
-                        && matches!(&self.nodes[id].op,
-                            PlanOp::LeftJoin { left, .. } if self.feeds(barrier, *left))
+                        && self.resolve(transfer.via).is_some_and(|via| {
+                            matches!(&self.nodes[via].op,
+                                PlanOp::LeftJoin { left, right, .. }
+                                    if self.feeds(barrier, *left)
+                                        && (via == id || self.feeds(id, *right)))
+                        })
                 });
                 let allowed = transferred
                     || if matches!(self.nodes[barrier].op, PlanOp::SubSelect { .. }) {

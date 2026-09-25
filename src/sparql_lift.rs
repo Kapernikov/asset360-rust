@@ -903,6 +903,12 @@ impl Rule for LiftOptionalRightSide<'_> {
         let inner_key = plan.key_of(inner);
         let barrier_key = plan.key_of(barrier);
         let inner_claims = plan.nodes[inner].discharges.clone();
+        // What moves with `C`: every obligation a node of it claims. Each
+        // leaves the body's scope with it, one step up, to the new join.
+        let moved_claims: Vec<crate::sparql_plan::ObligationId> = subtree(plan, c)
+            .into_iter()
+            .flat_map(|id| plan.nodes[id].discharges.clone())
+            .collect();
         let scope_b = plan.variables_of(b);
         let mut dropped: Vec<String> = Vec::new();
         if let PlanOp::SubSelect { vars, .. } = &mut plan.nodes[barrier].op {
@@ -958,7 +964,7 @@ impl Rule for LiftOptionalRightSide<'_> {
         let lifted_at = at[0];
         let lifted_key = plan.key_of(lifted_at);
         plan.retire(inner_key, Some(lifted_key));
-        for obligation in inner_claims {
+        for obligation in inner_claims.into_iter().chain(moved_claims) {
             plan.transfers.push(ScopeTransfer {
                 obligation,
                 via: lifted_key,
@@ -1056,12 +1062,16 @@ pub fn one_to_one(plan: &Plan, node: NodeId, below: NodeId) -> Result<(), String
             "G3a: n{node} is a sub-SELECT (domain {domain}), whose modifiers count rows of their own"
         )),
         PlanOp::LeftJoin { left, right, .. } if *left == below => {
-            let PlanOp::Values { variables, rows } = &plan.nodes[*right].op else {
+            let table = crate::sparql_constant::table_under(plan, *right);
+            let Some(PlanOp::Values { variables, rows }) = table.map(|table| &plan.nodes[table].op)
+            else {
                 return Err(format!(
                     "G3a: n{node} left-joins n{right}, which is not an inline table, so a row \
                      may meet several"
                 ));
             };
+            // Through a barrier, only what it exports is compared.
+            let exported = plan.variables_of(*right);
             let scope = plan.variables_of(*left);
             let bound = plan.definitely_bound_of(*left);
             // The largest key set the proof admits: shared, bound in every
@@ -1071,6 +1081,7 @@ pub fn one_to_one(plan: &Plan, node: NodeId, below: NodeId) -> Result<(), String
                 .enumerate()
                 .filter(|(column, variable)| {
                     scope.contains(variable.as_str())
+                        && exported.contains(variable.as_str())
                         && bound.contains(variable.as_str())
                         && rows
                             .iter()
@@ -1729,5 +1740,672 @@ pub(crate) mod tests {
             panic!("{plan}");
         };
         assert!(note.contains("reads a pattern (EXISTS)"), "{note}");
+    }
+}
+
+/// The design's per-rule regressions (appendix): every counterexample of
+/// the three reviews. A rule that must **fire** is compared against the
+/// oracle over the rows route; one that must **decline** names its guard
+/// in the printout, and the rewrite it refuses is evaluated and shown to
+/// differ, so the counterexample stays honest if the engine changes.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod regressions {
+    use super::tests::{PREFIX, as_bag, lifted_plan, oracle_rows, printout, rows_route_answer};
+    use crate::sparql_oracle::{fixture, probe, probe_sequence};
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    // --- R2 ---------------------------------------------------------------
+
+    /// **`r2_qualifying_strafter`**: the #494 shape must fire, and answer
+    /// what the engine answers.
+    #[test]
+    fn r2_qualifying_strafter() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = format!(
+            "{PREFIX}SELECT ?s ?tail WHERE {{ ?s a asset360:Signal . \
+             OPTIONAL {{ ?s asset360:locatedOnTrack ?e . \
+             BIND(STRAFTER(STR(?e), \"/track/\") AS ?tail) }} }}"
+        );
+        assert!(printout(&query, &schema).contains("R2  "));
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        assert_eq!(as_bag(&rows), as_bag(&oracle_rows(&query, &oracle)));
+        // The probe the design ran: equal.
+        let data = "<urn:s1> <urn:j> <urn:E1> .";
+        assert_eq!(
+            probe(
+                data,
+                "SELECT * { ?s <urn:j> ?j OPTIONAL { ?s <urn:j> ?e BIND(STRAFTER(STR(?e), \"urn:\") AS ?t) } }"
+            ),
+            probe(
+                data,
+                "SELECT ?s ?j ?e ?t { ?s <urn:j> ?j OPTIONAL { ?s <urn:j> ?e BIND(true AS ?m) } \
+                 BIND(IF(BOUND(?m), STRAFTER(STR(?e), \"urn:\"), ?never) AS ?t) }"
+            )
+        );
+    }
+
+    /// **`r2_non_strict_expression`**: `COALESCE` over an unmatched side is
+    /// not strict, and the witness makes that irrelevant.
+    #[test]
+    fn r2_non_strict_expression() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = format!(
+            "{PREFIX}SELECT ?s ?x WHERE {{ ?s a asset360:Signal . \
+             OPTIONAL {{ ?s asset360:length ?len . BIND(COALESCE(?len, 0) AS ?x) }} }}"
+        );
+        assert!(printout(&query, &schema).contains("R2  "));
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        assert_eq!(as_bag(&rows), as_bag(&oracle_rows(&query, &oracle)));
+        assert_eq!(
+            probe(
+                "",
+                "SELECT * { VALUES ?a {10} OPTIONAL { VALUES ?b {2} FILTER(false) BIND(COALESCE(?b, 0) AS ?x) } }"
+            ),
+            probe(
+                "",
+                "SELECT ?a ?b ?x { VALUES ?a {10} OPTIONAL { VALUES ?b {2} FILTER(false) BIND(true AS ?m) } \
+                 BIND(IF(BOUND(?m), COALESCE(?b, 0), ?never) AS ?x) }"
+            )
+        );
+    }
+
+    /// **`r2_input_from_a`** (G2b): `?b + ?a` computed inside the body sees
+    /// `?a` unbound; lifted, it would see the left row's.
+    #[test]
+    fn r2_input_from_a() {
+        let schema = test_schema_view();
+        let refined = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?x WHERE {{ ?s a asset360:Signal ; asset360:length ?a . \
+                 OPTIONAL {{ ?s asset360:name ?b . BIND(CONCAT(?b, STR(?a)) AS ?x) }} }}"
+            ),
+            &schema,
+        );
+        assert!(refined.contains("G2b: ?a in scope in"), "{refined}");
+        assert!(!refined.contains("R2  "), "{refined}");
+        assert_ne!(
+            probe(
+                "",
+                "SELECT * { VALUES ?a {10} OPTIONAL { VALUES ?b {2} BIND(?b + ?a AS ?x) } }"
+            ),
+            probe(
+                "",
+                "SELECT * { VALUES ?a {10} OPTIONAL { VALUES ?b {2} } BIND(?b + ?a AS ?x) }"
+            ),
+        );
+    }
+
+    /// **`r2_bnode_once_per_b_row`** (G2c): one blank node per body row in
+    /// the original, one per joined row after a lift.
+    #[test]
+    fn r2_bnode_once_per_b_row() {
+        let schema = test_schema_view();
+        let refined = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?x WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:name ?nm . BIND(BNODE() AS ?x) }} }}"
+            ),
+            &schema,
+        );
+        assert!(
+            refined.contains("G2c: the expression is not effect-free"),
+            "{refined}"
+        );
+        assert_ne!(
+            probe(
+                "",
+                "SELECT (COUNT(DISTINCT ?x) AS ?n) { VALUES ?a {1 2} OPTIONAL { { SELECT ?x { VALUES ?b {7} BIND(BNODE() AS ?x) } } } }"
+            ),
+            probe(
+                "",
+                "SELECT (COUNT(DISTINCT ?x) AS ?n) { VALUES ?a {1 2} OPTIONAL { VALUES ?b {7} } BIND(BNODE() AS ?x) }"
+            ),
+        );
+    }
+
+    // --- R1 ---------------------------------------------------------------
+
+    /// The R1 shape on the fixture: a label table joined on a numeric key,
+    /// which M1 declines (K4), inside the `OPTIONAL` that reads the key.
+    fn r1_query(condition: &str) -> String {
+        format!(
+            "{PREFIX}SELECT ?s ?len ?lbl WHERE {{ ?s a asset360:Signal . \
+             OPTIONAL {{ ?s asset360:length ?len . \
+             OPTIONAL {{ VALUES (?len ?lbl) {{ (3 \"three\") (7 \"seven\") }} {condition} }} }} }}"
+        )
+    }
+
+    /// **`r1_effect_free_condition`** / the shape R1 exists for: fires, and
+    /// the finish over rows is the oracle's answer.
+    #[test]
+    fn r1_effect_free_condition() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        for condition in ["", "FILTER(STRLEN(?lbl) = 5)"] {
+            let query = r1_query(condition);
+            let refined = printout(&query, &schema);
+            assert!(refined.contains("R1  "), "{condition}\n{refined}");
+            let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+            assert_eq!(
+                as_bag(&rows),
+                as_bag(&oracle_rows(&query, &oracle)),
+                "{condition}"
+            );
+        }
+    }
+
+    /// **`r1_volatile_condition`** (G1d): `RAND()` in the moved condition.
+    /// Asserted deterministically: R1 declines and says so. The random draw
+    /// is the design appendix's, and never runs here.
+    #[test]
+    fn r1_volatile_condition() {
+        let schema = test_schema_view();
+        let refined = printout(&r1_query("FILTER(RAND() < 0.5)"), &schema);
+        assert!(!refined.contains("R1  "), "{refined}");
+        assert!(refined.contains("G1d"), "{refined}");
+    }
+
+    /// **`r1_volatile_inside_c`** (G1d, the precaution): a volatile
+    /// expression inside `C` declines too.
+    #[test]
+    fn r1_volatile_inside_c() {
+        let schema = test_schema_view();
+        let refined = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?len ?lbl WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:length ?len . \
+                 OPTIONAL {{ {{ VALUES (?len ?lbl) {{ (3 \"three\") }} FILTER(RAND() < 0.5) }} }} }} }}"
+            ),
+            &schema,
+        );
+        assert!(!refined.contains("R1  "), "{refined}");
+    }
+
+    /// **`r1_bound_j_tests_merged_mapping`** and **`r1_empty_shared_set`**:
+    /// why the witness and not `BOUND(?j)`. `C` binds `?j` itself, so a test
+    /// on it is true for a left row the body never matched; the witness is
+    /// not, whatever the sides share.
+    #[test]
+    fn r1_the_witness_is_what_tests_the_match() {
+        let bound_j = "SELECT * { VALUES ?a {1} OPTIONAL { VALUES ?j {2} FILTER(false) \
+             OPTIONAL { VALUES (?j ?label) {(2 \"label\")} } } }";
+        assert_ne!(
+            probe("", bound_j),
+            probe(
+                "",
+                "SELECT * { VALUES ?a {1} OPTIONAL { VALUES ?j {2} FILTER(false) } \
+                 OPTIONAL { VALUES (?j ?label) {(2 \"label\")} FILTER(BOUND(?j)) } }"
+            ),
+            "revision 1's guard"
+        );
+        assert_eq!(
+            probe("", bound_j),
+            probe(
+                "",
+                "SELECT ?a ?j ?label { VALUES ?a {1} OPTIONAL { VALUES ?j {2} FILTER(false) BIND(true AS ?m) } \
+                 OPTIONAL { VALUES (?j ?label) {(2 \"label\")} FILTER(BOUND(?m)) } }"
+            ),
+            "the witness"
+        );
+        let empty = "SELECT * { VALUES ?a {1} OPTIONAL { VALUES ?b {2} FILTER(false) \
+             OPTIONAL { VALUES ?label {\"x\"} } } }";
+        assert_eq!(
+            probe("", empty),
+            probe(
+                "",
+                "SELECT ?a ?b ?label { VALUES ?a {1} OPTIONAL { VALUES ?b {2} FILTER(false) BIND(true AS ?m) } \
+                 OPTIONAL { VALUES ?label {\"x\"} FILTER(BOUND(?m)) } }"
+            ),
+        );
+    }
+
+    /// **`r1_c_shares_with_a_not_pinned_by_b`** (G1b).
+    #[test]
+    fn r1_c_shares_with_a_not_pinned_by_b() {
+        let schema = test_schema_view();
+        let refined = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?nm ?lbl WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 OPTIONAL {{ ?s asset360:length ?len . \
+                 OPTIONAL {{ VALUES (?len ?nm ?lbl) {{ (3 \"Alpha\" \"a\") }} }} }} }}"
+            ),
+            &schema,
+        );
+        assert!(refined.contains("G1b: ?nm shared by C"), "{refined}");
+        assert_ne!(
+            probe(
+                "",
+                "SELECT * { VALUES (?a ?k) {(1 7)} OPTIONAL { VALUES ?j {2} \
+                 OPTIONAL { VALUES (?j ?k ?label) {(2 8 \"label\")} } } }"
+            ),
+            probe(
+                "",
+                "SELECT ?a ?k ?j ?label { VALUES (?a ?k) {(1 7)} OPTIONAL { VALUES ?j {2} BIND(true AS ?m) } \
+                 OPTIONAL { VALUES (?j ?k ?label) {(2 8 \"label\")} FILTER(BOUND(?m)) } }"
+            ),
+        );
+    }
+
+    /// **`r1_inner_condition_reads_a`** (G1c).
+    #[test]
+    fn r1_inner_condition_reads_a() {
+        assert_ne!(
+            probe(
+                "",
+                "SELECT * { VALUES ?a {1} OPTIONAL { VALUES ?j {2} \
+                 OPTIONAL { VALUES (?j ?label) {(2 \"label\")} FILTER(!BOUND(?a)) } } }"
+            ),
+            probe(
+                "",
+                "SELECT ?a ?j ?label { VALUES ?a {1} OPTIONAL { VALUES ?j {2} BIND(true AS ?m) } \
+                 OPTIONAL { VALUES (?j ?label) {(2 \"label\")} FILTER(BOUND(?m) && !BOUND(?a)) } }"
+            ),
+        );
+        let schema = test_schema_view();
+        let refined = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?len ?lbl WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+                 OPTIONAL {{ ?s asset360:length ?len . \
+                 OPTIONAL {{ VALUES (?len ?lbl) {{ (3 \"three\") }} FILTER(!BOUND(?nm)) }} }} }}"
+            ),
+            &schema,
+        );
+        assert!(
+            refined.contains("G1c: the inner condition reads ?nm"),
+            "{refined}"
+        );
+    }
+
+    // --- R3 ---------------------------------------------------------------
+
+    /// **`r3_qualifying_page`**: a left join against a table unique on a key
+    /// the left side binds is one-to-one, so the page moves into the
+    /// statement -- and paging through it with `OFFSET` tiles the whole
+    /// ordered answer.
+    #[test]
+    fn r3_qualifying_page() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let full = |page: &str| {
+            format!(
+                "{PREFIX}SELECT ?s ?len ?lbl WHERE {{ ?s a asset360:Signal ; asset360:length ?len . \
+                 OPTIONAL {{ VALUES (?len ?lbl) {{ (3 \"three\") (7 \"seven\") (1 \"one\") }} }} }} \
+                 ORDER BY ?s {page}"
+            )
+        };
+        let refined = printout(&full("LIMIT 2"), &schema);
+        assert!(refined.contains("R3  "), "{refined}");
+        let expected = oracle_rows(&full(""), &oracle);
+        let mut tiled = Vec::new();
+        for offset in (0..expected.len()).step_by(2) {
+            let (_plan, rows) =
+                rows_route_answer(&full(&format!("LIMIT 2 OFFSET {offset}")), &schema, &oracle);
+            tiled.extend(rows);
+        }
+        assert_eq!(tiled, expected, "the pages tile the ordered answer");
+        assert_eq!(
+            probe_sequence(
+                "",
+                "SELECT ?id ?label { VALUES (?id ?j) {(3 2) (1 3) (2 1)} \
+                 OPTIONAL { VALUES (?j ?label) {(1 \"a\") (2 \"b\") (3 \"c\")} } } ORDER BY ?id LIMIT 2"
+            ),
+            probe_sequence(
+                "",
+                "SELECT ?id ?label { VALUES (?__ord ?id ?j) {(1 1 3) (2 2 1)} \
+                 OPTIONAL { VALUES (?j ?label) {(1 \"a\") (2 \"b\") (3 \"c\")} } } ORDER BY ?__ord"
+            ),
+        );
+    }
+
+    /// **`r3_undef_left_key_fans_out`** (G3a): a key the left side may leave
+    /// unbound is compatible with every row of the table.
+    #[test]
+    fn r3_undef_left_key_fans_out() {
+        assert_ne!(
+            probe(
+                "",
+                "SELECT * { VALUES (?id ?j) {(1 UNDEF) (2 3)} \
+                 OPTIONAL { VALUES (?j ?label) {(1 \"a\") (2 \"b\") (3 \"c\")} } } ORDER BY ?id LIMIT 1"
+            ),
+            probe(
+                "",
+                "SELECT * { { SELECT * { VALUES (?id ?j) {(1 UNDEF) (2 3)} } ORDER BY ?id LIMIT 1 } \
+                 OPTIONAL { VALUES (?j ?label) {(1 \"a\") (2 \"b\") (3 \"c\")} } }"
+            ),
+        );
+        let schema = test_schema_view();
+        let refined = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?len ?lbl WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:length ?len }} \
+                 OPTIONAL {{ VALUES (?len ?lbl) {{ (3 \"three\") (7 \"seven\") }} }} }} \
+                 ORDER BY ?s LIMIT 2"
+            ),
+            &schema,
+        );
+        assert!(!refined.contains("R3  "), "{refined}");
+    }
+
+    /// **`r3_duplicate_key_in_c`** (G3a): two rows of the table on one key.
+    #[test]
+    fn r3_duplicate_key_in_c() {
+        let schema = test_schema_view();
+        let refined = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?len ?lbl WHERE {{ ?s a asset360:Signal ; asset360:length ?len . \
+                 OPTIONAL {{ VALUES (?len ?lbl) {{ (3 \"three\") (3 \"drei\") }} }} }} \
+                 ORDER BY ?s LIMIT 2"
+            ),
+            &schema,
+        );
+        assert!(refined.contains("G3a: two rows of"), "{refined}");
+        assert!(!refined.contains("R3  "), "{refined}");
+    }
+
+    /// **`r3_volatile_bind_in_e`**: a `RAND()` above the page is evaluated
+    /// once per answer row on both routes, so R3 fires. Only the `?s`
+    /// sequence is compared.
+    #[test]
+    fn r3_volatile_bind_in_e() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = format!(
+            "{PREFIX}SELECT ?s ?r WHERE {{ ?s a asset360:Signal . BIND(RAND() AS ?r) }} \
+             ORDER BY ?s LIMIT 2"
+        );
+        assert!(printout(&query, &schema).contains("R3  "));
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        let ids = |rows: &[serde_json::Value]| -> Vec<String> {
+            rows.iter().map(|row| row["s"].to_string()).collect()
+        };
+        assert_eq!(ids(&rows), ids(&oracle_rows(&query, &oracle)));
+        assert!(rows.iter().all(|row| row.get("r").is_some()));
+    }
+
+    /// A `LIMIT` with no `ORDER BY` moves too: any page is an answer, and no
+    /// order crosses.
+    #[test]
+    fn r3_a_page_with_no_order() {
+        let schema = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?x WHERE {{ ?s a asset360:Signal . BIND(STR(?s) AS ?x) }} LIMIT 2"
+        );
+        let plan = lifted_plan(&query, &schema);
+        let printed = plan.to_string();
+        assert!(
+            printed.contains("no ORDER BY, so no order crosses"),
+            "{printed}"
+        );
+        assert!(!printed.contains("number"), "{printed}");
+        let oracle = fixture(&schema);
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        assert_eq!(rows.len(), 2);
+    }
+}
+
+/// Composition, fallbacks and the evaluation context: the pipeline as a
+/// whole rather than one rule at a time.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod composition {
+    use super::tests::{PREFIX, as_bag, lifted_plan, oracle_rows, printout, rows_route_answer};
+    use crate::sparql_oracle::fixture;
+    use crate::sparql_plan::{PassKind, Refinement};
+    use crate::sparql_refine::{Node, Plan, PlanDefect, PlanOp};
+    use crate::sparql_rules::Rule;
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    /// P4 widened: the path from the statement to the restoring sort holds
+    /// R2's witness-dropping projection and a left join against a table
+    /// unique on a bound key (G3a).
+    fn widened() -> String {
+        format!(
+            "{PREFIX}SELECT ?s ?name ?tail ?lbl WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?name ; asset360:length ?len . \
+             OPTIONAL {{ ?s asset360:locatedOnTrack ?e . \
+             BIND(STRAFTER(STR(?e), \"/track/\") AS ?tail) }} \
+             OPTIONAL {{ VALUES (?len ?lbl) {{ (3 \"three\") (7 \"seven\") }} }} }} \
+             ORDER BY ?name LIMIT 10"
+        )
+    }
+
+    /// **`r3_ordinal_through_projections`**: `?__ord` is in scope at every
+    /// node between the numbering and the restoring sort, projections
+    /// included, and only the query's final projection drops it; the answer
+    /// is the oracle's.
+    #[test]
+    fn r3_ordinal_through_projections() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = widened();
+        let plan = lifted_plan(&query, &schema);
+        let printed = plan.to_string();
+        assert!(
+            printed.contains("R2  ") && printed.contains("R3  "),
+            "{printed}"
+        );
+        super::ordinal_reaches_its_sort(&plan).unwrap();
+        let number = plan
+            .nodes
+            .iter()
+            .position(|node| matches!(node.op, PlanOp::Number { .. }))
+            .expect(&printed);
+        let mut at = number;
+        let mut projections = 0;
+        while !matches!(
+            plan.nodes[at].op,
+            PlanOp::Sort {
+                origin: crate::sparql_refine::SortOrigin::Ordinal,
+                ..
+            }
+        ) {
+            assert!(plan.variables_of(at).contains("__ord"), "n{at}\n{printed}");
+            if matches!(plan.nodes[at].op, PlanOp::Project { .. }) {
+                projections += 1;
+            }
+            at = crate::sparql_rules::consumers_of(&plan, at)[0];
+        }
+        assert!(
+            projections >= 1,
+            "the path holds R2's projection:\n{printed}"
+        );
+        let root = plan.nodes.len() - 1;
+        assert!(!plan.variables_of(root).contains("__ord"), "{printed}");
+
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        let expected = oracle_rows(&query, &oracle);
+        assert_eq!(as_bag(&rows), as_bag(&expected));
+        let names = |rows: &[serde_json::Value]| -> Vec<String> {
+            rows.iter().map(|row| row["name"].to_string()).collect()
+        };
+        assert_eq!(names(&rows), names(&expected));
+    }
+
+    /// **The mutation twin**: a rule that builds its projection as a keep
+    /// list -- R2's edit done wrong -- drops the ordinal between the
+    /// numbering and its sort, and the driver refuses it as a transition
+    /// defect naming the rule.
+    #[test]
+    fn a_projection_built_as_a_keep_list_loses_the_ordinal() {
+        struct KeepListProjection;
+        impl Rule for KeepListProjection {
+            fn name(&self) -> &'static str {
+                super::R2
+            }
+            fn apply(&self, plan: &mut Plan) -> bool {
+                // Above the numbering: a projection of the variables the
+                // query selects, and nothing else.
+                let Some(number) = plan
+                    .nodes
+                    .iter()
+                    .position(|node| matches!(node.op, PlanOp::Number { .. }))
+                else {
+                    return false;
+                };
+                if plan
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(&node.op, PlanOp::Project { vars, .. } if vars == &["s".to_owned()]))
+                {
+                    return false;
+                }
+                super::insert_above(
+                    plan,
+                    number,
+                    Node::engine(
+                        PlanOp::Project {
+                            input: number,
+                            vars: vec!["s".to_owned()],
+                        },
+                        Vec::new(),
+                    ),
+                );
+                true
+            }
+        }
+        let schema = test_schema_view();
+        let mut plan = lifted_plan(&widened(), &schema);
+        let failure = crate::sparql_rules::refine(&mut plan, &[&KeepListProjection])
+            .expect_err("the ordinal is lost");
+        match failure.defect {
+            PlanDefect::Transition {
+                rule,
+                defect: crate::sparql_scopes::TransitionDefect::OrdinalLost { .. },
+            } => assert_eq!(rule, super::R2),
+            other => panic!("{other}"),
+        }
+    }
+
+    /// **The replanning path** (the reviewer's non-blocking ask): R2 fires,
+    /// but the rows route is refused -- the region also holds an `EXISTS`,
+    /// which reads instance data the rows do not carry -- so the planner
+    /// refines again from the original plan, without the lifts. The records
+    /// route then carries no witness and no ordinal, and its fetch no page
+    /// or order of the query's that would drop records the engine needs.
+    /// (The design's example, a dataset clause, is refused by the scoper
+    /// before planning: `FROM` is an unsupported construct.)
+    #[test]
+    fn a_lift_the_rows_route_refuses_is_undone() {
+        let schema = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?name ?tail WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?name . OPTIONAL {{ ?s asset360:locatedOnTrack ?e . \
+             BIND(STRAFTER(STR(?e), \"/track/\") AS ?tail) }} \
+             FILTER(EXISTS {{ ?s asset360:length ?len }}) }} ORDER BY ?name LIMIT 1"
+        );
+        // The lift fires on it.
+        let lifted = lifted_plan(&query, &schema).to_string();
+        assert!(lifted.contains("R2  "), "{lifted}");
+        let plan = crate::sparql_plan::plan_query_refined(&query, &schema).unwrap();
+        assert!(
+            !matches!(plan.refinement, Refinement::UsedRows(_)),
+            "{plan}"
+        );
+        let printed = plan.to_string();
+        assert!(!printed.contains("__ord"), "{printed}");
+        assert!(!printed.contains("__m1"), "{printed}");
+        for pass in &plan.passes {
+            if let PassKind::Sql(sql) = &pass.kind {
+                assert!(
+                    !sql.ops
+                        .nodes
+                        .iter()
+                        .any(|node| matches!(node.op, crate::sparql_ops::Op::Sort { .. })),
+                    "the fetch carries no ORDER BY of the query's: {plan}"
+                );
+            }
+        }
+        // The records route re-runs the query itself over what it fetches,
+        // so there is nothing further to compare: what this test holds is
+        // that no lift's artifact reached that fetch.
+    }
+
+    /// **A mixed-column table stays the engine's and still answers through
+    /// the rows route**: M1 declines it (K7), R1 lifts it out of its
+    /// `OPTIONAL`, and the finish evaluates it.
+    #[test]
+    fn a_mixed_column_table_answers_over_rows() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = format!(
+            "{PREFIX}SELECT ?s ?nm ?tag WHERE {{ ?s a asset360:Signal . \
+             OPTIONAL {{ ?s asset360:name ?nm . \
+             OPTIONAL {{ VALUES (?nm ?tag) {{ (\"Alpha\" \"a\") (\"Echo\" <urn:echo>) }} }} }} }}"
+        );
+        // Where it stood, M1 declines it on K7 ...
+        let unlifted = crate::sparql_plan::with_declined(
+            &{
+                let mut plan = crate::sparql_refine::naive_plan_for(&query, &schema).unwrap();
+                let rules = crate::sparql_plan::refine_rules(&schema, None, false);
+                let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+                crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
+                plan
+            },
+            &schema,
+            None,
+        );
+        assert!(
+            unlifted.contains("K7: column ?tag is not uniform"),
+            "{unlifted}"
+        );
+        // ... so R1 lifts it, and it stays the engine's.
+        let refined = printout(&query, &schema);
+        assert!(refined.contains("R1  "), "{refined}");
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        assert_eq!(as_bag(&rows), as_bag(&oracle_rows(&query, &oracle)));
+    }
+
+    /// **The evaluation context**: a `BASE` the query declares reaches the
+    /// finish query, so an `IRI()` the engine evaluates over the rows
+    /// resolves as the records route would resolve it.
+    #[test]
+    fn the_finish_query_keeps_the_base() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = format!(
+            "BASE <https://example.org/base/> {PREFIX}SELECT ?s ?x WHERE {{ ?s a asset360:Signal . \
+             BIND(IRI(\"relative\") AS ?x) }}"
+        );
+        let (plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        assert!(
+            plan.to_string()
+                .contains("BASE <https://example.org/base/>"),
+            "{plan}"
+        );
+        assert_eq!(as_bag(&rows), as_bag(&oracle_rows(&query, &oracle)));
+    }
+
+    /// **A region with no write-back is the records route's**, decided at
+    /// plan time: a `SERVICE` has no algebra this crate writes back, and it
+    /// reads another dataset anyway.
+    #[test]
+    fn a_region_that_reads_instances_finishes_over_records() {
+        let schema = test_schema_view();
+        let plan = crate::sparql_plan::plan_query_refined(
+            &format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal . \
+                 FILTER(EXISTS {{ ?s asset360:name ?nm }}) }}"
+            ),
+            &schema,
+        )
+        .unwrap();
+        assert!(matches!(plan.refinement, Refinement::Used(_)), "{plan}");
+    }
+
+    /// **Fresh names are fresh**: a query that already uses `?__m1` gets
+    /// the witness `?__m2`.
+    #[test]
+    fn a_witness_name_the_query_uses_is_skipped() {
+        let schema = test_schema_view();
+        let printed = printout(
+            &format!(
+                "{PREFIX}SELECT ?s ?__m1 ?tail WHERE {{ ?s a asset360:Signal ; asset360:name ?__m1 . \
+                 OPTIONAL {{ ?s asset360:locatedOnTrack ?e . \
+                 BIND(STRAFTER(STR(?e), \"/track/\") AS ?tail) }} }}"
+            ),
+            &schema,
+        );
+        assert!(printed.contains("witness ?__m2"), "{printed}");
     }
 }
