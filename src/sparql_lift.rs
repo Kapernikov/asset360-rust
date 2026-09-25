@@ -624,6 +624,11 @@ impl Rule for LiftOptionalExtension {
         let never = fresh(plan, "__never", false);
         let inputs: BTreeSet<String> = variables_used(&expr).into_iter().collect();
         let scope_b = plan.variables_of(b);
+        // What the join exposed before the lift: all a consumer above may
+        // observe. The lift exposes more -- the witness, and what the
+        // barrier now exports for `e` -- and the projection drops exactly
+        // that, so a `COUNT(DISTINCT *)` above counts what it counted.
+        let exposed = plan.variables_of(join);
         let bind_key = plan.key_of(bind);
         let barrier_key = plan.key_of(barrier);
         let b_key = plan.key_of(b);
@@ -655,14 +660,16 @@ impl Rule for LiftOptionalExtension {
         );
         let mut inserted = vec![lifted];
         if !reused {
-            // Scope minus the witness: the join's scope after the edit (its
-            // left side, the barrier's new exports, the witness) and `?x`.
+            // Scope minus what the lift added: the join's scope after the
+            // edit, less the witness and whatever the barrier exports now
+            // and did not before.
             let mut scope: BTreeSet<String> = plan.variables_of(a);
             if let PlanOp::SubSelect { vars, .. } = &plan.nodes[barrier].op {
                 scope.extend(vars.iter().cloned());
             }
             scope.insert(var.clone());
             scope.remove(&witness);
+            scope.retain(|kept| exposed.contains(kept));
             inserted.push(Node::engine(
                 PlanOp::Project {
                     input: PREVIOUS,
@@ -939,6 +946,17 @@ impl Rule for LiftOptionalRightSide<'_> {
             .flat_map(|id| plan.nodes[id].discharges.clone())
             .collect();
         let scope_b = plan.variables_of(b);
+        // What the outer join exposed before the lift (see R2's edit).
+        let exposed = plan.variables_of(outer);
+        // What the lifted join compares `C` with, and its condition reads:
+        // the barrier must export those of them `B` binds, whether or not a
+        // prune took them away while nothing above demanded them.
+        let needed: BTreeSet<String> = plan
+            .variables_of(c)
+            .into_iter()
+            .chain(condition.iter().flat_map(variables_used))
+            .filter(|var| scope_b.contains(var))
+            .collect();
         let mut dropped: Vec<String> = Vec::new();
         if let PlanOp::SubSelect { vars, .. } = &mut plan.nodes[barrier].op {
             vars.retain(|var| {
@@ -948,6 +966,11 @@ impl Rule for LiftOptionalRightSide<'_> {
                 }
                 keep
             });
+            for var in &needed {
+                if !vars.contains(var) {
+                    vars.push(var.clone());
+                }
+            }
         }
         if let PlanOp::LeftJoin { witness: slot, .. } = &mut plan.nodes[outer].op {
             *slot = Some(witness.clone());
@@ -974,6 +997,7 @@ impl Rule for LiftOptionalRightSide<'_> {
             }
             scope.extend(plan.variables_of(c));
             scope.remove(&witness);
+            scope.retain(|kept| exposed.contains(kept));
             inserted.push(Node::engine(
                 PlanOp::Project {
                     input: PREVIOUS,
@@ -2216,6 +2240,52 @@ mod regressions {
                 as_bag(&rows),
                 as_bag(&oracle_rows(&query, &oracle)),
                 "{condition}"
+            );
+        }
+    }
+
+    /// R1 over a key nothing above selects: a prune took `?len` out of the
+    /// `OPTIONAL` body's exports while only `C` needed it, and the lifted
+    /// join must still compare `C` on it (found by the consolidator's
+    /// route differential: every typed signal got every label).
+    #[test]
+    fn r1_a_key_the_query_does_not_select() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let query = format!(
+            "{PREFIX}SELECT ?s ?lbl WHERE {{ ?s a asset360:Signal . \
+             OPTIONAL {{ ?s asset360:length ?len . \
+             OPTIONAL {{ VALUES (?len ?lbl) {{ (3 \"three\") (7 \"seven\") }} }} }} }}"
+        );
+        assert!(printout(&query, &schema).contains("R1  "));
+        let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+        assert_eq!(as_bag(&rows), as_bag(&oracle_rows(&query, &oracle)));
+    }
+
+    /// A whole-mapping observer above a lift sees what it saw: the
+    /// witness, and anything else the lift exposes, is projected away
+    /// before it.
+    #[test]
+    fn a_count_of_distinct_solutions_over_a_lift() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        for query in [
+            format!(
+                "{PREFIX}SELECT (COUNT(DISTINCT *) AS ?n) WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:locatedOnTrack ?e . \
+                 BIND(STRAFTER(STR(?e), \"/track/\") AS ?tail) }} }}"
+            ),
+            format!(
+                "{PREFIX}SELECT (COUNT(DISTINCT *) AS ?n) WHERE {{ ?s a asset360:Signal . \
+                 OPTIONAL {{ ?s asset360:length ?len . \
+                 OPTIONAL {{ VALUES (?len ?lbl) {{ (3 \"three\") (7 \"seven\") }} }} }} }}"
+            ),
+        ] {
+            let (_plan, rows) = rows_route_answer(&query, &schema, &oracle);
+            assert_eq!(
+                as_bag(&rows),
+                as_bag(&oracle_rows(&query, &oracle)),
+                "{query}"
             );
         }
     }
