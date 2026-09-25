@@ -1450,7 +1450,10 @@ pub fn plan_query_refined_with_options(
     // A lift that never fired changed nothing, so when none did the plan
     // refined with them *is* the plan refined without them, and it is used
     // as it stands rather than refined a second time.
+    #[cfg_attr(not(feature = "sparql-endpoint"), allow(unused_mut))]
     let mut settled: Option<crate::sparql_refine::Plan> = None;
+    #[cfg(not(feature = "sparql-endpoint"))]
+    let _ = rows_route;
     #[cfg(feature = "sparql-endpoint")]
     if rows_route {
         let rules = refine_rules(schema_view, schema_graph_iri, true);
