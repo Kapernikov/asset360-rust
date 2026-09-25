@@ -102,7 +102,16 @@ impl std::fmt::Display for ExecuteError {
                 write!(f, "Failed to convert object {object_uri} to RDF: {message}")
             }
             ExecuteError::TripleLimitExceeded { count, limit } => {
-                write!(f, "Triple count {count} exceeds limit {limit}")
+                // `count` is what the store held when loading stopped, not
+                // what the whole fetch would have made: loading is abandoned
+                // as soon as the ceiling is crossed, which is the point (see
+                // `sparql_execute`). Saying so keeps the number honest — it
+                // used to be the full total, paid for with the whole load.
+                write!(
+                    f,
+                    "Triple count {count} exceeds limit {limit}; loading was \
+                     stopped there, so the query's full data may be larger"
+                )
             }
             ExecuteError::ResultLimitExceeded { count, limit } => {
                 write!(f, "Result row count {count} exceeds limit {limit}")
@@ -131,9 +140,10 @@ impl std::fmt::Display for ExecuteError {
 pub struct ExecuteLimits {
     /// Maximum number of RDF triples allowed in the in-memory store.
     ///
-    /// Checked after loading all instance data. Each object produces roughly
-    /// `1 + number_of_slots` triples (one `rdf:type` + one per property).
-    /// Default: 500,000.
+    /// Checked while instance data loads, after each chunk, so a query over
+    /// the ceiling is refused instead of loading everything first and then
+    /// being told. Each object produces roughly `1 + number_of_slots` triples
+    /// (one `rdf:type` + one per property). Default: 500,000.
     pub max_triples: usize,
 
     /// Maximum number of result rows returned by a SELECT query.
@@ -287,6 +297,7 @@ pub(crate) fn geosparql_evaluator() -> oxigraph::sparql::SparqlEvaluator {
 /// * [`ExecuteError::ConversionError`] — an instance's `as_turtle()` failed
 ///   (data quality issue). The entire query fails; no partial results.
 /// * [`ExecuteError::TripleLimitExceeded`] — too many triples in the store.
+///   Raised *during* loading, as soon as a chunk crosses the ceiling.
 /// * [`ExecuteError::ResultLimitExceeded`] — too many result rows.
 /// * [`ExecuteError::QueryError`] — Oxigraph query execution error.
 /// * [`ExecuteError::StoreError`] — internal store creation/loading error.
@@ -320,38 +331,69 @@ pub fn sparql_execute(
         .primary_schema()
         .ok_or_else(|| ExecuteError::StoreError("No primary schema found".to_owned()))?;
 
-    for instance in instances {
-        let object_uri = instance.node_id().to_string();
-
-        let turtle_str = turtle_to_string(
-            instance,
-            schema_view,
-            &primary_schema,
-            &converter,
-            TurtleOptions { skolem: false },
-        )
-        .map_err(|e| ExecuteError::ConversionError {
-            object_uri: object_uri.clone(),
-            message: e.to_string(),
-        })?;
-
-        store
-            .load_from_reader(RdfFormat::Turtle, turtle_str.as_bytes())
+    // Loaded a chunk at a time, and the ceiling is read between chunks.
+    //
+    // Two things used to be wrong here, and they were the same line. Each
+    // instance was serialised to a Turtle *document* and handed to
+    // `load_from_reader` on its own: one parser, one prefix header and one
+    // store transaction per record, which measured ~2.4 ms per record on DEV
+    // — a fixed floor under every query the engine answers (#494, pepibru
+    // GitLab). Concatenated Turtle documents are still one Turtle document —
+    // `@prefix` may be restated, and each record restates its own — so a
+    // chunk is one parse and one transaction for `CHUNK` records.
+    //
+    // And the triple ceiling was checked only once everything was in. The
+    // all-CivilEngineeringAssets query spent ~45 s loading 1.76 M triples in
+    // order to be told 500 000 was the limit. Now the count is read after
+    // each chunk, so a query over the cap is refused while loading, at worst
+    // one chunk past the line.
+    //
+    // `CHUNK` is a balance between the two: large enough that the per-load
+    // overhead is amortised, small enough that overshooting the ceiling costs
+    // a bounded amount of loading. At the tens of triples a record makes, 64
+    // records is a few hundred triples of overshoot.
+    const CHUNK: usize = 64;
+    let mut buffer = String::new();
+    for batch in instances.chunks(CHUNK) {
+        buffer.clear();
+        for instance in batch {
+            let object_uri = instance.node_id().to_string();
+            let turtle_str = turtle_to_string(
+                instance,
+                schema_view,
+                &primary_schema,
+                &converter,
+                TurtleOptions { skolem: false },
+            )
             .map_err(|e| ExecuteError::ConversionError {
                 object_uri: object_uri.clone(),
+                message: e.to_string(),
+            })?;
+            buffer.push_str(&turtle_str);
+            buffer.push('\n');
+        }
+
+        store
+            .load_from_reader(RdfFormat::Turtle, buffer.as_bytes())
+            .map_err(|e| ExecuteError::ConversionError {
+                // The chunk's first record, which is what a reader can look
+                // up; the parse error itself carries the line.
+                object_uri: batch
+                    .first()
+                    .map(|i| i.node_id().to_string())
+                    .unwrap_or_default(),
                 message: format!("Failed to load turtle into store: {e}"),
             })?;
-    }
 
-    // Check triple limit
-    let triple_count = store
-        .len()
-        .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-    if triple_count > limits.max_triples {
-        return Err(ExecuteError::TripleLimitExceeded {
-            count: triple_count,
-            limit: limits.max_triples,
-        });
+        let triple_count = store
+            .len()
+            .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+        if triple_count > limits.max_triples {
+            return Err(ExecuteError::TripleLimitExceeded {
+                count: triple_count,
+                limit: limits.max_triples,
+            });
+        }
     }
 
     // The datamodel, in its own named graph. Deliberately *after* the triple
@@ -931,6 +973,51 @@ classes:
             result,
             Err(ExecuteError::TripleLimitExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn the_triple_ceiling_stops_the_load_instead_of_reading_it_all_first() {
+        // The all-CivilEngineeringAssets query spent ~45 s loading 1.76 M
+        // triples in order to be told the limit was 500 000 (#494, pepibru
+        // GitLab). The ceiling is read while loading now, so what reaches the
+        // store is bounded by the ceiling plus one chunk -- which is what
+        // this asserts, because "it was faster" is not a property a test can
+        // hold on to.
+        let sv = test_schema_view();
+        let instances: Vec<LinkMLInstance> = (0..1000)
+            .map(|i| {
+                load_signal(
+                    &sv,
+                    &format!(
+                        r#"{{"asset360_uri": "https://data.infrabel.be/asset360/signal/S{i}", "name": "S{i}"}}"#
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let result = sparql_execute(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s WHERE { ?s a asset360:Signal }",
+            &refs,
+            &sv,
+            ExecuteLimits {
+                max_triples: 100,
+                max_result_rows: 10_000,
+                max_eval_millis: None,
+            },
+            None,
+        );
+
+        let Err(ExecuteError::TripleLimitExceeded { count, limit }) = result else {
+            panic!("expected the triple ceiling, got {result:?}");
+        };
+        assert_eq!(limit, 100);
+        // 1000 signals make thousands of triples. Stopping means the store
+        // never held them: one chunk of 64 records past the ceiling at most.
+        assert!(
+            count < 1000,
+            "loading should have stopped near the ceiling, but {count} triples were read"
+        );
     }
 
     #[test]
