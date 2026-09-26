@@ -276,6 +276,7 @@ fn expressions_of(op: &PlanOp) -> Vec<&crate::sparql_refine::Expr> {
         | PlanOp::Unnest { .. }
         | PlanOp::Construct { .. }
         | PlanOp::Describe { .. }
+        | PlanOp::Number { .. }
         | PlanOp::Ask { .. } => Vec::new(),
     }
 }
@@ -419,12 +420,35 @@ fn aggregate_evaluates_the_same_out_of_context(
 pub fn materialisable_root(plan: &Plan, pass: &dyn Materialisation) -> Option<NodeId> {
     (0..plan.nodes.len()).rev().find(|&node| {
         !matches!(plan.nodes[node].op, PlanOp::Values { .. })
+            // A region already placed in SQL is a relation the statement
+            // joins (a constant table M1 lowered, with its barrier):
+            // re-evaluating it would hand the engine back what SQL holds.
+            && subtree(plan, node)
+                .iter()
+                .all(|id| plan.nodes[*id].executor == crate::sparql_refine::Executor::Engine)
+            // And a region that is only barriers over a table already *is*
+            // the relation it would evaluate to: nothing to evaluate.
+            && !is_a_table_already(plan, node)
             && plan.nodes[node].output == crate::sparql_refine::OutputKind::Solutions
             && is_an_evaluable_region(plan, node, pass)
             && is_the_top_of_its_region(plan, node, pass)
             && subtree_is_private(plan, node)
             && nothing_is_still_sinking_into_it(plan, node)
     })
+}
+
+/// Whether the subtree at `node` is a `Values` under nothing but
+/// `OPTIONAL`-body barriers: already the relation evaluation would produce.
+fn is_a_table_already(plan: &Plan, node: NodeId) -> bool {
+    match &plan.nodes[node].op {
+        PlanOp::Values { .. } => true,
+        PlanOp::SubSelect {
+            input,
+            domain: None,
+            ..
+        } => is_a_table_already(plan, *input),
+        _ => false,
+    }
 }
 
 /// Whether a filter above this subplan is still on its way *into* it.
@@ -588,10 +612,16 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
             left,
             right,
             condition,
+            witness,
             ..
         } => GraphPattern::LeftJoin {
             left: child(left)?,
-            right: child(right)?,
+            right: match witness {
+                Some(witness) => {
+                    Box::new(crate::sparql_algebra::with_witness(*child(right)?, witness))
+                }
+                None => child(right)?,
+            },
             expression: match condition {
                 Some(condition) => Some(condition.try_as_expression()?),
                 None => None,
@@ -648,7 +678,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
             }
             pattern
         }
-        PlanOp::Sort { input, terms } => GraphPattern::OrderBy {
+        PlanOp::Sort { input, terms, .. } => GraphPattern::OrderBy {
             inner: child(input)?,
             expression: terms
                 .iter()
@@ -697,6 +727,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
         PlanOp::Service { .. }
         | PlanOp::Scan { .. }
         | PlanOp::Unnest { .. }
+        | PlanOp::Number { .. }
         | PlanOp::Construct { .. }
         | PlanOp::Describe { .. }
         | PlanOp::Ask { .. } => return None,
@@ -987,9 +1018,16 @@ mod tests {
              GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:notation ?code }} \
              FILTER(CONTAINS(?code, \"GS\")) }} }}"
         ));
+        // The outer scan is not narrowed: the condition lives inside the
+        // `OPTIONAL` body's relation (M1 lowers the table there), which is
+        // where it decides whether the optional side matched.
         assert!(
-            !plan.contains("filter    signalType"),
+            !plan.contains("\n      filter    signalType"),
             "an optional match must not narrow the fetch:\n{plan}"
+        );
+        assert!(
+            plan.contains("relation  q0") && plan.contains("          filter    signalType"),
+            "the narrowing is the optional body's own:\n{plan}"
         );
     }
 
@@ -1031,10 +1069,13 @@ mod tests {
     /// would be a wrong answer, a wide one is only a slow right one. `main`
     /// fetches both classes whole for this query too, so nothing got worse.
     ///
-    /// Closing the gap means lowering the materialised `VALUES` into the
-    /// statement so the arm becomes all-SQL. That is neither PR's scope.
+    /// Closing the gap meant lowering the materialised `VALUES` into the
+    /// statement so the arm becomes all-SQL, which is what M1
+    /// ([`crate::sparql_constant`], asset360 #494) does: the test now pins
+    /// the closed gap, each arm's narrowing on its own arm of a stacked
+    /// union.
     #[test]
-    fn a_union_of_schema_filtered_arms_narrows_each_arm_but_not_the_fetch() {
+    fn a_union_of_schema_filtered_arms_narrows_each_arm_and_the_fetch() {
         let body = format!(
             "SELECT ?s WHERE {{ \
              {{ ?s a asset360:Signal ; asset360:signalType ?t . \
@@ -1063,19 +1104,27 @@ mod tests {
             );
         }
 
-        // The gap, pinned so that closing it fails this test rather than
-        // passing unnoticed: the union is not lowered, so neither narrowing
-        // reaches the fetch.
+        // The gap this test used to pin is closed by M1 (asset360 #494): the
+        // materialised `VALUES` of each arm lowers as a constant table, so
+        // each arm is all-SQL, the union is stacked, and each narrowing
+        // reaches the fetch on its own arm -- and only there.
         let lowered = plan_for(&body);
         assert!(
-            lowered.contains("not lowerable: the plan contains a UNION"),
-            "a schema-filtered arm keeps an engine-side VALUES, so the union \
-             is not all-SQL and is not stacked:\n{lowered}"
+            lowered.contains("union all"),
+            "each arm is all-SQL, so the union is stacked:\n{lowered}"
+        );
+        let (signal_arm, balise_arm) = lowered
+            .split_once("scan      asset360:BaliseGroup")
+            .expect("the BaliseGroup arm");
+        assert!(
+            signal_arm.contains("filter    signalType = 'GSA'")
+                && !signal_arm.contains("baliseGroupType"),
+            "the Signal arm carries its own narrowing and no other:\n{lowered}"
         );
         assert!(
-            !lowered.contains("signalType IN") && !lowered.contains("baliseGroupType IN"),
-            "and a condition under an unlowered union is refused rather than \
-             applied to the wrong branch:\n{lowered}"
+            balise_arm.contains("filter    baliseGroupType = 'SwBG'")
+                && !balise_arm.contains("signalType ="),
+            "the BaliseGroup arm carries its own narrowing and no other:\n{lowered}"
         );
     }
 

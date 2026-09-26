@@ -334,13 +334,19 @@ pub fn sparql_execute(
     // Loaded a chunk at a time, and the ceiling is read between chunks.
     //
     // Two things used to be wrong here, and they were the same line. Each
-    // instance was serialised to a Turtle *document* and handed to
-    // `load_from_reader` on its own: one parser, one prefix header and one
-    // store transaction per record, which measured ~2.4 ms per record on DEV
-    // — a fixed floor under every query the engine answers (#494, pepibru
-    // GitLab). Concatenated Turtle documents are still one Turtle document —
-    // `@prefix` may be restated, and each record restates its own — so a
-    // chunk is one parse and one transaction for `CHUNK` records.
+    // instance was serialised to Turtle and handed to `load_from_reader` on
+    // its own: one store transaction per record, which measured ~2.4 ms per
+    // record on DEV -- a fixed floor under every query the engine answers
+    // (#494, pepibru GitLab). Now each record is still *parsed* on its own,
+    // and a chunk of `CHUNK` records is inserted in one transaction.
+    //
+    // Parsed on its own, and not as one concatenated document: a record's
+    // inlined structures are blank nodes, and a blank-node label is scoped to
+    // the document it appears in. Concatenated, two records' `_:b0` became
+    // one node, and a query over an inlined structure answered a cross
+    // product of every record in the chunk (found by the consolidator's
+    // oracle over `sourceMetaInfo`). Each parse renames its blank nodes
+    // apart, which is what loading the records one by one always did.
     //
     // And the triple ceiling was checked only once everything was in. The
     // all-CivilEngineeringAssets query spent ~45 s loading 1.76 M triples in
@@ -353,9 +359,9 @@ pub fn sparql_execute(
     // a bounded amount of loading. At the tens of triples a record makes, 64
     // records is a few hundred triples of overshoot.
     const CHUNK: usize = 64;
-    let mut buffer = String::new();
+    let mut quads: Vec<oxigraph::model::Quad> = Vec::new();
     for batch in instances.chunks(CHUNK) {
-        buffer.clear();
+        quads.clear();
         for instance in batch {
             let object_uri = instance.node_id().to_string();
             let turtle_str = turtle_to_string(
@@ -369,21 +375,19 @@ pub fn sparql_execute(
                 object_uri: object_uri.clone(),
                 message: e.to_string(),
             })?;
-            buffer.push_str(&turtle_str);
-            buffer.push('\n');
+            for quad in oxigraph::io::RdfParser::from_format(RdfFormat::Turtle)
+                .rename_blank_nodes()
+                .for_slice(turtle_str.as_bytes())
+            {
+                quads.push(quad.map_err(|e| ExecuteError::ConversionError {
+                    object_uri: object_uri.clone(),
+                    message: format!("Failed to load turtle into store: {e}"),
+                })?);
+            }
         }
-
         store
-            .load_from_reader(RdfFormat::Turtle, buffer.as_bytes())
-            .map_err(|e| ExecuteError::ConversionError {
-                // The chunk's first record, which is what a reader can look
-                // up; the parse error itself carries the line.
-                object_uri: batch
-                    .first()
-                    .map(|i| i.node_id().to_string())
-                    .unwrap_or_default(),
-                message: format!("Failed to load turtle into store: {e}"),
-            })?;
+            .extend(quads.drain(..))
+            .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
         let triple_count = store
             .len()
@@ -458,6 +462,19 @@ pub fn sparql_execute(
     crate::sparql_alias::canonicalize(&mut parsed, schema_view)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
+    evaluate_with_ceiling(parsed, store, limits)
+}
+
+/// Evaluate a parsed query over a loaded store under the caller's limits,
+/// the wall-clock ceiling included: the one evaluation both
+/// [`sparql_execute`] and [`sparql_finish`] run, so the two routes are held
+/// to the same ceiling, the same backlog bound and the same row cap.
+#[cfg(feature = "sparql-endpoint")]
+fn evaluate_with_ceiling(
+    parsed: spargebra::Query,
+    store: Store,
+    limits: ExecuteLimits,
+) -> Result<SparqlAnswer, ExecuteError> {
     match limits.max_eval_millis {
         None => evaluate(parsed, &store, &limits, None),
         // The ceiling. Evaluation runs on its own thread and the caller waits
@@ -640,9 +657,258 @@ fn evaluate(
     }
 }
 
+/// Every pattern of a query, mutably, for the placeholder walk. Exhaustive
+/// over what the planner writes back; a variant it does not visit holds no
+/// placeholder the count can find, so an unvisited shape fails closed at
+/// plan time rather than being filled wrongly here.
+fn visit_patterns(
+    pattern: &mut spargebra::algebra::GraphPattern,
+    f: &mut dyn FnMut(&mut spargebra::algebra::GraphPattern),
+) {
+    use spargebra::algebra::GraphPattern as P;
+    f(pattern);
+    match pattern {
+        P::Join { left, right }
+        | P::LeftJoin { left, right, .. }
+        | P::Lateral { left, right }
+        | P::Union { left, right }
+        | P::Minus { left, right } => {
+            visit_patterns(left, f);
+            visit_patterns(right, f);
+        }
+        P::Filter { inner, .. }
+        | P::Graph { inner, .. }
+        | P::Extend { inner, .. }
+        | P::OrderBy { inner, .. }
+        | P::Project { inner, .. }
+        | P::Distinct { inner }
+        | P::Reduced { inner }
+        | P::Slice { inner, .. }
+        | P::Group { inner, .. }
+        | P::Service { inner, .. } => visit_patterns(inner, f),
+        P::Bgp { .. } | P::Path { .. } | P::Values { .. } => {}
+    }
+}
+
+fn query_pattern(query: &mut spargebra::Query) -> &mut spargebra::algebra::GraphPattern {
+    match query {
+        spargebra::Query::Select { pattern, .. }
+        | spargebra::Query::Construct { pattern, .. }
+        | spargebra::Query::Describe { pattern, .. }
+        | spargebra::Query::Ask { pattern, .. } => pattern,
+    }
+}
+
+/// How many `VALUES` blocks of `query` are the statement's placeholder: no
+/// rows, and exactly `vars` in that order. The planner requires one before
+/// it writes a finish query into a plan, so the executor can never fill the
+/// wrong table.
+pub fn placeholders_in(query: &spargebra::Query, vars: &[spargebra::term::Variable]) -> usize {
+    let mut query = query.clone();
+    let mut count = 0usize;
+    visit_patterns(query_pattern(&mut query), &mut |pattern| {
+        if let spargebra::algebra::GraphPattern::Values {
+            variables,
+            bindings,
+        } = pattern
+            && bindings.is_empty()
+            && variables.as_slice() == vars
+        {
+            count += 1;
+        }
+    });
+    count
+}
+
+/// A SPARQL-results term, back as a ground term.
+#[cfg(feature = "sparql-endpoint")]
+fn ground_of_json(value: &serde_json::Value) -> Result<spargebra::term::GroundTerm, ExecuteError> {
+    use spargebra::term::{GroundTerm, Literal, NamedNode};
+    let bad = |why: &str| ExecuteError::QueryError(format!("a solution cell {why}: {value}"));
+    let kind = value
+        .get("type")
+        .and_then(|kind| kind.as_str())
+        .ok_or_else(|| bad("has no type"))?;
+    let text = value
+        .get("value")
+        .and_then(|text| text.as_str())
+        .ok_or_else(|| bad("has no value"))?;
+    Ok(match kind {
+        "uri" => GroundTerm::NamedNode(NamedNode::new(text).map_err(|_| bad("is not an IRI"))?),
+        "literal" | "typed-literal" => {
+            if let Some(lang) = value.get("xml:lang").and_then(|lang| lang.as_str()) {
+                GroundTerm::Literal(
+                    Literal::new_language_tagged_literal(text, lang)
+                        .map_err(|_| bad("has a bad language tag"))?,
+                )
+            } else if let Some(datatype) = value.get("datatype").and_then(|dt| dt.as_str()) {
+                GroundTerm::Literal(Literal::new_typed_literal(
+                    text,
+                    NamedNode::new(datatype).map_err(|_| bad("has a bad datatype"))?,
+                ))
+            } else {
+                GroundTerm::Literal(Literal::new_simple_literal(text))
+            }
+        }
+        // The statement never emits a blank node: a structure is
+        // representable and never serialisable.
+        _ => return Err(bad("is not an IRI or a literal")),
+    })
+}
+
+/// **Finish a query over the statement's rows** (M2 of
+/// `docs/design/sparql-schema-relations-and-row-finish.md`).
+///
+/// `plan` is a `UsedRows` plan: its engine pass carries
+/// [`crate::sparql_plan::EngineInput::Solutions`], whose `finish` is the
+/// engine region written back at plan time with the statement as a
+/// placeholder `VALUES`. `solutions_json` is the statement's rows as SPARQL
+/// Query Results JSON, **in the order the statement returned them**: when
+/// the plan names an ordinal, row *i* (from 1) is bound to it here, so a
+/// caller that reorders the rows reorders the answer.
+///
+/// The rows replace the placeholder, and the finish query is evaluated over
+/// a store holding **only the schema graph** (built only when the finish
+/// reads a named graph), by the same evaluator and under the same limits as
+/// [`sparql_execute`]. There are no instance triples, so the triple ceiling
+/// bounds the **cells** handed over instead -- rows × bound columns, the
+/// ordinal included -- which a cell costs no more than the triple it would
+/// have been on the records route; over it, the answer is
+/// [`ExecuteError::TripleLimitExceeded`], counting cells.
+///
+/// Nothing is derived from the plan here: the query evaluated is the one
+/// the planner verified and printed.
+#[cfg(feature = "sparql-endpoint")]
+pub fn sparql_finish(
+    plan: &crate::sparql_plan::ExecutionPlan,
+    solutions_json: &str,
+    schema_view: &SchemaView,
+    limits: ExecuteLimits,
+    schema_graph_iri: Option<&str>,
+) -> Result<SparqlAnswer, ExecuteError> {
+    use crate::sparql_plan::{EngineInput, PassKind};
+
+    let Some((vars, ordinal, finish)) = plan.passes.iter().find_map(|pass| match &pass.kind {
+        PassKind::Engine(engine) => match &engine.input {
+            EngineInput::Solutions {
+                vars,
+                ordinal,
+                finish,
+                ..
+            } => Some((vars, ordinal, finish)),
+            EngineInput::Records => None,
+        },
+        PassKind::Sql(_) => None,
+    }) else {
+        return Err(ExecuteError::QueryError(
+            "the plan finishes over records, not rows: run it with sparql_execute".to_owned(),
+        ));
+    };
+    if limits.max_eval_millis.is_some() {
+        let abandoned = ABANDONED_EVALUATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        if abandoned >= MAX_ABANDONED_EVALUATIONS {
+            return Err(ExecuteError::EvaluationBacklog {
+                abandoned,
+                limit: MAX_ABANDONED_EVALUATIONS,
+            });
+        }
+    }
+
+    let results: serde_json::Value = serde_json::from_str(solutions_json)
+        .map_err(|e| ExecuteError::QueryError(format!("the statement's rows: {e}")))?;
+    let bindings = results
+        .get("results")
+        .and_then(|results| results.get("bindings"))
+        .and_then(|bindings| bindings.as_array())
+        .ok_or_else(|| {
+            ExecuteError::QueryError("the statement's rows carry no results.bindings".to_owned())
+        })?;
+
+    // The cell budget, before anything is built.
+    let mut cells = 0usize;
+    for binding in bindings {
+        cells += vars
+            .iter()
+            .filter(|var| binding.get(var.as_str()).is_some())
+            .count();
+        if ordinal.is_some() {
+            cells += 1;
+        }
+        if cells > limits.max_triples {
+            return Err(ExecuteError::TripleLimitExceeded {
+                count: cells,
+                limit: limits.max_triples,
+            });
+        }
+    }
+
+    let mut placeholder: Vec<spargebra::term::Variable> = vars
+        .iter()
+        .map(|var| spargebra::term::Variable::new_unchecked(var.clone()))
+        .collect();
+    if let Some(ordinal) = ordinal {
+        placeholder.push(spargebra::term::Variable::new_unchecked(ordinal.clone()));
+    }
+    let mut rows: Vec<Vec<Option<spargebra::term::GroundTerm>>> =
+        Vec::with_capacity(bindings.len());
+    for (index, binding) in bindings.iter().enumerate() {
+        let mut row = Vec::with_capacity(placeholder.len());
+        for var in vars {
+            row.push(match binding.get(var.as_str()) {
+                Some(cell) => Some(ground_of_json(cell)?),
+                None => None,
+            });
+        }
+        if ordinal.is_some() {
+            row.push(Some(spargebra::term::GroundTerm::Literal(
+                spargebra::term::Literal::from((index + 1) as i64),
+            )));
+        }
+        rows.push(row);
+    }
+
+    let mut parsed = crate::sparql_scoper::parse_query(finish)
+        .map_err(|e| ExecuteError::QueryError(format!("the finish query: {e}")))?;
+    let mut filled = 0usize;
+    let mut rows = Some(rows);
+    visit_patterns(query_pattern(&mut parsed), &mut |pattern| {
+        if let spargebra::algebra::GraphPattern::Values {
+            variables,
+            bindings,
+        } = pattern
+            && bindings.is_empty()
+            && variables.as_slice() == placeholder.as_slice()
+            && let Some(rows) = rows.take()
+        {
+            *bindings = rows;
+            filled += 1;
+        }
+    });
+    if filled != 1 {
+        return Err(ExecuteError::QueryError(
+            "the finish query has no placeholder for the statement's rows".to_owned(),
+        ));
+    }
+
+    let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+    if let Some(schema_graph_iri) = schema_graph_iri
+        && crate::sparql_graph_clauses::query_reads_named_graphs(finish, schema_view)
+    {
+        let schema_graph =
+            crate::sparql_schema_graph::SchemaGraph::build(schema_view, schema_graph_iri)
+                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+        for quad in &schema_graph.quads {
+            store
+                .insert(quad)
+                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+        }
+    }
+    evaluate_with_ceiling(parsed, store, limits)
+}
+
 /// Convert an RDF term to SPARQL JSON Results format.
 #[cfg(feature = "sparql-endpoint")]
-fn term_to_json(term: &oxigraph::model::Term) -> serde_json::Value {
+pub(crate) fn term_to_json(term: &oxigraph::model::Term) -> serde_json::Value {
     use oxigraph::model::Term;
     match term {
         Term::NamedNode(nn) => serde_json::json!({
@@ -1017,6 +1283,56 @@ classes:
         assert!(
             count < 1000,
             "loading should have stopped near the ceiling, but {count} triples were read"
+        );
+    }
+
+    /// Two records' inlined structures stay two blank nodes when they are
+    /// loaded in one chunk: each record is parsed on its own, so the `_:b0`
+    /// every record's Turtle starts from is renamed apart. Concatenated into
+    /// one document, the two became one node and the query answered a cross
+    /// product -- four rows for two signals (found by the consolidator's
+    /// oracle over `sourceMetaInfo`, #494 pepibru GitLab).
+    #[test]
+    fn a_chunk_keeps_each_records_blank_nodes_its_own() {
+        let sv = crate::sparql_scoper::tests::test_schema_view();
+        let conv = sv.converter();
+        let class = sv
+            .get_class(&Identifier::new("Signal"), &conv)
+            .unwrap()
+            .unwrap();
+        let instances: Vec<LinkMLInstance> = [("A", 1), ("B", 2)]
+            .iter()
+            .map(|(id, lon)| {
+                load_json_str(
+                    &format!(
+                        r#"{{"asset360_uri": "https://data.infrabel.be/asset360/signal/{id}", "location": {{"longitude": {lon}}}}}"#
+                    ),
+                    &sv,
+                    &class,
+                    &conv,
+                )
+                .unwrap()
+                .into_instance_tolerate_errors()
+                .unwrap()
+            })
+            .collect();
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let result = sparql_execute(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?lon WHERE { ?s a asset360:Signal ; asset360:location ?l . \
+             ?l asset360:longitude ?lon }",
+            &refs,
+            &sv,
+            ExecuteLimits::default(),
+            None,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.body).unwrap();
+        let bindings = parsed["results"]["bindings"].as_array().unwrap();
+        assert_eq!(
+            bindings.len(),
+            2,
+            "one row per signal, not a product: {bindings:?}"
         );
     }
 

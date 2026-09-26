@@ -1569,6 +1569,41 @@ class CommonMetadata:
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     def __new__(cls, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> CommonMetadata: ...
 
+class ConstantColumn:
+    r"""
+    One column of a ``"constant"``: an inline table the statement joins.
+    """
+    @property
+    def var(self) -> builtins.str:
+        r"""
+        The variable, which is also the column's name in the table.
+        """
+    @property
+    def term_kind(self) -> builtins.str:
+        r"""
+        How a cell becomes an RDF term: ``"iri"``, ``"literal"`` or
+        ``"enum_iri"`` (a key column compared with an enum slot holds that
+        slot's stored codes).
+        """
+    @property
+    def datatype(self) -> typing.Optional[builtins.str]:
+        r"""
+        Datatype IRI for a typed literal column, or ``None``.
+        """
+    @property
+    def lang(self) -> typing.Optional[builtins.str]:
+        r"""
+        Language tag of a language-tagged literal column, or ``None``.
+        """
+    @property
+    def key_translation(self) -> typing.Optional[builtins.str]:
+        r"""
+        On the key column: ``"identity"``, ``"enum→code"`` or ``"lexical"``,
+        the translation from a concept or literal to the other side's stored
+        text. ``None`` on every other column.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class ConstraintSet:
     @staticmethod
     def from_json(json:builtins.str) -> ConstraintSet:
@@ -2682,9 +2717,14 @@ class ExecutionPlan:
     @property
     def refinement(self) -> builtins.str:
         r"""
-        Where these operators came from: ``"used"``, ``"used_alone"`` or
-        ``"fallback"``. Every plan comes from :func:`plan_query_refined`, the
-        only planner, so these three are the whole vocabulary.
+        Where these operators came from: ``"used"``, ``"used_rows"``,
+        ``"used_alone"`` or ``"fallback"``. Every plan comes from
+        :func:`plan_query_refined`, the only planner, so these four are the
+        whole vocabulary.
+        
+        ``"used_rows"``: the statement answers every data read and emits
+        solution rows, and the engine finishes over them and the schema
+        graph -- see ``PlanPass.engine_input``.
         
         ``"used"`` and ``"used_alone"`` are different risks and read
         differently on purpose. ``"used"`` is a *fetch*: the statement narrows
@@ -4161,13 +4201,18 @@ class PlanOp:
     @property
     def join_key_left(self) -> typing.Optional[JoinColumn]:
         r"""
-        For a ``"join"`` on ``"identity"`` or ``"element"``: the left column,
-        as [`JoinColumn`].
+        For a ``"join"`` on ``"identity"``, ``"element"`` or ``"value"``: the
+        left column, as [`JoinColumn`]. For ``"value"`` one side is a
+        ``"constant"``'s key column (``source`` its alias, ``column`` the
+        variable) and the other a star's identity (empty ``path``), a star's
+        single-valued slot (``path`` the slot path, read as text:
+        ``object_data #>> path``) or a relation column.
         """
     @property
     def join_key_right(self) -> typing.Optional[JoinColumn]:
         r"""
-        For a ``"join"`` on ``"identity"`` or ``"element"``: the right column.
+        For a ``"join"`` on ``"identity"``, ``"element"`` or ``"value"``: the
+        right column.
         """
     @property
     def right_reading(self) -> typing.Optional[builtins.str]:
@@ -4192,7 +4237,25 @@ class PlanOp:
     @property
     def relation_alias(self) -> typing.Optional[builtins.str]:
         r"""
-        For ``"relation"``: the alias the derived table is joined under.
+        For ``"relation"`` and ``"constant"``: the alias the derived table is
+        joined under.
+        """
+    @property
+    def constant_columns(self) -> builtins.list[ConstantColumn]:
+        r"""
+        For ``"constant"``: one entry per column of the inline table, in
+        column order -- the variable (also the column's name), how a cell
+        becomes a term, and, on the key column, the translation that made
+        its cells the other side's stored text.
+        """
+    @property
+    def constant_rows(self) -> builtins.list[builtins.list[typing.Optional[builtins.str]]]:
+        r"""
+        For ``"constant"``: every row, duplicates included (the table is a
+        bag, never rendered under ``DISTINCT``), one stored text per column
+        in ``constant_columns`` order; ``None`` is ``NULL``. Render as
+        ``(VALUES (…), …) AS <alias>(<vars>)``, every cell ``text``; an
+        empty list is a table with no rows.
         """
     @property
     def relation_body(self) -> builtins.list[PlanOp]:
@@ -4310,6 +4373,46 @@ class PlanPass:
         descriptions of one pass is how a reader comes to use the stale one.
         """
     @property
+    def engine_input(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``kind == "engine"``: what the engine reads. ``"records"``: the
+        SQL pass fetched records, load them and re-run the whole query over
+        them (``sparql_execute``). ``"solutions"``: the SQL pass is a
+        statement whose rows are solutions over ``solution_vars``; the engine
+        evaluates ``finish`` over those rows and the schema graph and loads
+        no record (``sparql_finish``). ``None`` for an SQL pass. Closed set:
+        refuse a value you do not know.
+        """
+    @property
+    def solution_vars(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``engine_input == "solutions"``: the statement's columns, as the
+        variables they bind, in the statement's projection order.
+        """
+    @property
+    def ordinal(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``engine_input == "solutions"``: the variable ``sparql_finish``
+        numbers the rows in, ``1..`` in the order they are handed over --
+        the order the statement returned them, which a caller must keep.
+        ``None`` when the finish needs no order.
+        """
+    @property
+    def finish(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``engine_input == "solutions"``: the engine region as the SPARQL
+        query ``sparql_finish`` evaluates, written at plan time.
+        """
+    @property
+    def preserves_rows(self) -> builtins.bool:
+        r"""
+        For ``engine_input == "solutions"``: whether the finish answers
+        exactly one row per statement row. Then the row cap applies to the
+        statement itself; otherwise the answer may be smaller than the rows,
+        so the statement is bounded by the cell budget and the cap applies to
+        the finish's answer.
+        """
+    @property
     def causes(self) -> builtins.list[builtins.str]:
         r"""
         For ``kind == "engine"``: why the engine is needed, as stable cause
@@ -4394,6 +4497,15 @@ class PushdownBinding:
         representable -- a relation exports it, a join compares it, a
         ``GROUP BY`` groups by it -- and never serialisable; ``term_kind`` is
         a placeholder for it and a renderer must not emit it as an answer.
+        """
+    @property
+    def witness(self) -> builtins.bool:
+        r"""
+        ``True`` when the column is a left join's *match witness*: render
+        ``CASE WHEN <column> IS NULL THEN NULL ELSE 'true' END`` over the
+        column the binding otherwise names (a relation column, a star's
+        identity, a constant's key column) -- ``true`` exactly where that
+        join's right side matched. Its term is ``xsd:boolean``.
         """
     @property
     def numeric(self) -> builtins.bool:
@@ -4689,6 +4801,8 @@ class RelationColumn:
         r"""
         ``"identity"`` (a scanned record's ``asset360_uri``, under
         ``holder_star``), ``"slot"`` (a value the body's ``binding`` reads),
+        ``"constant"`` (a column of an inline table in the body, read by the
+        body's ``binding``, whose ``relation`` is the table's alias),
         ``"measure"`` (an aggregate under its own name in the body's
         grouping) or ``"structure"`` (an inlined element's occurrence
         identifier, composed in the body from ``binding``'s hops).
@@ -7111,7 +7225,7 @@ def naive_plan_text(query:builtins.str) -> builtins.str:
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None) -> ExecutionPlan:
+def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None, rows_route:builtins.bool=True) -> ExecutionPlan:
     r"""
     Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
     
@@ -7132,9 +7246,18 @@ def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_
       fetch is used instead, with ``refinement_reason`` saying why. No shape in
       the frozen inventory does this.
     
+    * ``"used_rows"`` — the statement answers every data read and emits
+      solution rows; the engine finishes over them and the schema graph
+      (``sparql_finish``) and loads no record.
+    
     Args:
         query: SPARQL query string.
         schema_view: The LinkML schema.
+        schema_graph_iri: The active datamodel's schema graph, or ``None``.
+        rows_route: ``False`` plans without the rows route (``"used_rows"``):
+            what a caller asks for when it cannot render that route's
+            statement. The records route answers every query the rows route
+            does, more slowly, so declining one is never a wrong answer.
     
     Returns:
         ExecutionPlan. Check ``is_accounted`` before running it — a plan with a
@@ -7215,6 +7338,37 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
     Raises:
         RuntimeError: Conversion failure (with object URI), limit exceeded,
             or query execution error.
+    """
+
+def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
+    r"""
+    Finish a ``refinement == "used_rows"`` plan over its statement's rows.
+    
+    The engine pass's ``finish`` query is evaluated with the rows in place of
+    its placeholder ``VALUES``, over a store holding only the schema graph
+    (built only when the finish reads a named graph). No record is loaded.
+    
+    Args:
+        plan: The ``used_rows`` plan the statement was rendered from.
+        solutions_json: The statement's rows as SPARQL Query Results JSON
+            over the pass's ``solution_vars`` -- **in the order the
+            statement returned them**: when the pass names an ``ordinal``,
+            row *i* is numbered *i* here and the answer is ordered by it.
+        schema_view: The active datamodel.
+        max_triples: The budget of *cells* handed over (rows × bound
+            columns, the ordinal included): a cell costs no more than the
+            triple it would have been on the records route. Over it, the
+            call raises ``RuntimeError("Triple limit exceeded: …")``.
+        max_result_rows: Maximum rows of the answer.
+        schema_graph_iri: As for ``sparql_execute``.
+        max_eval_millis: As for ``sparql_execute``.
+    
+    Returns:
+        ``(content_type, body)``, as ``sparql_execute``.
+    
+    Raises:
+        RuntimeError: a limit exceeded, a plan that finishes over records, or
+            an evaluation error -- the same texts ``sparql_execute`` raises.
     """
 
 def sparql_inexact_reasons() -> builtins.list[builtins.str]:

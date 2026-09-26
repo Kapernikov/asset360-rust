@@ -61,6 +61,16 @@ pub fn plan_to_query(plan: &Plan, schema: &SchemaView) -> Option<Query> {
     })
 }
 
+/// A left join's right side with its match witness: `BIND(true AS ?m)`
+/// appended, so `?m` is bound exactly where the right side matched.
+pub fn with_witness(right: GraphPattern, witness: &str) -> GraphPattern {
+    GraphPattern::Extend {
+        inner: Box::new(right),
+        variable: Variable::new_unchecked(witness.to_owned()),
+        expression: Expression::Literal(spargebra::term::Literal::from(true)),
+    }
+}
+
 /// The algebra of the subtree rooted at `node`.
 pub fn plan_to_algebra(plan: &Plan, schema: &SchemaView, node: NodeId) -> Option<GraphPattern> {
     let mut translation = Translation {
@@ -183,11 +193,16 @@ impl Translation<'_> {
                 right,
                 condition,
                 reference,
+                witness,
                 ..
             } => {
                 let left = self.pattern(*left)?;
                 let right = self.pattern(*right)?;
                 let right = self.with_edge(right, reference.as_ref(), node)?;
+                let right = match witness {
+                    Some(witness) => with_witness(right, witness),
+                    None => right,
+                };
                 let expression = match condition {
                     Some(condition) => Some(self.expression(condition, node)?),
                     None => None,
@@ -257,7 +272,7 @@ impl Translation<'_> {
                 }
                 pattern
             }
-            PlanOp::Sort { input, terms } => {
+            PlanOp::Sort { input, terms, .. } => {
                 let inner = self.pattern(*input)?;
                 let mut expression = Vec::with_capacity(terms.len());
                 for term in terms {
@@ -529,7 +544,11 @@ impl Translation<'_> {
                 }
                 pattern
             }
+            // Row numbering has no algebra: the finish query reads the
+            // ordinal as a column of the rows it is handed, never computes
+            // it (see `crate::sparql_lift`).
             PlanOp::Service { .. }
+            | PlanOp::Number { .. }
             | PlanOp::Construct { .. }
             | PlanOp::Describe { .. }
             | PlanOp::Ask { .. } => return None,
@@ -550,9 +569,36 @@ impl Translation<'_> {
             return Some(side);
         };
         let class_uri = self.class_of_scan(&edge.holder, at)?;
+        // An element-held edge reads the key off the element the holder's
+        // unnest binds: `?element <slot> ?referenced`, the element's own
+        // triple, where a record's is `?holder <slot> ?referenced`.
+        let (subject, class_uri) = if edge.path.is_empty() {
+            (edge.holder.clone(), class_uri)
+        } else {
+            let element =
+                self.plan
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(id, node)| match &node.op {
+                        PlanOp::Unnest {
+                            star_var,
+                            slot_path,
+                            var,
+                            ..
+                        } if *star_var == edge.holder
+                            && *slot_path == edge.path
+                            && self.plan.feeds(id, at) =>
+                        {
+                            Some(var.clone())
+                        }
+                        _ => None,
+                    })?;
+            (element, self.class_at(&class_uri, &edge.path)?)
+        };
         let predicate = self.predicate(&class_uri, &edge.slot)?;
         let triple = TriplePattern {
-            subject: TermPattern::Variable(Variable::new_unchecked(edge.holder.clone())),
+            subject: TermPattern::Variable(Variable::new_unchecked(subject)),
             predicate: NamedNodePattern::NamedNode(predicate),
             object: TermPattern::Variable(Variable::new_unchecked(edge.referenced.clone())),
         };
@@ -1031,7 +1077,7 @@ mod tests {
 /// the per-rewrite oracle, and the direct tests for the nodes a naive plan
 /// does not have.
 #[cfg(all(test, feature = "sparql-endpoint"))]
-mod equivalence {
+pub(crate) mod equivalence {
     use super::*;
     use crate::sparql_oracle::{Oracle, fixture};
     use crate::sparql_rules::{Rule, tier_one_rules};
@@ -1049,7 +1095,7 @@ mod equivalence {
     /// Refine one query one application at a time, translating the plan
     /// before and after each and holding both to the oracle. Returns the
     /// refined plan.
-    fn each_rewrite_preserves_answers(
+    pub(crate) fn each_rewrite_preserves_answers(
         query: &str,
         schema: &SchemaView,
         oracle: &Oracle,
@@ -1112,7 +1158,7 @@ mod equivalence {
     /// whole-mapping observers, a two-level array hop, and one level of
     /// nesting; each placed as a mandatory sub-select, an `OPTIONAL` body,
     /// or `OPTIONAL { { SELECT … } }`. Small enough to enumerate.
-    fn grammar() -> Vec<String> {
+    pub(crate) fn grammar() -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
 
         // The bodies a sub-select may have, each with its projection list.

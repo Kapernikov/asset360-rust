@@ -41,10 +41,12 @@ pub mod shacl_ast;
 pub mod sparql_algebra;
 pub mod sparql_alias;
 pub mod sparql_columns;
+pub mod sparql_constant;
 pub mod sparql_domains;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
 pub mod sparql_graph_clauses;
+pub mod sparql_lift;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_materialise;
 pub mod sparql_ops;
@@ -106,6 +108,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(py_naive_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_finish, m)?)?;
         // The token an unscoped refusal opens with when it names its own
         // rewrite (`sparql_scoper::UNSCOPED_REWRITE_NAMED`): exported so the
         // endpoint reads the constant instead of carrying a copy of it.
@@ -130,6 +133,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PushdownBinding>()?;
         m.add_class::<JoinColumn>()?;
         m.add_class::<RelationColumn>()?;
+        m.add_class::<ConstantColumn>()?;
         m.add_class::<PushdownMeasure>()?;
         m.add_class::<PushdownOrder>()?;
         m.add_class::<PushdownHaving>()?;
@@ -2064,6 +2068,16 @@ impl PushdownBinding {
         self.inner.occurrence
     }
 
+    /// ``True`` when the column is a left join's *match witness*: render
+    /// ``CASE WHEN <column> IS NULL THEN NULL ELSE 'true' END`` over the
+    /// column the binding otherwise names (a relation column, a star's
+    /// identity, a constant's key column) -- ``true`` exactly where that
+    /// join's right side matched. Its term is ``xsd:boolean``.
+    #[getter]
+    fn witness(&self) -> bool {
+        self.inner.witness
+    }
+
     /// ``True`` when the slot's values are numbers.
     ///
     /// The renderer needs this twice over: a numeric column is cast before
@@ -2557,6 +2571,68 @@ impl JoinColumn {
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass]
 #[derive(Clone)]
+/// One column of a ``"constant"``: an inline table the statement joins.
+pub struct ConstantColumn {
+    inner: crate::sparql_ops::ConstantColumn,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl ConstantColumn {
+    /// The variable, which is also the column's name in the table.
+    #[getter]
+    fn var(&self) -> String {
+        self.inner.var.clone()
+    }
+
+    /// How a cell becomes an RDF term: ``"iri"``, ``"literal"`` or
+    /// ``"enum_iri"`` (a key column compared with an enum slot holds that
+    /// slot's stored codes).
+    #[getter]
+    fn term_kind(&self) -> &'static str {
+        use crate::sparql_terms::TermKind;
+        match self.inner.descriptor.kind {
+            TermKind::Iri => "iri",
+            TermKind::Literal => "literal",
+            TermKind::EnumIri => "enum_iri",
+        }
+    }
+
+    /// Datatype IRI for a typed literal column, or ``None``.
+    #[getter]
+    fn datatype(&self) -> Option<String> {
+        self.inner.descriptor.datatype.clone()
+    }
+
+    /// Language tag of a language-tagged literal column, or ``None``.
+    #[getter]
+    fn lang(&self) -> Option<String> {
+        self.inner.descriptor.lang.clone()
+    }
+
+    /// On the key column: ``"identity"``, ``"enum→code"`` or ``"lexical"``,
+    /// the translation from a concept or literal to the other side's stored
+    /// text. ``None`` on every other column.
+    #[getter]
+    fn key_translation(&self) -> Option<&'static str> {
+        self.inner.key.as_ref().map(|key| key.translation.as_str())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ConstantColumn(var={:?}, term_kind={:?}, key={:?})",
+            self.inner.var,
+            self.term_kind(),
+            self.key_translation()
+        )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass]
+#[derive(Clone)]
 /// One export of a ``"relation"``: what the outside reads of the derived
 /// table, under the variable's name as the column's.
 pub struct RelationColumn {
@@ -2575,6 +2651,8 @@ impl RelationColumn {
 
     /// ``"identity"`` (a scanned record's ``asset360_uri``, under
     /// ``holder_star``), ``"slot"`` (a value the body's ``binding`` reads),
+    /// ``"constant"`` (a column of an inline table in the body, read by the
+    /// body's ``binding``, whose ``relation`` is the table's alias),
     /// ``"measure"`` (an aggregate under its own name in the body's
     /// grouping) or ``"structure"`` (an inlined element's occurrence
     /// identifier, composed in the body from ``binding``'s hops).
@@ -2624,11 +2702,11 @@ impl RelationColumn {
     fn binding(&self) -> Option<PushdownBinding> {
         use crate::sparql_ops::ColumnKind;
         match &self.inner.kind {
-            ColumnKind::Slot(binding) | ColumnKind::Structure { binding, .. } => {
-                Some(PushdownBinding {
-                    inner: binding.clone(),
-                })
-            }
+            ColumnKind::Slot(binding)
+            | ColumnKind::Structure { binding, .. }
+            | ColumnKind::Constant(binding) => Some(PushdownBinding {
+                inner: binding.clone(),
+            }),
             _ => None,
         }
     }
@@ -3119,14 +3197,21 @@ impl PlanOp {
         }
     }
 
-    /// For a ``"join"`` on ``"identity"`` or ``"element"``: the left column,
-    /// as [`JoinColumn`].
+    /// For a ``"join"`` on ``"identity"``, ``"element"`` or ``"value"``: the
+    /// left column, as [`JoinColumn`]. For ``"value"`` one side is a
+    /// ``"constant"``'s key column (``source`` its alias, ``column`` the
+    /// variable) and the other a star's identity (empty ``path``), a star's
+    /// single-valued slot (``path`` the slot path, read as text:
+    /// ``object_data #>> path``) or a relation column.
     #[getter]
     fn join_key_left(&self) -> Option<JoinColumn> {
         use crate::sparql_ops::{JoinKey, Op};
         match &self.inner.op {
             Op::Join {
-                key: JoinKey::Identity { left, .. } | JoinKey::Element { left, .. },
+                key:
+                    JoinKey::Identity { left, .. }
+                    | JoinKey::Element { left, .. }
+                    | JoinKey::Value { left, .. },
                 ..
             } => Some(JoinColumn {
                 inner: left.clone(),
@@ -3135,13 +3220,17 @@ impl PlanOp {
         }
     }
 
-    /// For a ``"join"`` on ``"identity"`` or ``"element"``: the right column.
+    /// For a ``"join"`` on ``"identity"``, ``"element"`` or ``"value"``: the
+    /// right column.
     #[getter]
     fn join_key_right(&self) -> Option<JoinColumn> {
         use crate::sparql_ops::{JoinKey, Op};
         match &self.inner.op {
             Op::Join {
-                key: JoinKey::Identity { right, .. } | JoinKey::Element { right, .. },
+                key:
+                    JoinKey::Identity { right, .. }
+                    | JoinKey::Element { right, .. }
+                    | JoinKey::Value { right, .. },
                 ..
             } => Some(JoinColumn {
                 inner: right.clone(),
@@ -3180,13 +3269,46 @@ impl PlanOp {
         }
     }
 
-    /// For ``"relation"``: the alias the derived table is joined under.
+    /// For ``"relation"`` and ``"constant"``: the alias the derived table is
+    /// joined under.
     #[getter]
     fn relation_alias(&self) -> Option<String> {
         use crate::sparql_ops::Op;
         match &self.inner.op {
-            Op::Relation { alias, .. } => Some(alias.clone()),
+            Op::Relation { alias, .. } | Op::Constant { alias, .. } => Some(alias.clone()),
             _ => None,
+        }
+    }
+
+    /// For ``"constant"``: one entry per column of the inline table, in
+    /// column order -- the variable (also the column's name), how a cell
+    /// becomes a term, and, on the key column, the translation that made
+    /// its cells the other side's stored text.
+    #[getter]
+    fn constant_columns(&self) -> Vec<ConstantColumn> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Constant { columns, .. } => columns
+                .iter()
+                .map(|column| ConstantColumn {
+                    inner: column.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``"constant"``: every row, duplicates included (the table is a
+    /// bag, never rendered under ``DISTINCT``), one stored text per column
+    /// in ``constant_columns`` order; ``None`` is ``NULL``. Render as
+    /// ``(VALUES (…), …) AS <alias>(<vars>)``, every cell ``text``; an
+    /// empty list is a table with no rows.
+    #[getter]
+    fn constant_rows(&self) -> Vec<Vec<Option<String>>> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Constant { rows, .. } => rows.clone(),
+            _ => Vec::new(),
         }
     }
 
@@ -3432,6 +3554,84 @@ impl PlanPass {
         }
     }
 
+    /// For ``kind == "engine"``: what the engine reads. ``"records"``: the
+    /// SQL pass fetched records, load them and re-run the whole query over
+    /// them (``sparql_execute``). ``"solutions"``: the SQL pass is a
+    /// statement whose rows are solutions over ``solution_vars``; the engine
+    /// evaluates ``finish`` over those rows and the schema graph and loads
+    /// no record (``sparql_finish``). ``None`` for an SQL pass. Closed set:
+    /// refuse a value you do not know.
+    #[getter]
+    fn engine_input(&self) -> Option<&'static str> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(engine) => Some(match engine.input {
+                crate::sparql_plan::EngineInput::Records => "records",
+                crate::sparql_plan::EngineInput::Solutions { .. } => "solutions",
+            }),
+            crate::sparql_plan::PassKind::Sql(_) => None,
+        }
+    }
+
+    /// For ``engine_input == "solutions"``: the statement's columns, as the
+    /// variables they bind, in the statement's projection order.
+    #[getter]
+    fn solution_vars(&self) -> Vec<String> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(crate::sparql_plan::EnginePass {
+                input: crate::sparql_plan::EngineInput::Solutions { vars, .. },
+                ..
+            }) => vars.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For ``engine_input == "solutions"``: the variable ``sparql_finish``
+    /// numbers the rows in, ``1..`` in the order they are handed over --
+    /// the order the statement returned them, which a caller must keep.
+    /// ``None`` when the finish needs no order.
+    #[getter]
+    fn ordinal(&self) -> Option<String> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(crate::sparql_plan::EnginePass {
+                input: crate::sparql_plan::EngineInput::Solutions { ordinal, .. },
+                ..
+            }) => ordinal.clone(),
+            _ => None,
+        }
+    }
+
+    /// For ``engine_input == "solutions"``: the engine region as the SPARQL
+    /// query ``sparql_finish`` evaluates, written at plan time.
+    #[getter]
+    fn finish(&self) -> Option<String> {
+        match &self.inner.kind {
+            crate::sparql_plan::PassKind::Engine(crate::sparql_plan::EnginePass {
+                input: crate::sparql_plan::EngineInput::Solutions { finish, .. },
+                ..
+            }) => Some(finish.clone()),
+            _ => None,
+        }
+    }
+
+    /// For ``engine_input == "solutions"``: whether the finish answers
+    /// exactly one row per statement row. Then the row cap applies to the
+    /// statement itself; otherwise the answer may be smaller than the rows,
+    /// so the statement is bounded by the cell budget and the cap applies to
+    /// the finish's answer.
+    #[getter]
+    fn preserves_rows(&self) -> bool {
+        matches!(
+            &self.inner.kind,
+            crate::sparql_plan::PassKind::Engine(crate::sparql_plan::EnginePass {
+                input: crate::sparql_plan::EngineInput::Solutions {
+                    preserves_rows: true,
+                    ..
+                },
+                ..
+            })
+        )
+    }
+
     /// For ``kind == "engine"``: why the engine is needed, as stable cause
     /// codes. Useful in a log line or an explain output — the reader wants to
     /// know what stopped SQL from answering alone.
@@ -3503,9 +3703,14 @@ impl ExecutionPlan {
             .collect()
     }
 
-    /// Where these operators came from: ``"used"``, ``"used_alone"`` or
-    /// ``"fallback"``. Every plan comes from :func:`plan_query_refined`, the
-    /// only planner, so these three are the whole vocabulary.
+    /// Where these operators came from: ``"used"``, ``"used_rows"``,
+    /// ``"used_alone"`` or ``"fallback"``. Every plan comes from
+    /// :func:`plan_query_refined`, the only planner, so these four are the
+    /// whole vocabulary.
+    ///
+    /// ``"used_rows"``: the statement answers every data read and emits
+    /// solution rows, and the engine finishes over them and the schema
+    /// graph -- see ``PlanPass.engine_input``.
     ///
     /// ``"used"`` and ``"used_alone"`` are different risks and read
     /// differently on purpose. ``"used"`` is a *fetch*: the statement narrows
@@ -3609,7 +3814,7 @@ impl ExecutionPlan {
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "plan_query_refined")]
-#[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
+#[pyo3(signature = (query, schema_view, schema_graph_iri=None, rows_route=true))]
 /// Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
 ///
 /// The only planner. A naive plan of the whole query is refined by rules to a
@@ -3629,9 +3834,18 @@ impl ExecutionPlan {
 ///   fetch is used instead, with ``refinement_reason`` saying why. No shape in
 ///   the frozen inventory does this.
 ///
+/// * ``"used_rows"`` — the statement answers every data read and emits
+///   solution rows; the engine finishes over them and the schema graph
+///   (``sparql_finish``) and loads no record.
+///
 /// Args:
 ///     query: SPARQL query string.
 ///     schema_view: The LinkML schema.
+///     schema_graph_iri: The active datamodel's schema graph, or ``None``.
+///     rows_route: ``False`` plans without the rows route (``"used_rows"``):
+///         what a caller asks for when it cannot render that route's
+///         statement. The records route answers every query the rows route
+///         does, more slowly, so declining one is never a wrong answer.
 ///
 /// Returns:
 ///     ExecutionPlan. Check ``is_accounted`` before running it — a plan with a
@@ -3646,14 +3860,20 @@ fn py_plan_query_refined(
     query: &str,
     schema_view: Py<PySchemaView>,
     schema_graph_iri: Option<String>,
+    rows_route: bool,
 ) -> PyResult<ExecutionPlan> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    crate::sparql_plan::plan_query_refined_with_schema_graph(query, sv, schema_graph_iri.as_deref())
-        .map(|inner| ExecutionPlan { inner })
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    crate::sparql_plan::plan_query_refined_with_options(
+        query,
+        sv,
+        schema_graph_iri.as_deref(),
+        rows_route,
+    )
+    .map(|inner| ExecutionPlan { inner })
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -3957,6 +4177,82 @@ fn sparql_execute(
         }
         // `EvaluationBacklog` reaches Python as its own `Display`, through
         // the arm below: one text, the one `sparql/engine.py` matches on.
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (plan, solutions_json, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None, max_eval_millis=None))]
+/// Finish a ``refinement == "used_rows"`` plan over its statement's rows.
+///
+/// The engine pass's ``finish`` query is evaluated with the rows in place of
+/// its placeholder ``VALUES``, over a store holding only the schema graph
+/// (built only when the finish reads a named graph). No record is loaded.
+///
+/// Args:
+///     plan: The ``used_rows`` plan the statement was rendered from.
+///     solutions_json: The statement's rows as SPARQL Query Results JSON
+///         over the pass's ``solution_vars`` -- **in the order the
+///         statement returned them**: when the pass names an ``ordinal``,
+///         row *i* is numbered *i* here and the answer is ordered by it.
+///     schema_view: The active datamodel.
+///     max_triples: The budget of *cells* handed over (rows × bound
+///         columns, the ordinal included): a cell costs no more than the
+///         triple it would have been on the records route. Over it, the
+///         call raises ``RuntimeError("Triple limit exceeded: …")``.
+///     max_result_rows: Maximum rows of the answer.
+///     schema_graph_iri: As for ``sparql_execute``.
+///     max_eval_millis: As for ``sparql_execute``.
+///
+/// Returns:
+///     ``(content_type, body)``, as ``sparql_execute``.
+///
+/// Raises:
+///     RuntimeError: a limit exceeded, a plan that finishes over records, or
+///         an evaluation error -- the same texts ``sparql_execute`` raises.
+#[allow(clippy::too_many_arguments)]
+fn sparql_finish(
+    py: Python<'_>,
+    plan: &ExecutionPlan,
+    solutions_json: &str,
+    schema_view: Py<PySchemaView>,
+    max_triples: usize,
+    max_result_rows: usize,
+    schema_graph_iri: Option<String>,
+    max_eval_millis: Option<u64>,
+) -> PyResult<(String, String)> {
+    let bound_sv = schema_view.bind(py);
+    let sv_ref = bound_sv.borrow();
+    let sv = sv_ref.as_rust();
+    match crate::sparql_executor::sparql_finish(
+        &plan.inner,
+        solutions_json,
+        sv,
+        crate::sparql_executor::ExecuteLimits {
+            max_triples,
+            max_result_rows,
+            max_eval_millis,
+        },
+        schema_graph_iri.as_deref(),
+    ) {
+        Ok(answer) => Ok((answer.content_type, answer.body)),
+        Err(crate::sparql_executor::ExecuteError::TripleLimitExceeded { count, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Triple limit exceeded: {count} > {limit} (cells handed to the engine)"
+            )))
+        }
+        Err(crate::sparql_executor::ExecuteError::ResultLimitExceeded { count, limit }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Result row limit exceeded: {count} > {limit}"
+            )))
+        }
+        Err(crate::sparql_executor::ExecuteError::EvaluationTimeExceeded { millis }) => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Evaluation time limit exceeded: the engine ran for more than {millis} ms"
+            )))
+        }
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }

@@ -104,6 +104,13 @@ impl NodeKey {
     /// The placeholder a freshly built node carries until the plan installs
     /// it. Never the key of a node in a plan.
     pub const UNASSIGNED: NodeKey = NodeKey(0);
+
+    /// A reference to this node in a log line a rule writes: printed as the
+    /// node's position *when the plan is printed* ([`Plan::render_node_refs`]),
+    /// so a later rewrite that renumbers the plan does not make it lie.
+    pub fn reference(&self) -> String {
+        format!("⟦{}⟧", self.0)
+    }
 }
 
 impl fmt::Display for NodeKey {
@@ -1837,6 +1844,16 @@ pub struct SortTerm {
     pub desc: bool,
 }
 
+/// Whose ordering a [`PlanOp::Sort`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrigin {
+    /// The query's own `ORDER BY`.
+    Query,
+    /// R3's restoring sort, over the ordinal the executor numbers the
+    /// statement's rows into.
+    Ordinal,
+}
+
 /// One value a [`PlanOp::Scan`] reads, and whether reading it fans out.
 ///
 /// `multivalued` is the field the fold rule's precondition rests on. 28d
@@ -1959,6 +1976,57 @@ pub enum JoinKey {
     },
     /// `on = []`: every pair. `CROSS JOIN`, or `LEFT JOIN … ON true`.
     Cross,
+    /// One side is a [`PlanOp::Values`] lowered as a constant table (M1 of
+    /// `docs/design/sparql-schema-relations-and-row-finish.md`), and the
+    /// join is SQL equality between its key column and the other side's
+    /// column for `var` -- which is SPARQL compatibility *only* under the
+    /// preconditions [`crate::sparql_constant::LowerConstantRelation`]
+    /// checks (K1–K7), and [`Plan::join_keys_agree`] checks again.
+    ///
+    /// `translation` is how a cell becomes the stored text the other
+    /// column holds; `column` names that column for a reader; `kept` and
+    /// `dropped` count the table's rows after the translation -- a dropped
+    /// row is one whose term lies outside the other column's image, which
+    /// matches nothing because the other side binds `var` in every solution.
+    Value {
+        var: String,
+        translation: KeyTranslation,
+        column: String,
+        kept: usize,
+        dropped: usize,
+    },
+}
+
+/// How a constant table's key cell becomes the stored text of the column it
+/// is compared with: the inverse image of that column's stored-to-term map,
+/// which is what makes SQL equality `sameTerm` (M1's K4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTranslation {
+    /// A record's identity: the IRI's own text.
+    Identity,
+    /// An enum slot: a concept IRI → the stored code(s) that mean it.
+    EnumCode,
+    /// A string slot (plain, or of one fixed language): the lexical form.
+    Lexical,
+}
+
+impl KeyTranslation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::EnumCode => "enum→code",
+            Self::Lexical => "lexical",
+        }
+    }
+
+    /// What a dropped cell is, for a printout: what it lies outside of.
+    pub fn outside(&self) -> &'static str {
+        match self {
+            Self::Identity => "not an IRI",
+            Self::EnumCode => "outside enum",
+            Self::Lexical => "of another kind",
+        }
+    }
 }
 
 impl fmt::Display for JoinKey {
@@ -1969,6 +2037,12 @@ impl fmt::Display for JoinKey {
             }
             Self::Element { var, path, .. } => write!(f, "element ?{var} at {}", path.join(".")),
             Self::Cross => f.write_str("cross"),
+            Self::Value {
+                var,
+                translation,
+                column,
+                ..
+            } => write!(f, "value ?{var} ({column}, {})", translation.as_str()),
         }
     }
 }
@@ -2039,6 +2113,14 @@ pub enum PlanOp {
         /// drops the rows the join exists to keep), and an obligation nobody
         /// claims is what makes losing it visible.
         condition: Option<Expr>,
+        /// A *match witness*: a fresh variable this join binds to `true` in
+        /// exactly the solutions where its right side matched, and leaves
+        /// unbound where the left row was kept unextended. Set only by the
+        /// lifting rules R1 and R2 (`crate::sparql_lift`), which read it
+        /// above the join as `BOUND(?m)`. In algebra it is `BIND(true AS
+        /// ?m)` appended to the right side; in SQL it is a column that is
+        /// non-`NULL` exactly when the right side joined.
+        witness: Option<String>,
     },
     /// `FILTER NOT EXISTS { ... }`: rows of `left` with no solution in
     /// `right`.
@@ -2099,6 +2181,19 @@ pub enum PlanOp {
     Sort {
         input: NodeId,
         terms: Vec<SortTerm>,
+        /// Whose ordering this is: the query's `ORDER BY`, or the sort that
+        /// restores the statement's row order from its ordinal (R3). No rule
+        /// matches an `Ordinal` sort and no progress measure counts one.
+        origin: SortOrigin,
+    },
+    /// The executor numbers its input's rows `1, 2, …` into `var`, in the
+    /// order they arrive. Only R3 (`crate::sparql_lift`) places one, directly
+    /// above the SQL statement whose row order it records, and only an
+    /// `Ordinal` sort reads it: order crosses the SQL/engine boundary as data,
+    /// because no engine operator is trusted to preserve it.
+    Number {
+        input: NodeId,
+        var: String,
     },
     Distinct {
         input: NodeId,
@@ -2254,6 +2349,7 @@ impl PlanOp {
             | Self::Bind { input, .. }
             | Self::Group { input, .. }
             | Self::Sort { input, .. }
+            | Self::Number { input, .. }
             | Self::Distinct { input }
             | Self::Reduced { input }
             | Self::Slice { input, .. }
@@ -2291,6 +2387,7 @@ impl PlanOp {
             | Self::Bind { input, .. }
             | Self::Group { input, .. }
             | Self::Sort { input, .. }
+            | Self::Number { input, .. }
             | Self::Distinct { input }
             | Self::Reduced { input }
             | Self::Slice { input, .. }
@@ -2322,6 +2419,7 @@ impl PlanOp {
             Self::Bind { .. } => "bind",
             Self::Group { .. } => "group",
             Self::Sort { .. } => "sort",
+            Self::Number { .. } => "number",
             Self::Distinct { .. } => "distinct",
             Self::Reduced { .. } => "reduced",
             Self::Slice { .. } => "slice",
@@ -2493,6 +2591,40 @@ pub struct Plan {
     /// became -- or `None` when nothing did. What lets evidence recorded by
     /// key resolve after the node it named is gone. See [`Plan::retire`].
     pub retired: BTreeMap<NodeKey, Option<NodeKey>>,
+    /// Obligations a rule moved out of the scope they were raised in, one
+    /// step up, each with the node that now claims them: the record *an
+    /// obligation stays in its scope* checks such a claim against. Only R1
+    /// (`crate::sparql_lift`) writes one.
+    pub transfers: Vec<ScopeTransfer>,
+    /// What each lifting rule (R1–R3, `crate::sparql_lift`) did, with the
+    /// facts it used, in the order it fired: the `rewrites` section of the
+    /// printout, so the proof obligations of each match are on the page.
+    pub rewrites: Vec<String>,
+    /// Exports a lifting rule moved out of a barrier, with the node that
+    /// produces the variable now: what the transition check *no demanded
+    /// export is dropped* accepts in place of the export, because the
+    /// consumer still sees the variable -- produced above the barrier
+    /// instead of inside it.
+    pub lifted_exports: Vec<LiftedExport>,
+}
+
+/// An export moved out of a barrier by a lifting rule (see
+/// [`Plan::lifted_exports`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiftedExport {
+    pub barrier: NodeKey,
+    pub var: String,
+    pub producer: NodeKey,
+}
+
+/// An obligation moved one scope up by a rule, with the node that now
+/// claims it (see [`Plan::transfers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeTransfer {
+    pub obligation: ObligationId,
+    /// The node that claims it now.
+    pub via: NodeKey,
+    pub rule: &'static str,
 }
 
 /// A plan that violates one of the invariants.
@@ -2633,6 +2765,9 @@ impl Plan {
             next_key: 1,
             origin: Vec::new(),
             retired: BTreeMap::new(),
+            transfers: Vec::new(),
+            rewrites: Vec::new(),
+            lifted_exports: Vec::new(),
         };
         plan.install(nodes);
         plan.record_origins();
@@ -3157,6 +3292,20 @@ impl Plan {
             PlanOp::Minus { left, .. } => {
                 out.extend(self.variables_memo(*left, memo).iter().cloned())
             }
+            PlanOp::Number { input, var } => {
+                out.extend(self.variables_memo(*input, memo).iter().cloned());
+                out.insert(var.clone());
+            }
+            PlanOp::LeftJoin {
+                left,
+                right,
+                witness,
+                ..
+            } => {
+                out.extend(self.variables_memo(*left, memo).iter().cloned());
+                out.extend(self.variables_memo(*right, memo).iter().cloned());
+                out.extend(witness.iter().cloned());
+            }
             other => {
                 for input in other.input_ids() {
                     out.extend(self.variables_memo(input, memo).iter().cloned());
@@ -3275,6 +3424,11 @@ impl Plan {
             // bound. `variables_of` adds `var` here; this deliberately does
             // not.
             PlanOp::Bind { input, .. } => out.extend(self.definitely_bound_of(*input)),
+            // The executor numbers every row.
+            PlanOp::Number { input, var } => {
+                out.extend(self.definitely_bound_of(*input));
+                out.insert(var.clone());
+            }
             // A grouping key is bound in the group when it was bound in the
             // rows -- `GROUP BY ?x` over solutions where `?x` is unbound puts
             // the unbound group in the output too. Measures are left out:
@@ -3369,6 +3523,34 @@ impl Plan {
 /// but the frontier is a *cut* and not a prefix: two stars, one folded and one
 /// not, interleave `[S]` and `[E]` in index order and no single line separates
 /// them. The per-node tag says the same thing without lying about the shape.
+impl Plan {
+    /// A log line with every [`NodeKey::reference`] in it replaced by the
+    /// node's current position, `n{id}` -- or its key, when it is retired
+    /// with no successor.
+    pub fn render_node_refs(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find('⟦') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + '⟦'.len_utf8()..];
+            let Some(end) = after.find('⟧') else {
+                out.push_str(&rest[start..]);
+                return out;
+            };
+            match after[..end].parse::<usize>() {
+                Ok(key) => match self.node(NodeKey(key)) {
+                    Some(id) => out.push_str(&format!("n{id}")),
+                    None => out.push_str(&format!("k{key}")),
+                },
+                Err(_) => out.push_str(&rest[start..start + '⟦'.len_utf8() + end + '⟧'.len_utf8()]),
+            }
+            rest = &after[end + '⟧'.len_utf8()..];
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
 impl fmt::Display for Plan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Plan ({} → {})", self.form.as_str(), self.form.expects())?;
@@ -3385,11 +3567,15 @@ impl fmt::Display for Plan {
                         .join(" ")
                 )
             };
+            let mut describe = node.op.describe();
+            if let Some(note) = crate::sparql_constant::lowered_note(self, id) {
+                describe = format!("{describe}  {note}");
+            }
             writeln!(
                 f,
                 "  n{id:<3} {:<9} {:<44} {}{claims}",
                 node.op.kind(),
-                node.op.describe(),
+                describe,
                 node.executor.tag()
             )?;
         }
@@ -3401,6 +3587,12 @@ impl fmt::Display for Plan {
                 if let Some(obligation) = self.obligations.get(*id) {
                     writeln!(f, "      o{id}  {obligation}")?;
                 }
+            }
+        }
+        if !self.rewrites.is_empty() {
+            writeln!(f, "  rewrites")?;
+            for rewrite in &self.rewrites {
+                writeln!(f, "      {}", self.render_node_refs(rewrite))?;
             }
         }
         writeln!(f, "\nobligations")?;
@@ -3465,15 +3657,22 @@ impl PlanOp {
                 reference,
                 key,
                 condition,
+                witness,
             } => {
                 let edge = match (reference, key) {
                     (Some(edge), _) => format!("  via ?{}.{}", edge.holder, edge.slot),
                     (None, Some(key)) => format!("  by {key}"),
                     (None, None) => String::new(),
                 };
+                let witness = match witness {
+                    Some(witness) => format!("  witness ?{witness}"),
+                    None => String::new(),
+                };
                 match condition {
-                    Some(condition) => format!("n{left}, n{right}{edge}  if {condition}"),
-                    None => format!("n{left}, n{right}{edge}"),
+                    Some(condition) => {
+                        format!("n{left}, n{right}{edge}{witness}  if {condition}")
+                    }
+                    None => format!("n{left}, n{right}{edge}{witness}"),
                 }
             }
             PlanOp::AntiJoin {
@@ -3521,11 +3720,23 @@ impl PlanOp {
                     )
                 }
             ),
-            PlanOp::Sort { terms, .. } => terms
-                .iter()
-                .map(|term| format!("{}{}", term.expr, if term.desc { " desc" } else { " asc" }))
-                .collect::<Vec<_>>()
-                .join(", "),
+            PlanOp::Sort { terms, origin, .. } => format!(
+                "{}{}",
+                terms
+                    .iter()
+                    .map(|term| format!(
+                        "{}{}",
+                        term.expr,
+                        if term.desc { " desc" } else { " asc" }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                match origin {
+                    SortOrigin::Query => "",
+                    SortOrigin::Ordinal => "  origin ordinal",
+                }
+            ),
+            PlanOp::Number { var, .. } => format!("?{var}"),
             PlanOp::Distinct { .. } | PlanOp::Reduced { .. } | PlanOp::Ask { .. } => String::new(),
             PlanOp::Slice { limit, offset, .. } => match limit {
                 Some(limit) => format!("limit {limit} offset {offset}"),
@@ -3909,6 +4120,7 @@ impl Builder<'_> {
                         reference: None,
                         key: None,
                         condition,
+                        witness: None,
                     },
                     claims,
                     vars,
@@ -4093,7 +4305,15 @@ impl Builder<'_> {
                         },
                     })
                     .collect();
-                self.push(PlanOp::Sort { input, terms }, claims, vars)
+                self.push(
+                    PlanOp::Sort {
+                        input,
+                        terms,
+                        origin: SortOrigin::Query,
+                    },
+                    claims,
+                    vars,
+                )
             }
             GraphPattern::Distinct { inner } => {
                 let claims =
@@ -4221,6 +4441,7 @@ impl Builder<'_> {
                     reference: None,
                     key: None,
                     condition: None,
+                    witness: None,
                 },
                 Vec::new(),
                 vars,

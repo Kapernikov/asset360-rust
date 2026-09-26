@@ -77,6 +77,13 @@ pub trait Rule {
     /// A rule that cannot fire must leave the plan untouched and return
     /// `false`, or the driver never reaches a fixpoint.
     fn apply(&self, plan: &mut Plan) -> bool;
+    /// Whether every application must lower the progress measure of
+    /// `crate::sparql_lift` -- the lifting rules R1–R3, whose termination
+    /// argument is that measure rather than the monotonicity the tier-one
+    /// rules have.
+    fn measured(&self) -> bool {
+        false
+    }
 }
 
 /// How many passes over the rule list the driver will make.
@@ -149,18 +156,49 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
         // not fire did not edit, so the record taken before it still
         // describes the plan the next rule sees. Re-taken after every edit.
         let mut kept = plan.kept_exports();
+        // Φ of the plan as it stands, computed only when a measured rule
+        // asks and forgotten whenever any rule edits the plan.
+        let mut phi: Option<(usize, usize, usize, usize)> = None;
         for rule in rules {
+            let before = if rule.measured() {
+                Some(*phi.get_or_insert_with(|| crate::sparql_lift::progress(plan)))
+            } else {
+                None
+            };
             if rule.apply(plan) {
+                phi = None;
                 changed = true;
                 log.applied.push(rule.name());
-                if let Err(defect) = plan.check_transition(&kept) {
-                    return Err(RuleFailure {
+                let fail = |defect, log| {
+                    Err(RuleFailure {
                         defect: crate::sparql_refine::PlanDefect::Transition {
                             rule: rule.name(),
                             defect,
                         },
                         log,
-                    });
+                    })
+                };
+                if let Err(defect) = plan.check_transition(&kept) {
+                    return fail(defect, log);
+                }
+                // The lifting rules' termination argument, checked per
+                // application: Φ drops strictly, lexicographically.
+                if let Some(before) = before {
+                    let after = crate::sparql_lift::progress(plan);
+                    if after >= before {
+                        return fail(
+                            crate::sparql_scopes::TransitionDefect::NoProgress {
+                                measures: Box::new([before, after]),
+                            },
+                            log,
+                        );
+                    }
+                    phi = Some(after);
+                }
+                // After every application, whoever made it: a rule that
+                // builds a projection as a keep list drops the ordinal.
+                if let Err(defect) = crate::sparql_lift::ordinal_reaches_its_sort(plan) {
+                    return fail(defect, log);
                 }
                 kept = plan.kept_exports();
                 debug_assert!(
@@ -2367,6 +2405,7 @@ pub(crate) fn applies_to_every_answer(plan: &Plan, node: NodeId) -> bool {
                 | PlanOp::Unnest { .. }
                 | PlanOp::Construct { .. }
                 | PlanOp::Describe { .. }
+                | PlanOp::Number { .. }
                 | PlanOp::Ask { .. } => false,
             }
     })
@@ -3414,8 +3453,12 @@ impl Rule for AbsorbOptionalReference<'_> {
             }
 
             // The preserved side: a scan of the match's subject, in SQL, whose
-            // rows all reach the join.
-            let Some((scan, class_uri)) =
+            // rows all reach the join -- or, for a subject that is an
+            // *element* of a collection the preserved side unnests, that
+            // unnest, and the scan it fans out (the element-held edge: the
+            // reference sits in the element, and the statement reads it off
+            // the element's own row).
+            let scan_of = |star: &str| {
                 plan.nodes
                     .iter()
                     .enumerate()
@@ -3424,7 +3467,7 @@ impl Rule for AbsorbOptionalReference<'_> {
                             star_var,
                             class_uri,
                             ..
-                        } if star_var == &star
+                        } if star_var == star
                             && node.executor == Executor::Sql
                             && mandatorily_feeds(plan, scan, left) =>
                         {
@@ -3432,7 +3475,37 @@ impl Rule for AbsorbOptionalReference<'_> {
                         }
                         _ => None,
                     })
-            else {
+            };
+            let holder = match scan_of(&star) {
+                Some((scan, class_uri)) => Some((scan, class_uri, star.clone(), Vec::new())),
+                None => plan.nodes.iter().enumerate().find_map(|(unnest, node)| {
+                    let PlanOp::Unnest {
+                        star_var,
+                        slot_path,
+                        var: element,
+                        ..
+                    } = &node.op
+                    else {
+                        return None;
+                    };
+                    if *element != star
+                        || node.executor != Executor::Sql
+                        || !mandatorily_feeds(plan, unnest, left)
+                    {
+                        return None;
+                    }
+                    let (scan, class_uri) = scan_of(star_var)?;
+                    // An inlined structure, whose elements are the rows the
+                    // unnest produces -- the class the slot is read on.
+                    if !crate::sparql_scopes::is_structure(self.schema, &class_uri, slot_path) {
+                        return None;
+                    }
+                    let element_class =
+                        crate::sparql_scopes::class_at_path_of(self.schema, &class_uri, slot_path)?;
+                    Some((scan, element_class, star_var.clone(), slot_path.clone()))
+                }),
+            };
+            let Some((scan, class_uri, holder_star, prefix)) = holder else {
                 continue;
             };
 
@@ -3451,7 +3524,11 @@ impl Rule for AbsorbOptionalReference<'_> {
             {
                 continue;
             }
-            let path = vec![slot.name.clone()];
+            let path: Vec<String> = prefix
+                .iter()
+                .cloned()
+                .chain(std::iter::once(slot.name.clone()))
+                .collect();
 
             // The delivered read, so the column reaches whoever renders the
             // join. Unbound: `?l` is the referenced record's identity.
@@ -3474,9 +3551,9 @@ impl Rule for AbsorbOptionalReference<'_> {
             if let PlanOp::LeftJoin { reference, .. } = &mut plan.nodes[id].op {
                 *reference = Some(ReferenceEdge {
                     referenced: var.clone(),
-                    holder: star,
+                    holder: holder_star,
                     slot: slot.name.clone(),
-                    path: Vec::new(),
+                    path: prefix,
                 });
             }
             // The edge names the referenced star, which the body's barrier
@@ -4013,7 +4090,13 @@ impl<'s> PushGrouping<'s> {
     /// element's blank node. It is representable and never serialisable
     /// (design, *What may cross a relation*, parts 1 and 3), so the query's
     /// own projection asks with `serialise` and declines it.
-    fn key_is_readable(&self, plan: &Plan, input: NodeId, key: &str, serialise: bool) -> bool {
+    pub(crate) fn key_is_readable(
+        &self,
+        plan: &Plan,
+        input: NodeId,
+        key: &str,
+        serialise: bool,
+    ) -> bool {
         let visible = Visible::below(plan, input);
         if let Some(binding) = visible.slot_of(key) {
             if !matches!(
@@ -4056,8 +4139,15 @@ impl<'s> PushGrouping<'s> {
             return true;
         }
         // Or a column a pushed relation below exports.
-        visible.relation_of(key).is_some()
-            && crate::sparql_scopes::representable(self.schema, plan, input, key, serialise)
+        if visible.relation_of(key).is_some() {
+            return crate::sparql_scopes::representable(self.schema, plan, input, key, serialise);
+        }
+        // Or a column of a constant table the statement joins (M1): one kind
+        // of term per column, so it both represents and serialises.
+        matches!(
+            crate::sparql_scopes::resolve_terms(plan.term_of(self.schema, input, key)),
+            Some(crate::sparql_scopes::TermOf::Constant { .. })
+        )
     }
 
     /// Whether an aggregate is one a grouped statement can compute, and its
@@ -4772,7 +4862,7 @@ fn projection_tail(plan: &Plan, scope: Option<NodeId>) -> Option<ProjectionTail>
                 vars = Some(projected.clone());
                 *input
             }
-            PlanOp::Sort { input, terms } => {
+            PlanOp::Sort { input, terms, .. } => {
                 sorts.extend(terms.iter().cloned());
                 *input
             }
@@ -4958,6 +5048,12 @@ pub fn tier_one_rules<'a>(
         // reduction, and it is what a materialised relation is worth to the
         // planner whether the schema produced it or the client wrote it.
         Box::new(ValuesNarrowTheJoinedScan::new(schema)),
+        // M1: an inline table the narrowing rules leave standing -- one that
+        // adds a column -- becomes a constant derived table the statement
+        // joins, under the preconditions that make SQL equality SPARQL
+        // compatibility. Like the rule above it knows nothing about where
+        // the table came from.
+        Box::new(crate::sparql_constant::LowerConstantRelation::new(schema)),
     ];
     // Only for a deployment that serves a schema graph: without one, no
     // subplan can depend on nothing but the schema, so the rule would ask a
@@ -4978,6 +5074,24 @@ pub fn tier_one_rules<'a>(
     #[cfg(not(feature = "sparql-endpoint"))]
     let _ = schema_graph_iri;
     rules
+}
+
+/// Every decline the rules can explain on a refined plan: `(rule, node,
+/// guard)`, for the `declined` section of a printout. A rule's match
+/// succeeded there and one of its guards stopped it; the guard is named in
+/// the words of the design that states it.
+pub fn declined(
+    plan: &Plan,
+    schema: &SchemaView,
+    schema_graph_iri: Option<&str>,
+) -> Vec<(&'static str, NodeId, String)> {
+    let mut out = Vec::new();
+    let lower = crate::sparql_constant::LowerConstantRelation::new(schema);
+    for (node, why) in lower.declined(plan) {
+        out.push((lower.name(), node, why));
+    }
+    out.extend(crate::sparql_lift::declined(plan, schema, schema_graph_iri));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -9553,5 +9667,75 @@ mod tests {
         assert!(log.reached_fixpoint);
         assert!(log.applied.is_empty());
         assert_eq!(before, plan.to_string());
+    }
+}
+
+/// Staging step 0 of `docs/design/sparql-schema-relations-and-row-finish.md`:
+/// an optional reference read off an *element* of a collection the
+/// preserved side unnests -- the #494 query's
+/// `OPTIONAL { ?section :isLocatedInStation ?station . ?station a :Station }`
+/// nested under the `hasCoveredSection` unnest.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod element_held_optional_reference {
+    use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+    use crate::sparql_oracle::Oracle;
+    use crate::sparql_refine::{Executor, PlanOp};
+    use crate::sparql_rules::{Rule, tier_one_rules};
+    use crate::sparql_scoper::tests::asset360_fixture_schema_view;
+
+    #[test]
+    fn the_nested_reference_is_the_left_join_s_element_held_edge() {
+        let schema = asset360_fixture_schema_view();
+        let oracle = Oracle::new(
+            &schema,
+            &[
+                (
+                    "Track",
+                    r#"{"id": "https://data.infrabel.be/asset360/track/T1", "typeURI": "https://example.org/Main"}"#,
+                ),
+                (
+                    "Line",
+                    r#"{"id": "https://data.infrabel.be/asset360/line/L1", "typeURI": "https://example.org/L"}"#,
+                ),
+                // A section with both references, one whose line is not a
+                // record, one with no line, and a complex with no sections.
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/1", "typeURI": "https://example.org/TC",
+                        "hasCoveredSection": [
+                          {"hasSequenceNumber": 1, "belongsToTrack": "https://data.infrabel.be/asset360/track/T1",
+                           "belongsToLine": "https://data.infrabel.be/asset360/line/L1"},
+                          {"hasSequenceNumber": 2, "belongsToTrack": "https://data.infrabel.be/asset360/track/T1",
+                           "belongsToLine": "https://data.infrabel.be/asset360/line/L-missing"},
+                          {"hasSequenceNumber": 3, "belongsToTrack": "https://data.infrabel.be/asset360/track/T1"}]}"#,
+                ),
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/2", "typeURI": "https://example.org/TC"}"#,
+                ),
+            ],
+        );
+        let rules = tier_one_rules(&schema, None);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let query = "SELECT ?s ?t ?tn ?l WHERE { ?s a asset360:TunnelComplex . \
+             OPTIONAL { ?s asset360:hasCoveredSection ?cs . ?cs asset360:belongsToTrack ?t . \
+             ?t a asset360:Track ; asset360:typeURI ?tn . \
+             OPTIONAL { ?cs asset360:belongsToLine ?l . ?l a asset360:Line } } }";
+        let plan = each_rewrite_preserves_answers(query, &schema, &oracle, &borrowed);
+        let edge = plan.nodes.iter().find_map(|node| match &node.op {
+            PlanOp::LeftJoin {
+                reference: Some(edge),
+                ..
+            } if edge.slot == "belongsToLine" => Some(edge.clone()),
+            _ => None,
+        });
+        let edge = edge.unwrap_or_else(|| panic!("the nested reference is an edge:\n{plan}"));
+        assert_eq!(edge.path, vec!["hasCoveredSection".to_owned()], "{plan}");
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "one statement:\n{plan}"
+        );
+        crate::sparql_ops::lower_refined(&plan, &schema, None, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
     }
 }

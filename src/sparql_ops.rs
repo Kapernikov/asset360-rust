@@ -383,6 +383,27 @@ pub enum Op {
         alias: String,
         columns: Vec<RelationColumn>,
     },
+    /// An inline table: `(VALUES (…), (…)) AS c{n}(col, …)` -- a
+    /// [`crate::sparql_refine::PlanOp::Values`] the statement joins (M1 of
+    /// `docs/design/sparql-schema-relations-and-row-finish.md`).
+    ///
+    /// Its own kind rather than a [`Op::Relation`], whose body is an
+    /// operator tree over records -- a constant has no records to read --
+    /// and so that a renderer built against contract 5 *refuses* it instead
+    /// of skipping it. It enters the statement the way a relation does:
+    /// through an [`Op::Join`] keyed by [`JoinKey::Value`], and its columns
+    /// are read by bindings whose `relation` is `alias`.
+    ///
+    /// `rows` is every row the table renders, duplicates included, never
+    /// under `DISTINCT` (K5), each cell the *stored* text: a key column's
+    /// cells are already translated into the text the other side's column
+    /// holds (`ConstantColumn::key`), and `None` is `NULL` -- `UNDEF`, which
+    /// K2 keeps out of a key column.
+    Constant {
+        alias: String,
+        columns: Vec<ConstantColumn>,
+        rows: Vec<Vec<Option<String>>>,
+    },
     /// The variables the query asked for, in `SELECT` order. Anything not
     /// listed is machinery: a variable that exists only to be grouped by, or
     /// an aggregate spargebra named internally.
@@ -437,6 +458,13 @@ pub enum JoinKey {
     Element { left: ColumnRef, right: ColumnRef },
     /// Every pair: `CROSS JOIN`, or `LEFT JOIN … ON true`.
     Cross,
+    /// `left.<col> = right.<col>` where one side is a [`Op::Constant`]'s key
+    /// column and the other a star's identity, a star's single-valued slot
+    /// (`path` non-empty, no `column`: `object_data #>> path`) or a
+    /// relation column. Text equality, which the planner proved is term
+    /// equality for this pair (M1's K4); the constant's cells are already
+    /// the other column's stored text.
+    Value { left: ColumnRef, right: ColumnRef },
 }
 
 impl JoinKey {
@@ -446,8 +474,28 @@ impl JoinKey {
             Self::Identity { .. } => "identity",
             Self::Element { .. } => "element",
             Self::Cross => "cross",
+            Self::Value { .. } => "value",
         }
     }
+}
+
+/// One column of an [`Op::Constant`].
+#[derive(Debug, Clone)]
+pub struct ConstantColumn {
+    /// The variable, which is also the column's name in the table.
+    pub var: String,
+    /// How a cell becomes an RDF term, as for a scan column.
+    pub descriptor: crate::sparql_terms::TermDescriptor,
+    /// Set on the key column: the other side's column it is compared with,
+    /// and the translation that made the cells comparable.
+    pub key: Option<ConstantKey>,
+}
+
+/// What a constant's key column is compared with.
+#[derive(Debug, Clone)]
+pub struct ConstantKey {
+    pub other: ColumnRef,
+    pub translation: crate::sparql_refine::KeyTranslation,
 }
 
 /// A column a join key names: a star's identity (`path` empty, no
@@ -501,6 +549,9 @@ pub enum ColumnKind {
         class_uri: String,
         binding: BindingSpec,
     },
+    /// A column of a constant table inside the body, read by the body's
+    /// binding (`relation` is the table's alias).
+    Constant(BindingSpec),
 }
 
 impl ColumnKind {
@@ -510,6 +561,7 @@ impl ColumnKind {
             Self::Slot(_) => "slot",
             Self::Measure { .. } => "measure",
             Self::Structure { .. } => "structure",
+            Self::Constant(_) => "constant",
         }
     }
 }
@@ -519,7 +571,7 @@ impl Op {
     /// on the variant.
     pub fn inputs(&self) -> Vec<OpId> {
         match self {
-            Self::Scan { .. } | Self::Relation { .. } => Vec::new(),
+            Self::Scan { .. } | Self::Relation { .. } | Self::Constant { .. } => Vec::new(),
             Self::Unnest { input, .. }
             | Self::Filter { input, .. }
             | Self::FilterTree { input, .. }
@@ -549,6 +601,7 @@ impl Op {
             Self::Slice { .. } => "slice",
             Self::Project { .. } => "project",
             Self::Relation { .. } => "relation",
+            Self::Constant { .. } => "constant",
         }
     }
 }
@@ -1092,6 +1145,28 @@ pub fn lower_refined_with(
     schema: &linkml_schemaview::schemaview::SchemaView,
     bounds: &FetchBounds,
 ) -> Result<OpTree, LoweringRefusal> {
+    lower_island(plan, schema, bounds, false)
+}
+
+/// The statement of a plan whose engine region finishes over the
+/// statement's *rows* (`Refinement::UsedRows`): the SQL island lowered as
+/// an answer -- its conditions enforce, its fan-outs are kept, and no fetch
+/// bound is added -- because its rows are solutions the engine reads as
+/// they are, not records it re-runs the query over.
+pub fn lower_rows_statement(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    bounds: &FetchBounds,
+) -> Result<OpTree, LoweringRefusal> {
+    lower_island(plan, schema, bounds, true)
+}
+
+fn lower_island(
+    plan: &crate::sparql_refine::Plan,
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    bounds: &FetchBounds,
+    answers_rows: bool,
+) -> Result<OpTree, LoweringRefusal> {
     use crate::sparql_refine::{Executor, PlanOp as RefinedOp};
     let fetch_bound = bounds.limit;
     let unioned_fetch_bound = bounds.limit_if_unioned;
@@ -1216,7 +1291,7 @@ pub fn lower_refined_with(
     // A pass that answers the query enforces its filters; one that feeds the
     // engine only narrows. The refined plan says which by whether anything
     // above the frontier is left.
-    let enforcement = if plan.nodes.len() == sql.len() {
+    let enforcement = if answers_rows || plan.nodes.len() == sql.len() {
         Enforcement::Enforces
     } else {
         Enforcement::Narrows
@@ -1383,7 +1458,9 @@ pub fn lower_refined_with(
     // against the *query*, which is the thing that decides how many rows an
     // answer can need, rather than against whatever the other planner
     // happened to compute.
-    if let Some(bound) = fetch_bound {
+    if enforcement == Enforcement::Narrows
+        && let Some(bound) = fetch_bound
+    {
         let demanded = plan.obligations.iter().find_map(|obligation| {
             match obligation {
                 crate::sparql_plan::Obligation::Slice { limit, offset } => {
@@ -1469,7 +1546,46 @@ impl Lowering<'_> {
                     path.clone(),
                 )?,
             },
+            TermOf::Constant { descriptor } => {
+                let values = self
+                    .plan
+                    .producers_of(body, var)
+                    .into_iter()
+                    .find(|producer| {
+                        matches!(
+                            self.plan.nodes[*producer].op,
+                            crate::sparql_refine::PlanOp::Values { .. }
+                        )
+                    })?;
+                ColumnKind::Constant(crate::sparql_pushdown::relation_spec(
+                    &crate::sparql_constant::constant_alias(self.plan, values),
+                    var,
+                    var,
+                    descriptor.clone(),
+                    false,
+                ))
+            }
             TermOf::Collection { .. } | TermOf::Computed => return None,
+        })
+    }
+
+    /// The other side's column for a value key: a star's identity or
+    /// single-valued slot, or a relation column -- whichever the statement
+    /// reads `var` from at `side`.
+    fn value_column_ref(&self, side: usize, var: &str) -> Option<ColumnRef> {
+        Some(match self.scanned_column(side, var)? {
+            Column::Star { star_var, path, .. } => ColumnRef {
+                source: star_var,
+                path,
+                column: None,
+            },
+            Column::Relation { alias, column } => ColumnRef {
+                source: alias,
+                path: Vec::new(),
+                column: Some(column.var.clone()),
+            },
+            // A witness is never a key: it is a fresh name nothing else binds.
+            Column::Witness { .. } => return None,
         })
     }
 
@@ -1547,6 +1663,29 @@ impl Lowering<'_> {
                     .ok_or(LoweringRefusal::Unrenderable { node: id })?,
             },
             PlanKey::Cross => JoinKey::Cross,
+            PlanKey::Value { var, .. } => {
+                let facts = crate::sparql_constant::key_facts(self.schema, self.plan, id)
+                    .map_err(|_| LoweringRefusal::Unrenderable { node: id })?;
+                let constant = ColumnRef {
+                    source: crate::sparql_constant::constant_alias(self.plan, facts.values),
+                    path: Vec::new(),
+                    column: Some(var.clone()),
+                };
+                let other = self
+                    .value_column_ref(facts.other, var)
+                    .ok_or(LoweringRefusal::Unrenderable { node: id })?;
+                if facts.values == left {
+                    JoinKey::Value {
+                        left: constant,
+                        right: other,
+                    }
+                } else {
+                    JoinKey::Value {
+                        left: other,
+                        right: constant,
+                    }
+                }
+            }
         };
         Ok(Op::Join {
             left: remap[&left],
@@ -1667,11 +1806,31 @@ impl Lowering<'_> {
                             // which is fewer than the query wrote (a read through
                             // a collection stays with the engine), and the
                             // premise has to cover every mandatory read.
-                            required_paths: bounds
-                                .required_paths
-                                .get(&(star_var.clone(), class_uri.clone()))
-                                .cloned()
-                                .unwrap_or_default(),
+                            required_paths: {
+                                let mut paths = bounds
+                                    .required_paths
+                                    .get(&(star_var.clone(), class_uri.clone()))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                // A statement that answers states its own
+                                // premise too: every nested read the scan
+                                // *requires*. Nothing else is bound to test
+                                // it -- a left join to a constant keyed on
+                                // it keeps the row whether or not the
+                                // value is there -- and a record holding the
+                                // structure without the value is no solution.
+                                if enforcement == Enforcement::Enforces {
+                                    for path in restated_required_paths(schema, class_uri, slots) {
+                                        if !paths
+                                            .iter()
+                                            .any(|stated| stated.slot_path == path.slot_path)
+                                        {
+                                            paths.push(path);
+                                        }
+                                    }
+                                }
+                                paths
+                            },
                             // Whether the query only optionally wants these rows,
                             // which is what decides how the renderer wraps every
                             // condition on them. A scan on the optional side of a
@@ -2297,8 +2456,16 @@ impl Lowering<'_> {
                         // barrier itself is a member of the scope above, and
                         // `classes` here is that scope's.
                         let body_classes = classes_feeding(plan, *input);
+                        // An export nothing in the body binds is unbound in
+                        // every row -- no column, and nothing to render (the
+                        // column loop below skips it for the same reason).
+                        let bound: Vec<String> = vars
+                            .iter()
+                            .filter(|var| !plan.producers_of(*input, var).is_empty())
+                            .cloned()
+                            .collect();
                         let columns =
-                            self.scope_columns(&body_classes, *input, vars, Some(id), id)?;
+                            self.scope_columns(&body_classes, *input, &bound, Some(id), id)?;
                         body.push(OpNode {
                             op: Op::Project {
                                 input: body.len() - 1,
@@ -2326,6 +2493,7 @@ impl Lowering<'_> {
                             ColumnKind::Slot(binding) => Some(binding.descriptor.clone()),
                             ColumnKind::Measure { descriptor } => Some(descriptor.clone()),
                             ColumnKind::Structure { .. } => None,
+                            ColumnKind::Constant(binding) => Some(binding.descriptor.clone()),
                         };
                         columns.push(RelationColumn {
                             var: var.clone(),
@@ -2344,6 +2512,41 @@ impl Lowering<'_> {
                         discharges: node.discharges.clone(),
                     });
                 }
+                // M1: an inline table the rule lowered, rendered from the
+                // facts the rule proved -- re-derived here rather than
+                // carried, so the statement renders the plan as it stands.
+                RefinedOp::Values { variables, .. } => {
+                    let join = crate::sparql_constant::keyed_consumer(plan, id)
+                        .ok_or(LoweringRefusal::Unrenderable { node: id })?;
+                    let facts = crate::sparql_constant::key_facts(schema, plan, join)
+                        .map_err(|_| LoweringRefusal::Unrenderable { node: id })?;
+                    if facts.values != id {
+                        return Err(LoweringRefusal::Unrenderable { node: id });
+                    }
+                    let other = self
+                        .value_column_ref(facts.other, &facts.var)
+                        .ok_or(LoweringRefusal::Unrenderable { node: id })?;
+                    let columns = variables
+                        .iter()
+                        .enumerate()
+                        .map(|(index, variable)| ConstantColumn {
+                            var: variable.as_str().to_owned(),
+                            descriptor: facts.descriptors[index].clone(),
+                            key: (index == facts.key_column).then(|| ConstantKey {
+                                other: other.clone(),
+                                translation: facts.translation,
+                            }),
+                        })
+                        .collect();
+                    nodes.push(OpNode {
+                        op: Op::Constant {
+                            alias: crate::sparql_constant::constant_alias(plan, id),
+                            columns,
+                            rows: facts.rows,
+                        },
+                        discharges: node.discharges.clone(),
+                    });
+                }
                 other => {
                     return Err(LoweringRefusal::UnknownOperator { kind: other.kind() });
                 }
@@ -2352,6 +2555,34 @@ impl Lowering<'_> {
         }
         Ok(nodes)
     }
+}
+
+/// The nested reads a scan requires, as the presence checks a statement
+/// that answers must state: every `Required` slot at least two hops deep,
+/// under no hop the scan reads optionally. A read under an optional hop
+/// constrains nothing about the record -- the hop may be missing and the
+/// row still an answer -- so it is left to the bindings that read it.
+fn restated_required_paths(
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    class_uri: &str,
+    slots: &[crate::sparql_refine::ScanSlot],
+) -> Vec<crate::sparql_scoper::RequiredPath> {
+    use crate::sparql_refine::SlotPresence;
+    slots
+        .iter()
+        .filter(|slot| slot.presence == SlotPresence::Required && slot.path.len() >= 2)
+        .filter(|slot| {
+            !(1..slot.path.len()).any(|hop| {
+                slots.iter().any(|other| {
+                    other.path.as_slice() == &slot.path[..hop]
+                        && other.presence == SlotPresence::Optional
+                })
+            })
+        })
+        // The scoper's own presence check, and its one refusal: a mapping
+        // element's key leaf, which the stored JSON need not carry.
+        .filter_map(|slot| crate::sparql_scoper::nested_presence_of(schema, class_uri, &slot.path))
+        .collect()
 }
 
 /// **A comparator clause, promoted: claims backed by rendered work.**
@@ -2688,7 +2919,15 @@ impl Lowering<'_> {
         var: &str,
         name: &str,
     ) -> Option<crate::sparql_pushdown::BindingSpec> {
-        match self.scanned_column(node, var)? {
+        self.binding_of_column(self.scanned_column(node, var)?, name)
+    }
+
+    fn binding_of_column(
+        &self,
+        column: Column,
+        name: &str,
+    ) -> Option<crate::sparql_pushdown::BindingSpec> {
+        match column {
             Column::Star {
                 star_var,
                 class_uri,
@@ -2704,6 +2943,50 @@ impl Lowering<'_> {
                     .unwrap_or_else(crate::sparql_terms::TermDescriptor::subject_iri),
                 column.descriptor.is_none(),
             )),
+            Column::Witness { anchor } => {
+                let mut binding = self.binding_of_column(*anchor, name)?;
+                binding.witness = true;
+                binding.occurrence = false;
+                binding.descriptor = crate::sparql_terms::TermDescriptor {
+                    kind: crate::sparql_terms::TermKind::Literal,
+                    datatype: Some("http://www.w3.org/2001/XMLSchema#boolean".to_owned()),
+                    lang: None,
+                    enum_map: Vec::new(),
+                    numeric: false,
+                };
+                Some(binding)
+            }
+        }
+    }
+
+    /// The column a left join's witness is read off: one of its right
+    /// side's that is non-`NULL` exactly on a joined row -- the right side's
+    /// key column for a keyed join (bound on both sides of a match, by the
+    /// key's own precondition), the right star's identity for a reference
+    /// edge. `None` for a join with no such column (a cross join).
+    fn witness_anchor(&self, join: usize) -> Option<Column> {
+        use crate::sparql_refine::{JoinKey as PlanKey, PlanOp as RefinedOp};
+        let RefinedOp::LeftJoin {
+            right,
+            key,
+            reference,
+            ..
+        } = &self.plan.nodes[join].op
+        else {
+            return None;
+        };
+        match (key, reference) {
+            (Some(PlanKey::Identity { var, .. } | PlanKey::Value { var, .. }), _) => {
+                self.scanned_column(*right, var)
+            }
+            (None, Some(edge)) => [&edge.holder, &edge.referenced]
+                .into_iter()
+                .find_map(|star| match self.scanned_column(*right, star)? {
+                    column @ Column::Star { .. } => Some(column),
+                    _ => None,
+                })
+                .filter(|column| matches!(column, Column::Star { path, .. } if path.is_empty())),
+            _ => None,
         }
     }
 
@@ -2834,6 +3117,20 @@ impl Lowering<'_> {
                 continue;
             }
             match &scan.op {
+                // A left join's match witness, which only that join binds.
+                RefinedOp::LeftJoin {
+                    witness: Some(witness),
+                    ..
+                } if witness == var => {
+                    let anchor = self.witness_anchor(id)?;
+                    candidates.push((
+                        optional_side(id),
+                        0,
+                        Column::Witness {
+                            anchor: Box::new(anchor),
+                        },
+                    ));
+                }
                 RefinedOp::Scan {
                     star_var,
                     class_uri,
@@ -2879,6 +3176,40 @@ impl Lowering<'_> {
                         Column::Relation {
                             alias: alias.clone(),
                             column: Box::new(column.clone()),
+                        },
+                    ));
+                }
+                // A lowered constant table's column: last, so a key the
+                // other side also binds is read off that side's column,
+                // which says how its text is spelled.
+                RefinedOp::Values { variables, rows }
+                    if variables.iter().any(|variable| variable.as_str() == var) =>
+                {
+                    let column = variables
+                        .iter()
+                        .position(|variable| variable.as_str() == var)?;
+                    let Ok(descriptor) = crate::sparql_constant::uniform_descriptor(rows, column)
+                    else {
+                        continue;
+                    };
+                    let alias = crate::sparql_constant::constant_alias(plan, id);
+                    candidates.push((
+                        optional_side(id),
+                        3,
+                        Column::Relation {
+                            alias: alias.clone(),
+                            column: Box::new(RelationColumn {
+                                var: var.to_owned(),
+                                kind: ColumnKind::Constant(crate::sparql_pushdown::relation_spec(
+                                    &alias,
+                                    var,
+                                    var,
+                                    descriptor.clone(),
+                                    false,
+                                )),
+                                descriptor: Some(descriptor),
+                                guaranteed: plan.definitely_bound_of(id).contains(var),
+                            }),
                         },
                     ));
                 }
@@ -2968,6 +3299,10 @@ enum Column {
         alias: String,
         column: Box<RelationColumn>,
     },
+    /// A left join's match witness, read off `anchor`: a column of the
+    /// join's right side that is non-`NULL` on every row the right side
+    /// joined.
+    Witness { anchor: Box<Column> },
 }
 
 /// A binding for a value at a path: a term, or -- when the path ends in an
@@ -3886,8 +4221,11 @@ mod tests {
     /// test about the fetch -- the pass an engine finishes -- needs one
     /// construct the statement cannot take. A `REGEX` is that: it stays with
     /// the engine, every pushable conjunct sinks below it, and the rows the
-    /// statement returns are a narrowing again.
-    const KEEP_A_FETCH: &str = " FILTER(REGEX(STR(?s), \"^x\"))";
+    /// statement returns are a narrowing again. And since the engine can
+    /// finish over a statement's *rows* where its region reads nothing but
+    /// them (`Refinement::UsedRows`), the fetch also needs a region that
+    /// reads instance data: an `EXISTS` does, whatever its pattern.
+    const KEEP_A_FETCH: &str = " FILTER(REGEX(STR(?s), \"^x\")) FILTER(EXISTS { })";
 
     /// A condition on a multivalued slot is a test over the array's elements,
     /// and the operator has to say so.
