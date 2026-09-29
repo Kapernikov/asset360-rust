@@ -1144,44 +1144,30 @@ impl PyConstraintSet {
 
     /// Parse SHACL Turtle text into a ConstraintSet.
     ///
-    /// With `include_nested=True` the set also carries the introspectable
-    /// shapes of every class inlined inside `target_class`, and `evaluate`
-    /// runs them on each nested object (violations then carry `path` and
-    /// `element_label`). Requires `schema_view`.
+    /// With `schema_view`, the set also carries the introspectable shapes of
+    /// every class inlined inside `target_class`, and `evaluate` runs them on
+    /// each nested object (those violations carry `path` and `element_label`).
     #[cfg(feature = "shacl-parser")]
     #[staticmethod]
-    #[pyo3(signature = (ttl, target_class, language="", schema_view=None, include_nested=false))]
+    #[pyo3(signature = (ttl, target_class, language="", schema_view=None))]
     fn from_shacl(
         py: Python<'_>,
         ttl: &str,
         target_class: &str,
         language: &str,
         schema_view: Option<Py<PySchemaView>>,
-        include_nested: bool,
     ) -> PyResult<Self> {
         let sv_option = schema_view.as_ref().map(|sv| {
             let bound = sv.bind(py);
             let borrowed = bound.borrow();
             borrowed.as_rust().clone()
         });
-        let inner = if include_nested {
-            let sv = sv_option.as_ref().ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("include_nested requires schema_view")
-            })?;
-            crate::constraint_set::ConstraintSet::from_shacl_with_nested(
-                ttl,
-                target_class,
-                language,
-                sv,
-            )
-        } else {
-            crate::constraint_set::ConstraintSet::from_shacl(
-                ttl,
-                target_class,
-                language,
-                sv_option.as_ref(),
-            )
-        }
+        let inner = crate::constraint_set::ConstraintSet::from_shacl(
+            ttl,
+            target_class,
+            language,
+            sv_option.as_ref(),
+        )
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(Self { inner })
     }

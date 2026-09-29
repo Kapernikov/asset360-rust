@@ -55,6 +55,15 @@ impl ConstraintSet {
     }
 
     /// Parse SHACL Turtle text into a constraint set.
+    ///
+    /// With a schema view, the set also carries the introspectable shapes of
+    /// every class inlined inside `target_class`, recursively (single-valued,
+    /// list and mapping slots, and the descendants of each range class).
+    /// SHACL's `sh:targetClass` applies to every node of the class, nested ones
+    /// included; this is how forward evaluation honours that. Those shapes are
+    /// marked [`ShapeResult::nested`] and only take part in
+    /// [`evaluate`](Self::evaluate). Without a schema view there is no way to
+    /// tell which classes are nested, so the set holds the root shapes only.
     #[cfg(feature = "shacl-parser")]
     pub fn from_shacl(
         ttl: &str,
@@ -72,39 +81,18 @@ impl ConstraintSet {
         if let Some(sv) = schema_view {
             cs = cs.with_schema_view(sv, target_class)?;
         }
-        Ok(cs)
-    }
-
-    /// Parse SHACL Turtle text into a constraint set for `target_class` that
-    /// also carries the introspectable shapes of every class inlined inside
-    /// it, recursively (single-valued, list and mapping slots, and the
-    /// descendants of each range class).
-    ///
-    /// SHACL's `sh:targetClass` applies to every node of the class, nested
-    /// ones included; this is how forward evaluation honours that. The extra
-    /// shapes are marked [`ShapeResult::nested`] and only take part in
-    /// [`evaluate`](Self::evaluate).
-    #[cfg(feature = "shacl-parser")]
-    pub fn from_shacl_with_nested(
-        ttl: &str,
-        target_class: &str,
-        language: &str,
-        schema_view: &SchemaView,
-    ) -> Result<Self, String> {
-        let mut cs = Self::from_shacl(ttl, target_class, language, Some(schema_view))?;
-        let Some(root) = cs.target_class.clone() else {
-            return Err(format!("class '{target_class}' not found in schema"));
-        };
-        for class_name in nested_class_names(&root) {
-            let shapes = shacl_parser::parse_shacl(ttl, &class_name, language)
-                .map_err(|e| format!("SHACL parse error: {e}"))?;
-            cs.shapes
-                .extend(shapes.into_iter().filter(|shape| shape.introspectable).map(
-                    |mut shape| {
-                        shape.nested = true;
-                        shape
-                    },
-                ));
+        if let Some(root) = cs.target_class.clone() {
+            for class_name in nested_class_names(&root) {
+                let shapes = shacl_parser::parse_shacl(ttl, &class_name, language)
+                    .map_err(|e| format!("SHACL parse error: {e}"))?;
+                cs.shapes
+                    .extend(shapes.into_iter().filter(|shape| shape.introspectable).map(
+                        |mut shape| {
+                            shape.nested = true;
+                            shape
+                        },
+                    ));
+            }
         }
         Ok(cs)
     }
@@ -126,7 +114,7 @@ impl ConstraintSet {
     /// Forward-evaluate all shapes against `object_data`, returning all violations.
     ///
     /// Root shapes run on `object_data` itself. Nested shapes (see
-    /// [`from_shacl_with_nested`](Self::from_shacl_with_nested)) run on every
+    /// [`from_shacl`](Self::from_shacl)) run on every
     /// inlined object of their target class, and their violations carry the
     /// object's `path` and `element_label`. Nested shapes need the schema view
     /// to find those objects; without one they are skipped.
@@ -1378,7 +1366,7 @@ ex:NoteTextShape a sh:NodeShape ;
     #[test]
     fn test_evaluate_nested_reports_each_object_at_its_path() {
         let sv = nested_schema_view();
-        let cs = ConstraintSet::from_shacl_with_nested(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
 
         let violations = cs.evaluate(&nested_invalid_data());
         let label = |s: &str| Some(s.to_owned());
@@ -1419,7 +1407,7 @@ ex:NoteTextShape a sh:NodeShape ;
     #[test]
     fn test_evaluate_nested_valid_data_is_clean() {
         let sv = nested_schema_view();
-        let cs = ConstraintSet::from_shacl_with_nested(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
         let data = json!({
             "id": "h1",
             "name": "Good",
@@ -1434,15 +1422,26 @@ ex:NoteTextShape a sh:NodeShape ;
         assert!(cs.evaluate(&data).is_empty());
     }
 
-    /// Without nested shapes nothing changes, and with them every root-only
-    /// operation still sees the root shapes alone.
+    /// Nested shapes add violations and nothing else: without them the set
+    /// evaluates the root as before, and every root-only operation gives the
+    /// same answer with or without them.
     #[cfg(feature = "shacl-parser")]
     #[test]
     fn test_nested_shapes_leave_root_operations_alone() {
         let sv = nested_schema_view();
-        let plain = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
-        let deep =
-            ConstraintSet::from_shacl_with_nested(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let deep = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
+        // The same set with its nested shapes taken out: what the parser gave
+        // before nested classes were collected.
+        let root_only: Vec<ShapeResult> =
+            serde_json::from_str::<Vec<ShapeResult>>(&deep.to_json().unwrap())
+                .unwrap()
+                .into_iter()
+                .filter(|shape| !shape.nested)
+                .collect();
+        let plain = ConstraintSet::from_json(&serde_json::to_string(&root_only).unwrap())
+            .unwrap()
+            .with_schema_view(&sv, "Holder")
+            .unwrap();
         let data = nested_invalid_data();
 
         assert_eq!(plain.shape_count(), 1);
@@ -1471,8 +1470,7 @@ ex:NoteTextShape a sh:NodeShape ;
     #[test]
     fn test_nested_shapes_survive_json_round_trip() {
         let sv = nested_schema_view();
-        let deep =
-            ConstraintSet::from_shacl_with_nested(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let deep = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
         let data = nested_invalid_data();
 
         let rebuilt = ConstraintSet::from_json(&deep.to_json().unwrap())
