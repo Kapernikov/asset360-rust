@@ -1224,6 +1224,35 @@ impl PyConstraintSet {
         }
     }
 
+    /// Solve backward for a field of a nested object, returning JSON
+    /// FieldConstraint or None. `path_json` is a JSON array leading to the
+    /// field: slot names, mapping keys and list positions, then the field
+    /// name (e.g. `["hasCalculationLoad", "hasLoadModel"]`). The shapes on
+    /// the nested object's class and its ancestors apply.
+    #[pyo3(signature = (object_data_json, path_json))]
+    fn solve_at(&self, object_data_json: &str, path_json: &str) -> PyResult<Option<String>> {
+        let data: serde_json::Value = serde_json::from_str(object_data_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid data JSON: {e}"))
+        })?;
+        let path: Vec<crate::shacl_ast::PathSegment> =
+            serde_json::from_str(path_json).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid path JSON: {e}"))
+            })?;
+        match self
+            .inner
+            .solve_at(&data, &path)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?
+        {
+            Some(fc) => {
+                let json = serde_json::to_string(&fc).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}"))
+                })?;
+                Ok(Some(json))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Solve allowed values for an array-member field, returning JSON
     /// FieldConstraint or None. `editing_index` excludes the edited member's own
     /// value from "already used" (None for a new member).

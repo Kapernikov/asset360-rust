@@ -159,27 +159,36 @@ impl ConstraintSet {
         {
             return Ok(());
         }
-        // Loading through the runtime rather than walking the raw JSON is what
-        // resolves each nested object's concrete class (type designators,
-        // descendants) and fills a mapping entry's key slot from its dict key.
+        let instance = self.load(object_data, "evaluate its nested shapes")?;
+        self.walk_nested(&instance, &mut Vec::new(), None, out)
+    }
+
+    /// Load `object_data` as the root class. Loading through the runtime
+    /// rather than walking the raw JSON is what resolves each nested object's
+    /// concrete class (type designators, descendants) and fills a mapping
+    /// entry's key slot from its dict key. `purpose` completes the error.
+    fn load(
+        &self,
+        object_data: &serde_json::Value,
+        purpose: &str,
+    ) -> Result<LinkMLInstance, String> {
         let sv = &self.schema_view;
         let root = &self.target_class;
         let conv = sv.converter();
         let loaded =
             LinkMLInstance::from_json(object_data.clone(), root.clone(), None, sv, &conv, false);
-        let Some(instance) = loaded.instance else {
+        loaded.instance.ok_or_else(|| {
             let issues: Vec<String> = loaded
                 .validation_issues
                 .iter()
                 .map(|issue| format!("{issue:?}"))
                 .collect();
-            return Err(format!(
-                "cannot load the object as {} to evaluate its nested shapes: {}",
+            format!(
+                "cannot load the object as {} to {purpose}: {}",
                 root.name(),
                 issues.join("; ")
-            ));
-        };
-        self.walk_nested(&instance, &mut Vec::new(), None, out)
+            )
+        })
     }
 
     fn walk_nested(
@@ -263,7 +272,80 @@ impl ConstraintSet {
         object_data: &serde_json::Value,
         target_field: &str,
     ) -> Option<FieldConstraint> {
+        self.solve_on(
+            &self.target_class,
+            &self.root_lineage,
+            object_data,
+            target_field,
+        )
+    }
+
+    /// Backward-solve a field of an object nested inside `object_data`.
+    ///
+    /// `path` leads to the field: slot names, mapping keys and list
+    /// positions, then the field name, as in [`Violation::path`] plus the
+    /// field (e.g. `["hasCalculationLoad", "hasLoadModel"]`). The field is
+    /// solved with the shapes on the nested object's class and its ancestors,
+    /// against that object's own values. A one-segment path is [`solve`](Self::solve).
+    ///
+    /// `Ok(None)` when no shape constrains the field, or the nested object is
+    /// absent (nothing to constrain yet). Fails when the path does not end in
+    /// a field name, does not fit the object, or `object_data` cannot be
+    /// loaded as the target class.
+    pub fn solve_at(
+        &self,
+        object_data: &serde_json::Value,
+        path: &[PathSegment],
+    ) -> Result<Option<FieldConstraint>, String> {
+        let Some((PathSegment::Key(target_field), parents)) = path.split_last() else {
+            return Err(format!("path {path:?} does not end in a field name"));
+        };
+        if parents.is_empty() {
+            return Ok(self.solve(object_data, target_field));
+        }
+        let instance = self.load(object_data, "solve a nested field")?;
+        let mut node = &instance;
+        for segment in parents {
+            let child = match (node, segment) {
+                (LinkMLInstance::Object { values, .. }, PathSegment::Key(key))
+                | (LinkMLInstance::Mapping { values, .. }, PathSegment::Key(key)) => {
+                    values.get(key)
+                }
+                (LinkMLInstance::List { values, .. }, PathSegment::Index(index)) => {
+                    values.get(*index)
+                }
+                _ => {
+                    return Err(format!(
+                        "path {path:?} does not fit the object at {segment:?}"
+                    ));
+                }
+            };
+            match child {
+                None | Some(LinkMLInstance::Null { .. }) => return Ok(None),
+                Some(child) => node = child,
+            }
+        }
+        let LinkMLInstance::Object { class, .. } = node else {
+            return Err(format!("path {path:?} does not lead to a nested object"));
+        };
+        Ok(self.solve_on(class, &class_lineage(class)?, &node.to_json(), target_field))
+    }
+
+    /// Solve `target_field` of an object of `class`, whose `is_a` lineage
+    /// (itself first) picks the shapes that apply to it.
+    fn solve_on(
+        &self,
+        class: &ClassView,
+        lineage: &[String],
+        object_data: &serde_json::Value,
+        target_field: &str,
+    ) -> Option<FieldConstraint> {
         let obj = object_data.as_object()?;
+        let shapes: Vec<&ShapeResult> = self
+            .shapes
+            .iter()
+            .filter(|s| lineage.contains(&s.target_class))
+            .collect();
 
         // Build known fields = all object fields except the target
         let mut known = obj.clone();
@@ -273,15 +355,17 @@ impl ConstraintSet {
         // JSON null, not a wildcard. The inner solver's "missing == wildcard"
         // is correct for forward eval but wrong for edit-session backward
         // solving — fix at the API boundary (see MR 438).
-        for field in self.affected_fields() {
+        for field in shapes.iter().flat_map(|s| &s.affected_fields) {
             if field != target_field {
-                known.entry(field).or_insert(serde_json::Value::Null);
+                known
+                    .entry(field.clone())
+                    .or_insert(serde_json::Value::Null);
             }
         }
 
         // Collect predicates from all introspectable shapes that have an AST
         let mut predicates: Vec<Predicate> = Vec::new();
-        for shape in self.root_shapes() {
+        for shape in shapes {
             if shape.introspectable
                 && let Some(ref ast) = shape.ast
                 && let Some(pred) =
@@ -303,11 +387,7 @@ impl ConstraintSet {
         };
 
         // Enum resolution: an enum-ranged target field gets its passing values
-        if let Some(slot) = self
-            .target_class
-            .slots()
-            .iter()
-            .find(|slot| slot.name == target_field)
+        if let Some(slot) = class.slots().iter().find(|slot| slot.name == target_field)
             && let Some(enum_view) = slot.get_range_enum()
             && let Ok(keys) = enum_view.permissible_value_keys()
         {
@@ -1292,8 +1372,10 @@ classes:
     attributes:
       kind:
         designates_type: true
-      standard: {}
-      model: {}
+      standard:
+        range: Standard
+      model:
+        range: Model
   SpecialLoad:
     is_a: Load
   Section:
@@ -1306,9 +1388,22 @@ classes:
         range: integer
       kp: {}
       track: {}
+      load:
+        range: Load
+        inlined: true
   Note:
     attributes:
       text: {}
+enums:
+  Standard:
+    permissible_values:
+      S1: {}
+      S2: {}
+  Model:
+    permissible_values:
+      M1: {}
+      M2: {}
+      M9: {}
 "#;
 
     #[cfg(feature = "shacl-parser")]
@@ -1608,5 +1703,99 @@ ex:NoteTextShape a sh:NodeShape ;
             error.contains("cannot load the object as Holder"),
             "{error}"
         );
+    }
+
+    /// A nested field is solved with its own object's shapes and enum: in a
+    /// single-valued object, below a mapping entry and below a list item.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_solve_at_nested_field() {
+        let sv = nested_schema_view();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let data = nested_invalid_data();
+        let at = |path: serde_json::Value| {
+            let path: Vec<PathSegment> = serde_json::from_value(path).unwrap();
+            serde_json::to_value(cs.solve_at(&data, &path).unwrap()).unwrap()
+        };
+        let only_m1 = json!({ "type": "AllowedValues", "values": ["M1"] });
+        assert_eq!(at(json!(["holderLoad", "model"])), only_m1);
+        assert_eq!(at(json!(["elements", "Side", "load", "model"])), only_m1);
+
+        let listed = json!({
+            "id": "h1",
+            "sections": [
+                { "sequenceNumber": 1 },
+                { "sequenceNumber": 2, "load": { "standard": "S1" } }
+            ]
+        });
+        let path: Vec<PathSegment> =
+            serde_json::from_value(json!(["sections", 1, "load", "model"])).unwrap();
+        assert_eq!(
+            serde_json::to_value(cs.solve_at(&listed, &path).unwrap()).unwrap(),
+            only_m1
+        );
+    }
+
+    /// A subclass instance, picked by its type designator, gets its parent's
+    /// shapes and its own enum.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_solve_at_subclass_instance() {
+        let sv = nested_schema_view();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let data = json!({
+            "id": "h1",
+            "holderLoad": { "kind": "ex:SpecialLoad", "standard": "S1" }
+        });
+        let path = [
+            PathSegment::Key("holderLoad".into()),
+            PathSegment::Key("model".into()),
+        ];
+        assert_eq!(
+            serde_json::to_value(cs.solve_at(&data, &path).unwrap()).unwrap(),
+            json!({ "type": "AllowedValues", "values": ["M1"] })
+        );
+    }
+
+    /// No answer where nothing constrains the field: a class without shapes,
+    /// or a nested object not filled in yet.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_solve_at_unconstrained_is_none() {
+        let sv = nested_schema_view();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let data = nested_invalid_data();
+        let at = |path: serde_json::Value| {
+            let path: Vec<PathSegment> = serde_json::from_value(path).unwrap();
+            cs.solve_at(&data, &path).unwrap()
+        };
+        assert!(at(json!(["elements", "Side", "parts", 0, "code"])).is_none());
+        assert!(at(json!(["elements", "Main", "load", "model"])).is_none());
+    }
+
+    /// A one-segment path is plain solving, loadable object or not; a path
+    /// that does not end in a field or does not fit the object fails.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_solve_at_plain_field_and_bad_paths() {
+        let sv = nested_schema_view();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let data = nested_invalid_data();
+        let name = [PathSegment::Key("name".into())];
+        assert!(cs.solve(&data, "name").is_some());
+        assert_eq!(
+            serde_json::to_value(cs.solve_at(&data, &name).unwrap()).unwrap(),
+            serde_json::to_value(cs.solve(&data, "name")).unwrap()
+        );
+
+        for bad in [
+            json!([]),
+            json!(["sections", 1]),
+            json!(["sections", "1", "track"]),
+            json!(["name", "x"]),
+        ] {
+            let path: Vec<PathSegment> = serde_json::from_value(bad.clone()).unwrap();
+            assert!(cs.solve_at(&data, &path).is_err(), "{bad}");
+        }
     }
 }
