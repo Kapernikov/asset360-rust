@@ -1133,58 +1133,49 @@ struct PyConstraintSet {
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl PyConstraintSet {
-    /// Create a ConstraintSet from a JSON array of ShapeResult objects.
+    /// Create a ConstraintSet for `target_class` from a JSON array of
+    /// ShapeResult objects (as written by `to_json`).
     #[staticmethod]
-    #[pyo3(signature = (json,))]
-    fn from_json(json: &str) -> PyResult<Self> {
-        let inner = crate::constraint_set::ConstraintSet::from_json(json)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        Ok(Self { inner })
-    }
-
-    /// Parse SHACL Turtle text into a ConstraintSet.
-    #[cfg(feature = "shacl-parser")]
-    #[staticmethod]
-    #[pyo3(signature = (ttl, target_class, language="", schema_view=None))]
-    fn from_shacl(
+    #[pyo3(signature = (json, schema_view, target_class))]
+    fn from_json(
         py: Python<'_>,
-        ttl: &str,
-        target_class: &str,
-        language: &str,
-        schema_view: Option<Py<PySchemaView>>,
-    ) -> PyResult<Self> {
-        let sv_option = schema_view.as_ref().map(|sv| {
-            let bound = sv.bind(py);
-            let borrowed = bound.borrow();
-            borrowed.as_rust().clone()
-        });
-        let inner = crate::constraint_set::ConstraintSet::from_shacl(
-            ttl,
-            target_class,
-            language,
-            sv_option.as_ref(),
-        )
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        Ok(Self { inner })
-    }
-
-    /// Attach a schema view (returns a new ConstraintSet with schema awareness).
-    #[pyo3(signature = (schema_view, target_class))]
-    fn with_schema_view(
-        &self,
-        py: Python<'_>,
+        json: &str,
         schema_view: Py<PySchemaView>,
         target_class: &str,
     ) -> PyResult<Self> {
         let bound = schema_view.bind(py);
         let borrowed = bound.borrow();
-        let sv = borrowed.as_rust();
-        let new_inner = self
-            .inner
-            .clone()
-            .with_schema_view(sv, target_class)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        Ok(Self { inner: new_inner })
+        let inner =
+            crate::constraint_set::ConstraintSet::from_json(json, borrowed.as_rust(), target_class)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Parse SHACL Turtle text into a ConstraintSet for `target_class`.
+    ///
+    /// The set also carries the introspectable shapes of every class inlined
+    /// inside `target_class`, and `evaluate` runs them on each nested object
+    /// (those violations carry `path` and `element_label`).
+    #[cfg(feature = "shacl-parser")]
+    #[staticmethod]
+    #[pyo3(signature = (ttl, target_class, language, schema_view))]
+    fn from_shacl(
+        py: Python<'_>,
+        ttl: &str,
+        target_class: &str,
+        language: &str,
+        schema_view: Py<PySchemaView>,
+    ) -> PyResult<Self> {
+        let bound = schema_view.bind(py);
+        let borrowed = bound.borrow();
+        let inner = crate::constraint_set::ConstraintSet::from_shacl(
+            ttl,
+            target_class,
+            language,
+            borrowed.as_rust(),
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(Self { inner })
     }
 
     /// Serialize the shapes to JSON.
@@ -1194,13 +1185,24 @@ impl PyConstraintSet {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
     }
 
+    /// Serialize only the shapes that target the root class itself, for a
+    /// consumer that places violations on the root object's own fields.
+    fn root_shapes_json(&self) -> PyResult<String> {
+        self.inner
+            .root_shapes_json()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
+    }
+
     /// Evaluate all shapes against object data, returning JSON array of violations.
     #[pyo3(signature = (object_data_json,))]
     fn evaluate(&self, object_data_json: &str) -> PyResult<String> {
         let data: serde_json::Value = serde_json::from_str(object_data_json).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid data JSON: {e}"))
         })?;
-        let violations = self.inner.evaluate(&data);
+        let violations = self
+            .inner
+            .evaluate(&data)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         serde_json::to_string(&violations)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
     }
@@ -1275,9 +1277,9 @@ impl PyConstraintSet {
 
     fn __repr__(&self) -> String {
         format!(
-            "ConstraintSet(shapes={}, has_schema={})",
-            self.inner.shape_count(),
-            self.inner.has_schema()
+            "ConstraintSet(target_class={}, shapes={})",
+            self.inner.target_class_name(),
+            self.inner.shape_count()
         )
     }
 }

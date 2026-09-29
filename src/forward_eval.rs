@@ -26,6 +26,8 @@ pub fn evaluate_forward(shape: &ShapeResult, data: &serde_json::Value) -> Vec<Vi
             enforcement_level: shape.enforcement_level.clone(),
             suggested_fix: None,
             shape_uri: shape.stable_shape_uri().map(str::to_owned),
+            path: Vec::new(),
+            element_label: None,
         }]
     }
 }

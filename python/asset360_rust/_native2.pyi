@@ -1606,22 +1606,28 @@ class ConstantColumn:
 
 class ConstraintSet:
     @staticmethod
-    def from_json(json:builtins.str) -> ConstraintSet:
+    def from_json(json:builtins.str, schema_view:SchemaView, target_class:builtins.str) -> ConstraintSet:
         r"""
-        Create a ConstraintSet from a JSON array of ShapeResult objects.
+        Create a ConstraintSet for `target_class` from a JSON array of
+        ShapeResult objects (as written by `to_json`).
         """
     @staticmethod
-    def from_shacl(ttl:builtins.str, target_class:builtins.str, language:builtins.str='', schema_view:typing.Optional[SchemaView]=None) -> ConstraintSet:
+    def from_shacl(ttl:builtins.str, target_class:builtins.str, language:builtins.str, schema_view:SchemaView) -> ConstraintSet:
         r"""
-        Parse SHACL Turtle text into a ConstraintSet.
-        """
-    def with_schema_view(self, schema_view:SchemaView, target_class:builtins.str) -> ConstraintSet:
-        r"""
-        Attach a schema view (returns a new ConstraintSet with schema awareness).
+        Parse SHACL Turtle text into a ConstraintSet for `target_class`.
+        
+        The set also carries the introspectable shapes of every class inlined
+        inside `target_class`, and `evaluate` runs them on each nested object
+        (those violations carry `path` and `element_label`).
         """
     def to_json(self) -> builtins.str:
         r"""
         Serialize the shapes to JSON.
+        """
+    def root_shapes_json(self) -> builtins.str:
+        r"""
+        Serialize only the shapes that target the root class itself, for a
+        consumer that places violations on the root object's own fields.
         """
     def evaluate(self, object_data_json:builtins.str) -> builtins.str:
         r"""

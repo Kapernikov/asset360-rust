@@ -1113,26 +1113,17 @@ pub struct ConstraintSetHandle {
 
 #[wasm_bindgen]
 impl ConstraintSetHandle {
-    /// Create a ConstraintSet from a JSON array of ShapeResult objects.
+    /// Create a ConstraintSet for `targetClass` from a JSON array of
+    /// ShapeResult objects.
     #[wasm_bindgen(js_name = fromJson)]
-    pub fn from_json(json: &str) -> Result<ConstraintSetHandle, JsValue> {
-        let inner = crate::constraint_set::ConstraintSet::from_json(json)
-            .map_err(|e| JsValue::from_str(&e))?;
-        Ok(Self { inner })
-    }
-
-    /// Attach a schema view and target class (returns a new handle).
-    #[wasm_bindgen(js_name = withSchemaView)]
-    pub fn with_schema_view(
-        self,
+    pub fn from_json(
+        json: &str,
         sv: &SchemaViewHandle,
         target_class: &str,
     ) -> Result<ConstraintSetHandle, JsValue> {
-        let new_inner = self
-            .inner
-            .with_schema_view(&sv.inner, target_class)
+        let inner = crate::constraint_set::ConstraintSet::from_json(json, &sv.inner, target_class)
             .map_err(|e| JsValue::from_str(&e))?;
-        Ok(Self { inner: new_inner })
+        Ok(Self { inner })
     }
 
     /// Forward-evaluate all shapes against object data.
@@ -1141,7 +1132,10 @@ impl ConstraintSetHandle {
     pub fn evaluate(&self, object_data_json: &str) -> Result<JsValue, JsValue> {
         let data: serde_json::Value = serde_json::from_str(object_data_json)
             .map_err(|e| JsValue::from_str(&format!("invalid data JSON: {e}")))?;
-        let violations = self.inner.evaluate(&data);
+        let violations = self
+            .inner
+            .evaluate(&data)
+            .map_err(|e| JsValue::from_str(&e))?;
         to_js(&violations)
     }
 
@@ -1200,9 +1194,9 @@ impl ConstraintSetHandle {
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!(
-            "ConstraintSetHandle(shapes={}, has_schema={})",
-            self.inner.shape_count(),
-            self.inner.has_schema()
+            "ConstraintSetHandle(targetClass={}, shapes={})",
+            self.inner.target_class_name(),
+            self.inner.shape_count()
         )
     }
 }

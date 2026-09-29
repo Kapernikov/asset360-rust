@@ -174,6 +174,25 @@ pub struct Violation {
     /// `None` for a blank-node shape — see [`ShapeResult::stable_shape_uri`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape_uri: Option<String>,
+    /// Location of the violating object, from the root: slot names, mapping
+    /// keys and list positions, e.g. `["hasStructureElement", "Main_beam",
+    /// "hasCalculationLoad"]`. Empty (and omitted) for the root object.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<PathSegment>,
+    /// Human-readable name of the list or mapping element the violating
+    /// object sits in: its identity label (key, identifier or sequence
+    /// number), else its 1-based position. `None` for the root object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_label: Option<String>,
+}
+
+/// One step of a [`Violation::path`]: a slot name or mapping key, or a list
+/// position. Serializes as a bare JSON string or number.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PathSegment {
+    Index(usize),
+    Key(String),
 }
 
 #[cfg(test)]
@@ -257,6 +276,8 @@ mod tests {
             enforcement_level: EnforcementLevel::Serious,
             suggested_fix: Some("Change secondary status".into()),
             shape_uri: Some("https://data.infrabel.be/asset360/StatusComboShape".into()),
+            path: Vec::new(),
+            element_label: None,
         };
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains("\"enforcement_level\":\"serious\""));

@@ -241,6 +241,37 @@ pub fn parse_shacl(
     target_class: &str,
     language: &str,
 ) -> Result<Vec<ShapeResult>, ParseError> {
+    if target_class.is_empty() {
+        parse_shacl_matching(ttl, language, |_| true)
+    } else {
+        parse_shacl_for_classes(ttl, &[target_class], language)
+    }
+}
+
+/// Parse the Turtle once and return the shapes whose `sh:targetClass` is any
+/// of `target_classes` (each given as a local name or a full IRI). Shapes of
+/// other classes are skipped before their body is parsed, exactly as
+/// [`parse_shacl`] skips them for a single class.
+pub fn parse_shacl_for_classes(
+    ttl: &str,
+    target_classes: &[&str],
+    language: &str,
+) -> Result<Vec<ShapeResult>, ParseError> {
+    parse_shacl_matching(ttl, language, |shape_target| {
+        shape_target.is_some_and(|tc| {
+            let tc_local = iri_local_name(tc);
+            target_classes
+                .iter()
+                .any(|wanted| tc_local == *wanted || tc == *wanted)
+        })
+    })
+}
+
+fn parse_shacl_matching(
+    ttl: &str,
+    language: &str,
+    wanted: impl Fn(Option<&str>) -> bool,
+) -> Result<Vec<ShapeResult>, ParseError> {
     let store = TripleStore::parse(ttl)?;
     let mut results = Vec::new();
 
@@ -255,15 +286,8 @@ pub fn parse_shacl(
 
         // Check target class
         let shape_target = store.first_str(subj, &sh("targetClass"));
-        if !target_class.is_empty() {
-            if let Some(ref tc) = shape_target {
-                let tc_local = iri_local_name(tc);
-                if tc_local != target_class && tc != target_class {
-                    continue;
-                }
-            } else {
-                continue;
-            }
+        if !wanted(shape_target.as_deref()) {
+            continue;
         }
 
         let target_class_name = shape_target
@@ -1507,12 +1531,18 @@ asset360:AllowedTypesShape
         assert_eq!(shapes.len(), 2);
         // Exactly one introspectable shape survives to the Rust evaluator.
         assert_eq!(shapes.iter().filter(|s| s.introspectable).count(), 1);
-        let cs = ConstraintSet::from_json(&serde_json::to_string(&shapes).unwrap()).unwrap();
+        let (sv, _) = crate::constraint_set::bare_schema("TunnelComplex");
+        let cs = ConstraintSet::from_json(
+            &serde_json::to_string(&shapes).unwrap(),
+            &sv,
+            "TunnelComplex",
+        )
+        .unwrap();
         // Valid status combo, and a docType OUTSIDE the sh:in set — must NOT be
         // flagged, because the sh:in shape is pyshacl's, not the Rust engine's.
         let data = serde_json::json!({"primary": "TSI", "secondary": "COM", "docType": "Z"});
         assert!(
-            cs.evaluate(&data).is_empty(),
+            cs.evaluate(&data).unwrap().is_empty(),
             "non-introspectable sh:in shape must not be evaluated by the Rust engine"
         );
 
@@ -1520,7 +1550,7 @@ asset360:AllowedTypesShape
         // consumer groups its findings per rule on this, and the parser's
         // full IRI is what it has to receive.
         let bad = serde_json::json!({"primary": "TSI", "secondary": "SST", "docType": "A"});
-        let violations = cs.evaluate(&bad);
+        let violations = cs.evaluate(&bad).unwrap();
         assert_eq!(violations.len(), 1);
         assert_eq!(
             violations[0].shape_uri.as_deref(),
