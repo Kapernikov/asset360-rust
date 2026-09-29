@@ -1606,22 +1606,19 @@ class ConstantColumn:
 
 class ConstraintSet:
     @staticmethod
-    def from_json(json:builtins.str) -> ConstraintSet:
+    def from_json(json:builtins.str, schema_view:SchemaView, target_class:builtins.str) -> ConstraintSet:
         r"""
-        Create a ConstraintSet from a JSON array of ShapeResult objects.
+        Create a ConstraintSet for `target_class` from a JSON array of
+        ShapeResult objects (as written by `to_json`).
         """
     @staticmethod
-    def from_shacl(ttl:builtins.str, target_class:builtins.str, language:builtins.str='', schema_view:typing.Optional[SchemaView]=None) -> ConstraintSet:
+    def from_shacl(ttl:builtins.str, target_class:builtins.str, language:builtins.str, schema_view:SchemaView) -> ConstraintSet:
         r"""
-        Parse SHACL Turtle text into a ConstraintSet.
+        Parse SHACL Turtle text into a ConstraintSet for `target_class`.
         
-        With `schema_view`, the set also carries the introspectable shapes of
-        every class inlined inside `target_class`, and `evaluate` runs them on
-        each nested object (those violations carry `path` and `element_label`).
-        """
-    def with_schema_view(self, schema_view:SchemaView, target_class:builtins.str) -> ConstraintSet:
-        r"""
-        Attach a schema view (returns a new ConstraintSet with schema awareness).
+        The set also carries the introspectable shapes of every class inlined
+        inside `target_class`, and `evaluate` runs them on each nested object
+        (those violations carry `path` and `element_label`).
         """
     def to_json(self) -> builtins.str:
         r"""

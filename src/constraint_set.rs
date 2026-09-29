@@ -31,21 +31,26 @@ pub enum FieldConstraint {
 #[derive(Clone)]
 pub struct ConstraintSet {
     shapes: Vec<ShapeResult>,
-    schema_view: Option<SchemaView>,
-    target_class: Option<ClassView>,
+    schema_view: SchemaView,
+    target_class: ClassView,
 }
 
 impl ConstraintSet {
     // ── Construction ─────────────────────────────────────────────────
 
-    /// Deserialize a constraint set from a JSON array of `ShapeResult`s.
-    pub fn from_json(json: &str) -> Result<Self, String> {
+    /// Deserialize a constraint set for `target_class` from a JSON array of
+    /// `ShapeResult`s (as written by [`to_json`](Self::to_json)).
+    pub fn from_json(
+        json: &str,
+        schema_view: &SchemaView,
+        target_class: &str,
+    ) -> Result<Self, String> {
         let shapes: Vec<ShapeResult> =
             serde_json::from_str(json).map_err(|e| format!("invalid shapes JSON: {e}"))?;
         Ok(Self {
             shapes,
-            schema_view: None,
-            target_class: None,
+            schema_view: schema_view.clone(),
+            target_class: resolve_class(schema_view, target_class)?,
         })
     }
 
@@ -54,59 +59,47 @@ impl ConstraintSet {
         serde_json::to_string(&self.shapes)
     }
 
-    /// Parse SHACL Turtle text into a constraint set.
+    /// Parse SHACL Turtle text into a constraint set for `target_class`.
     ///
-    /// With a schema view, the set also carries the introspectable shapes of
-    /// every class inlined inside `target_class`, recursively (single-valued,
-    /// list and mapping slots, and the descendants of each range class).
-    /// SHACL's `sh:targetClass` applies to every node of the class, nested ones
+    /// The set also carries the introspectable shapes of every class inlined
+    /// inside `target_class`, recursively (single-valued, list and mapping
+    /// slots, and the descendants of each range class). SHACL's
+    /// `sh:targetClass` applies to every node of the class, nested ones
     /// included; this is how forward evaluation honours that. Those shapes are
     /// marked [`ShapeResult::nested`] and only take part in
-    /// [`evaluate`](Self::evaluate). Without a schema view there is no way to
-    /// tell which classes are nested, so the set holds the root shapes only.
+    /// [`evaluate`](Self::evaluate).
     #[cfg(feature = "shacl-parser")]
     pub fn from_shacl(
         ttl: &str,
         target_class: &str,
         language: &str,
-        schema_view: Option<&SchemaView>,
+        schema_view: &SchemaView,
     ) -> Result<Self, String> {
-        let shapes = shacl_parser::parse_shacl(ttl, target_class, language)
+        let root = resolve_class(schema_view, target_class)?;
+        let nested = nested_class_names(&root)?;
+        let wanted: Vec<&str> = std::iter::once(target_class)
+            .chain(nested.iter().map(String::as_str))
+            .collect();
+        let parsed = shacl_parser::parse_shacl_for_classes(ttl, &wanted, language)
             .map_err(|e| format!("SHACL parse error: {e}"))?;
-        let mut cs = Self {
-            shapes,
-            schema_view: None,
-            target_class: None,
-        };
-        if let Some(sv) = schema_view {
-            cs = cs.with_schema_view(sv, target_class)?;
-        }
-        if let Some(root) = cs.target_class.clone() {
-            for class_name in nested_class_names(&root) {
-                let shapes = shacl_parser::parse_shacl(ttl, &class_name, language)
-                    .map_err(|e| format!("SHACL parse error: {e}"))?;
-                cs.shapes
-                    .extend(shapes.into_iter().filter(|shape| shape.introspectable).map(
-                        |mut shape| {
-                            shape.nested = true;
-                            shape
-                        },
-                    ));
+        let root_name = target_class
+            .rsplit(['/', '#'])
+            .next()
+            .unwrap_or(target_class);
+        let mut shapes = Vec::with_capacity(parsed.len());
+        for mut shape in parsed {
+            if shape.target_class == root_name {
+                shapes.push(shape);
+            } else if shape.introspectable {
+                shape.nested = true;
+                shapes.push(shape);
             }
         }
-        Ok(cs)
-    }
-
-    /// Attach a schema view and resolve the target class.
-    pub fn with_schema_view(mut self, sv: &SchemaView, target_class: &str) -> Result<Self, String> {
-        let conv = sv.converter();
-        let class_view = sv
-            .get_class(&Identifier::new(target_class), &conv)
-            .map_err(|e| format!("error resolving class '{target_class}': {e:?}"))?
-            .ok_or_else(|| format!("class '{target_class}' not found in schema"))?;
-        self.schema_view = Some(sv.clone());
-        self.target_class = Some(class_view);
-        Ok(self)
+        Ok(Self {
+            shapes,
+            schema_view: schema_view.clone(),
+            target_class: root,
+        })
     }
 
     // ── Operations ───────────────────────────────────────────────────
@@ -116,9 +109,13 @@ impl ConstraintSet {
     /// Root shapes run on `object_data` itself. Nested shapes (see
     /// [`from_shacl`](Self::from_shacl)) run on every
     /// inlined object of their target class, and their violations carry the
-    /// object's `path` and `element_label`. Nested shapes need the schema view
-    /// to find those objects; without one they are skipped.
-    pub fn evaluate(&self, object_data: &serde_json::Value) -> Vec<Violation> {
+    /// object's `path` and `element_label`.
+    ///
+    /// Fails when nested shapes exist and `object_data` cannot be loaded as the
+    /// target class at all, since none of them could then be checked.
+    /// Validation issues on a loadable object (a half-filled form) are not a
+    /// failure: its nested objects are still evaluated.
+    pub fn evaluate(&self, object_data: &serde_json::Value) -> Result<Vec<Violation>, String> {
         let mut violations = Vec::new();
         for shape in self.root_shapes() {
             if !shape.introspectable {
@@ -126,27 +123,40 @@ impl ConstraintSet {
             }
             violations.extend(crate::forward_eval::evaluate_forward(shape, object_data));
         }
-        self.evaluate_nested(object_data, &mut violations);
-        violations
+        self.evaluate_nested(object_data, &mut violations)?;
+        Ok(violations)
     }
 
-    fn evaluate_nested(&self, object_data: &serde_json::Value, out: &mut Vec<Violation>) {
+    fn evaluate_nested(
+        &self,
+        object_data: &serde_json::Value,
+        out: &mut Vec<Violation>,
+    ) -> Result<(), String> {
         if !self.shapes.iter().any(|s| s.nested && s.introspectable) {
-            return;
+            return Ok(());
         }
-        let (Some(sv), Some(root)) = (&self.schema_view, &self.target_class) else {
-            return;
-        };
         // Loading through the runtime rather than walking the raw JSON is what
         // resolves each nested object's concrete class (type designators,
         // descendants) and fills a mapping entry's key slot from its dict key.
+        let sv = &self.schema_view;
+        let root = &self.target_class;
         let conv = sv.converter();
         let loaded =
             LinkMLInstance::from_json(object_data.clone(), root.clone(), None, sv, &conv, false);
         let Some(instance) = loaded.instance else {
-            return;
+            let issues: Vec<String> = loaded
+                .validation_issues
+                .iter()
+                .map(|issue| format!("{issue:?}"))
+                .collect();
+            return Err(format!(
+                "cannot load the object as {} to evaluate its nested shapes: {}",
+                root.name(),
+                issues.join("; ")
+            ));
         };
         self.walk_nested(&instance, root.name(), &mut Vec::new(), None, out);
+        Ok(())
     }
 
     fn walk_nested(
@@ -260,28 +270,23 @@ impl ConstraintSet {
             Predicate::and(predicates)
         };
 
-        // Try enum resolution if schema is available
-        if let (Some(sv), Some(class_view)) = (&self.schema_view, &self.target_class) {
-            // Find the slot matching target_field
-            let _ = sv; // used indirectly via class_view
-            for slot in class_view.slots() {
-                if slot.name == target_field {
-                    if let Some(enum_view) = slot.get_range_enum() {
-                        // Slot has an enum range — filter permissible values
-                        if let Ok(keys) = enum_view.permissible_value_keys() {
-                            let passing: Vec<String> = keys
-                                .iter()
-                                .filter(|candidate| {
-                                    evaluate_predicate_for_value(&combined, target_field, candidate)
-                                })
-                                .cloned()
-                                .collect();
-                            return Some(FieldConstraint::AllowedValues { values: passing });
-                        }
-                    }
-                    break;
-                }
-            }
+        // Enum resolution: an enum-ranged target field gets its passing values
+        if let Some(slot) = self
+            .target_class
+            .slots()
+            .iter()
+            .find(|slot| slot.name == target_field)
+            && let Some(enum_view) = slot.get_range_enum()
+            && let Ok(keys) = enum_view.permissible_value_keys()
+        {
+            let passing: Vec<String> = keys
+                .iter()
+                .filter(|candidate| {
+                    evaluate_predicate_for_value(&combined, target_field, candidate)
+                })
+                .cloned()
+                .collect();
+            return Some(FieldConstraint::AllowedValues { values: passing });
         }
 
         Some(FieldConstraint::Query {
@@ -352,10 +357,9 @@ impl ConstraintSet {
         Some(FieldConstraint::AllowedValues { values: allowed })
     }
 
-    /// Permissible enum keys of `member_field` on the range class of `array_field`,
-    /// when a schema view is attached.
+    /// Permissible enum keys of `member_field` on the range class of `array_field`.
     fn member_enum_keys(&self, array_field: &str, member_field: &str) -> Option<Vec<String>> {
-        let class_view = self.target_class.as_ref()?;
+        let class_view = &self.target_class;
         let array_slot = class_view.slots().iter().find(|s| s.name == array_field)?;
         let range_class = array_slot.get_range_class()?;
         let member_slot = range_class
@@ -403,9 +407,9 @@ impl ConstraintSet {
         self.shapes.len()
     }
 
-    /// Whether a schema view has been attached.
-    pub fn has_schema(&self) -> bool {
-        self.schema_view.is_some()
+    /// Name of the class this set was built for.
+    pub fn target_class_name(&self) -> &str {
+        self.target_class.name()
     }
 }
 
@@ -414,7 +418,7 @@ impl ConstraintSet {
 /// Names of the classes an instance of `root` can hold inlined, at any depth:
 /// the range class of every inlined slot and that class's descendants, sorted.
 /// `root` itself is left out; its shapes are already the set's root shapes.
-fn nested_class_names(root: &ClassView) -> Vec<String> {
+fn nested_class_names(root: &ClassView) -> Result<Vec<String>, String> {
     let mut found = std::collections::BTreeSet::new();
     let mut queue = vec![root.clone()];
     while let Some(class) = queue.pop() {
@@ -425,7 +429,9 @@ fn nested_class_names(root: &ClassView) -> Vec<String> {
             let Some(range) = slot.get_range_class() else {
                 continue;
             };
-            let descendants = range.get_descendants(true, false).unwrap_or_default();
+            let descendants = range
+                .get_descendants(true, false)
+                .map_err(|e| format!("error resolving descendants of '{}': {e:?}", range.name()))?;
             for candidate in std::iter::once(range).chain(descendants) {
                 if candidate.name() != root.name() && found.insert(candidate.name().to_owned()) {
                     queue.push(candidate);
@@ -433,7 +439,15 @@ fn nested_class_names(root: &ClassView) -> Vec<String> {
             }
         }
     }
-    found.into_iter().collect()
+    Ok(found.into_iter().collect())
+}
+
+fn resolve_class(schema_view: &SchemaView, target_class: &str) -> Result<ClassView, String> {
+    let conv = schema_view.converter();
+    schema_view
+        .get_class(&Identifier::new(target_class), &conv)
+        .map_err(|e| format!("error resolving class '{target_class}': {e:?}"))?
+        .ok_or_else(|| format!("class '{target_class}' not found in schema"))
 }
 
 /// Resolve the `member_field` value within one array-member JSON object.
@@ -515,11 +529,54 @@ fn values_equal_json_str(candidate: &str, value: &serde_json::Value) -> bool {
     }
 }
 
+/// Schema with one slot-less class, `Bare`, for tests that only care about
+/// the shapes.
+#[cfg(test)]
+pub(crate) fn bare_schema() -> (SchemaView, ClassView) {
+    use linkml_meta::SchemaDefinition;
+    use serde_path_to_error as p2e;
+    use serde_yml as yml;
+
+    const BARE: &str = "
+id: https://example.org/bare
+name: bare
+prefixes:
+  linkml: https://w3id.org/linkml/
+  ex: https://example.org/bare/
+default_prefix: ex
+default_range: string
+imports:
+  - linkml:types
+classes:
+  Bare: {}
+";
+    let mut sv = SchemaView::new();
+    for raw in [include_str!("../tests/data/types.yaml"), BARE] {
+        let schema: SchemaDefinition = p2e::deserialize(yml::Deserializer::from_str(raw)).unwrap();
+        sv.add_schema(schema).unwrap();
+    }
+    let class = resolve_class(&sv, "Bare").unwrap();
+    (sv, class)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shacl_ast::{EnforcementLevel, PropertyPath, ShaclAst};
     use serde_json::json;
+
+    /// A class with no slots: every field a test shape names is outside the
+    /// schema, so solving falls back to a `Query` and no enum or member lookup
+    /// kicks in. What the schema-less tests exercised before a schema was
+    /// mandatory.
+    fn bare(shapes: Vec<ShapeResult>) -> ConstraintSet {
+        let (schema_view, target_class) = bare_schema();
+        ConstraintSet {
+            shapes,
+            schema_view,
+            target_class,
+        }
+    }
 
     fn status_combo_shape() -> ShapeResult {
         let forbidden = vec![
@@ -597,11 +654,7 @@ mod tests {
     }
 
     fn file_links_cs() -> ConstraintSet {
-        ConstraintSet {
-            shapes: vec![file_links_shape()],
-            schema_view: None,
-            target_class: None,
-        }
+        bare(vec![file_links_shape()])
     }
 
     fn allowed_set(fc: Option<FieldConstraint>) -> Vec<String> {
@@ -664,18 +717,19 @@ mod tests {
     fn test_evaluate_blocks_duplicate_and_disallowed() {
         let cs = file_links_cs();
         let dup = json!({"fileLinksTyped": [{"type": "Sketch"}, {"type": "Sketch"}]});
-        assert_eq!(cs.evaluate(&dup).len(), 1);
+        assert_eq!(cs.evaluate(&dup).unwrap().len(), 1);
         let wrong = json!({"fileLinksTyped": [{"type": "Cassandra"}]});
-        assert_eq!(cs.evaluate(&wrong).len(), 1);
+        assert_eq!(cs.evaluate(&wrong).unwrap().len(), 1);
         let ok = json!({"fileLinksTyped": [{"type": "Sketch"}, {"type": "NetMapExcerpt"}]});
-        assert!(cs.evaluate(&ok).is_empty());
+        assert!(cs.evaluate(&ok).unwrap().is_empty());
     }
 
     #[test]
     fn test_from_json_to_json_roundtrip() {
         let shapes = vec![status_combo_shape()];
         let json = serde_json::to_string(&shapes).unwrap();
-        let cs = ConstraintSet::from_json(&json).unwrap();
+        let (sv, _) = bare_schema();
+        let cs = ConstraintSet::from_json(&json, &sv, "Bare").unwrap();
         assert_eq!(cs.shape_count(), 1);
         let json2 = cs.to_json().unwrap();
         // Roundtrip should produce equivalent JSON
@@ -686,31 +740,23 @@ mod tests {
 
     #[test]
     fn test_evaluate_no_violations() {
-        let cs = ConstraintSet {
-            shapes: vec![status_combo_shape()],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![status_combo_shape()]);
         let data = json!({
             "ceAssetPrimaryStatus": "In_voorbereiding",
             "ceAssetSecondaryStatus": "In_dienst",
         });
-        let violations = cs.evaluate(&data);
+        let violations = cs.evaluate(&data).unwrap();
         assert!(violations.is_empty());
     }
 
     #[test]
     fn test_evaluate_with_violation() {
-        let cs = ConstraintSet {
-            shapes: vec![status_combo_shape()],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![status_combo_shape()]);
         let data = json!({
             "ceAssetPrimaryStatus": "In_voorbereiding",
             "ceAssetSecondaryStatus": "Verkocht",
         });
-        let violations = cs.evaluate(&data);
+        let violations = cs.evaluate(&data).unwrap();
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].message, "Forbidden status combination");
         // The consumer groups findings per rule, so the shape identity has to
@@ -724,12 +770,8 @@ mod tests {
         // every parse, so an id here would be worse than none.
         let mut anonymous = status_combo_shape();
         anonymous.shape_uri = "_:b7".into();
-        let cs = ConstraintSet {
-            shapes: vec![anonymous],
-            schema_view: None,
-            target_class: None,
-        };
-        let violations = cs.evaluate(&data);
+        let cs = bare(vec![anonymous]);
+        let violations = cs.evaluate(&data).unwrap();
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].shape_uri, None);
     }
@@ -751,17 +793,13 @@ mod tests {
             sparql: None,
             nested: false,
         };
-        let cs = ConstraintSet {
-            shapes: vec![shape1, shape2],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![shape1, shape2]);
         // This data violates shape1 (forbidden combo) and passes shape2
         let data = json!({
             "ceAssetPrimaryStatus": "In_voorbereiding",
             "ceAssetSecondaryStatus": "Verkocht",
         });
-        let violations = cs.evaluate(&data);
+        let violations = cs.evaluate(&data).unwrap();
         assert_eq!(violations.len(), 1);
 
         // This data violates shape2 (primary not in allowed set) but passes shape1
@@ -769,7 +807,7 @@ mod tests {
             "ceAssetPrimaryStatus": "Uit_opvolging",
             "ceAssetSecondaryStatus": "Verkocht",
         });
-        let violations2 = cs.evaluate(&data2);
+        let violations2 = cs.evaluate(&data2).unwrap();
         assert_eq!(violations2.len(), 1);
         assert_eq!(violations2[0].message, "Another rule");
         assert_eq!(
@@ -779,12 +817,8 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_without_schema() {
-        let cs = ConstraintSet {
-            shapes: vec![status_combo_shape()],
-            schema_view: None,
-            target_class: None,
-        };
+    fn test_solve_field_outside_schema_returns_query() {
+        let cs = bare(vec![status_combo_shape()]);
         let data = json!({
             "ceAssetPrimaryStatus": "In_voorbereiding",
             "ceAssetSecondaryStatus": "In_dienst",
@@ -805,11 +839,7 @@ mod tests {
 
     #[test]
     fn test_solve_no_restrictions() {
-        let cs = ConstraintSet {
-            shapes: vec![status_combo_shape()],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![status_combo_shape()]);
         let data = json!({
             "ceAssetPrimaryStatus": "In_dienst",
             "ceAssetSecondaryStatus": "In_dienst",
@@ -828,11 +858,7 @@ mod tests {
 
     #[test]
     fn test_solve_missing_peer_treated_as_null() {
-        let cs = ConstraintSet {
-            shapes: vec![status_combo_shape()],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![status_combo_shape()]);
         // No primary supplied. After normalization, primary=null causes every
         // `And(primary==X, secondary==Y)` branch to short-circuit to false,
         // so the outer `Not(Or(...))` is true and target is free.
@@ -845,11 +871,7 @@ mod tests {
 
     #[test]
     fn test_solve_missing_peer_matches_explicit_null() {
-        let cs = ConstraintSet {
-            shapes: vec![status_combo_shape()],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![status_combo_shape()]);
         let from_empty = cs.solve(&json!({}), "ceAssetSecondaryStatus");
         let from_null = cs.solve(
             &json!({ "ceAssetPrimaryStatus": null }),
@@ -887,11 +909,7 @@ mod tests {
             sparql: None,
             nested: false,
         };
-        let cs = ConstraintSet {
-            shapes: vec![shape],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![shape]);
         let result = cs.solve(&json!({}), "secondary");
         assert!(
             result.is_none(),
@@ -928,11 +946,7 @@ mod tests {
             sparql: None,
             nested: false,
         };
-        let cs = ConstraintSet {
-            shapes: vec![shape],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![shape]);
         let result = cs.solve(&json!({}), "secondary");
         assert!(
             result.is_none(),
@@ -944,11 +958,7 @@ mod tests {
     fn test_solve_target_not_coerced_to_null() {
         // Target absent from object_data must still produce a meaningful
         // predicate — normalization must skip the target field.
-        let cs = ConstraintSet {
-            shapes: vec![status_combo_shape()],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![status_combo_shape()]);
         let result = cs.solve(
             &json!({ "ceAssetPrimaryStatus": "In_voorbereiding" }),
             "ceAssetSecondaryStatus",
@@ -982,11 +992,7 @@ mod tests {
             sparql: None,
             nested: false,
         };
-        let cs = ConstraintSet {
-            shapes: vec![shape1, shape2],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![shape1, shape2]);
         let fields = cs.affected_fields();
         assert_eq!(
             fields,
@@ -1025,11 +1031,7 @@ mod tests {
             ),
             nested: false,
         };
-        let cs = ConstraintSet {
-            shapes: vec![shape],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![shape]);
 
         let mut focus = serde_json::Map::new();
         focus.insert("asset360_uri".into(), json!("https://example.org/tc-42"));
@@ -1042,11 +1044,7 @@ mod tests {
 
     #[test]
     fn test_scope_no_scope_shapes() {
-        let cs = ConstraintSet {
-            shapes: vec![status_combo_shape()],
-            schema_view: None,
-            target_class: None,
-        };
+        let cs = bare(vec![status_combo_shape()]);
         let mut focus = serde_json::Map::new();
         focus.insert("asset360_uri".into(), json!("https://example.org/obj-1"));
 
@@ -1110,27 +1108,23 @@ mod tests {
     // ── Cross-reference PathEquals end-to-end ────────────────────────
 
     fn track_line_cs() -> ConstraintSet {
-        ConstraintSet {
-            shapes: vec![ShapeResult {
-                shape_uri: "asset360:CoveredSection_TrackLineConsistencyShape".into(),
-                target_class: "CoveredSection".into(),
-                enforcement_level: EnforcementLevel::Serious,
-                message: "Track must be on the section's line.".into(),
-                affected_fields: vec!["belongsToLine".into()],
-                introspectable: true,
-                ast: Some(ShaclAst::PathEquals {
-                    path_a: PropertyPath::sequence(vec![
-                        PropertyPath::iri("https://data.infrabel.be/asset360/belongsToTrack"),
-                        PropertyPath::iri("https://data.infrabel.be/asset360/refersToLine"),
-                    ]),
-                    path_b: PropertyPath::iri("https://data.infrabel.be/asset360/belongsToLine"),
-                }),
-                sparql: None,
-                nested: false,
-            }],
-            schema_view: None,
-            target_class: None,
-        }
+        bare(vec![ShapeResult {
+            shape_uri: "asset360:CoveredSection_TrackLineConsistencyShape".into(),
+            target_class: "CoveredSection".into(),
+            enforcement_level: EnforcementLevel::Serious,
+            message: "Track must be on the section's line.".into(),
+            affected_fields: vec!["belongsToLine".into()],
+            introspectable: true,
+            ast: Some(ShaclAst::PathEquals {
+                path_a: PropertyPath::sequence(vec![
+                    PropertyPath::iri("https://data.infrabel.be/asset360/belongsToTrack"),
+                    PropertyPath::iri("https://data.infrabel.be/asset360/refersToLine"),
+                ]),
+                path_b: PropertyPath::iri("https://data.infrabel.be/asset360/belongsToLine"),
+            }),
+            sparql: None,
+            nested: false,
+        }])
     }
 
     #[test]
@@ -1177,9 +1171,9 @@ mod tests {
 
         // Attaching the schema resolves CoveredSection (an embedded-only class)
         // via get_class — this is the "small risk" the spec flags.
-        let cs = track_line_cs()
-            .with_schema_view(&sv, "CoveredSection")
-            .unwrap();
+        let cs =
+            ConstraintSet::from_json(&track_line_cs().to_json().unwrap(), &sv, "CoveredSection")
+                .unwrap();
 
         let data = json!({ "belongsToLine": "https://data.infrabel.be/asset360/Line-9" });
         match cs.solve(&data, "belongsToTrack") {
@@ -1240,6 +1234,13 @@ classes:
       load:
         range: Load
         inlined: true
+      parts:
+        range: Part
+        multivalued: true
+        inlined_as_list: true
+  Part:
+    attributes:
+      code: {}
   Load:
     attributes:
       standard: {}
@@ -1294,6 +1295,22 @@ ex:MainElementNeedsLoadShape a sh:NodeShape ;
     [ sh:not [ sh:property [ sh:path ex:elementType ; sh:hasValue "Main" ] ] ]
     [ sh:property [ sh:path ex:load ; sh:minCount 1 ] ]
   ) .
+
+ex:ElementPartCodeShape a sh:NodeShape ;
+  sh:targetClass ex:Element ;
+  asset360:introspectable true ;
+  sh:message "Each part code is allowed once."@en ;
+  sh:property [ sh:path ( ex:parts ex:code ) ; sh:in ( "P1" "P2" ) ] ;
+  sh:property [
+    sh:path ex:parts ;
+    sh:qualifiedValueShape [ sh:path ex:code ; sh:hasValue "P1" ] ;
+    sh:qualifiedMaxCount 1
+  ] ;
+  sh:property [
+    sh:path ex:parts ;
+    sh:qualifiedValueShape [ sh:path ex:code ; sh:hasValue "P2" ] ;
+    sh:qualifiedMaxCount 1
+  ] .
 
 ex:SectionKpNeedsTrackShape a sh:NodeShape ;
   sh:targetClass ex:Section ;
@@ -1366,9 +1383,9 @@ ex:NoteTextShape a sh:NodeShape ;
     #[test]
     fn test_evaluate_nested_reports_each_object_at_its_path() {
         let sv = nested_schema_view();
-        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
 
-        let violations = cs.evaluate(&nested_invalid_data());
+        let violations = cs.evaluate(&nested_invalid_data()).unwrap();
         let label = |s: &str| Some(s.to_owned());
         assert_eq!(
             located(&violations),
@@ -1403,90 +1420,83 @@ ex:NoteTextShape a sh:NodeShape ;
         assert!(root_json.get("element_label").is_none());
     }
 
+    /// The same set with its nested shapes taken out: what `from_shacl` gave
+    /// before nested classes were collected.
     #[cfg(feature = "shacl-parser")]
-    #[test]
-    fn test_evaluate_nested_valid_data_is_clean() {
-        let sv = nested_schema_view();
-        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
-        let data = json!({
-            "id": "h1",
-            "name": "Good",
-            "elements": {
-                "Main": { "load": { "standard": "S1", "model": "M1" } },
-                "Side": { "elementType": "Side" }
-            },
-            "sections": [ { "sequenceNumber": 1, "kp": "k1", "track": "t1" }, { "sequenceNumber": 2 } ],
-            "notes": [ { "text": "fine" } ],
-            "holderLoad": { "standard": "S1", "model": "M1" }
-        });
-        assert!(cs.evaluate(&data).is_empty());
-    }
-
-    /// Nested shapes add violations and nothing else: without them the set
-    /// evaluates the root as before, and every root-only operation gives the
-    /// same answer with or without them.
-    #[cfg(feature = "shacl-parser")]
-    #[test]
-    fn test_nested_shapes_leave_root_operations_alone() {
-        let sv = nested_schema_view();
-        let deep = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
-        // The same set with its nested shapes taken out: what the parser gave
-        // before nested classes were collected.
-        let root_only: Vec<ShapeResult> =
+    fn root_only(deep: &ConstraintSet, sv: &SchemaView) -> ConstraintSet {
+        let shapes: Vec<ShapeResult> =
             serde_json::from_str::<Vec<ShapeResult>>(&deep.to_json().unwrap())
                 .unwrap()
                 .into_iter()
                 .filter(|shape| !shape.nested)
                 .collect();
-        let plain = ConstraintSet::from_json(&serde_json::to_string(&root_only).unwrap())
-            .unwrap()
-            .with_schema_view(&sv, "Holder")
-            .unwrap();
+        ConstraintSet::from_json(&serde_json::to_string(&shapes).unwrap(), sv, "Holder").unwrap()
+    }
+
+    /// Nested shapes add violations and nothing else: every root-only
+    /// operation gives the same answer with or without them.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_nested_shapes_leave_root_operations_alone() {
+        let sv = nested_schema_view();
+        let deep = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let plain = root_only(&deep, &sv);
         let data = nested_invalid_data();
 
-        assert_eq!(plain.shape_count(), 1);
-        assert_eq!(deep.shape_count(), 5);
+        let root_violations: Vec<Violation> = deep
+            .evaluate(&data)
+            .unwrap()
+            .into_iter()
+            .filter(|v| v.path.is_empty())
+            .collect();
         assert_eq!(
-            located(&plain.evaluate(&data)),
-            vec![("Name must be Good.".into(), json!([]), None)]
+            located(&root_violations),
+            located(&plain.evaluate(&data).unwrap())
         );
-
         assert_eq!(deep.affected_fields(), plain.affected_fields());
-        assert_eq!(deep.affected_fields(), vec!["name".to_owned()]);
         let solved = |cs: &ConstraintSet| {
-            ["name", "standard", "model", "kp"]
+            ["name", "standard", "model", "kp", "code"]
                 .map(|field| serde_json::to_value(cs.solve(&data, field)).unwrap())
         };
         assert_eq!(solved(&deep), solved(&plain));
+        // `parts`/`code` is a unique-by-member rule, but on the nested Element.
+        let solved_member = |cs: &ConstraintSet| {
+            serde_json::to_value(cs.solve_member(&data, "parts", "code", None)).unwrap()
+        };
+        assert_eq!(solved_member(&deep), solved_member(&plain));
         assert_eq!(
             serde_json::to_value(deep.scope(data.as_object().unwrap(), "id")).unwrap(),
             serde_json::to_value(plain.scope(data.as_object().unwrap(), "id")).unwrap()
         );
     }
 
-    /// The frontend rebuilds a set from JSON and attaches the schema after:
-    /// that path must evaluate the nested shapes exactly the same way.
+    /// The frontend rebuilds a set from JSON: that path must evaluate the
+    /// nested shapes exactly the same way.
     #[cfg(feature = "shacl-parser")]
     #[test]
     fn test_nested_shapes_survive_json_round_trip() {
         let sv = nested_schema_view();
-        let deep = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
+        let deep = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
         let data = nested_invalid_data();
 
-        let rebuilt = ConstraintSet::from_json(&deep.to_json().unwrap())
-            .unwrap()
-            .with_schema_view(&sv, "Holder")
-            .unwrap();
+        let rebuilt = ConstraintSet::from_json(&deep.to_json().unwrap(), &sv, "Holder").unwrap();
         assert_eq!(
-            located(&rebuilt.evaluate(&data)),
-            located(&deep.evaluate(&data))
+            located(&rebuilt.evaluate(&data).unwrap()),
+            located(&deep.evaluate(&data).unwrap())
         );
+    }
 
-        // With no schema there is no way to find the nested objects: root only.
-        let schemaless = ConstraintSet::from_json(&deep.to_json().unwrap()).unwrap();
-        assert_eq!(
-            located(&schemaless.evaluate(&data)),
-            vec![("Name must be Good.".into(), json!([]), None)]
+    /// An object the runtime cannot load at all leaves no nested shape
+    /// checkable, and says so instead of reporting nothing.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_evaluate_nested_refuses_unloadable_object() {
+        let sv = nested_schema_view();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let error = cs.evaluate(&json!(["not", "an", "object"])).unwrap_err();
+        assert!(
+            error.contains("cannot load the object as Holder"),
+            "{error}"
         );
     }
 }
