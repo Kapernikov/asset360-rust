@@ -316,6 +316,7 @@ pub fn parse_shacl(
                 introspectable: false,
                 ast: None,
                 sparql: Some(select),
+                nested: false,
             });
             continue;
         }
@@ -336,6 +337,7 @@ pub fn parse_shacl(
                 introspectable: false,
                 ast: None,
                 sparql: None,
+                nested: false,
             });
             continue;
         }
@@ -353,6 +355,7 @@ pub fn parse_shacl(
                     introspectable: true,
                     ast: Some(ast),
                     sparql: None,
+                    nested: false,
                 });
             }
             Err(e) => {

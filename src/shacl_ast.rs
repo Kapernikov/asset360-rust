@@ -138,6 +138,16 @@ pub struct ShapeResult {
     /// Raw SPARQL select string (only if `introspectable` is false).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sparql: Option<String>,
+    /// Whether this shape targets a class inlined somewhere inside the
+    /// constraint set's root class rather than the root class itself.
+    ///
+    /// Forward evaluation runs a nested shape on every inlined object of its
+    /// `target_class`; backward solving, scope derivation and
+    /// `affected_fields` ignore it, because its fields are not fields of the
+    /// root object. Carried in the JSON so a set rebuilt with `from_json`
+    /// evaluates the same way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nested: bool,
 }
 
 impl ShapeResult {
@@ -174,6 +184,25 @@ pub struct Violation {
     /// `None` for a blank-node shape — see [`ShapeResult::stable_shape_uri`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape_uri: Option<String>,
+    /// Location of the violating object, from the root: slot names, mapping
+    /// keys and list positions, e.g. `["hasStructureElement", "Main_beam",
+    /// "hasCalculationLoad"]`. Empty (and omitted) for the root object.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<PathSegment>,
+    /// Human-readable name of the list or mapping element the violating
+    /// object sits in: its identity label (key, identifier or sequence
+    /// number), else its 1-based position. `None` for the root object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_label: Option<String>,
+}
+
+/// One step of a [`Violation::path`]: a slot name or mapping key, or a list
+/// position. Serializes as a bare JSON string or number.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PathSegment {
+    Index(usize),
+    Key(String),
 }
 
 #[cfg(test)]
@@ -237,6 +266,7 @@ mod tests {
                 value: serde_json::json!("value"),
             }),
             sparql: None,
+            nested: false,
         };
         let json = serde_json::to_string(&shape).unwrap();
         let parsed: ShapeResult = serde_json::from_str(&json).unwrap();
@@ -257,6 +287,8 @@ mod tests {
             enforcement_level: EnforcementLevel::Serious,
             suggested_fix: Some("Change secondary status".into()),
             shape_uri: Some("https://data.infrabel.be/asset360/StatusComboShape".into()),
+            path: Vec::new(),
+            element_label: None,
         };
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains("\"enforcement_level\":\"serious\""));
@@ -282,6 +314,7 @@ mod tests {
             introspectable: true,
             ast: None,
             sparql: None,
+            nested: false,
         };
         assert_eq!(
             shape.stable_shape_uri(),

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::predicate::Predicate;
-use crate::shacl_ast::{ShapeResult, Violation};
+use crate::shacl_ast::{PathSegment, ShapeResult, Violation};
 
 #[cfg(feature = "shacl-parser")]
 use crate::shacl_parser;
@@ -12,6 +12,9 @@ use crate::shacl_parser;
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
+use linkml_schemaview::slotview::SlotInlineMode;
+
+use linkml_runtime::LinkMLInstance;
 
 /// Describes the allowed values for a target field after backward solving.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -72,6 +75,40 @@ impl ConstraintSet {
         Ok(cs)
     }
 
+    /// Parse SHACL Turtle text into a constraint set for `target_class` that
+    /// also carries the introspectable shapes of every class inlined inside
+    /// it, recursively (single-valued, list and mapping slots, and the
+    /// descendants of each range class).
+    ///
+    /// SHACL's `sh:targetClass` applies to every node of the class, nested
+    /// ones included; this is how forward evaluation honours that. The extra
+    /// shapes are marked [`ShapeResult::nested`] and only take part in
+    /// [`evaluate`](Self::evaluate).
+    #[cfg(feature = "shacl-parser")]
+    pub fn from_shacl_with_nested(
+        ttl: &str,
+        target_class: &str,
+        language: &str,
+        schema_view: &SchemaView,
+    ) -> Result<Self, String> {
+        let mut cs = Self::from_shacl(ttl, target_class, language, Some(schema_view))?;
+        let Some(root) = cs.target_class.clone() else {
+            return Err(format!("class '{target_class}' not found in schema"));
+        };
+        for class_name in nested_class_names(&root) {
+            let shapes = shacl_parser::parse_shacl(ttl, &class_name, language)
+                .map_err(|e| format!("SHACL parse error: {e}"))?;
+            cs.shapes
+                .extend(shapes.into_iter().filter(|shape| shape.introspectable).map(
+                    |mut shape| {
+                        shape.nested = true;
+                        shape
+                    },
+                ));
+        }
+        Ok(cs)
+    }
+
     /// Attach a schema view and resolve the target class.
     pub fn with_schema_view(mut self, sv: &SchemaView, target_class: &str) -> Result<Self, String> {
         let conv = sv.converter();
@@ -87,15 +124,107 @@ impl ConstraintSet {
     // ── Operations ───────────────────────────────────────────────────
 
     /// Forward-evaluate all shapes against `object_data`, returning all violations.
+    ///
+    /// Root shapes run on `object_data` itself. Nested shapes (see
+    /// [`from_shacl_with_nested`](Self::from_shacl_with_nested)) run on every
+    /// inlined object of their target class, and their violations carry the
+    /// object's `path` and `element_label`. Nested shapes need the schema view
+    /// to find those objects; without one they are skipped.
     pub fn evaluate(&self, object_data: &serde_json::Value) -> Vec<Violation> {
         let mut violations = Vec::new();
-        for shape in &self.shapes {
+        for shape in self.root_shapes() {
             if !shape.introspectable {
                 continue;
             }
             violations.extend(crate::forward_eval::evaluate_forward(shape, object_data));
         }
+        self.evaluate_nested(object_data, &mut violations);
         violations
+    }
+
+    fn evaluate_nested(&self, object_data: &serde_json::Value, out: &mut Vec<Violation>) {
+        if !self.shapes.iter().any(|s| s.nested && s.introspectable) {
+            return;
+        }
+        let (Some(sv), Some(root)) = (&self.schema_view, &self.target_class) else {
+            return;
+        };
+        // Loading through the runtime rather than walking the raw JSON is what
+        // resolves each nested object's concrete class (type designators,
+        // descendants) and fills a mapping entry's key slot from its dict key.
+        let conv = sv.converter();
+        let loaded =
+            LinkMLInstance::from_json(object_data.clone(), root.clone(), None, sv, &conv, false);
+        let Some(instance) = loaded.instance else {
+            return;
+        };
+        self.walk_nested(&instance, root.name(), &mut Vec::new(), None, out);
+    }
+
+    fn walk_nested(
+        &self,
+        node: &LinkMLInstance,
+        root_class: &str,
+        path: &mut Vec<PathSegment>,
+        label: Option<&str>,
+        out: &mut Vec<Violation>,
+    ) {
+        match node {
+            LinkMLInstance::Object { values, class, .. } => {
+                if !path.is_empty() {
+                    let class_name = class.name();
+                    // A nested object of the root class itself gets the root shapes.
+                    let applicable = self.shapes.iter().filter(|s| {
+                        s.introspectable
+                            && s.target_class == class_name
+                            && (s.nested || class_name == root_class)
+                    });
+                    let mut data = None;
+                    for shape in applicable {
+                        let data = data.get_or_insert_with(|| node.to_json());
+                        for mut violation in crate::forward_eval::evaluate_forward(shape, data) {
+                            violation.path = path.clone();
+                            violation.element_label = label.map(str::to_owned);
+                            out.push(violation);
+                        }
+                    }
+                }
+                let mut keys: Vec<&String> = values.keys().collect();
+                keys.sort();
+                for key in keys {
+                    path.push(PathSegment::Key(key.clone()));
+                    self.walk_nested(&values[key], root_class, path, label, out);
+                    path.pop();
+                }
+            }
+            LinkMLInstance::List { values, .. } => {
+                for (index, child) in values.iter().enumerate() {
+                    let own = linkml_runtime::element_identity_label(child)
+                        .unwrap_or_else(|| (index + 1).to_string());
+                    path.push(PathSegment::Index(index));
+                    self.walk_nested(child, root_class, path, Some(&own), out);
+                    path.pop();
+                }
+            }
+            LinkMLInstance::Mapping { values, .. } => {
+                let mut keys: Vec<&String> = values.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let child = &values[key];
+                    let own = linkml_runtime::element_identity_label(child)
+                        .unwrap_or_else(|| key.clone());
+                    path.push(PathSegment::Key(key.clone()));
+                    self.walk_nested(child, root_class, path, Some(&own), out);
+                    path.pop();
+                }
+            }
+            LinkMLInstance::Scalar { .. } | LinkMLInstance::Null { .. } => {}
+        }
+    }
+
+    /// Shapes on the root class: everything but the nested ones.
+    fn root_shapes(&self) -> impl Iterator<Item = &ShapeResult> {
+        self.shapes.iter().filter(|s| !s.nested)
     }
 
     /// Backward-solve: determine the allowed values for `target_field` given `object_data`.
@@ -122,7 +251,7 @@ impl ConstraintSet {
 
         // Collect predicates from all introspectable shapes that have an AST
         let mut predicates: Vec<Predicate> = Vec::new();
-        for shape in &self.shapes {
+        for shape in self.root_shapes() {
             if shape.introspectable
                 && let Some(ref ast) = shape.ast
                 && let Some(pred) =
@@ -203,8 +332,7 @@ impl ConstraintSet {
 
         // Find the matching rule and its allowed set + excluded (capacity-filled) values.
         let solution = self
-            .shapes
-            .iter()
+            .root_shapes()
             .filter(|s| s.introspectable)
             .find_map(|s| {
                 s.ast.as_ref().and_then(|ast| {
@@ -257,7 +385,7 @@ impl ConstraintSet {
         uri_field: &str,
     ) -> Option<Predicate> {
         let mut predicates: Vec<Predicate> = Vec::new();
-        for shape in &self.shapes {
+        for shape in self.root_shapes() {
             if let Some(pred) =
                 crate::scope_predicate::derive_scope_predicate(shape, focus_data, uri_field)
             {
@@ -274,8 +402,7 @@ impl ConstraintSet {
     /// Return all field names referenced by any shape, sorted and deduplicated.
     pub fn affected_fields(&self) -> Vec<String> {
         let mut fields: Vec<String> = self
-            .shapes
-            .iter()
+            .root_shapes()
             .flat_map(|s| s.affected_fields.iter().cloned())
             .collect();
         fields.sort();
@@ -295,6 +422,31 @@ impl ConstraintSet {
 }
 
 // ── Private helpers ──────────────────────────────────────────────────
+
+/// Names of the classes an instance of `root` can hold inlined, at any depth:
+/// the range class of every inlined slot and that class's descendants, sorted.
+/// `root` itself is left out; its shapes are already the set's root shapes.
+fn nested_class_names(root: &ClassView) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut queue = vec![root.clone()];
+    while let Some(class) = queue.pop() {
+        for slot in class.slots() {
+            if slot.determine_slot_inline_mode() != SlotInlineMode::Inline {
+                continue;
+            }
+            let Some(range) = slot.get_range_class() else {
+                continue;
+            };
+            let descendants = range.get_descendants(true, false).unwrap_or_default();
+            for candidate in std::iter::once(range).chain(descendants) {
+                if candidate.name() != root.name() && found.insert(candidate.name().to_owned()) {
+                    queue.push(candidate);
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
 
 /// Resolve the `member_field` value within one array-member JSON object.
 /// `member_field` is a local name (the dotted/sequence case is not used here).
@@ -428,6 +580,7 @@ mod tests {
                 }),
             }),
             sparql: None,
+            nested: false,
         }
     }
 
@@ -451,6 +604,7 @@ mod tests {
                 max_count_per_value: 1,
             }),
             sparql: None,
+            nested: false,
         }
     }
 
@@ -607,6 +761,7 @@ mod tests {
                 values: vec![json!("In_voorbereiding"), json!("In_opvolging")],
             }),
             sparql: None,
+            nested: false,
         };
         let cs = ConstraintSet {
             shapes: vec![shape1, shape2],
@@ -742,6 +897,7 @@ mod tests {
                 }),
             }),
             sparql: None,
+            nested: false,
         };
         let cs = ConstraintSet {
             shapes: vec![shape],
@@ -782,6 +938,7 @@ mod tests {
                 }),
             }),
             sparql: None,
+            nested: false,
         };
         let cs = ConstraintSet {
             shapes: vec![shape],
@@ -835,6 +992,7 @@ mod tests {
             introspectable: true,
             ast: None,
             sparql: None,
+            nested: false,
         };
         let cs = ConstraintSet {
             shapes: vec![shape1, shape2],
@@ -877,6 +1035,7 @@ mod tests {
                 "#
                 .to_owned(),
             ),
+            nested: false,
         };
         let cs = ConstraintSet {
             shapes: vec![shape],
@@ -979,6 +1138,7 @@ mod tests {
                     path_b: PropertyPath::iri("https://data.infrabel.be/asset360/belongsToLine"),
                 }),
                 sparql: None,
+                nested: false,
             }],
             schema_view: None,
             target_class: None,
@@ -1049,5 +1209,286 @@ mod tests {
             }
             other => panic!("expected Query, got {other:?}"),
         }
+    }
+
+    // ── Nested evaluation ────────────────────────────────────────────
+
+    #[cfg(feature = "shacl-parser")]
+    const NESTED_SCHEMA: &str = r#"
+id: https://example.org/nested
+name: nested
+prefixes:
+  linkml: https://w3id.org/linkml/
+  ex: https://example.org/nested/
+default_prefix: ex
+default_range: string
+imports:
+  - linkml:types
+classes:
+  Holder:
+    attributes:
+      id:
+        identifier: true
+      name: {}
+      elements:
+        range: Element
+        multivalued: true
+        inlined: true
+      sections:
+        range: Section
+        multivalued: true
+        inlined_as_list: true
+      notes:
+        range: Note
+        multivalued: true
+        inlined_as_list: true
+      holderLoad:
+        range: Load
+        inlined: true
+  Element:
+    attributes:
+      elementType:
+        key: true
+      load:
+        range: Load
+        inlined: true
+  Load:
+    attributes:
+      standard: {}
+      model: {}
+  Section:
+    unique_keys:
+      section_key:
+        unique_key_slots:
+          - sequenceNumber
+    attributes:
+      sequenceNumber:
+        range: integer
+      kp: {}
+      track: {}
+  Note:
+    attributes:
+      text: {}
+"#;
+
+    #[cfg(feature = "shacl-parser")]
+    const NESTED_SHAPES: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <https://example.org/nested/> .
+@prefix asset360: <https://data.infrabel.be/asset360/> .
+
+ex:HolderNameShape a sh:NodeShape ;
+  sh:targetClass ex:Holder ;
+  asset360:introspectable true ;
+  sh:message "Name must be Good."@en ;
+  sh:or (
+    [ sh:property [ sh:path ex:name ; sh:hasValue "Good" ] ]
+    [ sh:property [ sh:path ex:name ; sh:maxCount 0 ] ]
+  ) .
+
+ex:LoadComboShape a sh:NodeShape ;
+  sh:targetClass ex:Load ;
+  asset360:introspectable true ;
+  sh:message "Model not allowed for standard."@en ;
+  sh:or (
+    [ sh:and (
+      [ sh:property [ sh:path ex:standard ; sh:hasValue "S1" ] ]
+      [ sh:property [ sh:path ex:model ; sh:hasValue "M1" ] ]
+    ) ]
+    [ sh:property [ sh:path ex:standard ; sh:maxCount 0 ] ]
+  ) .
+
+ex:MainElementNeedsLoadShape a sh:NodeShape ;
+  sh:targetClass ex:Element ;
+  asset360:introspectable true ;
+  sh:message "A main element needs a load."@en ;
+  sh:or (
+    [ sh:not [ sh:property [ sh:path ex:elementType ; sh:hasValue "Main" ] ] ]
+    [ sh:property [ sh:path ex:load ; sh:minCount 1 ] ]
+  ) .
+
+ex:SectionKpNeedsTrackShape a sh:NodeShape ;
+  sh:targetClass ex:Section ;
+  asset360:introspectable true ;
+  sh:message "A KP needs a track."@en ;
+  sh:or (
+    [ sh:property [ sh:path ex:kp ; sh:maxCount 0 ] ]
+    [ sh:property [ sh:path ex:track ; sh:minCount 1 ] ]
+  ) .
+
+ex:NoteTextShape a sh:NodeShape ;
+  sh:targetClass ex:Note ;
+  asset360:introspectable true ;
+  sh:message "A note needs text."@en ;
+  sh:property [ sh:path ex:text ; sh:minCount 1 ] .
+"#;
+
+    #[cfg(feature = "shacl-parser")]
+    fn nested_schema_view() -> SchemaView {
+        use linkml_meta::SchemaDefinition;
+        use serde_path_to_error as p2e;
+        use serde_yml as yml;
+
+        let mut sv = SchemaView::new();
+        for raw in [include_str!("../tests/data/types.yaml"), NESTED_SCHEMA] {
+            let schema: SchemaDefinition =
+                p2e::deserialize(yml::Deserializer::from_str(raw)).unwrap();
+            sv.add_schema(schema).unwrap();
+        }
+        sv
+    }
+
+    /// Every rule broken once: the root, a mapping entry in compact form (its
+    /// key only as the dict key), an object nested one level below a mapping
+    /// entry, a single-valued inlined object, a keyed list item and an
+    /// unkeyed list item.
+    #[cfg(feature = "shacl-parser")]
+    fn nested_invalid_data() -> serde_json::Value {
+        json!({
+            "id": "h1",
+            "name": "Bad",
+            "elements": {
+                "Main": {},
+                "Side": { "elementType": "Side", "load": { "standard": "S1", "model": "M2" } }
+            },
+            "sections": [
+                { "sequenceNumber": 1, "kp": "k1", "track": "t1" },
+                { "sequenceNumber": 7, "kp": "k2" }
+            ],
+            "notes": [ { "text": "fine" }, {} ],
+            "holderLoad": { "standard": "S1", "model": "M9" }
+        })
+    }
+
+    #[cfg(feature = "shacl-parser")]
+    fn located(violations: &[Violation]) -> Vec<(String, serde_json::Value, Option<String>)> {
+        violations
+            .iter()
+            .map(|v| {
+                (
+                    v.message.clone(),
+                    serde_json::to_value(&v.path).unwrap(),
+                    v.element_label.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_evaluate_nested_reports_each_object_at_its_path() {
+        let sv = nested_schema_view();
+        let cs = ConstraintSet::from_shacl_with_nested(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+
+        let violations = cs.evaluate(&nested_invalid_data());
+        let label = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            located(&violations),
+            vec![
+                ("Name must be Good.".into(), json!([]), None),
+                (
+                    "A main element needs a load.".into(),
+                    json!(["elements", "Main"]),
+                    label("Main")
+                ),
+                (
+                    "Model not allowed for standard.".into(),
+                    json!(["elements", "Side", "load"]),
+                    label("Side")
+                ),
+                (
+                    "Model not allowed for standard.".into(),
+                    json!(["holderLoad"]),
+                    None
+                ),
+                ("A note needs text.".into(), json!(["notes", 1]), label("2")),
+                (
+                    "A KP needs a track.".into(),
+                    json!(["sections", 1]),
+                    label("7")
+                ),
+            ]
+        );
+        // The root violation serializes exactly as before: no path, no label.
+        let root_json = serde_json::to_value(&violations[0]).unwrap();
+        assert!(root_json.get("path").is_none());
+        assert!(root_json.get("element_label").is_none());
+    }
+
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_evaluate_nested_valid_data_is_clean() {
+        let sv = nested_schema_view();
+        let cs = ConstraintSet::from_shacl_with_nested(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let data = json!({
+            "id": "h1",
+            "name": "Good",
+            "elements": {
+                "Main": { "load": { "standard": "S1", "model": "M1" } },
+                "Side": { "elementType": "Side" }
+            },
+            "sections": [ { "sequenceNumber": 1, "kp": "k1", "track": "t1" }, { "sequenceNumber": 2 } ],
+            "notes": [ { "text": "fine" } ],
+            "holderLoad": { "standard": "S1", "model": "M1" }
+        });
+        assert!(cs.evaluate(&data).is_empty());
+    }
+
+    /// Without nested shapes nothing changes, and with them every root-only
+    /// operation still sees the root shapes alone.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_nested_shapes_leave_root_operations_alone() {
+        let sv = nested_schema_view();
+        let plain = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", Some(&sv)).unwrap();
+        let deep =
+            ConstraintSet::from_shacl_with_nested(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let data = nested_invalid_data();
+
+        assert_eq!(plain.shape_count(), 1);
+        assert_eq!(deep.shape_count(), 5);
+        assert_eq!(
+            located(&plain.evaluate(&data)),
+            vec![("Name must be Good.".into(), json!([]), None)]
+        );
+
+        assert_eq!(deep.affected_fields(), plain.affected_fields());
+        assert_eq!(deep.affected_fields(), vec!["name".to_owned()]);
+        let solved = |cs: &ConstraintSet| {
+            ["name", "standard", "model", "kp"]
+                .map(|field| serde_json::to_value(cs.solve(&data, field)).unwrap())
+        };
+        assert_eq!(solved(&deep), solved(&plain));
+        assert_eq!(
+            serde_json::to_value(deep.scope(data.as_object().unwrap(), "id")).unwrap(),
+            serde_json::to_value(plain.scope(data.as_object().unwrap(), "id")).unwrap()
+        );
+    }
+
+    /// The frontend rebuilds a set from JSON and attaches the schema after:
+    /// that path must evaluate the nested shapes exactly the same way.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_nested_shapes_survive_json_round_trip() {
+        let sv = nested_schema_view();
+        let deep =
+            ConstraintSet::from_shacl_with_nested(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let data = nested_invalid_data();
+
+        let rebuilt = ConstraintSet::from_json(&deep.to_json().unwrap())
+            .unwrap()
+            .with_schema_view(&sv, "Holder")
+            .unwrap();
+        assert_eq!(
+            located(&rebuilt.evaluate(&data)),
+            located(&deep.evaluate(&data))
+        );
+
+        // With no schema there is no way to find the nested objects: root only.
+        let schemaless = ConstraintSet::from_json(&deep.to_json().unwrap()).unwrap();
+        assert_eq!(
+            located(&schemaless.evaluate(&data)),
+            vec![("Name must be Good.".into(), json!([]), None)]
+        );
     }
 }

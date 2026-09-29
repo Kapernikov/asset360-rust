@@ -248,6 +248,7 @@ mod tests {
                 "#
                 .to_owned(),
             ),
+            nested: false,
         }
     }
 
@@ -302,6 +303,7 @@ mod tests {
                 child: Box::new(crate::shacl_ast::ShaclAst::And { children: vec![] }),
             }),
             sparql: None,
+            nested: false,
         };
 
         let mut focus = serde_json::Map::new();

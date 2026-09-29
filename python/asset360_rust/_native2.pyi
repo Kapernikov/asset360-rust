@@ -1611,9 +1611,14 @@ class ConstraintSet:
         Create a ConstraintSet from a JSON array of ShapeResult objects.
         """
     @staticmethod
-    def from_shacl(ttl:builtins.str, target_class:builtins.str, language:builtins.str='', schema_view:typing.Optional[SchemaView]=None) -> ConstraintSet:
+    def from_shacl(ttl:builtins.str, target_class:builtins.str, language:builtins.str='', schema_view:typing.Optional[SchemaView]=None, include_nested:builtins.bool=False) -> ConstraintSet:
         r"""
         Parse SHACL Turtle text into a ConstraintSet.
+        
+        With `include_nested=True` the set also carries the introspectable
+        shapes of every class inlined inside `target_class`, and `evaluate`
+        runs them on each nested object (violations then carry `path` and
+        `element_label`). Requires `schema_view`.
         """
     def with_schema_view(self, schema_view:SchemaView, target_class:builtins.str) -> ConstraintSet:
         r"""
