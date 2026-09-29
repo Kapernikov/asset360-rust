@@ -12,6 +12,7 @@ use crate::shacl_parser;
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
+#[cfg(feature = "shacl-parser")]
 use linkml_schemaview::slotview::SlotInlineMode;
 
 use linkml_runtime::LinkMLInstance;
@@ -449,6 +450,7 @@ impl ConstraintSet {
 /// Names of the classes an instance of `root` can hold inlined, at any depth:
 /// the range class of every inlined slot and that class's descendants, sorted.
 /// `root` itself is left out; its shapes are already the set's root shapes.
+#[cfg(feature = "shacl-parser")]
 fn nested_class_names(root: &ClassView) -> Result<Vec<String>, String> {
     let mut found = std::collections::BTreeSet::new();
     let mut queue = vec![root.clone()];
