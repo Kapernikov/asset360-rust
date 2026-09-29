@@ -1637,6 +1637,14 @@ class ConstraintSet:
         r"""
         Solve backward for a target field, returning JSON FieldConstraint or None.
         """
+    def solve_at(self, object_data_json:builtins.str, path_json:builtins.str) -> typing.Optional[builtins.str]:
+        r"""
+        Solve backward for a field of a nested object, returning JSON
+        FieldConstraint or None. `path_json` is a JSON array leading to the
+        field: slot names, mapping keys and list positions, then the field
+        name (e.g. `["hasCalculationLoad", "hasLoadModel"]`). The shapes on
+        the nested object's class and its ancestors apply.
+        """
     def solve_member(self, object_data_json:builtins.str, array_field:builtins.str, member_field:builtins.str, editing_index:typing.Optional[builtins.int]=None) -> typing.Optional[builtins.str]:
         r"""
         Solve allowed values for an array-member field, returning JSON

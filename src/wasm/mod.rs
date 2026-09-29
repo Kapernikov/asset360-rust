@@ -1151,6 +1151,29 @@ impl ConstraintSetHandle {
         }
     }
 
+    /// Backward-solve a field of a nested object.
+    ///
+    /// `path_json` is a JSON array leading to the field: slot names, mapping
+    /// keys and list positions, then the field name (e.g.
+    /// `["hasCalculationLoad", "hasLoadModel"]`). The shapes on the nested
+    /// object's class and its ancestors apply.
+    /// Returns a FieldConstraint JS object, or null if no constraints apply.
+    #[wasm_bindgen(js_name = solveAt)]
+    pub fn solve_at(&self, object_data_json: &str, path_json: &str) -> Result<JsValue, JsValue> {
+        let data: serde_json::Value = serde_json::from_str(object_data_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid data JSON: {e}")))?;
+        let path: Vec<crate::shacl_ast::PathSegment> = serde_json::from_str(path_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid path JSON: {e}")))?;
+        match self
+            .inner
+            .solve_at(&data, &path)
+            .map_err(|e| JsValue::from_str(&e))?
+        {
+            Some(fc) => to_js(&fc),
+            None => Ok(JsValue::NULL),
+        }
+    }
+
     /// Backward-solve allowed values for a member field of an array slot.
     ///
     /// `object_data_json` is the full parent object; `array_field` the
