@@ -277,7 +277,6 @@ mod tests {
             introspectable: true,
             ast: Some(ast),
             sparql: None,
-            nested: false,
         }
     }
 

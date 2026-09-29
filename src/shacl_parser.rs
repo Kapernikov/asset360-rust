@@ -340,7 +340,6 @@ fn parse_shacl_matching(
                 introspectable: false,
                 ast: None,
                 sparql: Some(select),
-                nested: false,
             });
             continue;
         }
@@ -361,7 +360,6 @@ fn parse_shacl_matching(
                 introspectable: false,
                 ast: None,
                 sparql: None,
-                nested: false,
             });
             continue;
         }
@@ -379,7 +377,6 @@ fn parse_shacl_matching(
                     introspectable: true,
                     ast: Some(ast),
                     sparql: None,
-                    nested: false,
                 });
             }
             Err(e) => {
@@ -1534,9 +1531,13 @@ asset360:AllowedTypesShape
         assert_eq!(shapes.len(), 2);
         // Exactly one introspectable shape survives to the Rust evaluator.
         assert_eq!(shapes.iter().filter(|s| s.introspectable).count(), 1);
-        let (sv, _) = crate::constraint_set::bare_schema();
-        let cs = ConstraintSet::from_json(&serde_json::to_string(&shapes).unwrap(), &sv, "Bare")
-            .unwrap();
+        let (sv, _) = crate::constraint_set::bare_schema("TunnelComplex");
+        let cs = ConstraintSet::from_json(
+            &serde_json::to_string(&shapes).unwrap(),
+            &sv,
+            "TunnelComplex",
+        )
+        .unwrap();
         // Valid status combo, and a docType OUTSIDE the sh:in set — must NOT be
         // flagged, because the sh:in shape is pyshacl's, not the Rust engine's.
         let data = serde_json::json!({"primary": "TSI", "secondary": "COM", "docType": "Z"});

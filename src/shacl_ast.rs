@@ -138,16 +138,6 @@ pub struct ShapeResult {
     /// Raw SPARQL select string (only if `introspectable` is false).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sparql: Option<String>,
-    /// Whether this shape targets a class inlined somewhere inside the
-    /// constraint set's root class rather than the root class itself.
-    ///
-    /// Forward evaluation runs a nested shape on every inlined object of its
-    /// `target_class`; backward solving, scope derivation and
-    /// `affected_fields` ignore it, because its fields are not fields of the
-    /// root object. Carried in the JSON so a set rebuilt with `from_json`
-    /// evaluates the same way.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub nested: bool,
 }
 
 impl ShapeResult {
@@ -266,7 +256,6 @@ mod tests {
                 value: serde_json::json!("value"),
             }),
             sparql: None,
-            nested: false,
         };
         let json = serde_json::to_string(&shape).unwrap();
         let parsed: ShapeResult = serde_json::from_str(&json).unwrap();
@@ -314,7 +303,6 @@ mod tests {
             introspectable: true,
             ast: None,
             sparql: None,
-            nested: false,
         };
         assert_eq!(
             shape.stable_shape_uri(),

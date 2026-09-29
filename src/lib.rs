@@ -1185,6 +1185,14 @@ impl PyConstraintSet {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
     }
 
+    /// Serialize only the shapes that target the root class itself, for a
+    /// consumer that places violations on the root object's own fields.
+    fn root_shapes_json(&self) -> PyResult<String> {
+        self.inner
+            .root_shapes_json()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize error: {e}")))
+    }
+
     /// Evaluate all shapes against object data, returning JSON array of violations.
     #[pyo3(signature = (object_data_json,))]
     fn evaluate(&self, object_data_json: &str) -> PyResult<String> {

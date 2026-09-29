@@ -1624,6 +1624,11 @@ class ConstraintSet:
         r"""
         Serialize the shapes to JSON.
         """
+    def root_shapes_json(self) -> builtins.str:
+        r"""
+        Serialize only the shapes that target the root class itself, for a
+        consumer that places violations on the root object's own fields.
+        """
     def evaluate(self, object_data_json:builtins.str) -> builtins.str:
         r"""
         Evaluate all shapes against object data, returning JSON array of violations.

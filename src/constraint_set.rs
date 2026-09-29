@@ -54,9 +54,19 @@ impl ConstraintSet {
         })
     }
 
-    /// Serialize the shapes back to JSON.
+    /// Serialize the shapes back to JSON: the root class's and the nested
+    /// classes' alike, so [`from_json`](Self::from_json) rebuilds the same set.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&self.shapes)
+    }
+
+    /// Serialize only the shapes that target the root class itself.
+    ///
+    /// For a consumer that places violations on the root object's own fields
+    /// (a form's live check): a nested shape's fields belong to the nested
+    /// object, not to the root.
+    pub fn root_shapes_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.root_shapes().collect::<Vec<_>>())
     }
 
     /// Parse SHACL Turtle text into a constraint set for `target_class`.
@@ -65,9 +75,8 @@ impl ConstraintSet {
     /// inside `target_class`, recursively (single-valued, list and mapping
     /// slots, and the descendants of each range class). SHACL's
     /// `sh:targetClass` applies to every node of the class, nested ones
-    /// included; this is how forward evaluation honours that. Those shapes are
-    /// marked [`ShapeResult::nested`] and only take part in
-    /// [`evaluate`](Self::evaluate).
+    /// included; this is how forward evaluation honours that. Those shapes
+    /// only take part in [`evaluate`](Self::evaluate).
     #[cfg(feature = "shacl-parser")]
     pub fn from_shacl(
         ttl: &str,
@@ -82,19 +91,11 @@ impl ConstraintSet {
             .collect();
         let parsed = shacl_parser::parse_shacl_for_classes(ttl, &wanted, language)
             .map_err(|e| format!("SHACL parse error: {e}"))?;
-        let root_name = target_class
-            .rsplit(['/', '#'])
-            .next()
-            .unwrap_or(target_class);
-        let mut shapes = Vec::with_capacity(parsed.len());
-        for mut shape in parsed {
-            if shape.target_class == root_name {
-                shapes.push(shape);
-            } else if shape.introspectable {
-                shape.nested = true;
-                shapes.push(shape);
-            }
-        }
+        // Nested classes only contribute what the Rust engine can evaluate.
+        let shapes = parsed
+            .into_iter()
+            .filter(|shape| shape.target_class == root.name() || shape.introspectable)
+            .collect();
         Ok(Self {
             shapes,
             schema_view: schema_view.clone(),
@@ -132,7 +133,11 @@ impl ConstraintSet {
         object_data: &serde_json::Value,
         out: &mut Vec<Violation>,
     ) -> Result<(), String> {
-        if !self.shapes.iter().any(|s| s.nested && s.introspectable) {
+        if !self
+            .shapes
+            .iter()
+            .any(|s| s.introspectable && !self.is_root_shape(s))
+        {
             return Ok(());
         }
         // Loading through the runtime rather than walking the raw JSON is what
@@ -155,14 +160,13 @@ impl ConstraintSet {
                 issues.join("; ")
             ));
         };
-        self.walk_nested(&instance, root.name(), &mut Vec::new(), None, out);
+        self.walk_nested(&instance, &mut Vec::new(), None, out);
         Ok(())
     }
 
     fn walk_nested(
         &self,
         node: &LinkMLInstance,
-        root_class: &str,
         path: &mut Vec<PathSegment>,
         label: Option<&str>,
         out: &mut Vec<Violation>,
@@ -170,13 +174,13 @@ impl ConstraintSet {
         match node {
             LinkMLInstance::Object { values, class, .. } => {
                 if !path.is_empty() {
+                    // Matched by class, so a nested object of the root class
+                    // itself gets the root shapes too.
                     let class_name = class.name();
-                    // A nested object of the root class itself gets the root shapes.
-                    let applicable = self.shapes.iter().filter(|s| {
-                        s.introspectable
-                            && s.target_class == class_name
-                            && (s.nested || class_name == root_class)
-                    });
+                    let applicable = self
+                        .shapes
+                        .iter()
+                        .filter(|s| s.introspectable && s.target_class == class_name);
                     let mut data = None;
                     for shape in applicable {
                         let data = data.get_or_insert_with(|| node.to_json());
@@ -191,7 +195,7 @@ impl ConstraintSet {
                 keys.sort();
                 for key in keys {
                     path.push(PathSegment::Key(key.clone()));
-                    self.walk_nested(&values[key], root_class, path, label, out);
+                    self.walk_nested(&values[key], path, label, out);
                     path.pop();
                 }
             }
@@ -200,7 +204,7 @@ impl ConstraintSet {
                     let own = linkml_runtime::element_identity_label(child)
                         .unwrap_or_else(|| (index + 1).to_string());
                     path.push(PathSegment::Index(index));
-                    self.walk_nested(child, root_class, path, Some(&own), out);
+                    self.walk_nested(child, path, Some(&own), out);
                     path.pop();
                 }
             }
@@ -212,7 +216,7 @@ impl ConstraintSet {
                     let own = linkml_runtime::element_identity_label(child)
                         .unwrap_or_else(|| key.clone());
                     path.push(PathSegment::Key(key.clone()));
-                    self.walk_nested(child, root_class, path, Some(&own), out);
+                    self.walk_nested(child, path, Some(&own), out);
                     path.pop();
                 }
             }
@@ -220,9 +224,17 @@ impl ConstraintSet {
         }
     }
 
-    /// Shapes on the root class: everything but the nested ones.
+    /// Whether `shape` targets the class this set was built for. Everything
+    /// else in the set belongs to a class nested inside it. Decided against
+    /// the set's own class, not stored on the shape: the same shape is a root
+    /// shape in a set built for its own class.
+    fn is_root_shape(&self, shape: &ShapeResult) -> bool {
+        shape.target_class == self.target_class.name()
+    }
+
+    /// Shapes on the root class.
     fn root_shapes(&self) -> impl Iterator<Item = &ShapeResult> {
-        self.shapes.iter().filter(|s| !s.nested)
+        self.shapes.iter().filter(|s| self.is_root_shape(s))
     }
 
     /// Backward-solve: determine the allowed values for `target_field` given `object_data`.
@@ -529,10 +541,11 @@ fn values_equal_json_str(candidate: &str, value: &serde_json::Value) -> bool {
     }
 }
 
-/// Schema with one slot-less class, `Bare`, for tests that only care about
-/// the shapes.
+/// Schema of slot-less classes, one per class the hand-built test shapes
+/// target, for tests that only care about the shapes. `class` picks the
+/// set's root.
 #[cfg(test)]
-pub(crate) fn bare_schema() -> (SchemaView, ClassView) {
+pub(crate) fn bare_schema(class: &str) -> (SchemaView, ClassView) {
     use linkml_meta::SchemaDefinition;
     use serde_path_to_error as p2e;
     use serde_yml as yml;
@@ -548,14 +561,17 @@ default_range: string
 imports:
   - linkml:types
 classes:
-  Bare: {}
+  TunnelComponent: {}
+  TunnelComplex: {}
+  CoveredSection: {}
+  Thing: {}
 ";
     let mut sv = SchemaView::new();
     for raw in [include_str!("../tests/data/types.yaml"), BARE] {
         let schema: SchemaDefinition = p2e::deserialize(yml::Deserializer::from_str(raw)).unwrap();
         sv.add_schema(schema).unwrap();
     }
-    let class = resolve_class(&sv, "Bare").unwrap();
+    let class = resolve_class(&sv, class).unwrap();
     (sv, class)
 }
 
@@ -565,12 +581,13 @@ mod tests {
     use crate::shacl_ast::{EnforcementLevel, PropertyPath, ShaclAst};
     use serde_json::json;
 
-    /// A class with no slots: every field a test shape names is outside the
-    /// schema, so solving falls back to a `Query` and no enum or member lookup
-    /// kicks in. What the schema-less tests exercised before a schema was
-    /// mandatory.
+    /// A set rooted at the shapes' own (slot-less) class: every field a test
+    /// shape names is outside the schema, so solving falls back to a `Query`
+    /// and no enum or member lookup kicks in.
     fn bare(shapes: Vec<ShapeResult>) -> ConstraintSet {
-        let (schema_view, target_class) = bare_schema();
+        let class = shapes[0].target_class.clone();
+        assert!(shapes.iter().all(|s| s.target_class == class));
+        let (schema_view, target_class) = bare_schema(&class);
         ConstraintSet {
             shapes,
             schema_view,
@@ -625,7 +642,6 @@ mod tests {
                 }),
             }),
             sparql: None,
-            nested: false,
         }
     }
 
@@ -649,7 +665,6 @@ mod tests {
                 max_count_per_value: 1,
             }),
             sparql: None,
-            nested: false,
         }
     }
 
@@ -728,8 +743,8 @@ mod tests {
     fn test_from_json_to_json_roundtrip() {
         let shapes = vec![status_combo_shape()];
         let json = serde_json::to_string(&shapes).unwrap();
-        let (sv, _) = bare_schema();
-        let cs = ConstraintSet::from_json(&json, &sv, "Bare").unwrap();
+        let (sv, _) = bare_schema("TunnelComponent");
+        let cs = ConstraintSet::from_json(&json, &sv, "TunnelComponent").unwrap();
         assert_eq!(cs.shape_count(), 1);
         let json2 = cs.to_json().unwrap();
         // Roundtrip should produce equivalent JSON
@@ -791,7 +806,6 @@ mod tests {
                 values: vec![json!("In_voorbereiding"), json!("In_opvolging")],
             }),
             sparql: None,
-            nested: false,
         };
         let cs = bare(vec![shape1, shape2]);
         // This data violates shape1 (forbidden combo) and passes shape2
@@ -907,7 +921,6 @@ mod tests {
                 }),
             }),
             sparql: None,
-            nested: false,
         };
         let cs = bare(vec![shape]);
         let result = cs.solve(&json!({}), "secondary");
@@ -944,7 +957,6 @@ mod tests {
                 }),
             }),
             sparql: None,
-            nested: false,
         };
         let cs = bare(vec![shape]);
         let result = cs.solve(&json!({}), "secondary");
@@ -990,7 +1002,6 @@ mod tests {
             introspectable: true,
             ast: None,
             sparql: None,
-            nested: false,
         };
         let cs = bare(vec![shape1, shape2]);
         let fields = cs.affected_fields();
@@ -1029,7 +1040,6 @@ mod tests {
                 "#
                 .to_owned(),
             ),
-            nested: false,
         };
         let cs = bare(vec![shape]);
 
@@ -1123,7 +1133,6 @@ mod tests {
                 path_b: PropertyPath::iri("https://data.infrabel.be/asset360/belongsToLine"),
             }),
             sparql: None,
-            nested: false,
         }])
     }
 
@@ -1424,13 +1433,7 @@ ex:NoteTextShape a sh:NodeShape ;
     /// before nested classes were collected.
     #[cfg(feature = "shacl-parser")]
     fn root_only(deep: &ConstraintSet, sv: &SchemaView) -> ConstraintSet {
-        let shapes: Vec<ShapeResult> =
-            serde_json::from_str::<Vec<ShapeResult>>(&deep.to_json().unwrap())
-                .unwrap()
-                .into_iter()
-                .filter(|shape| !shape.nested)
-                .collect();
-        ConstraintSet::from_json(&serde_json::to_string(&shapes).unwrap(), sv, "Holder").unwrap()
+        ConstraintSet::from_json(&deep.root_shapes_json().unwrap(), sv, "Holder").unwrap()
     }
 
     /// Nested shapes add violations and nothing else: every root-only
@@ -1484,6 +1487,35 @@ ex:NoteTextShape a sh:NodeShape ;
             located(&rebuilt.evaluate(&data).unwrap()),
             located(&deep.evaluate(&data).unwrap())
         );
+    }
+
+    /// Whether a shape is nested depends on the set's root, not on the shape:
+    /// a Holder set's JSON rebuilt for Element runs Element's shapes at the
+    /// root, Load's below it, and leaves Holder's out.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_rebuilt_for_a_nested_class_roots_at_that_class() {
+        let sv = nested_schema_view();
+        let deep = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let element = ConstraintSet::from_json(&deep.to_json().unwrap(), &sv, "Element").unwrap();
+        let data = json!({
+            "elementType": "Main",
+            "load": { "standard": "S1", "model": "M2" },
+            "parts": [ { "code": "P1" }, { "code": "P1" } ]
+        });
+        assert_eq!(
+            located(&element.evaluate(&data).unwrap()),
+            vec![
+                ("Each part code is allowed once.".into(), json!([]), None),
+                (
+                    "Model not allowed for standard.".into(),
+                    json!(["load"]),
+                    None
+                ),
+            ]
+        );
+        assert!(element.affected_fields().contains(&"parts".to_owned()));
+        assert!(!element.affected_fields().contains(&"name".to_owned()));
     }
 
     /// An object the runtime cannot load at all leaves no nested shape
