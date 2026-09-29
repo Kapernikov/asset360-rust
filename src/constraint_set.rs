@@ -33,6 +33,10 @@ pub struct ConstraintSet {
     shapes: Vec<ShapeResult>,
     schema_view: SchemaView,
     target_class: ClassView,
+    /// `target_class` and its `is_a` ancestors, nearest first: a shape on any
+    /// of them applies to the root, as `sh:targetClass` reaches instances of
+    /// subclasses.
+    root_lineage: Vec<String>,
 }
 
 impl ConstraintSet {
@@ -47,10 +51,12 @@ impl ConstraintSet {
     ) -> Result<Self, String> {
         let shapes: Vec<ShapeResult> =
             serde_json::from_str(json).map_err(|e| format!("invalid shapes JSON: {e}"))?;
+        let root = resolve_class(schema_view, target_class)?;
         Ok(Self {
             shapes,
             schema_view: schema_view.clone(),
-            target_class: resolve_class(schema_view, target_class)?,
+            root_lineage: class_lineage(&root)?,
+            target_class: root,
         })
     }
 
@@ -76,7 +82,8 @@ impl ConstraintSet {
     /// slots, and the descendants of each range class). SHACL's
     /// `sh:targetClass` applies to every node of the class, nested ones
     /// included; this is how forward evaluation honours that. Those shapes
-    /// only take part in [`evaluate`](Self::evaluate).
+    /// only take part in [`evaluate`](Self::evaluate). A shape on an `is_a`
+    /// ancestor of a class applies to it as well, at the root and nested.
     #[cfg(feature = "shacl-parser")]
     pub fn from_shacl(
         ttl: &str,
@@ -85,8 +92,18 @@ impl ConstraintSet {
         schema_view: &SchemaView,
     ) -> Result<Self, String> {
         let root = resolve_class(schema_view, target_class)?;
-        let nested = nested_class_names(&root)?;
+        let root_lineage = class_lineage(&root)?;
+        // The nested classes and the ancestors of each, whose shapes reach them.
+        let mut nested = std::collections::BTreeSet::new();
+        for class_name in nested_class_names(&root)? {
+            for ancestor in class_lineage(&resolve_class(schema_view, &class_name)?)? {
+                if !root_lineage.contains(&ancestor) {
+                    nested.insert(ancestor);
+                }
+            }
+        }
         let wanted: Vec<&str> = std::iter::once(target_class)
+            .chain(root_lineage.iter().map(String::as_str))
             .chain(nested.iter().map(String::as_str))
             .collect();
         let parsed = shacl_parser::parse_shacl_for_classes(ttl, &wanted, language)
@@ -94,10 +111,11 @@ impl ConstraintSet {
         // Nested classes only contribute what the Rust engine can evaluate.
         let shapes = parsed
             .into_iter()
-            .filter(|shape| shape.target_class == root.name() || shape.introspectable)
+            .filter(|shape| root_lineage.contains(&shape.target_class) || shape.introspectable)
             .collect();
         Ok(Self {
             shapes,
+            root_lineage,
             schema_view: schema_view.clone(),
             target_class: root,
         })
@@ -160,8 +178,7 @@ impl ConstraintSet {
                 issues.join("; ")
             ));
         };
-        self.walk_nested(&instance, &mut Vec::new(), None, out);
-        Ok(())
+        self.walk_nested(&instance, &mut Vec::new(), None, out)
     }
 
     fn walk_nested(
@@ -170,17 +187,18 @@ impl ConstraintSet {
         path: &mut Vec<PathSegment>,
         label: Option<&str>,
         out: &mut Vec<Violation>,
-    ) {
+    ) -> Result<(), String> {
         match node {
             LinkMLInstance::Object { values, class, .. } => {
                 if !path.is_empty() {
-                    // Matched by class, so a nested object of the root class
-                    // itself gets the root shapes too.
-                    let class_name = class.name();
+                    // Matched by the object's class and its ancestors, so a
+                    // subclass instance gets its parents' shapes, and a nested
+                    // object of the root class gets the root shapes.
+                    let lineage = class_lineage(class)?;
                     let applicable = self
                         .shapes
                         .iter()
-                        .filter(|s| s.introspectable && s.target_class == class_name);
+                        .filter(|s| s.introspectable && lineage.contains(&s.target_class));
                     let mut data = None;
                     for shape in applicable {
                         let data = data.get_or_insert_with(|| node.to_json());
@@ -195,7 +213,7 @@ impl ConstraintSet {
                 keys.sort();
                 for key in keys {
                     path.push(PathSegment::Key(key.clone()));
-                    self.walk_nested(&values[key], path, label, out);
+                    self.walk_nested(&values[key], path, label, out)?;
                     path.pop();
                 }
             }
@@ -204,7 +222,7 @@ impl ConstraintSet {
                     let own = linkml_runtime::element_identity_label(child)
                         .unwrap_or_else(|| (index + 1).to_string());
                     path.push(PathSegment::Index(index));
-                    self.walk_nested(child, path, Some(&own), out);
+                    self.walk_nested(child, path, Some(&own), out)?;
                     path.pop();
                 }
             }
@@ -216,20 +234,21 @@ impl ConstraintSet {
                     let own = linkml_runtime::element_identity_label(child)
                         .unwrap_or_else(|| key.clone());
                     path.push(PathSegment::Key(key.clone()));
-                    self.walk_nested(child, path, Some(&own), out);
+                    self.walk_nested(child, path, Some(&own), out)?;
                     path.pop();
                 }
             }
             LinkMLInstance::Scalar { .. } | LinkMLInstance::Null { .. } => {}
         }
+        Ok(())
     }
 
-    /// Whether `shape` targets the class this set was built for. Everything
-    /// else in the set belongs to a class nested inside it. Decided against
-    /// the set's own class, not stored on the shape: the same shape is a root
-    /// shape in a set built for its own class.
+    /// Whether `shape` targets the class this set was built for or one of its
+    /// ancestors. Everything else in the set belongs to a class nested inside
+    /// it. Decided against the set's own class, not stored on the shape: the
+    /// same shape is a root shape in a set built for its own class.
     fn is_root_shape(&self, shape: &ShapeResult) -> bool {
-        shape.target_class == self.target_class.name()
+        self.root_lineage.contains(&shape.target_class)
     }
 
     /// Shapes on the root class.
@@ -454,6 +473,20 @@ fn nested_class_names(root: &ClassView) -> Result<Vec<String>, String> {
     Ok(found.into_iter().collect())
 }
 
+/// `class` and its `is_a` ancestors, nearest first.
+fn class_lineage(class: &ClassView) -> Result<Vec<String>, String> {
+    let mut lineage = vec![class.name().to_owned()];
+    let mut current = class.clone();
+    while let Some(parent) = current
+        .parent_class()
+        .map_err(|e| format!("error resolving the parent of '{}': {e:?}", current.name()))?
+    {
+        lineage.push(parent.name().to_owned());
+        current = parent;
+    }
+    Ok(lineage)
+}
+
 fn resolve_class(schema_view: &SchemaView, target_class: &str) -> Result<ClassView, String> {
     let conv = schema_view.converter();
     schema_view
@@ -591,6 +624,7 @@ mod tests {
         ConstraintSet {
             shapes,
             schema_view,
+            root_lineage: class_lineage(&target_class).unwrap(),
             target_class,
         }
     }
@@ -1250,10 +1284,16 @@ classes:
   Part:
     attributes:
       code: {}
+  SpecialHolder:
+    is_a: Holder
   Load:
     attributes:
+      kind:
+        designates_type: true
       standard: {}
       model: {}
+  SpecialLoad:
+    is_a: Load
   Section:
     unique_keys:
       section_key:
@@ -1516,6 +1556,42 @@ ex:NoteTextShape a sh:NodeShape ;
         );
         assert!(element.affected_fields().contains(&"parts".to_owned()));
         assert!(!element.affected_fields().contains(&"name".to_owned()));
+    }
+
+    /// `sh:targetClass` reaches instances of subclasses too (SHACL 2.1.3.3):
+    /// a `Load` shape must run on an inlined `SpecialLoad`.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_evaluate_nested_applies_shape_to_subclass_instances() {
+        let sv = nested_schema_view();
+        let cs = ConstraintSet::from_shacl(NESTED_SHAPES, "Holder", "en", &sv).unwrap();
+        let data = json!({
+            "id": "h1",
+            "holderLoad": { "kind": "ex:SpecialLoad", "standard": "S1", "model": "M9" }
+        });
+        assert_eq!(
+            located(&cs.evaluate(&data).unwrap()),
+            vec![(
+                "Model not allowed for standard.".into(),
+                json!(["holderLoad"]),
+                None
+            )]
+        );
+    }
+
+    /// The same at the root: a set built for a subclass carries its parent's
+    /// shapes as root shapes, for evaluation and solving alike.
+    #[cfg(feature = "shacl-parser")]
+    #[test]
+    fn test_subclass_root_gets_parent_shapes() {
+        let sv = nested_schema_view();
+        let special = ConstraintSet::from_shacl(NESTED_SHAPES, "SpecialHolder", "en", &sv).unwrap();
+        let data = json!({ "id": "h1", "name": "Bad" });
+        assert_eq!(
+            located(&special.evaluate(&data).unwrap()),
+            vec![("Name must be Good.".into(), json!([]), None)]
+        );
+        assert_eq!(special.affected_fields(), vec!["name".to_owned()]);
     }
 
     /// An object the runtime cannot load at all leaves no nested shape
