@@ -1677,7 +1677,8 @@ ex:NoteTextShape a sh:NodeShape ;
     }
 
     /// The same at the root: a set built for a subclass carries its parent's
-    /// shapes as root shapes, for evaluation and solving alike.
+    /// shapes as root shapes, for evaluation, solving and `root_shapes_json`
+    /// alike, and so does one rebuilt from JSON the way the frontend does.
     #[cfg(feature = "shacl-parser")]
     #[test]
     fn test_subclass_root_gets_parent_shapes() {
@@ -1689,6 +1690,17 @@ ex:NoteTextShape a sh:NodeShape ;
             vec![("Name must be Good.".into(), json!([]), None)]
         );
         assert_eq!(special.affected_fields(), vec!["name".to_owned()]);
+
+        let rebuilt =
+            ConstraintSet::from_json(&special.to_json().unwrap(), &sv, "SpecialHolder").unwrap();
+        let root: Vec<ShapeResult> =
+            serde_json::from_str(&rebuilt.root_shapes_json().unwrap()).unwrap();
+        let root_uris: Vec<&str> = root.iter().map(|s| s.shape_uri.as_str()).collect();
+        assert_eq!(
+            root_uris,
+            vec!["https://example.org/nested/HolderNameShape"]
+        );
+        assert!(rebuilt.shape_count() > root.len());
     }
 
     /// An object the runtime cannot load at all leaves no nested shape
