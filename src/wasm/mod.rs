@@ -1214,6 +1214,16 @@ impl ConstraintSetHandle {
             .map_err(|e| JsValue::from_str(&format!("serialize error: {e}")))
     }
 
+    /// Serialize only the shapes that apply to the handle's own class: those
+    /// on the class or one of its `is_a` ancestors. The rest belong to the
+    /// classes nested inside it.
+    #[wasm_bindgen(js_name = rootShapesJson)]
+    pub fn root_shapes_json(&self) -> Result<String, JsValue> {
+        self.inner
+            .root_shapes_json()
+            .map_err(|e| JsValue::from_str(&format!("serialize error: {e}")))
+    }
+
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!(
