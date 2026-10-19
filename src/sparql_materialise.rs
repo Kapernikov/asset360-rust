@@ -1668,4 +1668,35 @@ mod tests {
             );
         }
     }
+
+    /// The materialisation reads the graphs the query can see, as the engine
+    /// does: a `FROM` alone leaves no named graph (SPARQL 1.1 13.2), so the
+    /// schema graph is not there to evaluate and nothing is materialised;
+    /// naming it in `FROM NAMED` brings the evaluation back. Same answer on
+    /// both routes, whichever rules fired.
+    #[test]
+    fn the_materialisation_honours_the_datasets_clause() {
+        const G: &str = SCHEMA_GRAPH;
+        let text = |clause: &str| {
+            refined_for(&format!(
+                "SELECT ?code {clause} WHERE {{ GRAPH <{G}> {{ ?t skos:notation ?code }} \
+                 FILTER(CONTAINS(?code, \"GS\")) }}"
+            ))
+        };
+        for hidden in ["FROM <urn:x>", "FROM <urn:x> FROM NAMED <urn:y>"] {
+            let plan = text(hidden);
+            assert!(
+                plan.contains("graph "),
+                "{hidden}: schema graph kept:\n{plan}"
+            );
+            assert!(
+                !plan.contains("values"),
+                "{hidden}: evaluated a hidden graph:\n{plan}"
+            );
+        }
+        for visible in ["", &format!("FROM <urn:x> FROM NAMED <{G}>")] {
+            let plan = text(visible);
+            assert!(plan.contains("values"), "{visible}: not evaluated:\n{plan}");
+        }
+    }
 }

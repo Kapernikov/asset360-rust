@@ -502,7 +502,9 @@ classes:
         let query = format!("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {spelling}");
         let parsed = crate::sparql_scoper::parse_query_for(&query, sv).expect("parses");
         let mut plan = crate::sparql_refine::naive_plan_in(&parsed, dataset).expect("plans");
-        let rule = MostSpecificTypeIsTheDirectType::new(sv, dataset);
+        // The graphs the query can see, as production hands the rules.
+        let visible = dataset.seen_through(crate::sparql_scoper::dataset_of(&parsed));
+        let rule = MostSpecificTypeIsTheDirectType::new(sv, &visible);
         let rules: [&dyn Rule; 1] = [&rule];
         let log = refine(&mut plan, &rules).expect("every invariant holds");
         (!log.applied.is_empty(), plan.to_string())
@@ -546,6 +548,41 @@ classes:
         );
         assert!(!plan.contains("antijoin"), "{plan}");
         // The ledger stayed balanced: `refine` checked it.
+    }
+
+    /// A `FROM` without a `FROM NAMED` leaves no named graph (SPARQL 1.1
+    /// 13.2), so the schema graph inside the NOT EXISTS is invisible and the
+    /// subclass test is empty: the rule has nothing to prove and declines. It
+    /// fires once the clause names the schema graph.
+    #[test]
+    fn a_from_clause_hides_the_schema_graph_and_the_rule_declines() {
+        const A: &str = "urn:graph:a";
+        let sv = schema_view();
+        let dataset = DatasetSpec::new(TypeRegime::IsA)
+            .with_data_graph(A, TypeRegime::IsA)
+            .with_default_graph(A)
+            .with_schema_graph(G, TypeRegime::IsA);
+        let with_clause = |clause: &str| {
+            canonical(G).replace(
+                "SELECT ?s ?t WHERE",
+                &format!("SELECT ?s ?t {clause} WHERE"),
+            )
+        };
+        let (fired, plan) = refined(&sv, &dataset, &with_clause(&format!("FROM <{A}>")));
+        assert!(!fired && !plan.contains("directType"), "{plan}");
+        let (fired, plan) = refined(
+            &sv,
+            &dataset,
+            &with_clause(&format!("FROM <{A}> FROM NAMED <{G}>")),
+        );
+        assert!(fired && plan.contains("directType"), "{plan}");
+        // The same for `FROM NAMED` of some other graph.
+        let (fired, _) = refined(
+            &sv,
+            &dataset,
+            &with_clause(&format!("FROM <{A}> FROM NAMED <urn:other>")),
+        );
+        assert!(!fired);
     }
 
     /// Asserted data has no `directType`: the NOT EXISTS is simply true, and

@@ -355,7 +355,7 @@ pub fn sparql_execute(
     crate::sparql_alias::canonicalize(&mut parsed, schema_view)
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
-    refuse_named_data_graphs(&mut parsed, dataset)?;
+    refuse_named_data_graphs(&parsed, dataset)?;
 
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
@@ -513,7 +513,7 @@ fn insert_schema_graphs(
 /// no graph of that name and the engine would otherwise read an empty one.
 #[cfg(feature = "sparql-endpoint")]
 fn refuse_named_data_graphs(
-    query: &mut spargebra::Query,
+    query: &spargebra::Query,
     dataset: &DatasetSpec,
 ) -> Result<(), ExecuteError> {
     use spargebra::Query;
@@ -559,7 +559,7 @@ fn refuse_named_data_graphs(
 
     let mut offending: Vec<String> = Vec::new();
     {
-        let pattern = match &*query {
+        let pattern = match query {
             Query::Select { pattern, .. }
             | Query::Construct { pattern, .. }
             | Query::Describe { pattern, .. }
@@ -574,20 +574,13 @@ fn refuse_named_data_graphs(
         | Query::Ask { dataset, .. } => dataset,
     };
     if let Some(spec) = clause.as_ref() {
-        // The default graph said out loud, and only that.
-        let only_the_default = spec.named.as_ref().is_none_or(Vec::is_empty)
-            && !spec.default.is_empty()
-            && spec
-                .default
-                .iter()
-                .all(|graph| dataset.default_graph() == Some(graph.as_str()));
-        if only_the_default {
-            *clause = None;
-        } else {
-            for graph in spec.default.iter().chain(spec.named.iter().flatten()) {
-                if dataset.data_regime(graph.as_str()).is_some() {
-                    offending.push(graph.as_str().to_owned());
-                }
+        // Every graph a clause names: a data graph of the dataset is one the
+        // store holds no copy of (the default graph's own IRI included). The
+        // clause itself is never dropped -- it also decides which named
+        // graphs the query can see.
+        for graph in spec.default.iter().chain(spec.named.iter().flatten()) {
+            if dataset.data_regime(graph.as_str()).is_some() {
+                offending.push(graph.as_str().to_owned());
             }
         }
     }
@@ -1152,8 +1145,8 @@ classes:
     /// The engine holds the records in the default graph only, so a query
     /// naming a data graph is refused by name until it evaluates them -- never
     /// answered from a graph that is empty. The default graph's own IRI in a
-    /// `FROM` is the default graph said out loud and is accepted; a schema
-    /// graph is not a data graph.
+    /// `FROM` is a data graph like the others, refused (the clause is never
+    /// dropped); a schema graph is not a data graph.
     #[test]
     fn a_named_data_graph_is_refused_until_the_engine_evaluates_it() {
         use linkml_runtime::schema_rdf::TypeRegime;
@@ -1181,6 +1174,8 @@ classes:
             format!("SELECT ?s WHERE {{ GRAPH <{I}> {{ {body} }} }}"),
             format!("SELECT ?s FROM <{I}> WHERE {{ {body} }}"),
             format!("SELECT ?s FROM <{A}> FROM <{I}> WHERE {{ {body} }}"),
+            // The default graph's own name in a `FROM` is a data graph too.
+            format!("SELECT ?s FROM <{A}> WHERE {{ {body} }}"),
             format!("SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {{ {body} }} }}"),
             // The default graph by its own name is still a *graph* in a
             // `GRAPH` clause, which the store has no such name for.
@@ -1194,15 +1189,11 @@ classes:
                 other => panic!("`{query}` must be refused, got {other:?}"),
             }
         }
-        // The default graph said out loud, and no clause at all, answer.
-        for query in [
-            format!("SELECT ?s WHERE {{ {body} }}"),
-            format!("SELECT ?s FROM <{A}> WHERE {{ {body} }}"),
-        ] {
-            let answer = run(&query).unwrap_or_else(|e| panic!("`{query}`: {e}"));
-            let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
-            assert_eq!(parsed["results"]["bindings"].as_array().unwrap().len(), 2);
-        }
+        // No clause at all answers.
+        let query = format!("SELECT ?s WHERE {{ {body} }}");
+        let answer = run(&query).unwrap_or_else(|e| panic!("`{query}`: {e}"));
+        let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(parsed["results"]["bindings"].as_array().unwrap().len(), 2);
         // An invalid dataset is refused before anything is loaded.
         let invalid = DatasetSpec::default().with_default_graph(A);
         assert!(matches!(
