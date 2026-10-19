@@ -70,7 +70,9 @@ use crate::sparql_refine::{
     SlotPresence, SlotReading, SortTerm, inner_join_groups, is_type_pattern, object_variable,
     predicate_iri, scan_classes, scan_with_fanout, subject_iri, subject_variable, type_class_iri,
 };
-use crate::sparql_slot_family::slot_on_class_or_descendant;
+use crate::sparql_slot_family::{
+    slot_for_predicate_on_class_or_descendant, slot_on_class_or_descendant,
+};
 
 /// One rewrite.
 pub trait Rule {
@@ -329,19 +331,18 @@ impl<'s> FoldMatchesIntoScan<'s> {
             // Asked of the class rather than of the slot's own definition:
             // the same slot name on two classes may differ, and it is this
             // class's column that will be read.
-            let Ok(Some(slot)) = self.schema.get_slot_by_uri(predicate) else {
-                continue;
-            };
             // The class or, failing that, its descendants (#512): a slot a
             // subclass declares is read by name, and a record of another
             // class simply has no value for it.
-            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
+            let Some(on_class) =
+                slot_for_predicate_on_class_or_descendant(self.schema, &class, predicate)
+            else {
                 continue;
             };
             found.push((
                 id,
                 ScanSlot {
-                    path: vec![slot.name.clone()],
+                    path: vec![on_class.name.clone()],
                     var: Some(var.to_owned()),
                     multivalued: on_class.determine_slot_container_mode()
                         != SlotContainerMode::SingleValue,
@@ -1691,17 +1692,16 @@ impl Rule for DeliverOptionalRead<'_> {
                 continue;
             };
 
-            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
-                continue;
-            };
             let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
                 continue;
             };
-            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
+            let Some(on_class) =
+                slot_for_predicate_on_class_or_descendant(self.schema, &class, &predicate)
+            else {
                 continue;
             };
             let delivered = ScanSlot {
-                path: vec![slot.name.clone()],
+                path: vec![on_class.name.clone()],
                 // Bound by nothing here. The `match` above is what binds the
                 // variable, and the engine's left join decides it; this slot
                 // exists so the column reaches the engine at all. Binding it
@@ -2314,16 +2314,15 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
                 continue;
             };
-            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
-                continue;
-            };
-            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
+            let Some(on_class) =
+                slot_for_predicate_on_class_or_descendant(self.schema, &class, &predicate)
+            else {
                 continue;
             };
             let multivalued =
                 on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue;
             let mut path = site.prefix.clone();
-            path.push(slot.name.clone());
+            path.push(on_class.name.clone());
             // A multivalued hop *off an element* is a nested fan-out: the
             // element's own collection, one row per element of it, whose
             // occurrence is the outer element's plus one hop
@@ -2742,8 +2741,7 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
                 .to_string()
         };
         let class = self.schema.get_class_by_uri(&class_uri).ok().flatten()?;
-        let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
-        let on_class = slot_on_class_or_descendant(&class, &slot.name)?;
+        let on_class = slot_for_predicate_on_class_or_descendant(self.schema, &class, predicate)?;
         // Identity is [`FoldIdentityConstant`]'s, and the two rules have to be
         // disjoint or the plan depends on which fired first -- which it did:
         // reversed, this rule turned `?s :id "u"` into a JSONB path condition
@@ -2756,7 +2754,7 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         // slower) question.
         if class
             .identifier_slot()
-            .is_some_and(|identifier| identifier.name == slot.name)
+            .is_some_and(|identifier| identifier.name == on_class.name)
         {
             return None;
         }
@@ -2778,7 +2776,7 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
             (true, false) => return None,
         };
         let mut slot_path = site.prefix.clone();
-        slot_path.push(slot.name.clone());
+        slot_path.push(on_class.name.clone());
         let condition = Expr::Compare {
             op: CompareOp::Eq,
             left: Box::new(Expr::Slot {
@@ -2798,7 +2796,7 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         condition.to_sql(self.schema, &classes)?;
         Some(Read {
             condition,
-            slot: slot.name.clone(),
+            slot: on_class.name.clone(),
             multivalued: !single_valued,
         })
     }
@@ -4318,24 +4316,24 @@ impl Rule for AbsorbOptionalReference<'_> {
             }
 
             // A single-valued reference column of that class.
-            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
-                continue;
-            };
             let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
                 continue;
             };
-            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
+            let Some(on_class) =
+                slot_for_predicate_on_class_or_descendant(self.schema, &class, &predicate)
+            else {
                 continue;
             };
             if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue
-                || !PushReferenceJoin::new(self.schema).stores_a_reference(&class_uri, &slot.name)
+                || !PushReferenceJoin::new(self.schema)
+                    .stores_a_reference(&class_uri, &on_class.name)
             {
                 continue;
             }
             let path: Vec<String> = prefix
                 .iter()
                 .cloned()
-                .chain(std::iter::once(slot.name.clone()))
+                .chain(std::iter::once(on_class.name.clone()))
                 .collect();
 
             // The delivered read, so the column reaches whoever renders the
@@ -4360,7 +4358,7 @@ impl Rule for AbsorbOptionalReference<'_> {
                 *reference = Some(ReferenceEdge {
                     referenced: var.clone(),
                     holder: holder_star,
-                    slot: slot.name.clone(),
+                    slot: on_class.name.clone(),
                     path: prefix,
                 });
             }
@@ -5419,16 +5417,18 @@ impl Rule for NarrowByAKeptHop<'_> {
             let Ok(Some(class)) = self.schema.get_class_by_uri(class_uri) else {
                 continue;
             };
-            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
-                continue;
-            };
-            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
+            let Some(on_class) =
+                slot_for_predicate_on_class_or_descendant(self.schema, &class, &predicate)
+            else {
                 continue;
             };
             // Already known: either the read was folded (with its variable, so
             // the check is there) or this rule has already run on it. A rule
             // that keeps adding the same slot never reaches a fixpoint.
-            if slots.iter().any(|known| known.path == [slot.name.clone()]) {
+            if slots
+                .iter()
+                .any(|known| known.path == [on_class.name.clone()])
+            {
                 continue;
             }
             // The identifier's existence check is structurally always true --
@@ -5439,7 +5439,7 @@ impl Rule for NarrowByAKeptHop<'_> {
             // caught exactly that.
             if class
                 .identifier_slot()
-                .is_some_and(|identifier| identifier.name == slot.name)
+                .is_some_and(|identifier| identifier.name == on_class.name)
             {
                 continue;
             }
@@ -5447,7 +5447,7 @@ impl Rule for NarrowByAKeptHop<'_> {
                 on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue;
             if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
                 slots.push(ScanSlot {
-                    path: vec![slot.name.clone()],
+                    path: vec![on_class.name.clone()],
                     // No variable: the value is not delivered and nothing
                     // above may read it. The engine answers the read; this
                     // only narrows the rows it reads over.
@@ -6556,6 +6556,42 @@ mod tests {
             "{plan}"
         );
         println!("{plan}");
+    }
+
+    /// A read of `asset360:name` on a `Anchor` is not folded onto the
+    /// attribute `name` of a descendant that is written under another
+    /// `slot_uri`: that is a different predicate (review probe P4), and the
+    /// fold would read its column as the answer.
+    #[test]
+    fn a_read_is_not_folded_onto_a_same_named_slot_of_another_predicate() {
+        let schema = crate::sparql_scoper::tests::test_schema_view_plus(
+            r#"
+  Anchor:
+    class_uri: asset360:Anchor
+    attributes:
+      asset360_uri:
+        identifier: true
+  AnchorKid:
+    class_uri: asset360:AnchorKid
+    is_a: Anchor
+    attributes:
+      name:
+        slot_uri: asset360:kidName
+        range: string
+"#,
+        );
+        let rule = FoldMatchesIntoScan::new(&schema);
+        let mut plan = plan_of("SELECT ?v WHERE { ?s a asset360:Anchor ; asset360:name ?v }");
+        refine(&mut plan, &[&rule]).expect("declining preserves every invariant");
+        assert!(scan_slots(&plan).is_empty(), "{plan}");
+        // The same read under the descendant's own predicate is folded.
+        let mut plan = plan_of("SELECT ?v WHERE { ?s a asset360:Anchor ; asset360:kidName ?v }");
+        refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
+        assert_eq!(
+            scan_slots(&plan),
+            vec![("name".to_owned(), "v".to_owned(), false)],
+            "{plan}"
+        );
     }
 
     /// A node's key outlives the rewrite that removes it: a folded match is

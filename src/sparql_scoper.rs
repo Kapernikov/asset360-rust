@@ -1740,6 +1740,7 @@ fn scope_qualified(
                 type_depth: usize::MAX,
                 slot_depth: HashMap::new(),
                 object_variables: BTreeMap::new(),
+                slot_predicates: HashMap::new(),
                 variable_depth: HashMap::new(),
                 inline_filters: HashMap::new(),
                 claimed: Vec::new(),
@@ -1796,6 +1797,16 @@ fn scope_qualified(
             // Handled below. The `else` after this branch is the drop site for
             // a predicate the schema does not know.
             let slot_name = slot_view.name.clone();
+            // One name under two predicates cannot be walked by either: the
+            // star is keyed by name, so the two reads would be merged. Honestly
+            // inexact, and the engine finishes the query.
+            if builder
+                .slot_predicates
+                .insert(slot_name.clone(), pred_iri.to_owned())
+                .is_some_and(|known| known != pred_iri)
+            {
+                record_loss(Inexact::DuplicateSlotBinding);
+            }
             let multivalued = slot_view.determine_slot_container_mode()
                 != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
             // How this column's values render, so an inline constant is judged
@@ -2858,6 +2869,10 @@ struct StarBuilder {
     /// Several variables on one slot is a self-join over its values; they are
     /// kept in the order the query wrote them, slots in name order.
     object_variables: BTreeMap<String, Vec<String>>,
+    /// Map: slot name → the predicate the query wrote for it. A path walk
+    /// asks the schema for the slot *by that predicate*, not by the name: two
+    /// slots of one name may be written under different IRIs.
+    slot_predicates: HashMap<String, String>,
     /// Variable → the shallowest OPTIONAL depth at which a triple of this star
     /// binds it as an object. Needed because `slot_depth` is per slot, and two
     /// variables on one slot can sit in different blocks.
@@ -5135,6 +5150,7 @@ fn collect_path_bindings(
             continue;
         };
         walk_paths(
+            schema_view,
             star_var,
             star_var,
             &class_view,
@@ -5160,6 +5176,7 @@ fn collect_path_bindings(
 
 #[allow(clippy::too_many_arguments)]
 fn walk_paths(
+    schema_view: &SchemaView,
     star_var: &str,
     current_var: &str,
     current_class: &linkml_schemaview::classview::ClassView,
@@ -5204,9 +5221,16 @@ fn walk_paths(
         // The class's own O(1) name index rather than a scan. It hands back an
         // owned SlotView, which this did not need before — worth it for a wide
         // class (TunnelComplex has 95 slots), a wash for a narrow one.
-        let Some(slot) =
-            crate::sparql_slot_family::slot_on_class_or_descendant(current_class, slot_name)
-        else {
+        // Asked by the predicate the query wrote, not by the name it resolved
+        // to: a same-named slot under another IRI is not what was read.
+        let Some(predicate) = builder.slot_predicates.get(slot_name) else {
+            continue;
+        };
+        let Some(slot) = crate::sparql_slot_family::slot_for_predicate_on_class_or_descendant(
+            schema_view,
+            current_class,
+            predicate,
+        ) else {
             continue;
         };
 
@@ -5263,6 +5287,7 @@ fn walk_paths(
                 ) {
                     traversed.insert(object_var.clone());
                     walk_paths(
+                        schema_view,
                         star_var,
                         object_var,
                         &range_class,
