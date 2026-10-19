@@ -46,11 +46,11 @@ def test_a_coherent_dataset_builds():
 
 
 def test_a_graph_of_records_needs_the_own_partition():
-    only_is_a = TypeRegime([TypePartition.IsA])
+    only_is_a = TypeRegime([TypePartition.IS_A])
     with pytest.raises(ValueError, match="lacks the own partition"):
         DatasetSpec(TypeRegime.ASSERTED, data_graphs={A: only_is_a})
     with pytest.raises(ValueError, match="lacks the own partition"):
-        DatasetSpec(TypeRegime.parse("none"))
+        DatasetSpec(TypeRegime.parse("{}"))
 
 
 def test_limits_are_keyword_only_with_their_defaults():
@@ -110,7 +110,7 @@ def test_a_dataset_can_be_read_back():
 
 
 def test_a_dataset_repr_round_trips_and_hashes_with_equality():
-    own_and_isa = TypeRegime([TypePartition.Own, TypePartition.IsA])
+    own_and_isa = TypeRegime([TypePartition.OWN, TypePartition.IS_A])
     for dataset in (
         DatasetSpec(TypeRegime.ASSERTED),
         DatasetSpec(TypeRegime.IS_A, data_graphs={A: own_and_isa}),
@@ -128,12 +128,12 @@ def test_a_dataset_repr_round_trips_and_hashes_with_equality():
 
 
 def test_a_regime_that_is_no_named_one_reads_back_as_itself():
-    own_and_isa = TypeRegime([TypePartition.Own, TypePartition.IsA])
+    own_and_isa = TypeRegime([TypePartition.OWN, TypePartition.IS_A])
     dataset = DatasetSpec(TypeRegime.ASSERTED, data_graphs={A: own_and_isa})
     assert dataset.data_graphs == {A: own_and_isa}
     assert repr(dataset) == (
         "DatasetSpec(TypeRegime.ASSERTED, "
-        "data_graphs={'urn:graph:asserted': TypeRegime.parse('own+isa')})"
+        "data_graphs={'urn:graph:asserted': TypeRegime.parse('{own,is_a}')})"
     )
 
 

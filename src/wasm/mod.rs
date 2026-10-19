@@ -976,7 +976,7 @@ impl LinkMLInstanceHandle {
     /// type regime the `rdf:type` triples are written under: `"asserted"` (the
     /// instance's own class; the default), `"is_a"` (plus every `is_a`
     /// ancestor and `sesame:directType`), `"is_a_and_mixins"` (plus mixins), or
-    /// any `+`-joined list of partitions (`own`, `isa`, `mixin`, `direct`).
+    /// any braced partition set such as `{own,is_a}` (`own`, `is_a`, `mixin`, `direct`).
     /// `skolem` names inlined elements with IRIs instead of blank nodes.
     #[wasm_bindgen(js_name = toTurtle)]
     pub fn to_turtle(

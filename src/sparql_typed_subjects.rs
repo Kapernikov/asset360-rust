@@ -780,7 +780,7 @@ classes:
     #[test]
     fn subclass_edges_are_irreflexive_in_every_regime() {
         let sv = schema_view();
-        for regime in TypeRegime::NAMED {
+        for &regime in TypeRegime::NAMED {
             for (sub, sup) in subclass_edges(&sv, regime).unwrap() {
                 assert_ne!(class_key(&sub), class_key(&sup), "{regime:?}");
             }

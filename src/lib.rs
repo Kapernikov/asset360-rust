@@ -3922,7 +3922,7 @@ impl ExecutionPlan {
 ///   default graph under its regime.
 /// * ``data_graphs`` -- named graphs over the golden records, each under a
 ///   regime: ``GRAPH <iri> { ... }`` reads the records under that regime. A
-///   regime must contain ``TypePartition.Own``, which holds every non-type
+///   regime must contain ``TypePartition.OWN``, which holds every non-type
 ///   triple of a record.
 /// * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
 ///   subclass edges under a regime.
@@ -4085,7 +4085,7 @@ fn py_regime(
 }
 
 /// How Python spells a regime in a `repr`: the named ones as attributes, any
-/// other set as `TypeRegime.parse('own+isa')`.
+/// other set as `TypeRegime.parse('{own,is_a}')`.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 fn regime_repr(regime: linkml_runtime::schema_rdf::TypeRegime) -> String {
     use linkml_runtime::schema_rdf::TypeRegime;

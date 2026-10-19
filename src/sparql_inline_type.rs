@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn the_verdict_follows_the_regime() {
         use InlineTypeTest::*;
-        for regime in TypeRegime::NAMED {
+        for &regime in TypeRegime::NAMED {
             // A subclass of the range: the elements designated by it.
             assert_eq!(
                 test("Place", "SpotPlace", regime),
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn a_range_without_a_designator_is_all_one_class() {
         use InlineTypeTest::*;
-        for regime in TypeRegime::NAMED {
+        for &regime in TypeRegime::NAMED {
             assert_eq!(
                 test("Detail", "Coordinates", regime),
                 NeverMatches,

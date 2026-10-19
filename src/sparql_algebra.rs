@@ -1441,7 +1441,7 @@ pub(crate) mod equivalence {
     fn in_each_regime(mut each: impl FnMut(TypeRegime, &SchemaView, &Oracle, &DatasetSpec)) {
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        for regime in TypeRegime::NAMED {
+        for &regime in TypeRegime::NAMED {
             let oracle = crate::sparql_oracle::fixture_in(&schema, regime);
             each(
                 regime,
@@ -1538,8 +1538,8 @@ pub(crate) mod equivalence {
         ];
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        for regime in TypeRegime::NAMED {
-            for graph in TypeRegime::NAMED {
+        for &regime in TypeRegime::NAMED {
+            for &graph in TypeRegime::NAMED {
                 let oracle = crate::sparql_oracle::fixture_in(&schema, regime)
                     .with_schema_graph(&schema, G, graph);
                 let dataset = DatasetSpec::builder(regime)

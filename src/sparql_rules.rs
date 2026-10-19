@@ -11713,7 +11713,7 @@ mod direct_type {
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; asset360:label ?l ; a ?t . \
              OPTIONAL { ?s sesame:directType ?d } }",
         ];
-        for regime in TypeRegime::NAMED {
+        for &regime in TypeRegime::NAMED {
             let oracle = crate::sparql_oracle::Oracle::new_in(&schema, &records, regime);
             let dataset = DatasetSpec::builder(regime)
                 .build()
