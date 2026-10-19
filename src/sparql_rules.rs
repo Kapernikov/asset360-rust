@@ -58,6 +58,7 @@ use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
+use linkml_runtime::schema_rdf::TypeRegime;
 use spargebra::algebra::AggregateExpression;
 use spargebra::term::{GroundTerm, Term, TermPattern, TriplePattern};
 
@@ -65,7 +66,7 @@ use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
     CompareOp, Executor, Expr, Measure, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot,
     SlotPresence, SlotReading, SortTerm, inner_join_groups, is_type_pattern, object_variable,
-    predicate_iri, scan_with_fanout, subject_iri, subject_variable, type_class_iri,
+    predicate_iri, scan_classes, scan_with_fanout, subject_iri, subject_variable, type_class_iri,
 };
 
 /// One rewrite.
@@ -280,7 +281,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
         plan: &Plan,
         keys: &HashMap<String, String>,
         star: &str,
-        class_uri: &str,
+        (class_uri, regime): (&str, TypeRegime),
         group: &[usize],
         type_group: usize,
     ) -> Vec<(NodeId, ScanSlot)> {
@@ -292,10 +293,20 @@ impl<'s> FoldMatchesIntoScan<'s> {
             if node.executor != Executor::Engine || group[id] != type_group {
                 continue;
             }
-            let PlanOp::Match { pattern } = &node.op else {
+            // Only matches of the scan's own regime fold into it: a triple of
+            // another regime reads another graph, and `None` is a triple
+            // under a `GRAPH`, which no scan reads.
+            let PlanOp::Match {
+                pattern,
+                regime: Some(match_regime),
+            } = &node.op
+            else {
                 continue;
             };
-            if subject_star(keys, pattern).as_deref() != Some(star) || is_type_pattern(pattern) {
+            if *match_regime != regime
+                || subject_star(keys, pattern).as_deref() != Some(star)
+                || is_type_pattern(pattern)
+            {
                 continue;
             }
             let (Some(predicate), Some(var)) = (predicate_iri(pattern), object_variable(pattern))
@@ -357,7 +368,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
 fn const_subject_stars(plan: &Plan) -> HashMap<String, String> {
     let mut keys: HashMap<String, String> = HashMap::new();
     for node in &plan.nodes {
-        let PlanOp::Match { pattern } = &node.op else {
+        let PlanOp::Match { pattern, .. } = &node.op else {
             continue;
         };
         let Some(iri) = subject_iri(pattern) else {
@@ -368,6 +379,29 @@ fn const_subject_stars(plan: &Plan) -> HashMap<String, String> {
             .or_insert_with(|| format!("_const_subject_{next}"));
     }
     keys
+}
+
+/// Whether the match at `matched` and the scan at `scan` stand on the same
+/// data graph: the match carries a regime and the scan reads under it.
+///
+/// Every rule that folds a match into an existing scan, or lets a scan stand
+/// in for one, asks this first. A match under a `GRAPH` has no regime, so it
+/// is never the scan's; a match of another regime reads a graph that writes
+/// its `rdf:type` triples differently, so the records the scan fetches are not
+/// the ones the match ranges over.
+fn same_regime(plan: &Plan, matched: NodeId, scan: NodeId) -> bool {
+    match (&plan.nodes[matched].op, &plan.nodes[scan].op) {
+        (
+            PlanOp::Match {
+                regime: Some(on_match),
+                ..
+            },
+            PlanOp::Scan {
+                regime: on_scan, ..
+            },
+        ) => on_match == on_scan,
+        _ => false,
+    }
 }
 
 /// The star a triple pattern's subject names: its variable, or the synthetic
@@ -402,9 +436,19 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // fact, derived by 3a from the other side of a join. A
             // restriction is read exactly where a type match is, so an
             // untyped body gets its scan by the same edit as a typed one.
-            let (identifier_values, star, class_uri): (Vec<String>, String, String) = match &node.op
-            {
-                PlanOp::Match { pattern } => {
+            let (identifier_values, star, class_uri, type_regime): (
+                Vec<String>,
+                String,
+                String,
+                Option<TypeRegime>,
+            ) = match &node.op {
+                // A type match under a `GRAPH` is not about the data graph
+                // and folds into nothing.
+                PlanOp::Match { regime: None, .. } => continue,
+                PlanOp::Match {
+                    pattern,
+                    regime: Some(regime),
+                } => {
                     // A constant subject is a star of one record: the
                     // query named the identity, so the scan carries it as
                     // an identifier value and the statement reads one row
@@ -421,12 +465,14 @@ impl Rule for FoldMatchesIntoScan<'_> {
                     else {
                         continue;
                     };
-                    (identifier_values, star, class_uri.to_owned())
+                    (identifier_values, star, class_uri.to_owned(), Some(*regime))
                 }
+                // A restriction does not say which graph it was derived
+                // from; its regime is that of the matches it folds (below).
                 PlanOp::Filter {
                     condition: crate::sparql_refine::Expr::InClass { var, class_uri },
                     ..
-                } => (Vec::new(), var.clone(), class_uri.clone()),
+                } => (Vec::new(), var.clone(), class_uri.clone(), None),
                 _ => continue,
             };
             let star = star.as_str();
@@ -474,7 +520,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
                         && !in_other_union_arm(plan, type_node, *other_id)
                 })
                 .filter_map(|(_, other)| match &other.op {
-                    PlanOp::Match { pattern }
+                    PlanOp::Match { pattern, .. }
                         if subject_star(&keys, pattern).as_deref() == Some(star) =>
                     {
                         type_class_iri(pattern).map(str::to_owned)
@@ -503,8 +549,37 @@ impl Rule for FoldMatchesIntoScan<'_> {
             }
             let star = star.to_owned();
             let class_uri = class_uri.to_owned();
-            let slots =
-                self.foldable_slots(plan, &keys, &star, &class_uri, &groups, groups[type_node]);
+            // A type match carries its regime. A restriction takes the regime
+            // of the earliest data-graph match on its star in its group, so
+            // the matches of one regime fold and the others stay put.
+            let Some(regime) = type_regime.or_else(|| {
+                plan.nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(id, other)| match &other.op {
+                        PlanOp::Match {
+                            pattern,
+                            regime: Some(regime),
+                        } if other.executor == Executor::Engine
+                            && groups[id] == groups[type_node]
+                            && subject_star(&keys, pattern).as_deref() == Some(star.as_str())
+                            && !is_type_pattern(pattern) =>
+                        {
+                            Some(*regime)
+                        }
+                        _ => None,
+                    })
+            }) else {
+                continue;
+            };
+            let slots = self.foldable_slots(
+                plan,
+                &keys,
+                &star,
+                (&class_uri, regime),
+                &groups,
+                groups[type_node],
+            );
             // A restriction with nothing of the star's to fold beneath it --
             // no variable-object match on the star in its group -- is not a
             // scan yet: it stays where 3b left it. (A star read only through
@@ -514,7 +589,14 @@ impl Rule for FoldMatchesIntoScan<'_> {
             if slots.is_empty() && matches!(plan.nodes[type_node].op, PlanOp::Filter { .. }) {
                 continue;
             }
-            fold(plan, type_node, &star, &class_uri, identifier_values, slots);
+            let classes = scan_classes(self.schema, &class_uri, regime);
+            fold(
+                plan,
+                type_node,
+                (&star, &class_uri, regime, classes),
+                identifier_values,
+                slots,
+            );
             return true;
         }
         false
@@ -554,8 +636,7 @@ fn in_other_union_arm(plan: &Plan, left: NodeId, right: NodeId) -> bool {
 fn fold(
     plan: &mut Plan,
     type_node: NodeId,
-    star: &str,
-    class_uri: &str,
+    (star, class_uri, regime, classes): (&str, &str, TypeRegime, Vec<String>),
     identifier_values: Vec<String>,
     slots: Vec<(NodeId, ScanSlot)>,
 ) {
@@ -596,6 +677,7 @@ fn fold(
             let emitted = scan_with_fanout(
                 star,
                 class_uri,
+                (regime, classes.clone()),
                 scan_slots.clone(),
                 identifier_values.clone(),
                 nodes.len(),
@@ -1086,7 +1168,7 @@ impl Rule for DeliverOptionalRead<'_> {
             if plan.nodes[id].executor != Executor::Engine {
                 continue;
             }
-            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+            let PlanOp::Match { pattern, .. } = &plan.nodes[id].op else {
                 continue;
             };
             if is_type_pattern(pattern) {
@@ -1114,6 +1196,9 @@ impl Rule for DeliverOptionalRead<'_> {
                     return None;
                 };
                 if node.executor != Executor::Sql || star_var != &star {
+                    return None;
+                }
+                if !same_regime(plan, id, scan) {
                     return None;
                 }
                 if slots
@@ -1254,7 +1339,7 @@ impl Rule for AbsorbOptionalRead<'_> {
             if consumers(plan, barrier).len() != 1 || consumers(plan, right).len() != 1 {
                 continue;
             }
-            let PlanOp::Match { pattern } = &plan.nodes[right].op else {
+            let PlanOp::Match { pattern, .. } = &plan.nodes[right].op else {
                 continue;
             };
             if plan.nodes[right].executor != Executor::Engine || is_type_pattern(pattern) {
@@ -1278,6 +1363,7 @@ impl Rule for AbsorbOptionalRead<'_> {
             let Some(scan) = plan.nodes.iter().enumerate().position(|(scan, node)| {
                 matches!(&node.op, PlanOp::Scan { star_var, .. } if star_var == &star)
                     && node.executor == Executor::Sql
+                    && same_regime(plan, right, scan)
                     && mandatorily_feeds(plan, scan, left)
             }) else {
                 continue;
@@ -1703,7 +1789,7 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             if plan.nodes[id].executor != Executor::Engine {
                 continue;
             }
-            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+            let PlanOp::Match { pattern, .. } = &plan.nodes[id].op else {
                 continue;
             };
             if is_type_pattern(pattern) {
@@ -1737,6 +1823,9 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             let Some(site) = subject_site(plan, other, &subject) else {
                 continue;
             };
+            if !same_regime(plan, id, site.scan) {
+                continue;
+            }
             // An empty prefix is the star itself, which is the fold rule's:
             // that one has the type pattern to fold with and the multiplicity
             // machinery to fold it safely.
@@ -2026,7 +2115,7 @@ impl Rule for ConstantObjectBecomesFilter<'_> {
             if plan.nodes[id].executor != Executor::Engine {
                 continue;
             }
-            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+            let PlanOp::Match { pattern, .. } = &plan.nodes[id].op else {
                 continue;
             };
             // A type pattern with a constant object is the *scope*, not a
@@ -2064,6 +2153,9 @@ impl Rule for ConstantObjectBecomesFilter<'_> {
             let Some(site) = subject_site(plan, other, &subject) else {
                 continue;
             };
+            if !same_regime(plan, id, site.scan) {
+                continue;
+            }
             let Some(read) = self.condition_for(&site, &predicate, &term) else {
                 continue;
             };
@@ -2444,7 +2536,7 @@ impl Rule for FoldIdentityConstant<'_> {
             if plan.nodes[id].executor != Executor::Engine {
                 continue;
             }
-            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+            let PlanOp::Match { pattern, .. } = &plan.nodes[id].op else {
                 continue;
             };
             if is_type_pattern(pattern) {
@@ -2478,6 +2570,9 @@ impl Rule for FoldIdentityConstant<'_> {
             let Some(site) = subject_site(plan, other, &star) else {
                 continue;
             };
+            if !same_regime(plan, id, site.scan) {
+                continue;
+            }
             if !site.prefix.is_empty() {
                 // A nested structure has no identity of its own to fix.
                 continue;
@@ -3423,7 +3518,7 @@ impl Rule for AbsorbOptionalReference<'_> {
                 (_, PlanOp::Match { .. }) => (b, a),
                 _ => continue,
             };
-            let PlanOp::Match { pattern } = &plan.nodes[matched].op else {
+            let PlanOp::Match { pattern, .. } = &plan.nodes[matched].op else {
                 continue;
             };
             if plan.nodes[matched].executor != Executor::Engine || is_type_pattern(pattern) {
@@ -3511,6 +3606,9 @@ impl Rule for AbsorbOptionalReference<'_> {
             let Some((scan, class_uri, holder_star, prefix)) = holder else {
                 continue;
             };
+            if !same_regime(plan, matched, scan) {
+                continue;
+            }
 
             // A single-valued reference column of that class.
             let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
@@ -4569,7 +4667,7 @@ impl Rule for NarrowByAKeptHop<'_> {
             if plan.nodes[id].executor != Executor::Engine {
                 continue;
             }
-            let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+            let PlanOp::Match { pattern, .. } = &plan.nodes[id].op else {
                 continue;
             };
             if is_type_pattern(pattern) {
@@ -4594,6 +4692,9 @@ impl Rule for NarrowByAKeptHop<'_> {
             }) else {
                 continue;
             };
+            if !same_regime(plan, id, scan) {
+                continue;
+            }
             let PlanOp::Scan {
                 class_uri, slots, ..
             } = &plan.nodes[scan].op

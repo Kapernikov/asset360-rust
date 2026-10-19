@@ -2881,6 +2881,20 @@ impl PlanOp {
         }
     }
 
+    /// For ``"scan"``: every class the scan reads, canonical IRIs sorted --
+    /// ``class_uri`` and the classes whose records have it among their
+    /// ``rdf:type`` under the scan's regime. Render
+    /// ``asset_type = ANY(classes)``; one element is the plain
+    /// ``asset_type = class_uri``.
+    #[getter]
+    fn classes(&self) -> Vec<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { classes, .. } => classes.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// For ``"scan"``: values bound against the class's identifier slot, to be
     /// compared against the indexed ``asset360_uri`` column rather than the
     /// JSONB payload.

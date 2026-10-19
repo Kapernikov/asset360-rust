@@ -128,6 +128,12 @@ pub enum Op {
         /// The SPARQL variable this star binds, which becomes a table alias.
         star_var: String,
         class_uri: String,
+        /// Every class the scan reads, canonical IRIs sorted: `class_uri` and
+        /// the classes whose records have it among their `rdf:type`s under
+        /// the scan's regime (`PlanOp::Scan::classes`). A renderer filters
+        /// `asset_type = ANY(classes)`; with one element that is the
+        /// `asset_type = class_uri` it always was.
+        classes: Vec<String>,
         /// Values bound against the class's identifier slot, compared against
         /// the indexed `asset360_uri` column rather than the payload.
         identifier_values: Vec<String>,
@@ -657,6 +663,9 @@ pub fn lower_sql_pass(
             op: Op::Scan {
                 star_var: star.variable.clone(),
                 class_uri: star.class_uri.clone(),
+                // The scoper decomposes under the asserted regime only: a
+                // star is its own class.
+                classes: vec![star.class_uri.clone()],
                 identifier_values: star.identifier_values.clone(),
                 required_slots: star.required_fields.clone(),
                 optional_slots: star.optional_fields.clone(),
@@ -1274,7 +1283,7 @@ fn lower_island(
             continue;
         };
         let unfolded = plan.nodes.iter().any(|node| {
-            let RefinedOp::Match { pattern } = &node.op else {
+            let RefinedOp::Match { pattern, .. } = &node.op else {
                 return false;
             };
             crate::sparql_refine::subject_variable(pattern) == Some(star_var.as_str())
@@ -1770,8 +1779,10 @@ impl Lowering<'_> {
                 RefinedOp::Scan {
                     star_var,
                     class_uri,
+                    classes: scanned_classes,
                     slots,
                     identifier_values,
+                    ..
                 } => {
                     // Only a slot of the record itself is an existence check.
                     // A value further in is reached by walking into the column,
@@ -1789,6 +1800,7 @@ impl Lowering<'_> {
                         op: Op::Scan {
                             star_var: star_var.clone(),
                             class_uri: class_uri.clone(),
+                            classes: scanned_classes.clone(),
                             // What the query fixed the identity to, plus anything
                             // the filters below hoist here: both belong against
                             // the indexed column rather than the JSONB payload.
@@ -4062,6 +4074,7 @@ mod tests {
             crate::sparql_refine::Node::engine(
                 crate::sparql_refine::PlanOp::Match {
                     pattern: Box::new(pattern),
+                    regime: Some(linkml_runtime::schema_rdf::TypeRegime::Asserted),
                 },
                 Vec::new(),
             ),

@@ -625,7 +625,7 @@ impl Rule for RestrictScopeAtBoundary<'_> {
 fn types_itself(plan: &Plan, side: NodeId, var: &str) -> bool {
     (0..plan.nodes.len()).any(|id| {
         plan.feeds(id, side)
-            && matches!(&plan.nodes[id].op, PlanOp::Match { pattern }
+            && matches!(&plan.nodes[id].op, PlanOp::Match { pattern, regime: Some(_) }
                 if crate::sparql_refine::subject_variable(pattern) == Some(var)
                     && crate::sparql_refine::type_class_iri(pattern).is_some())
     })
@@ -639,9 +639,10 @@ fn only_reference_reads(plan: &Plan, schema: &SchemaView, side: NodeId, var: &st
         .filter(|id| plan.feeds(*id, side))
         .filter_map(|id| match &plan.nodes[id].op {
             PlanOp::Scan { star_var, .. } => Some(star_var.clone()),
-            PlanOp::Match { pattern }
-                if crate::sparql_refine::type_class_iri(pattern).is_some() =>
-            {
+            PlanOp::Match {
+                pattern,
+                regime: Some(_),
+            } if crate::sparql_refine::type_class_iri(pattern).is_some() => {
                 crate::sparql_refine::subject_variable(pattern).map(str::to_owned)
             }
             _ => None,
@@ -652,7 +653,7 @@ fn only_reference_reads(plan: &Plan, schema: &SchemaView, side: NodeId, var: &st
         if !plan.feeds(id, side) {
             continue;
         }
-        let PlanOp::Match { pattern } = &plan.nodes[id].op else {
+        let PlanOp::Match { pattern, .. } = &plan.nodes[id].op else {
             continue;
         };
         if crate::sparql_refine::subject_variable(pattern) != Some(var) {
@@ -720,7 +721,7 @@ fn single_read_body(plan: &Plan, side: NodeId, var: &str) -> bool {
     else {
         return false;
     };
-    matches!(&plan.nodes[*input].op, PlanOp::Match { pattern }
+    matches!(&plan.nodes[*input].op, PlanOp::Match { pattern, .. }
         if crate::sparql_refine::subject_variable(pattern) == Some(var)
             && crate::sparql_refine::type_class_iri(pattern).is_none())
 }
@@ -733,7 +734,7 @@ fn reads_as_a_star(plan: &Plan, side: NodeId, var: &str) -> bool {
         if !plan.feeds(id, side) {
             continue;
         }
-        if let PlanOp::Match { pattern } = &plan.nodes[id].op {
+        if let PlanOp::Match { pattern, .. } = &plan.nodes[id].op {
             if crate::sparql_refine::object_variable(pattern) == Some(var) {
                 return false;
             }

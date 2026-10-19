@@ -3994,6 +3994,15 @@ class PlanOp:
         For ``"scan"``: the class IRI to match against ``asset_type``.
         """
     @property
+    def classes(self) -> builtins.list[builtins.str]:
+        r"""
+        For ``"scan"``: every class the scan reads, canonical IRIs sorted --
+        ``class_uri`` and the classes whose records have it among their
+        ``rdf:type`` under the scan's regime. Render
+        ``asset_type = ANY(classes)``; one element is the plain
+        ``asset_type = class_uri``.
+        """
+    @property
     def identifier_values(self) -> builtins.list[builtins.str]:
         r"""
         For ``"scan"``: values bound against the class's identifier slot, to be

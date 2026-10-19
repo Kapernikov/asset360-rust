@@ -157,7 +157,7 @@ impl Translation<'_> {
             PlanOp::Unit => GraphPattern::Bgp {
                 patterns: Vec::new(),
             },
-            PlanOp::Match { pattern } => GraphPattern::Bgp {
+            PlanOp::Match { pattern, .. } => GraphPattern::Bgp {
                 patterns: vec![(**pattern).clone()],
             },
             PlanOp::Path {
@@ -335,6 +335,7 @@ impl Translation<'_> {
                 class_uri,
                 slots,
                 identifier_values,
+                ..
             } => {
                 let type_iri = NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?;
                 let mut required: Vec<TriplePattern> = vec![TriplePattern {

@@ -5493,11 +5493,18 @@ pub(crate) mod tests {
 
     /// Small hand-written schema shared with the pushdown analyser's tests.
     pub(crate) fn test_schema_view() -> SchemaView {
+        test_schema_view_plus("")
+    }
+
+    /// [`test_schema_view`] with `extra` classes appended: for a test that
+    /// needs a shape most tests must not see (a subclass hands its slots to a
+    /// class whose queries then read as ambiguous).
+    pub(crate) fn test_schema_view_plus(extra: &str) -> SchemaView {
         use linkml_meta::SchemaDefinition;
         use serde_path_to_error as p2e;
         use serde_yml as yml;
 
-        let schema_yaml = r#"
+        let base = r#"
 id: https://data.infrabel.be/asset360
 name: asset360
 prefixes:
@@ -5777,8 +5784,9 @@ classes:
       lat:
         range: integer
 "#;
+        let schema_yaml = format!("{base}{extra}");
         let schema: SchemaDefinition =
-            p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
+            p2e::deserialize(yml::Deserializer::from_str(&schema_yaml)).unwrap();
         let mut sv = SchemaView::new();
         sv.add_schema(schema).unwrap();
         sv

@@ -588,7 +588,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
         PlanOp::Unit => GraphPattern::Bgp {
             patterns: Vec::new(),
         },
-        PlanOp::Match { pattern } => GraphPattern::Bgp {
+        PlanOp::Match { pattern, .. } => GraphPattern::Bgp {
             patterns: vec![(**pattern).clone()],
         },
         PlanOp::Path {

@@ -71,6 +71,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use linkml_runtime::schema_rdf::{TypeRegime, type_family};
 use linkml_schemaview::schemaview::SchemaView;
 
 use spargebra::Query;
@@ -2064,6 +2065,16 @@ pub enum PlanOp {
     /// between them are nodes too.
     Match {
         pattern: Box<TriplePattern>,
+        /// The data graph this triple is matched against, by its type
+        /// regime: `Some(r)` for a triple outside any `GRAPH`, matched
+        /// against the dataset's data graph (which holds `rdf:type` triples
+        /// the way regime `r` writes them).
+        ///
+        /// `None` for a triple under a [`PlanOp::Graph`]: the schema graph,
+        /// `GRAPH ?g`, or any other named graph. No data rule may fold such a
+        /// triple into a [`PlanOp::Scan`] -- the records a scan reads are the
+        /// default graph's, not that graph's.
+        regime: Option<TypeRegime>,
     },
     /// A property path. Engine-only, and no rule pushes one.
     Path {
@@ -2260,6 +2271,22 @@ pub enum PlanOp {
     Scan {
         star_var: String,
         class_uri: String,
+        /// The type regime of the data graph this scan stands for: under it,
+        /// `?s a class_uri` holds for every record of one of [`classes`].
+        ///
+        /// [`classes`]: PlanOp::Scan::classes
+        regime: TypeRegime,
+        /// Every class whose records have `class_uri` among their `rdf:type`s
+        /// under `regime` (canonical IRIs, sorted, deduplicated, `class_uri`
+        /// included): `type_family` of the class. Under
+        /// [`TypeRegime::Asserted`] that is `class_uri` alone. The scan reads
+        /// the records whose `asset_type` is one of these.
+        /// [`Plan::scan_classes_agree`] checks it against the schema.
+        classes: Vec<String>,
+        /// The variable bound to the record's direct type, read from the
+        /// `asset_type` column, once a rule has folded
+        /// `sesame:directType ?t` into the scan. `None` until then.
+        direct_type: Option<String>,
         slots: Vec<ScanSlot>,
         /// Values the query fixed the record's *identity* to.
         ///
@@ -2519,6 +2546,9 @@ impl Node {
 pub fn scan_with_fanout(
     star_var: &str,
     class_uri: &str,
+    // The regime the scan reads under, and the classes it stands for under
+    // it (`scan_classes`): the caller has the schema, this function does not.
+    (regime, classes): (TypeRegime, Vec<String>),
     slots: Vec<ScanSlot>,
     // `identifier_values`: the record's identity, when the query named it
     // rather than a variable. A constant subject scans one row, against the
@@ -2546,6 +2576,9 @@ pub fn scan_with_fanout(
         PlanOp::Scan {
             star_var: star_var.to_owned(),
             class_uri: class_uri.to_owned(),
+            regime,
+            classes,
+            direct_type: None,
             slots,
             identifier_values,
         },
@@ -2684,6 +2717,11 @@ pub enum PlanDefect {
     MisrecordedJoin {
         join: NodeId,
     },
+    /// A scan whose `classes` are not the type family of its `class_uri`
+    /// under its `regime`. See [`Plan::scan_classes_agree`].
+    MisrecordedScanClasses {
+        scan: NodeId,
+    },
     /// A rule's edit dropped an export a consumer demanded: the one check
     /// that relates two plans rather than inspecting one. See
     /// [`Plan::check_transition`].
@@ -2725,6 +2763,10 @@ impl fmt::Display for PlanDefect {
                 f,
                 "n{scan} folded the multivalued slot '{slot}' without the unnest \
                  that binds its variable, so a record with several values counts once"
+            ),
+            Self::MisrecordedScanClasses { scan } => write!(
+                f,
+                "n{scan}: a scan's classes are not the type family of its class under its regime"
             ),
             Self::MisrecordedJoin { join } => write!(
                 f,
@@ -2905,7 +2947,33 @@ impl Plan {
     /// [`Plan::check`], plus the invariants that need the schema.
     pub fn check_with(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
         self.check()?;
+        self.scan_classes_agree(schema)?;
         self.join_keys_agree(schema).map_err(PlanDefect::Scope)
+    }
+
+    /// **Invariant 7.** A scan's `classes` are what the schema says they are.
+    ///
+    /// `classes` is a fact about the schema -- the classes whose records have
+    /// `class_uri` among their `rdf:type`s under the scan's regime -- recorded
+    /// on the scan so a renderer reads it instead of re-deriving it. What
+    /// would otherwise be a silently wrong `asset_type` filter (a subclass
+    /// dropped: rows missing; a stranger added: rows invented) is checked here
+    /// by recomputing it with [`scan_classes`], the one function that builds
+    /// it.
+    pub fn scan_classes_agree(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
+        for (id, node) in self.nodes.iter().enumerate() {
+            if let PlanOp::Scan {
+                class_uri,
+                regime,
+                classes,
+                ..
+            } = &node.op
+                && *classes != scan_classes(schema, class_uri, *regime)
+            {
+                return Err(PlanDefect::MisrecordedScanClasses { scan: id });
+            }
+        }
+        Ok(())
     }
 
     /// **Invariant 1.** Every obligation appears exactly once, in a node or in
@@ -3262,7 +3330,7 @@ impl Plan {
                 // `match` that stayed above is what binds it.
                 out.extend(slots.iter().filter_map(|slot| slot.var.clone()));
             }
-            PlanOp::Match { pattern } => {
+            PlanOp::Match { pattern, .. } => {
                 add_term_var(&pattern.subject, &mut out);
                 if let NamedNodePattern::Variable(variable) = &pattern.predicate {
                     out.insert(variable.as_str().to_owned());
@@ -3363,7 +3431,7 @@ impl Plan {
             }
             // A triple pattern matches or it does not: every variable in it is
             // bound in every solution.
-            PlanOp::Match { pattern } => {
+            PlanOp::Match { pattern, .. } => {
                 add_term_var(&pattern.subject, &mut out);
                 if let NamedNodePattern::Variable(variable) = &pattern.predicate {
                     out.insert(variable.as_str().to_owned());
@@ -3615,7 +3683,10 @@ impl PlanOp {
     pub fn describe(&self) -> String {
         match self {
             PlanOp::Unit => "{}".to_owned(),
-            PlanOp::Match { pattern } => triple_text(pattern),
+            PlanOp::Match { pattern, regime } => match regime.and_then(regime_label) {
+                Some(label) => format!("{} [{label}]", triple_text(pattern)),
+                None => triple_text(pattern),
+            },
             PlanOp::Path {
                 subject,
                 path,
@@ -3765,11 +3836,29 @@ impl PlanOp {
             PlanOp::Scan {
                 star_var,
                 class_uri,
+                regime,
+                classes,
                 slots,
                 identifier_values,
+                ..
             } => format!(
-                "{} as ?{star_var}{}, requires [{}]",
+                "{}{}{} as ?{star_var}{}, requires [{}]",
                 shorten(class_uri),
+                regime_label(*regime)
+                    .map(|label| format!(" [{label}]"))
+                    .unwrap_or_default(),
+                {
+                    let others: Vec<String> = classes
+                        .iter()
+                        .filter(|class| *class != class_uri)
+                        .map(|class| shorten(class))
+                        .collect();
+                    if others.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (+ {})", others.join(", "))
+                    }
+                },
                 if identifier_values.is_empty() {
                     String::new()
                 } else {
@@ -3899,6 +3988,14 @@ pub fn naive_plan_for(query_str: &str, schema_view: &SchemaView) -> Result<Plan,
 /// broken assumption into an error instead of a plan that answers a different
 /// question.
 pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
+    naive_plan_in(query, TypeRegime::Asserted)
+}
+
+/// [`naive_plan`] over a dataset whose data graph has type regime
+/// `default_regime`: every triple outside a `GRAPH` is matched against it.
+/// The caller's dataset decides the regime; [`naive_plan`] is the asserted
+/// one, what every dataset was before regimes existed.
+pub fn naive_plan_in(query: &Query, default_regime: TypeRegime) -> Result<Plan, RefineError> {
     let obligations = crate::sparql_plan::obligations_of(query)?;
     let form = QueryForm::of(query);
     let pattern = match query {
@@ -3927,6 +4024,8 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
         next_triple: 0,
         next_modifier: triple_count,
         domains_opened: 0,
+        default_regime,
+        in_graph: false,
     };
     let mut root = builder.pattern(pattern, true);
 
@@ -3969,6 +4068,45 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
     Ok(plan)
 }
 
+/// The label a regime carries in plan text. `None` for
+/// [`TypeRegime::Asserted`], so an asserted plan prints as it always did.
+fn regime_label(regime: TypeRegime) -> Option<&'static str> {
+    match regime {
+        TypeRegime::Asserted => None,
+        TypeRegime::IsA => Some("is_a"),
+        TypeRegime::IsAAndMixins => Some("is_a+mixins"),
+    }
+}
+
+/// The classes a scan of `class_uri` stands for under `regime`: every class
+/// whose records have `class_uri` among their `rdf:type`s (canonical IRIs,
+/// sorted, deduplicated, `class_uri` included).
+///
+/// The one place this is computed, and [`Plan::scan_classes_agree`] recomputes
+/// it through here. A class the schema does not know stands for itself.
+pub(crate) fn scan_classes(
+    schema: &SchemaView,
+    class_uri: &str,
+    regime: TypeRegime,
+) -> Vec<String> {
+    let mut classes: Vec<String> = schema
+        .get_class_by_uri(class_uri)
+        .ok()
+        .flatten()
+        .and_then(|class| type_family(&class, regime).ok())
+        .map(|family| {
+            family
+                .iter()
+                .map(|class| class.canonical_uri().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    classes.push(class_uri.to_owned());
+    classes.sort();
+    classes.dedup();
+    classes
+}
+
 /// Walks the algebra once, in the same order the obligation enumeration walks
 /// it, so a node can claim the obligation that came from the same place.
 struct Builder<'o> {
@@ -3983,9 +4121,23 @@ struct Builder<'o> {
     /// Naming domains opened so far: each off-spine sub-`SELECT` gets the
     /// next one, in walk order. The scoper counts the same way.
     domains_opened: usize,
+    /// The type regime of the dataset's data graph: the regime of every
+    /// triple matched outside a `GRAPH`. The caller's dataset decides it;
+    /// a builder starts with [`TypeRegime::Asserted`], what every dataset
+    /// was before regimes existed.
+    default_regime: TypeRegime,
+    /// Whether the walk is inside a `GRAPH`: a triple there is not matched
+    /// against the data graph, so it carries no regime.
+    in_graph: bool,
 }
 
 impl Builder<'_> {
+    /// The regime a triple matched here carries: the default regime outside
+    /// any `GRAPH`, `None` inside one.
+    fn match_regime(&self) -> Option<TypeRegime> {
+        (!self.in_graph).then_some(self.default_regime)
+    }
+
     fn push(
         &mut self,
         op: PlanOp,
@@ -4360,7 +4512,9 @@ impl Builder<'_> {
                 self.push(PlanOp::Project { input, vars }, Vec::new(), bound)
             }
             GraphPattern::Graph { name, inner } => {
+                let outer = std::mem::replace(&mut self.in_graph, true);
                 let input = self.pattern(inner, on_spine);
+                self.in_graph = outer;
                 let vars = self.vars[input].clone();
                 self.push(
                     PlanOp::Graph {
@@ -4483,6 +4637,7 @@ impl Builder<'_> {
             let node = self.push(
                 PlanOp::Match {
                     pattern: Box::new(pattern.clone()),
+                    regime: self.match_regime(),
                 },
                 claims,
                 vars,
@@ -5091,6 +5246,9 @@ mod tests {
             PlanOp::Scan {
                 star_var: "s".to_owned(),
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
+                regime: TypeRegime::Asserted,
+                classes: vec!["https://data.infrabel.be/asset360/Signal".to_owned()],
+                direct_type: None,
                 identifier_values: Vec::new(),
                 slots: vec![ScanSlot {
                     path: vec!["trafficKinds".to_owned()],
@@ -5135,6 +5293,10 @@ mod tests {
         let nodes = scan_with_fanout(
             "s",
             "https://data.infrabel.be/asset360/TunnelComplex",
+            (
+                TypeRegime::Asserted,
+                vec!["https://data.infrabel.be/asset360/TunnelComplex".to_owned()],
+            ),
             slots,
             Vec::new(),
             0,
@@ -5145,6 +5307,117 @@ mod tests {
         assert!(
             nodes.iter().all(|node| node.executor == Executor::Sql),
             "a folded subtree runs in SQL"
+        );
+    }
+
+    /// A regime is on every matched triple and every scan: a triple outside
+    /// `GRAPH` carries the dataset's, one inside carries none; a scan under
+    /// `is_a` lists the subclasses it reads, in the plan text and in
+    /// `classes`; and an asserted plan prints as it always did.
+    #[test]
+    fn a_regime_reaches_every_match_and_scan() {
+        // A subclass of `Signal`, so a regime other than `asserted` has a
+        // family to list: under `is_a` a scan of `Signal` also reads these.
+        let sv = crate::sparql_scoper::tests::test_schema_view_plus(
+            "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
+        );
+        let signal = "https://data.infrabel.be/asset360/Signal".to_owned();
+        let shunt = "https://data.infrabel.be/asset360/ShuntSignal".to_owned();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?g WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+             GRAPH <https://example.org/g> {{ ?g a asset360:Signal }} }}"
+        );
+        let parsed = crate::sparql_scoper::parse_query_for(&query, &sv).unwrap();
+        let regimes = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
+            plan.nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    PlanOp::Match { pattern, regime } => Some((triple_text(pattern), *regime)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let asserted = naive_plan_in(&parsed, TypeRegime::Asserted).unwrap();
+        let in_graph = |regimes: &[(String, Option<TypeRegime>)]| {
+            regimes
+                .iter()
+                .map(|(text, regime)| (text.contains("?g"), *regime))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            in_graph(&regimes(&asserted)),
+            vec![
+                (false, Some(TypeRegime::Asserted)),
+                (false, Some(TypeRegime::Asserted)),
+                (true, None),
+            ]
+        );
+        // Asserted plan text carries no regime label, on a match or a scan.
+        assert!(!asserted.to_string().contains("[is_a"), "{asserted}");
+
+        let is_a = naive_plan_in(&parsed, TypeRegime::IsA).unwrap();
+        assert_eq!(
+            in_graph(&regimes(&is_a)),
+            vec![
+                (false, Some(TypeRegime::IsA)),
+                (false, Some(TypeRegime::IsA)),
+                (true, None),
+            ]
+        );
+        assert!(is_a.to_string().contains("[is_a]"), "{is_a}");
+
+        // Folded under `is_a`: the scan of `Signal` reads `ShuntSignal` too.
+        // The match under `GRAPH` is nobody's to fold and stays a match.
+        for (plan, expected) in [
+            (&asserted, vec![signal.clone()]),
+            (&is_a, vec![shunt.clone(), signal.clone()]),
+        ] {
+            let rules = crate::sparql_rules::tier_one_rules(&sv, None);
+            let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+                rules.iter().map(|rule| rule.as_ref()).collect();
+            let mut plan = plan.clone();
+            crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
+            plan.check_with(&sv).unwrap();
+            let scans: Vec<&Vec<String>> = plan
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    PlanOp::Scan { classes, .. } => Some(classes),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(scans, vec![&expected], "{plan}");
+            assert_eq!(
+                plan.to_string().contains("(+ asset360:ShuntSignal)"),
+                expected.len() > 1,
+                "{plan}"
+            );
+            assert!(
+                plan.nodes
+                    .iter()
+                    .any(|node| matches!(&node.op, PlanOp::Match { regime: None, .. })),
+                "{plan}"
+            );
+        }
+
+        // The invariant: a scan that lists the wrong family is refused.
+        let mut refined = is_a.clone();
+        let rules = crate::sparql_rules::tier_one_rules(&sv, None);
+        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+            rules.iter().map(|rule| rule.as_ref()).collect();
+        crate::sparql_rules::refine(&mut refined, &borrowed).unwrap();
+        let scan = refined
+            .nodes
+            .iter()
+            .position(|node| matches!(node.op, PlanOp::Scan { .. }))
+            .unwrap();
+        if let PlanOp::Scan { classes, .. } = &mut refined.nodes[scan].op {
+            classes.retain(|class| *class != shunt);
+        }
+        assert_eq!(
+            refined.scan_classes_agree(&sv),
+            Err(PlanDefect::MisrecordedScanClasses { scan })
         );
     }
 
@@ -6004,7 +6277,7 @@ mod tests {
             .iter()
             .enumerate()
             .find(|(_, node)| match &node.op {
-                PlanOp::Match { pattern } => {
+                PlanOp::Match { pattern, .. } => {
                     predicate_iri(pattern) == Some("https://data.infrabel.be/asset360/name")
                 }
                 _ => false,
@@ -6015,7 +6288,7 @@ mod tests {
             .nodes
             .iter()
             .enumerate()
-            .find(|(_, node)| matches!(&node.op, PlanOp::Match { pattern } if is_type_pattern(pattern)))
+            .find(|(_, node)| matches!(&node.op, PlanOp::Match { pattern, .. } if is_type_pattern(pattern)))
             .map(|(id, _)| id)
             .expect("the type match is a node");
         let mandatory = matches

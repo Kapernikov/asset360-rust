@@ -741,6 +741,7 @@ mod tests {
         nodes.push(Node::engine(
             PlanOp::Match {
                 pattern: Box::new(triple),
+                regime: Some(linkml_runtime::schema_rdf::TypeRegime::Asserted),
             },
             Vec::new(),
         ));
