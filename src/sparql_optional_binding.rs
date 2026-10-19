@@ -21,6 +21,17 @@
 //! alone. An `OPTIONAL` sharing nothing with what precedes it is a product by
 //! construction and is also left alone: it is at least what it says.
 //!
+//! A sub-select projecting a variable its own `OPTIONAL` binds
+//! (`{ SELECT ?a ?f WHERE { ?a :p ?e OPTIONAL { ?e :q ?f } } }`) leaves `?f`
+//! maybe-unbound outside it, so every sibling `OPTIONAL` keyed on `?f` is the
+//! same product as above and each is refused alike. Soundness of refusing all
+//! of them: the hazard is a property of one `LeftJoin` (its right side shares
+//! only maybe-unbound variables with its left), independent of how many
+//! siblings follow. The rule must therefore see the query as written; on the
+//! sub-select-qualified copy the scoper reads (`?f` renamed `?f__d1` inside),
+//! the first sibling shares nothing with its left and slipped through while
+//! the second, now sharing `?f` with the first's label, was refused.
+//!
 //! "Certainly bound" is the textbook notion: a variable every solution of the
 //! pattern binds. A basic graph pattern binds all of its variables; a join
 //! binds both sides'; a left join binds its preserved side's; a union binds

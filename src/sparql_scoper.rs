@@ -1558,6 +1558,17 @@ pub fn scope_query(
     dataset: &DatasetSpec,
     scoping: Scoping<'_>,
 ) -> Result<QueryPlan, ScopeError> {
+    // An `OPTIONAL` joined to what precedes it only through a variable that
+    // may be unbound there is a cartesian product per the algebra, and never
+    // what the author meant. Refused for both routes, with the nested
+    // spelling; see `crate::sparql_optional_binding`. Checked on the query as
+    // written: qualifying renames a sub-select's variables (`?m` becomes
+    // `?m__d1`), which cuts the join the rule reasons about.
+    if let Some(shape) = crate::sparql_optional_binding::optional_on_a_maybe_unbound_variable(query)
+    {
+        return Err(ScopeError::UnsupportedConstruct(shape.to_string()));
+    }
+
     let qualified = crate::sparql_domains::qualify(query);
     scope_qualified(&qualified, schema_view, dataset, scoping)
 }
@@ -1581,15 +1592,6 @@ fn scope_qualified(
     // downstream carried it and one route answered the clause while the other
     // ignored it -- see doc 28h.
     let graphs = QueryGraphs::new(dataset, query)?;
-
-    // An `OPTIONAL` joined to what precedes it only through a variable that
-    // may be unbound there is a cartesian product per the algebra, and never
-    // what the author meant. Refused for both routes, with the nested
-    // spelling; see `crate::sparql_optional_binding`.
-    if let Some(shape) = crate::sparql_optional_binding::optional_on_a_maybe_unbound_variable(query)
-    {
-        return Err(ScopeError::UnsupportedConstruct(shape.to_string()));
-    }
 
     let pattern = match query {
         Query::Select { pattern, .. } => pattern,
@@ -9550,6 +9552,44 @@ classes:
                 && msg.contains("Add `?t a <https://data.infrabel.be/asset360/Track>`"),
             "{msg}"
         );
+    }
+
+    /// The #460 refusal is a property of the query as written, so one
+    /// OPTIONAL and two identical sibling OPTIONALs keyed on a variable a
+    /// sub-select leaves maybe-unbound are refused alike, both naming the
+    /// first. It used to run on the sub-select-qualified query, where the
+    /// sub-select's `?m` is `?m__d1`: the first sibling then shared nothing
+    /// with its left side (accepted, "a product by construction") and only
+    /// the second, whose left side now held the first's `?m`, was refused.
+    #[test]
+    fn a_label_optional_on_a_subselect_variable_is_refused_one_or_two_alike() {
+        let sv = asset360_fixture_schema_view();
+        let nl = "OPTIONAL { GRAPH <https://x/schema> { ?m skos:prefLabel ?nl } }";
+        let fr = "OPTIONAL { GRAPH <https://x/schema> { ?m skos:prefLabel ?fr } }";
+        for siblings in [nl.to_string(), format!("{nl} {fr}")] {
+            let err = sparql_scope(
+                &format!(
+                    "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                     PREFIX skos: <http://www.w3.org/2004/02/skos/core#> \
+                     SELECT * WHERE {{ ?s a asset360:TunnelComplex . OPTIONAL {{ \
+                       {{ SELECT ?s ?m WHERE {{ ?s a asset360:TunnelComplex ; \
+                            asset360:hasCoveredSection ?e . \
+                            ?e a asset360:CoveredSection . \
+                            OPTIONAL {{ ?e asset360:hasSequenceNumber ?m }} }} }} \
+                       {siblings} }} }}"
+                ),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect_err("refused");
+            let ScopeError::UnsupportedConstruct(message) = err else {
+                panic!("not the #460 refusal: {err:?}");
+            };
+            assert!(
+                message.starts_with("OPTIONAL { GRAPH <https://x/schema> { ?m <http://www.w3.org/2004/02/skos/core#prefLabel> ?nl"),
+                "{message}"
+            );
+        }
     }
 
     /// Two sibling OPTIONALs through the same inline list (#553): each
