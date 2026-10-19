@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 #[cfg(all(feature = "python-bindings", feature = "stubgen"))]
 use pyo3_stub_gen::{
     define_stub_info_gatherer,
-    derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods},
+    derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pyfunction, gen_stub_pymethods},
 };
 
 #[cfg(feature = "python-bindings")]
@@ -127,6 +127,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sparql_predeclared_prefixes, m)?)?;
         m.add_function(wrap_pyfunction!(py_check_predicates, m)?)?;
         m.add_class::<PyPredicateCheck>()?;
+        m.add_class::<PyPredicateVerdict>()?;
         m.add_function(wrap_pyfunction!(py_broken_out_column, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
@@ -4643,6 +4644,20 @@ fn sparql_predeclared_prefixes(
     crate::sparql_scoper::predeclared_prefixes(sv_ref.as_rust())
 }
 
+/// The verdict on one fixed predicate of one subject; see :func:`check_predicates`.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass_enum)]
+#[pyclass(name = "PredicateVerdict", eq, eq_int, hash, frozen)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PyPredicateVerdict {
+    /// The subject's class family carries a slot under this IRI.
+    Carried,
+    /// No class in the subject's family carries a slot under this IRI.
+    NotCarried,
+    /// The subject's class cannot be told, so the predicate is not judged.
+    Unchecked,
+}
+
 /// What :func:`check_predicates` found for one fixed predicate of one subject.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
@@ -4653,15 +4668,14 @@ pub struct PyPredicateCheck {
     subject: String,
     /// The predicate IRI, exactly as the query spelled it.
     predicate: String,
-    /// ``"carried"``, ``"not_carried"`` or ``"unchecked"``.
-    verdict: String,
-    /// The class the subject was judged by (``carried`` and ``not_carried``);
-    /// ``None`` for ``unchecked``.
+    verdict: PyPredicateVerdict,
+    /// The class the subject was judged by (``Carried`` and ``NotCarried``);
+    /// ``None`` for ``Unchecked``.
     class_iri: Option<String>,
-    /// ``not_carried`` only: the IRI the data uses for the slot the author
+    /// ``NotCarried`` only: the IRI the data uses for the slot the author
     /// most likely meant, when there is one. This is the spelling to paste.
     suggestion: Option<String>,
-    /// ``not_carried`` only: the full human-readable explanation.
+    /// ``NotCarried`` only: the full human-readable explanation.
     message: Option<String>,
 }
 
@@ -4680,20 +4694,25 @@ impl PyPredicateCheck {
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(name = "check_predicates", signature = (query, schema_view, bound=None))]
+#[pyo3(name = "check_predicates", signature = (query, schema_view, regime, bound=None))]
 /// Judge every fixed predicate a query uses against its subject's class.
 ///
 /// Never refuses. A subject's class is its one ``rdf:type``, the class
 /// ``bound`` gives its variable, or the range of the slot that reached it, and
-/// it is judged together with its subclasses. The query is judged as written,
+/// it is judged together with the classes ``rdf:type`` gives its instances
+/// under ``regime``. The query is judged as written,
 /// with no alias resolved first: a predicate spelled with the wrong namespace
-/// is ``not_carried``, and ``suggestion`` is the IRI the data uses. A subject
-/// whose class cannot be told is ``unchecked``, never silently passed.
+/// is ``NotCarried``, and ``suggestion`` is the IRI the data uses. A subject
+/// whose class cannot be told is ``Unchecked``, never silently passed.
 /// ``rdf:type`` and variable predicates are not slots and are not reported.
 ///
 /// Args:
 ///     query: SPARQL query string (a SHACL ``sh:select`` body, say).
 ///     schema_view: The LinkML schema.
+///     regime: The :class:`TypeRegime` of the data graph the query reads. A
+///         subject is judged with the classes its type implies under it, so
+///         a slot only a subclass carries is carried by a parent-typed
+///         subject under ``IsA`` and not under ``Asserted``.
 ///     bound: Variables the caller has already bound, name without ``?`` or
 ///         ``$`` to class IRI — SHACL pre-binds ``this`` to the shape's
 ///         ``sh:targetClass``.
@@ -4707,6 +4726,7 @@ fn py_check_predicates(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
+    regime: linkml_runtime_python::PyTypeRegime,
     bound: Option<std::collections::BTreeMap<String, String>>,
 ) -> PyResult<Vec<PyPredicateCheck>> {
     use crate::sparql_alias::PredicateVerdict;
@@ -4717,29 +4737,35 @@ fn py_check_predicates(
     let parsed = crate::sparql_scoper::parse_query_for(query, sv)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     let bound: Vec<(String, String)> = bound.unwrap_or_default().into_iter().collect();
-    Ok(crate::sparql_alias::check_predicates(&parsed, sv, &bound)
-        .into_iter()
-        .map(|check| {
-            let (verdict, class_iri, suggestion, message) = match check.verdict {
-                PredicateVerdict::Carried { class_iri } => ("carried", Some(class_iri), None, None),
-                PredicateVerdict::NotCarried(refusal) => (
-                    "not_carried",
-                    Some(refusal.class_iri.clone()),
-                    refusal.suggestion.as_ref().map(|s| s.canonical.clone()),
-                    Some(refusal.to_string()),
-                ),
-                PredicateVerdict::Unchecked => ("unchecked", None, None, None),
-            };
-            PyPredicateCheck {
-                subject: check.subject,
-                predicate: check.predicate,
-                verdict: verdict.to_owned(),
-                class_iri,
-                suggestion,
-                message,
-            }
-        })
-        .collect())
+    Ok(
+        crate::sparql_alias::check_predicates(&parsed, sv, &bound, regime.into())
+            .into_iter()
+            .map(|check| {
+                let (verdict, class_iri, suggestion, message) = match check.verdict {
+                    PredicateVerdict::Carried { class_iri } => {
+                        (PyPredicateVerdict::Carried, Some(class_iri), None, None)
+                    }
+                    PredicateVerdict::NotCarried(refusal) => (
+                        PyPredicateVerdict::NotCarried,
+                        Some(refusal.class_iri.clone()),
+                        refusal.suggestion.as_ref().map(|s| s.canonical.clone()),
+                        Some(refusal.to_string()),
+                    ),
+                    PredicateVerdict::Unchecked => {
+                        (PyPredicateVerdict::Unchecked, None, None, None)
+                    }
+                };
+                PyPredicateCheck {
+                    subject: check.subject,
+                    predicate: check.predicate,
+                    verdict,
+                    class_iri,
+                    suggestion,
+                    message,
+                }
+            })
+            .collect(),
+    )
 }
 
 #[cfg(all(

@@ -4,7 +4,7 @@ subjects can carry, as the SHACL linter reads it (consolidator-server #306)."""
 from __future__ import annotations
 
 import pytest
-from asset360_rust import SchemaView, check_predicates
+from asset360_rust import PredicateVerdict, SchemaView, TypeRegime, check_predicates
 
 _SCHEMA_YAML = """
 id: https://example.org/s
@@ -50,25 +50,36 @@ def test_a_seeded_this_is_judged_by_its_class_family_as_written():
         check_predicates(
             f"SELECT $this WHERE {{ $this <{WRONG_NAME}> ?a ; <{NAME}> ?b ; <{LENGTH}> ?c }}",
             _schema(),
+            TypeRegime.IsA,
             {"this": ASSET},
         )
     )
     wrong = checks[WRONG_NAME]
-    assert wrong.verdict == "not_carried"
+    assert wrong.verdict == PredicateVerdict.NotCarried
     assert wrong.suggestion == NAME
     assert wrong.class_iri == ASSET
     assert "can never match" in wrong.message
-    assert checks[NAME].verdict == "carried"
+    assert checks[NAME].verdict == PredicateVerdict.Carried
     # a slot only a subclass carries is carried by the family
-    assert checks[LENGTH].verdict == "carried"
+    assert checks[LENGTH].verdict == PredicateVerdict.Carried
     assert checks[LENGTH].message is None
 
 
+def test_a_subclass_only_predicate_follows_the_regime():
+    query = f"SELECT ?a WHERE {{ ?a a <{ASSET}> ; <{LENGTH}> ?l }}"
+    (is_a,) = check_predicates(query, _schema(), TypeRegime.IsA)
+    (asserted,) = check_predicates(query, _schema(), TypeRegime.Asserted)
+    assert is_a.verdict == PredicateVerdict.Carried
+    assert asserted.verdict == PredicateVerdict.NotCarried
+
+
 def test_a_subject_without_an_inferable_class_is_unchecked():
-    (check,) = check_predicates(f"SELECT ?s WHERE {{ ?s <{NAME}> ?n }}", _schema())
-    assert (check.subject, check.verdict, check.class_iri) == ("?s", "unchecked", None)
+    (check,) = check_predicates(
+        f"SELECT ?s WHERE {{ ?s <{NAME}> ?n }}", _schema(), TypeRegime.IsA
+    )
+    assert (check.subject, check.verdict, check.class_iri) == ("?s", PredicateVerdict.Unchecked, None)
 
 
 def test_a_query_that_does_not_parse_raises_value_error():
     with pytest.raises(ValueError):
-        check_predicates("SELECT WHERE {", _schema())
+        check_predicates("SELECT WHERE {", _schema(), TypeRegime.IsA)
