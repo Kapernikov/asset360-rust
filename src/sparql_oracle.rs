@@ -197,6 +197,27 @@ pub const MIXIN_CLASSES: &str = r#"
     class_uri: asset360:Trip
     is_a: Equipment
     mixins: [Tag]
+  # A parent with no identifier slot whose subclasses each have one, under
+  # different names: what asset360's `BuiltElement` (no identifier) and its
+  # subclass `CivilEngineeringAsset` (`id`) are. A scan of `Structure` reads
+  # the subclasses' records, so what identifies them is the subclasses' slots.
+  Structure:
+    class_uri: asset360:Structure
+    attributes:
+      title:
+        range: string
+  Bridge:
+    is_a: Structure
+    class_uri: asset360:Bridge
+    attributes:
+      bridgeId:
+        identifier: true
+  Culvert:
+    is_a: Structure
+    class_uri: asset360:Culvert
+    attributes:
+      culvertId:
+        identifier: true
 "#;
 
 /// [`fixture`] written under type regime `regime`, plus one record of each
@@ -228,6 +249,14 @@ fn records_in_regimes() -> Vec<(&'static str, &'static str)> {
         (
             "Breaker",
             r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/B1", "label": "b"}"#,
+        ),
+        (
+            "Bridge",
+            r#"{"bridgeId": "https://data.infrabel.be/asset360/st/BR1", "title": "b1"}"#,
+        ),
+        (
+            "Culvert",
+            r#"{"culvertId": "https://data.infrabel.be/asset360/st/CU1", "title": "c1"}"#,
         ),
     ]);
     records

@@ -5451,7 +5451,7 @@ pub fn observable_slots(
 ///
 /// Three things are always kept whatever the query asks:
 ///
-/// * the **identifier slot**, because the writer mints the record's subject
+/// * the **identifier slot** of every class the scan can return, because the writer mints the record's subject
 ///   IRI from it and a record with no subject joins to nothing;
 /// * the **type-designator slot** (`typeURI`), because the record's own stored
 ///   type is what several configurations read and it costs one short string;
@@ -5469,6 +5469,7 @@ pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &Sc
     for node in &mut ops.nodes {
         let Op::Scan {
             class_uri,
+            asset_types,
             required_slots,
             optional_slots,
             retrieval,
@@ -5484,8 +5485,26 @@ pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &Sc
         // them: a column it cannot see is a condition that cannot be true.
         keep.extend(required_slots.iter().cloned());
         keep.extend(optional_slots.iter().cloned());
-        if let Some(identifier) = identifier_slot_of(schema, class_uri) {
-            keep.insert(identifier);
+        // The identifier of every class the scan can return. A scan is not
+        // only of `class_uri`: it reads every record whose `asset_type` is in
+        // `asset_types`, and each of those records is identified by *its own
+        // class's* identifier slot. `BuiltElement` has none, its subclass
+        // `CivilEngineeringAsset` has `id`: keeping only the scanned class's
+        // identifier boxed every record without one, and the writer minted
+        // the same subject for all of them.
+        //
+        // Proof of completeness: a row the fetch returns has an `asset_type`
+        // in `asset_types` (the fetch filters `asset_type = ANY(asset_types)`,
+        // and `class_uri` is the scan's own class, kept for the lowering that
+        // leaves `asset_types` empty). The record's subject is minted from the
+        // identifier slot of that `asset_type`'s class, which is inserted
+        // below for every member of the set. A slot a record's class does not
+        // declare is simply absent from its payload, so the union costs
+        // nothing on a record that does not have it.
+        for class in std::iter::once(&*class_uri).chain(asset_types.iter()) {
+            if let Some(identifier) = identifier_slot_of(schema, class) {
+                keep.insert(identifier);
+            }
         }
         keep.insert("typeURI".to_owned());
 
@@ -5651,6 +5670,49 @@ mod retrieval_tests {
         );
         assert_eq!(got.len(), 1);
         assert!(slots_of(&got[0]).contains(&"location".to_owned()));
+    }
+
+    /// A scan of a class with no identifier slot reads the records of its
+    /// subclasses, and what identifies those is *their* identifier slot. The
+    /// retrieval keeps the identifier of every class the scan can return.
+    #[test]
+    fn a_scan_of_an_identifierless_parent_keeps_its_subclasses_identifiers() {
+        use linkml_runtime::schema_rdf::TypeRegime;
+        let sv =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let plan = plan_of(
+            &format!("{PREFIX}SELECT (COUNT(?s) AS ?n) WHERE {{ ?s a asset360:Structure }}"),
+            &sv,
+            &crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]),
+        )
+        .expect("should plan");
+        let scans: Vec<(Vec<String>, Retrieval)> = plan
+            .passes
+            .iter()
+            .filter_map(|pass| match &pass.kind {
+                PassKind::Sql(sql) => Some(sql.ops.clone()),
+                PassKind::Engine(_) => None,
+            })
+            .flat_map(|ops| ops.nodes)
+            .filter_map(|node| match node.op {
+                Op::Scan {
+                    asset_types,
+                    retrieval,
+                    ..
+                } => Some((asset_types, retrieval)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scans.len(), 1, "one scan");
+        let (asset_types, retrieval) = &scans[0];
+        assert!(
+            asset_types.iter().any(|class| class.ends_with("/Bridge")),
+            "the scan reads the subclasses' records: {asset_types:?}"
+        );
+        let slots = slots_of(retrieval);
+        for identifier in ["bridgeId", "culvertId"] {
+            assert!(slots.contains(&identifier.to_owned()), "{slots:?}");
+        }
     }
 
     /// A join reads two classes; each scan keeps what its own side needs, and

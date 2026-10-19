@@ -595,15 +595,16 @@ fn insert_schema_graphs(
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
 ) -> Result<(), ExecuteError> {
-    for (iri, regime) in crate::sparql_graph_clauses::schema_graphs_read(query, dataset) {
-        let quads = crate::sparql_schema_graph::SchemaGraph::build(schema_view, regime)
-            .quads_in(&iri)
+    let read = crate::sparql_graph_clauses::schema_graphs_read(query, dataset);
+    let quads = crate::sparql_schema_graph::SchemaGraph::quads_of_graphs(
+        schema_view,
+        read.iter().map(|(iri, regime)| (iri.as_str(), *regime)),
+    )
+    .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+    for quad in &quads {
+        store
+            .insert(quad)
             .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-        for quad in &quads {
-            store
-                .insert(quad)
-                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-        }
     }
     Ok(())
 }
@@ -1418,6 +1419,78 @@ classes:
                 "SELECT ?s FROM <urn:empty> WHERE {{ GRAPH ?g {{ {body} }} }}"
             )),
             0
+        );
+    }
+
+    /// The fetch projects each record to the plan's retrieval before the
+    /// engine sees it. A scan of a class with no identifier slot reads its
+    /// subclasses' records; if the projection drops *their* identifier, the
+    /// writer mints one subject for every record and `COUNT(?s)` answers 1.
+    #[test]
+    fn an_identifierless_parent_counts_its_subclass_records_after_the_fetch_projection() {
+        use crate::sparql_ops::{Op, Retrieval};
+        use crate::sparql_plan::PassKind;
+        use linkml_runtime::schema_rdf::TypeRegime;
+        let sv =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let dataset = crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]);
+        let plan = crate::sparql_plan::plan_of(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Structure }",
+            &sv,
+            &dataset,
+        )
+        .expect("plans");
+        // What the fetch keeps: the union of every scan's retrieval.
+        let mut keep: Option<std::collections::BTreeSet<String>> = Some(Default::default());
+        for pass in &plan.passes {
+            let PassKind::Sql(sql) = &pass.kind else {
+                continue;
+            };
+            for node in &sql.ops.nodes {
+                if let Op::Scan { retrieval, .. } = &node.op {
+                    match (retrieval, keep.as_mut()) {
+                        (Retrieval::Slots(slots), Some(keep)) => keep.extend(slots.iter().cloned()),
+                        _ => keep = None,
+                    }
+                }
+            }
+        }
+        let load = |class: &str, json: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+            if let Some(keep) = &keep {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .retain(|slot, _| keep.contains(slot));
+            }
+            let conv = sv.converter();
+            let cv = sv
+                .get_class(&Identifier::new(class), &conv)
+                .unwrap()
+                .unwrap();
+            load_json_str(&value.to_string(), &sv, &cv, &conv)
+                .unwrap()
+                .into_instance_tolerate_errors()
+                .unwrap()
+        };
+        let instances = [
+            load(
+                "Bridge",
+                r#"{"bridgeId": "https://data.infrabel.be/asset360/st/BR1", "title": "b"}"#,
+            ),
+            load(
+                "Culvert",
+                r#"{"culvertId": "https://data.infrabel.be/asset360/st/CU1", "title": "c"}"#,
+            ),
+        ];
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let answer = sparql_execute_plan(&plan, &refs, &sv, ExecuteLimits::default()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(
+            parsed["results"]["bindings"][0]["n"]["value"], "2",
+            "{}",
+            answer.body
         );
     }
 

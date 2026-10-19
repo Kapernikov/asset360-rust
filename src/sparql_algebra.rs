@@ -1596,6 +1596,11 @@ pub(crate) mod equivalence {
     fn every_rewrite_of_the_type_queries_preserves_the_answer_in_every_regime() {
         const G: &str = "https://data.infrabel.be/asset360/schema";
         let queries = [
+            // An identifier-less parent whose subclasses carry the identity:
+            // the count is the number of records, not 1.
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Structure }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Structure ; a ?t }",
+            "SELECT ?s ?l WHERE { ?s a asset360:Structure ; asset360:title ?l }",
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t }",
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
             // The scan's direct type, in a regime with no `directType` triple

@@ -867,15 +867,18 @@ pub(crate) mod tests {
         );
     }
 
-    /// P3 of the design: the label left-joined where its key may be unbound
-    /// is declined, and the printout says which guard stopped it.
+    /// P3 of the design: the label joined where its key may be unbound is
+    /// declined, and the printout says which guard stopped it. (Joined, not
+    /// left-joined: a sibling `OPTIONAL` on a maybe-unbound key is refused by
+    /// the scoper before any plan exists -- #460 -- so there is no plan to
+    /// print for it.)
     #[test]
     fn p3_an_optional_key_declines_on_k1() {
         let sv = asset360_schema_view();
         let q = asset360_query(&format!(
             "SELECT ?s ?typeNl WHERE {{ ?s a asset360:Signal . \
              OPTIONAL {{ ?s asset360:signalType ?t }} \
-             OPTIONAL {{ GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }} }}"
+             GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }}"
         ));
         let refined = crate::sparql_plan::plan_texts_of(
             &q,
@@ -887,7 +890,7 @@ pub(crate) mod tests {
         assert!(refined.contains("  declined\n"), "{refined}");
         assert!(
             refined.contains(
-                "lower_constant_relation  n1  K1: ?t is in scope in n0 but not bound in every \
+                "lower_constant_relation  n2  K1: ?t is in scope in n1 but not bound in every \
                  solution (optional read)"
             ),
             "{refined}"

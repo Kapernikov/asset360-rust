@@ -1337,12 +1337,31 @@ pub fn refined_plan_text(
     crate::sparql_alias::canonicalize(&mut parsed, schema)
         .map_err(|e| ScopeError::from(e).to_string())?;
     let parsed = parsed;
+    // The refusals production gives before it refines anything: the same two
+    // calls, in the same order, as `plan_query_refined`. A query refused here
+    // has no plan to show -- printing one would be printing a plan production
+    // never returns. A refusal that comes after refinement (`resolve`'s
+    // unscoped star) is deliberately not repeated: the refined plan is the
+    // evidence for it.
+    obligations_of(&parsed).map_err(|e| e.to_string())?;
+    match crate::sparql_scoper::scope_query(
+        &parsed,
+        schema,
+        dataset,
+        crate::sparql_scoper::Scoping::Record,
+    ) {
+        // Not final: a query with no instance star (a question about the
+        // datamodel alone) is read by the schema-graph route, and the refined
+        // plan is what shows what the pipeline did with it.
+        Ok(_) | Err(ScopeError::Unscoped { .. }) => {}
+        Err(refusal) => return Err(refusal.to_string()),
+    }
     let naive = crate::sparql_refine::naive_plan(&parsed, dataset).map_err(|e| e.to_string())?;
     // The plan production builds: with the lifts when they reach the rows
     // route, without them otherwise (see `plan_query_refined`).
     let lifts = plan_query_refined(&parsed, schema, dataset, Finishing::Rows)
         .is_ok_and(|plan| matches!(plan.refinement, Refinement::UsedRows(_)));
-    let visible = dataset.seen_through(crate::sparql_scoper::dataset_of(&parsed));
+    let visible = dataset.read_by(&parsed);
     let rules = refine_rules(schema, &visible, lifts);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
         rules.iter().map(|rule| rule.as_ref()).collect();
@@ -1470,7 +1489,7 @@ pub fn plan_query_refined(
     // The graphs the query can see: under a `FROM NAMED` a graph outside the
     // set is not there to be read, for the rules that read a schema graph as
     // much as for the engine.
-    let visible = dataset.seen_through(crate::sparql_scoper::dataset_of(&parsed));
+    let visible = dataset.read_by(&parsed);
     let dataset_in_force = &visible;
     let naive = match crate::sparql_refine::naive_plan(&parsed, dataset) {
         Ok(plan) => plan,
@@ -3565,6 +3584,36 @@ classes:
             .expect_err("a refusal, not a plan");
         assert_eq!(text, production.to_string());
         assert!(text.contains("not a slot of Track"), "{text}");
+    }
+
+    /// The diagnostic ran `plan_query_refined` only inside `.is_ok_and(..)`,
+    /// so a refusal of the scoper (here #460: an `OPTIONAL` joined on a
+    /// variable the optional before it may leave unbound) was discarded and the
+    /// printout showed a plan production refuses. It prints production's
+    /// refusal, in production's words. (A refusal that only the *refined* plan
+    /// can decide -- an unscoped star -- is still printed as the plan: that is
+    /// the evidence the diagnostic exists for.)
+    #[test]
+    fn the_refined_plan_text_prints_a_scoper_refusal_production_gives() {
+        let sv = test_schema_view();
+        const SCHEMA: &str = "urn:graph:schema";
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+            &[],
+            &[(SCHEMA, linkml_runtime::schema_rdf::TypeRegime::ASSERTED)],
+        );
+        let query = format!(
+            "{PREFIX}PREFIX skos: <http://www.w3.org/2004/02/skos/core#> \
+             SELECT * WHERE {{ ?a a asset360:Signal . \
+             OPTIONAL {{ ?a asset360:locatedOnTrack ?f }} \
+             OPTIONAL {{ GRAPH <{SCHEMA}> {{ ?f skos:prefLabel ?l }} }} }}"
+        );
+        let production = plan_of(&query, &sv, &dataset).expect_err("production refuses it");
+        let text = plan_texts_of(&query, &sv, &dataset)
+            .1
+            .expect_err("a refusal, not a plan");
+        assert_eq!(text, production.to_string());
+        assert!(text.contains("Nest it under the OPTIONAL"), "{text}");
     }
 
     /// `FROM NAMED` and no `FROM` leaves the default graph empty (SPARQL 1.1

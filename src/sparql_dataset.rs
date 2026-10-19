@@ -204,6 +204,26 @@ impl DatasetSpec {
         seen
     }
 
+    /// The dataset as one query can observe it: [`Self::seen_through`] its
+    /// `FROM NAMED`, and only the schema graphs it can read
+    /// ([`crate::sparql_graph_clauses::schema_graphs_read`]: the ones it names,
+    /// all of them for a `GRAPH ?g`).
+    ///
+    /// What the planner's rules are built over. A schema graph the query cannot
+    /// reach changes no answer -- every rule that consults one does so for a
+    /// `GRAPH` the query wrote -- and building one is ~300 ms, so a dataset
+    /// serving four must not build four for a query that names one.
+    pub(crate) fn read_by(&self, query: &spargebra::Query) -> Self {
+        let mut seen = self.seen_through(crate::sparql_scoper::dataset_of(query));
+        let read: std::collections::BTreeSet<String> =
+            crate::sparql_graph_clauses::schema_graphs_read(query, &seen)
+                .into_iter()
+                .map(|(iri, _)| iri)
+                .collect();
+        seen.schema_graphs.retain(|iri, _| read.contains(iri));
+        seen
+    }
+
     /// Whether the dataset serves any schema graph at all.
     pub(crate) fn has_schema_graph(&self) -> bool {
         !self.schema_graphs.is_empty()

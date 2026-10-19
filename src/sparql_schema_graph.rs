@@ -89,6 +89,14 @@ impl std::fmt::Display for InvalidGraphIri {
 #[cfg(feature = "sparql-endpoint")]
 impl std::error::Error for InvalidGraphIri {}
 
+#[cfg(all(test, feature = "sparql-endpoint"))]
+thread_local! {
+    /// How many times [`SchemaGraph::build`] ran on this thread: building one
+    /// costs ~300 ms on the asset360 datamodel, so a test pins how many a
+    /// request pays for. Per thread, so parallel tests do not see each other.
+    pub(crate) static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The triplified datamodel, in one named graph, plus what could not be
 /// triplified.
 #[cfg(feature = "sparql-endpoint")]
@@ -117,6 +125,8 @@ impl SchemaGraph {
     /// (see [`linkml_runtime::schema_rdf::TypeRegime`]): one schema graph per
     /// regime the dataset serves.
     pub fn build(sv: &SchemaView, regime: TypeRegime) -> Self {
+        #[cfg(test)]
+        BUILDS.with(|builds| builds.set(builds.get() + 1));
         let built = schema_triples(sv, &SchemaRdfOptions::default().with_regime(regime));
         let mut triples = built.triples;
         // The extras are written as quads in the default graph and stripped to
@@ -132,6 +142,34 @@ impl SchemaGraph {
             triples,
             skipped: built.skipped,
         }
+    }
+
+    /// The quads of several schema graphs, each placed in its own named graph:
+    /// what the engine leg and a materialisation load.
+    ///
+    /// A graph's triples depend on its regime and on nothing else (the IRI is
+    /// only the placement, [`Self::quads_in`]), so the datamodel is built once
+    /// per *distinct regime* and re-labelled per graph. Building is the
+    /// expensive part (~300 ms on the asset360 datamodel); two graphs
+    /// publishing the same regime must not pay twice. The one place a request
+    /// builds schema graphs, so the executor and the planner share the rule.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidGraphIri`] when a graph's IRI is not absolute.
+    pub fn quads_of_graphs<'a>(
+        sv: &SchemaView,
+        graphs: impl IntoIterator<Item = (&'a str, TypeRegime)>,
+    ) -> Result<Vec<Quad>, InvalidGraphIri> {
+        let mut built: std::collections::HashMap<TypeRegime, SchemaGraph> = Default::default();
+        let mut quads = Vec::new();
+        for (iri, regime) in graphs {
+            let graph = built
+                .entry(regime)
+                .or_insert_with(|| SchemaGraph::build(sv, regime));
+            quads.extend(graph.quads_in(iri)?);
+        }
+        Ok(quads)
     }
 
     /// Every triple placed in the named graph `graph_iri`: the quads to load

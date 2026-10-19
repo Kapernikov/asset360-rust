@@ -36,7 +36,6 @@ use crate::sparql_dataset::DatasetSpec;
 /// query can reach, each under its own regime, so a query that reads one pays
 /// for one and an instance query pays for none (a named graph is invisible
 /// unless the query says `GRAPH`, `FROM` or `FROM NAMED`).
-#[cfg(feature = "sparql-endpoint")]
 pub(crate) fn schema_graphs_read(
     parsed: &spargebra::Query,
     dataset: &DatasetSpec,

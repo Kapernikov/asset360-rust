@@ -802,16 +802,18 @@ impl Materialisation for SchemaGraphMaterialisation<'_> {
             .get_or_init(|| {
                 // Every schema graph the dataset serves, each in its own
                 // named graph under its own regime: the shape the engine leg
-                // loads, so a probe answers what the engine would answer.
+                // loads, so a probe answers what the engine would answer. The
+                // planner hands this the dataset *as the query reads it*
+                // ([`DatasetSpec::read_by`]), so that is the graphs it can
+                // reach and no others; one build per regime.
                 let store = Store::new().ok()?;
-                for (iri, regime) in self.dataset.schema_graphs() {
-                    let quads =
-                        crate::sparql_schema_graph::SchemaGraph::build(self.schema_view, regime)
-                            .quads_in(iri)
-                            .ok()?;
-                    for quad in &quads {
-                        store.insert(quad).ok()?;
-                    }
+                let quads = crate::sparql_schema_graph::SchemaGraph::quads_of_graphs(
+                    self.schema_view,
+                    self.dataset.schema_graphs(),
+                )
+                .ok()?;
+                for quad in &quads {
+                    store.insert(quad).ok()?;
                 }
                 Some(store)
             })
@@ -952,6 +954,50 @@ mod tests {
             plan.contains("filter    signalType = 'GSA'"),
             "the fetch must be narrowed to the code the schema filter permits:\n{plan}"
         );
+    }
+
+    /// A request pays for the schema graphs it can read, once per regime. A
+    /// dataset serving four (an alias and three regimes) built all four, in
+    /// every rule that asks, for a query naming one: ~300 ms each.
+    #[test]
+    fn a_plan_builds_only_the_schema_graphs_the_query_can_read_once_per_regime() {
+        use linkml_runtime::schema_rdf::TypeRegime;
+        const ALIAS: &str = "https://data.infrabel.be/asset360/schema-alias";
+        const INFERRED: &str = "https://data.infrabel.be/asset360/schema-inferred";
+        const MIXINS: &str = "https://data.infrabel.be/asset360/schema-mixins";
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[],
+            &[
+                (SCHEMA_GRAPH, TypeRegime::ASSERTED),
+                (ALIAS, TypeRegime::ASSERTED),
+                (INFERRED, TypeRegime::IS_A),
+                (MIXINS, TypeRegime::IS_A_AND_MIXINS),
+            ],
+        );
+        let sv = asset360_schema_view();
+        let builds_for = |graph: &str| {
+            let text = query(&format!(
+                "SELECT ?s ?code WHERE {{ \
+                 ?s a asset360:Signal ; asset360:signalType ?t . \
+                 GRAPH {graph} {{ ?t skos:notation ?code }} \
+                 FILTER(CONTAINS(?code, \"GS\")) }}"
+            ));
+            let parsed = crate::sparql_scoper::parse_query(&text, Some(&sv)).unwrap();
+            crate::sparql_schema_graph::BUILDS.with(|builds| builds.set(0));
+            crate::sparql_plan::plan_query_refined(
+                &parsed,
+                &sv,
+                &dataset,
+                crate::sparql_plan::Finishing::Rows,
+            )
+            .expect("plans");
+            crate::sparql_schema_graph::BUILDS.with(|builds| builds.get())
+        };
+        // One graph named: one build, not four, and not one per rule.
+        assert_eq!(builds_for(&format!("<{SCHEMA_GRAPH}>")), 1);
+        // `GRAPH ?g` can read all four, which are three regimes.
+        assert_eq!(builds_for("?g"), 3);
     }
 
     /// The same query with no schema graph configured: no rule exists, nothing
