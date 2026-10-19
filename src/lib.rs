@@ -4065,17 +4065,13 @@ impl PyDatasetSpec {
     }
 }
 
-/// The Python object for a regime. `linkml_runtime_python` converts the other
-/// way only, so this goes through `TypeRegime.parse(str(regime))`, which
-/// round-trips every set.
+/// The Python object for a regime.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 fn py_regime(
     py: Python<'_>,
     regime: linkml_runtime::schema_rdf::TypeRegime,
 ) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
-    py.get_type::<linkml_runtime_python::PyTypeRegime>()
-        .call_method1("parse", (regime.to_string(),))?
-        .extract()
+    Py::new(py, linkml_runtime_python::PyTypeRegime::from(regime))
 }
 
 /// How Python spells a regime in a `repr`: the named ones as attributes, any
