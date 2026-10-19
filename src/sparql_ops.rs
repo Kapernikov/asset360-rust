@@ -1386,6 +1386,7 @@ fn lower_island(
             class_uri,
             identifier_values,
             slots,
+            regime,
             ..
         } = &plan.nodes[id].op
         else {
@@ -1410,7 +1411,32 @@ fn lower_island(
                             .iter()
                             .any(|value| subject.trim_matches(['<', '>']) == value),
                     };
-                    if !scopes_the_subject || class_iri != class_uri {
+                    // A scan of C discharges `?s a D` when D is C (the trivial
+                    // case) or when every record the scan reads is an instance
+                    // of D.
+                    //
+                    // Proof. The scan reads exactly the records whose
+                    // `rdf:type`s include C under its `regime`, i.e. the
+                    // records of `classes = type_family(C, regime)`. A record
+                    // of class K in that family is an instance of D under the
+                    // same regime iff K is in `type_family(D, regime)`. So if
+                    // `classes ⊆ type_family(D, regime)`, `?s a D` holds for
+                    // every row the scan returns, and rendering nothing for
+                    // the claim loses no row and admits none. The regime must
+                    // be the scan's own: families differ per regime (under
+                    // Asserted a family is the class alone, so only equality
+                    // passes). A class the schema does not know has no
+                    // family, so only equality passes.
+                    let covers = class_iri == class_uri || {
+                        // Recomputed from `class_uri` rather than read from
+                        // the scan's `classes`, which invariant 7 pins to
+                        // the same function: this check then stands alone.
+                        let read = crate::sparql_refine::scan_classes(schema, class_uri, *regime);
+                        let wanted = crate::sparql_refine::scan_classes(schema, class_iri, *regime);
+                        schema.get_class_by_uri(class_iri).ok().flatten().is_some()
+                            && read.iter().all(|class| wanted.contains(class))
+                    };
+                    if !scopes_the_subject || !covers {
                         return wrong(claim);
                     }
                 }
@@ -4226,6 +4252,76 @@ mod tests {
 
     fn lowered(query: &str, sv: &SchemaView) -> Result<OpTree, LoweringRefusal> {
         lower_refined(&refined_plan(query, sv), sv, None, None)
+    }
+
+    /// [`lowered`] over a dataset whose data graph has type regime `regime`.
+    fn lowered_in(
+        query: &str,
+        sv: &SchemaView,
+        regime: linkml_runtime::schema_rdf::TypeRegime,
+    ) -> Result<OpTree, LoweringRefusal> {
+        let dataset = crate::sparql_dataset::DatasetSpec::new(regime);
+        let rules = crate::sparql_rules::tier_one_rules(sv, &dataset);
+        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+            rules.iter().map(|rule| rule.as_ref()).collect();
+        let parsed =
+            crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
+        let mut plan = crate::sparql_refine::naive_plan_in(&parsed, &dataset)
+            .expect("should build a naive plan");
+        crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
+        lower_refined(&plan, sv, None, None)
+    }
+
+    /// A parent type beside its subclass's is discharged by the subclass scan
+    /// under `is_a`: every record that scan reads is also an `Equipment`. The
+    /// fold claims both matches; lowering used to demand the scan's class be
+    /// the claimed one and refused (#511).
+    #[test]
+    fn a_scan_discharges_a_parent_type_claim_when_its_family_is_inside() {
+        use linkml_runtime::schema_rdf::TypeRegime;
+        let sv = test_schema_view();
+        let query = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment }";
+        let tree = lowered_in(query, &sv, TypeRegime::IsA).expect("should lower under is_a");
+        let Op::Scan { class_uri, .. } = &tree.nodes[0].op else {
+            panic!("the first node is the scan");
+        };
+        assert!(class_uri.ends_with("/Relay"), "{class_uri}");
+        assert_eq!(tree.find("scan").len(), 1);
+        // Asserted: the two classes are different families, so the fold
+        // declines and nothing folds into one scan claiming both.
+        if let Ok(tree) = lowered_in(query, &sv, TypeRegime::Asserted) {
+            assert_ne!(tree.find("scan").len(), 1, "must not fold");
+        }
+        // A sibling is not covered: Relay's family is not inside Switch's.
+        let sibling = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }";
+        if let Ok(tree) = lowered_in(sibling, &sv, TypeRegime::IsA) {
+            assert_ne!(tree.find("scan").len(), 1, "siblings do not fold");
+        }
+    }
+
+    /// The same with the record named: the identifier narrowing survives.
+    #[test]
+    fn a_named_record_keeps_its_identifier_narrowing_beside_a_parent_type() {
+        use linkml_runtime::schema_rdf::TypeRegime;
+        let sv = test_schema_view();
+        let iri = "https://data.infrabel.be/asset360/relay-1";
+        let query = format!(
+            "SELECT ?s WHERE {{ VALUES ?s {{ <{iri}> }} ?s a asset360:Relay , asset360:Equipment }}"
+        );
+        let tree = lowered_in(&query, &sv, TypeRegime::IsA).expect("should lower under is_a");
+        let Op::Scan {
+            class_uri,
+            identifier_values,
+            ..
+        } = &tree.nodes[0].op
+        else {
+            panic!("the first node is the scan");
+        };
+        assert!(class_uri.ends_with("/Relay"), "{class_uri}");
+        assert!(
+            identifier_values.iter().any(|v| v.contains("relay-1")),
+            "{identifier_values:?}"
+        );
     }
 
     /// A conjunct no rule pushes, to keep a query a *fetch*.
