@@ -3988,8 +3988,14 @@ pub fn naive_plan_for(query_str: &str, schema_view: &SchemaView) -> Result<Plan,
 /// broken assumption into an error instead of a plan that answers a different
 /// question.
 pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
-    naive_plan_in(query, TypeRegime::Asserted)
+    naive_plan_in(query, DEFAULT_TYPE_REGIME)
 }
+
+/// The regime a plan is read under when its caller names none: what every
+/// dataset was before regimes existed. The plan builder and the scoper both
+/// start here, so a decision the scoper takes about a star's types is taken
+/// under the regime the plan's matches will carry.
+pub(crate) const DEFAULT_TYPE_REGIME: TypeRegime = TypeRegime::Asserted;
 
 /// [`naive_plan`] over a dataset whose data graph has type regime
 /// `default_regime`: every triple outside a `GRAPH` is matched against it.

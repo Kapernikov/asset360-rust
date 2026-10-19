@@ -1734,8 +1734,9 @@ fn scope_qualified(
                             builder.type_iri.clone().unwrap_or_default(),
                             nn.as_str().to_owned(),
                         ]),
-                        // regime: R3's Match.regime replaces this constant once the field lands.
-                        linkml_runtime::schema_rdf::TypeRegime::IsA,
+                        // The scoper has no dataset of its own: it reads
+                        // under the regime every plan builder starts with.
+                        crate::sparql_refine::DEFAULT_TYPE_REGIME,
                     )
                 {
                     // A parent type beside its subclass (#511): the family of
@@ -7268,31 +7269,27 @@ classes:
         }
     }
 
-    /// A parent type beside its subclass is not a repeated type (#511): the
-    /// star is the subclass, whichever type came first, and the plan is exact.
-    /// Siblings stay an intersection.
+    /// A parent type beside its subclass is judged in the regime the scoper
+    /// reads under (#511). Asserted, the two are an empty intersection and the
+    /// repeated type is recorded, as for siblings.
     #[test]
     fn a_parent_type_beside_its_subclass_is_one_star() {
         let sv = test_schema_view();
         let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+        // The scoper reads under the default (asserted) regime, where a
+        // class's family is the class alone: a parent beside its subclass is
+        // an intersection of two classes with nothing in it, so the second
+        // type is not absorbed. (Under `is_a` the star would collapse to the
+        // subclass; the scoper has no dataset to say so yet, and the plan
+        // rule `FoldMatchesIntoScan` does it where the regime is known.)
         for query in [
             "SELECT ?s WHERE { ?s a asset360:Relay ; a asset360:Equipment }",
             "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
+            "SELECT ?s WHERE { ?s a asset360:Relay ; a asset360:Switch }",
         ] {
             let plan = sparql_scope(&format!("{prefix}{query}"), &sv).expect("scopes");
-            assert_eq!(plan.inexact, None, "{query}");
-            assert_eq!(
-                find_star(&plan, "s").class_uri,
-                "https://data.infrabel.be/asset360/Relay",
-                "{query}"
-            );
+            assert_eq!(plan.inexact, Some(Inexact::RepeatedType), "{query}");
         }
-        let plan = sparql_scope(
-            &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Relay ; a asset360:Switch }}"),
-            &sv,
-        )
-        .expect("scopes");
-        assert_eq!(plan.inexact, Some(Inexact::RepeatedType));
     }
 
     /// A `GRAPH` pattern is not an instance pattern.

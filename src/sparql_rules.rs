@@ -58,7 +58,6 @@ use linkml_runtime::schema_rdf::{TypeRegime, type_family};
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
-use linkml_runtime::schema_rdf::TypeRegime;
 use spargebra::algebra::AggregateExpression;
 use spargebra::term::{GroundTerm, Term, TermPattern, TriplePattern};
 
@@ -562,9 +561,11 @@ impl Rule for FoldMatchesIntoScan<'_> {
                         && !in_other_union_arm(plan, type_node, *other_id)
                 })
                 .filter_map(|(other_id, other)| match &other.op {
-                    PlanOp::Match { pattern, regime: other_regime }
-                        if *other_regime == Some(regime)
-                            && subject_star(&keys, pattern).as_deref() == Some(star) =>
+                    PlanOp::Match {
+                        pattern,
+                        regime: other_regime,
+                    } if *other_regime == Some(regime)
+                        && subject_star(&keys, pattern).as_deref() == Some(star) =>
                     {
                         type_class_iri(pattern).map(|class| (other_id, class.to_owned()))
                     }
@@ -581,14 +582,21 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // inside all the others (#511); the fold then runs from the node
             // that carries that class, so the answer does not depend on which
             // type the query wrote first.
+            //
+            // "Inside" is judged in the star's own regime, the one its type
+            // matches carry (counted above only when they share it). Under
+            // `Asserted` the family of a class is that class alone, so two
+            // different classes never include one another and the fold
+            // declines: a graph that writes only asserted `rdf:type` triples
+            // holds no record typed both `:Parent` and `:Child`, so the
+            // intersection is empty and a scan of the subclass would invent
+            // answers. Under `IsA` the subclass's family is inside its
+            // parent's, `a Child ∧ a Parent ≡ a Child`, and the fold is exact.
+            // A restriction carries no regime of its own; it takes the one
+            // resolved above from the matches it folds with.
             let mut subsumed: Vec<NodeId> = Vec::new();
             if classes_on_star.len() != 1 {
-                let Some(specific) = most_specific(
-                    self.schema,
-                    &classes_on_star,
-                    // regime: R3's Match.regime replaces this constant once the field lands.
-                    TypeRegime::IsA,
-                ) else {
+                let Some(specific) = most_specific(self.schema, &classes_on_star, regime) else {
                     continue;
                 };
                 if specific != class_uri {
@@ -6048,6 +6056,15 @@ mod tests {
         naive_plan_of(&format!("{PREFIX}{query}")).expect("should build a naive plan")
     }
 
+    /// [`plan_of`] over a dataset whose data graph has type regime `regime`:
+    /// what a class's family is, and so whether a parent type beside its
+    /// subclass is one class, depends on it.
+    fn plan_in(query: &str, regime: TypeRegime) -> Plan {
+        let parsed =
+            crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
+        crate::sparql_refine::naive_plan_in(&parsed, regime).expect("should build a naive plan")
+    }
+
     /// Every slot the scan folded, as (slot, variable, multivalued).
     fn scan_slots(plan: &Plan) -> Vec<(String, String, bool)> {
         plan.nodes
@@ -6388,7 +6405,7 @@ mod tests {
             "SELECT ?s ?v WHERE { ?s a asset360:Equipment , asset360:LatchRelay , asset360:Relay ; \
              asset360:voltage ?v }",
         ] {
-            let mut plan = plan_of(query);
+            let mut plan = plan_in(query, TypeRegime::IsA);
             let before = plan.obligations.len();
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert_eq!(log.applied.len(), 1, "{query}\n{plan}");
@@ -6405,14 +6422,40 @@ mod tests {
             // The ancestors' type reads are discharged by the scan.
             assert_eq!(plan.obligations.len(), before, "{plan}");
             assert!(plan.residual.is_empty(), "{query}\n{plan}");
-            println!("{plan}");
+            let text = plan.to_string();
+            assert!(
+                text.contains("[is_a]"),
+                "the scan names its regime:\n{text}"
+            );
+            assert!(
+                plan.scan_classes_agree(&schema).is_ok(),
+                "the scan's classes are those of its regime:\n{text}"
+            );
         }
 
-        // Siblings: neither family is inside the other.
-        let mut plan = plan_of("SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }");
-        let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
-        assert!(log.applied.is_empty(), "{plan}");
-        assert_eq!(plan.find("match").len(), 2, "{plan}");
+        // Under the asserted regime a class's family is the class alone, so
+        // the intersection of a parent and its subclass is empty: the fold
+        // declines and the engine keeps both reads.
+        for query in [
+            "SELECT ?s ?v WHERE { ?s a asset360:Relay , asset360:Equipment ; asset360:voltage ?v }",
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment , asset360:Relay ; asset360:voltage ?v }",
+        ] {
+            let mut plan = plan_in(query, TypeRegime::Asserted);
+            let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
+            assert!(log.applied.is_empty(), "{query}\n{plan}");
+            assert!(plan.find("scan").is_empty(), "{query}\n{plan}");
+        }
+
+        // Siblings: neither family is inside the other, in any regime.
+        for regime in [TypeRegime::Asserted, TypeRegime::IsA] {
+            let mut plan = plan_in(
+                "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }",
+                regime,
+            );
+            let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
+            assert!(log.applied.is_empty(), "{plan}");
+            assert_eq!(plan.find("match").len(), 2, "{plan}");
+        }
     }
 
     /// A class the schema does not know has no columns and no multiplicities,
@@ -8502,6 +8545,11 @@ mod tests {
         refine_naive(&plan_of(query), schema, reverse)
     }
 
+    /// [`refined`] over a dataset whose data graph has type regime `regime`.
+    fn refined_in(query: &str, schema: &SchemaView, regime: TypeRegime) -> Plan {
+        refine_naive(&plan_in(query, regime), schema, false)
+    }
+
     /// The value conditions today's star decomposition pushes, as
     /// `?star.path <condition>`.
     ///
@@ -8799,7 +8847,7 @@ mod tests {
             "SELECT ?s ?l WHERE { ?s a asset360:Equipment , asset360:Relay ; asset360:label ?l . \
              VALUES ?l { \"a\" \"b\" } }",
         ] {
-            let plan = refined(query, &schema, false);
+            let plan = refined_in(query, &schema, TypeRegime::IsA);
             let scans = plan.find("scan");
             assert_eq!(scans.len(), 1, "{plan}");
             assert!(plan.find("values").is_empty(), "narrowing folded:\n{plan}");
