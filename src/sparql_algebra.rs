@@ -102,9 +102,24 @@ impl Translation<'_> {
         format!("_{}_{}", hint, self.fresh)
     }
 
-    fn predicate(&self, class_uri: &str, slot: &str) -> Option<NamedNode> {
+    fn predicate(
+        &self,
+        class_uri: &str,
+        slot: &str,
+        designator_as_type: bool,
+    ) -> Option<NamedNode> {
         let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
         let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, slot)?;
+        // A type designator is not a triple: the writer states the element's
+        // class as `rdf:type` and skips the slot. Its value (a `uri` range
+        // stores the very IRI the writer types the element with) is what that
+        // `rdf:type` object is, so a *condition* on it reads the type -- exact
+        // for a test of the value, and there is no row where the element names
+        // no designator, which a test of the value never asked about. A scan's
+        // own read of the slot is left as the query wrote it.
+        if designator_as_type && slot.definition().designates_type == Some(true) {
+            return NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok();
+        }
         let conv = self.schema.converter();
         let iri = slot.canonical_uri().to_uri(&conv).ok()?;
         NamedNode::new(iri.0).ok()
@@ -126,11 +141,37 @@ impl Translation<'_> {
         object: TermPattern,
         counter: &mut usize,
     ) -> Option<Vec<TriplePattern>> {
+        self.read_as(class_uri, star, path, object, counter, false)
+    }
+
+    /// [`Self::read`] for the address of a condition, where a designator is
+    /// read as the type it stands for.
+    fn read_condition(
+        &self,
+        class_uri: &str,
+        star: &str,
+        path: &[String],
+        object: TermPattern,
+        counter: &mut usize,
+    ) -> Option<Vec<TriplePattern>> {
+        self.read_as(class_uri, star, path, object, counter, true)
+    }
+
+    fn read_as(
+        &self,
+        class_uri: &str,
+        star: &str,
+        path: &[String],
+        object: TermPattern,
+        counter: &mut usize,
+        designator_as_type: bool,
+    ) -> Option<Vec<TriplePattern>> {
         let mut triples = Vec::new();
         let mut subject = TermPattern::Variable(Variable::new_unchecked(star.to_owned()));
         let mut class = class_uri.to_owned();
         for (index, hop) in path.iter().enumerate() {
-            let predicate = self.predicate(&class, hop)?;
+            let predicate =
+                self.predicate(&class, hop, designator_as_type && index + 1 == path.len())?;
             let last = index + 1 == path.len();
             let next = if last {
                 object.clone()
@@ -596,7 +637,7 @@ impl Translation<'_> {
                     })?;
             (element, self.class_at(&class_uri, &edge.path)?)
         };
-        let predicate = self.predicate(&class_uri, &edge.slot)?;
+        let predicate = self.predicate(&class_uri, &edge.slot, false)?;
         let triple = TriplePattern {
             subject: TermPattern::Variable(Variable::new_unchecked(subject)),
             predicate: NamedNodePattern::NamedNode(predicate),
@@ -787,7 +828,7 @@ impl Translation<'_> {
             SlotReading::Column => {
                 let var = self.fresh_var(&format!("{star}_{}", path.join("_")));
                 let mut counter = 200 + self.fresh;
-                reads.extend(self.read(
+                reads.extend(self.read_condition(
                     &class_uri,
                     star,
                     path,
@@ -808,7 +849,7 @@ impl Translation<'_> {
                 let element_class = self.class_at(&class_uri, &path[..prefix])?;
                 let var = self.fresh_var(&format!("{element}_{}", path[prefix..].join("_")));
                 let mut counter = 300 + self.fresh;
-                reads.extend(self.read(
+                reads.extend(self.read_condition(
                     &element_class,
                     &element,
                     &path[prefix..],

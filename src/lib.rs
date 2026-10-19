@@ -46,6 +46,7 @@ pub mod sparql_domains;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
 pub mod sparql_graph_clauses;
+pub(crate) mod sparql_inline_type;
 pub mod sparql_lift;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_materialise;

@@ -465,6 +465,11 @@ impl Rule for FoldMatchesIntoScan<'_> {
                     else {
                         continue;
                     };
+                    // A structure stored inside a record has no table to scan:
+                    // its type is `InlineTypeMatchBecomesFilter`'s.
+                    if is_inline_element(plan, self.schema, &star) {
+                        continue;
+                    }
                     (identifier_values, star, class_uri.to_owned(), Some(*regime))
                 }
                 // A restriction does not say which graph it was derived
@@ -1884,12 +1889,12 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
                 consumer,
                 other,
                 scan,
-                ScanSlot {
+                Some(ScanSlot {
                     path: path.clone(),
                     var: Some(var.clone()),
                     multivalued,
                     presence: SlotPresence::Required,
-                },
+                }),
             );
             if multivalued {
                 // Above the outer element's fan-out, which is where the
@@ -1928,13 +1933,15 @@ fn fold_into_scan(
     join: NodeId,
     other: NodeId,
     scan: NodeId,
-    slot: ScanSlot,
+    slot: Option<ScanSlot>,
 ) {
     // A multivalued slot here is a nested fan-out off an element, and the
     // caller inserts its unnest in the same edit (`FoldNestedMatchIntoPath`).
+    // No slot at all is a match that says nothing the scan does not already
+    // say (`InlineTypeMatchBecomesFilter`, discharged): only the claim moves.
     let mut claims = plan.nodes[matched].discharges.clone();
     claims.extend(plan.nodes[join].discharges.iter().copied());
-    if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
+    if let (PlanOp::Scan { slots, .. }, Some(slot)) = (&mut plan.nodes[scan].op, slot) {
         slots.push(slot);
     }
     plan.nodes[scan].discharges.extend(claims);
@@ -1960,6 +1967,224 @@ fn fold_into_scan(
     }
 
     plan.rebuild(nodes, &remap);
+}
+
+// ---------------------------------------------------------------------------
+// The type of an inline element
+// ---------------------------------------------------------------------------
+
+/// Whether `var` is the object of a read of an *inlined* slot: a structure
+/// stored inside another record, not a record of its own.
+///
+/// Asked of the unfolded matches *and* of the scans, so it holds before and
+/// after the read has been folded into a scan -- which is what lets
+/// [`FoldMatchesIntoScan`] and [`InlineTypeMatchBecomesFilter`] agree on who
+/// owns the variable's type whatever order they run in.
+fn is_inline_element(plan: &Plan, schema: &SchemaView, var: &str) -> bool {
+    plan.nodes.iter().any(|node| match &node.op {
+        PlanOp::Match { pattern, .. } => {
+            object_variable(pattern) == Some(var)
+                && predicate_iri(pattern)
+                    .and_then(|predicate| schema.get_slot_by_uri(predicate).ok().flatten())
+                    .is_some_and(|slot| slot.determine_slot_inline_mode() == SlotInlineMode::Inline)
+        }
+        PlanOp::Scan {
+            class_uri, slots, ..
+        } => slots
+            .iter()
+            .filter(|read| read.var.as_deref() == Some(var))
+            .any(|read| {
+                let Some((last, prefix)) = read.path.split_last() else {
+                    return false;
+                };
+                crate::sparql_scopes::class_at_path_of(schema, class_uri, prefix)
+                    .and_then(|holder| schema.get_class_by_uri(&holder).ok().flatten())
+                    .and_then(|holder| {
+                        crate::sparql_slot_family::slot_on_class_or_descendant(&holder, last)
+                    })
+                    .is_some_and(|slot| slot.determine_slot_inline_mode() == SlotInlineMode::Inline)
+            }),
+        _ => false,
+    })
+}
+
+/// `?x a :C`, with `?x` an element read from an inline slot of a scanned
+/// record, becomes a condition on the element's designator -- or disappears,
+/// or stays with the engine -- and is never a scan of `C`.
+///
+/// Without it [`FoldMatchesIntoScan`] read the type as the scope of a *record*
+/// star: `scan :SpotLocation as ?loc`, a second island joined to the record by
+/// `?loc` alone, which dropped the narrowing of the first and loaded every
+/// record of the class (#514).
+///
+/// **Equivalence.** The decision, and its proof, are
+/// [`crate::sparql_inline_type::inline_type_test`]: the match holds for an
+/// element iff its designated class is in `type_family(C, regime)`, the regime
+/// being the match's own (`PlanOp::Match::regime`: the graph the triple is
+/// read from; none under a non-data graph, where the rule does not apply). The match is one
+/// triple with a constant object, so it joins each element row to at most one
+/// row and adds no column: replacing it, and the join that carried it, with a
+/// filter that holds of exactly the elements it matches keeps every solution
+/// and its multiplicity. The three verdicts:
+///
+/// * *discharged* -- every storable element matches; the match and its join
+///   go and the scan takes the claim;
+/// * *designator in the set* -- the match becomes a filter on
+///   `path ++ [designator]`, the same condition (and the same stored-text
+///   check, [`Expr::to_sql`]) a constant on that slot would get;
+/// * *never matches* -- left alone. The plan cannot state "selects nothing"
+///   (see `to_sql`), and the engine, which holds the triple, answers it empty.
+///
+/// Preconditions, each with the wrong answer it prevents:
+///
+/// * **The subject is a structure inside a scanned record**, found by the
+///   same [`subject_site`] as every nested read: through a read the query
+///   made mandatory, with its fan-out below the match. Inside an `OPTIONAL`
+///   the type match would drop the rows the `LeftJoin` keeps.
+/// * **The match's one consumer is a plain `Join` on the subject.** The edit
+///   is the one [`ConstantObjectBecomesFilter`] makes.
+/// * **An absent designator is a match in a nested position** when the range
+///   itself is among the classes asked for (`D = R` for an element that names
+///   none). A path condition cannot say "absent" two hops down (`!bound`
+///   holds one hop only), so that case is left to the engine rather than
+///   narrowed to the elements that do carry the value.
+pub struct InlineTypeMatchBecomesFilter<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> InlineTypeMatchBecomesFilter<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+}
+
+impl Rule for InlineTypeMatchBecomesFilter<'_> {
+    fn name(&self) -> &'static str {
+        "inline_type_match_becomes_filter"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        use crate::sparql_inline_type::{InlineTypeTest, inline_type_test};
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match { pattern, regime } = &plan.nodes[id].op else {
+                continue;
+            };
+            // Not a data graph: no rule about type triples applies.
+            let Some(regime) = *regime else {
+                continue;
+            };
+            let (Some(subject), Some(class_uri)) =
+                (subject_variable(pattern), type_class_iri(pattern))
+            else {
+                continue;
+            };
+            let (subject, class_uri) = (subject.to_owned(), class_uri.to_owned());
+            let above = consumers(plan, id);
+            let [consumer] = above.as_slice() else {
+                continue;
+            };
+            let PlanOp::Join {
+                left, right, on, ..
+            } = &plan.nodes[*consumer].op
+            else {
+                continue;
+            };
+            if on.as_slice() != [subject.clone()] {
+                continue;
+            }
+            let (consumer, other) = (*consumer, if *left == id { *right } else { *left });
+            let Some(site) = subject_site(plan, other, &subject) else {
+                continue;
+            };
+            if site.prefix.is_empty() {
+                continue;
+            }
+            let Some(range_uri) =
+                crate::sparql_scopes::class_at_path_of(self.schema, &site.class_uri, &site.prefix)
+            else {
+                continue;
+            };
+            let (Some(range), Some(asked)) = (
+                self.schema.get_class_by_uri(&range_uri).ok().flatten(),
+                self.schema.get_class_by_uri(&class_uri).ok().flatten(),
+            ) else {
+                continue;
+            };
+            match inline_type_test(self.schema, &range, &asked, regime) {
+                Some(InlineTypeTest::Discharged) => {
+                    fold_into_scan(plan, id, consumer, other, site.scan, None);
+                    return true;
+                }
+                Some(InlineTypeTest::DesignatorIn {
+                    slot,
+                    values,
+                    iri_valued,
+                    includes_absent: false,
+                }) => {
+                    let mut slot_path = site.prefix.clone();
+                    slot_path.push(slot);
+                    let reading = if prefix_crosses_a_collection(
+                        self.schema,
+                        &site.class_uri,
+                        &site.prefix,
+                    ) {
+                        SlotReading::BoundElement
+                    } else {
+                        SlotReading::Column
+                    };
+                    let value = Box::new(Expr::Slot {
+                        star_var: site.star_var.clone(),
+                        slot_path,
+                        reading,
+                        presence: SlotPresence::Required,
+                    });
+                    let mut terms: Vec<Expr> = values
+                        .iter()
+                        .map(|text| {
+                            Expr::Literal(if iri_valued {
+                                Term::NamedNode(spargebra::term::NamedNode::new_unchecked(
+                                    text.clone(),
+                                ))
+                            } else {
+                                Term::Literal(spargebra::term::Literal::new_simple_literal(
+                                    text.clone(),
+                                ))
+                            })
+                        })
+                        .collect();
+                    let condition = if terms.len() == 1 {
+                        Expr::Compare {
+                            op: CompareOp::Eq,
+                            left: value,
+                            right: Box::new(terms.remove(0)),
+                        }
+                    } else {
+                        Expr::In {
+                            value,
+                            candidates: terms,
+                        }
+                    };
+                    let classes = HashMap::from([(site.star_var.clone(), site.class_uri.clone())]);
+                    // The stored-text check: a designator no stored value
+                    // spells this way would select nothing, which is not a
+                    // narrowing.
+                    if condition.to_sql(self.schema, &classes).is_none() {
+                        continue;
+                    }
+                    replace_match_with_filter(plan, id, consumer, other, condition);
+                    return true;
+                }
+                // Never matches, matches only with the designator absent, or
+                // not decidable: the engine holds the triple.
+                Some(InlineTypeTest::NeverMatches | InlineTypeTest::DesignatorIn { .. }) | None => {
+                }
+            }
+        }
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5117,6 +5342,7 @@ pub fn tier_one_rules<'a>(
 ) -> Vec<Box<dyn Rule + 'a>> {
     #[cfg_attr(not(feature = "sparql-endpoint"), allow(unused_mut))]
     let mut rules: Vec<Box<dyn Rule + 'a>> = vec![
+        Box::new(InlineTypeMatchBecomesFilter::new(schema)),
         Box::new(FoldMatchesIntoScan::new(schema)),
         Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(DeliverOptionalRead::new(schema)),
@@ -9841,5 +10067,166 @@ mod element_held_optional_reference {
         );
         crate::sparql_ops::lower_refined(&plan, &schema, None, None)
             .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
+    }
+}
+
+/// `?x` reached through an *inline* slot and typed (`?x a :C`) is a test on
+/// the element's designator, not a record scan (#514): the element is a
+/// structure inside a record, so there is no table of `C` to scan.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod inline_type_match {
+    use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+    use crate::sparql_oracle::Oracle;
+    use crate::sparql_rules::{Rule, tier_one_rules};
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    const NS: &str = "https://data.infrabel.be/asset360";
+
+    /// A site with elements of two subclasses and one with no designator at
+    /// all (a plain `Place`), a site with one other-subclass element, and one
+    /// with no places.
+    fn oracle(sv: &linkml_schemaview::schemaview::SchemaView) -> Oracle {
+        let one = format!(
+            r#"{{"asset360_uri": "{NS}/site/1", "places": [
+                 {{"typeURI": "{NS}/SpotPlace", "label": "spot"}},
+                 {{"typeURI": "{NS}/RoadPlace", "label": "road"}},
+                 {{"label": "plain"}}]}}"#
+        );
+        let two = format!(
+            r#"{{"asset360_uri": "{NS}/site/2", "places": [
+                 {{"typeURI": "{NS}/RoadPlace", "label": "road2"}}]}}"#
+        );
+        let three = format!(r#"{{"asset360_uri": "{NS}/site/3"}}"#);
+        Oracle::new(sv, &[("Site", &one), ("Site", &two), ("Site", &three)])
+    }
+
+    fn refine_and_check(query: &str) -> crate::sparql_refine::Plan {
+        let sv = test_schema_view();
+        let oracle = oracle(&sv);
+        let rules = tier_one_rules(&sv, None);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        each_rewrite_preserves_answers(query, &sv, &oracle, &borrowed)
+    }
+
+    /// The element is tested by its designator, in SQL, and no scan of the
+    /// subclass appears; the oracle agrees at every step, over elements of two
+    /// subclasses and one without a designator.
+    #[test]
+    fn a_subclass_type_on_an_inline_element_is_a_designator_condition() {
+        for (class, label) in [("SpotPlace", "spot"), ("RoadPlace", "road")] {
+            let query = format!(
+                "SELECT ?s ?l WHERE {{ ?s a asset360:Site ; asset360:places ?p . \
+                 ?p a asset360:{class} ; asset360:label ?l }}"
+            );
+            let plan = refine_and_check(&query);
+            let text = plan.to_string();
+            assert!(
+                !text.contains(&format!("scan      asset360:{class}")),
+                "the element is not a record to scan:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("typeURI[each] = <{NS}/{class}>")),
+                "the designator is tested:\n{text}"
+            );
+            assert!(
+                plan.nodes
+                    .iter()
+                    .all(|node| node.executor == crate::sparql_refine::Executor::Sql),
+                "{text}"
+            );
+            let sv = test_schema_view();
+            let answers = oracle(&sv).answers_to(&format!("PREFIX asset360: <{NS}/> {query}"));
+            assert!(
+                answers
+                    .keys()
+                    .any(|row| row.get("l").is_some_and(|l| l.contains(label))),
+                "{class}: {answers:?}"
+            );
+        }
+    }
+
+    /// The production route (`plan_query_refined`) plans the same query with the
+    /// same result: the record's narrowing survives, the element is no second
+    /// island.
+    #[test]
+    fn the_production_plan_has_one_island() {
+        let sv = test_schema_view();
+        let plan = crate::sparql_plan::plan_query_refined(
+            &format!(
+                "PREFIX asset360: <{NS}/> SELECT ?l WHERE {{ VALUES ?s {{ <{NS}/site/1> }} \
+                 ?s a asset360:Site ; asset360:places ?p . \
+                 ?p a asset360:SpotPlace ; asset360:label ?l }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        let text = plan.to_string();
+        assert!(!text.contains("pass 1  SQL"), "{text}");
+        assert!(
+            text.contains(&format!("identity  {NS}/site/1"))
+                && text.contains(&format!("places.typeURI = '{NS}/SpotPlace'")),
+            "{text}"
+        );
+    }
+
+    /// The reported query (#514): a location typed through two inline hops,
+    /// the second of them a collection off a nested structure -- a shape no
+    /// rule folds into the signal's scan yet. The type must not become a scan
+    /// of its own: that was a second island that dropped the `VALUES`
+    /// narrowing and read every signal.
+    #[test]
+    fn a_typed_location_is_not_a_second_island() {
+        let sv = crate::sparql_scoper::tests::asset360_fixture_schema_view();
+        let query = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             PREFIX irsm: <https://data.infrabel.be/asset360-rsm-subset/> \
+             PREFIX rsm: <http://rsm.uic.org/RSM12#> \
+             SELECT ?loc ?r WHERE { VALUES ?s { <https://data.infrabel.be/data/Signals/2b10> } \
+               ?s a asset360:Signal ; asset360:refersToLocatedNetEntity ?lne . \
+               ?lne rsm:EAID_43382C11_960E_40e0_B6E0_198963C97DF8 ?loc . \
+               ?loc a irsm:SpotLocation ; irsm:locationrole ?r }";
+        let text = crate::sparql_plan::plan_query_refined(query, &sv)
+            .unwrap()
+            .to_string();
+        assert!(!text.contains("pass 1  SQL"), "{text}");
+        assert!(
+            text.contains("identity  https://data.infrabel.be/data/Signals/2b10")
+                && !text.contains("scan      irsm:SpotLocation")
+                && !text.contains("asset360-rsm-subset/SpotLocation  as"),
+            "{text}"
+        );
+
+        let rules = tier_one_rules(&sv, None);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let mut plan = crate::sparql_refine::naive_plan_of(query).unwrap();
+        crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
+        let text = plan.to_string();
+        assert!(!text.contains("scan      irsm:SpotLocation"), "{text}");
+        assert!(
+            text.contains("match     ?loc a irsm:SpotLocation"),
+            "{text}"
+        );
+    }
+
+    /// What the plan cannot say stays with the engine, and is still right: a
+    /// class unrelated to the range matches nothing; the range itself, asserted,
+    /// also matches the element that names no designator, which a path
+    /// condition cannot state.
+    #[test]
+    fn what_a_condition_cannot_say_stays_a_match() {
+        for class in ["Fix", "Place"] {
+            let plan = refine_and_check(&format!(
+                "SELECT ?s ?l WHERE {{ ?s a asset360:Site ; asset360:places ?p . \
+                 ?p a asset360:{class} ; asset360:label ?l }}"
+            ));
+            let text = plan.to_string();
+            assert!(
+                !text.contains(&format!("scan      asset360:{class}")),
+                "{class} is not a record to scan:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("match     ?p a asset360:{class}")),
+                "the triple stays for the engine:\n{text}"
+            );
+        }
     }
 }

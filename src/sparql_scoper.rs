@@ -5531,6 +5531,9 @@ types:
   integer:
     uri: xsd:integer
     base: int
+  uri:
+    uri: xsd:anyURI
+    base: URI
 
 # Partially mapped, as the real `signalType` is: `GSA` carries a `meaning` and
 # renders as that IRI, while `KSS` has none and renders as the IRI minted for
@@ -5753,6 +5756,12 @@ classes:
     attributes:
       label:
         range: string
+      # The class an element is, as `BaseLocation.typeURI` is in the real
+      # datamodel: a full IRI, written by the instance writer, and absent on
+      # an element that is a plain `Place`.
+      typeURI:
+        range: uri
+        designates_type: true
   SpotPlace:
     is_a: Place
     class_uri: asset360:SpotPlace
