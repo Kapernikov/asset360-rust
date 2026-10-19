@@ -1076,10 +1076,17 @@ pub fn check_predicates(
 ///
 /// The one place the family is decided, so the judgement, the reach and the
 /// suggestion cannot disagree about it.
+///
+/// The widest regime's family is used because the refusal exists for
+/// predicates that match under no reading of the query; it must not refuse
+/// one that some data graph answers (a narrower graph just answers fewer
+/// rows, which is the planner's business, not a spelling error).
 fn family(class: &ClassView) -> Option<Vec<ClassView>> {
-    let mut family = vec![class.clone()];
-    family.extend(class.get_descendants(true, false).ok()?);
-    Some(family)
+    linkml_runtime::schema_rdf::type_family(
+        class,
+        linkml_runtime::schema_rdf::TypeRegime::IsAAndMixins,
+    )
+    .ok()
 }
 
 /// What one class, or one class and its subclasses, can carry: the class's

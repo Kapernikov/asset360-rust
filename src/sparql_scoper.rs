@@ -1733,6 +1733,8 @@ fn scope_qualified(
                             builder.type_iri.clone().unwrap_or_default(),
                             nn.as_str().to_owned(),
                         ]),
+                        // regime: R3's Match.regime replaces this constant once the field lands.
+                        linkml_runtime::schema_rdf::TypeRegime::IsA,
                     )
                 {
                     // A parent type beside its subclass (#511): the family of

@@ -54,6 +54,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
+use linkml_runtime::schema_rdf::{TypeRegime, type_family};
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
@@ -582,7 +583,12 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // type the query wrote first.
             let mut subsumed: Vec<NodeId> = Vec::new();
             if classes_on_star.len() != 1 {
-                let Some(specific) = most_specific(self.schema, &classes_on_star) else {
+                let Some(specific) = most_specific(
+                    self.schema,
+                    &classes_on_star,
+                    // regime: R3's Match.regime replaces this constant once the field lands.
+                    TypeRegime::IsA,
+                ) else {
                     continue;
                 };
                 if specific != class_uri {
@@ -5989,14 +5995,19 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for Materialise<M> {
 /// intersection and [`most_specific`] returns `None` for them. Every
 /// subsumption decision in this file goes through here so the regime can be
 /// threaded in later.
-fn type_family(schema: &SchemaView, class_iri: &str) -> Option<BTreeSet<String>> {
+fn family_iris(
+    schema: &SchemaView,
+    class_iri: &str,
+    regime: TypeRegime,
+) -> Option<BTreeSet<String>> {
     let class = schema.get_class_by_uri(class_iri).ok().flatten()?;
-    let mut family: BTreeSet<String> = class
-        .get_descendants(true, false)
+    let converter = schema.converter();
+    let mut family: BTreeSet<String> = type_family(&class, regime)
         .ok()?
         .iter()
-        .map(|descendant| descendant.canonical_uri().to_string())
-        .collect();
+        .map(|member| member.canonical_uri().to_uri(&converter).map(|uri| uri.0))
+        .collect::<Result<_, _>>()
+        .ok()?;
     family.insert(class_iri.to_owned());
     Some(family)
 }
@@ -6005,10 +6016,14 @@ fn type_family(schema: &SchemaView, class_iri: &str) -> Option<BTreeSet<String>>
 /// is one: `C` such that `family(C) ⊆ family(D)` for every other `D`, which
 /// makes `a C ∧ a D ≡ a C`. `None` when the classes are not a chain (or one is
 /// unknown to the schema).
-pub(crate) fn most_specific(schema: &SchemaView, classes: &BTreeSet<String>) -> Option<String> {
+pub(crate) fn most_specific(
+    schema: &SchemaView,
+    classes: &BTreeSet<String>,
+    regime: TypeRegime,
+) -> Option<String> {
     let families: Vec<(&String, BTreeSet<String>)> = classes
         .iter()
-        .map(|class| type_family(schema, class).map(|family| (class, family)))
+        .map(|class| family_iris(schema, class, regime).map(|family| (class, family)))
         .collect::<Option<_>>()?;
     let mut candidates = families.iter().filter(|(class, family)| {
         families
@@ -6034,7 +6049,7 @@ fn slot_on_class_or_descendant(
     if let Some(own) = class.slot(&name) {
         return Some(own);
     }
-    let family = class.get_descendants(true, true).ok()?;
+    let family = type_family(class, TypeRegime::IsAAndMixins).ok()?;
     let mut found: Option<linkml_schemaview::slotview::SlotView> = None;
     for member in &family {
         let Some(slot) = member.slot(&name) else {
@@ -10597,5 +10612,63 @@ mod inline_type_match {
             let text = plan.to_string();
             assert!(text.contains(needle), "{name}: {text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod family_iri_tests {
+    use std::collections::BTreeSet;
+
+    use linkml_meta::SchemaDefinition;
+    use linkml_runtime::schema_rdf::TypeRegime;
+    use linkml_schemaview::schemaview::SchemaView;
+
+    use super::most_specific;
+
+    /// A schema whose classes declare no `class_uri`, so their IRI comes from
+    /// the default prefix.
+    fn default_prefix_schema() -> SchemaView {
+        let raw = r#"
+id: https://example.org/dp
+name: dp
+prefixes:
+  linkml: https://w3id.org/linkml/
+  dp: https://example.org/dp/
+default_prefix: dp
+default_range: string
+classes:
+  Parent:
+    attributes:
+      uri:
+        identifier: true
+  Sub:
+    is_a: Parent
+"#;
+        let schema: SchemaDefinition =
+            serde_path_to_error::deserialize(serde_yml::Deserializer::from_str(raw)).unwrap();
+        let mut sv = SchemaView::new();
+        sv.add_schema(schema).unwrap();
+        sv
+    }
+
+    /// The family members are compared with the full IRIs the star carries,
+    /// whatever form `canonical_uri` takes (a CURIE under a default prefix).
+    #[test]
+    fn a_default_prefix_class_chain_folds_to_the_subclass() {
+        let schema = default_prefix_schema();
+        let sub = schema
+            .get_class_by_uri("https://example.org/dp/Sub")
+            .unwrap()
+            .expect("Sub is addressable by its full IRI");
+        println!("canonical_uri(Sub) = {:?}", sub.canonical_uri());
+        let classes: BTreeSet<String> = [
+            "https://example.org/dp/Sub".to_owned(),
+            "https://example.org/dp/Parent".to_owned(),
+        ]
+        .into();
+        assert_eq!(
+            most_specific(&schema, &classes, TypeRegime::IsA).as_deref(),
+            Some("https://example.org/dp/Sub")
+        );
     }
 }
