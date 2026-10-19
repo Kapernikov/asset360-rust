@@ -5751,6 +5751,30 @@ classes:
         range: Place
         multivalued: true
         inlined: true
+      # A single-valued nested object holding the collection: the hop to
+      # `places` is a fan-out off a chain, not off the record.
+      holder:
+        range: Holder
+        inlined: true
+  Holder:
+    class_uri: asset360:Holder
+    attributes:
+      places:
+        range: Place
+        multivalued: true
+        inlined: true
+      # A single-valued nested object holding the collection: the hop to
+      # `places` is a fan-out off a chain, not off the record.
+      holder:
+        range: Holder
+        inlined: true
+  Holder:
+    class_uri: asset360:Holder
+    attributes:
+      places:
+        range: Place
+        multivalued: true
+        inlined: true
   Place:
     class_uri: asset360:Place
     attributes:
@@ -5786,6 +5810,9 @@ classes:
     attributes:
       source:
         range: string
+      typeURI:
+        range: uri
+        designates_type: true
   GeoFix:
     is_a: Fix
     class_uri: asset360:GeoFix

@@ -1763,13 +1763,16 @@ fn prefix_crosses_a_collection(schema: &SchemaView, class_uri: &str, path: &[Str
 ///   stores an identifier, so the value beyond it lives in *another record*
 ///   and is a join rather than a path -- walking into it would read a column
 ///   that does not exist.
-/// * **The nested slot is single-valued.** A multivalued one fans out, and a
-///   scan owes an [`PlanOp::Unnest`] for every multivalued slot it reads
-///   (invariant five). This rule extends a scan that already exists, so it
-///   cannot honour that debt through [`scan_with_fanout`] -- the one function
-///   allowed to build a scan -- and paying it by hand is exactly the
-///   discipline stage 1 replaced with a constructor. Lifting this means
-///   rebuilding the scan through that function, not editing it here.
+/// * **The nested slot is single-valued, or its fan-out is placed with the
+///   scan's own.** A multivalued one fans out, and a scan owes an
+///   [`PlanOp::Unnest`] for every multivalued slot it reads (invariant five).
+///   Two shapes are folded, each with its unnest inserted in the same edit:
+///   a hop off an *element* the plan already unnests (nested fan-out), and a
+///   hop off a single-valued nested *chain* (`record.a.b.slot`, no collection
+///   or reference on the way). The latter is the record-level fan-out with a
+///   longer path: the chain is one present structure per scan row, so one
+///   solution per element of its array is one row per element of that array,
+///   which is the `Unnest` of the whole path directly above the scan.
 /// * **The match's one consumer is a plain `Join` on the subject variable,
 ///   whose other side takes every row from that scan.** As for a constant
 ///   object: a nested read inside an `OPTIONAL` is not a column of the
@@ -1870,13 +1873,27 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             if multivalued && site.prefix.is_empty() {
                 continue;
             }
-            if multivalued
-                && !plan.nodes.iter().enumerate().any(|(unnest, node)| {
-                    matches!(&node.op, PlanOp::Unnest { star_var, slot_path, .. }
-                        if *star_var == site.star_var && *slot_path == site.prefix)
-                        && plan.feeds(unnest, other)
-                })
-            {
+            let off_an_element = plan.nodes.iter().enumerate().any(|(unnest, node)| {
+                matches!(&node.op, PlanOp::Unnest { star_var, slot_path, .. }
+                    if *star_var == site.star_var && *slot_path == site.prefix)
+                    && plan.feeds(unnest, other)
+            });
+            // **A multivalued hop off a single-valued nested chain** is the
+            // record-level fan-out with a longer path. Where the prefix crosses
+            // no collection and no reference (`class_at_path` declines both),
+            // `record.prefix` is exactly one structure -- present, since the
+            // site is a mandatory read -- so "one solution per element of
+            // `record.prefix.slot`" is "one row per element of that array",
+            // which is what an `Unnest` of the whole path yields from the scan
+            // row: `scan_with_fanout`'s unnest, over a path of several hops.
+            // The match and the join that carried it say nothing more (the
+            // join is on `?lne`, which the scan already binds, once per row),
+            // and a record whose chain or array is empty has no solution in
+            // either reading (`Required`).
+            let off_a_chain = !off_an_element
+                && !prefix_crosses_a_collection(self.schema, &site.class_uri, &site.prefix)
+                && class_at_path(self.schema, &site.class_uri, &site.prefix).is_some();
+            if multivalued && !off_an_element && !off_a_chain {
                 continue;
             }
             let scan = site.scan;
@@ -1900,18 +1917,22 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
                 // Above the outer element's fan-out, which is where the
                 // element is a row: the nested unnest reads it.
                 let scan = plan.node(scan_key).expect("the scan is live");
-                let outer = plan
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .position(|(id, node)| {
-                        matches!(&node.op, PlanOp::Unnest { star_var, slot_path, .. }
-                            if *star_var == star && slot_path.as_slice() == prefix.as_slice())
-                            // *This* scan's fan-out: a star per scope has one
-                            // each.
-                            && plan.feeds(scan, id)
-                    })
-                    .expect("the outer fan-out this fold rests on");
+                let outer = if off_a_chain {
+                    // The scan row is the element's holder: fan out from it.
+                    scan
+                } else {
+                    plan.nodes
+                        .iter()
+                        .enumerate()
+                        .position(|(id, node)| {
+                            matches!(&node.op, PlanOp::Unnest { star_var, slot_path, .. }
+                                if *star_var == star && slot_path.as_slice() == prefix.as_slice())
+                                // *This* scan's fan-out: a star per scope has one
+                                // each.
+                                && plan.feeds(scan, id)
+                        })
+                        .expect("the outer fan-out this fold rests on")
+                };
                 insert_required_unnest_above(plan, outer, &star, path, var);
             }
             return true;
@@ -10097,7 +10118,28 @@ mod inline_type_match {
                  {{"typeURI": "{NS}/RoadPlace", "label": "road2"}}]}}"#
         );
         let three = format!(r#"{{"asset360_uri": "{NS}/site/3"}}"#);
-        Oracle::new(sv, &[("Site", &one), ("Site", &two), ("Site", &three)])
+        // The collection behind a single-valued nested object, with a spot
+        // place whose fix is a `GeoFix`, one whose fix is a plain `Fix`, and
+        // an empty holder.
+        let four = format!(
+            r#"{{"asset360_uri": "{NS}/site/4", "holder": {{"places": [
+                 {{"typeURI": "{NS}/SpotPlace", "label": "s1",
+                   "coords": {{"typeURI": "{NS}/GeoFix", "source": "g", "lat": 5}}}},
+                 {{"typeURI": "{NS}/SpotPlace", "label": "s2", "coords": {{"source": "plain"}}}},
+                 {{"typeURI": "{NS}/RoadPlace", "label": "r1"}},
+                 {{"label": "p1"}}]}}}}"#
+        );
+        let five = format!(r#"{{"asset360_uri": "{NS}/site/5", "holder": {{}}}}"#);
+        Oracle::new(
+            sv,
+            &[
+                ("Site", &one),
+                ("Site", &two),
+                ("Site", &three),
+                ("Site", &four),
+                ("Site", &five),
+            ],
+        )
     }
 
     fn refine_and_check(query: &str) -> crate::sparql_refine::Plan {
@@ -10202,8 +10244,9 @@ mod inline_type_match {
         let text = plan.to_string();
         assert!(!text.contains("scan      irsm:SpotLocation"), "{text}");
         assert!(
-            text.contains("match     ?loc a irsm:SpotLocation"),
-            "{text}"
+            !text.contains("match     ?loc a irsm:SpotLocation")
+                && text.contains("locations.typeURI[each] = <"),
+            "the type is a designator condition on the folded collection:\n{text}"
         );
     }
 
@@ -10227,6 +10270,91 @@ mod inline_type_match {
                 text.contains(&format!("match     ?p a asset360:{class}")),
                 "the triple stays for the engine:\n{text}"
             );
+        }
+    }
+
+    /// A collection behind a single-valued nested object folds into the
+    /// record's scan as one fan-out over the whole path, so both issue shapes
+    /// are one SQL statement: the #513 walk through subclass-only slots, and
+    /// the #514 type on the elements.
+    #[test]
+    fn a_collection_off_a_nested_chain_is_one_sql_pass() {
+        let sv = test_schema_view();
+        for (query, needle, answer) in [
+            (
+                "SELECT ?s ?lat WHERE { ?s a asset360:Site ; asset360:holder ?n . \
+                 ?n asset360:places ?p . ?p asset360:coords ?c . ?c asset360:lat ?lat }",
+                "holder.places",
+                "5",
+            ),
+            (
+                "SELECT ?s ?l WHERE { ?s a asset360:Site ; asset360:holder ?n . \
+                 ?n asset360:places ?p . ?p a asset360:SpotPlace ; asset360:label ?l }",
+                "holder.places.typeURI[each]",
+                "s2",
+            ),
+        ] {
+            let plan = refine_and_check(query);
+            let text = plan.to_string();
+            assert!(
+                plan.nodes
+                    .iter()
+                    .all(|node| node.executor == crate::sparql_refine::Executor::Sql),
+                "{query}\n{text}"
+            );
+            assert!(text.contains(needle), "{needle}\n{text}");
+            assert!(!text.contains("match "), "{text}");
+            let answers = oracle(&sv).answers_to(&format!("PREFIX asset360: <{NS}/> {query}"));
+            assert!(
+                answers
+                    .keys()
+                    .any(|row| row.values().any(|v| v.contains(answer))),
+                "{answers:?}"
+            );
+            let production = crate::sparql_plan::plan_query_refined(
+                &format!("PREFIX asset360: <{NS}/> {query}"),
+                &sv,
+            )
+            .unwrap()
+            .to_string();
+            assert!(!production.contains("pass 1"), "{production}");
+        }
+    }
+
+    /// Both issue queries on the real datamodel, without `VALUES`: the signal's
+    /// location collection is one fan-out in the scan's own statement, and the
+    /// type on its elements is a designator condition.
+    #[test]
+    fn the_real_schema_plans_both_issue_shapes_in_one_pass() {
+        let sv = crate::sparql_scoper::tests::asset360_fixture_schema_view();
+        let head = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             PREFIX irsm: <https://data.infrabel.be/asset360-rsm-subset/> \
+             PREFIX rsm: <http://rsm.uic.org/RSM12#> ";
+        let locations = "?s a asset360:Signal ; asset360:refersToLocatedNetEntity ?lne . \
+             ?lne rsm:EAID_43382C11_960E_40e0_B6E0_198963C97DF8 ?loc .";
+        for (name, body, needle) in [
+            (
+                "#513",
+                "SELECT ?s WHERE { LOC ?loc rsm:EAID_9B4FDB13_51CB_47d8_AD9E_E1F190422B77 ?c }",
+                "refersToLocatedNetEntity.locations",
+            ),
+            (
+                "#514",
+                "SELECT ?s ?r WHERE { LOC ?loc a irsm:SpotLocation ; irsm:locationrole ?r }",
+                "typeURI",
+            ),
+        ] {
+            let query = format!("{head}{}", body.replace("LOC", locations));
+            let production = crate::sparql_plan::plan_query_refined(&query, &sv)
+                .unwrap()
+                .to_string();
+            assert!(production.contains("all in SQL"), "{name}: {production}");
+            let rules = tier_one_rules(&sv, None);
+            let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            let mut plan = crate::sparql_refine::naive_plan_of(&query).unwrap();
+            crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
+            let text = plan.to_string();
+            assert!(text.contains(needle), "{name}: {text}");
         }
     }
 }

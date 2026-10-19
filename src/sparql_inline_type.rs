@@ -180,9 +180,14 @@ mod tests {
     fn a_range_without_a_designator_is_all_one_class() {
         use InlineTypeTest::*;
         for regime in TypeRegime::ALL {
-            assert_eq!(test("Fix", "GeoFix", regime), NeverMatches, "{regime:?}");
-            assert_eq!(test("Fix", "Place", regime), NeverMatches, "{regime:?}");
+            assert_eq!(
+                test("Detail", "Coordinates", regime),
+                NeverMatches,
+                "{regime:?}"
+            );
+            assert_eq!(test("Detail", "Place", regime), NeverMatches, "{regime:?}");
         }
-        assert_eq!(test("Fix", "Fix", TypeRegime::Asserted), Discharged);
+        assert_eq!(test("Detail", "Detail", TypeRegime::Asserted), Discharged);
+        assert_eq!(test("Detail", "Detail", TypeRegime::IsA), Discharged);
     }
 }
