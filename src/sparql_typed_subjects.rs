@@ -67,6 +67,23 @@
 //! as filtering after it, multiplicities included. Every other shape is left
 //! alone.
 //!
+//! **Precondition: the body's other variables are private to it.** The claim
+//! that the predicate depends only on `(s, t)` holds only if `?sub` is bound by
+//! nothing outside the NOT EXISTS. If the left side binds it (say
+//! `VALUES ?sub { :Asset }`), the NOT EXISTS tests one fixed `sub`, not "some
+//! type of `s`", and it no longer computes the most specific type. So the rule
+//! refuses when anything in the *whole* left subtree binds a body variable
+//! other than `?s` and `?t`, and when the body is anything but the two
+//! patterns (no extra triple or filter).
+//!
+//! **One spelling, on purpose.** Only this exact shape is recognised: `?s a
+//! ?t` against `?s a ?sub . GRAPH <G> { ?sub rdfs:subClassOf+ ?t }` in a NOT
+//! EXISTS. Equivalent spellings (`FILTER NOT EXISTS` with the patterns
+//! reordered inside other shapes, `MINUS`, `rdfs:subClassOf*`, an `OPTIONAL` +
+//! `!BOUND`, ...) are not rewritten and the engine answers them as written:
+//! each would need its own proof, and a recogniser that guesses is how a
+//! rewrite changes answers.
+//!
 //! # The dataset
 //!
 //! The one question this rule asks the dataset is *what regime does the schema
@@ -339,6 +356,24 @@ impl MostSpecificTypeIsTheDirectType<'_> {
         if s == sub || s == path_sup || sub == path_sup || sub_regime != *regime {
             return None;
         }
+        // The body is exactly the four nodes the spelling names (the join,
+        // the `?s a ?sub` match, the graph and its path): no extra triple or
+        // filter hides in it.
+        if body.len() != 4 {
+            return None;
+        }
+        // Precondition of the proof: the filter depends on `(?s, ?t)` alone.
+        // The body's other variables (`?sub`) must be private to it, so
+        // nothing in the whole left subtree -- a VALUES, another pattern, a
+        // BIND -- may bind any variable of the body besides `?s` and `?t`.
+        let bound_left = plan.variables_of(kept);
+        let body_vars = plan.variables_of(right);
+        if body_vars
+            .iter()
+            .any(|v| *v != s && *v != path_sup && bound_left.contains(v))
+        {
+            return None;
+        }
         Some(Found {
             anti,
             kept,
@@ -564,6 +599,33 @@ classes:
             plan.contains("directType") && plan.contains("name"),
             "{plan}"
         );
+    }
+
+    /// F2 of the rules review: `?sub` bound outside the NOT EXISTS makes the
+    /// filter depend on more than `(?s, ?t)`. With `?sub` fixed to `Root`, only
+    /// the types below `Root` are dropped, so the filter is not "most specific
+    /// type" and the rewrite would change the answer. Any variable of the body
+    /// the left side binds, whatever binds it, refuses the rewrite.
+    #[test]
+    fn a_body_variable_bound_on_the_left_leaves_the_plan_alone() {
+        let sv = schema_view();
+        let dataset = serving(TypeRegime::IsA, TypeRegime::IsA);
+        let not_exists = format!(
+            "FILTER NOT EXISTS {{ ?s a ?sub . GRAPH <{G}> {{ ?sub rdfs:subClassOf+ ?t }} }}"
+        );
+        for left in [
+            "VALUES ?sub { <https://example.org/typed/Root> } ?s a ?t",
+            "?s a ?t VALUES ?sub { <https://example.org/typed/Root> }",
+            "?s a ?t . ?s <https://example.org/typed/name> ?sub",
+        ] {
+            let (fired, plan) = refined(
+                &sv,
+                &dataset,
+                &format!("SELECT ?s ?t WHERE {{ {left} {not_exists} }}"),
+            );
+            assert!(!fired, "{left}:\n{plan}");
+            assert!(plan.contains("antijoin"), "{left}:\n{plan}");
+        }
     }
 
     #[test]

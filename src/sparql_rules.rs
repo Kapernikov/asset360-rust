@@ -559,9 +559,16 @@ impl Rule for FoldMatchesIntoScan<'_> {
                         type_class_iri(pattern).map(|class| (other_id, class.to_owned()))
                     }
                     PlanOp::Filter {
-                        condition: crate::sparql_refine::Expr::InClass { var, class_uri, .. },
+                        condition:
+                            crate::sparql_refine::Expr::InClass {
+                                var,
+                                class_uri,
+                                regime: other_regime,
+                            },
                         ..
-                    } if var == star => Some((other_id, class_uri.clone())),
+                    } if var == star && *other_regime == regime => {
+                        Some((other_id, class_uri.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -581,8 +588,12 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // intersection is empty and a scan of the subclass would invent
             // answers. Under `IsA` the subclass's family is inside its
             // parent's, `a Child ∧ a Parent ≡ a Child`, and the fold is exact.
-            // A restriction carries no regime of its own; it takes the one
-            // resolved above from the matches it folds with.
+            // An `InClass` restriction carries the regime of the read it was
+            // derived from, and the collection above counts it only when
+            // that regime is the folding node's own: a restriction in
+            // another regime is not a type read of this star. A folding
+            // node that is itself a restriction folds in the regime the
+            // restriction carries.
             let mut subsumed: Vec<NodeId> = Vec::new();
             if classes_on_star.len() != 1 {
                 let Some(specific) = most_specific(self.schema, &classes_on_star, regime) else {
@@ -6408,12 +6419,12 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for Materialise<M> {
 /// The classes a type read on `class_iri` ranges over: the class and its
 /// descendants.
 ///
-/// regime: this is the *inferred* regime, where an instance of `Signal` is
-/// also an `Asset`. Under the asserted regime the family of a class is the
-/// class alone, so two different classes on one subject are an empty
-/// intersection and [`most_specific`] returns `None` for them. Every
-/// subsumption decision in this file goes through here so the regime can be
-/// threaded in later.
+/// `regime` is the data regime of the reads being compared. Under an
+/// inferred regime an instance of `Signal` is also an `Asset`. Under the
+/// asserted regime the family of a class is the class alone, so two different
+/// classes on one subject are an empty intersection and [`most_specific`]
+/// returns `None` for them. Every subsumption decision in this file goes
+/// through here, so the regime is always the caller's.
 fn family_iris(
     schema: &SchemaView,
     class_iri: &str,
@@ -6873,6 +6884,61 @@ mod tests {
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert!(log.applied.is_empty(), "{plan}");
             assert_eq!(plan.find("match").len(), 2, "{plan}");
+        }
+    }
+
+    /// Wrap the voltage read of `plan` in an `InClass` restriction of
+    /// `class_uri` in `regime`, as one pushed down by an earlier rule sits: on
+    /// one side of the join, inside the star's group.
+    fn with_restriction(plan: &mut Plan, class_uri: &str, regime: TypeRegime) {
+        let join = plan.find("match")[1];
+        let mut nodes = plan.nodes.clone();
+        nodes.insert(
+            join + 1,
+            Node::engine(
+                PlanOp::Filter {
+                    input: join,
+                    condition: Expr::InClass {
+                        var: "s".to_owned(),
+                        class_uri: class_uri.to_owned(),
+                        regime,
+                    },
+                },
+                Vec::new(),
+            ),
+        );
+        let remap: Vec<Option<NodeId>> = (0..plan.nodes.len())
+            .map(|id| Some(if id > join { id + 1 } else { id }))
+            .collect();
+        for node in nodes.iter_mut().skip(join + 2) {
+            node.op.map_inputs(|input| remap[input].unwrap());
+        }
+        // The join reads the restriction now, not the match.
+        if let PlanOp::Join { right, .. } = &mut nodes[join + 2].op {
+            *right = join + 1;
+        }
+        plan.rebuild(nodes, &remap);
+    }
+
+    /// A restriction in another regime is not a type read of this star: it
+    /// does not join the chain (#511), and is left where it was.
+    #[test]
+    fn a_restriction_in_another_regime_does_not_join_the_chain() {
+        let schema = test_schema_view();
+        let rule = FoldMatchesIntoScan::new(&schema);
+        let query = "SELECT ?s ?v WHERE { ?s a asset360:Relay ; asset360:voltage ?v }";
+        let equipment = "https://data.infrabel.be/asset360/Equipment";
+        for (regime, absorbed) in [(TypeRegime::IsA, true), (TypeRegime::Asserted, false)] {
+            let mut plan = plan_in(query, TypeRegime::IsA);
+            with_restriction(&mut plan, equipment, regime);
+            let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
+            assert_eq!(log.applied.len(), 1, "{regime:?}\n{plan}");
+            assert_eq!(plan.find("scan").len(), 1, "{regime:?}\n{plan}");
+            assert_eq!(
+                plan.find("filter").is_empty(),
+                absorbed,
+                "{regime:?}\n{plan}"
+            );
         }
     }
 
