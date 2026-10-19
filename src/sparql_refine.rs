@@ -2668,6 +2668,11 @@ pub struct Plan {
     /// consumer still sees the variable -- produced above the barrier
     /// instead of inside it.
     pub lifted_exports: Vec<LiftedExport>,
+    /// The regime a triple outside any `GRAPH` is read under: the dataset's
+    /// default graph (or the `FROM` graphs) of the query, `None` when the
+    /// default graph is no data graph. Only the printout reads it: asserted is
+    /// printed bare when it is this, and said when it is not.
+    pub default_regime: Option<TypeRegime>,
 }
 
 /// An export moved out of a barrier by a lifting rule (see
@@ -2839,6 +2844,7 @@ impl Plan {
             transfers: Vec::new(),
             rewrites: Vec::new(),
             lifted_exports: Vec::new(),
+            default_regime: None,
         };
         plan.install(nodes);
         plan.record_origins();
@@ -3660,6 +3666,22 @@ impl Plan {
 impl fmt::Display for Plan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Plan ({} → {})", self.form.as_str(), self.form.expects())?;
+        // The nodes a printed `GRAPH` is above: what explains a match that
+        // reads no data graph.
+        let mut under_graph = vec![false; self.nodes.len()];
+        for (id, node) in self.nodes.iter().enumerate() {
+            if matches!(node.op, PlanOp::Graph { .. }) {
+                let mut stack = vec![id];
+                while let Some(at) = stack.pop() {
+                    for input in self.nodes[at].op.input_ids() {
+                        if !under_graph[input] {
+                            under_graph[input] = true;
+                            stack.push(input);
+                        }
+                    }
+                }
+            }
+        }
         for (id, node) in self.nodes.iter().enumerate() {
             let claims = if node.discharges.is_empty() {
                 String::new()
@@ -3673,7 +3695,10 @@ impl fmt::Display for Plan {
                         .join(" ")
                 )
             };
-            let mut describe = node.op.describe();
+            let mut describe = node.op.describe_with(RegimeContext::Plan {
+                default: self.default_regime,
+                under_graph: under_graph[id],
+            });
             if let Some(note) = crate::sparql_constant::lowered_note(self, id) {
                 describe = format!("{describe}  {note}");
             }
@@ -3719,9 +3744,16 @@ impl PlanOp {
     /// "the same plan" has to be stated in terms of node descriptions rather
     /// than of `n3`.
     pub fn describe(&self) -> String {
+        self.describe_with(RegimeContext::Bare)
+    }
+
+    /// [`PlanOp::describe`] with the context the plan's printout has, so a
+    /// match reading no data graph and one reading the asserted graph are
+    /// told apart (see [`regime_tag`]).
+    fn describe_with(&self, context: RegimeContext) -> String {
         match self {
             PlanOp::Unit => "{}".to_owned(),
-            PlanOp::Match { pattern, regime } => match regime.and_then(regime_label) {
+            PlanOp::Match { pattern, regime } => match regime_tag(*regime, context) {
                 Some(label) => format!("{} [{label}]", triple_text(pattern)),
                 None => triple_text(pattern),
             },
@@ -3884,7 +3916,7 @@ impl PlanOp {
             } => format!(
                 "{}{}{} as ?{star_var}{}{}{}, requires [{}]",
                 shorten(class_uri),
-                regime_label(*regime)
+                regime_tag(Some(*regime), context)
                     .map(|label| format!(" [{label}]"))
                     .unwrap_or_default(),
                 {
@@ -4147,9 +4179,46 @@ pub fn naive_plan_in(query: &Query, dataset: &DatasetSpec) -> Result<Plan, Refin
     debug_assert_eq!(root, builder.nodes.len() - 1, "the root is the last node");
 
     let nodes = builder.nodes;
-    let plan = Plan::from_nodes(form, obligations, nodes);
+    let mut plan = Plan::from_nodes(form, obligations, nodes);
+    plan.default_regime = default_regime;
     plan.check().map_err(RefineError::Defect)?;
     Ok(plan)
+}
+
+/// How a node's regime is told in plan text. The plan's printout knows its
+/// default regime and which nodes sit under a printed `GRAPH`; the
+/// context-free [`PlanOp::describe`] does not and keeps the short spelling.
+#[derive(Debug, Clone, Copy)]
+enum RegimeContext {
+    /// No plan around: asserted and "no regime" are both bare.
+    Bare,
+    /// Printed as part of a plan.
+    Plan {
+        default: Option<TypeRegime>,
+        under_graph: bool,
+    },
+}
+
+/// The tag a node's regime carries in plan text. The regimes other than
+/// asserted always say so ([`regime_label`]); asserted is bare only when it is
+/// what the plan reads by default, and is `[asserted]` otherwise, so it can
+/// never be taken for "no data graph". A match with no regime says
+/// `[no data graph]` unless a printed `GRAPH` above it is the explanation.
+fn regime_tag(regime: Option<TypeRegime>, context: RegimeContext) -> Option<&'static str> {
+    let RegimeContext::Plan {
+        default,
+        under_graph,
+    } = context
+    else {
+        return regime.and_then(regime_label);
+    };
+    match regime {
+        Some(TypeRegime::Asserted) if default == Some(TypeRegime::Asserted) => None,
+        Some(TypeRegime::Asserted) => Some("asserted"),
+        Some(other) => regime_label(other),
+        None if under_graph => None,
+        None => Some("no data graph"),
+    }
 }
 
 /// The label a regime carries in plan text. `None` for
@@ -5604,6 +5673,57 @@ mod tests {
         // A plan that reads the regime of another graph than its default
         // says so in its text.
         assert!(mixed.to_string().contains("[is_a]"), "{mixed}");
+    }
+
+    /// Review F9: the text tells a match that reads no data graph from one
+    /// that reads the asserted graph. Asserted is bare only when it is the
+    /// plan's own default; under another default it is said (`[asserted]`),
+    /// and a match outside a printed `GRAPH` that reads no regime says so.
+    #[test]
+    fn the_plan_text_tells_no_data_graph_from_the_asserted_one() {
+        const A: &str = "urn:graph:asserted";
+        const S: &str = "urn:graph:schema";
+        let sv = crate::sparql_scoper::tests::test_schema_view();
+        let text = |default: TypeRegime, query: &str| {
+            let dataset = DatasetSpec::new(default)
+                .with_data_graph(A, TypeRegime::Asserted)
+                .with_schema_graph(S, TypeRegime::IsA);
+            let parsed =
+                crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
+            naive_plan_in(&parsed, &dataset).unwrap().to_string()
+        };
+        let body = "?s asset360:name ?n";
+        // The default regime, asserted: as it always printed.
+        let plain = text(
+            TypeRegime::Asserted,
+            &format!("SELECT ?s WHERE {{ {body} }}"),
+        );
+        assert!(
+            !plain.contains("[asserted]") && !plain.contains("[no data"),
+            "{plain}"
+        );
+        // Asserted under another default is said.
+        let in_a = text(
+            TypeRegime::IsA,
+            &format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"),
+        );
+        assert!(in_a.contains("[asserted]"), "{in_a}");
+        // No data graph, outside any printed GRAPH: said, and not the same
+        // text as the asserted match.
+        let nowhere = text(
+            TypeRegime::Asserted,
+            &format!("SELECT ?s FROM <urn:unknown> WHERE {{ {body} }}"),
+        );
+        assert!(nowhere.contains("[no data graph]"), "{nowhere}");
+        // Under a printed GRAPH the graph is the explanation: no tag.
+        let under_graph = text(
+            TypeRegime::Asserted,
+            &format!("SELECT ?s WHERE {{ GRAPH <{S}> {{ {body} }} }}"),
+        );
+        assert!(
+            under_graph.contains("graph ") && !under_graph.contains("[no data"),
+            "{under_graph}"
+        );
     }
 
     /// A regime is on every matched triple and every scan: a triple outside
