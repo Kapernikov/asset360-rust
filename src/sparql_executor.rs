@@ -1217,6 +1217,47 @@ classes:
         ));
     }
 
+    /// SPARQL 1.1 section 13.2: with `FROM NAMED` and no `FROM` the default
+    /// graph is empty; with `FROM` and no `FROM NAMED` the named graph set is
+    /// empty; with neither, the store's graphs. The engine must be told
+    /// exactly what the query said, so each case is asked here.
+    #[test]
+    fn the_three_dataset_cases_in_the_engine() {
+        let sv = test_schema_view();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let dataset = crate::sparql_dataset::default_dataset();
+        let rows = |query: &str| {
+            let answer = sparql_execute(
+                &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+                &refs,
+                &sv,
+                ExecuteLimits::default(),
+                dataset,
+            )
+            .unwrap_or_else(|e| panic!("`{query}`: {e}"));
+            let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+            parsed["results"]["bindings"].as_array().unwrap().len()
+        };
+        let body = "?s a asset360:Signal";
+        // No clause: the records.
+        assert_eq!(rows(&format!("SELECT ?s WHERE {{ {body} }}")), 2);
+        // `FROM NAMED` alone: an empty default graph.
+        assert_eq!(
+            rows(&format!(
+                "SELECT ?s FROM NAMED <urn:empty> WHERE {{ {body} }}"
+            )),
+            0
+        );
+        // `FROM` alone: no named graphs.
+        assert_eq!(
+            rows(&format!(
+                "SELECT ?s FROM <urn:empty> WHERE {{ GRAPH ?g {{ {body} }} }}"
+            )),
+            0
+        );
+    }
+
     #[test]
     fn test_ask_query() {
         let sv = test_schema_view();
@@ -2228,7 +2269,9 @@ classes:
                     &sv,
                     &primary,
                     &conv,
-                    TurtleOptions::default().with_skolem(false),
+                    TurtleOptions::default()
+                        .with_skolem(false)
+                        .with_regime(linkml_runtime::schema_rdf::TypeRegime::Asserted),
                 )
                 .unwrap();
                 store
@@ -2449,7 +2492,9 @@ classes:
             &sv,
             &primary,
             &conv,
-            TurtleOptions::default().with_skolem(false),
+            TurtleOptions::default()
+                .with_skolem(false)
+                .with_regime(linkml_runtime::schema_rdf::TypeRegime::Asserted),
         )
         .unwrap();
 

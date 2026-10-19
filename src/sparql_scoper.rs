@@ -8822,6 +8822,12 @@ classes:
             "SELECT ?s FROM NAMED <{A}> WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
         ));
         assert_eq!(outside.inexact, Some(Inexact::NamedGraph));
+        // `FROM NAMED` alone leaves the default graph empty (SPARQL 1.1
+        // 13.2), so a pattern outside a `GRAPH` is not the records either.
+        let empty_default = scoped(&format!(
+            "SELECT ?s FROM NAMED <{A}> WHERE {{ ?s a asset360:Signal }}"
+        ));
+        assert_eq!(empty_default.inexact, Some(Inexact::NamedGraph));
     }
 
     /// A star reads its records under the regime of its `rdf:type` triple's

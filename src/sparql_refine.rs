@@ -4076,8 +4076,9 @@ pub fn naive_plan_in(query: &Query, dataset: &DatasetSpec) -> Result<Plan, Refin
     let graphs = QueryGraphs::new(dataset, crate::sparql_scoper::dataset_of(query));
     let default_regime = match graphs.default_reads() {
         GraphReads::Data(regime) => Some(regime),
-        GraphReads::Schema | GraphReads::Other => None,
+        GraphReads::Schema | GraphReads::Other | GraphReads::Empty => None,
     };
+    let default_is_empty = graphs.default_reads() == GraphReads::Empty;
     let obligations = crate::sparql_plan::obligations_of(query)?;
     let form = QueryForm::of(query);
     let pattern = match query {
@@ -4108,6 +4109,7 @@ pub fn naive_plan_in(query: &Query, dataset: &DatasetSpec) -> Result<Plan, Refin
         domains_opened: 0,
         graphs,
         regime: default_regime,
+        empty: default_is_empty,
     };
     let mut root = builder.pattern(pattern, true);
 
@@ -4210,6 +4212,11 @@ struct Builder<'o> {
     /// a variable, a graph the endpoint does not serve), which no data rule
     /// may fold.
     regime: Option<TypeRegime>,
+    /// The graph the walk is in is the empty graph (the default graph of a
+    /// query with `FROM NAMED` and no `FROM`): a triple pattern matched here
+    /// has no solution, so it is planned as the empty relation, not as a
+    /// match for some rule or the engine to find out about.
+    empty: bool,
 }
 
 impl Builder<'_> {
@@ -4600,11 +4607,14 @@ impl Builder<'_> {
                 };
                 let regime = match reads {
                     GraphReads::Data(regime) => Some(regime),
-                    GraphReads::Schema | GraphReads::Other => None,
+                    GraphReads::Schema | GraphReads::Other | GraphReads::Empty => None,
                 };
                 let outer = std::mem::replace(&mut self.regime, regime);
+                // A named graph is never the empty default graph.
+                let outer_empty = std::mem::replace(&mut self.empty, false);
                 let input = self.pattern(inner, on_spine);
                 self.regime = outer;
+                self.empty = outer_empty;
                 // A data graph holds the records every `Match` reads, so the
                 // `GRAPH` says nothing the matches do not: each carries the
                 // graph's regime. No node for it, hence none of the rules
@@ -4731,14 +4741,21 @@ impl Builder<'_> {
                 vars.insert(variable.as_str().to_owned());
             }
             add_term_var(&pattern.object, &mut vars);
-            let node = self.push(
+            let op = if self.empty {
+                PlanOp::Values {
+                    variables: vars
+                        .iter()
+                        .map(|name| spargebra::term::Variable::new_unchecked(name.as_str()))
+                        .collect(),
+                    rows: Vec::new(),
+                }
+            } else {
                 PlanOp::Match {
                     pattern: Box::new(pattern.clone()),
                     regime: self.match_regime(),
-                },
-                claims,
-                vars,
-            );
+                }
+            };
+            let node = self.push(op, claims, vars);
             current = Some(match current {
                 Some(left) => self.join(left, node),
                 None => node,
@@ -5489,12 +5506,14 @@ mod tests {
         let in_inferred = plan(&format!("SELECT ?s WHERE {{ GRAPH <{I}> {body} }}"));
         assert_eq!(regimes(&in_inferred), vec![Some(TypeRegime::IsA); 2]);
         assert_eq!(graph_nodes(&in_inferred), 0, "{in_inferred}");
-        // A `FROM` alone restricts no named graph (it parses as an empty
-        // `FROM NAMED` list).
+        // A `FROM` alone leaves no named graph (it parses as an empty
+        // `FROM NAMED` list, SPARQL 1.1 13.2): `GRAPH <I>` reads nothing the
+        // plan can name, and is the engine's to say so.
         let from_and_graph = plan(&format!(
             "SELECT ?s FROM <{A}> WHERE {{ GRAPH <{I}> {body} }}"
         ));
-        assert_eq!(regimes(&from_and_graph), vec![Some(TypeRegime::IsA); 2]);
+        assert_eq!(regimes(&from_and_graph), vec![None; 2]);
+        assert_eq!(graph_nodes(&from_and_graph), 1);
         // `GRAPH ?g` and the schema graph stay, and read no regime.
         for graph in ["?g".to_owned(), format!("<{S}>")] {
             let kept = plan(&format!("SELECT ?s WHERE {{ GRAPH {graph} {body} }}"));
@@ -5508,6 +5527,38 @@ mod tests {
         ));
         assert_eq!(regimes(&outside), vec![None; 2]);
         assert_eq!(graph_nodes(&outside), 1);
+
+        // `FROM NAMED` and no `FROM`: the default graph is the empty graph
+        // (SPARQL 1.1 13.2). A pattern outside any `GRAPH` is the empty
+        // relation -- no match left for anything to find out about -- while
+        // `GRAPH <named>` inside the same query still reads the graph it
+        // lists, under that graph's regime.
+        let empty_default = plan(&format!("SELECT ?s FROM NAMED <{I}> WHERE {body}"));
+        assert!(matches(&empty_default).is_empty(), "{empty_default}");
+        let empty_rows = empty_default
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.op, PlanOp::Values { rows, .. } if rows.is_empty()))
+            .count();
+        assert_eq!(empty_rows, 2, "{empty_default}");
+        let listed = plan(&format!(
+            "SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {body} }}"
+        ));
+        assert_eq!(regimes(&listed), vec![Some(TypeRegime::IsA); 2]);
+        assert_eq!(graph_nodes(&listed), 0);
+        // Both at once: the `FROM` graph is the default, the `FROM NAMED`
+        // graph the named one.
+        let both = plan(&format!(
+            "SELECT ?s FROM <{A}> FROM NAMED <{I}> WHERE {{ {body} GRAPH <{I}> {{ ?s asset360:code ?c }} }}"
+        ));
+        assert_eq!(
+            regimes(&both),
+            vec![
+                Some(TypeRegime::Asserted),
+                Some(TypeRegime::Asserted),
+                Some(TypeRegime::IsA)
+            ]
+        );
 
         // Per pattern: the type of one graph, the type of another.
         let mixed = plan(&format!(

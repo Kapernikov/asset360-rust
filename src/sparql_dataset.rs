@@ -274,10 +274,9 @@ impl DatasetSpec {
     /// graph the engine would not show the query.
     pub(crate) fn seen_through(&self, clause: Option<&spargebra::algebra::QueryDataset>) -> Self {
         let mut seen = self.clone();
-        if let Some(named) = clause
-            .and_then(|clause| clause.named.as_ref())
-            .filter(|named| !named.is_empty())
-        {
+        // A `FROM` alone parses as an empty `FROM NAMED` list, and that is the
+        // truth of it: no named graph is visible (SPARQL 1.1 13.2).
+        if let Some(named) = clause.and_then(|clause| clause.named.as_ref()) {
             seen.schema_graphs
                 .retain(|iri, _| named.iter().any(|graph| graph.as_str() == iri));
         }
@@ -337,6 +336,10 @@ pub(crate) enum GraphReads {
     Data(TypeRegime),
     /// The datamodel. Only the engine, or a schema-only region, reads it.
     Schema,
+    /// Nothing: the empty graph. The default graph of a query that writes
+    /// `FROM NAMED` and no `FROM` (SPARQL 1.1 13.2), which no triple pattern
+    /// matches in.
+    Empty,
     /// Anything else: a graph the endpoint does not serve, or a set of graphs
     /// no single regime stands for. Only the engine can say what it holds.
     Other,
@@ -352,6 +355,10 @@ pub(crate) enum GraphReads {
 pub(crate) struct QueryGraphs<'a> {
     dataset: &'a DatasetSpec,
     from: Vec<String>,
+    /// Whether the query wrote a `FROM` / `FROM NAMED` clause at all.
+    clause_written: bool,
+    /// The graphs a `GRAPH` clause can reach, when the query wrote a dataset
+    /// clause: exactly its `FROM NAMED` list, empty for a `FROM` alone.
     from_named: Option<Vec<String>>,
 }
 
@@ -364,6 +371,7 @@ impl<'a> QueryGraphs<'a> {
     ) -> Self {
         Self {
             dataset,
+            clause_written: clause.is_some(),
             from: clause
                 .map(|clause| {
                     clause
@@ -373,13 +381,12 @@ impl<'a> QueryGraphs<'a> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // `FROM` alone parses as an empty `FROM NAMED` list: no named graph
+            // at all, as the engine evaluates it.
             from_named: clause.and_then(|clause| {
                 clause
                     .named
                     .as_ref()
-                    // `FROM` alone parses as an empty `FROM NAMED` list, which
-                    // restricts nothing.
-                    .filter(|named| !named.is_empty())
                     .map(|named| named.iter().map(|g| g.as_str().to_owned()).collect())
             }),
         }
@@ -389,9 +396,14 @@ impl<'a> QueryGraphs<'a> {
         self.dataset
     }
 
-    /// What a triple pattern outside any `GRAPH` reads: the dataset's default
-    /// graph without a `FROM`, otherwise the union of the graphs it names.
+    /// What a triple pattern outside any `GRAPH` reads, per SPARQL 1.1 13.2:
+    /// the dataset's default graph when the query writes no dataset clause,
+    /// the union of the `FROM` graphs when it writes any, and the empty graph
+    /// for `FROM NAMED` alone.
     pub(crate) fn default_reads(&self) -> GraphReads {
+        if self.from.is_empty() && self.clause_written {
+            return GraphReads::Empty;
+        }
         if self.from.is_empty() {
             return GraphReads::Data(self.dataset.default_regime());
         }

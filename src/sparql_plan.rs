@@ -3448,6 +3448,37 @@ classes:
         assert_eq!(classes[0].len(), 2, "{classes:?}");
     }
 
+    /// `FROM NAMED` and no `FROM` leaves the default graph empty (SPARQL 1.1
+    /// 13.2): the refined plan says so (an empty relation where each default
+    /// graph pattern was), no pass answers from the table, and the engine --
+    /// which is handed the clause -- is what answers.
+    #[test]
+    fn from_named_alone_plans_an_empty_default_graph() {
+        let sv = test_schema_view();
+        let dataset = crate::sparql_dataset::DatasetSpec::default()
+            .with_data_graph("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::Asserted);
+        let query = format!(
+            "{PREFIX}SELECT ?s ?nm FROM NAMED <urn:g:a> WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?nm }}"
+        );
+        let text = refined_plan_text(&query, &sv, &dataset).expect("should plan");
+        assert!(!text.contains("scan"), "{text}");
+        assert!(text.contains("values"), "{text}");
+        let plan = plan_query_refined_in(&query, &sv, &dataset).expect("should plan");
+        assert!(!plan.sql_only(), "the table cannot answer for it:\n{plan}");
+        assert!(
+            plan.passes
+                .iter()
+                .any(|pass| matches!(pass.kind, PassKind::Engine(_))),
+            "{plan}"
+        );
+        // The same query with the clause dropped is answered from the table.
+        let plain =
+            plan_query_refined_in(&query.replace("FROM NAMED <urn:g:a> ", ""), &sv, &dataset)
+                .expect("should plan");
+        assert!(plain.sql_only(), "{plain}");
+    }
+
     /// A statement that does not answer alone hands the engine its rows when
     /// what is left reads nothing else, and is a fetch when it does; either
     /// way the note says what it left behind.
