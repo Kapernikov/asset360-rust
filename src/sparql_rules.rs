@@ -261,8 +261,18 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
 /// * **The same multivalued slot read twice does not fold.** Two matches on
 ///   one array are a cross product in SPARQL -- three values answer nine ways
 ///   -- and one unnest restores three. Left to the engine.
-/// * **Two `rdf:type`s on one subject do not fold.** That is an intersection
-///   of classes; a scan of one of them counts every instance of it.
+/// * **Two `rdf:type`s on one subject fold only along a chain (#511).**
+///   `?s a C ; a D` is an intersection of classes. Under the inferred regime
+///   a subject's type set is the family of its class, so the intersection is
+///   `family(C) ∩ family(D)`; when `family(C) ⊆ family(D)` that is
+///   `family(C)`, and the scan of `C` returns exactly those records. Fold to
+///   the class whose family is inside every other one's, and discharge the
+///   other classes' type reads (matches and `InClass` restrictions) with the
+///   scan: it satisfies them, since every record it returns is in their
+///   family. The proof is the inclusion, checked by [`most_specific`], the one
+///   place that knows what a family is. Classes with no such member (neither
+///   family inside the other) are a real intersection, and a scan of one of
+///   them counts every instance of it: they stay with the engine.
 pub struct FoldMatchesIntoScan<'s> {
     schema: &'s SchemaView,
 }
@@ -319,7 +329,10 @@ impl<'s> FoldMatchesIntoScan<'s> {
             let Ok(Some(slot)) = self.schema.get_slot_by_uri(predicate) else {
                 continue;
             };
-            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+            // The class or, failing that, its descendants (#512): a slot a
+            // subclass declares is read by name, and a record of another
+            // class simply has no value for it.
+            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
                 continue;
             };
             found.push((
@@ -514,9 +527,32 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // (design, *What a relational subtree derives*). Two types on one
             // variable *in one scope* still decline.
             let scopes = plan.scopes();
+            // A type match carries its regime. A restriction takes the regime
+            // of the earliest data-graph match on its star in its group, so
+            // the matches of one regime fold and the others stay put.
+            let Some(regime) = type_regime.or_else(|| {
+                plan.nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(id, other)| match &other.op {
+                        PlanOp::Match {
+                            pattern,
+                            regime: Some(regime),
+                        } if other.executor == Executor::Engine
+                            && groups[id] == groups[type_node]
+                            && subject_star(&keys, pattern).as_deref() == Some(star)
+                            && !is_type_pattern(pattern) =>
+                        {
+                            Some(*regime)
+                        }
+                        _ => None,
+                    })
+            }) else {
+                continue;
+            };
             // Counted as *classes*, not as nodes: a restriction beside a
             // type match of the same class is one class said twice.
-            let classes_on_star: BTreeSet<String> = plan
+            let type_nodes: Vec<(NodeId, String)> = plan
                 .nodes
                 .iter()
                 .enumerate()
@@ -524,22 +560,45 @@ impl Rule for FoldMatchesIntoScan<'_> {
                     scopes[*other_id] == scopes[type_node]
                         && !in_other_union_arm(plan, type_node, *other_id)
                 })
-                .filter_map(|(_, other)| match &other.op {
-                    PlanOp::Match { pattern, .. }
-                        if subject_star(&keys, pattern).as_deref() == Some(star) =>
+                .filter_map(|(other_id, other)| match &other.op {
+                    PlanOp::Match { pattern, regime: other_regime }
+                        if *other_regime == Some(regime)
+                            && subject_star(&keys, pattern).as_deref() == Some(star) =>
                     {
-                        type_class_iri(pattern).map(str::to_owned)
+                        type_class_iri(pattern).map(|class| (other_id, class.to_owned()))
                     }
                     PlanOp::Filter {
                         condition: crate::sparql_refine::Expr::InClass { var, class_uri },
                         ..
-                    } if var == star => Some(class_uri.clone()),
+                    } if var == star => Some((other_id, class_uri.clone())),
                     _ => None,
                 })
                 .collect();
-            let classes_on_star = classes_on_star.len();
-            if classes_on_star != 1 {
-                continue;
+            let classes_on_star: BTreeSet<String> =
+                type_nodes.iter().map(|(_, class)| class.clone()).collect();
+            // Several classes on one star fold only when one of them is
+            // inside all the others (#511); the fold then runs from the node
+            // that carries that class, so the answer does not depend on which
+            // type the query wrote first.
+            let mut subsumed: Vec<NodeId> = Vec::new();
+            if classes_on_star.len() != 1 {
+                let Some(specific) = most_specific(self.schema, &classes_on_star) else {
+                    continue;
+                };
+                if specific != class_uri {
+                    continue;
+                }
+                // The ancestors' type reads must be mandatory members of the
+                // same row set as the node folding them, or discharging them
+                // would drop a constraint the query keeps.
+                subsumed = type_nodes
+                    .iter()
+                    .filter(|(_, class)| *class != specific)
+                    .map(|(id, _)| *id)
+                    .collect();
+                if subsumed.iter().any(|id| groups[*id] != groups[type_node]) {
+                    continue;
+                }
             }
             if self
                 .schema
@@ -554,29 +613,6 @@ impl Rule for FoldMatchesIntoScan<'_> {
             }
             let star = star.to_owned();
             let class_uri = class_uri.to_owned();
-            // A type match carries its regime. A restriction takes the regime
-            // of the earliest data-graph match on its star in its group, so
-            // the matches of one regime fold and the others stay put.
-            let Some(regime) = type_regime.or_else(|| {
-                plan.nodes
-                    .iter()
-                    .enumerate()
-                    .find_map(|(id, other)| match &other.op {
-                        PlanOp::Match {
-                            pattern,
-                            regime: Some(regime),
-                        } if other.executor == Executor::Engine
-                            && groups[id] == groups[type_node]
-                            && subject_star(&keys, pattern).as_deref() == Some(star.as_str())
-                            && !is_type_pattern(pattern) =>
-                        {
-                            Some(*regime)
-                        }
-                        _ => None,
-                    })
-            }) else {
-                continue;
-            };
             let slots = self.foldable_slots(
                 plan,
                 &keys,
@@ -591,13 +627,19 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // constant objects under a restriction is the one shape this
             // leaves to the engine; the fold replaces leaves, and a scan
             // with no read has no leaf to replace.)
-            if slots.is_empty() && matches!(plan.nodes[type_node].op, PlanOp::Filter { .. }) {
+            if slots.is_empty()
+                && matches!(plan.nodes[type_node].op, PlanOp::Filter { .. })
+                && !subsumed
+                    .iter()
+                    .any(|id| matches!(plan.nodes[*id].op, PlanOp::Match { .. }))
+            {
                 continue;
             }
             let classes = scan_classes(self.schema, &class_uri, regime);
             fold(
                 plan,
                 type_node,
+                &subsumed,
                 (&star, &class_uri, regime, classes),
                 identifier_values,
                 slots,
@@ -641,6 +683,7 @@ fn in_other_union_arm(plan: &Plan, left: NodeId, right: NodeId) -> bool {
 fn fold(
     plan: &mut Plan,
     type_node: NodeId,
+    subsumed: &[NodeId],
     (star, class_uri, regime, classes): (&str, &str, TypeRegime, Vec<String>),
     identifier_values: Vec<String>,
     slots: Vec<(NodeId, ScanSlot)>,
@@ -650,19 +693,23 @@ fn fold(
     // the matches (and whatever joins them), and its consumers must read
     // its input once it is gone, not the scan. Its claim moves to the scan
     // like a type match's; its position does not.
-    let restriction = match &plan.nodes[type_node].op {
-        PlanOp::Filter { input, .. } => Some((type_node, *input)),
-        _ => None,
-    };
-    if restriction.is_none() {
-        folded.push(type_node);
+    //
+    // `subsumed` are the type reads of ancestor classes (#511): the scan of
+    // the most specific class satisfies them, so they are discharged with it
+    // exactly like the type read the scan is built from.
+    let mut restrictions: Vec<(NodeId, NodeId)> = Vec::new();
+    for id in std::iter::once(&type_node).chain(subsumed) {
+        match &plan.nodes[*id].op {
+            PlanOp::Filter { input, .. } => restrictions.push((*id, *input)),
+            _ => folded.push(*id),
+        }
     }
     folded.sort_unstable();
     let first = folded.first().copied().unwrap_or(type_node);
 
     let mut claims: Vec<ObligationId> = folded
         .iter()
-        .chain(restriction.iter().map(|(filter, _)| filter))
+        .chain(restrictions.iter().map(|(filter, _)| filter))
         .flat_map(|id| plan.nodes[*id].discharges.clone())
         .collect();
     claims.sort_unstable();
@@ -698,10 +745,8 @@ fn fold(
         if folded.contains(&old) {
             continue;
         }
-        if let Some((filter, input)) = restriction
-            && old == filter
-        {
-            remap[old] = remap[input];
+        if let Some((_, input)) = restrictions.iter().find(|(filter, _)| *filter == old) {
+            remap[old] = remap[*input];
             continue;
         }
         let mut op = node.op.clone();
@@ -1233,7 +1278,7 @@ impl Rule for DeliverOptionalRead<'_> {
             let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
                 continue;
             };
-            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
                 continue;
             };
             let delivered = ScanSlot {
@@ -3567,7 +3612,7 @@ impl<'s> PushReferenceJoin<'s> {
             .get_class_by_uri(class_uri)
             .ok()
             .flatten()
-            .and_then(|class| class.slot(&Identifier::Name(slot_name.to_owned())))
+            .and_then(|class| slot_on_class_or_descendant(&class, slot_name))
             .is_some_and(|slot| slot.determine_slot_inline_mode() == SlotInlineMode::Reference)
     }
 }
@@ -3863,7 +3908,7 @@ impl Rule for AbsorbOptionalReference<'_> {
             let Some(class) = self.schema.get_class_by_uri(&class_uri).ok().flatten() else {
                 continue;
             };
-            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
                 continue;
             };
             if on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue
@@ -4953,7 +4998,7 @@ impl Rule for NarrowByAKeptHop<'_> {
             let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
                 continue;
             };
-            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
                 continue;
             };
             // Already known: either the read was folded (with its variable, so
@@ -5935,6 +5980,83 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for Materialise<M> {
     }
 }
 
+/// The classes a type read on `class_iri` ranges over: the class and its
+/// descendants.
+///
+/// regime: this is the *inferred* regime, where an instance of `Signal` is
+/// also an `Asset`. Under the asserted regime the family of a class is the
+/// class alone, so two different classes on one subject are an empty
+/// intersection and [`most_specific`] returns `None` for them. Every
+/// subsumption decision in this file goes through here so the regime can be
+/// threaded in later.
+fn type_family(schema: &SchemaView, class_iri: &str) -> Option<BTreeSet<String>> {
+    let class = schema.get_class_by_uri(class_iri).ok().flatten()?;
+    let mut family: BTreeSet<String> = class
+        .get_descendants(true, false)
+        .ok()?
+        .iter()
+        .map(|descendant| descendant.canonical_uri().to_string())
+        .collect();
+    family.insert(class_iri.to_owned());
+    Some(family)
+}
+
+/// The class of `classes` whose family is inside every other one's, if there
+/// is one: `C` such that `family(C) ⊆ family(D)` for every other `D`, which
+/// makes `a C ∧ a D ≡ a C`. `None` when the classes are not a chain (or one is
+/// unknown to the schema).
+pub(crate) fn most_specific(schema: &SchemaView, classes: &BTreeSet<String>) -> Option<String> {
+    let families: Vec<(&String, BTreeSet<String>)> = classes
+        .iter()
+        .map(|class| type_family(schema, class).map(|family| (class, family)))
+        .collect::<Option<_>>()?;
+    let mut candidates = families.iter().filter(|(class, family)| {
+        families
+            .iter()
+            .all(|(other, other_family)| class == other || family.is_subset(other_family))
+    });
+    let (class, _) = candidates.next()?;
+    // Two classes with equal families would both qualify; there is no single
+    // answer then, and the fold declines.
+    candidates.next().is_none().then(|| (*class).clone())
+}
+
+// TODO(R2 rebase): replace with crate::sparql_slot_family::slot_on_class_or_descendant
+/// The slot `slot_name` as `class` reads it: its own declaration, else the
+/// one definition every descendant carrying that name agrees on (same slot
+/// IRI, range, inline mode and container mode), else `None` and the fold
+/// declines.
+fn slot_on_class_or_descendant(
+    class: &linkml_schemaview::classview::ClassView,
+    slot_name: &str,
+) -> Option<linkml_schemaview::slotview::SlotView> {
+    let name = Identifier::Name(slot_name.to_owned());
+    if let Some(own) = class.slot(&name) {
+        return Some(own);
+    }
+    let family = class.get_descendants(true, true).ok()?;
+    let mut found: Option<linkml_schemaview::slotview::SlotView> = None;
+    for member in &family {
+        let Some(slot) = member.slot(&name) else {
+            continue;
+        };
+        match &found {
+            None => found = Some(slot),
+            Some(first) => {
+                let same = first.definition().slot_uri == slot.definition().slot_uri
+                    && first.definition().range == slot.definition().range
+                    && first.determine_slot_inline_mode() == slot.determine_slot_inline_mode()
+                    && first.determine_slot_container_mode()
+                        == slot.determine_slot_container_mode();
+                if !same {
+                    return None;
+                }
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6273,6 +6395,45 @@ mod tests {
         let mut plan = plan_of("SELECT ?s WHERE { ?s a asset360:Signal ; a asset360:Track }");
         let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
 
+        assert!(log.applied.is_empty(), "{plan}");
+        assert_eq!(plan.find("match").len(), 2, "{plan}");
+    }
+
+    /// A parent type beside its subclass is the subclass (#511), whichever
+    /// the query wrote first; unrelated classes still decline.
+    #[test]
+    fn a_parent_type_beside_its_subclass_folds_to_the_subclass() {
+        let schema = test_schema_view();
+        let rule = FoldMatchesIntoScan::new(&schema);
+        for query in [
+            "SELECT ?s ?v WHERE { ?s a asset360:Relay , asset360:Equipment ; asset360:voltage ?v }",
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment , asset360:Relay ; asset360:voltage ?v }",
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment , asset360:LatchRelay , asset360:Relay ; \
+             asset360:voltage ?v }",
+        ] {
+            let mut plan = plan_of(query);
+            let before = plan.obligations.len();
+            let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
+            assert_eq!(log.applied.len(), 1, "{query}\n{plan}");
+            let scans = plan.find("scan");
+            assert_eq!(scans.len(), 1, "{query}\n{plan}");
+            let PlanOp::Scan { class_uri, .. } = &plan.nodes[scans[0]].op else {
+                panic!("{plan}")
+            };
+            assert!(
+                class_uri.ends_with("Relay"),
+                "the most specific class is scanned: {class_uri}\n{plan}"
+            );
+            assert!(plan.find("match").is_empty(), "{query}\n{plan}");
+            // The ancestors' type reads are discharged by the scan.
+            assert_eq!(plan.obligations.len(), before, "{plan}");
+            assert!(plan.residual.is_empty(), "{query}\n{plan}");
+            println!("{plan}");
+        }
+
+        // Siblings: neither family is inside the other.
+        let mut plan = plan_of("SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }");
+        let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
         assert!(log.applied.is_empty(), "{plan}");
         assert_eq!(plan.find("match").len(), 2, "{plan}");
     }
@@ -6917,6 +7078,62 @@ mod tests {
         assert!(printed.contains("?s.name IN (\"a\")"), "{printed}");
         assert!(printed.contains("?s.length IN ("), "{printed}");
         assert_eq!(plan.find("values").len(), 1, "{printed}");
+    }
+
+    /// A slot only a subclass declares folds into the parent's scan (#512),
+    /// required or optional; a slot two subclasses declare differently does
+    /// not. SQL reads the slot by name, so a record of another class has no
+    /// value, which is SPARQL's answer (no row / unbound).
+    #[test]
+    fn a_slot_a_subclass_declares_folds_into_the_parent_scan() {
+        let schema = test_schema_view();
+
+        let plan = refined(
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment ; asset360:voltage ?v }",
+            &schema,
+            false,
+        );
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert!(
+            plan.residual.is_empty(),
+            "nothing left to the engine:\n{plan}"
+        );
+        let scan = plan.find("scan")[0];
+        let PlanOp::Scan {
+            class_uri, slots, ..
+        } = &plan.nodes[scan].op
+        else {
+            panic!("{plan}");
+        };
+        assert!(class_uri.ends_with("Equipment"), "{plan}");
+        assert_eq!(slots[0].presence, SlotPresence::Required, "{plan}");
+        assert!(!slots[0].multivalued, "{plan}");
+
+        let plan = refined(
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment . \
+             OPTIONAL { ?s asset360:voltage ?v } }",
+            &schema,
+            false,
+        );
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert!(plan.find("leftjoin").is_empty(), "{plan}");
+        let scan = plan.find("scan")[0];
+        let PlanOp::Scan { slots, .. } = &plan.nodes[scan].op else {
+            panic!("{plan}");
+        };
+        assert_eq!(slots[0].presence, SlotPresence::Optional, "{plan}");
+
+        // `regime` is multivalued on Switch and single on Breaker: no single
+        // reading of it exists on Equipment, so nothing folds.
+        let rule = FoldMatchesIntoScan::new(&schema);
+        let mut plan =
+            plan_of("SELECT ?s ?r WHERE { ?s a asset360:Equipment ; asset360:regime ?r }");
+        refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
+        assert_eq!(plan.find("match").len(), 1, "slot not folded:\n{plan}");
+        assert!(
+            scan_slots(&plan).is_empty(),
+            "no slot read on the scan:\n{plan}"
+        );
     }
 
     /// An `OPTIONAL` read of a scanned star becomes a bound nullable column,
@@ -8595,6 +8812,30 @@ mod tests {
             plan.find("scan").is_empty(),
             "an intersection of classes is not a scan of one:\n{plan}"
         );
+
+        // A parent beside its subclass is not an intersection (#511): one
+        // scan of the subclass, the VALUES narrowing kept, whichever type is
+        // written first, and the engine does not run.
+        for query in [
+            "SELECT ?s ?l WHERE { ?s a asset360:Relay , asset360:Equipment ; asset360:label ?l . \
+             VALUES ?l { \"a\" \"b\" } }",
+            "SELECT ?s ?l WHERE { ?s a asset360:Equipment , asset360:Relay ; asset360:label ?l . \
+             VALUES ?l { \"a\" \"b\" } }",
+        ] {
+            let plan = refined(query, &schema, false);
+            let scans = plan.find("scan");
+            assert_eq!(scans.len(), 1, "{plan}");
+            assert!(plan.find("values").is_empty(), "narrowing folded:\n{plan}");
+            assert!(
+                plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+                "no engine pass:\n{plan}"
+            );
+            let PlanOp::Scan { class_uri, .. } = &plan.nodes[scans[0]].op else {
+                panic!("{plan}")
+            };
+            assert!(class_uri.ends_with("Relay"), "{plan}");
+            println!("{plan}");
+        }
     }
 
     #[test]

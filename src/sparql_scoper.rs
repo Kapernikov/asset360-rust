@@ -1726,6 +1726,23 @@ fn scope_qualified(
                     // The same type stated twice says nothing new.
                     unconsumed.remove(&index);
                     builder.claimed.push(index);
+                } else if *depth == builder.type_depth
+                    && let Some(specific) = crate::sparql_rules::most_specific(
+                        schema_view,
+                        &std::collections::BTreeSet::from([
+                            builder.type_iri.clone().unwrap_or_default(),
+                            nn.as_str().to_owned(),
+                        ]),
+                    )
+                {
+                    // A parent type beside its subclass (#511): the family of
+                    // the more specific class is inside the other's, so the
+                    // intersection is that family and the star's class is the
+                    // specific one. Either triple is satisfied by it, whatever
+                    // order the query wrote them in.
+                    builder.type_iri = Some(specific);
+                    unconsumed.remove(&index);
+                    builder.claimed.push(index);
                 } else if *depth < builder.type_depth {
                     // A second, *different* rdf:type is an intersection —
                     // `?s a :Signal ; a :Track` matches nothing unless one
@@ -5819,6 +5836,38 @@ classes:
     attributes:
       lat:
         range: integer
+  # An `is_a` chain, additive: `Equipment` > `Relay` > `LatchRelay`, with
+  # `Switch` and `Breaker` as siblings that declare `regime` differently
+  # (multivalued vs single), so a family can agree on a slot or disagree.
+  Equipment:
+    class_uri: asset360:Equipment
+    attributes:
+      asset360_uri:
+        identifier: true
+      label:
+        range: string
+  Relay:
+    is_a: Equipment
+    class_uri: asset360:Relay
+    attributes:
+      voltage:
+        range: integer
+  LatchRelay:
+    is_a: Relay
+    class_uri: asset360:LatchRelay
+  Switch:
+    is_a: Equipment
+    class_uri: asset360:Switch
+    attributes:
+      regime:
+        range: string
+        multivalued: true
+  Breaker:
+    is_a: Equipment
+    class_uri: asset360:Breaker
+    attributes:
+      regime:
+        range: string
 "#;
         let schema_yaml = format!("{base}{extra}");
         let schema: SchemaDefinition =
@@ -7133,6 +7182,33 @@ classes:
                 "wrong cause recorded for: {query}"
             );
         }
+    }
+
+    /// A parent type beside its subclass is not a repeated type (#511): the
+    /// star is the subclass, whichever type came first, and the plan is exact.
+    /// Siblings stay an intersection.
+    #[test]
+    fn a_parent_type_beside_its_subclass_is_one_star() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Relay ; a asset360:Equipment }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
+        ] {
+            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).expect("scopes");
+            assert_eq!(plan.inexact, None, "{query}");
+            assert_eq!(
+                find_star(&plan, "s").class_uri,
+                "https://data.infrabel.be/asset360/Relay",
+                "{query}"
+            );
+        }
+        let plan = sparql_scope(
+            &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Relay ; a asset360:Switch }}"),
+            &sv,
+        )
+        .expect("scopes");
+        assert_eq!(plan.inexact, Some(Inexact::RepeatedType));
     }
 
     /// A `GRAPH` pattern is not an instance pattern.
