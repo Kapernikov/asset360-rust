@@ -8809,6 +8809,7 @@ classes:
         for query in [
             "SELECT (COUNT(*) AS ?n) FROM <urn:empty> WHERE { ?s a asset360:Signal }",
             "ASK FROM <urn:empty> WHERE { ?s a asset360:Signal }",
+            "SELECT ?s FROM NAMED <urn:empty> WHERE { ?s a asset360:Signal }",
         ] {
             assert_eq!(
                 scoped(query).inexact,
