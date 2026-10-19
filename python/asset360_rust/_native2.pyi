@@ -5,6 +5,7 @@ import asset360_rust
 import builtins
 import datetime
 import typing
+from enum import Enum
 
 UNSCOPED_REWRITE_NAMED: builtins.str
 class AltDescription:
@@ -4565,26 +4566,23 @@ class PredicateCheck:
         The predicate IRI, exactly as the query spelled it.
         """
     @property
-    def verdict(self) -> builtins.str:
-        r"""
-        ``"carried"``, ``"not_carried"`` or ``"unchecked"``.
-        """
+    def verdict(self) -> PredicateVerdict: ...
     @property
     def class_iri(self) -> typing.Optional[builtins.str]:
         r"""
-        The class the subject was judged by (``carried`` and ``not_carried``);
-        ``None`` for ``unchecked``.
+        The class the subject was judged by (``Carried`` and ``NotCarried``);
+        ``None`` for ``Unchecked``.
         """
     @property
     def suggestion(self) -> typing.Optional[builtins.str]:
         r"""
-        ``not_carried`` only: the IRI the data uses for the slot the author
+        ``NotCarried`` only: the IRI the data uses for the slot the author
         most likely meant, when there is one. This is the spelling to paste.
         """
     @property
     def message(self) -> typing.Optional[builtins.str]:
         r"""
-        ``not_carried`` only: the full human-readable explanation.
+        ``NotCarried`` only: the full human-readable explanation.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -7285,6 +7283,23 @@ class ValidationResult:
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
 
+class PredicateVerdict(Enum):
+    r"""
+    The verdict on one fixed predicate of one subject; see :func:`check_predicates`.
+    """
+    Carried = ...
+    r"""
+    The subject's class family carries a slot under this IRI.
+    """
+    NotCarried = ...
+    r"""
+    No class in the subject's family carries a slot under this IRI.
+    """
+    Unchecked = ...
+    r"""
+    The subject's class cannot be told, so the predicate is not judged.
+    """
+
 def apply_deltas(base:LinkMLInstance, stages:typing.Sequence[ChangeStage]) -> tuple[LinkMLInstance, dict]: ...
 
 def blame_map_to_path_stage_map(value:asset360_rust.LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> list[tuple[list[str], asset360_rust.Asset360ChangeMeta]]: ...
@@ -7311,21 +7326,26 @@ def broken_out_column(class_uri:builtins.str, slot_path:typing.Sequence[builtins
     available from elsewhere and there is no plan operator to ask.
     """
 
-def check_predicates(query:builtins.str, schema_view:SchemaView, bound:typing.Optional[typing.Mapping[builtins.str, builtins.str]]=None) -> builtins.list[PredicateCheck]:
+def check_predicates(query:builtins.str, schema_view:SchemaView, regime:TypeRegime, bound:typing.Optional[typing.Mapping[builtins.str, builtins.str]]=None) -> builtins.list[PredicateCheck]:
     r"""
     Judge every fixed predicate a query uses against its subject's class.
     
     Never refuses. A subject's class is its one ``rdf:type``, the class
     ``bound`` gives its variable, or the range of the slot that reached it, and
-    it is judged together with its subclasses. The query is judged as written,
+    it is judged together with the classes ``rdf:type`` gives its instances
+    under ``regime``. The query is judged as written,
     with no alias resolved first: a predicate spelled with the wrong namespace
-    is ``not_carried``, and ``suggestion`` is the IRI the data uses. A subject
-    whose class cannot be told is ``unchecked``, never silently passed.
+    is ``NotCarried``, and ``suggestion`` is the IRI the data uses. A subject
+    whose class cannot be told is ``Unchecked``, never silently passed.
     ``rdf:type`` and variable predicates are not slots and are not reported.
     
     Args:
         query: SPARQL query string (a SHACL ``sh:select`` body, say).
         schema_view: The LinkML schema.
+        regime: The :class:`TypeRegime` of the data graph the query reads. A
+            subject is judged with the classes its type implies under it, so
+            a slot only a subclass carries is carried by a parent-typed
+            subject under ``IsA`` and not under ``Asserted``.
         bound: Variables the caller has already bound, name without ``?`` or
             ``$`` to class IRI — SHACL pre-binds ``this`` to the shape's
             ``sh:targetClass``.

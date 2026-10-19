@@ -718,6 +718,27 @@ classes:
         ));
     }
 
+    /// Every branch of the data-regime judgement. Asserted data is accepted
+    /// (the own class is the direct type); a regime without `Own` is declined
+    /// (`?s a ?t` would not read the own class); inferred types without
+    /// `Direct` are declined (nothing to rewrite to); `Own + Direct` is accepted.
+    #[test]
+    fn the_data_regime_judgement_covers_every_branch() {
+        let sv = schema_view();
+        let graph = TypeRegime::IS_A_AND_MIXINS;
+        let own_direct = TypeRegime::ASSERTED.with(TypePartition::Direct);
+        let own_is_a = TypeRegime::ASSERTED.with(TypePartition::IsA);
+        let direct_only = TypeRegime::empty().with(TypePartition::Direct);
+        let no_own_is_a = TypeRegime::empty().with(TypePartition::IsA);
+        assert!(most_specific_is_direct(&sv, graph, TypeRegime::ASSERTED));
+        assert!(most_specific_is_direct(&sv, graph, own_direct));
+        assert!(most_specific_is_direct(&sv, graph, TypeRegime::IS_A));
+        assert!(!most_specific_is_direct(&sv, graph, own_is_a));
+        assert!(!most_specific_is_direct(&sv, graph, direct_only));
+        assert!(!most_specific_is_direct(&sv, graph, no_own_is_a));
+        assert!(!most_specific_is_direct(&sv, graph, TypeRegime::empty()));
+    }
+
     /// The dataset names its schema graphs by regime; the rule reads the one the
     /// query names. `inferred-mixins` over is-a data covers every edge the data
     /// uses, so the rewrite fires; `asserted` over mixin data does not, and is
