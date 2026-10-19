@@ -1688,47 +1688,49 @@ class DatasetSpec:
     means: the one value every planning and evaluating entry point takes, so no
     call can forget it.
     
-    * ``default_regime`` -- the :class:`TypeRegime` a triple pattern outside any
-      ``GRAPH`` is matched under (unless ``default_graph`` names a data graph,
-      whose regime it then is).
+    * ``default`` -- what the default graph is, stated once: a
+      :class:`TypeRegime` (the records, written under it, with no graph name),
+      or the IRI (a ``str``) of one of ``data_graphs``, which then *is* the
+      default graph under its regime.
     * ``data_graphs`` -- named graphs over the golden records, each under a
-      regime: ``GRAPH <iri> { ... }`` reads the records under that regime.
-    * ``default_graph`` -- the IRI of one of the data graphs that *is* the
-      default graph.
-    * ``partition_graphs`` -- the graph that holds one :class:`TypePartition` of
-      the type triples.
+      regime: ``GRAPH <iri> { ... }`` reads the records under that regime. A
+      regime must contain ``TypePartition.Own``, which holds every non-type
+      triple of a record.
     * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
       subclass edges under a regime.
     
-    ``DatasetSpec(TypeRegime.ASSERTED)`` is the dataset every endpoint was
-    before graphs had regimes: an asserted default graph and no named graph.
+    A query reads **one** data graph (see ``plan_query_refined``), so the
+    engine loads the records flat under one regime.
+    
+    ``DatasetSpec(TypeRegime.ASSERTED)`` is an asserted default graph and no
+    named graph. ``repr`` round-trips: ``eval(repr(x)) == x``.
     
     Raises:
-        ValueError: the default graph is not a data graph, or one IRI is
-            registered with two meanings.
+        ValueError: the default graph is not a data graph, one IRI is
+            registered with two meanings, or a regime lacks ``Own``.
     """
+    @property
+    def default(self) -> TypeRegime | builtins.str:
+        r"""
+        What the default graph was stated as: the :class:`TypeRegime`, or the
+        IRI of the data graph. The constructor's first argument, as given.
+        """
     @property
     def default_regime(self) -> TypeRegime:
         r"""
         The regime a triple pattern outside any ``GRAPH`` is matched under: the
-        regime of ``default_graph`` when one is declared, else the one given to
-        the constructor.
+        ``default`` regime, or the regime of the data graph ``default`` names.
+        """
+    @property
+    def default_graph(self) -> typing.Optional[builtins.str]:
+        r"""
+        The IRI of the data graph that is the default graph, or ``None`` when
+        the default is a regime.
         """
     @property
     def data_graphs(self) -> builtins.dict[builtins.str, TypeRegime]:
         r"""
         Every data graph, IRI to regime.
-        """
-    @property
-    def default_graph(self) -> typing.Optional[builtins.str]:
-        r"""
-        The IRI of the data graph that is the default graph, if one is declared.
-        """
-    @property
-    def partition_graphs(self) -> builtins.dict[TypePartition, builtins.str]:
-        r"""
-        The graph that holds each :class:`TypePartition`, for the partitions
-        that have one.
         """
     @property
     def schema_graphs(self) -> builtins.dict[builtins.str, TypeRegime]:
@@ -1737,7 +1739,8 @@ class DatasetSpec:
         under.
         """
     def __eq__(self, other:builtins.object) -> builtins.bool: ...
-    def __new__(cls, default_regime:TypeRegime, *, data_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None, default_graph:typing.Optional[builtins.str]=None, partition_graphs:typing.Optional[typing.Mapping[TypePartition, builtins.str]]=None, schema_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None) -> DatasetSpec: ...
+    def __hash__(self) -> builtins.int: ...
+    def __new__(cls, default:TypeRegime | builtins.str, *, data_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None, schema_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None) -> DatasetSpec: ...
     def __repr__(self) -> builtins.str: ...
 
 class Definition:

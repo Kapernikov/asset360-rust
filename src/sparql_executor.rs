@@ -1324,13 +1324,13 @@ classes:
             .unwrap()
         };
         let refs: Vec<&LinkMLInstance> = vec![&beacon];
-        let dataset = DatasetSpec::builder(TypeRegime::ASSERTED)
-            .with_data_graph(A, TypeRegime::ASSERTED)
-            .with_data_graph(I, TypeRegime::IS_A)
-            .with_default_graph(A)
-            .with_schema_graph(S, TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset =
+            DatasetSpec::builder(crate::sparql_dataset::DefaultGraph::DataGraph(A.into()))
+                .with_data_graph(A, TypeRegime::ASSERTED)
+                .with_data_graph(I, TypeRegime::IS_A)
+                .with_schema_graph(S, TypeRegime::IS_A)
+                .build()
+                .expect("a valid dataset");
         let prefixed =
             |query: &str| format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}");
         let rows_of = |answer: SparqlAnswer| -> usize {

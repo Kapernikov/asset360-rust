@@ -266,7 +266,7 @@ def test_the_dataset_is_required_and_validated():
     with pytest.raises(TypeError):
         _plan_with_dataset(query, schema())
     with pytest.raises(ValueError, match="not a registered data graph"):
-        DatasetSpec(TypeRegime.ASSERTED, default_graph="urn:graph:nowhere")
+        DatasetSpec("urn:graph:nowhere")
     with pytest.raises(ValueError, match="registered as"):
         DatasetSpec(
             TypeRegime.ASSERTED,

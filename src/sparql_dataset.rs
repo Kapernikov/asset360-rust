@@ -2,16 +2,12 @@
 //! one holds, and what the default graph means.
 //!
 //! One value, passed to every entry point that plans or evaluates a query, so
-//! no call can forget it. It replaces the bare `schema_graph_iri` the planner
-//! used to be handed: a single optional IRI could say "there is a schema
-//! graph" and nothing else, where the endpoint now serves
+//! no call can forget it. The endpoint serves
 //!
 //! * **data graphs** -- named graphs over the golden records, each under a
 //!   [`TypeRegime`] (which `rdf:type` triples its records carry),
-//! * a **default graph**, whose regime is the dataset's `default_regime` or
-//!   that of the data graph it is declared to be,
-//! * **partition graphs** -- the graph that holds one [`TypePartition`] of the
-//!   type triples, for an engine that materialises them apart, and
+//! * a **default graph**, which is either a regime or one of the data graphs
+//!   ([`DefaultGraph`]), and
 //! * **schema graphs** -- the datamodel itself, one per regime its subclass
 //!   edges are published under.
 //!
@@ -24,19 +20,34 @@ use std::fmt;
 
 use linkml_runtime::schema_rdf::{TypePartition, TypeRegime};
 
+/// What the default graph is: stated once, in one of two ways.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DefaultGraph {
+    /// The records, written under this regime, with no graph name of their own.
+    Regime(TypeRegime),
+    /// One of the dataset's data graphs (registered with
+    /// [`DatasetSpecBuilder::with_data_graph`]): the default graph *is* that
+    /// graph, under its regime.
+    DataGraph(String),
+}
+
+impl From<TypeRegime> for DefaultGraph {
+    fn from(regime: TypeRegime) -> Self {
+        Self::Regime(regime)
+    }
+}
+
 /// Which named graphs the endpoint serves and what the default graph means.
 ///
 /// Always valid: the only way to make one is [`DatasetSpecBuilder::build`]
 /// (through [`DatasetSpec::builder`]), which refuses a dataset that contradicts
 /// itself, so an entry point that takes a `DatasetSpec` has nothing to check.
-/// [`Self::asserted`] is the dataset every endpoint was before graphs had
-/// regimes: an asserted default graph, no named graphs, no schema graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`Self::asserted`] is the dataset with an asserted default graph, no named
+/// graphs and no schema graph.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DatasetSpec {
-    default_regime: TypeRegime,
+    default: DefaultGraph,
     data_graphs: BTreeMap<String, TypeRegime>,
-    default_graph: Option<String>,
-    partition_graphs: BTreeMap<TypePartition, String>,
     schema_graphs: BTreeMap<String, TypeRegime>,
 }
 
@@ -48,10 +59,6 @@ pub struct DatasetSpec {
 pub enum GraphRole {
     /// A named graph over the golden records, under this regime.
     DataGraph(TypeRegime),
-    /// The default graph, declared to be one of the data graphs.
-    DefaultGraph,
-    /// The graph that holds this partition of the type triples.
-    PartitionGraph(TypePartition),
     /// The datamodel, its subclass edges published under this regime.
     SchemaGraph(TypeRegime),
 }
@@ -60,8 +67,6 @@ impl fmt::Display for GraphRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DataGraph(regime) => write!(f, "a data graph ({regime})"),
-            Self::DefaultGraph => write!(f, "the default graph"),
-            Self::PartitionGraph(partition) => write!(f, "the {partition:?} partition graph"),
             Self::SchemaGraph(regime) => write!(f, "a schema graph ({regime})"),
         }
     }
@@ -74,18 +79,20 @@ pub enum DatasetConflict {
     /// The default graph names an IRI that is not a registered data graph.
     DefaultGraphNotADataGraph { iri: String },
     /// One IRI was registered with two different meanings (a data graph and a
-    /// schema graph, two regimes, or two partitions).
+    /// schema graph, or two regimes).
     GraphRegisteredTwice {
         iri: String,
         first: GraphRole,
         second: GraphRole,
     },
-    /// One partition of the type triples was given two different graphs.
-    PartitionHasTwoGraphs {
-        partition: TypePartition,
-        first: String,
-        second: String,
-    },
+    /// A data graph's regime lacks the [`TypePartition::Own`] partition, which
+    /// holds every non-type triple of a record: such a graph holds no record's
+    /// slot values, and a scan over it would claim records the writer never
+    /// typed that way.
+    DataGraphWithoutOwn { iri: String, regime: TypeRegime },
+    /// The default regime lacks [`TypePartition::Own`]: the records loaded
+    /// under it would carry no slot values (see [`Self::DataGraphWithoutOwn`]).
+    DefaultRegimeWithoutOwn { regime: TypeRegime },
 }
 
 impl fmt::Display for DatasetConflict {
@@ -99,14 +106,15 @@ impl fmt::Display for DatasetConflict {
                 f,
                 "<{iri}> is registered as {first} and as {second}; a graph has one meaning"
             ),
-            Self::PartitionHasTwoGraphs {
-                partition,
-                first,
-                second,
-            } => write!(
+            Self::DataGraphWithoutOwn { iri, regime } => write!(
                 f,
-                "the {partition:?} partition graph is both <{first}> and <{second}>; \
-                 a partition is held by one graph"
+                "the data graph <{iri}> has regime {regime}, which lacks the own partition; \
+                 a graph of records holds their slot values in it"
+            ),
+            Self::DefaultRegimeWithoutOwn { regime } => write!(
+                f,
+                "the default regime {regime} lacks the own partition; \
+                 records are written with their slot values in it"
             ),
         }
     }
@@ -156,32 +164,28 @@ pub struct DatasetSpecBuilder {
 }
 
 impl DatasetSpec {
-    /// Start a dataset whose default graph carries `default_regime` and which
-    /// serves no named graph, until the `with_*` methods say otherwise.
-    pub fn builder(default_regime: TypeRegime) -> DatasetSpecBuilder {
+    /// Start a dataset with this default graph (a regime, or one of the data
+    /// graphs) that serves no named graph, until the `with_*` methods say
+    /// otherwise. The one place the default graph is stated.
+    pub fn builder(default: impl Into<DefaultGraph>) -> DatasetSpecBuilder {
         DatasetSpecBuilder {
             spec: DatasetSpec {
-                default_regime,
+                default: default.into(),
                 data_graphs: BTreeMap::new(),
-                default_graph: None,
-                partition_graphs: BTreeMap::new(),
                 schema_graphs: BTreeMap::new(),
             },
             conflicts: Vec::new(),
         }
     }
 
-    /// The dataset every endpoint was before graphs had regimes: an asserted
-    /// default graph and no named graph. Stated by name where a caller wants
-    /// it, because there is deliberately no [`Default`]: a dataset is
-    /// something a deployment decides, and one that is defaulted by accident
-    /// plans a different endpoint's query.
+    /// An asserted default graph and no named graph. Stated by name where a
+    /// caller wants it, because there is deliberately no [`Default`]: a dataset
+    /// is something a deployment decides, and one that is defaulted by
+    /// accident plans a different endpoint's query.
     pub fn asserted() -> Self {
         Self {
-            default_regime: TypeRegime::ASSERTED,
+            default: DefaultGraph::Regime(TypeRegime::ASSERTED),
             data_graphs: BTreeMap::new(),
-            default_graph: None,
-            partition_graphs: BTreeMap::new(),
             schema_graphs: BTreeMap::new(),
         }
     }
@@ -209,36 +213,6 @@ impl DatasetSpecBuilder {
             }
             _ => {
                 self.spec.data_graphs.insert(iri, regime);
-            }
-        }
-        self
-    }
-
-    /// Make the default graph one of the data graphs: its regime becomes the
-    /// default regime. The IRI must be registered with [`Self::with_data_graph`]
-    /// (checked by [`Self::build`], so the order of the calls is free).
-    pub fn with_default_graph(mut self, iri: impl Into<String>) -> Self {
-        self.spec.default_graph = Some(iri.into());
-        self
-    }
-
-    /// The graph holding one partition of the type triples.
-    pub fn with_partition_graph(
-        mut self,
-        partition: TypePartition,
-        iri: impl Into<String>,
-    ) -> Self {
-        let iri = iri.into();
-        match self.spec.partition_graphs.get(&partition) {
-            Some(seen) if *seen != iri => {
-                self.conflicts.push(DatasetConflict::PartitionHasTwoGraphs {
-                    partition,
-                    first: seen.clone(),
-                    second: iri,
-                });
-            }
-            _ => {
-                self.spec.partition_graphs.insert(partition, iri);
             }
         }
         self
@@ -278,25 +252,20 @@ impl DatasetSpecBuilder {
             spec,
             mut conflicts,
         } = self;
-        if let Some(iri) = &spec.default_graph
-            && !spec.data_graphs.contains_key(iri)
-        {
-            conflicts.push(DatasetConflict::DefaultGraphNotADataGraph { iri: iri.clone() });
-        }
-        let mut partitions: BTreeMap<&str, TypePartition> = BTreeMap::new();
-        for (partition, iri) in &spec.partition_graphs {
-            if let Some(regime) = spec.schema_graphs.get(iri) {
-                conflicts.push(DatasetConflict::GraphRegisteredTwice {
-                    iri: iri.clone(),
-                    first: GraphRole::SchemaGraph(*regime),
-                    second: GraphRole::PartitionGraph(*partition),
-                });
+        match &spec.default {
+            DefaultGraph::DataGraph(iri) if !spec.data_graphs.contains_key(iri) => {
+                conflicts.push(DatasetConflict::DefaultGraphNotADataGraph { iri: iri.clone() });
             }
-            if let Some(seen) = partitions.insert(iri, *partition) {
-                conflicts.push(DatasetConflict::GraphRegisteredTwice {
+            DefaultGraph::Regime(regime) if !regime.contains(TypePartition::Own) => {
+                conflicts.push(DatasetConflict::DefaultRegimeWithoutOwn { regime: *regime });
+            }
+            _ => {}
+        }
+        for (iri, regime) in &spec.data_graphs {
+            if !regime.contains(TypePartition::Own) {
+                conflicts.push(DatasetConflict::DataGraphWithoutOwn {
                     iri: iri.clone(),
-                    first: GraphRole::PartitionGraph(seen),
-                    second: GraphRole::PartitionGraph(*partition),
+                    regime: *regime,
                 });
             }
         }
@@ -309,14 +278,21 @@ impl DatasetSpecBuilder {
 }
 
 impl DatasetSpec {
+    /// How the default graph was stated.
+    pub fn default_graph_spec(&self) -> &DefaultGraph {
+        &self.default
+    }
+
     /// The regime a triple pattern outside any `GRAPH` is matched under when
     /// the query names no `FROM`: the default graph's.
     pub fn default_regime(&self) -> TypeRegime {
-        self.default_graph
-            .as_ref()
-            .and_then(|iri| self.data_graphs.get(iri))
-            .copied()
-            .unwrap_or(self.default_regime)
+        match &self.default {
+            DefaultGraph::Regime(regime) => *regime,
+            DefaultGraph::DataGraph(iri) => *self
+                .data_graphs
+                .get(iri)
+                .expect("build() checked that the default graph is a data graph"),
+        }
     }
 
     /// The regime of the data graph `iri`, if it is one.
@@ -330,14 +306,12 @@ impl DatasetSpec {
         self.schema_graphs.get(iri).copied()
     }
 
-    /// The graph that holds partition `p`, if the dataset names one.
-    pub fn partition_graph(&self, p: TypePartition) -> Option<&str> {
-        self.partition_graphs.get(&p).map(String::as_str)
-    }
-
     /// The IRI the default graph is declared to be, if it is a named graph.
     pub fn default_graph(&self) -> Option<&str> {
-        self.default_graph.as_deref()
+        match &self.default {
+            DefaultGraph::DataGraph(iri) => Some(iri),
+            DefaultGraph::Regime(_) => None,
+        }
     }
 
     /// Every data graph, IRI order.
@@ -363,11 +337,11 @@ impl DatasetSpec {
     ///
     /// True while no named graph holds records: the records are in the default
     /// graph, which a `GRAPH` clause never reaches, so the named graphs are the
-    /// schema graphs and only them. Once the dataset serves a data graph (or a
-    /// partition graph) a graph variable ranges over those too, and it is no
-    /// longer a question about the datamodel.
+    /// schema graphs and only them. Once the dataset serves a data graph a
+    /// graph variable ranges over it too, and it is no longer a question about
+    /// the datamodel.
     pub(crate) fn graph_variable_is_schema_only(&self) -> bool {
-        self.data_graphs.is_empty() && self.partition_graphs.is_empty()
+        self.data_graphs.is_empty()
     }
 
     /// The dataset as one query's `FROM NAMED` leaves it: under such a clause
@@ -425,8 +399,9 @@ pub enum GraphReads {
     /// `FROM NAMED` and no `FROM` (SPARQL 1.1 13.2), which no triple pattern
     /// matches in.
     Empty,
-    /// Anything else: a graph the endpoint does not serve, or a set of graphs
-    /// no single regime stands for. Only the engine can say what it holds.
+    /// Anything else: a graph the endpoint does not serve, a `GRAPH ?g`, or a
+    /// default graph that mixes data and schema graphs. Only the engine can say
+    /// what it holds.
     Other,
 }
 
@@ -585,12 +560,16 @@ mod tests {
     const M: &str = "urn:graph:mixins";
     const S: &str = "urn:graph:schema";
 
-    fn served_builder() -> DatasetSpecBuilder {
-        DatasetSpec::builder(TypeRegime::ASSERTED)
+    fn served_with(default: impl Into<DefaultGraph>) -> DatasetSpecBuilder {
+        DatasetSpec::builder(default)
             .with_data_graph(A, TypeRegime::ASSERTED)
             .with_data_graph(I, TypeRegime::IS_A)
             .with_data_graph(M, TypeRegime::IS_A_AND_MIXINS)
             .with_schema_graph(S, TypeRegime::IS_A)
+    }
+
+    fn served_builder() -> DatasetSpecBuilder {
+        served_with(TypeRegime::ASSERTED)
     }
 
     fn served() -> DatasetSpec {
@@ -605,24 +584,26 @@ mod tests {
             Ok(dataset.clone())
         );
         assert_eq!(dataset.default_regime(), TypeRegime::ASSERTED);
+        assert_eq!(dataset.default_graph(), None);
         assert!(!dataset.has_schema_graph());
         assert_eq!(dataset.data_regime(A), None);
     }
 
     #[test]
     fn a_dataset_answers_for_each_graph_it_serves() {
-        let dataset = served_builder()
-            .with_default_graph(I)
-            .with_partition_graph(TypePartition::Own, A)
+        let dataset = served_with(DefaultGraph::DataGraph(I.into()))
             .build()
             .expect("a valid dataset");
         assert_eq!(dataset.default_regime(), TypeRegime::IS_A);
+        assert_eq!(dataset.default_graph(), Some(I));
+        assert_eq!(
+            dataset.default_graph_spec(),
+            &DefaultGraph::DataGraph(I.into())
+        );
         assert_eq!(dataset.data_regime(M), Some(TypeRegime::IS_A_AND_MIXINS));
         assert_eq!(dataset.schema_regime(S), Some(TypeRegime::IS_A));
         assert_eq!(dataset.data_regime(S), None);
         assert_eq!(dataset.schema_regime(A), None);
-        assert_eq!(dataset.partition_graph(TypePartition::Own), Some(A));
-        assert_eq!(dataset.partition_graph(TypePartition::Mixin), None);
     }
 
     fn conflicts_of(builder: DatasetSpecBuilder) -> Vec<DatasetConflict> {
@@ -635,14 +616,13 @@ mod tests {
 
     #[test]
     fn a_dataset_that_contradicts_itself_is_refused_by_name() {
-        let orphan = DatasetSpec::builder(TypeRegime::ASSERTED).with_default_graph(A);
+        let orphan = DatasetSpec::builder(DefaultGraph::DataGraph(A.into()));
         assert_eq!(
             conflicts_of(orphan),
             vec![DatasetConflict::DefaultGraphNotADataGraph { iri: A.into() }]
         );
         // The order of the calls does not matter.
-        let ordered = DatasetSpec::builder(TypeRegime::ASSERTED)
-            .with_default_graph(A)
+        let ordered = DatasetSpec::builder(DefaultGraph::DataGraph(A.into()))
             .with_data_graph(A, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
@@ -657,7 +637,6 @@ mod tests {
         };
         let data = GraphRole::DataGraph;
         let schema = GraphRole::SchemaGraph;
-        let partition = GraphRole::PartitionGraph;
         for (builder, expected) in [
             (
                 served_builder().with_data_graph(A, TypeRegime::IS_A),
@@ -675,30 +654,6 @@ mod tests {
                 served_builder().with_schema_graph(S, TypeRegime::ASSERTED),
                 twice(S, schema(TypeRegime::IS_A), schema(TypeRegime::ASSERTED)),
             ),
-            (
-                served_builder()
-                    .with_partition_graph(TypePartition::Own, "urn:x")
-                    .with_partition_graph(TypePartition::Own, "urn:y"),
-                DatasetConflict::PartitionHasTwoGraphs {
-                    partition: TypePartition::Own,
-                    first: "urn:x".into(),
-                    second: "urn:y".into(),
-                },
-            ),
-            (
-                served_builder()
-                    .with_partition_graph(TypePartition::Own, "urn:x")
-                    .with_partition_graph(TypePartition::IsA, "urn:x"),
-                twice(
-                    "urn:x",
-                    partition(TypePartition::Own),
-                    partition(TypePartition::IsA),
-                ),
-            ),
-            (
-                served_builder().with_partition_graph(TypePartition::Own, S),
-                twice(S, schema(TypeRegime::IS_A), partition(TypePartition::Own)),
-            ),
         ] {
             assert_eq!(conflicts_of(builder), vec![expected]);
         }
@@ -711,14 +666,47 @@ mod tests {
         );
     }
 
+    /// `Own` holds every non-type triple of a record, so a graph of records
+    /// without it holds no slot values: refused, for a data graph and for the
+    /// default regime, and the empty set is one of them.
+    #[test]
+    fn a_regime_without_own_is_no_graph_of_records() {
+        let is_a_only = TypeRegime::from(TypePartition::IsA);
+        assert!(!is_a_only.contains(TypePartition::Own));
+        assert!(TypeRegime::IS_A_AND_MIXINS.contains(TypePartition::Own));
+        for regime in [is_a_only, TypeRegime::empty()] {
+            assert_eq!(
+                conflicts_of(served_builder().with_data_graph("urn:graph:odd", regime)),
+                vec![DatasetConflict::DataGraphWithoutOwn {
+                    iri: "urn:graph:odd".into(),
+                    regime
+                }]
+            );
+            assert_eq!(
+                conflicts_of(DatasetSpec::builder(regime)),
+                vec![DatasetConflict::DefaultRegimeWithoutOwn { regime }]
+            );
+        }
+        let text = DatasetConflict::DataGraphWithoutOwn {
+            iri: "urn:graph:odd".into(),
+            regime: is_a_only,
+        }
+        .to_string();
+        assert!(
+            text.contains("urn:graph:odd") && text.contains("own"),
+            "{text}"
+        );
+    }
+
     /// Every conflict is reported, not the first one met: a deployment fixing
     /// its configuration should not have to rebuild once per mistake.
     #[test]
     fn every_conflict_is_reported_at_once() {
-        let error = served_builder()
+        let error = DatasetSpec::builder(DefaultGraph::DataGraph("urn:graph:nowhere".into()))
+            .with_data_graph(A, TypeRegime::ASSERTED)
             .with_data_graph(A, TypeRegime::IS_A)
-            .with_default_graph("urn:graph:nowhere")
-            .with_partition_graph(TypePartition::Own, S)
+            .with_schema_graph(S, TypeRegime::IS_A)
+            .with_data_graph(S, TypeRegime::IS_A)
             .build()
             .expect_err("three conflicts");
         assert_eq!(error.conflicts().len(), 3, "{error}");
@@ -730,6 +718,9 @@ mod tests {
         ] {
             assert!(text.contains(mention), "{text}");
         }
+        // Display names a role by its regime, not by its debug spelling.
+        assert!(text.contains("a data graph (asserted)"), "{text}");
+        assert!(!text.contains("DataGraph"), "{text}");
     }
 
     #[test]

@@ -570,12 +570,12 @@ classes:
     fn a_from_clause_hides_the_schema_graph_and_the_rule_declines() {
         const A: &str = "urn:graph:a";
         let sv = schema_view();
-        let dataset = DatasetSpec::builder(TypeRegime::IS_A)
-            .with_data_graph(A, TypeRegime::IS_A)
-            .with_default_graph(A)
-            .with_schema_graph(G, TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset =
+            DatasetSpec::builder(crate::sparql_dataset::DefaultGraph::DataGraph(A.into()))
+                .with_data_graph(A, TypeRegime::IS_A)
+                .with_schema_graph(G, TypeRegime::IS_A)
+                .build()
+                .expect("a valid dataset");
         let with_clause = |clause: &str| {
             canonical(G).replace(
                 "SELECT ?s ?t WHERE",

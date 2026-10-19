@@ -3904,28 +3904,30 @@ impl ExecutionPlan {
 /// means: the one value every planning and evaluating entry point takes, so no
 /// call can forget it.
 ///
-/// * ``default_regime`` -- the :class:`TypeRegime` a triple pattern outside any
-///   ``GRAPH`` is matched under (unless ``default_graph`` names a data graph,
-///   whose regime it then is).
+/// * ``default`` -- what the default graph is, stated once: a
+///   :class:`TypeRegime` (the records, written under it, with no graph name),
+///   or the IRI (a ``str``) of one of ``data_graphs``, which then *is* the
+///   default graph under its regime.
 /// * ``data_graphs`` -- named graphs over the golden records, each under a
-///   regime: ``GRAPH <iri> { ... }`` reads the records under that regime.
-/// * ``default_graph`` -- the IRI of one of the data graphs that *is* the
-///   default graph.
-/// * ``partition_graphs`` -- the graph that holds one :class:`TypePartition` of
-///   the type triples.
+///   regime: ``GRAPH <iri> { ... }`` reads the records under that regime. A
+///   regime must contain ``TypePartition.Own``, which holds every non-type
+///   triple of a record.
 /// * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
 ///   subclass edges under a regime.
 ///
-/// ``DatasetSpec(TypeRegime.ASSERTED)`` is the dataset every endpoint was
-/// before graphs had regimes: an asserted default graph and no named graph.
+/// A query reads **one** data graph (see ``plan_query_refined``), so the
+/// engine loads the records flat under one regime.
+///
+/// ``DatasetSpec(TypeRegime.ASSERTED)`` is an asserted default graph and no
+/// named graph. ``repr`` round-trips: ``eval(repr(x)) == x``.
 ///
 /// Raises:
-///     ValueError: the default graph is not a data graph, or one IRI is
-///         registered with two meanings.
+///     ValueError: the default graph is not a data graph, one IRI is
+///         registered with two meanings, or a regime lacks ``Own``.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass(name = "DatasetSpec", frozen, eq)]
-#[derive(Clone, PartialEq, Eq)]
+#[pyclass(name = "DatasetSpec", frozen, eq, hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PyDatasetSpec {
     inner: crate::sparql_dataset::DatasetSpec,
 }
@@ -3935,14 +3937,13 @@ pub struct PyDatasetSpec {
 #[pymethods]
 impl PyDatasetSpec {
     #[new]
-    #[pyo3(signature = (default_regime, *, data_graphs=None, default_graph=None, partition_graphs=None, schema_graphs=None))]
+    #[pyo3(signature = (default, *, data_graphs=None, schema_graphs=None))]
     fn new(
-        default_regime: linkml_runtime_python::PyTypeRegime,
-        data_graphs: Option<std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>>,
-        default_graph: Option<String>,
-        partition_graphs: Option<
-            std::collections::HashMap<linkml_runtime_python::PyTypePartition, String>,
+        #[gen_stub(override_type(type_repr = "TypeRegime | builtins.str"))] default: &Bound<
+            '_,
+            PyAny,
         >,
+        data_graphs: Option<std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>>,
         schema_graphs: Option<
             std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>,
         >,
@@ -3953,26 +3954,19 @@ impl PyDatasetSpec {
             data_graphs.unwrap_or_default().into_iter().collect();
         let schema_graphs: std::collections::BTreeMap<_, _> =
             schema_graphs.unwrap_or_default().into_iter().collect();
-        let partition_graphs: std::collections::BTreeMap<_, _> = partition_graphs
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(partition, iri)| {
-                (
-                    linkml_runtime::schema_rdf::TypePartition::from(partition),
-                    iri,
-                )
-            })
-            .collect();
 
-        let mut inner = crate::sparql_dataset::DatasetSpec::builder(default_regime.into());
+        let default = if let Ok(regime) = default.extract::<linkml_runtime_python::PyTypeRegime>() {
+            crate::sparql_dataset::DefaultGraph::Regime(regime.into())
+        } else if let Ok(iri) = default.extract::<String>() {
+            crate::sparql_dataset::DefaultGraph::DataGraph(iri)
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "the default graph is a TypeRegime or the IRI (a str) of a data graph",
+            ));
+        };
+        let mut inner = crate::sparql_dataset::DatasetSpec::builder(default);
         for (iri, regime) in data_graphs {
             inner = inner.with_data_graph(iri, regime.into());
-        }
-        if let Some(iri) = default_graph {
-            inner = inner.with_default_graph(iri);
-        }
-        for (partition, iri) in partition_graphs {
-            inner = inner.with_partition_graph(partition, iri);
         }
         for (iri, regime) in schema_graphs {
             inner = inner.with_schema_graph(iri, regime.into());
@@ -3984,12 +3978,33 @@ impl PyDatasetSpec {
         Ok(Self { inner })
     }
 
+    /// What the default graph was stated as: the :class:`TypeRegime`, or the
+    /// IRI of the data graph. The constructor's first argument, as given.
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "TypeRegime | builtins.str"))]
+    fn default(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self.inner.default_graph_spec() {
+            crate::sparql_dataset::DefaultGraph::Regime(regime) => {
+                Ok(py_regime(py, *regime)?.into_any())
+            }
+            crate::sparql_dataset::DefaultGraph::DataGraph(iri) => {
+                Ok(iri.into_pyobject(py)?.into_any().unbind())
+            }
+        }
+    }
+
     /// The regime a triple pattern outside any ``GRAPH`` is matched under: the
-    /// regime of ``default_graph`` when one is declared, else the one given to
-    /// the constructor.
+    /// ``default`` regime, or the regime of the data graph ``default`` names.
     #[getter]
     fn default_regime(&self, py: Python<'_>) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
         py_regime(py, self.inner.default_regime())
+    }
+
+    /// The IRI of the data graph that is the default graph, or ``None`` when
+    /// the default is a regime.
+    #[getter]
+    fn default_graph(&self) -> Option<String> {
+        self.inner.default_graph().map(str::to_owned)
     }
 
     /// Every data graph, IRI to regime.
@@ -4001,28 +4016,6 @@ impl PyDatasetSpec {
         self.inner
             .data_graphs()
             .map(|(iri, regime)| Ok((iri.to_owned(), py_regime(py, regime)?)))
-            .collect()
-    }
-
-    /// The IRI of the data graph that is the default graph, if one is declared.
-    #[getter]
-    fn default_graph(&self) -> Option<String> {
-        self.inner.default_graph().map(str::to_owned)
-    }
-
-    /// The graph that holds each :class:`TypePartition`, for the partitions
-    /// that have one.
-    #[getter]
-    fn partition_graphs(
-        &self,
-    ) -> std::collections::HashMap<linkml_runtime_python::PyTypePartition, String> {
-        linkml_runtime::schema_rdf::TypePartition::ALL
-            .into_iter()
-            .filter_map(|partition| {
-                self.inner
-                    .partition_graph(partition)
-                    .map(|iri| (partition.into(), iri.to_owned()))
-            })
             .collect()
     }
 
@@ -4041,11 +4034,14 @@ impl PyDatasetSpec {
 
     fn __repr__(&self) -> String {
         let regime = regime_repr;
-        let mut parts = vec![regime(self.inner.default_regime())];
+        let mut parts = vec![match self.inner.default_graph_spec() {
+            crate::sparql_dataset::DefaultGraph::Regime(r) => regime(*r),
+            crate::sparql_dataset::DefaultGraph::DataGraph(iri) => py_str_repr(iri),
+        }];
         let graphs = |graphs: Vec<(&str, linkml_runtime::schema_rdf::TypeRegime)>| {
             let entries: Vec<String> = graphs
                 .into_iter()
-                .map(|(iri, r)| format!("'{iri}': {}", regime(r)))
+                .map(|(iri, r)| format!("{}: {}", py_str_repr(iri), regime(r)))
                 .collect();
             format!("{{{}}}", entries.join(", "))
         };
@@ -4053,26 +4049,18 @@ impl PyDatasetSpec {
         if !data.is_empty() {
             parts.push(format!("data_graphs={}", graphs(data)));
         }
-        if let Some(iri) = self.inner.default_graph() {
-            parts.push(format!("default_graph='{iri}'"));
-        }
-        let partitions: Vec<String> = linkml_runtime::schema_rdf::TypePartition::ALL
-            .into_iter()
-            .filter_map(|partition| {
-                self.inner
-                    .partition_graph(partition)
-                    .map(|iri| format!("TypePartition.{partition:?}: '{iri}'"))
-            })
-            .collect();
-        if !partitions.is_empty() {
-            parts.push(format!("partition_graphs={{{}}}", partitions.join(", ")));
-        }
         let schema: Vec<_> = self.inner.schema_graphs().collect();
         if !schema.is_empty() {
             parts.push(format!("schema_graphs={}", graphs(schema)));
         }
         format!("DatasetSpec({})", parts.join(", "))
     }
+}
+
+/// A string as Python's ``repr`` writes it, for the cases an IRI can hold.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+fn py_str_repr(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 /// The Python object for a regime.
