@@ -51,7 +51,7 @@ impl Oracle {
                 schema,
                 &primary,
                 &conv,
-                TurtleOptions { skolem: false },
+                TurtleOptions::default().with_skolem(false),
             )
             .unwrap();
             store

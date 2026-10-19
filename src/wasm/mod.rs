@@ -964,9 +964,7 @@ impl LinkMLInstanceHandle {
             sv,
             &schema,
             &conv,
-            TurtleOptions {
-                skolem: skolem.unwrap_or(false),
-            },
+            TurtleOptions::default().with_skolem(skolem.unwrap_or(false)),
         )
         .map_err(|e| JsValue::from_str(&e.to_string()))
     }

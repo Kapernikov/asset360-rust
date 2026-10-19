@@ -369,7 +369,7 @@ pub fn sparql_execute(
                 schema_view,
                 &primary_schema,
                 &converter,
-                TurtleOptions { skolem: false },
+                TurtleOptions::default().with_skolem(false),
             )
             .map_err(|e| ExecuteError::ConversionError {
                 object_uri: object_uri.clone(),
@@ -2023,7 +2023,7 @@ classes:
                     &sv,
                     &primary,
                     &conv,
-                    TurtleOptions { skolem: false },
+                    TurtleOptions::default().with_skolem(false),
                 )
                 .unwrap();
                 store
@@ -2244,7 +2244,7 @@ classes:
             &sv,
             &primary,
             &conv,
-            TurtleOptions { skolem: false },
+            TurtleOptions::default().with_skolem(false),
         )
         .unwrap();
 
