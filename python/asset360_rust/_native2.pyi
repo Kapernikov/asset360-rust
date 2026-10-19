@@ -4450,6 +4450,44 @@ class PlanPass:
         """
     def __repr__(self) -> builtins.str: ...
 
+class PredicateCheck:
+    r"""
+    What :func:`check_predicates` found for one fixed predicate of one subject.
+    """
+    @property
+    def subject(self) -> builtins.str:
+        r"""
+        The subject as the query wrote it: ``?t``, ``<iri>`` or ``_:b``.
+        """
+    @property
+    def predicate(self) -> builtins.str:
+        r"""
+        The predicate IRI, exactly as the query spelled it.
+        """
+    @property
+    def verdict(self) -> builtins.str:
+        r"""
+        ``"carried"``, ``"not_carried"`` or ``"unchecked"``.
+        """
+    @property
+    def class_iri(self) -> typing.Optional[builtins.str]:
+        r"""
+        The class the subject was judged by (``carried`` and ``not_carried``);
+        ``None`` for ``unchecked``.
+        """
+    @property
+    def suggestion(self) -> typing.Optional[builtins.str]:
+        r"""
+        ``not_carried`` only: the IRI the data uses for the slot the author
+        most likely meant, when there is one. This is the spelling to paste.
+        """
+    @property
+    def message(self) -> typing.Optional[builtins.str]:
+        r"""
+        ``not_carried`` only: the full human-readable explanation.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 class Prefix:
     @property
     def prefix_prefix(self) -> builtins.str: ...
@@ -7122,6 +7160,32 @@ def broken_out_column(class_uri:builtins.str, slot_path:typing.Sequence[builtins
     at the point the operator was built, rather than calling this function
     with a substitute. Call this function directly when a real class URI is
     available from elsewhere and there is no plan operator to ask.
+    """
+
+def check_predicates(query:builtins.str, schema_view:SchemaView, bound:typing.Optional[typing.Mapping[builtins.str, builtins.str]]=None) -> builtins.list[PredicateCheck]:
+    r"""
+    Judge every fixed predicate a query uses against its subject's class.
+    
+    Never refuses. A subject's class is its one ``rdf:type``, the class
+    ``bound`` gives its variable, or the range of the slot that reached it, and
+    it is judged together with its subclasses. The query is judged as written,
+    with no alias resolved first: a predicate spelled with the wrong namespace
+    is ``not_carried``, and ``suggestion`` is the IRI the data uses. A subject
+    whose class cannot be told is ``unchecked``, never silently passed.
+    ``rdf:type`` and variable predicates are not slots and are not reported.
+    
+    Args:
+        query: SPARQL query string (a SHACL ``sh:select`` body, say).
+        schema_view: The LinkML schema.
+        bound: Variables the caller has already bound, name without ``?`` or
+            ``$`` to class IRI — SHACL pre-binds ``this`` to the shape's
+            ``sh:targetClass``.
+    
+    Returns:
+        One :class:`PredicateCheck` per (subject, predicate) seen.
+    
+    Raises:
+        ValueError: the query does not parse or is an update.
     """
 
 def compute_history(stages:typing.Sequence[ChangeStage]) -> tuple[LinkMLInstance, builtins.list[ChangeStage]]:
