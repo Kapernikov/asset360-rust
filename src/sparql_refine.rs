@@ -2296,17 +2296,12 @@ pub enum PlanOp {
     Scan {
         star_var: String,
         class_uri: String,
-        /// The type regime of the data graph this scan stands for: under it,
-        /// `?s a class_uri` holds for every record of one of [`classes`].
-        ///
-        /// [`classes`]: PlanOp::Scan::classes
-        regime: TypeRegime,
         /// Every class whose records have `class_uri` among their `rdf:type`s
-        /// under `regime` (canonical IRIs, sorted, deduplicated, `class_uri`
-        /// included): `type_family` of the class. Under
-        /// [`TypeRegime::ASSERTED`] that is `class_uri` alone. The scan reads
-        /// the records whose `asset_type` is one of these.
-        /// [`Plan::scan_classes_agree`] checks it against the schema.
+        /// under the plan's one data regime ([`Plan::data_regime`]; canonical
+        /// IRIs, sorted, deduplicated, `class_uri` included): `type_family` of
+        /// the class. Under [`TypeRegime::ASSERTED`] that is `class_uri` alone.
+        /// Under that regime `?s a class_uri` holds for every record of one of
+        /// them. [`Plan::scan_classes_agree`] checks it against the schema.
         classes: Vec<String>,
         /// The variable bound to the record's direct type, read from the
         /// `asset_type` column, once a rule has folded
@@ -2316,8 +2311,9 @@ pub enum PlanOp {
         /// (`?s sesame:directType <C>`), canonical IRIs sorted. Empty: no
         /// constraint. A record is read only when its `asset_type` is in
         /// here *and* in [`classes`](PlanOp::Scan::classes), so the lowering
-        /// renders `asset_type = ANY(classes ∩ direct_type_in)`; `classes`
-        /// itself stays `type_family` of the class, which is the invariant
+        /// writes `asset_types = classes ∩ direct_type_in`
+        /// ([`crate::sparql_ops::Op::Scan`]); `classes` itself stays
+        /// `type_family` of the class, which is the invariant
         /// [`Plan::scan_classes_agree`] checks.
         direct_type_in: Vec<String>,
         slots: Vec<ScanSlot>,
@@ -2579,9 +2575,9 @@ impl Node {
 pub fn scan_with_fanout(
     star_var: &str,
     class_uri: &str,
-    // The regime the scan reads under, and the classes it stands for under
-    // it (`scan_classes`): the caller has the schema, this function does not.
-    (regime, classes): (TypeRegime, Vec<String>),
+    // The classes the scan stands for under the plan's regime
+    // (`scan_classes`): the caller has the schema, this function does not.
+    classes: Vec<String>,
     slots: Vec<ScanSlot>,
     // `identifier_values`: the record's identity, when the query named it
     // rather than a variable. A constant subject scans one row, against the
@@ -2609,7 +2605,6 @@ pub fn scan_with_fanout(
         PlanOp::Scan {
             star_var: star_var.to_owned(),
             class_uri: class_uri.to_owned(),
-            regime,
             classes,
             direct_type: None,
             direct_type_in: Vec::new(),
@@ -2673,11 +2668,17 @@ pub struct Plan {
     /// consumer still sees the variable -- produced above the barrier
     /// instead of inside it.
     pub lifted_exports: Vec<LiftedExport>,
-    /// The regime a triple outside any `GRAPH` is read under: the dataset's
-    /// default graph (or the `FROM` graphs) of the query, `None` when the
-    /// default graph is no data graph. Only the printout reads it: asserted is
-    /// printed bare when it is this, and said when it is not.
-    pub default_regime: Option<TypeRegime>,
+    /// What a triple outside any `GRAPH` reads: the dataset's default graph
+    /// (or the `FROM` graphs) of the query -- the records under a regime, the
+    /// datamodel, nothing, or something only the engine can say. The printout
+    /// reads it: asserted is printed bare when the default graph reads it, and
+    /// said when it does not.
+    pub default_reads: GraphReads,
+    /// The one regime the query reads its records under
+    /// ([`crate::sparql_graph_clauses::single_data_regime`]): the regime every
+    /// match of a data graph and every scan is under. What
+    /// [`Plan::scan_classes_agree`] derives a scan's classes with.
+    pub data_regime: TypeRegime,
 }
 
 /// An export moved out of a barrier by a lifting rule (see
@@ -2857,7 +2858,8 @@ impl Plan {
             transfers: Vec::new(),
             rewrites: Vec::new(),
             lifted_exports: Vec::new(),
-            default_regime: None,
+            default_reads: GraphReads::Empty,
+            data_regime: TypeRegime::ASSERTED,
         };
         plan.install(nodes);
         plan.record_origins();
@@ -3011,18 +3013,16 @@ impl Plan {
     pub fn scan_classes_agree(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
         for (id, node) in self.nodes.iter().enumerate() {
             if let PlanOp::Scan {
-                class_uri,
-                regime,
-                classes,
-                ..
+                class_uri, classes, ..
             } = &node.op
             {
-                let derived = scan_classes(schema, class_uri, *regime).map_err(|error| {
-                    PlanDefect::ScanClassesUnavailable {
-                        scan: id,
-                        error: error.to_string(),
-                    }
-                })?;
+                let derived =
+                    scan_classes(schema, class_uri, self.data_regime).map_err(|error| {
+                        PlanDefect::ScanClassesUnavailable {
+                            scan: id,
+                            error: error.to_string(),
+                        }
+                    })?;
                 if *classes != derived {
                     return Err(PlanDefect::MisrecordedScanClasses { scan: id });
                 }
@@ -3716,7 +3716,8 @@ impl fmt::Display for Plan {
                 )
             };
             let mut describe = node.op.describe_with(RegimeContext::Plan {
-                default: self.default_regime,
+                data: self.data_regime,
+                default: self.default_reads.data_regime(),
                 under_graph: under_graph[id],
             });
             if let Some(note) = crate::sparql_constant::lowered_note(self, id) {
@@ -3926,7 +3927,6 @@ impl PlanOp {
             PlanOp::Scan {
                 star_var,
                 class_uri,
-                regime,
                 classes,
                 slots,
                 identifier_values,
@@ -3936,7 +3936,7 @@ impl PlanOp {
             } => format!(
                 "{}{}{} as ?{star_var}{}{}{}, requires [{}]",
                 shorten(class_uri),
-                regime_tag(Some(*regime), context)
+                scan_regime_tag(context)
                     .map(|label| format!(" [{label}]"))
                     .unwrap_or_default(),
                 {
@@ -4118,7 +4118,7 @@ pub fn naive_plan_for(
 pub fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
     let graphs = QueryGraphs::new(dataset, query).map_err(ScopeError::from)?;
     let default_reads = graphs.default_reads();
-    let default_regime = default_reads.data_regime();
+    let data_regime = graphs.regime();
     let obligations = crate::sparql_plan::obligations_of(query)?;
     let form = QueryForm::of(query);
     let pattern = match query {
@@ -4187,7 +4187,8 @@ pub fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineEr
 
     let nodes = builder.nodes;
     let mut plan = Plan::from_nodes(form, obligations, nodes);
-    plan.default_regime = default_regime;
+    plan.default_reads = default_reads;
+    plan.data_regime = data_regime;
     plan.check().map_err(RefineError::Defect)?;
     Ok(plan)
 }
@@ -4201,6 +4202,8 @@ enum RegimeContext {
     Bare,
     /// Printed as part of a plan.
     Plan {
+        /// The plan's one data regime: what its scans read under.
+        data: TypeRegime,
         default: Option<TypeRegime>,
         under_graph: bool,
     },
@@ -4213,6 +4216,7 @@ enum RegimeContext {
 /// `[no data graph]` unless a printed `GRAPH` above it is the explanation.
 fn regime_tag(regime: Option<TypeRegime>, context: RegimeContext) -> Option<String> {
     let RegimeContext::Plan {
+        data: _,
         default,
         under_graph,
     } = context
@@ -4226,6 +4230,15 @@ fn regime_tag(regime: Option<TypeRegime>, context: RegimeContext) -> Option<Stri
         Some(other) => Some(other.to_string()),
         None if under_graph => None,
         None => Some("no data graph".to_owned()),
+    }
+}
+
+/// The tag a scan carries in plan text: the plan's data regime, told by
+/// [`regime_tag`]. A scan printed outside a plan has no regime to tell.
+fn scan_regime_tag(context: RegimeContext) -> Option<String> {
+    match context {
+        RegimeContext::Plan { data, .. } => regime_tag(Some(data), context),
+        RegimeContext::Bare => None,
     }
 }
 
@@ -5476,7 +5489,6 @@ mod tests {
             PlanOp::Scan {
                 star_var: "s".to_owned(),
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
-                regime: TypeRegime::ASSERTED,
                 classes: vec!["https://data.infrabel.be/asset360/Signal".to_owned()],
                 direct_type: None,
                 direct_type_in: Vec::new(),
@@ -5524,10 +5536,7 @@ mod tests {
         let nodes = scan_with_fanout(
             "s",
             "https://data.infrabel.be/asset360/TunnelComplex",
-            (
-                TypeRegime::ASSERTED,
-                vec!["https://data.infrabel.be/asset360/TunnelComplex".to_owned()],
-            ),
+            vec!["https://data.infrabel.be/asset360/TunnelComplex".to_owned()],
             slots,
             Vec::new(),
             0,

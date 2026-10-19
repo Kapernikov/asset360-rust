@@ -642,20 +642,16 @@ impl Plan {
     /// from that identity carries it, so it never changes which graph a star
     /// reads.
     pub fn identity_regime(&self, node: NodeId, var: &str, class_uri: &str) -> Option<TypeRegime> {
-        let mut regimes =
-            self.producers_of(node, var)
-                .into_iter()
-                .filter_map(|producer| match &self.nodes[producer].op {
-                    PlanOp::Scan {
-                        star_var,
-                        class_uri: scanned,
-                        regime,
-                        ..
-                    } if star_var == var && scanned == class_uri => Some(*regime),
-                    _ => None,
-                });
-        let regime = regimes.next()?;
-        regimes.all(|other| other == regime).then_some(regime)
+        self.producers_of(node, var)
+            .into_iter()
+            .any(|producer| {
+                matches!(
+                    &self.nodes[producer].op,
+                    PlanOp::Scan { star_var, class_uri: scanned, .. }
+                        if star_var == var && scanned == class_uri
+                )
+            })
+            .then_some(self.data_regime)
     }
 
     /// The outer variables a subtree reads: empty everywhere but the right

@@ -297,7 +297,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
         plan: &Plan,
         keys: &HashMap<String, String>,
         star: &str,
-        (class_uri, regime): (&str, TypeRegime),
+        class_uri: &str,
         group: &[usize],
         type_group: usize,
     ) -> Vec<(NodeId, ScanSlot)> {
@@ -309,20 +309,16 @@ impl<'s> FoldMatchesIntoScan<'s> {
             if node.executor != Executor::Engine || group[id] != type_group {
                 continue;
             }
-            // Only matches of the scan's own regime fold into it: a triple of
-            // another regime reads another graph, and `None` is a triple
-            // under a `GRAPH`, which no scan reads.
+            // Only matches of the data graph fold into a scan: a triple under
+            // a `GRAPH` that stays reads no records, which no scan reads.
             let PlanOp::Match {
                 pattern,
-                reads: GraphReads::Data(match_regime),
+                reads: GraphReads::Data(_),
             } = &node.op
             else {
                 continue;
             };
-            if *match_regime != regime
-                || subject_star(keys, pattern).as_deref() != Some(star)
-                || is_type_pattern(pattern)
-            {
+            if subject_star(keys, pattern).as_deref() != Some(star) || is_type_pattern(pattern) {
                 continue;
             }
             let (Some(predicate), Some(var)) = (predicate_iri(pattern), object_variable(pattern))
@@ -401,27 +397,23 @@ fn const_subject_stars(plan: &Plan) -> HashMap<String, String> {
     keys
 }
 
-/// Whether the match at `matched` and the scan at `scan` stand on the same
-/// data graph: the match carries a regime and the scan reads under it.
+/// Whether the match at `matched` reads the records: a data graph, outside any
+/// `GRAPH` that stays.
 ///
 /// Every rule that folds a match into an existing scan, or lets a scan stand
-/// in for one, asks this first. A match under a `GRAPH` has no regime, so it
-/// is never the scan's; a match of another regime reads a graph that writes
-/// its `rdf:type` triples differently, so the records the scan fetches are not
-/// the ones the match ranges over.
-fn same_regime(plan: &Plan, matched: NodeId, scan: NodeId) -> bool {
-    match (&plan.nodes[matched].op, &plan.nodes[scan].op) {
-        (
-            PlanOp::Match {
-                reads: GraphReads::Data(on_match),
-                ..
-            },
-            PlanOp::Scan {
-                regime: on_scan, ..
-            },
-        ) => on_match == on_scan,
-        _ => false,
-    }
+/// in for one, asks this first. A match under a `GRAPH` that stays reads no
+/// records (the datamodel, a graph the endpoint does not serve), so it is never
+/// the scan's. A match of the data graph is always under the plan's one data
+/// regime ([`Plan::data_regime`]), which is the regime of every scan, so no
+/// regime has to be compared.
+fn reads_the_records(plan: &Plan, matched: NodeId) -> bool {
+    matches!(
+        &plan.nodes[matched].op,
+        PlanOp::Match {
+            reads: GraphReads::Data(_),
+            ..
+        }
+    )
 }
 
 /// The star a triple pattern's subject names: its variable, or the synthetic
@@ -634,14 +626,8 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // The regime is the type source's own -- a type match's, or the
             // restriction's -- so the matches of that regime fold and the
             // others stay put.
-            let slots = self.foldable_slots(
-                plan,
-                &keys,
-                &star,
-                (&class_uri, regime),
-                &groups,
-                groups[type_node],
-            );
+            let slots =
+                self.foldable_slots(plan, &keys, &star, &class_uri, &groups, groups[type_node]);
             // A restriction with nothing of the star's to fold beneath it --
             // no variable-object match on the star in its group -- is not a
             // scan yet: it stays where 3b left it. (A star read only through
@@ -668,7 +654,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
                 plan,
                 type_node,
                 &subsumed,
-                (&star, &class_uri, regime, classes),
+                (&star, &class_uri, classes),
                 identifier_values,
                 slots,
             );
@@ -744,7 +730,7 @@ fn type_read_site(plan: &Plan, id: NodeId, star: &str) -> Option<TypeReadSite> {
     };
     let other = if *left == id { *right } else { *left };
     let site = subject_site(plan, other, star)?;
-    if !site.prefix.is_empty() || !same_regime(plan, id, site.scan) {
+    if !site.prefix.is_empty() || !reads_the_records(plan, id) {
         return None;
     }
     Some(TypeReadSite {
@@ -1114,7 +1100,7 @@ fn fold(
     plan: &mut Plan,
     type_node: NodeId,
     subsumed: &[NodeId],
-    (star, class_uri, regime, classes): (&str, &str, TypeRegime, Vec<String>),
+    (star, class_uri, classes): (&str, &str, Vec<String>),
     identifier_values: Vec<String>,
     slots: Vec<(NodeId, ScanSlot)>,
 ) {
@@ -1159,7 +1145,7 @@ fn fold(
             let emitted = scan_with_fanout(
                 star,
                 class_uri,
-                (regime, classes.clone()),
+                classes.clone(),
                 scan_slots.clone(),
                 identifier_values.clone(),
                 nodes.len(),
@@ -1678,7 +1664,7 @@ impl Rule for DeliverOptionalRead<'_> {
                 if node.executor != Executor::Sql || star_var != &star {
                     return None;
                 }
-                if !same_regime(plan, id, scan) {
+                if !reads_the_records(plan, id) {
                     return None;
                 }
                 if slots
@@ -1844,7 +1830,7 @@ impl Rule for AbsorbOptionalRead<'_> {
             let Some(scan) = plan.nodes.iter().enumerate().position(|(scan, node)| {
                 matches!(&node.op, PlanOp::Scan { star_var, .. } if star_var == &star)
                     && node.executor == Executor::Sql
-                    && same_regime(plan, right, scan)
+                    && reads_the_records(plan, right)
                     && mandatorily_feeds(plan, scan, left)
             }) else {
                 continue;
@@ -2306,7 +2292,7 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             let Some(site) = subject_site(plan, other, &subject) else {
                 continue;
             };
-            if !same_regime(plan, id, site.scan) {
+            if !reads_the_records(plan, id) {
                 continue;
             }
             // An empty prefix is the star itself, which is the fold rule's:
@@ -2876,7 +2862,7 @@ impl Rule for ConstantObjectBecomesFilter<'_> {
             let Some(site) = subject_site(plan, other, &subject) else {
                 continue;
             };
-            if !same_regime(plan, id, site.scan) {
+            if !reads_the_records(plan, id) {
                 continue;
             }
             let Some(read) = self.condition_for(&site, &predicate, &term) else {
@@ -3293,7 +3279,7 @@ impl Rule for FoldIdentityConstant<'_> {
             let Some(site) = subject_site(plan, other, &star) else {
                 continue;
             };
-            if !same_regime(plan, id, site.scan) {
+            if !reads_the_records(plan, id) {
                 continue;
             }
             if !site.prefix.is_empty() {
@@ -4333,7 +4319,7 @@ impl Rule for AbsorbOptionalReference<'_> {
             let Some((scan, class_uri, holder_star, prefix)) = holder else {
                 continue;
             };
-            if !same_regime(plan, matched, scan) {
+            if !reads_the_records(plan, matched) {
                 continue;
             }
 
@@ -5429,7 +5415,7 @@ impl Rule for NarrowByAKeptHop<'_> {
             }) else {
                 continue;
             };
-            if !same_regime(plan, id, scan) {
+            if !reads_the_records(plan, id) {
                 continue;
             }
             let PlanOp::Scan {
@@ -11492,10 +11478,10 @@ mod direct_type {
         let [scan] = tree.find("scan")[..] else {
             panic!("one scan:\n{plan}")
         };
-        let crate::sparql_ops::Op::Scan { classes, .. } = &tree.nodes[scan].op else {
+        let crate::sparql_ops::Op::Scan { asset_types, .. } = &tree.nodes[scan].op else {
             panic!("{plan}")
         };
-        assert_eq!(short(classes), ["Relay"], "asset_type = the one class");
+        assert_eq!(short(asset_types), ["Relay"], "asset_type = the one class");
 
         // Outside the family: no record can have it.
         let plan = refined_in(

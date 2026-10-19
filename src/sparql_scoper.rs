@@ -788,15 +788,10 @@ pub struct Star {
     /// `asset_type` column with `=`, not `LIKE`.
     pub class_uri: String,
 
-    /// The type regime the star's `rdf:type` is read under: the regime of the
-    /// graph that triple is in (the dataset's default regime for a triple
-    /// outside any `GRAPH`).
-    pub regime: TypeRegime,
-
     /// Every class the star reads, canonical IRIs sorted: `class_uri` and the
-    /// classes whose records have it among their `rdf:type`s under
-    /// [`Self::regime`] (what `asset_type = ANY(classes)` filters). One
-    /// element, `class_uri`, under the asserted regime.
+    /// classes whose records have it among their `rdf:type`s under the plan's
+    /// one data regime ([`QueryPlan::data_regime`]). One element, `class_uri`,
+    /// under the asserted regime.
     pub classes: Vec<String>,
 
     /// Values bound to this class's LinkML identifier slot (the slot
@@ -1655,16 +1650,6 @@ fn scope_qualified(
     {
         triples_with_depth.retain(|(triple, _)| !in_the_schema_graph(triple));
     }
-    // The regime a triple's own graph reads it under; a graph that is not one
-    // data graph reads as the widest.
-    let regime_of = |triple: &TriplePattern| match graph_of
-        .get(&std::ptr::from_ref(triple))
-        .map(|graph| graph.reads)
-    {
-        Some(GraphReads::Data(regime)) => regime,
-        _ => graphs.regime(),
-    };
-
     // Anything dropped along the way is recorded here, at the point it is
     // dropped. The first cause wins: one actionable reason beats a list.
     let mut inexact: Option<Inexact> = None;
@@ -1766,7 +1751,6 @@ fn scope_qualified(
                 variable_depth: HashMap::new(),
                 inline_filters: HashMap::new(),
                 claimed: Vec::new(),
-                regime: regime_of(tp),
             });
 
         if pred_iri == RDF_TYPE {
@@ -1774,11 +1758,6 @@ fn scope_qualified(
                 if builder.type_iri.is_none() {
                     builder.type_iri = Some(nn.as_str().to_owned());
                     builder.type_depth = *depth;
-                    // The star reads the records whose types, *under the
-                    // regime of the graph this triple is in*, include the
-                    // class. Slot triples say nothing about it: a record has
-                    // its slots in every regime.
-                    builder.regime = regime_of(tp);
                     unconsumed.remove(&index);
                     builder.claimed.push(index);
                 } else if builder.type_iri.as_deref() == Some(nn.as_str()) {
@@ -1792,8 +1771,8 @@ fn scope_qualified(
                             builder.type_iri.clone().unwrap_or_default(),
                             nn.as_str().to_owned(),
                         ]),
-                        // Judged under the regime of this triple's own graph.
-                        regime_of(tp),
+                        // Judged under the query's one data regime.
+                        graphs.regime(),
                     )
                 {
                     // A parent type beside its subclass (#511): the family of
@@ -1812,7 +1791,6 @@ fn scope_qualified(
                     // leave this triple unconsumed.
                     builder.type_iri = Some(nn.as_str().to_owned());
                     builder.type_depth = *depth;
-                    builder.regime = regime_of(tp);
                 }
             }
         } else if let Ok(Some(slot_view)) = schema_view.get_slot_by_uri(pred_iri) {
@@ -2177,8 +2155,7 @@ fn scope_qualified(
 
         stars.push(Star {
             variable: builder.variable.clone(),
-            classes: crate::sparql_refine::scan_classes(schema_view, &class_uri, builder.regime)?,
-            regime: builder.regime,
+            classes: crate::sparql_refine::scan_classes(schema_view, &class_uri, graphs.regime())?,
             class_uri,
             multivalued_fields,
             numeric_fields,
@@ -2912,13 +2889,6 @@ struct StarBuilder {
     /// still be discarded, and its triples are then represented by nothing
     /// unless the path walk picks them up. Kept so they can be handed back.
     claimed: Vec<usize>,
-    /// The type regime the star reads its records under: its `rdf:type`
-    /// triple's own graph's (the first triple's when it has none). One per
-    /// star and not one per `(subject, regime)`: a subject's slots are the
-    /// same in every regime, so only the type triple says which records, and
-    /// a second type under another regime is an intersection the star
-    /// already declines (`Inexact::RepeatedType`).
-    regime: TypeRegime,
 }
 
 impl StarBuilder {
@@ -8942,7 +8912,7 @@ classes:
         let regime_of = |plan: &QueryPlan| {
             let stars = plan.root.all_stars();
             assert_eq!(stars.len(), 1, "{stars:?}");
-            stars[0].regime
+            plan.data_regime
         };
 
         // No clause: the dataset's default regime, and the one class.
@@ -9074,7 +9044,6 @@ classes:
         ));
         assert_eq!(both.root.all_stars().len(), 1);
         assert_eq!(classes(&both), vec![beacon, signal]);
-        assert_eq!(both.root.all_stars()[0].regime, TypeRegime::IS_A);
         assert_eq!(both.data_regime, TypeRegime::IS_A);
     }
 

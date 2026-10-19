@@ -128,18 +128,19 @@ pub enum Op {
         /// The SPARQL variable this star binds, which becomes a table alias.
         star_var: String,
         class_uri: String,
-        /// Every class the scan reads, canonical IRIs sorted: `class_uri` and
-        /// the classes whose records have it among their `rdf:type`s under
-        /// the scan's regime (`PlanOp::Scan::classes`). A renderer filters
-        /// `asset_type = ANY(classes)`; with one element that is the
-        /// `asset_type = class_uri` it always was.
-        classes: Vec<String>,
+        /// Records whose `asset_type` is one of these, canonical IRIs sorted:
+        /// the classes whose records have `class_uri` among their `rdf:type`s
+        /// under the plan's data regime (`PlanOp::Scan::classes`), narrowed to
+        /// the direct types the query fixed (`PlanOp::Scan::direct_type_in`).
+        /// A renderer filters `asset_type = ANY(asset_types)`; with one element
+        /// that is `asset_type = class_uri`.
+        asset_types: Vec<String>,
         /// Values bound against the class's identifier slot, compared against
         /// the indexed `asset360_uri` column rather than the payload.
         identifier_values: Vec<String>,
         /// The variable bound to the record's direct type, when a rule
         /// folded `sesame:directType ?t` into the scan: render
-        /// `asset_type AS <col>` and answer it as an IRI. `classes` is
+        /// `asset_type AS <col>` and answer it as an IRI. `asset_types` is
         /// already narrowed by any direct type the query fixed.
         direct_type: Option<String>,
         /// Slots that must be present: `object_data ? 'slot'`.
@@ -671,8 +672,8 @@ pub fn lower_sql_pass(
             op: Op::Scan {
                 star_var: star.variable.clone(),
                 class_uri: star.class_uri.clone(),
-                // The classes the star's regime says its type stands for.
-                classes: star.classes.clone(),
+                // The classes the plan's regime says its type stands for.
+                asset_types: star.classes.clone(),
                 identifier_values: star.identifier_values.clone(),
                 direct_type: None,
                 required_slots: star.required_fields.clone(),
@@ -1399,7 +1400,6 @@ fn lower_island(
             class_uri,
             identifier_values,
             slots,
-            regime,
             direct_type,
             direct_type_in,
             ..
@@ -1407,6 +1407,7 @@ fn lower_island(
         else {
             continue;
         };
+        let regime = &plan.data_regime;
         for claim in &plan.nodes[id].discharges {
             let wrong = |claim: &crate::sparql_plan::Obligation| {
                 Err(LoweringRefusal::ClaimWithoutTheWork {
@@ -1894,9 +1895,9 @@ impl Lowering<'_> {
                             star_var: star_var.clone(),
                             class_uri: class_uri.clone(),
                             // The family, narrowed by the direct types the query
-                            // fixed: `asset_type = ANY(classes)` is then exactly
+                            // fixed: `asset_type = ANY(asset_types)` is then exactly
                             // "the record's direct type is one of these".
-                            classes: if direct_type_in.is_empty() {
+                            asset_types: if direct_type_in.is_empty() {
                                 scanned_classes.clone()
                             } else {
                                 scanned_classes

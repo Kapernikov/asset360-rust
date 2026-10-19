@@ -3470,7 +3470,7 @@ classes:
                 })
                 .flatten()
                 .filter_map(|node| match &node.op {
-                    crate::sparql_ops::Op::Scan { classes, .. } => Some(classes.clone()),
+                    crate::sparql_ops::Op::Scan { asset_types, .. } => Some(asset_types.clone()),
                     _ => None,
                 })
                 .collect();

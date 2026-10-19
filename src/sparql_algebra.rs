@@ -383,9 +383,9 @@ impl Translation<'_> {
                 identifier_values,
                 direct_type,
                 direct_type_in,
-                regime,
                 ..
             } => {
+                let regime = plan.data_regime;
                 let type_iri = NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?;
                 let mut required: Vec<TriplePattern> = vec![TriplePattern {
                     subject: TermPattern::Variable(Variable::new_unchecked(star_var.clone())),

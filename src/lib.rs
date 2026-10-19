@@ -2905,16 +2905,17 @@ impl PlanOp {
         }
     }
 
-    /// For ``"scan"``: every class the scan reads, canonical IRIs sorted --
-    /// ``class_uri`` and the classes whose records have it among their
-    /// ``rdf:type`` under the scan's regime. Render
-    /// ``asset_type = ANY(classes)``; one element is the plain
+    /// For ``"scan"``: records whose ``asset_type`` is one of these,
+    /// canonical IRIs sorted -- ``class_uri`` and the classes whose records
+    /// have it among their ``rdf:type`` under the plan's data regime, narrowed
+    /// to the direct types the query fixed. Render
+    /// ``asset_type = ANY(asset_types)``; one element is the plain
     /// ``asset_type = class_uri``.
     #[getter]
-    fn classes(&self) -> Vec<String> {
+    fn asset_types(&self) -> Vec<String> {
         use crate::sparql_ops::Op;
         match &self.inner.op {
-            Op::Scan { classes, .. } => classes.clone(),
+            Op::Scan { asset_types, .. } => asset_types.clone(),
             _ => Vec::new(),
         }
     }
@@ -2935,7 +2936,7 @@ impl PlanOp {
 
     /// For ``"scan"``: the variable bound to the record's direct type, or
     /// ``None``. Render ``asset_type AS <col>`` and answer it as an IRI
-    /// (``classes`` already holds only the direct types the query allows).
+    /// (``asset_types`` already holds only the direct types the query allows).
     #[getter]
     fn direct_type(&self) -> Option<String> {
         use crate::sparql_ops::Op;

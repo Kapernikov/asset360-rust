@@ -4106,12 +4106,13 @@ class PlanOp:
         For ``"scan"``: the class IRI to match against ``asset_type``.
         """
     @property
-    def classes(self) -> builtins.list[builtins.str]:
+    def asset_types(self) -> builtins.list[builtins.str]:
         r"""
-        For ``"scan"``: every class the scan reads, canonical IRIs sorted --
-        ``class_uri`` and the classes whose records have it among their
-        ``rdf:type`` under the scan's regime. Render
-        ``asset_type = ANY(classes)``; one element is the plain
+        For ``"scan"``: records whose ``asset_type`` is one of these,
+        canonical IRIs sorted -- ``class_uri`` and the classes whose records
+        have it among their ``rdf:type`` under the plan's data regime, narrowed
+        to the direct types the query fixed. Render
+        ``asset_type = ANY(asset_types)``; one element is the plain
         ``asset_type = class_uri``.
         """
     @property
@@ -4126,7 +4127,7 @@ class PlanOp:
         r"""
         For ``"scan"``: the variable bound to the record's direct type, or
         ``None``. Render ``asset_type AS <col>`` and answer it as an IRI
-        (``classes`` already holds only the direct types the query allows).
+        (``asset_types`` already holds only the direct types the query allows).
         """
     @property
     def required_slots(self) -> builtins.list[builtins.str]:

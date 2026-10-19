@@ -307,18 +307,18 @@ def _is_a_scan(query):
 
 def test_a_direct_type_is_a_column_of_the_scan():
     """`sesame:directType ?t` is the scan's `asset_type`, bound as `?t`; a constant
-    one narrows `classes` (what the renderer filters `asset_type` by)."""
+    one narrows `asset_types` (what the renderer filters `asset_type` by)."""
     _, scan = _is_a_scan(
         "SELECT ?s ?t WHERE { ?s a asset360:Asset ; sesame:directType ?t }"
     )
     assert scan.direct_type == "t"
-    assert len(scan.classes) == 2
+    assert len(scan.asset_types) == 2
 
     _, scan = _is_a_scan(
         "SELECT ?s WHERE { ?s a asset360:Asset ; sesame:directType asset360:Signal }"
     )
     assert scan.direct_type is None
-    assert [c.rsplit("/", 1)[1] for c in scan.classes] == ["Signal"]
+    assert [c.rsplit("/", 1)[1] for c in scan.asset_types] == ["Signal"]
 
     plan, scan = _is_a_scan(
         "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Signal ; a ?t } GROUP BY ?t"
