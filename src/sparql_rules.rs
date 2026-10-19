@@ -1612,7 +1612,7 @@ fn class_at_path(
 ) -> Option<linkml_schemaview::classview::ClassView> {
     let mut class = schema.get_class_by_uri(class_uri).ok().flatten()?;
     for name in path {
-        let slot = class.slot(&Identifier::Name(name.clone()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)?;
         if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
             return None;
         }
@@ -1631,7 +1631,8 @@ fn prefix_crosses_a_collection(schema: &SchemaView, class_uri: &str, path: &[Str
         return false;
     };
     for name in path {
-        let Some(slot) = class.slot(&Identifier::Name(name.clone())) else {
+        let Some(slot) = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)
+        else {
             return false;
         };
         if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
@@ -1756,7 +1757,9 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
                 continue;
             };
-            let Some(on_class) = class.slot(&Identifier::Name(slot.name.clone())) else {
+            let Some(on_class) =
+                crate::sparql_slot_family::slot_on_class_or_descendant(&class, &slot.name)
+            else {
                 continue;
             };
             let multivalued =
@@ -1944,7 +1947,7 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         };
         let class = self.schema.get_class_by_uri(&class_uri).ok().flatten()?;
         let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
-        let on_class = class.slot(&Identifier::Name(slot.name.clone()))?;
+        let on_class = crate::sparql_slot_family::slot_on_class_or_descendant(&class, &slot.name)?;
         // Identity is [`FoldIdentityConstant`]'s, and the two rules have to be
         // disjoint or the plan depends on which fired first -- which it did:
         // reversed, this rule turned `?s :id "u"` into a JSONB path condition

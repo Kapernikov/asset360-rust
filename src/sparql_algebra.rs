@@ -34,7 +34,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 
 use spargebra::Query;
@@ -105,7 +104,7 @@ impl Translation<'_> {
 
     fn predicate(&self, class_uri: &str, slot: &str) -> Option<NamedNode> {
         let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
-        let slot = class.slot(&Identifier::Name(slot.to_owned()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, slot)?;
         let conv = self.schema.converter();
         let iri = slot.canonical_uri().to_uri(&conv).ok()?;
         NamedNode::new(iri.0).ok()

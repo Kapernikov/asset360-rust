@@ -4013,6 +4013,23 @@ classes:
         assert_eq!(doubled.ledger_balances().unwrap_err().duplicated, vec![0]);
     }
 
+    /// A leaf reached through slots declared only on subclasses of the hop
+    /// ranges is read by SQL as a nested path, not left to the engine.
+    #[test]
+    fn a_leaf_behind_subclass_only_slots_is_read_by_sql() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?lat WHERE {{ ?s a asset360:Site ; asset360:place ?p . \
+             ?p asset360:coords ?c . ?c asset360:lat ?lat }}"
+        );
+        let refined = refined_plan_text(&query, &sv, None).expect("this shape refines");
+        assert!(refined.contains("[S]"), "no SQL in:\n{refined}");
+        assert!(
+            refined.contains("place.coords.lat→?lat"),
+            "the nested read is not in the plan:\n{refined}"
+        );
+    }
+
     /// The naive text and the refined text must *differ* for a query the
     /// pipeline actually improves, and both must carry the same obligations.
     ///

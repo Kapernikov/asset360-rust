@@ -332,14 +332,15 @@ pub(crate) fn path_multiplies(
     class_uri: &str,
     slot_path: &[String],
 ) -> bool {
-    use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::slotview::SlotContainerMode;
 
     let Ok(Some(mut class_view)) = schema_view.get_class_by_uri(class_uri) else {
         return false;
     };
     for (i, slot_name) in slot_path.iter().enumerate() {
-        let Some(slot) = class_view.slot(&Identifier::Name(slot_name.clone())) else {
+        let Some(slot) =
+            crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, slot_name)
+        else {
             return false;
         };
         if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
@@ -396,12 +397,11 @@ pub(crate) fn occurrence_spec(
     var_name: &str,
     slot_path: Vec<String>,
 ) -> Option<BindingSpec> {
-    use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::slotview::SlotInlineMode;
     let mut class_view = schema_view.get_class_by_uri(class_uri).ok()??;
     let mut containers = Vec::with_capacity(slot_path.len());
     for name in &slot_path {
-        let slot = class_view.slot(&Identifier::Name(name.clone()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, name)?;
         if slot.determine_slot_inline_mode() == SlotInlineMode::Reference {
             return None;
         }

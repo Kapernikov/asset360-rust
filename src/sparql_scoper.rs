@@ -4324,7 +4324,7 @@ pub(crate) fn nested_presence_of(
     let mut class = schema_view.get_class_by_uri(class_uri).ok().flatten()?;
     let mut containers = Vec::with_capacity(slot_path.len());
     for (index, name) in slot_path.iter().enumerate() {
-        let slot = class.slot(&Identifier::Name(name.clone()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)?;
         let mode = slot.determine_slot_container_mode();
         containers.push(mode);
         if index + 1 == slot_path.len() {
@@ -7378,6 +7378,46 @@ classes:
         assert!(
             star.filters.is_empty(),
             "a nested value is not a column of the record"
+        );
+    }
+
+    /// A hop's range names a family: a slot declared only on a subclass of the
+    /// range is still a hop of the path, two levels deep here (`coords` is on
+    /// `SpotPlace` only, `lat` on `GeoFix` only). A slot two siblings declare
+    /// differently has no one meaning and is refused as before.
+    #[test]
+    fn a_nested_path_walks_through_subclass_only_slots() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?lat WHERE {{ ?s a asset360:Site ; asset360:place ?p .                  ?p asset360:coords ?c . ?c asset360:lat ?lat }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None, "{:?}", plan.inexact);
+
+        assert_eq!(
+            plan.path_bindings.get("lat").map(|b| b.slot_path.clone()),
+            Some(vec![
+                "place".to_owned(),
+                "coords".to_owned(),
+                "lat".to_owned()
+            ]),
+            "the leaf is a nested path of the scanned record"
+        );
+
+        // Two descendants, two definitions of `tag`: not a path.
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?t WHERE {{ ?s a asset360:Site ; asset360:place ?p .                  ?p asset360:tag ?t }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert!(
+            !plan.path_bindings.contains_key("t"),
+            "an ambiguous subclass slot must not become a path"
         );
     }
 

@@ -1135,11 +1135,10 @@ pub fn is_structure(schema: &SchemaView, class_uri: &str, path: &[String]) -> bo
 /// `[parts, children]`. `None` past a reference hop (the value is in another
 /// record) or where the range is not a class.
 pub fn class_at_path_of(schema: &SchemaView, class_uri: &str, path: &[String]) -> Option<String> {
-    use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::slotview::SlotInlineMode;
     let mut class = schema.get_class_by_uri(class_uri).ok().flatten()?;
     for name in path {
-        let slot = class.slot(&Identifier::Name(name.clone()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)?;
         if slot.determine_slot_inline_mode() == SlotInlineMode::Reference {
             return None;
         }
