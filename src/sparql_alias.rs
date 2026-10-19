@@ -2027,14 +2027,14 @@ classes:
 
     fn rewrite(query: &str) -> (Query, Vec<Rewrite>) {
         let sv = schema_view();
-        let mut parsed = crate::sparql_scoper::parse_query(query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
         let rewrites = canonicalize(&mut parsed, &sv).expect("accepted");
         (parsed, rewrites)
     }
 
     fn refuse(query: &str) -> NotASlotOfClass {
         let sv = schema_view();
-        let mut parsed = crate::sparql_scoper::parse_query(query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
         match canonicalize(&mut parsed, &sv) {
             Err(SpellingError::NotASlotOfClass(refusal)) => *refusal,
             other => panic!("{query}: expected a refusal, got {other:?}"),
@@ -2049,7 +2049,7 @@ classes:
         let query = format!(
             "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Tunnel\" }}"
         );
-        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let SpellingError::LiteralAgainstAConcept(refusal) =
             canonicalize(&mut parsed, &sv).expect_err("refused")
         else {
@@ -2074,7 +2074,7 @@ classes:
         let query = format!(
             "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Bridge\" }}"
         );
-        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let SpellingError::LiteralAgainstAConcept(refusal) =
             canonicalize(&mut parsed, &sv).expect_err("refused")
         else {
@@ -2089,7 +2089,7 @@ classes:
         let query = format!(
             "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Viaduct\" }}"
         );
-        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let refusal = canonicalize(&mut parsed, &sv).expect_err("refused");
         assert!(refusal.to_string().contains("No value of"), "{refusal}");
 
@@ -2107,7 +2107,7 @@ classes:
             let query = format!(
                 "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> ?k . {filter} }}"
             );
-            let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
             let refusal = canonicalize(&mut parsed, &sv).expect_err(&query);
             assert!(
                 matches!(refusal, SpellingError::LiteralAgainstAConcept(_)),
@@ -2120,7 +2120,7 @@ classes:
         let query = format!(
             "SELECT ?s WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <https://data.infrabel.be/asset360-rsm-subset/side> \"Left\" }}"
         );
-        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let SpellingError::LiteralAgainstAConcept(refusal) =
             canonicalize(&mut parsed, &sv).expect_err("refused")
         else {
@@ -2147,7 +2147,7 @@ classes:
             ),
             format!("SELECT ?z WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> \"Tunnel\" }}"),
         ] {
-            let mut parsed = crate::sparql_scoper::parse_query(&accepted).expect("parses");
+            let mut parsed = crate::sparql_scoper::parse_query(&accepted, None).expect("parses");
             canonicalize(&mut parsed, &sv).expect("accepted");
         }
     }
@@ -2523,7 +2523,7 @@ classes:
                 "SELECT ?t WHERE {{ ?z a <{ZONE}> ; <http://www.openrdf.org/schema/sesame#directType> ?t }}"
             ),
         ] {
-            let mut parsed = crate::sparql_scoper::parse_query(&accepted).expect("parses");
+            let mut parsed = crate::sparql_scoper::parse_query(&accepted, None).expect("parses");
             canonicalize(&mut parsed, &sv).unwrap_or_else(|e| panic!("{accepted}: {e}"));
         }
 
@@ -2561,7 +2561,7 @@ classes:
     // -- #306: the same judgement as a report, for the SHACL linter --------
 
     fn check(query: &str, bound: &[(&str, &str)]) -> Vec<PredicateCheck> {
-        let parsed = crate::sparql_scoper::parse_query(query).expect("parses");
+        let parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
         let bound: Vec<(String, String)> = bound
             .iter()
             .map(|(v, c)| ((*v).to_owned(), (*c).to_owned()))
@@ -2674,7 +2674,7 @@ classes:
             format!("SELECT ?c WHERE {{ ?s a <{LNE}> ; <{CODE}> ?c }}"),
             format!("SELECT ?c WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{CODE}> ?c }}"),
         ] {
-            let parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
             let verdict_under = |regime| {
                 check_predicates(&parsed, &sv, &[], regime)
                     .into_iter()
@@ -2707,7 +2707,7 @@ classes:
         const DIRECT: &str = "http://www.openrdf.org/schema/sesame#directType";
         let sv = schema_view();
         let judge = |query: &str, regime, predicate: &str| {
-            let parsed = crate::sparql_scoper::parse_query(query).expect("parses");
+            let parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
             check_predicates(&parsed, &sv, &[], regime)
                 .into_iter()
                 .find(|c| c.predicate == predicate)
@@ -2791,7 +2791,7 @@ classes:
             ),
         ] {
             let sv = schema_view();
-            let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
             canonicalize(&mut parsed, &sv).unwrap_or_else(|e| panic!("{query}: {e}"));
         }
     }
@@ -2839,6 +2839,7 @@ classes:
         }
         let mut parsed = crate::sparql_scoper::parse_query(
             "SELECT ?l WHERE { ?a <https://example.org/shared/label> ?l }",
+            None,
         )
         .expect("parses");
         let error = canonicalize_predicates(&mut parsed, &sv).expect_err("ambiguous");

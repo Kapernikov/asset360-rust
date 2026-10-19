@@ -3620,7 +3620,7 @@ impl OpTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparql_plan::{PassKind, plan_query_refined};
+    use crate::sparql_plan::{PassKind, plan_of};
     use crate::sparql_scoper::tests::test_schema_view;
     use linkml_schemaview::schemaview::SchemaView;
 
@@ -3629,7 +3629,7 @@ mod tests {
     /// Every SQL pass of a planned query, as (pass claims, operator tree).
     fn sql_passes(query: &str) -> Vec<(Vec<ObligationId>, OpTree)> {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!("{PREFIX}{query}"),
             &sv,
             crate::sparql_dataset::default_dataset(),
@@ -4359,8 +4359,8 @@ mod tests {
             crate::sparql_rules::tier_one_rules(sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
-        let mut plan = crate::sparql_refine::naive_plan_of(
-            &format!("{PREFIX}{query}"),
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
             crate::sparql_dataset::default_dataset(),
         )
         .expect("should build a naive plan");
@@ -4384,8 +4384,8 @@ mod tests {
         let rules = crate::sparql_rules::tier_one_rules(sv, &dataset);
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
-        let parsed =
-            crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
+        let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
+            .expect("should parse");
         let mut plan =
             crate::sparql_refine::naive_plan(&parsed, &dataset).expect("should build a naive plan");
         crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
@@ -4980,7 +4980,7 @@ mod tests {
     #[test]
     fn a_branch_whose_constant_is_not_the_columns_term_is_refused() {
         let sv = test_schema_view();
-        let err = plan_query_refined(
+        let err = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm ; \
                  asset360:kind ?k . FILTER(?nm = \"BX517\" || ?k = \"GSA\") }}"
@@ -5500,7 +5500,7 @@ pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &Sc
 #[cfg(test)]
 mod retrieval_tests {
     use super::*;
-    use crate::sparql_plan::{PassKind, plan_query_refined};
+    use crate::sparql_plan::{PassKind, plan_of};
     use crate::sparql_scoper::tests::test_schema_view;
 
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
@@ -5509,7 +5509,7 @@ mod retrieval_tests {
     /// Every scan's retrieval, in plan order.
     fn retrievals(query: &str) -> Vec<Retrieval> {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!("{PREFIX}{query}"),
             &sv,
             crate::sparql_dataset::default_dataset(),
@@ -5595,7 +5595,7 @@ mod retrieval_tests {
             "!(asset360:kind)",
         ] {
             let query = format!("{PREFIX}SELECT ?x WHERE {{ ?s a asset360:Signal ; {path} ?x }}");
-            let parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
             assert_eq!(
                 observable_slots(&parsed, &sv),
                 Err(NotEnumerable::PropertyPath),
@@ -5682,7 +5682,7 @@ mod retrieval_tests {
             "{PREFIX}SELECT ?code WHERE {{ ?s a asset360:Signal ; asset360:kind ?t . \
              GRAPH <urn:schema> {{ ?t skos:notation ?code }} }}"
         );
-        let parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let slots = observable_slots(&parsed, &sv).expect("enumerable");
         assert!(slots.contains("kind"), "{slots:?}");
         assert!(
@@ -5719,8 +5719,8 @@ mod retrieval_tests {
             "SELECT ?s WHERE { ?s a asset360:Signal \
              OPTIONAL { ?s asset360:kind ?k FILTER EXISTS { ?s asset360:hasName \"Shared\" } } }",
         ] {
-            let parsed =
-                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("parses");
+            let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
+                .expect("parses");
             let slots = observable_slots(&parsed, &sv).expect("enumerable");
             assert!(slots.contains("hasName"), "{query}\n{slots:?}");
         }

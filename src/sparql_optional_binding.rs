@@ -298,10 +298,13 @@ mod tests {
     use super::*;
 
     fn parse(body: &str) -> Query {
-        crate::sparql_scoper::parse_query(&format!(
-            "PREFIX : <https://data.infrabel.be/asset360/> \
+        crate::sparql_scoper::parse_query(
+            &format!(
+                "PREFIX : <https://data.infrabel.be/asset360/> \
              PREFIX skos: <http://www.w3.org/2004/02/skos/core#> {body}"
-        ))
+            ),
+            None,
+        )
         .expect("parses")
     }
 

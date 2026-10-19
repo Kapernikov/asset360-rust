@@ -479,7 +479,7 @@ mod tests {
 
     fn reduced(query: &str) -> Query {
         let sv = test_schema_view();
-        let mut parsed = parse_query(&format!("{PREFIX}{query}")).expect("parses");
+        let mut parsed = parse_query(&format!("{PREFIX}{query}"), None).expect("parses");
         reduce_paths(&mut parsed, &sv);
         parsed
     }
@@ -554,9 +554,10 @@ mod tests {
 "#,
         );
         for predicate in ["attrOnlyPredicate", "usageOnlyPredicate"] {
-            let mut parsed = parse_query(&format!(
-                "{PREFIX}SELECT ?s WHERE {{ ?s asset360:{predicate}* asset360:Signal }}"
-            ))
+            let mut parsed = parse_query(
+                &format!("{PREFIX}SELECT ?s WHERE {{ ?s asset360:{predicate}* asset360:Signal }}"),
+                None,
+            )
             .expect("parses");
             reduce_paths(&mut parsed, &sv);
             assert!(has_path(&parsed), "{predicate}: {parsed}");
@@ -583,7 +584,7 @@ mod tests {
             "SELECT ?s WHERE { GRAPH <https://data.infrabel.be/asset360/schema> { ?s rdfs:subClassOf+ asset360:Signal } }",
         ] {
             let sv = test_schema_view();
-            let parsed = parse_query(&format!("{PREFIX}{query}")).expect("parses");
+            let parsed = parse_query(&format!("{PREFIX}{query}"), None).expect("parses");
             let mut got = parsed.clone();
             reduce_paths(&mut got, &sv);
             assert_eq!(got.to_string(), parsed.to_string(), "{query}");
@@ -613,7 +614,7 @@ mod tests {
             "SELECT ?s ?t WHERE { ?s a asset360:Signal OPTIONAL { ?s a/rdfs:subClassOf* asset360:Track . BIND(1 AS ?t) } }",
         ] {
             let text = format!("{PREFIX}{query}");
-            let original = parse_query(&text).expect("parses");
+            let original = parse_query(&text, None).expect("parses");
             let mut rewritten = original.clone();
             reduce_paths(&mut rewritten, &sv);
             assert!(!has_path(&rewritten), "{query}: {rewritten}");
@@ -635,9 +636,10 @@ mod tests {
     fn a_constant_no_triple_mentions_still_binds_under_a_zero_length_step() {
         let sv = test_schema_view();
         let oracle = crate::sparql_oracle::fixture(&sv);
-        let mut query = parse_query(&format!(
-            "{PREFIX}SELECT ?t WHERE {{ ?t rdfs:subClassOf* asset360:Nowhere }}"
-        ))
+        let mut query = parse_query(
+            &format!("{PREFIX}SELECT ?t WHERE {{ ?t rdfs:subClassOf* asset360:Nowhere }}"),
+            None,
+        )
         .expect("parses");
         reduce_paths(&mut query, &sv);
         let bag = oracle.answers(query);

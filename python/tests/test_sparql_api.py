@@ -168,6 +168,13 @@ def test_a_query_reading_two_data_graphs_is_refused_by_name_on_every_route():
     assert plan.data_regime == TypeRegime.IS_A
 
 
+def test_the_rows_route_switch_is_keyword_only():
+    signature = inspect.signature(plan_query_refined)
+    assert list(signature.parameters)[:3] == ["query", "schema_view", "dataset"]
+    assert signature.parameters["rows_route"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["rows_route"].default is True
+
+
 def test_the_records_route_takes_the_plan_and_its_dataset():
     sv = SchemaView()
     sv.add_schema_str(_SCHEMA_YAML)

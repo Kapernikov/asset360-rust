@@ -108,7 +108,7 @@ impl Oracle {
 
     /// The answer to a query string.
     pub fn answers_to(&self, query: &str) -> Bag {
-        self.answers(crate::sparql_scoper::parse_query(query).unwrap())
+        self.answers(crate::sparql_scoper::parse_query(query, None).unwrap())
     }
 }
 
@@ -306,7 +306,7 @@ pub fn probe_sequence(turtle: &str, query: &str) -> Vec<BTreeMap<String, String>
     }
     ordered_answers(
         &Oracle { store },
-        crate::sparql_scoper::parse_query(query).unwrap(),
+        crate::sparql_scoper::parse_query(query, None).unwrap(),
     )
 }
 

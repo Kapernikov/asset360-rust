@@ -1887,9 +1887,8 @@ pub(crate) mod tests {
 
     /// The plan production refines a query to with the lifts on.
     pub(crate) fn lifted_plan(query: &str, schema: &SchemaView) -> Plan {
-        let mut plan = crate::sparql_refine::naive_plan_for(
-            query,
-            schema,
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(query, Some(schema)).unwrap(),
             crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
@@ -1925,18 +1924,15 @@ pub(crate) mod tests {
         schema: &SchemaView,
         oracle: &Oracle,
     ) -> (ExecutionPlan, Vec<serde_json::Value>) {
-        let plan = crate::sparql_plan::plan_query_refined(
-            query,
-            schema,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
+        let plan =
+            crate::sparql_plan::plan_of(query, schema, crate::sparql_dataset::default_dataset())
+                .unwrap();
         assert!(
             matches!(plan.refinement, Refinement::UsedRows(_)),
             "expected the rows route:\n{plan}"
         );
         // The same placement, for the island it placed.
-        let parsed = crate::sparql_scoper::parse_query_for(query, schema).unwrap();
+        let parsed = crate::sparql_scoper::parse_query(query, Some(schema)).unwrap();
         let obligations = crate::sparql_plan::obligations_of(&parsed).unwrap();
         let mut lifted =
             crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
@@ -1990,7 +1986,7 @@ pub(crate) mod tests {
     /// The oracle's own answer to the original query, in its order.
     pub(crate) fn oracle_rows(query: &str, oracle: &Oracle) -> Vec<serde_json::Value> {
         oracle
-            .json_rows(crate::sparql_scoper::parse_query(query).unwrap())
+            .json_rows(crate::sparql_scoper::parse_query(query, None).unwrap())
             .1
     }
 
@@ -2101,7 +2097,7 @@ pub(crate) mod tests {
         assert_ne!(original, rows_only);
 
         let schema = test_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &format!(
                 "{PREFIX}SELECT ?s ?found WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
                  BIND(EXISTS {{ ?s asset360:length ?len }} AS ?found) }}"
@@ -2717,12 +2713,9 @@ mod composition {
         // The lift fires on it.
         let lifted = lifted_plan(&query, &schema).to_string();
         assert!(lifted.contains("R2  "), "{lifted}");
-        let plan = crate::sparql_plan::plan_query_refined(
-            &query,
-            &schema,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
+        let plan =
+            crate::sparql_plan::plan_of(&query, &schema, crate::sparql_dataset::default_dataset())
+                .unwrap();
         assert!(
             !matches!(plan.refinement, Refinement::UsedRows(_)),
             "{plan}"
@@ -2761,9 +2754,8 @@ mod composition {
         // Where it stood, M1 declines it on K7 ...
         let unlifted = crate::sparql_plan::with_declined(
             &{
-                let mut plan = crate::sparql_refine::naive_plan_for(
-                    &query,
-                    &schema,
+                let mut plan = crate::sparql_refine::naive_plan(
+                    &crate::sparql_scoper::parse_query(&query, Some(&schema)).unwrap(),
                     crate::sparql_dataset::default_dataset(),
                 )
                 .unwrap();
@@ -2816,7 +2808,7 @@ mod composition {
     #[test]
     fn a_region_that_reads_instances_finishes_over_records() {
         let schema = test_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &format!(
                 "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal . \
                  FILTER(EXISTS {{ ?s asset360:name ?nm }}) }}"
@@ -3028,7 +3020,7 @@ mod grammar_differential {
         let mut routed = 0;
         for body in crate::sparql_algebra::equivalence::grammar() {
             let query = format!("{PREFIX}{body}");
-            let Ok(plan) = crate::sparql_plan::plan_query_refined(
+            let Ok(plan) = crate::sparql_plan::plan_of(
                 &query,
                 &schema,
                 crate::sparql_dataset::default_dataset(),

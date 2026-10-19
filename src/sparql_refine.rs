@@ -133,8 +133,8 @@ impl fmt::Display for NodeKey {
 ///
 /// This is what [`crate::sparql_ops::Enforcement`] collapses into once the
 /// split is load-bearing. A node is `Sql` while the engine also re-applies it
-/// -- exactly today's `Narrows` -- because the engine leg re-runs the whole
-/// original query string.
+/// -- [`crate::sparql_ops::Enforcement::Narrows`] -- because the engine leg
+/// re-runs the whole original query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Executor {
     Sql,
@@ -1898,8 +1898,8 @@ pub struct ScanSlot {
     /// `None` for a read that constrains the value without naming it: `?s
     /// :name "BX517"` asserts that the slot exists *and* what it holds, and
     /// the existence half is a slot the scan reads while the value half is a
-    /// condition above it. Today's star says the same thing by listing the
-    /// name in `required_fields` with no entry in `slot_variables`.
+    /// condition above it. The scoper's star says the same thing by listing
+    /// the name in `required_fields` with no entry in `slot_variables`.
     ///
     /// A slot with no variable binds nothing, so nothing above the scan can
     /// read it: no condition resolves through it, no join keys on it, and a
@@ -1914,10 +1914,9 @@ pub struct ScanSlot {
 
 /// Whether a scan *requires* the value it reads, or only allows it.
 ///
-/// The distinction 28d did not have, and the reason the ledger and the plan
-/// could disagree about an `OPTIONAL`. Today's star decomposition carries it
-/// as `required_fields` versus `optional_fields`, and it decides one thing in
-/// the SQL: whether an `object_data ? 'slot'` existence check is emitted.
+/// The scoper's star decomposition carries it as `required_fields` versus
+/// `optional_fields`, and it decides one thing in the SQL: whether an
+/// `object_data ? 'slot'` existence check is emitted.
 ///
 /// **Orthogonal to whether the read binds a variable**, which is
 /// [`ScanSlot::var`]. The two facts together are the whole of what a scan does
@@ -2320,7 +2319,7 @@ pub enum PlanOp {
         /// Values the query fixed the record's *identity* to.
         ///
         /// Not a slot and not a JSONB path: the identifier is the record's own
-        /// URI, which lives in an indexed column, and today's star
+        /// URI, which lives in an indexed column, and the scoper's star
         /// decomposition carries it apart from `filters` for exactly that
         /// reason. A scan with one of these reads one record; a scan without
         /// reads the class.
@@ -4057,26 +4056,6 @@ impl From<ScopeError> for RefineError {
     }
 }
 
-/// Parse a query with the schema-less parser and build its naive plan.
-///
-/// Diagnostics and tests; a query here declares the datamodel's prefixes
-/// itself. See [`crate::sparql_scoper::sparql_parser`].
-pub fn naive_plan_of(query_str: &str, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
-    let parsed = crate::sparql_scoper::parse_query(query_str)?;
-    naive_plan(&parsed, dataset)
-}
-
-/// Parse a query with the schema-seeded parser and build its naive plan over
-/// `dataset` (see [`naive_plan`]).
-pub fn naive_plan_for(
-    query_str: &str,
-    schema_view: &SchemaView,
-    dataset: &DatasetSpec,
-) -> Result<Plan, RefineError> {
-    let parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
-    naive_plan(&parsed, dataset)
-}
-
 /// The query, faithfully, with every node engine-executed and nothing folded.
 ///
 /// The obligations are [`crate::sparql_plan::obligations_of`]'s, unchanged, so
@@ -4272,11 +4251,13 @@ fn reads_tag(reads: GraphReads, context: RegimeContext) -> Option<String> {
 /// The one place this is computed, and [`Plan::scan_classes_agree`] recomputes
 /// it through here. A class the schema does not know stands for itself.
 ///
-/// **An error is an error.** When the schema cannot say what the family is
-/// (a cycle in `is_a`, a mixin that does not resolve), the answer is
+/// **An error is an error.** The schema view fails when it cannot resolve a
+/// class this walks through: `class_uri` itself, or a class below it whose
+/// `is_a` names a class that does not exist. The answer is then
 /// [`ScanClassesError`] and not a shorter list: a scan standing for fewer
 /// classes than its records belong to returns fewer rows, with nothing to say
-/// so.
+/// so. (A cycle in `is_a` and a mixin that does not resolve are no errors: the
+/// traversal is cycle-safe and skips an unresolved mixin.)
 pub(crate) fn scan_classes(
     schema: &SchemaView,
     class_uri: &str,
@@ -4307,11 +4288,29 @@ pub(crate) fn scan_classes(
 
 /// The schema could not say which classes a scan stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScanClassesError {
-    pub class_uri: String,
-    pub regime: TypeRegime,
+    class_uri: String,
+    regime: TypeRegime,
     /// The schema's own error.
-    pub message: String,
+    message: String,
+}
+
+impl ScanClassesError {
+    /// The class the scan was of.
+    pub fn class_uri(&self) -> &str {
+        &self.class_uri
+    }
+
+    /// The regime its family was asked for under.
+    pub fn regime(&self) -> TypeRegime {
+        self.regime
+    }
+
+    /// The schema's own error.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Display for ScanClassesError {
@@ -5052,8 +5051,8 @@ mod tests {
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
     fn plan_of(query: &str) -> Plan {
-        naive_plan_of(
-            &format!("{PREFIX}{query}"),
+        naive_plan(
+            &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
             crate::sparql_dataset::default_dataset(),
         )
         .expect("should build a naive plan")
@@ -5394,8 +5393,8 @@ mod tests {
             "SELECT ?s WHERE { ?s a asset360:Signal MINUS { ?s asset360:name ?nm } }",
             "SELECT ?nm WHERE { ?s asset360:locatedOnTrack+/asset360:hasName ?nm }",
         ] {
-            let error = naive_plan_of(
-                &format!("{PREFIX}{query}"),
+            let error = naive_plan(
+                &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
                 crate::sparql_dataset::default_dataset(),
             )
             .expect_err("obligation enumeration refuses this");
@@ -5572,7 +5571,7 @@ mod tests {
             .expect("a valid dataset");
         let try_plan = |query: &str| {
             let parsed =
-                crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
             naive_plan(&parsed, &dataset)
         };
         let plan = |query: &str| try_plan(query).unwrap();
@@ -5744,7 +5743,7 @@ mod tests {
                 .build()
                 .expect("a valid dataset");
             let parsed =
-                crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
             naive_plan(&parsed, &dataset).unwrap().to_string()
         };
         let body = "?s asset360:name ?n";
@@ -5797,8 +5796,9 @@ mod tests {
         // Under `is_a` the family is read off every class, `Broken` included.
         let error = scan_classes(&sv, signal, TypeRegime::IS_A)
             .expect_err("the schema cannot say what the family is");
-        assert_eq!(error.class_uri, signal);
-        assert_eq!(error.regime, TypeRegime::IS_A);
+        assert_eq!(error.class_uri(), signal);
+        assert_eq!(error.regime(), TypeRegime::IS_A);
+        assert!(!error.message().is_empty());
 
         // The planner surfaces it to the caller instead of planning a scan
         // that reads only `Signal`.
@@ -5807,7 +5807,7 @@ mod tests {
             .expect("a valid dataset");
         let query =
             format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?n }}");
-        let planned = crate::sparql_plan::plan_query_refined(&query, &sv, &dataset)
+        let planned = crate::sparql_plan::plan_of(&query, &sv, &dataset)
             .expect_err("a planning error, not a plan");
         assert!(
             matches!(planned, crate::sparql_scoper::ScopeError::SchemaError(_)),
@@ -5832,7 +5832,7 @@ mod tests {
         let body = "?s asset360:name ?n";
         let reads_of = |query: &str| -> (Vec<GraphReads>, String) {
             let parsed =
-                crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
             let plan = naive_plan(&parsed, &dataset).unwrap();
             let reads = plan
                 .nodes
@@ -5857,9 +5857,9 @@ mod tests {
         // which. (Over a dataset that serves a data graph it is refused: it
         // could read several.)
         let schema_only = crate::sparql_dataset::schema_dataset(S);
-        let parsed = crate::sparql_scoper::parse_query_for(
+        let parsed = crate::sparql_scoper::parse_query(
             &format!("{PREFIX}SELECT ?s WHERE {{ GRAPH ?g {{ {body} }} }}"),
-            &sv,
+            Some(&sv),
         )
         .unwrap();
         let variable = naive_plan(&parsed, &schema_only).unwrap();
@@ -5909,7 +5909,7 @@ mod tests {
             "{PREFIX}SELECT ?s ?g WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
              GRAPH <https://example.org/g> {{ ?g a asset360:Signal }} }}"
         );
-        let parsed = crate::sparql_scoper::parse_query_for(&query, &sv).unwrap();
+        let parsed = crate::sparql_scoper::parse_query(&query, Some(&sv)).unwrap();
         let regimes = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
             plan.nodes
                 .iter()
@@ -6779,8 +6779,8 @@ mod tests {
                 _ => None,
             }
         }
-        let parsed =
-            crate::sparql_scoper::parse_query(query).unwrap_or_else(|err| panic!("{query}: {err}"));
+        let parsed = crate::sparql_scoper::parse_query(query, None)
+            .unwrap_or_else(|err| panic!("{query}: {err}"));
         let Query::Select { pattern, .. } = &parsed else {
             unreachable!("a SELECT")
         };

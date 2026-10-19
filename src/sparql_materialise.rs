@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn without_a_schema_graph_nothing_is_evaluated() {
         let schema_view = asset360_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &query(&format!(
                 "SELECT ?s ?code WHERE {{ \
                  ?s a asset360:Signal ; asset360:signalType ?t . \
@@ -1171,8 +1171,12 @@ mod tests {
     /// mechanism that is general in the prose and specific in the code.
     #[test]
     fn a_second_pass_needs_no_edit_to_the_first() {
-        let mut plan = crate::sparql_refine::naive_plan_of(
-            "SELECT ?x ?y WHERE { VALUES ?x { 1 2 } VALUES ?y { 3 } }",
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(
+                "SELECT ?x ?y WHERE { VALUES ?x { 1 2 } VALUES ?y { 3 } }",
+                None,
+            )
+            .unwrap(),
             crate::sparql_dataset::default_dataset(),
         )
         .expect("a naive plan");
@@ -1389,7 +1393,7 @@ mod tests {
     /// The lowered execution plan, which is what the endpoint renders.
     fn plan_for(body: &str) -> String {
         let schema_view = asset360_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &query(body),
             &schema_view,
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
@@ -1645,8 +1649,8 @@ mod tests {
                 false,
             ),
         ] {
-            let plan = crate::sparql_refine::naive_plan_of(
-                &query(body),
+            let plan = crate::sparql_refine::naive_plan(
+                &crate::sparql_scoper::parse_query(&query(body), None).unwrap(),
                 crate::sparql_dataset::default_dataset(),
             )
             .expect("the query parses");

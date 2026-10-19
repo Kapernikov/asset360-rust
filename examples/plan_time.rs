@@ -37,8 +37,14 @@ fn main() {
         let schema: SchemaDefinition = serde_path_to_error::deserialize(deser).unwrap();
         sv.add_schema(schema).unwrap();
     }
+    let parsed = asset360_rust::sparql_scoper::parse_query(&query, Some(&sv)).unwrap();
     let t = Instant::now();
-    let plan = asset360_rust::sparql_plan::plan_query_refined(&query, &sv, &dataset);
+    let plan = asset360_rust::sparql_plan::plan_query_refined(
+        &parsed,
+        &sv,
+        &dataset,
+        asset360_rust::sparql_plan::Finishing::Rows,
+    );
     let elapsed = t.elapsed();
     match plan {
         Ok(_) => println!("planned in {elapsed:?}"),

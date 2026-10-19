@@ -509,7 +509,7 @@ classes:
     /// The canonical spelling, with `data` the regime of the data graph.
     fn refined(sv: &SchemaView, dataset: &DatasetSpec, spelling: &str) -> (bool, String) {
         let query = format!("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {spelling}");
-        let parsed = crate::sparql_scoper::parse_query_for(&query, sv).expect("parses");
+        let parsed = crate::sparql_scoper::parse_query(&query, Some(sv)).expect("parses");
         let mut plan = crate::sparql_refine::naive_plan(&parsed, dataset).expect("plans");
         // The graphs the query can see, as production hands the rules.
         let visible = dataset.seen_through(crate::sparql_scoper::dataset_of(&parsed));

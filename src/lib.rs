@@ -4104,13 +4104,11 @@ fn regime_repr(regime: linkml_runtime::schema_rdf::TypeRegime) -> String {
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "plan_query_refined")]
-#[pyo3(signature = (query, schema_view, dataset, rows_route=true))]
+#[pyo3(signature = (query, schema_view, dataset, *, rows_route=true))]
 /// Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
 ///
 /// The only planner. A naive plan of the whole query is refined by rules to a
-/// fixpoint and lowered into the operators the caller renders. There used to
-/// be a second one — a single-pass analysis, exposed as ``plan_query`` — and a
-/// runtime gate that ran both and compared them; both are gone.
+/// fixpoint and lowered into the operators the caller renders.
 ///
 /// ``refinement`` says how to run it:
 ///
@@ -4160,7 +4158,14 @@ fn py_plan_query_refined(
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    crate::sparql_plan::plan_query_refined_with_options(query, sv, &dataset.inner, rows_route)
+    let parsed = crate::sparql_scoper::parse_query(query, Some(sv))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let finishing = if rows_route {
+        crate::sparql_plan::Finishing::Rows
+    } else {
+        crate::sparql_plan::Finishing::RecordsOnly
+    };
+    crate::sparql_plan::plan_query_refined(&parsed, sv, &dataset.inner, finishing)
         .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -4205,10 +4210,9 @@ fn py_naive_plan_text(query: &str, dataset: PyDatasetSpec) -> PyResult<String> {
 /// The refined plan for a query, as the text the Rust tests print.
 ///
 /// Diagnostics, and the one thing the `ExecutionPlan` artifact cannot show: on
-/// a fallback the artifact carries *today's* operators, so the plan that was
-/// rejected leaves no trace beyond `refinement_reason`. Reading a table of
-/// fallbacks without it means guessing which rule declined -- which cost a
-/// round of guessing once.
+/// a fallback the artifact carries the scoper's operators, so the plan that was
+/// rejected leaves no trace beyond `refinement_reason`. This is that plan, and
+/// its `declined` section names the rule that did not fire and why.
 ///
 /// Args:
 ///     query: SPARQL query string.
@@ -4286,7 +4290,19 @@ fn sparql_scope(
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    match crate::sparql_scoper::sparql_scope(query, sv, &dataset.inner) {
+    // The same spelling pass every other entry point runs, so a caller that
+    // only scopes -- the config linter -- accepts and refuses exactly what
+    // the planner and the engine leg do. See [`crate::sparql_alias`].
+    let scoped = crate::sparql_scoper::parse_query(query, Some(sv)).and_then(|mut parsed| {
+        crate::sparql_alias::canonicalize(&mut parsed, sv)?;
+        crate::sparql_scoper::scope_query(
+            &parsed,
+            sv,
+            &dataset.inner,
+            crate::sparql_scoper::Scoping::Refuse,
+        )
+    });
+    match scoped {
         Ok(plan) => Ok(plan.into()),
         // ScopeError's Display produces exactly these strings, so there is one
         // place to change when a variant is added — rather than two blocks
@@ -4807,7 +4823,7 @@ fn py_check_predicates(
     let sv_bound = schema_view.bind(py);
     let sv_ref = sv_bound.borrow();
     let sv = sv_ref.as_rust();
-    let parsed = crate::sparql_scoper::parse_query_for(query, sv)
+    let parsed = crate::sparql_scoper::parse_query(query, Some(sv))
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     let bound: Vec<(String, String)> = bound.unwrap_or_default().into_iter().collect();
     Ok(

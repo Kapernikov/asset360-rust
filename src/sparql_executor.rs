@@ -266,7 +266,7 @@ pub(crate) fn geosparql_evaluator() -> oxigraph::sparql::SparqlEvaluator {
 /// Execute a SPARQL query against a set of LinkML instances.
 ///
 /// This is the main entry point for query execution. The caller (Django view)
-/// has already used [`crate::sparql_scoper::sparql_scope`] to determine which
+/// has already used [`crate::sparql_scoper::scope_query`] to determine which
 /// objects to fetch and has loaded them as [`LinkMLInstance`] objects.
 ///
 /// # Arguments
@@ -281,18 +281,11 @@ pub(crate) fn geosparql_evaluator() -> oxigraph::sparql::SparqlEvaluator {
 ///
 /// # The serialisation is not a parameter
 ///
-/// It used to be, and the caller could contradict the query: a `CONSTRUCT`
-/// with `format = "json"` reached the `Graph` arm below and failed with
-/// `Unsupported format for graph results: json`. The caller had to read the
-/// query's form to avoid that, which meant a second, cruder parser on the
-/// other side of the FFI boundary — and the consolidator-server one read
-/// `query.strip().upper().startswith("CONSTRUCT")`, so every `CONSTRUCT`
-/// behind a `PREFIX` line — nearly all of them — answered 500.
-///
-/// Nothing was gained for it: oxigraph hands back `QueryResults::{Solutions,
-/// Boolean, Graph}`, so the *result type* already says which serialisation is
-/// possible, and the two non-graph arms ignored `format` entirely. The answer
-/// therefore carries its own content type.
+/// A caller-chosen format could contradict the query (a `CONSTRUCT` asked for
+/// as JSON), and choosing one meant a second parser of the query's form on the
+/// caller's side. oxigraph hands back `QueryResults::{Solutions, Boolean,
+/// Graph}`, so the *result type* already says which serialisation is possible.
+/// The answer therefore carries its own content type.
 ///
 /// # Errors
 ///
@@ -326,7 +319,7 @@ pub fn sparql_execute(
     //
     // Parsed *before* the records are loaded, so a query the engine will
     // refuse costs nothing to refuse.
-    let mut parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)
+    let mut parsed = crate::sparql_scoper::parse_query(query_str, Some(schema_view))
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
     // One slot, two spellings -- and one class, two spellings. The data
@@ -1142,7 +1135,7 @@ pub fn sparql_finish(
         rows.push(row);
     }
 
-    let mut parsed = crate::sparql_scoper::parse_query(finish)
+    let mut parsed = crate::sparql_scoper::parse_query(finish, None)
         .map_err(|e| ExecuteError::QueryError(format!("the finish query: {e}")))?;
     let mut filled = 0usize;
     let mut rows = Some(rows);
@@ -1341,7 +1334,7 @@ classes:
         let run = |query: &str| -> Result<usize, String> {
             let query = prefixed(query);
             let unplanned = sparql_execute(&query, &refs, &sv, &dataset, ExecuteLimits::default());
-            let plan = crate::sparql_plan::plan_query_refined(&query, &sv, &dataset);
+            let plan = crate::sparql_plan::plan_of(&query, &sv, &dataset);
             match (unplanned, plan) {
                 (Ok(answer), Ok(plan)) => {
                     let planned = sparql_execute_plan(&plan, &refs, &sv, ExecuteLimits::default())
@@ -2469,7 +2462,7 @@ classes:
             answer["results"]["bindings"].as_array().unwrap().len()
         };
 
-        let mut plan = crate::sparql_plan::plan_query_refined(
+        let mut plan = crate::sparql_plan::plan_of(
             &query,
             &sv,
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),

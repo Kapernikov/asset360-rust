@@ -7581,14 +7581,12 @@ def naive_plan_text(query:builtins.str, dataset:DatasetSpec) -> builtins.str:
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def plan_query_refined(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec, rows_route:builtins.bool=True) -> ExecutionPlan:
+def plan_query_refined(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec, *, rows_route:builtins.bool=True) -> ExecutionPlan:
     r"""
     Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
     
     The only planner. A naive plan of the whole query is refined by rules to a
-    fixpoint and lowered into the operators the caller renders. There used to
-    be a second one — a single-pass analysis, exposed as ``plan_query`` — and a
-    runtime gate that ran both and compared them; both are gone.
+    fixpoint and lowered into the operators the caller renders.
     
     ``refinement`` says how to run it:
     
@@ -7634,10 +7632,9 @@ def refined_plan_text(query:builtins.str, schema_view:SchemaView, dataset:Datase
     The refined plan for a query, as the text the Rust tests print.
     
     Diagnostics, and the one thing the `ExecutionPlan` artifact cannot show: on
-    a fallback the artifact carries *today's* operators, so the plan that was
-    rejected leaves no trace beyond `refinement_reason`. Reading a table of
-    fallbacks without it means guessing which rule declined -- which cost a
-    round of guessing once.
+    a fallback the artifact carries the scoper's operators, so the plan that was
+    rejected leaves no trace beyond `refinement_reason`. This is that plan, and
+    its `declined` section names the rule that did not fire and why.
     
     Args:
         query: SPARQL query string.

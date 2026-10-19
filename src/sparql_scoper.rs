@@ -1348,36 +1348,19 @@ impl std::fmt::Display for ScopeError {
 
 pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-/// Analyse a SPARQL query and produce a [`QueryPlan`], for a deployment whose
-/// dataset is `dataset`.
-///
-/// Parses the query via `spargebra`, decomposes the BGP into stars,
-/// detects join edges between stars, and collects filter conditions.
-///
-/// # Errors
-///
-/// - [`ScopeError::ParseError`] — invalid SPARQL syntax.
-/// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
-/// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update.
-///
-/// `dataset` says which named graphs the endpoint serves: the schema graphs
-/// the datamodel is published in, the data graphs the records are served as,
-/// and what the default graph means. It is a parameter and not a constant
-/// because the deployment decides it — see [`crate::sparql_dataset`] and
-/// [`crate::sparql_schema_graph`]. A dataset with no schema graph has no
-/// pattern in one, so every triple is scoped as an instance pattern.
-pub fn sparql_scope(
+/// A string query scoped as the endpoint does: parsed with the datamodel's
+/// parser, spelled canonically, refused on anything it refuses. Test
+/// convenience over [`parse_query`], [`crate::sparql_alias::canonicalize`] and
+/// [`scope_query`], which are the operations.
+#[cfg(test)]
+pub(crate) fn sparql_scope(
     query_str: &str,
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
 ) -> Result<QueryPlan, ScopeError> {
-    let mut query = parse_query_for(query_str, schema_view)?;
-    // The same spelling pass every other entry point runs, so a caller that
-    // only scopes -- the config linter, through the `sparql_scope` binding --
-    // accepts and refuses exactly what the planner and the engine leg do. See
-    // [`crate::sparql_alias`].
+    let mut query = parse_query(query_str, Some(schema_view))?;
     crate::sparql_alias::canonicalize(&mut query, schema_view)?;
-    scope_parsed(&query, schema_view, dataset)
+    scope_query(&query, schema_view, dataset, Scoping::Refuse)
 }
 
 /// The vocabularies the parser seeds whatever the datamodel says.
@@ -1469,9 +1452,8 @@ pub fn predeclared_prefixes(
 /// ([`schema_prefixes`]) — read off the schema rather than hardcoded, so a
 /// refusal's "did you mean `irsm:longname`" can be pasted as written, and a
 /// second datamodel (`DATAMODEL=rinf`) describes itself instead of being
-/// handed asset360's namespace. `asset360:` used to be the one hardcoded
-/// datamodel prefix here; it is now seeded like any other because the schema
-/// declares it.
+/// handed asset360's namespace. `asset360:` is seeded like any other
+/// datamodel prefix, because the schema declares it.
 ///
 /// These are defaults, not overrides: a query that declares a label itself wins
 /// (the parser's in-query declaration overwrites the seeded one), so a caller
@@ -1507,14 +1489,17 @@ pub fn sparql_parser() -> SparqlParser {
     parser
 }
 
-/// Parse a query with [`sparql_parser_for`], rejecting SPARQL Update.
-pub fn parse_query_for(query_str: &str, schema_view: &SchemaView) -> Result<Query, ScopeError> {
-    parse_with(&sparql_parser_for(schema_view), query_str)
-}
-
-/// Parse a query with [`sparql_parser`], rejecting SPARQL Update.
-pub fn parse_query(query_str: &str) -> Result<Query, ScopeError> {
-    parse_with(&sparql_parser(), query_str)
+/// Parse a query, rejecting SPARQL Update: **the** parse function.
+///
+/// With a schema, the parser is [`sparql_parser_for`] -- seeded from the
+/// datamodel, which every entry point that serves a client uses. Without one
+/// it is [`sparql_parser`], the endpoint's vocabularies only: for diagnostics
+/// and tests, where a query declares the datamodel's prefixes itself.
+pub fn parse_query(query_str: &str, schema_view: Option<&SchemaView>) -> Result<Query, ScopeError> {
+    match schema_view {
+        Some(schema_view) => parse_with(&sparql_parser_for(schema_view), query_str),
+        None => parse_with(&sparql_parser(), query_str),
+    }
 }
 
 fn parse_with(parser: &SparqlParser, query_str: &str) -> Result<Query, ScopeError> {
@@ -1531,24 +1516,33 @@ fn parse_with(parser: &SparqlParser, query_str: &str) -> Result<Query, ScopeErro
         .map_err(|e| ScopeError::ParseError(e.to_string()))
 }
 
-/// Plan an already-parsed query, for a deployment whose dataset is `dataset`.
+/// Analyse a parsed query and produce a [`QueryPlan`], for a deployment whose
+/// dataset is `dataset`: the one scoping operation.
 ///
-/// Separate from [`sparql_scope`] so a caller that needs the parsed algebra for
-/// its own analysis — the aggregate pushdown does — can parse once and share
-/// the result, instead of parsing the same string again with a parser that
-/// might not match.
+/// Decomposes the BGP into stars, detects join edges between stars, and
+/// collects filter conditions. The caller parses ([`parse_query`]) and spells
+/// the query canonically ([`crate::sparql_alias::canonicalize`]) first, so a
+/// caller that needs the parsed algebra for its own analysis parses once and
+/// shares the result, instead of parsing the same string again with a parser
+/// that might not match.
 ///
-/// See [`sparql_scope`] for what `dataset` is and why it is not a constant.
-pub fn scope_parsed(
-    query: &Query,
-    schema_view: &SchemaView,
-    dataset: &DatasetSpec,
-) -> Result<QueryPlan, ScopeError> {
-    scope_parsed_as(query, schema_view, dataset, Scoping::Refuse)
-}
-
-/// [`scope_parsed`] with a choice of what to do with an
-/// untyped star. The pipeline's entry point.
+/// `scoping` says what to do with an untyped star: refuse it
+/// ([`Scoping::Refuse`]), record it for the refined plan to type
+/// ([`Scoping::Record`]), or type it from classes the refined plan derived
+/// ([`Scoping::Resolve`]).
+///
+/// # Errors
+///
+/// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
+/// - [`ScopeError::CrossDataGraph`] — the query reads more than one data graph.
+/// - [`ScopeError::UnsupportedConstruct`] — a construct this does not support.
+///
+/// `dataset` says which named graphs the endpoint serves: the schema graphs
+/// the datamodel is published in, the data graphs the records are served as,
+/// and what the default graph means. It is a parameter and not a constant
+/// because the deployment decides it — see [`crate::sparql_dataset`] and
+/// [`crate::sparql_schema_graph`]. A dataset with no schema graph has no
+/// pattern in one, so every triple is scoped as an instance pattern.
 ///
 /// **A star is a `(naming domain, variable)`.** The query is first read with
 /// every variable inside a sub-select qualified by its domain
@@ -1556,7 +1550,7 @@ pub fn scope_parsed(
 /// which keys by variable name and is otherwise unchanged -- is per domain
 /// by construction: a private inner `?s` is `?s__d1`, a star of its own,
 /// typed from its own domain's triples or not at all.
-pub fn scope_parsed_as(
+pub fn scope_query(
     query: &Query,
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
@@ -8884,7 +8878,7 @@ classes:
     }
 
     /// Review finding 4, and what replaced its refusal. A dataset clause used
-    /// to be discarded by the `..` in every arm of [`scope_parsed`], so
+    /// to be discarded by the `..` in every arm of [`scope_query`], so
     /// `FROM <urn:empty>` was planned as all-in-SQL, admitted, and answered
     /// from the table — `2` for a dataset in which the answer is `0`. It was
     /// refused by name, because nothing downstream carried it. The plan carries
@@ -9375,18 +9369,12 @@ classes:
             "{ ?s asset360:hasAccessibleTracks",
             "{ ?s a asset360:TunnelComplex ; asset360:hasAccessibleTracks",
         );
-        let untyped_plan = crate::sparql_plan::plan_query_refined(
-            untyped,
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap_or_else(|error| panic!("refused: {error}"));
-        let typed_plan = crate::sparql_plan::plan_query_refined(
-            &typed,
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
+        let untyped_plan =
+            crate::sparql_plan::plan_of(untyped, &sv, crate::sparql_dataset::default_dataset())
+                .unwrap_or_else(|error| panic!("refused: {error}"));
+        let typed_plan =
+            crate::sparql_plan::plan_of(&typed, &sv, crate::sparql_dataset::default_dataset())
+                .unwrap();
         // The passes, not the ledger: the typed body owes one more type
         // obligation, and that is the only difference there may be.
         let passes = |plan: &crate::sparql_plan::ExecutionPlan| {
@@ -9517,7 +9505,7 @@ classes:
     #[test]
     fn the_execution_plan_carries_the_path_edge_into_the_fetch() {
         let sv = asset360_fixture_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             TUNNEL_TRACK_OPTIONAL,
             &sv,
             crate::sparql_dataset::default_dataset(),
@@ -9650,7 +9638,7 @@ classes:
              OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }";
         each_rewrite_preserves_answers(query, &sv, &oracle, &borrowed);
 
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
             &sv,
             crate::sparql_dataset::default_dataset(),
@@ -9791,7 +9779,7 @@ classes:
         // as written (#478, pepibru GitLab issue).
         let sv = two_schema_view();
         let query = "SELECT ?n WHERE { ?t a irsm:Track ; irsm:name ?n . ?s a asset360:Signal }";
-        let parsed = parse_query_for(query, &sv).expect("both datamodel prefixes are seeded");
+        let parsed = parse_query(query, Some(&sv)).expect("both datamodel prefixes are seeded");
         assert_eq!(
             first_type_iri(&parsed),
             "https://data.infrabel.be/asset360-rsm-subset/Track"
@@ -9800,7 +9788,10 @@ classes:
         // datamodel: the same text is a parse error there, which is the
         // difference between the two parsers and why every entry point that
         // serves a client takes the seeded one.
-        assert!(matches!(parse_query(query), Err(ScopeError::ParseError(_))));
+        assert!(matches!(
+            parse_query(query, None),
+            Err(ScopeError::ParseError(_))
+        ));
     }
 
     #[test]
@@ -9826,7 +9817,7 @@ classes:
             assert!(predeclared.contains_key(label), "{label}");
         }
         let parsed =
-            parse_query_for("SELECT ?c WHERE { ?p schema:domainIncludes ?c }", &sv).unwrap();
+            parse_query("SELECT ?c WHERE { ?p schema:domainIncludes ?c }", Some(&sv)).unwrap();
         let Query::Select { pattern, .. } = &parsed else {
             panic!()
         };
@@ -9839,9 +9830,9 @@ classes:
     #[test]
     fn an_in_query_declaration_still_wins_over_the_seed() {
         let sv = two_schema_view();
-        let parsed = parse_query_for(
+        let parsed = parse_query(
             "PREFIX asset360: <urn:elsewhere/> SELECT ?s WHERE { ?s a asset360:Signal }",
-            &sv,
+            Some(&sv),
         )
         .unwrap();
         assert_eq!(first_type_iri(&parsed), "urn:elsewhere/Signal");

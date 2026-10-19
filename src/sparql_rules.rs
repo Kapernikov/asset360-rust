@@ -6481,7 +6481,7 @@ pub(crate) fn most_specific(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparql_refine::naive_plan_of;
+    use crate::sparql_refine::naive_plan;
     use crate::sparql_scoper::tests::test_schema_view;
     use linkml_schemaview::identifier::Identifier;
 
@@ -6490,8 +6490,8 @@ mod tests {
          PREFIX skos: <http://www.w3.org/2004/02/skos/core#> ";
 
     fn plan_of(query: &str) -> Plan {
-        naive_plan_of(
-            &format!("{PREFIX}{query}"),
+        naive_plan(
+            &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
             crate::sparql_dataset::default_dataset(),
         )
         .expect("should build a naive plan")
@@ -6501,8 +6501,8 @@ mod tests {
     /// what a class's family is, and so whether a parent type beside its
     /// subclass is one class, depends on it.
     fn plan_in(query: &str, regime: TypeRegime) -> Plan {
-        let parsed =
-            crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
+        let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
+            .expect("should parse");
         crate::sparql_refine::naive_plan(
             &parsed,
             &crate::sparql_dataset::DatasetSpec::builder(regime)
@@ -11004,7 +11004,7 @@ mod inline_type_match {
     #[test]
     fn the_production_plan_has_one_island() {
         let sv = test_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &format!(
                 "PREFIX asset360: <{NS}/> SELECT ?l WHERE {{ VALUES ?s {{ <{NS}/site/1> }} \
                  ?s a asset360:Site ; asset360:places ?p . \
@@ -11038,13 +11038,10 @@ mod inline_type_match {
                ?s a asset360:Signal ; asset360:refersToLocatedNetEntity ?lne . \
                ?lne rsm:EAID_43382C11_960E_40e0_B6E0_198963C97DF8 ?loc . \
                ?loc a irsm:SpotLocation ; irsm:locationrole ?r }";
-        let text = crate::sparql_plan::plan_query_refined(
-            query,
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap()
-        .to_string();
+        let text =
+            crate::sparql_plan::plan_of(query, &sv, crate::sparql_dataset::default_dataset())
+                .unwrap()
+                .to_string();
         assert!(!text.contains("pass 1  SQL"), "{text}");
         assert!(
             text.contains("identity  https://data.infrabel.be/data/Signals/2b10")
@@ -11055,9 +11052,11 @@ mod inline_type_match {
 
         let rules = tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
-        let mut plan =
-            crate::sparql_refine::naive_plan_of(query, crate::sparql_dataset::default_dataset())
-                .unwrap();
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(query, None).unwrap(),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
         let text = plan.to_string();
         assert!(!text.contains("scan      irsm:SpotLocation"), "{text}");
@@ -11091,7 +11090,7 @@ mod inline_type_match {
                    ?p asset360:label ?l }} \
                  GRAPH <{type_graph}> {{ ?p a asset360:Place }} }}"
             );
-            let parsed = crate::sparql_scoper::parse_query_for(&query, &sv).unwrap();
+            let parsed = crate::sparql_scoper::parse_query(&query, Some(&sv)).unwrap();
             let mut plan = crate::sparql_refine::naive_plan(&parsed, &dataset).unwrap();
             let rules = tier_one_rules(&sv, &dataset);
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
@@ -11111,13 +11110,13 @@ mod inline_type_match {
             "inferred: every element is a place, the triple is discharged:\n{inferred}"
         );
         // Two graphs of different regimes are two data regimes: refused.
-        let parsed = crate::sparql_scoper::parse_query_for(
+        let parsed = crate::sparql_scoper::parse_query(
             &format!(
                 "PREFIX asset360: <{NS}/> SELECT ?s WHERE {{ \
                  GRAPH <{A}> {{ ?s a asset360:Site ; asset360:places ?p }} \
                  GRAPH <{I}> {{ ?p a asset360:Place }} }}"
             ),
-            &sv,
+            Some(&sv),
         )
         .unwrap();
         assert!(crate::sparql_refine::naive_plan(&parsed, &dataset).is_err());
@@ -11286,7 +11285,7 @@ mod inline_type_match {
                     .any(|row| row.values().any(|v| v.contains(answer))),
                 "{answers:?}"
             );
-            let production = crate::sparql_plan::plan_query_refined(
+            let production = crate::sparql_plan::plan_of(
                 &format!("PREFIX asset360: <{NS}/> {query}"),
                 &sv,
                 crate::sparql_dataset::default_dataset(),
@@ -11321,18 +11320,15 @@ mod inline_type_match {
             ),
         ] {
             let query = format!("{head}{}", body.replace("LOC", locations));
-            let production = crate::sparql_plan::plan_query_refined(
-                &query,
-                &sv,
-                crate::sparql_dataset::default_dataset(),
-            )
-            .unwrap()
-            .to_string();
+            let production =
+                crate::sparql_plan::plan_of(&query, &sv, crate::sparql_dataset::default_dataset())
+                    .unwrap()
+                    .to_string();
             assert!(production.contains("all in SQL"), "{name}: {production}");
             let rules = tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
-            let mut plan = crate::sparql_refine::naive_plan_of(
-                &query,
+            let mut plan = crate::sparql_refine::naive_plan(
+                &crate::sparql_scoper::parse_query(&query, None).unwrap(),
                 crate::sparql_dataset::default_dataset(),
             )
             .unwrap();
@@ -11360,8 +11356,8 @@ mod direct_type {
          PREFIX sesame: <http://www.openrdf.org/schema/sesame#> ";
 
     fn refined_in(query: &str, schema: &SchemaView, regime: TypeRegime) -> Plan {
-        let parsed =
-            crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
+        let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
+            .expect("should parse");
         let mut plan = naive_plan(
             &parsed,
             &DatasetSpec::builder(regime)
@@ -11647,7 +11643,8 @@ mod direct_type {
             "SELECT ?s ?d ?t WHERE { ?s a asset360:Relay ; sesame:directType ?d ; a ?t }",
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t ; sesame:directType asset360:Relay }",
         ] {
-            let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
+            let parsed =
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap();
             let naive = naive_plan(
                 &parsed,
                 &DatasetSpec::builder(TypeRegime::IS_A)

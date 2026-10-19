@@ -5,6 +5,24 @@
 use js_sys::{Array, JSON};
 use serde::Serialize;
 use serde_wasm_bindgen::to_value;
+
+/// What `toTurtle` takes.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurtleOptions {
+    #[serde(default)]
+    skolem: bool,
+    #[serde(default)]
+    regime: Option<String>,
+}
+
+#[wasm_bindgen(typescript_custom_section)]
+const TURTLE_OPTIONS_TS: &'static str = r#"
+export interface TurtleOptions {
+  skolem?: boolean;
+  regime?: string;
+}
+"#;
 use wasm_bindgen::prelude::*;
 
 #[cfg(feature = "minijinja-wasm")]
@@ -954,17 +972,24 @@ impl LinkMLInstanceHandle {
 
     /// Serialize this instance as Turtle (RDF).
     ///
-    /// `regime` is the type regime the `rdf:type` triples are written under:
-    /// `"asserted"` (the instance's own class; the default, and what this
-    /// always wrote), `"is_a"` (plus every `is_a` ancestor and
-    /// `sesame:directType`), `"is_a_and_mixins"` (plus mixins), or any
-    /// `+`-joined list of partitions (`own`, `isa`, `mixin`, `direct`).
+    /// `options` is `{ skolem?: boolean, regime?: string }`. `regime` is the
+    /// type regime the `rdf:type` triples are written under: `"asserted"` (the
+    /// instance's own class; the default), `"is_a"` (plus every `is_a`
+    /// ancestor and `sesame:directType`), `"is_a_and_mixins"` (plus mixins), or
+    /// any `+`-joined list of partitions (`own`, `isa`, `mixin`, `direct`).
+    /// `skolem` names inlined elements with IRIs instead of blank nodes.
     #[wasm_bindgen(js_name = toTurtle)]
     pub fn to_turtle(
         &self,
-        skolem: Option<bool>,
-        regime: Option<String>,
+        #[wasm_bindgen(unchecked_param_type = "TurtleOptions | undefined")] options: JsValue,
     ) -> Result<String, JsValue> {
+        let options: TurtleOptions = if options.is_undefined() || options.is_null() {
+            TurtleOptions::default()
+        } else {
+            serde_wasm_bindgen::from_value(options)
+                .map_err(|e| JsValue::from_str(&format!("invalid toTurtle options: {e}")))?
+        };
+        let TurtleOptions { skolem, regime } = options;
         let regime: TypeRegime = regime
             .as_deref()
             .map(str::parse)
@@ -983,7 +1008,7 @@ impl LinkMLInstanceHandle {
             sv,
             &schema,
             &conv,
-            &WriteOptions::flat(regime).with_skolem(skolem.unwrap_or(false)),
+            &WriteOptions::flat(regime).with_skolem(skolem),
         )
         .map_err(|e| JsValue::from_str(&e.to_string()))
     }

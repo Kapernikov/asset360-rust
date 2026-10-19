@@ -347,7 +347,7 @@ fn at_most_one_row(plan: &Plan, node: NodeId) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::sparql_refine::{Executor, Plan, naive_plan_of};
+    use crate::sparql_refine::{Executor, Plan, naive_plan};
     use crate::sparql_rules::{refine, tier_one_rules};
     use crate::sparql_scoper::tests::test_schema_view;
 
@@ -355,8 +355,8 @@ mod tests {
 
     fn refined(query: &str) -> Plan {
         let schema = test_schema_view();
-        let mut plan = naive_plan_of(
-            &format!("{PREFIX}{query}"),
+        let mut plan = naive_plan(
+            &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
             crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
@@ -404,7 +404,8 @@ mod tests {
                 obligations: plan.obligations.clone(),
                 refinement: crate::sparql_plan::Refinement::UsedAlone(String::new()),
                 dataset: crate::sparql_dataset::DatasetSpec::asserted(),
-                query: crate::sparql_scoper::parse_query("SELECT * WHERE { ?s ?p ?o }").unwrap(),
+                query: crate::sparql_scoper::parse_query("SELECT * WHERE { ?s ?p ?o }", None)
+                    .unwrap(),
                 data_regime: linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
             }
         );
@@ -829,7 +830,7 @@ mod tests {
             outcome_of(&scalar, &fixture, crate::sparql_dataset::default_dataset()),
             Outcome::Statement
         );
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &scalar,
             &fixture,
             crate::sparql_dataset::default_dataset(),

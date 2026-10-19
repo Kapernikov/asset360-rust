@@ -367,9 +367,10 @@ mod tests {
     use super::*;
 
     fn parse(query: &str) -> Query {
-        crate::sparql_scoper::parse_query(&format!(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"
-        ))
+        crate::sparql_scoper::parse_query(
+            &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+            None,
+        )
         .unwrap()
     }
 

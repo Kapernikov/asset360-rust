@@ -1031,7 +1031,8 @@ mod tests {
              GROUP BY ?s HAVING (COUNT(*) > 1) ORDER BY DESC(?n)",
             "SELECT ?s ?d WHERE { ?s a asset360:Signal . BIND(?s AS ?d) }",
         ] {
-            let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
+            let parsed =
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap();
             let plan =
                 crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
                     .unwrap();
@@ -1205,7 +1206,7 @@ pub(crate) mod equivalence {
         dataset: &crate::sparql_dataset::DatasetSpec,
     ) -> Plan {
         let text = format!("{PREFIX}{query}");
-        let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
+        let parsed = crate::sparql_scoper::parse_query(&text, None).unwrap();
         let expected = answers(oracle, &parsed);
         let mut plan = crate::sparql_refine::naive_plan(&parsed, dataset)
             .unwrap_or_else(|e| panic!("{query}: {e}"));
@@ -1561,7 +1562,7 @@ pub(crate) mod equivalence {
                     let text = format!(
                         "{PREFIX}PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {query}"
                     );
-                    let original = crate::sparql_scoper::parse_query(&text).unwrap();
+                    let original = crate::sparql_scoper::parse_query(&text, None).unwrap();
                     let mut reduced = original.clone();
                     crate::sparql_paths::reduce_paths(&mut reduced, &schema);
                     assert_eq!(
@@ -1580,15 +1581,21 @@ pub(crate) mod equivalence {
                 if regime == TypeRegime::ASSERTED {
                     // Not vacuous: parent + subclass is empty when the data
                     // asserts each record's own class only, and not otherwise.
-                    let both = crate::sparql_scoper::parse_query(&format!(
-                        "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
-                    ))
+                    let both = crate::sparql_scoper::parse_query(
+                        &format!(
+                            "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
+                        ),
+                        None,
+                    )
                     .unwrap();
                     assert!(answers(&oracle, &both).is_empty());
                 } else {
-                    let both = crate::sparql_scoper::parse_query(&format!(
-                        "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
-                    ))
+                    let both = crate::sparql_scoper::parse_query(
+                        &format!(
+                            "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
+                        ),
+                        None,
+                    )
                     .unwrap();
                     assert!(!answers(&oracle, &both).is_empty());
                 }
@@ -1671,7 +1678,7 @@ pub(crate) mod equivalence {
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
             for query in grammar().iter().step_by(5) {
                 let text = format!("{PREFIX}{query}");
-                let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
+                let parsed = crate::sparql_scoper::parse_query(&text, None).unwrap();
                 let expected = answers(oracle, &parsed);
                 let mut plan = crate::sparql_refine::naive_plan(&parsed, dataset).unwrap();
                 for rule in &borrowed {

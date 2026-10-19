@@ -1336,8 +1336,8 @@ mod tests {
 
     fn refined(query: &str) -> Plan {
         let schema = test_schema_view();
-        let mut plan = crate::sparql_refine::naive_plan_of(
-            &format!("{PREFIX}{query}"),
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
             crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
@@ -1441,7 +1441,7 @@ mod tests {
              {{ SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }} ORDER BY ?s LIMIT 3 }} \
              GRAPH <{I}> {{ ?s asset360:name ?nm }} }}"
         );
-        let parsed = crate::sparql_scoper::parse_query_for(&query, &schema).unwrap();
+        let parsed = crate::sparql_scoper::parse_query(&query, Some(&schema)).unwrap();
         let mut plan = crate::sparql_refine::naive_plan(&parsed, &dataset).unwrap();
         let rules = tier_one_rules(&schema, &dataset);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
@@ -1873,12 +1873,9 @@ mod tests {
             outcome_of(&query, &schema, crate::sparql_dataset::default_dataset()),
             Outcome::Statement
         );
-        let plan = crate::sparql_plan::plan_query_refined(
-            &query,
-            &schema,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
+        let plan =
+            crate::sparql_plan::plan_of(&query, &schema, crate::sparql_dataset::default_dataset())
+                .unwrap();
         let rendered = format!("{plan}");
         assert!(
             rendered.contains("filter    hasCoveredSection.hasSequenceNumber = '1'"),

@@ -80,7 +80,7 @@ pub fn query_reads_named_graphs(query: &str, schema_view: &SchemaView) -> bool {
         }
     }
 
-    let Ok(parsed) = crate::sparql_scoper::parse_query_for(query, schema_view) else {
+    let Ok(parsed) = crate::sparql_scoper::parse_query(query, Some(schema_view)) else {
         return true;
     };
     let pattern = match &parsed {
@@ -105,7 +105,7 @@ pub fn schema_graphs_read(
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
 ) -> Vec<(String, TypeRegime)> {
-    match crate::sparql_scoper::parse_query_for(query, schema_view) {
+    match crate::sparql_scoper::parse_query(query, Some(schema_view)) {
         Ok(parsed) => schema_graphs_read_in(&parsed, dataset),
         Err(_) => dataset
             .schema_graphs()
@@ -517,7 +517,7 @@ pub fn reads_only_the_schema_graph(
         }
     }
 
-    let Ok(parsed) = crate::sparql_scoper::parse_query_for(query, schema_view) else {
+    let Ok(parsed) = crate::sparql_scoper::parse_query(query, Some(schema_view)) else {
         return false;
     };
     let pattern = match &parsed {
