@@ -308,8 +308,8 @@ pub fn sparql_execute(
     query_str: &str,
     instances: &[&LinkMLInstance],
     schema_view: &SchemaView,
-    limits: ExecuteLimits,
     dataset: &DatasetSpec,
+    limits: ExecuteLimits,
 ) -> Result<SparqlAnswer, ExecuteError> {
     // The bound on the backlog, before anything is allocated: what a full
     // backlog is bounding is memory, and the store built below is up to
@@ -1130,8 +1130,8 @@ classes:
              SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name } ORDER BY ?name",
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         )
         .unwrap();
 
@@ -1165,8 +1165,8 @@ classes:
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
                 &refs,
                 &sv,
-                ExecuteLimits::default(),
                 &dataset,
+                ExecuteLimits::default(),
             )
         };
         let body = "?s a asset360:Signal ; asset360:name ?name";
@@ -1201,8 +1201,8 @@ classes:
                 "SELECT ?s WHERE { ?s ?p ?o }",
                 &refs,
                 &sv,
-                ExecuteLimits::default(),
-                &invalid
+                &invalid,
+                ExecuteLimits::default()
             ),
             Err(ExecuteError::QueryError(m)) if m.contains("not a registered data graph")
         ));
@@ -1223,8 +1223,8 @@ classes:
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
                 &refs,
                 &sv,
-                ExecuteLimits::default(),
                 dataset,
+                ExecuteLimits::default(),
             )
             .unwrap_or_else(|e| panic!("`{query}`: {e}"));
             let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
@@ -1259,8 +1259,8 @@ classes:
              ASK { ?s a asset360:Signal ; asset360:name \"BX517\" }",
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         )
         .unwrap();
 
@@ -1278,8 +1278,8 @@ classes:
              ASK { ?s a asset360:Signal ; asset360:name \"NONEXISTENT\" }",
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         )
         .unwrap();
 
@@ -1297,12 +1297,12 @@ classes:
              SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
             &refs,
             &sv,
+            crate::sparql_dataset::default_dataset(),
             ExecuteLimits {
                 max_triples: 500_000,
                 max_result_rows: 1,
                 max_eval_millis: None,
             },
-            crate::sparql_dataset::default_dataset(),
         );
 
         assert!(matches!(
@@ -1335,12 +1335,12 @@ classes:
             query,
             &refs,
             &sv,
+            crate::sparql_dataset::default_dataset(),
             ExecuteLimits {
                 max_triples: 500_000,
                 max_result_rows: 10,
                 max_eval_millis: Some(1),
             },
-            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(
@@ -1372,12 +1372,12 @@ classes:
              SELECT ?s WHERE { ?s a asset360:Signal }",
             &refs,
             &sv,
+            crate::sparql_dataset::default_dataset(),
             ExecuteLimits {
                 max_triples: 500_000,
                 max_result_rows: 10_000,
                 max_eval_millis: Some(30_000),
             },
-            crate::sparql_dataset::default_dataset(),
         )
         .expect("a query under the ceiling answers");
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
@@ -1415,15 +1415,15 @@ classes:
             query,
             &refs,
             &sv,
-            with_ceiling,
             crate::sparql_dataset::default_dataset(),
+            with_ceiling,
         );
         let unbounded = sparql_execute(
             query,
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         );
         ABANDONED_EVALUATIONS.fetch_sub(MAX_ABANDONED_EVALUATIONS, Ordering::SeqCst);
 
@@ -1444,12 +1444,12 @@ classes:
             query,
             &refs,
             &sv,
+            crate::sparql_dataset::default_dataset(),
             ExecuteLimits {
                 max_triples: 500_000,
                 max_result_rows: 10_000,
                 max_eval_millis: Some(30_000),
             },
-            crate::sparql_dataset::default_dataset(),
         );
         assert!(answered.is_ok(), "{answered:?}");
     }
@@ -1464,12 +1464,12 @@ classes:
              SELECT ?s WHERE { ?s a asset360:Signal }",
             &refs,
             &sv,
+            crate::sparql_dataset::default_dataset(),
             ExecuteLimits {
                 max_triples: 1,
                 max_result_rows: 10_000,
                 max_eval_millis: None,
             },
-            crate::sparql_dataset::default_dataset(),
         );
 
         assert!(matches!(
@@ -1503,12 +1503,12 @@ classes:
              SELECT ?s WHERE { ?s a asset360:Signal }",
             &refs,
             &sv,
+            crate::sparql_dataset::default_dataset(),
             ExecuteLimits {
                 max_triples: 100,
                 max_result_rows: 10_000,
                 max_eval_millis: None,
             },
-            crate::sparql_dataset::default_dataset(),
         );
 
         let Err(ExecuteError::TripleLimitExceeded { count, limit }) = result else {
@@ -1560,8 +1560,8 @@ classes:
              ?l asset360:longitude ?lon }",
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result.body).unwrap();
@@ -1584,8 +1584,8 @@ classes:
              WHERE { ?s a asset360:Signal ; asset360:name ?n }",
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         )
         .unwrap();
 
@@ -1611,8 +1611,8 @@ classes:
              SELECT ?s WHERE { ?s rdf:type p:Signal }",
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         )
         .unwrap();
 
@@ -1636,8 +1636,8 @@ classes:
              SELECT ?s WHERE { ?s rdf:type p:Signal }",
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         )
         .unwrap();
 
@@ -1655,8 +1655,8 @@ classes:
              INSERT DATA { <urn:a> p:name \"x\" }",
             &[],
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         );
 
         let message = match result {
@@ -1784,8 +1784,8 @@ classes:
             &format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; {triple} }}"),
             &refs,
             sv,
-            super::ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            super::ExecuteLimits::default(),
         )
         .expect("query executes");
         let parsed: serde_json::Value = serde_json::from_str(&json.body).unwrap();
@@ -2028,8 +2028,8 @@ classes:
             ),
             &refs,
             &sv,
-            super::ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            super::ExecuteLimits::default(),
         )
         .expect("query executes");
 
@@ -2133,8 +2133,8 @@ classes:
             query,
             &refs,
             sv,
-            ExecuteLimits::default(),
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),
+            ExecuteLimits::default(),
         )
         .unwrap_or_else(|err| panic!("query failed: {err}\n{query}"));
         serde_json::from_str(&raw.body).unwrap()
@@ -2312,16 +2312,16 @@ classes:
                 query,
                 &refs,
                 &sv,
-                ExecuteLimits::default(),
                 &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),
+                ExecuteLimits::default(),
             )
             .unwrap_or_else(|err| panic!("{query}: {err}"));
             let with_schema_loaded = sparql_execute(
                 forced,
                 &refs,
                 &sv,
-                ExecuteLimits::default(),
                 &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),
+                ExecuteLimits::default(),
             )
             .unwrap_or_else(|err| panic!("{forced}: {err}"));
 
@@ -2614,8 +2614,8 @@ classes:
             ),
             &refs,
             &sv,
-            super::ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            super::ExecuteLimits::default(),
         )
         .expect("query executes");
 
@@ -2736,8 +2736,8 @@ classes:
             &format!("SELECT ?n WHERE {{ ?t <{predicate}> ?n }}"),
             &refs,
             &sv,
-            ExecuteLimits::default(),
             crate::sparql_dataset::default_dataset(),
+            ExecuteLimits::default(),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();

@@ -4235,7 +4235,7 @@ fn load_json_batch(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, instances, schema_view, max_triples, max_result_rows, dataset, max_eval_millis=None))]
+#[pyo3(signature = (query, instances, schema_view, dataset, *, max_triples=500_000, max_result_rows=10_000, max_eval_millis=None))]
 /// Execute a SPARQL query against a list of LinkML instances.
 ///
 /// Converts each instance to RDF, loads into an in-memory store (with
@@ -4246,10 +4246,6 @@ fn load_json_batch(
 ///     query: SPARQL query string.
 ///     instances: List of LinkMLInstance objects to query against.
 ///     schema_view: The LinkML schema (for RDF conversion).
-///     format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
-///         ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
-///     max_triples: Maximum triples in the store.
-///     max_result_rows: Maximum result rows.
 ///     dataset: The :class:`DatasetSpec` the endpoint serves: which schema
 ///         graphs to build (only the ones the query names), and the type
 ///         regime the records are loaded under. There is deliberately no
@@ -4258,7 +4254,10 @@ fn load_json_batch(
 ///         deployment. A query naming a *data* graph (``GRAPH``, ``FROM``,
 ///         ``FROM NAMED``) is refused for now: the engine holds the records
 ///         in the default graph only.
-///     max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
+///     max_triples: Maximum triples in the store (keyword-only, default
+///         500 000).
+///     max_result_rows: Maximum result rows (keyword-only, default 10 000).
+///     max_eval_millis: Keyword-only. Wall-clock ceiling on the engine's evaluation, in
 ///         milliseconds, counted once the store is loaded. ``None`` (the
 ///         default) is no ceiling. The caller is answered at the deadline
 ///         with ``RuntimeError("Evaluation time limit exceeded: …")``; the
@@ -4289,9 +4288,9 @@ fn sparql_execute(
     query: &str,
     instances: Vec<Py<PyLinkMLInstance>>,
     schema_view: Py<PySchemaView>,
+    dataset: PyDatasetSpec,
     max_triples: usize,
     max_result_rows: usize,
-    dataset: PyDatasetSpec,
     max_eval_millis: Option<u64>,
 ) -> PyResult<(String, String)> {
     let bound_sv = schema_view.bind(py);
@@ -4306,12 +4305,12 @@ fn sparql_execute(
         query,
         &instance_refs,
         sv,
+        &dataset.inner,
         crate::sparql_executor::ExecuteLimits {
             max_triples,
             max_result_rows,
             max_eval_millis,
         },
-        &dataset.inner,
     ) {
         // `(content_type, body)`: the serialisation belongs to the query's form,
         // and the form is something this function has already parsed. A caller
@@ -4349,7 +4348,7 @@ fn sparql_execute(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (plan, solutions_json, schema_view, max_triples, max_result_rows, max_eval_millis=None))]
+#[pyo3(signature = (plan, solutions_json, schema_view, *, max_triples=500_000, max_result_rows=10_000, max_eval_millis=None))]
 /// Finish a ``refinement == "used_rows"`` plan over its statement's rows.
 ///
 /// The engine pass's ``finish`` query is evaluated with the rows in place of
@@ -4363,12 +4362,14 @@ fn sparql_execute(
 ///         statement returned them**: when the pass names an ``ordinal``,
 ///         row *i* is numbered *i* here and the answer is ordered by it.
 ///     schema_view: The active datamodel.
-///     max_triples: The budget of *cells* handed over (rows × bound
-///         columns, the ordinal included): a cell costs no more than the
-///         triple it would have been on the records route. Over it, the
-///         call raises ``RuntimeError("Triple limit exceeded: …")``.
-///     max_result_rows: Maximum rows of the answer.
-///     max_eval_millis: As for ``sparql_execute``.
+///     max_triples: Keyword-only, default 500 000. The budget of *cells*
+///         handed over (rows × bound columns, the ordinal included): a cell
+///         costs no more than the triple it would have been on the records
+///         route. Over it, the call raises
+///         ``RuntimeError("Triple limit exceeded: …")``.
+///     max_result_rows: Keyword-only, default 10 000. Maximum rows of the
+///         answer.
+///     max_eval_millis: Keyword-only. As for ``sparql_execute``.
 ///
 /// The dataset is the plan's own: the one it was planned under, so the rows
 /// and their finish cannot be read under different graphs.
@@ -4497,7 +4498,7 @@ fn sparql_schema_graph_skipped(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, dataset, schema_view))]
+#[pyo3(signature = (query, schema_view, dataset))]
 /// Whether every triple pattern in the query reads a schema graph.
 ///
 /// Such a query asks about the datamodel and about no golden record, so the
@@ -4507,26 +4508,26 @@ fn sparql_schema_graph_skipped(
 ///
 /// Args:
 ///     query: SPARQL query string.
-///     dataset: The :class:`DatasetSpec` the endpoint serves. With no schema
-///         graph in it no query reads only one. A ``GRAPH ?g`` counts as
-///         reading the schema graph only while the dataset serves no data
-///         graph (the variable can bind nothing else).
 ///     schema_view: The LinkML schema, whose prefixes seed the parser — the
 ///         same parser the planner used, so a query the planner refused as
 ///         unscoped parses here too rather than being reported as not
 ///         schema-only because a datamodel prefix was left undeclared.
+///     dataset: The :class:`DatasetSpec` the endpoint serves. With no schema
+///         graph in it no query reads only one. A ``GRAPH ?g`` counts as
+///         reading the schema graph only while the dataset serves no data
+///         graph (the variable can bind nothing else).
 fn sparql_reads_only_the_schema_graph(
     py: Python<'_>,
     query: &str,
-    dataset: PyDatasetSpec,
     schema_view: Py<PySchemaView>,
+    dataset: PyDatasetSpec,
 ) -> bool {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     crate::sparql_graph_clauses::reads_only_the_schema_graph(
         query,
-        &dataset.inner,
         sv_ref.as_rust(),
+        &dataset.inner,
     )
 }
 

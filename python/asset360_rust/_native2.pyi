@@ -7522,7 +7522,7 @@ def refined_plan_text(query:builtins.str, schema_view:SchemaView, dataset:Datase
         ValueError: the query does not parse or cannot be represented.
     """
 
-def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, max_triples:builtins.int, max_result_rows:builtins.int, dataset:DatasetSpec, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, dataset:DatasetSpec, *, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
     
@@ -7534,10 +7534,6 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
         query: SPARQL query string.
         instances: List of LinkMLInstance objects to query against.
         schema_view: The LinkML schema (for RDF conversion).
-        format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
-            ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
-        max_triples: Maximum triples in the store.
-        max_result_rows: Maximum result rows.
         dataset: The :class:`DatasetSpec` the endpoint serves: which schema
             graphs to build (only the ones the query names), and the type
             regime the records are loaded under. There is deliberately no
@@ -7546,7 +7542,10 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             deployment. A query naming a *data* graph (``GRAPH``, ``FROM``,
             ``FROM NAMED``) is refused for now: the engine holds the records
             in the default graph only.
-        max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
+        max_triples: Maximum triples in the store (keyword-only, default
+            500 000).
+        max_result_rows: Maximum result rows (keyword-only, default 10 000).
+        max_eval_millis: Keyword-only. Wall-clock ceiling on the engine's evaluation, in
             milliseconds, counted once the store is loaded. ``None`` (the
             default) is no ceiling. The caller is answered at the deadline
             with ``RuntimeError("Evaluation time limit exceeded: …")``; the
@@ -7570,7 +7569,7 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             or query execution error.
     """
 
-def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, max_triples:builtins.int, max_result_rows:builtins.int, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
+def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, *, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
     r"""
     Finish a ``refinement == "used_rows"`` plan over its statement's rows.
     
@@ -7585,12 +7584,14 @@ def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:S
             statement returned them**: when the pass names an ``ordinal``,
             row *i* is numbered *i* here and the answer is ordered by it.
         schema_view: The active datamodel.
-        max_triples: The budget of *cells* handed over (rows × bound
-            columns, the ordinal included): a cell costs no more than the
-            triple it would have been on the records route. Over it, the
-            call raises ``RuntimeError("Triple limit exceeded: …")``.
-        max_result_rows: Maximum rows of the answer.
-        max_eval_millis: As for ``sparql_execute``.
+        max_triples: Keyword-only, default 500 000. The budget of *cells*
+            handed over (rows × bound columns, the ordinal included): a cell
+            costs no more than the triple it would have been on the records
+            route. Over it, the call raises
+            ``RuntimeError("Triple limit exceeded: …")``.
+        max_result_rows: Keyword-only, default 10 000. Maximum rows of the
+            answer.
+        max_eval_millis: Keyword-only. As for ``sparql_execute``.
     
     The dataset is the plan's own: the one it was planned under, so the rows
     and their finish cannot be read under different graphs.
@@ -7630,7 +7631,7 @@ def sparql_predeclared_prefixes(schema_view:SchemaView) -> builtins.dict[builtin
         schema_view: The LinkML schema whose ``prefixes:`` seed the parser.
     """
 
-def sparql_reads_only_the_schema_graph(query:builtins.str, dataset:DatasetSpec, schema_view:SchemaView) -> builtins.bool:
+def sparql_reads_only_the_schema_graph(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec) -> builtins.bool:
     r"""
     Whether every triple pattern in the query reads a schema graph.
     
@@ -7641,14 +7642,14 @@ def sparql_reads_only_the_schema_graph(query:builtins.str, dataset:DatasetSpec, 
     
     Args:
         query: SPARQL query string.
-        dataset: The :class:`DatasetSpec` the endpoint serves. With no schema
-            graph in it no query reads only one. A ``GRAPH ?g`` counts as
-            reading the schema graph only while the dataset serves no data
-            graph (the variable can bind nothing else).
         schema_view: The LinkML schema, whose prefixes seed the parser — the
             same parser the planner used, so a query the planner refused as
             unscoped parses here too rather than being reported as not
             schema-only because a datamodel prefix was left undeclared.
+        dataset: The :class:`DatasetSpec` the endpoint serves. With no schema
+            graph in it no query reads only one. A ``GRAPH ?g`` counts as
+            reading the schema graph only while the dataset serves no data
+            graph (the variable can bind nothing else).
     """
 
 def sparql_schema_graph_ntriples(schema_view:SchemaView, dataset:DatasetSpec, graph_iri:builtins.str) -> builtins.str:

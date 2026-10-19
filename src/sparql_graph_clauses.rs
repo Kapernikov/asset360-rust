@@ -202,8 +202,8 @@ pub fn schema_graphs_read(
 /// surface, not be turned into an empty answer.
 pub fn reads_only_the_schema_graph(
     query: &str,
-    dataset: &DatasetSpec,
     schema_view: &SchemaView,
+    dataset: &DatasetSpec,
 ) -> bool {
     use crate::sparql_dataset::{GraphReads, QueryGraphs};
     use spargebra::Query;
@@ -332,7 +332,7 @@ mod tests {
             Some(iri) => crate::sparql_dataset::schema_dataset(iri),
             None => crate::sparql_dataset::DatasetSpec::asserted(),
         };
-        super::reads_only_the_schema_graph(query, &dataset, &test_schema_view())
+        super::reads_only_the_schema_graph(query, &test_schema_view(), &dataset)
     }
 
     #[test]
@@ -502,25 +502,25 @@ mod tests {
         let variable = "SELECT ?c WHERE { GRAPH ?g { ?c ?p ?o } }";
         assert!(super::reads_only_the_schema_graph(
             variable,
-            &only_schema,
-            &schema_view
+            &schema_view,
+            &only_schema
         ));
         assert!(!super::reads_only_the_schema_graph(
             variable,
-            &with_data,
-            &schema_view
+            &schema_view,
+            &with_data
         ));
         // A data graph is no schema graph, by name.
         assert!(!super::reads_only_the_schema_graph(
             "SELECT ?c WHERE { GRAPH <urn:graph:inferred> { ?c ?p ?o } }",
-            &with_data,
-            &schema_view
+            &schema_view,
+            &with_data
         ));
         // A `FROM` makes the default graph one.
         assert!(super::reads_only_the_schema_graph(
             &format!("SELECT ?c FROM <{SCHEMA_GRAPH}> WHERE {{ ?c ?p ?o }}"),
-            &with_data,
-            &schema_view
+            &schema_view,
+            &with_data
         ));
 
         let read = |query: &str| -> Vec<String> {
