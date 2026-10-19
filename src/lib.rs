@@ -4157,7 +4157,9 @@ fn py_plan_query_refined(
 /// Raises:
 ///     ValueError: the query does not parse or cannot be represented.
 fn py_naive_plan_text(query: &str, dataset: PyDatasetSpec) -> PyResult<String> {
-    crate::sparql_plan::naive_plan_text(query, &dataset.inner)
+    let parsed = crate::sparql_scoper::parse_query(query, None)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    crate::sparql_plan::naive_plan_text(&parsed, &dataset.inner)
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
@@ -4194,7 +4196,9 @@ fn py_refined_plan_text(
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
-    crate::sparql_plan::refined_plan_text(query, sv, &dataset.inner)
+    let parsed = crate::sparql_scoper::parse_query(query, Some(sv))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    crate::sparql_plan::refined_plan_text(&parsed, sv, &dataset.inner)
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
@@ -4742,13 +4746,13 @@ impl PyPredicateCheck {
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(name = "check_predicates", signature = (query, schema_view, regime, bound=None))]
+#[pyo3(name = "check_predicates", signature = (query, schema_view, dataset, bound=None))]
 /// Judge every fixed predicate a query uses against its subject's class.
 ///
 /// Never refuses. A subject's class is its one ``rdf:type``, the class
 /// ``bound`` gives its variable, or the range of the slot that reached it, and
 /// it is judged together with the classes ``rdf:type`` gives its instances
-/// under ``regime``. The query is judged as written,
+/// under the regime of the data graph the query reads. The query is judged as written,
 /// with no alias resolved first: a predicate spelled with the wrong namespace
 /// is ``NotCarried``, and ``suggestion`` is the IRI the data uses. A subject
 /// whose class cannot be told is ``Unchecked``, never silently passed.
@@ -4757,10 +4761,11 @@ impl PyPredicateCheck {
 /// Args:
 ///     query: SPARQL query string (a SHACL ``sh:select`` body, say).
 ///     schema_view: The LinkML schema.
-///     regime: The :class:`TypeRegime` of the data graph the query reads. A
-///         subject is judged with the classes its type implies under it, so
-///         a slot only a subclass carries is carried by a parent-typed
-///         subject under ``IsA`` and not under ``Asserted``.
+///     dataset: The :class:`DatasetSpec` the query reads. A subject is judged
+///         with the classes its type implies under the regime of the data
+///         graph the query reads, so a slot only a subclass carries is
+///         carried by a parent-typed subject under ``IS_A`` and not under
+///         ``ASSERTED``.
 ///     bound: Variables the caller has already bound, name without ``?`` or
 ///         ``$`` to class IRI — SHACL pre-binds ``this`` to the shape's
 ///         ``sh:targetClass``.
@@ -4769,12 +4774,13 @@ impl PyPredicateCheck {
 ///     One :class:`PredicateCheck` per (subject, predicate) seen.
 ///
 /// Raises:
-///     ValueError: the query does not parse or is an update.
+///     ValueError: the query does not parse, is an update, or reads more than
+///         one data graph (``cross_data_graph``).
 fn py_check_predicates(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
-    regime: linkml_runtime_python::PyTypeRegime,
+    dataset: PyDatasetSpec,
     bound: Option<std::collections::BTreeMap<String, String>>,
 ) -> PyResult<Vec<PyPredicateCheck>> {
     use crate::sparql_alias::PredicateVerdict;
@@ -4786,7 +4792,8 @@ fn py_check_predicates(
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     let bound: Vec<(String, String)> = bound.unwrap_or_default().into_iter().collect();
     Ok(
-        crate::sparql_alias::check_predicates(&parsed, sv, &bound, regime.into())
+        crate::sparql_alias::check_predicates(&parsed, sv, &bound, &dataset.inner)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
             .into_iter()
             .map(|check| {
                 let (verdict, class_iri, suggestion, message) = match check.verdict {

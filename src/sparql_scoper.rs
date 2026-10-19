@@ -1458,7 +1458,7 @@ pub fn predeclared_prefixes(
 /// These are defaults, not overrides: a query that declares a label itself wins
 /// (the parser's in-query declaration overwrites the seeded one), so a caller
 /// who binds `rdf:` to something else gets the query they wrote.
-pub fn sparql_parser_for(schema_view: &SchemaView) -> SparqlParser {
+fn sparql_parser_for(schema_view: &SchemaView) -> SparqlParser {
     let mut parser = SparqlParser::new();
     for (label, namespace) in predeclared_prefixes(schema_view) {
         // A namespace that is not an IRI cannot be a prefix of any IRI in
@@ -1479,7 +1479,7 @@ pub fn sparql_parser_for(schema_view: &SchemaView) -> SparqlParser {
 /// leaves the datamodel's own prefix undeclared does not parse here, which is
 /// the difference between the two and why every entry point that serves a
 /// client takes the other one.
-pub fn sparql_parser() -> SparqlParser {
+fn sparql_parser() -> SparqlParser {
     let mut parser = SparqlParser::new();
     for &(label, namespace) in ENDPOINT_PREFIXES {
         parser = parser
@@ -2780,7 +2780,7 @@ fn scope_qualified(
     // A `FROM` that makes the default graph something other than the records
     // (a schema graph, a graph the endpoint does not serve) leaves every
     // pattern outside a `GRAPH` reading it: the table cannot answer for it.
-    if !matches!(graphs.default_reads(), GraphReads::Data(_)) {
+    if !matches!(graphs.default_reads(), GraphReads::Data) {
         record_loss(Inexact::NamedGraph);
     }
 
@@ -3900,7 +3900,7 @@ fn graphs_of_triples(
                         let reads = graphs.graph_reads(graph.as_str());
                         TripleGraph {
                             reads,
-                            foreign: !matches!(reads, GraphReads::Data(_)),
+                            foreign: !matches!(reads, GraphReads::Data),
                         }
                     }
                     NamedNodePattern::Variable(_) => TripleGraph {
@@ -3909,7 +3909,7 @@ fn graphs_of_triples(
                         {
                             GraphReads::Schema
                         } else {
-                            GraphReads::Data(graphs.regime())
+                            GraphReads::Data
                         },
                         foreign: true,
                     },
@@ -5610,7 +5610,7 @@ fn contains_foreign_scope(pattern: &GraphPattern, graphs: &QueryGraphs<'_>) -> O
         GraphPattern::Graph {
             name: NamedNodePattern::NamedNode(graph),
             inner,
-        } if matches!(graphs.graph_reads(graph.as_str()), GraphReads::Data(_)) => {
+        } if matches!(graphs.graph_reads(graph.as_str()), GraphReads::Data) => {
             contains_foreign_scope(inner, graphs)
         }
         GraphPattern::Graph { .. } => Some(Inexact::NamedGraph),

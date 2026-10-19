@@ -938,7 +938,7 @@ pub fn refuse_uncarried_predicates(
     query: &Query,
     schema_view: &SchemaView,
 ) -> Result<(), Box<NotASlotOfClass>> {
-    match check_predicates(query, schema_view, &[], WIDEST_REGIME)
+    match judge_predicates(query, schema_view, &[], WIDEST_REGIME)
         .into_iter()
         .find_map(|check| match check.verdict {
             PredicateVerdict::NotCarried(refusal) => Some(refusal),
@@ -979,10 +979,11 @@ pub enum PredicateVerdict {
 ///
 /// A subject's class is the one `rdf:type` the query gives it, or the one in
 /// `bound`, or the range of the slot that reached it. The class is judged
-/// together with the classes `rdf:type` gives its instances under `regime`,
-/// the regime of the data graph the query reads (`type_family`): `?s a C`
-/// binds instances of any of them, so a predicate any of them carries is
-/// carried. Under `Asserted` that is `C` alone, so a subclass-only predicate
+/// together with the classes `rdf:type` gives its instances under the regime
+/// of the data graph the query reads under `dataset`
+/// ([`crate::sparql_graph_clauses::single_data_graph`], which refuses a query
+/// that reads several): `?s a C` binds instances of any of them, so a
+/// predicate any of them carries is carried. Under `ASSERTED` that is `C` alone, so a subclass-only predicate
 /// on a `C`-typed subject is not carried. A node reached through a slot is
 /// typed under the same regime, so the slot's range is judged by its family
 /// under it too. `bound` seeds variables the
@@ -996,6 +997,17 @@ pub enum PredicateVerdict {
 /// [`refuse_uncarried_predicates`]: `GRAPH`, `SERVICE` and property paths
 /// contribute nothing, a sub-`SELECT` is its own scope.
 pub fn check_predicates(
+    query: &Query,
+    schema_view: &SchemaView,
+    bound: &[(String, String)],
+    dataset: &crate::sparql_dataset::DatasetSpec,
+) -> Result<Vec<PredicateCheck>, crate::sparql_scoper::ScopeError> {
+    let regime = crate::sparql_graph_clauses::single_data_graph(query, dataset)?.regime;
+    Ok(judge_predicates(query, schema_view, bound, regime))
+}
+
+/// [`check_predicates`] under a regime already known.
+fn judge_predicates(
     query: &Query,
     schema_view: &SchemaView,
     bound: &[(String, String)],
@@ -2566,7 +2578,13 @@ classes:
             .iter()
             .map(|(v, c)| ((*v).to_owned(), (*c).to_owned()))
             .collect();
-        check_predicates(&parsed, &schema_view(), &bound, TypeRegime::IS_A)
+        check_predicates(
+            &parsed,
+            &schema_view(),
+            &bound,
+            &crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]),
+        )
+        .expect("one data graph")
     }
 
     fn verdict<'a>(
@@ -2666,7 +2684,7 @@ classes:
 
     /// The family follows the regime of the graph read: a slot only a subclass
     /// carries is carried by a parent-typed subject (or one reached through a
-    /// slot ranging over the parent) under `IsA`, and not under `Asserted`.
+    /// slot ranging over the parent) under `IS_A`, and not under `ASSERTED`.
     #[test]
     fn a_subclass_only_predicate_follows_the_regime() {
         let sv = schema_view();
@@ -2676,11 +2694,17 @@ classes:
         ] {
             let parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
             let verdict_under = |regime| {
-                check_predicates(&parsed, &sv, &[], regime)
-                    .into_iter()
-                    .find(|c| c.predicate == CODE)
-                    .expect("code is checked")
-                    .verdict
+                check_predicates(
+                    &parsed,
+                    &sv,
+                    &[],
+                    &crate::sparql_dataset::dataset_with(regime, &[], &[]),
+                )
+                .expect("one data graph")
+                .into_iter()
+                .find(|c| c.predicate == CODE)
+                .expect("code is checked")
+                .verdict
             };
             assert!(
                 matches!(
@@ -2708,11 +2732,17 @@ classes:
         let sv = schema_view();
         let judge = |query: &str, regime, predicate: &str| {
             let parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
-            check_predicates(&parsed, &sv, &[], regime)
-                .into_iter()
-                .find(|c| c.predicate == predicate)
-                .unwrap_or_else(|| panic!("{predicate} is checked in {query}"))
-                .verdict
+            check_predicates(
+                &parsed,
+                &sv,
+                &[],
+                &crate::sparql_dataset::dataset_with(regime, &[], &[]),
+            )
+            .expect("one data graph")
+            .into_iter()
+            .find(|c| c.predicate == predicate)
+            .unwrap_or_else(|| panic!("{predicate} is checked in {query}"))
+            .verdict
         };
         for regime in [TypeRegime::IS_A, TypeRegime::ASSERTED] {
             // Carried: a slot the class itself declares.

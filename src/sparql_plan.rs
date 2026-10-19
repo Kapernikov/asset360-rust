@@ -1274,7 +1274,7 @@ pub enum Outcome {
 
 /// [`Outcome`] of planning a query.
 #[cfg(test)]
-pub fn outcome_of(query: &str, schema: &SchemaView, dataset: &DatasetSpec) -> Outcome {
+pub(crate) fn outcome_of(query: &str, schema: &SchemaView, dataset: &DatasetSpec) -> Outcome {
     match plan_of(query, schema, dataset) {
         Ok(plan) => match &plan.refinement {
             Refinement::UsedAlone(_) => Outcome::Statement,
@@ -1284,6 +1284,22 @@ pub fn outcome_of(query: &str, schema: &SchemaView, dataset: &DatasetSpec) -> Ou
         },
         Err(error) => Outcome::Rejected(error.to_string()),
     }
+}
+
+/// [`refined_plan_text`] and [`naive_plan_text`] of a query as written, for
+/// tests: the production functions take the parsed query.
+#[cfg(test)]
+pub(crate) fn plan_texts_of(
+    query: &str,
+    schema: &SchemaView,
+    dataset: &DatasetSpec,
+) -> (Result<String, String>, Result<String, String>) {
+    let parse =
+        |schema| crate::sparql_scoper::parse_query(query, schema).map_err(|e| e.to_string());
+    (
+        parse(None).and_then(|parsed| naive_plan_text(&parsed, dataset)),
+        parse(Some(schema)).and_then(|parsed| refined_plan_text(&parsed, schema, dataset)),
+    )
 }
 
 /// The plan the refinement pipeline *starts* from: every node the engine's.
@@ -1300,9 +1316,8 @@ pub fn outcome_of(query: &str, schema: &SchemaView, dataset: &DatasetSpec) -> Ou
 /// so a rule can only ever discharge them, never invent one. It does take the
 /// dataset, which says which graph each pattern reads and so which regime it
 /// is matched under.
-pub fn naive_plan_text(query: &str, dataset: &DatasetSpec) -> Result<String, String> {
-    let parsed = crate::sparql_scoper::parse_query(query, None).map_err(|e| e.to_string())?;
-    crate::sparql_refine::naive_plan(&parsed, dataset)
+pub fn naive_plan_text(query: &Query, dataset: &DatasetSpec) -> Result<String, String> {
+    crate::sparql_refine::naive_plan(query, dataset)
         .map(|plan| plan.to_string())
         .map_err(|e| e.to_string())
 }
@@ -1319,12 +1334,11 @@ pub fn naive_plan_text(query: &str, dataset: &DatasetSpec) -> Result<String, Str
 /// and which regime each pattern is matched under, so a diagnostic that left it
 /// out would print a plan production never builds.
 pub fn refined_plan_text(
-    query: &str,
+    query: &Query,
     schema: &linkml_schemaview::schemaview::SchemaView,
     dataset: &DatasetSpec,
 ) -> Result<String, String> {
-    let mut parsed =
-        crate::sparql_scoper::parse_query(query, Some(schema)).map_err(|e| e.to_string())?;
+    let mut parsed = query.clone();
     // The pass production runs before it reads anything (see
     // `plan_query_refined`): the aliases are settled and what
     // the query's classes cannot carry is refused, so this never prints a plan
@@ -3560,7 +3574,9 @@ classes:
         let query =
             format!("{PREFIX}SELECT ?lo WHERE {{ ?c a asset360:Track ; asset360:longitude ?lo }}");
         let production = plan_of(&query, &sv, &dataset).expect_err("refused");
-        let text = refined_plan_text(&query, &sv, &dataset).expect_err("a refusal, not a plan");
+        let text = plan_texts_of(&query, &sv, &dataset)
+            .1
+            .expect_err("a refusal, not a plan");
         assert_eq!(text, production.to_string());
         assert!(text.contains("not a slot of Track"), "{text}");
     }
@@ -3581,7 +3597,7 @@ classes:
             "{PREFIX}SELECT ?s ?nm FROM NAMED <urn:g:other> WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm }}"
         );
-        let text = refined_plan_text(&query, &sv, &dataset).expect("should plan");
+        let text = plan_texts_of(&query, &sv, &dataset).1.expect("should plan");
         assert!(!text.contains("scan"), "{text}");
         assert!(text.contains("values"), "{text}");
         let plan = plan_of(&query, &sv, &dataset).expect("should plan");
@@ -4297,7 +4313,8 @@ classes:
             "{PREFIX}SELECT ?s ?lat WHERE {{ ?s a asset360:Site ; asset360:place ?p . \
              ?p asset360:coords ?c . ?c asset360:lat ?lat }}"
         );
-        let refined = refined_plan_text(&query, &sv, crate::sparql_dataset::default_dataset())
+        let refined = plan_texts_of(&query, &sv, crate::sparql_dataset::default_dataset())
+            .1
             .expect("this shape refines");
         assert!(refined.contains("[S]"), "no SQL in:\n{refined}");
         assert!(
@@ -4321,9 +4338,11 @@ classes:
              ?s a asset360:Signal ; asset360:kind ?kind }} GROUP BY ?kind"
         );
 
-        let naive = naive_plan_text(&query, crate::sparql_dataset::default_dataset())
+        let naive = plan_texts_of(&query, &sv, crate::sparql_dataset::default_dataset())
+            .0
             .expect("the naive plan is a transcription");
-        let refined = refined_plan_text(&query, &sv, crate::sparql_dataset::default_dataset())
+        let refined = plan_texts_of(&query, &sv, crate::sparql_dataset::default_dataset())
+            .1
             .expect("this shape refines");
 
         assert_ne!(naive, refined, "refinement moved nothing");

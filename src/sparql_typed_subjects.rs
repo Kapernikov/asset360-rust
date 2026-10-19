@@ -212,7 +212,7 @@ fn typed_pair(plan: &Plan, id: NodeId) -> Option<(String, String, TypeRegime)> {
     Some((
         subject_variable(pattern)?.to_owned(),
         object_variable(pattern)?.to_owned(),
-        reads.data_regime()?,
+        reads.is_data().then_some(plan.data_regime)?,
     ))
 }
 

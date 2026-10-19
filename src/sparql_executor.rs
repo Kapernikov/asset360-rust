@@ -578,7 +578,7 @@ fn insert_schema_graphs(
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
 ) -> Result<(), ExecuteError> {
-    for (iri, regime) in crate::sparql_graph_clauses::schema_graphs_read_in(query, dataset) {
+    for (iri, regime) in crate::sparql_graph_clauses::schema_graphs_read(query, dataset) {
         let quads = crate::sparql_schema_graph::SchemaGraph::build(schema_view, regime)
             .quads_in(&iri)
             .map_err(|e| ExecuteError::StoreError(e.to_string()))?;

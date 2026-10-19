@@ -218,8 +218,9 @@ impl DatasetSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GraphReads {
-    /// The golden records, under this regime. The SQL route reads them.
-    Data(TypeRegime),
+    /// The golden records, under the plan's one regime
+    /// ([`crate::sparql_refine::Plan::data_regime`]). The SQL route reads them.
+    Data,
     /// The datamodel. Only the engine, or a schema-only region, reads it.
     Schema,
     /// Nothing: the empty graph. The default graph of a query that writes
@@ -233,14 +234,10 @@ pub enum GraphReads {
 }
 
 impl GraphReads {
-    /// The regime the records are read under: `Some` for [`Self::Data`] and
-    /// for nothing else. What a rule about type triples asks, since only the
-    /// data graph holds records a scan could read.
-    pub fn data_regime(&self) -> Option<TypeRegime> {
-        match self {
-            Self::Data(regime) => Some(*regime),
-            _ => None,
-        }
+    /// Whether this is the data graph, the only one that holds records a scan
+    /// could read: what a rule about type triples asks.
+    pub fn is_data(&self) -> bool {
+        matches!(self, Self::Data)
     }
 }
 
@@ -311,7 +308,7 @@ impl<'a> QueryGraphs<'a> {
             return GraphReads::Empty;
         }
         if self.from.is_empty() {
-            return GraphReads::Data(self.regime);
+            return GraphReads::Data;
         }
         // The query reads one data graph, so a `FROM` over data graphs is one
         // regime: the plan's.
@@ -320,7 +317,7 @@ impl<'a> QueryGraphs<'a> {
             .iter()
             .all(|iri| self.dataset.data_regime(iri).is_some())
         {
-            GraphReads::Data(self.regime)
+            GraphReads::Data
         } else if self
             .from
             .iter()
@@ -341,8 +338,8 @@ impl<'a> QueryGraphs<'a> {
         {
             return GraphReads::Other;
         }
-        if let Some(regime) = self.dataset.data_regime(iri) {
-            GraphReads::Data(regime)
+        if self.dataset.data_regime(iri).is_some() {
+            GraphReads::Data
         } else if self.dataset.is_schema_graph(iri) {
             GraphReads::Schema
         } else {

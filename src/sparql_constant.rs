@@ -828,11 +828,12 @@ pub(crate) mod tests {
              OPTIONAL {{ ?s asset360:signalType ?t . \
              OPTIONAL {{ GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }} }} }}"
         ));
-        let refined = crate::sparql_plan::refined_plan_text(
+        let refined = crate::sparql_plan::plan_texts_of(
             &q,
             &sv,
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
         )
+        .1
         .unwrap();
         assert!(
             refined.contains("lowered as c1, key ?t: enum→code, 1 kept, 2 outside enum [S]"),
@@ -876,11 +877,12 @@ pub(crate) mod tests {
              OPTIONAL {{ ?s asset360:signalType ?t }} \
              OPTIONAL {{ GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }} }}"
         ));
-        let refined = crate::sparql_plan::refined_plan_text(
+        let refined = crate::sparql_plan::plan_texts_of(
             &q,
             &sv,
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
         )
+        .1
         .unwrap();
         assert!(refined.contains("  declined\n"), "{refined}");
         assert!(

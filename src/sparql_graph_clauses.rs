@@ -1,13 +1,14 @@
 //! What a query's `GRAPH` clauses say about routing it.
 //!
-//! Two questions, both answered by walking an already-parsed SPARQL algebra
-//! rather than by guessing at the query text. Both are about *this endpoint's
+//! Three questions, all answered by walking an already-parsed SPARQL algebra
+//! rather than by guessing at the query text. All are about *this endpoint's
 //! routes* — there is nothing generic here, which is why this sits beside the
 //! scoper and not in the upstream LinkML crates:
 //!
-//! * [`query_reads_named_graphs`] and [`schema_graphs_read`] decide whether
-//!   building a schema graph is worth anything at all for this request, and
-//!   which ones.
+//! * [`schema_graphs_read`] decides which schema graphs are worth building for
+//!   this request (an instance query pays for none).
+//! * [`single_data_graph`] decides which one data graph the query reads, and
+//!   refuses a query that reads several.
 //! * [`reads_only_the_schema_graph`] decides whether the scoper's "unscoped"
 //!   refusal is the right answer or the wrong one.
 //!
@@ -16,107 +17,27 @@
 //! with none means the active datamodel configures no schema graph, in which
 //! case no query can be reading one.
 //!
-//! Both parse with [`crate::sparql_scoper::sparql_parser`], the parser the
-//! endpoint's other entry points use. A bare `SparqlParser::new()` here knew
+//! Queries are parsed with [`crate::sparql_scoper::parse_query`], the parser
+//! the endpoint's other entry points use. A bare `SparqlParser::new()` here knew
 //! none of the pre-registered vocabularies, so `GRAPH <…> { ?c rdfs:label ?l }`
 //! — a datamodel-discovery query, written the only way it can be written —
-//! did not parse, both functions took their "does not parse" branch, and the
-//! query came back refused as *unscoped*: a parse failure reported as a
-//! question about scope.
+//! did not parse, and the query came back refused as *unscoped*: a parse
+//! failure reported as a question about scope.
 
 use linkml_runtime::schema_rdf::TypeRegime;
 use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_dataset::DatasetSpec;
 
-/// Whether a query could observe a named graph at all.
-///
-/// A named graph is invisible unless the query says `GRAPH`: oxigraph's default
-/// query dataset is the store's default graph, and neither `FROM NAMED` nor a
-/// `DESCRIBE` reaches a named graph on its own. So for the overwhelming
-/// majority of requests — every instance query — the schema graph would be
-/// built, inserted and never read.
-///
-/// This is a precise test, not a substring guess: the query is parsed and its
-/// algebra walked for a `GRAPH` node. A query that does not parse is treated as
-/// *possibly* reading it, so the schema graph is built and oxigraph is left to
-/// report the real parse error rather than this function inventing one.
-pub fn query_reads_named_graphs(query: &str, schema_view: &SchemaView) -> bool {
-    use spargebra::Query;
-    use spargebra::algebra::GraphPattern;
-
-    fn walk(pattern: &GraphPattern) -> bool {
-        // A `GRAPH` inside an expression's `EXISTS` block is a `GRAPH` clause.
-        // Walking children only, this answered *false* for
-        // `FILTER EXISTS { GRAPH <…/schema> { ?c ?p ?o } }`, the schema graph
-        // was never built, and the query answered zero rows — while the same
-        // query with an otherwise ineffective `OPTIONAL { GRAPH … }` bolted on
-        // answered correctly, which is how the defect was found.
-        if crate::sparql_scoper::exists_patterns_in_expressions_of(pattern)
-            .into_iter()
-            .any(walk)
-        {
-            return true;
-        }
-        match pattern {
-            GraphPattern::Graph { .. } => true,
-            GraphPattern::Join { left, right }
-            | GraphPattern::Union { left, right }
-            | GraphPattern::Lateral { left, right }
-            | GraphPattern::Minus { left, right } => walk(left) || walk(right),
-            GraphPattern::LeftJoin { left, right, .. } => walk(left) || walk(right),
-            GraphPattern::Filter { inner, .. }
-            | GraphPattern::Extend { inner, .. }
-            | GraphPattern::OrderBy { inner, .. }
-            | GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. }
-            | GraphPattern::Group { inner, .. }
-            | GraphPattern::Service { inner, .. } => walk(inner),
-            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
-                false
-            }
-        }
-    }
-
-    let Ok(parsed) = crate::sparql_scoper::parse_query(query, Some(schema_view)) else {
-        return true;
-    };
-    let pattern = match &parsed {
-        Query::Select { pattern, .. }
-        | Query::Construct { pattern, .. }
-        | Query::Describe { pattern, .. }
-        | Query::Ask { pattern, .. } => pattern,
-    };
-    walk(pattern)
-}
-
 /// The schema graphs a query can observe: the ones it names with a `GRAPH`
 /// constant, `FROM` or `FROM NAMED`, and every one of them for a `GRAPH ?g`.
 ///
 /// What the executor builds and loads: one store entry per schema graph the
 /// query can reach, each under its own regime, so a query that reads one pays
-/// for one and an instance query pays for none. A query that does not parse is
-/// treated as possibly reading all of them, so oxigraph reports the real parse
-/// error rather than this function inventing one.
-pub fn schema_graphs_read(
-    query: &str,
-    schema_view: &SchemaView,
-    dataset: &DatasetSpec,
-) -> Vec<(String, TypeRegime)> {
-    match crate::sparql_scoper::parse_query(query, Some(schema_view)) {
-        Ok(parsed) => schema_graphs_read_in(&parsed, dataset),
-        Err(_) => dataset
-            .schema_graphs()
-            .map(|(iri, regime)| (iri.to_owned(), regime))
-            .collect(),
-    }
-}
-
-/// [`schema_graphs_read`] for a query that is already parsed: what the
-/// executor asks of the query it is about to evaluate.
-pub fn schema_graphs_read_in(
+/// for one and an instance query pays for none (a named graph is invisible
+/// unless the query says `GRAPH`, `FROM` or `FROM NAMED`).
+#[cfg(feature = "sparql-endpoint")]
+pub(crate) fn schema_graphs_read(
     parsed: &spargebra::Query,
     dataset: &DatasetSpec,
 ) -> Vec<(String, TypeRegime)> {
@@ -577,12 +498,8 @@ mod tests {
     /// reads it from `asset360_model/datamodels/asset360.yaml`.
     const SCHEMA_GRAPH: &str = "https://data.infrabel.be/asset360/schema";
 
-    /// The production functions over the shared test schema, so the cases
+    /// The production function over the shared test schema, so the cases
     /// below read as the questions they ask rather than as plumbing.
-    fn query_reads_named_graphs(query: &str) -> bool {
-        super::query_reads_named_graphs(query, &test_schema_view())
-    }
-
     fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
         let dataset = match schema_graph_iri {
             Some(iri) => crate::sparql_dataset::schema_dataset(iri),
@@ -605,25 +522,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn only_a_graph_clause_can_reach_the_schema_graph() {
-        // Nothing to build for: no GRAPH clause anywhere.
-        assert!(!query_reads_named_graphs("SELECT ?s WHERE { ?s ?p ?o }"));
-        // `FROM NAMED` alone reaches no named graph without a GRAPH clause.
-        assert!(!query_reads_named_graphs(
-            "SELECT ?s FROM NAMED <urn:g> WHERE { ?s ?p ?o }"
-        ));
-        assert!(query_reads_named_graphs(
-            "SELECT ?s WHERE { GRAPH <urn:g> { ?s ?p ?o } }"
-        ));
-        assert!(query_reads_named_graphs(
-            "SELECT ?s WHERE { ?s ?p ?o OPTIONAL { GRAPH ?g { ?s ?q ?r } } }"
-        ));
-        // An unparseable query is treated as possibly reading it, so oxigraph
-        // reports the real parse error rather than this function inventing one.
-        assert!(query_reads_named_graphs("SELECT ?s WHERE {"));
-    }
-
     /// Review finding 3, second manifestation.
     ///
     /// A `GRAPH` inside an expression's `EXISTS` block is a `GRAPH` clause, and
@@ -640,7 +538,6 @@ mod tests {
         let inside_exists = format!(
             "SELECT ?s WHERE {{ ?s ?p ?o . FILTER EXISTS {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c ?q ?r }} }} }}"
         );
-        assert!(query_reads_named_graphs(&inside_exists));
         // Mixed, not schema-only: one instance pattern, one schema pattern.
         assert!(!reads_only_the_schema_graph(
             &inside_exists,
@@ -682,7 +579,6 @@ mod tests {
         let query = format!(
             "SELECT ?l WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c a owl:Class ; rdfs:label ?l }} }}"
         );
-        assert!(query_reads_named_graphs(&query));
         assert!(reads_only_the_schema_graph(&query, Some(SCHEMA_GRAPH)));
     }
 
@@ -787,10 +683,13 @@ mod tests {
         ));
 
         let read = |query: &str| -> Vec<String> {
-            super::schema_graphs_read(query, &schema_view, &with_data)
-                .into_iter()
-                .map(|(iri, _)| iri)
-                .collect()
+            super::schema_graphs_read(
+                &crate::sparql_scoper::parse_query(query, Some(&schema_view)).unwrap(),
+                &with_data,
+            )
+            .into_iter()
+            .map(|(iri, _)| iri)
+            .collect()
         };
         assert!(read("SELECT ?s WHERE { ?s ?p ?o }").is_empty());
         assert_eq!(
@@ -806,7 +705,6 @@ mod tests {
             vec![SCHEMA_GRAPH.to_owned()]
         );
         assert_eq!(read(variable).len(), 2, "a variable can bind either");
-        assert_eq!(read("SELECT ?s WHERE {").len(), 2, "unparseable: all");
     }
 
     /// No schema graph configured: nothing reads only it, not even a query

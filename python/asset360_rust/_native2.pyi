@@ -7366,14 +7366,14 @@ def broken_out_column(class_uri:builtins.str, slot_path:typing.Sequence[builtins
     available from elsewhere and there is no plan operator to ask.
     """
 
-def check_predicates(query:builtins.str, schema_view:SchemaView, regime:TypeRegime, bound:typing.Optional[typing.Mapping[builtins.str, builtins.str]]=None) -> builtins.list[PredicateCheck]:
+def check_predicates(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec, bound:typing.Optional[typing.Mapping[builtins.str, builtins.str]]=None) -> builtins.list[PredicateCheck]:
     r"""
     Judge every fixed predicate a query uses against its subject's class.
     
     Never refuses. A subject's class is its one ``rdf:type``, the class
     ``bound`` gives its variable, or the range of the slot that reached it, and
     it is judged together with the classes ``rdf:type`` gives its instances
-    under ``regime``. The query is judged as written,
+    under the regime of the data graph the query reads. The query is judged as written,
     with no alias resolved first: a predicate spelled with the wrong namespace
     is ``NotCarried``, and ``suggestion`` is the IRI the data uses. A subject
     whose class cannot be told is ``Unchecked``, never silently passed.
@@ -7382,10 +7382,11 @@ def check_predicates(query:builtins.str, schema_view:SchemaView, regime:TypeRegi
     Args:
         query: SPARQL query string (a SHACL ``sh:select`` body, say).
         schema_view: The LinkML schema.
-        regime: The :class:`TypeRegime` of the data graph the query reads. A
-            subject is judged with the classes its type implies under it, so
-            a slot only a subclass carries is carried by a parent-typed
-            subject under ``IsA`` and not under ``Asserted``.
+        dataset: The :class:`DatasetSpec` the query reads. A subject is judged
+            with the classes its type implies under the regime of the data
+            graph the query reads, so a slot only a subclass carries is
+            carried by a parent-typed subject under ``IS_A`` and not under
+            ``ASSERTED``.
         bound: Variables the caller has already bound, name without ``?`` or
             ``$`` to class IRI — SHACL pre-binds ``this`` to the shape's
             ``sh:targetClass``.
@@ -7394,7 +7395,8 @@ def check_predicates(query:builtins.str, schema_view:SchemaView, regime:TypeRegi
         One :class:`PredicateCheck` per (subject, predicate) seen.
     
     Raises:
-        ValueError: the query does not parse or is an update.
+        ValueError: the query does not parse, is an update, or reads more than
+            one data graph (``cross_data_graph``).
     """
 
 def compute_history(stages:typing.Sequence[ChangeStage]) -> tuple[LinkMLInstance, builtins.list[ChangeStage]]:

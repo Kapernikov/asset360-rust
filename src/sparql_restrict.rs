@@ -641,7 +641,7 @@ impl Rule for RestrictScopeAtBoundary<'_> {
 fn types_itself(plan: &Plan, side: NodeId, var: &str) -> bool {
     (0..plan.nodes.len()).any(|id| {
         plan.feeds(id, side)
-            && matches!(&plan.nodes[id].op, PlanOp::Match { pattern, reads: GraphReads::Data(_) }
+            && matches!(&plan.nodes[id].op, PlanOp::Match { pattern, reads: GraphReads::Data }
                 if crate::sparql_refine::subject_variable(pattern) == Some(var)
                     && crate::sparql_refine::type_class_iri(pattern).is_some())
     })
@@ -657,7 +657,7 @@ fn only_reference_reads(plan: &Plan, schema: &SchemaView, side: NodeId, var: &st
             PlanOp::Scan { star_var, .. } => Some(star_var.clone()),
             PlanOp::Match {
                 pattern,
-                reads: GraphReads::Data(_),
+                reads: GraphReads::Data,
             } if crate::sparql_refine::type_class_iri(pattern).is_some() => {
                 crate::sparql_refine::subject_variable(pattern).map(str::to_owned)
             }
@@ -1467,7 +1467,7 @@ mod tests {
             plan.nodes.iter().all(|node| !matches!(
                 &node.op,
                 PlanOp::Match {
-                    reads: GraphReads::Data(TypeRegime::ASSERTED),
+                    reads: GraphReads::Data,
                     ..
                 }
             )),

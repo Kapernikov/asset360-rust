@@ -2087,17 +2087,16 @@ pub enum PlanOp {
     Match {
         pattern: Box<TriplePattern>,
         /// The graph this triple is matched against.
-        /// [`GraphReads::Data`]`(r)` for a triple read from a data graph --
-        /// outside any `GRAPH`, or under one that names a data graph --
-        /// which holds `rdf:type` triples the way regime `r` writes them.
+        /// [`GraphReads::Data`] for a triple read from the data graph --
+        /// outside any `GRAPH`, or under one that names the data graph --
+        /// which holds `rdf:type` triples the way the plan's one regime
+        /// ([`Plan::data_regime`]) writes them.
         ///
         /// Any other value is a triple under a [`PlanOp::Graph`] that stays:
         /// the datamodel ([`GraphReads::Schema`]), `GRAPH ?g` or a graph the
         /// endpoint does not serve ([`GraphReads::Other`]). No data rule may
         /// fold such a triple into a [`PlanOp::Scan`] -- the records a scan
         /// reads are the data graph's, not that graph's.
-        /// [`GraphReads::data_regime`] is the one-line question the rules
-        /// ask.
         reads: GraphReads,
     },
     /// A property path. Engine-only, and no rule pushes one.
@@ -2667,12 +2666,6 @@ pub struct Plan {
     /// consumer still sees the variable -- produced above the barrier
     /// instead of inside it.
     pub lifted_exports: Vec<LiftedExport>,
-    /// What a triple outside any `GRAPH` reads: the dataset's default graph
-    /// (or the `FROM` graphs) of the query -- the records under a regime, the
-    /// datamodel, nothing, or something only the engine can say. The printout
-    /// reads it: asserted is printed bare when the default graph reads it, and
-    /// said when it does not.
-    pub default_reads: GraphReads,
     /// The one regime the query reads its records under
     /// ([`crate::sparql_graph_clauses::single_data_graph`]): the regime every
     /// match of a data graph and every scan is under. What
@@ -2857,7 +2850,6 @@ impl Plan {
             transfers: Vec::new(),
             rewrites: Vec::new(),
             lifted_exports: Vec::new(),
-            default_reads: GraphReads::Empty,
             data_regime: TypeRegime::ASSERTED,
         };
         plan.install(nodes);
@@ -3716,7 +3708,6 @@ impl fmt::Display for Plan {
             };
             let mut describe = node.op.describe_with(RegimeContext::Plan {
                 data: self.data_regime,
-                default: self.default_reads.data_regime(),
                 under_graph: under_graph[id],
             });
             if let Some(note) = crate::sparql_constant::lowered_note(self, id) {
@@ -4097,6 +4088,7 @@ impl From<ScopeError> for RefineError {
 pub fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
     let graphs = QueryGraphs::new(dataset, query).map_err(ScopeError::from)?;
     let default_reads = graphs.default_reads();
+
     let data_regime = graphs.regime();
     let obligations = crate::sparql_plan::obligations_of(query)?;
     let form = QueryForm::of(query);
@@ -4167,81 +4159,64 @@ pub fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineEr
 
     let nodes = builder.nodes;
     let mut plan = Plan::from_nodes(form, obligations, nodes);
-    plan.default_reads = default_reads;
     plan.data_regime = data_regime;
     plan.check().map_err(RefineError::Defect)?;
     Ok(plan)
 }
 
-/// How a node's regime is told in plan text. The plan's printout knows its
-/// default regime and which nodes sit under a printed `GRAPH`; the
-/// context-free [`PlanOp::describe`] does not and keeps the short spelling.
+/// How a node's regime is told in plan text. The plan's printout knows its one
+/// data regime and which nodes sit under a printed `GRAPH`; the context-free
+/// [`PlanOp::describe`] does not and keeps the short spelling.
 #[derive(Debug, Clone, Copy)]
 enum RegimeContext {
-    /// No plan around: asserted and "no regime" are both bare.
+    /// No plan around: no regime is told.
     Bare,
     /// Printed as part of a plan.
     Plan {
-        /// The plan's one data regime: what its scans read under.
+        /// The plan's one data regime: what its scans and its data matches
+        /// read under.
         data: TypeRegime,
-        default: Option<TypeRegime>,
         under_graph: bool,
     },
 }
 
-/// The tag a node's regime carries in plan text: its `Display` spelling, so
-/// the plan and the regime's own name never drift. Asserted is bare only when
-/// it is what the plan reads by default, and is `[asserted]` otherwise, so it
-/// can never be taken for "no data graph". A match with no regime says
-/// `[no data graph]` unless a printed `GRAPH` above it is the explanation.
-fn regime_tag(regime: Option<TypeRegime>, context: RegimeContext) -> Option<String> {
-    let RegimeContext::Plan {
-        data: _,
-        default,
-        under_graph,
-    } = context
-    else {
-        return regime
-            .filter(|regime| *regime != TypeRegime::ASSERTED)
-            .map(|regime| regime.to_string());
-    };
-    match regime {
-        Some(TypeRegime::ASSERTED) if default == Some(TypeRegime::ASSERTED) => None,
-        Some(other) => Some(other.to_string()),
-        None if under_graph => None,
-        None => Some("no data graph".to_owned()),
-    }
+/// The tag the plan's data regime carries in plan text: its `Display`
+/// spelling, so the plan and the regime's own name never drift. Asserted is
+/// bare: a match that reads no data graph says so itself ([`reads_tag`]).
+fn regime_tag(regime: TypeRegime) -> Option<String> {
+    (regime != TypeRegime::ASSERTED).then(|| regime.to_string())
 }
 
-/// The tag a scan carries in plan text: the plan's data regime, told by
-/// [`regime_tag`]. A scan printed outside a plan has no regime to tell.
+/// The tag a scan carries in plan text: the plan's data regime. A scan printed
+/// outside a plan has no regime to tell.
 fn scan_regime_tag(context: RegimeContext) -> Option<String> {
     match context {
-        RegimeContext::Plan { data, .. } => regime_tag(Some(data), context),
+        RegimeContext::Plan { data, .. } => regime_tag(data),
         RegimeContext::Bare => None,
     }
 }
 
-/// The tag a match carries in plan text: its regime when it reads a data graph
-/// ([`regime_tag`]); otherwise what it reads, unless a printed `GRAPH` above it
-/// is the explanation. A match that reads no data graph and no graph a printed
+/// The tag a match carries in plan text: the plan's regime when it reads the
+/// data graph; otherwise what it reads, unless a printed `GRAPH` above it is
+/// the explanation. A match that reads no data graph and no graph a printed
 /// `GRAPH` names is told apart from one reading the asserted graph.
 fn reads_tag(reads: GraphReads, context: RegimeContext) -> Option<String> {
-    match reads {
-        GraphReads::Data(regime) => regime_tag(Some(regime), context),
-        other => match context {
+    match (reads, context) {
+        (GraphReads::Data, _) => scan_regime_tag(context),
+        (
+            other,
             RegimeContext::Plan {
                 under_graph: false, ..
-            } => Some(
-                match other {
-                    GraphReads::Schema => "schema graph",
-                    GraphReads::Empty => "empty graph",
-                    _ => "no data graph",
-                }
-                .to_owned(),
-            ),
-            _ => None,
-        },
+            },
+        ) => Some(
+            match other {
+                GraphReads::Schema => "schema graph",
+                GraphReads::Empty => "empty graph",
+                _ => "no data graph",
+            }
+            .to_owned(),
+        ),
+        _ => None,
     }
 }
 
@@ -4740,14 +4715,14 @@ impl Builder<'_> {
                 // `Match` under a kept `Graph` node is read by the rules as
                 // that graph's.
                 let reads = match reads {
-                    GraphReads::Data(_) if self.inside_graph_node => GraphReads::Other,
+                    GraphReads::Data if self.inside_graph_node => GraphReads::Other,
                     other => other,
                 };
                 // A data graph holds the records every `Match` reads, so the
                 // `GRAPH` says nothing the matches do not. No node for it,
                 // hence none of the rules that treat a `Graph` as opaque has
                 // anything to decline.
-                let dissolves = matches!(reads, GraphReads::Data(_));
+                let dissolves = matches!(reads, GraphReads::Data);
                 // A named graph is never the empty default graph.
                 let outer = std::mem::replace(&mut self.reads, reads);
                 let outer_inside = self.inside_graph_node;
@@ -5608,9 +5583,10 @@ mod tests {
             plan.nodes
                 .iter()
                 .filter_map(|node| match &node.op {
-                    PlanOp::Match { pattern, reads } => {
-                        Some((triple_text(pattern), reads.data_regime()))
-                    }
+                    PlanOp::Match { pattern, reads } => Some((
+                        triple_text(pattern),
+                        reads.is_data().then_some(plan.data_regime),
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -5876,7 +5852,7 @@ mod tests {
         };
 
         let (reads, _) = reads_of(&format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"));
-        assert_eq!(reads, vec![GraphReads::Data(TypeRegime::IS_A)]);
+        assert_eq!(reads, vec![GraphReads::Data]);
         let (reads, _) = reads_of(&format!("SELECT ?s WHERE {{ GRAPH <{S}> {{ {body} }} }}"));
         assert_eq!(reads, vec![GraphReads::Schema]);
         let (reads, _) = reads_of(&format!(
@@ -5913,12 +5889,9 @@ mod tests {
         assert_eq!(reads, vec![GraphReads::Other]);
         assert!(text.contains("[no data graph]"), "{text}");
         // Only the data graph answers the one-line question the rules ask.
-        assert_eq!(
-            GraphReads::Data(TypeRegime::IS_A).data_regime(),
-            Some(TypeRegime::IS_A)
-        );
+        assert!(GraphReads::Data.is_data());
         for other in [GraphReads::Schema, GraphReads::Other, GraphReads::Empty] {
-            assert_eq!(other.data_regime(), None);
+            assert!(!other.is_data());
         }
     }
 
@@ -5944,9 +5917,10 @@ mod tests {
             plan.nodes
                 .iter()
                 .filter_map(|node| match &node.op {
-                    PlanOp::Match { pattern, reads } => {
-                        Some((triple_text(pattern), reads.data_regime()))
-                    }
+                    PlanOp::Match { pattern, reads } => Some((
+                        triple_text(pattern),
+                        reads.is_data().then_some(plan.data_regime),
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -6017,9 +5991,9 @@ mod tests {
                 "{plan}"
             );
             assert!(
-                plan.nodes
-                    .iter()
-                    .any(|node| matches!(&node.op, PlanOp::Match { reads, .. } if reads.data_regime().is_none())),
+                plan.nodes.iter().any(
+                    |node| matches!(&node.op, PlanOp::Match { reads, .. } if !reads.is_data())
+                ),
                 "{plan}"
             );
         }

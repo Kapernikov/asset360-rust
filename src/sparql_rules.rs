@@ -313,7 +313,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
             // a `GRAPH` that stays reads no records, which no scan reads.
             let PlanOp::Match {
                 pattern,
-                reads: GraphReads::Data(_),
+                reads: GraphReads::Data,
             } = &node.op
             else {
                 continue;
@@ -410,7 +410,7 @@ fn reads_the_records(plan: &Plan, matched: NodeId) -> bool {
     matches!(
         &plan.nodes[matched].op,
         PlanOp::Match {
-            reads: GraphReads::Data(_),
+            reads: GraphReads::Data,
             ..
         }
     )
@@ -455,11 +455,11 @@ impl Rule for FoldMatchesIntoScan<'_> {
                 TypeRegime,
             ) = match &node.op {
                 // A type match under a `GRAPH` is not about the data graph
-                // and folds into nothing.
-                PlanOp::Match { reads, .. } if reads.data_regime().is_none() => continue,
+                // and folds into nothing: only the data graph's match arm
+                // below takes a match.
                 PlanOp::Match {
                     pattern,
-                    reads: GraphReads::Data(regime),
+                    reads: GraphReads::Data,
                 } => {
                     // A constant subject is a star of one record: the
                     // query named the identity, so the scan carries it as
@@ -482,7 +482,12 @@ impl Rule for FoldMatchesIntoScan<'_> {
                     if is_inline_element(plan, self.schema, &star) {
                         continue;
                     }
-                    (identifier_values, star, class_uri.to_owned(), *regime)
+                    (
+                        identifier_values,
+                        star,
+                        class_uri.to_owned(),
+                        plan.data_regime,
+                    )
                 }
                 // A restriction carries the regime of the scan it was
                 // derived from, so it folds with the matches of that regime
@@ -549,7 +554,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
                     PlanOp::Match {
                         pattern,
                         reads: other_reads,
-                    } if other_reads.data_regime() == Some(regime)
+                    } if other_reads.is_data()
                         && subject_star(&keys, pattern).as_deref() == Some(star) =>
                     {
                         type_class_iri(pattern).map(|class| (other_id, class.to_owned()))
@@ -806,7 +811,7 @@ impl Rule for FoldDirectTypeIntoScan {
             }
             let PlanOp::Match {
                 pattern,
-                reads: GraphReads::Data(regime),
+                reads: GraphReads::Data,
             } = &plan.nodes[id].op
             else {
                 continue;
@@ -814,7 +819,7 @@ impl Rule for FoldDirectTypeIntoScan {
             if !is_direct_type_pattern(pattern) {
                 continue;
             }
-            let regime = *regime;
+            let regime = plan.data_regime;
             if !writes_direct_type(regime) {
                 replace_match_with_empty_relation(plan, id);
                 return true;
@@ -964,7 +969,7 @@ impl Rule for TypeVariableBecomesTypeTable<'_> {
             }
             let PlanOp::Match {
                 pattern,
-                reads: GraphReads::Data(regime),
+                reads: GraphReads::Data,
             } = &plan.nodes[id].op
             else {
                 continue;
@@ -972,7 +977,7 @@ impl Rule for TypeVariableBecomesTypeTable<'_> {
             if !is_type_pattern(pattern) {
                 continue;
             }
-            let regime = *regime;
+            let regime = plan.data_regime;
             let (Some(star), Some(ty)) = (subject_variable(pattern), object_variable(pattern))
             else {
                 continue;
@@ -989,9 +994,8 @@ impl Rule for TypeVariableBecomesTypeTable<'_> {
             let waits = plan.nodes.iter().enumerate().any(|(other, node)| {
                 other != id
                     && node.executor == Executor::Engine
-                    && matches!(&node.op, PlanOp::Match { pattern, reads: GraphReads::Data(r) }
-                        if *r == regime
-                            && is_direct_type_pattern(pattern)
+                    && matches!(&node.op, PlanOp::Match { pattern, reads: GraphReads::Data }
+                        if is_direct_type_pattern(pattern)
                             && subject_variable(pattern) == Some(star.as_str()))
             });
             if waits {
@@ -2556,9 +2560,10 @@ impl Rule for InlineTypeMatchBecomesFilter<'_> {
                 continue;
             };
             // Not a data graph: no rule about type triples applies.
-            let Some(regime) = reads.data_regime() else {
+            if !reads.is_data() {
                 continue;
-            };
+            }
+            let regime = plan.data_regime;
             let (Some(subject), Some(class_uri)) =
                 (subject_variable(pattern), type_class_iri(pattern))
             else {

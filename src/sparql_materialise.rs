@@ -1405,11 +1405,12 @@ mod tests {
     /// The refined plan, for the cases that are about a node rather than about
     /// the statement.
     fn refined_for(body: &str) -> String {
-        crate::sparql_plan::refined_plan_text(
+        crate::sparql_plan::plan_texts_of(
             &query(body),
             &asset360_schema_view(),
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
         )
+        .1
         .expect("the query refines")
     }
 

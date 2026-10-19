@@ -4,7 +4,7 @@ subjects can carry, as the SHACL linter reads it (consolidator-server #306)."""
 from __future__ import annotations
 
 import pytest
-from asset360_rust import PredicateVerdict, SchemaView, TypeRegime, check_predicates
+from asset360_rust import DatasetSpec, PredicateVerdict, SchemaView, TypeRegime, check_predicates
 
 _SCHEMA_YAML = """
 id: https://example.org/s
@@ -50,7 +50,7 @@ def test_a_seeded_this_is_judged_by_its_class_family_as_written():
         check_predicates(
             f"SELECT $this WHERE {{ $this <{WRONG_NAME}> ?a ; <{NAME}> ?b ; <{LENGTH}> ?c }}",
             _schema(),
-            TypeRegime.IS_A,
+            DatasetSpec(TypeRegime.IS_A),
             {"this": ASSET},
         )
     )
@@ -67,19 +67,19 @@ def test_a_seeded_this_is_judged_by_its_class_family_as_written():
 
 def test_a_subclass_only_predicate_follows_the_regime():
     query = f"SELECT ?a WHERE {{ ?a a <{ASSET}> ; <{LENGTH}> ?l }}"
-    (is_a,) = check_predicates(query, _schema(), TypeRegime.IS_A)
-    (asserted,) = check_predicates(query, _schema(), TypeRegime.ASSERTED)
+    (is_a,) = check_predicates(query, _schema(), DatasetSpec(TypeRegime.IS_A))
+    (asserted,) = check_predicates(query, _schema(), DatasetSpec(TypeRegime.ASSERTED))
     assert is_a.verdict == PredicateVerdict.Carried
     assert asserted.verdict == PredicateVerdict.NotCarried
 
 
 def test_a_subject_without_an_inferable_class_is_unchecked():
     (check,) = check_predicates(
-        f"SELECT ?s WHERE {{ ?s <{NAME}> ?n }}", _schema(), TypeRegime.IS_A
+        f"SELECT ?s WHERE {{ ?s <{NAME}> ?n }}", _schema(), DatasetSpec(TypeRegime.IS_A)
     )
     assert (check.subject, check.verdict, check.class_iri) == ("?s", PredicateVerdict.Unchecked, None)
 
 
 def test_a_query_that_does_not_parse_raises_value_error():
     with pytest.raises(ValueError):
-        check_predicates("SELECT WHERE {", _schema(), TypeRegime.IS_A)
+        check_predicates("SELECT WHERE {", _schema(), DatasetSpec(TypeRegime.IS_A))

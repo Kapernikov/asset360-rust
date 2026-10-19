@@ -749,9 +749,7 @@ mod tests {
         nodes.push(Node::engine(
             PlanOp::Match {
                 pattern: Box::new(triple),
-                reads: crate::sparql_dataset::GraphReads::Data(
-                    linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-                ),
+                reads: crate::sparql_dataset::GraphReads::Data,
             },
             Vec::new(),
         ));
