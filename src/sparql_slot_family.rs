@@ -4,14 +4,22 @@
 /// expected, itself excluded: its `is_a` and mixin descendants.
 ///
 /// One function, so every walk of a path asks the same question.
-// stub: replaced by rust-linkml-core's `type_family(cv, TypeRegime::IsAAndMixins)`
-// (minus cv itself) once that WS-U API is frozen.
+// Slot resolution is about the schema, not the triples, so the regime is the
+// widest one: a subclass by `is_a` or by mixin is a family member either way.
 pub(crate) fn descendants_for_slot_resolution(
     class: &linkml_schemaview::classview::ClassView,
 ) -> Vec<linkml_schemaview::classview::ClassView> {
-    // `get_descendants` guards its recursion with a visited list, so a class
-    // that mixes itself in terminates.
-    class.get_descendants(true, true).unwrap_or_default()
+    use linkml_runtime::schema_rdf::{TypeRegime, type_family};
+    // `type_family` includes `class` itself and is cycle-safe (a class may mix
+    // itself in); the caller asks the class first, so it is dropped here. A
+    // schema error yields no family, which declines the hop: the behaviour
+    // before family resolution existed, never a wider answer.
+    let own = class.canonical_uri();
+    type_family(class, TypeRegime::IsAAndMixins)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|member| member.canonical_uri() != own)
+        .collect()
 }
 
 /// The slot `slot_name` as a path hop sees it on `class`: the class's own
