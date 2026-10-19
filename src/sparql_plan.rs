@@ -1295,7 +1295,15 @@ pub fn refined_plan_text(
     dataset: &DatasetSpec,
 ) -> Result<String, String> {
     dataset.validate().map_err(|e| e.to_string())?;
-    let parsed = crate::sparql_scoper::parse_query_for(query, schema).map_err(|e| e.to_string())?;
+    let mut parsed =
+        crate::sparql_scoper::parse_query_for(query, schema).map_err(|e| e.to_string())?;
+    // The pass production runs before it reads anything (see
+    // `plan_query_refined_with_options`): the aliases are settled and what
+    // the query's classes cannot carry is refused, so this never prints a plan
+    // production would refuse.
+    crate::sparql_alias::canonicalize(&mut parsed, schema)
+        .map_err(|e| ScopeError::from(e).to_string())?;
+    let parsed = parsed;
     let naive = crate::sparql_refine::naive_plan_in(&parsed, dataset).map_err(|e| e.to_string())?;
     // The plan production builds: with the lifts when they reach the rows
     // route, without them otherwise (see `plan_query_refined`).
@@ -3446,6 +3454,21 @@ classes:
         ));
         assert!(!finish.contains("GRAPH"), "{finish}");
         assert_eq!(classes[0].len(), 2, "{classes:?}");
+    }
+
+    /// Review F10a: the diagnostic runs the alias/refusal pass production
+    /// runs, so it never prints a plan production refuses; it prints the
+    /// refusal instead.
+    #[test]
+    fn the_refined_plan_text_prints_the_refusal_production_gives() {
+        let sv = test_schema_view();
+        let dataset = crate::sparql_dataset::DatasetSpec::default();
+        let query =
+            format!("{PREFIX}SELECT ?lo WHERE {{ ?c a asset360:Track ; asset360:longitude ?lo }}");
+        let production = plan_query_refined_in(&query, &sv, &dataset).expect_err("refused");
+        let text = refined_plan_text(&query, &sv, &dataset).expect_err("a refusal, not a plan");
+        assert_eq!(text, production.to_string());
+        assert!(text.contains("not a slot of Track"), "{text}");
     }
 
     /// `FROM NAMED` and no `FROM` leaves the default graph empty (SPARQL 1.1

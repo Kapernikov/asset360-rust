@@ -4379,14 +4379,22 @@ mod tests {
         assert_eq!(tree.find("scan").len(), 1);
         // Asserted: the two classes are different families, so the fold
         // declines and nothing folds into one scan claiming both.
-        if let Ok(tree) = lowered_in(query, &sv, TypeRegime::Asserted) {
-            assert_ne!(tree.find("scan").len(), 1, "must not fold");
-        }
+        assert!(
+            matches!(
+                lowered_in(query, &sv, TypeRegime::Asserted),
+                Err(LoweringRefusal::NothingPushed)
+            ),
+            "asserted: nothing folds, and lowering says so"
+        );
         // A sibling is not covered: Relay's family is not inside Switch's.
         let sibling = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }";
-        if let Ok(tree) = lowered_in(sibling, &sv, TypeRegime::IsA) {
-            assert_ne!(tree.find("scan").len(), 1, "siblings do not fold");
-        }
+        assert!(
+            matches!(
+                lowered_in(sibling, &sv, TypeRegime::IsA),
+                Err(LoweringRefusal::NothingPushed)
+            ),
+            "siblings do not fold, and lowering says so"
+        );
     }
 
     /// The same with the record named: the identifier narrowing survives.
