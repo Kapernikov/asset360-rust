@@ -77,7 +77,10 @@ pub enum Predicate {
     /// `?v` is the identity of a record of this class, read under this type
     /// regime (that of the scan it was derived from). The fold reads it as
     /// the star's type when 3b carries it to the matches.
-    Class(String, TypeRegime),
+    Class {
+        class_uri: String,
+        regime: TypeRegime,
+    },
     /// A condition over slots of `?v`'s record -- `?v.kind = 'GSA'` -- that
     /// the other side's every row satisfies. It lands as a filter above
     /// the side's scan of `?v`, where SQL applies it; it is never the type.
@@ -87,7 +90,9 @@ pub enum Predicate {
 impl std::fmt::Display for Predicate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Class(class_uri, _) => write!(f, "∈ {}", crate::sparql_plan::shorten(class_uri)),
+            Self::Class { class_uri, .. } => {
+                write!(f, "∈ {}", crate::sparql_plan::shorten(class_uri))
+            }
             Self::Condition(condition) => write!(f, "where {condition}"),
         }
     }
@@ -114,7 +119,7 @@ impl Restriction {
             self.at.side,
             &self.var,
             match &self.predicate {
-                Predicate::Class(class_uri, _) => class_uri.clone(),
+                Predicate::Class { class_uri, .. } => class_uri.clone(),
                 Predicate::Condition(condition) => format!("{condition}"),
             },
         )
@@ -123,7 +128,7 @@ impl Restriction {
     /// The class this restriction carries, when it is one.
     pub fn class_uri(&self) -> Option<&str> {
         match &self.predicate {
-            Predicate::Class(class_uri, _) => Some(class_uri),
+            Predicate::Class { class_uri, .. } => Some(class_uri),
             Predicate::Condition(_) => None,
         }
     }
@@ -131,7 +136,7 @@ impl Restriction {
     /// The filter condition that spells this restriction in a plan.
     pub fn condition(&self) -> Expr {
         match &self.predicate {
-            Predicate::Class(class_uri, regime) => Expr::InClass {
+            Predicate::Class { class_uri, regime } => Expr::InClass {
                 var: self.var.clone(),
                 class_uri: class_uri.clone(),
                 regime: *regime,
@@ -569,7 +574,7 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                             },
                             Vec::new(),
                         );
-                        placed(plan, Predicate::Class(class_uri, regime), filter);
+                        placed(plan, Predicate::Class { class_uri, regime }, filter);
                         return true;
                     }
 
@@ -1453,10 +1458,10 @@ mod tests {
         };
         assert_eq!(
             restriction.predicate,
-            Predicate::Class(
-                "https://data.infrabel.be/asset360/Signal".to_owned(),
-                TypeRegime::IsA
-            ),
+            Predicate::Class {
+                class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
+                regime: TypeRegime::IsA
+            },
             "{plan}"
         );
         // Only the inner star is a scan; the asserted slot match is another
