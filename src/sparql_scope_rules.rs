@@ -399,6 +399,7 @@ mod tests {
                 residual: Vec::new(),
                 obligations: plan.obligations.clone(),
                 refinement: crate::sparql_plan::Refinement::UsedAlone(String::new()),
+                dataset: crate::sparql_dataset::DatasetSpec::default(),
             }
         );
         println!("{printed}");

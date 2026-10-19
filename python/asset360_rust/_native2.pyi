@@ -7567,7 +7567,7 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             or query execution error.
     """
 
-def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, max_triples:builtins.int, max_result_rows:builtins.int, dataset:DatasetSpec, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
+def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, max_triples:builtins.int, max_result_rows:builtins.int, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
     r"""
     Finish a ``refinement == "used_rows"`` plan over its statement's rows.
     
@@ -7587,8 +7587,10 @@ def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:S
             triple it would have been on the records route. Over it, the
             call raises ``RuntimeError("Triple limit exceeded: …")``.
         max_result_rows: Maximum rows of the answer.
-        dataset: As for ``sparql_execute``.
         max_eval_millis: As for ``sparql_execute``.
+    
+    The dataset is the plan's own: the one it was planned under, so the rows
+    and their finish cannot be read under different graphs.
     
     Returns:
         ``(content_type, body)``, as ``sparql_execute``.

@@ -1968,7 +1968,6 @@ pub(crate) mod tests {
             &json,
             schema,
             crate::sparql_executor::ExecuteLimits::default(),
-            crate::sparql_dataset::default_dataset(),
         )
         .unwrap_or_else(|error| panic!("{error}\n{plan}"));
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();

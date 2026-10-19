@@ -300,6 +300,11 @@ pub struct ExecutionPlan {
     /// How this plan is to be run, and what the engine was left. See
     /// [`plan_query_refined`].
     pub refinement: Refinement,
+    /// The dataset the plan was made for. The regime of every scan and the
+    /// schema graphs a finish query may read were decided under it, so
+    /// [`crate::sparql_executor::sparql_finish`] reads it from here rather than
+    /// being handed a second one that could disagree.
+    pub dataset: DatasetSpec,
 }
 
 impl ExecutionPlan {
@@ -1465,7 +1470,13 @@ pub fn plan_query_refined_with_options(
         // partial refusal is partial in what the *rules* proved.
         Err(error) => {
             let scoped = resolve(&parsed, schema_view, dataset, &recorded, None)?;
-            return Ok(fetch_only(obligations, &scoped, error.to_string(), None));
+            return Ok(fetch_only(
+                obligations,
+                &scoped,
+                error.to_string(),
+                None,
+                dataset,
+            ));
         }
     };
     // **M2's lifts are kept only when they reach `UsedRows`.** They exist to
@@ -1530,6 +1541,7 @@ pub fn plan_query_refined_with_options(
             &scoped,
             format!("a rule broke the plan: {failure}"),
             None,
+            dataset,
         ));
     }
     // `resolve`: every recorded star is typed from the refined plan's scan
@@ -1556,6 +1568,7 @@ pub fn plan_query_refined_with_options(
                 &scoped,
                 format!("not lowerable: {refusal}"),
                 Some((&refined, schema_view)),
+                dataset,
             ));
         }
     };
@@ -1574,6 +1587,7 @@ pub fn plan_query_refined_with_options(
         obligations,
         // Decided by `answers_alone` below; both arms overwrite it.
         refinement: Refinement::Used(None),
+        dataset: dataset.clone(),
     };
 
     match answers_alone(&plan, &ops) {
@@ -1943,6 +1957,7 @@ pub(crate) fn rows_placement(
         residual: Vec::new(),
         obligations: obligations.to_vec(),
         refinement: Refinement::UsedRows(note),
+        dataset: dataset.clone(),
     };
     Ok(RowsPlacement {
         plan,
@@ -2419,6 +2434,7 @@ fn fetch_only(
     scoped: &crate::sparql_scoper::QueryPlan,
     why: String,
     refined: Option<(&crate::sparql_refine::Plan, &SchemaView)>,
+    dataset: &DatasetSpec,
 ) -> ExecutionPlan {
     let triple_count = obligations
         .iter()
@@ -2477,6 +2493,7 @@ fn fetch_only(
             why,
             narrowings: Box::new(narrowings),
         },
+        dataset: dataset.clone(),
     }
 }
 
@@ -4123,6 +4140,7 @@ classes:
             }],
             residual: vec![1],
             refinement: Refinement::Used(None),
+            dataset: DatasetSpec::default(),
         };
         assert!(balanced.ledger_balances().is_ok());
         assert!(
@@ -4303,6 +4321,7 @@ classes:
             }],
             residual: Vec::new(),
             refinement: Refinement::UsedAlone("hand-built".to_owned()),
+            dataset: DatasetSpec::default(),
         };
         plan.ledger_balances().unwrap();
 

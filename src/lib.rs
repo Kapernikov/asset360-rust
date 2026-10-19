@@ -4344,7 +4344,7 @@ fn sparql_execute(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (plan, solutions_json, schema_view, max_triples, max_result_rows, dataset, max_eval_millis=None))]
+#[pyo3(signature = (plan, solutions_json, schema_view, max_triples, max_result_rows, max_eval_millis=None))]
 /// Finish a ``refinement == "used_rows"`` plan over its statement's rows.
 ///
 /// The engine pass's ``finish`` query is evaluated with the rows in place of
@@ -4363,8 +4363,10 @@ fn sparql_execute(
 ///         triple it would have been on the records route. Over it, the
 ///         call raises ``RuntimeError("Triple limit exceeded: …")``.
 ///     max_result_rows: Maximum rows of the answer.
-///     dataset: As for ``sparql_execute``.
 ///     max_eval_millis: As for ``sparql_execute``.
+///
+/// The dataset is the plan's own: the one it was planned under, so the rows
+/// and their finish cannot be read under different graphs.
 ///
 /// Returns:
 ///     ``(content_type, body)``, as ``sparql_execute``.
@@ -4380,7 +4382,6 @@ fn sparql_finish(
     schema_view: Py<PySchemaView>,
     max_triples: usize,
     max_result_rows: usize,
-    dataset: PyDatasetSpec,
     max_eval_millis: Option<u64>,
 ) -> PyResult<(String, String)> {
     let bound_sv = schema_view.bind(py);
@@ -4395,7 +4396,6 @@ fn sparql_finish(
             max_result_rows,
             max_eval_millis,
         },
-        &dataset.inner,
     ) {
         Ok(answer) => Ok((answer.content_type, answer.body)),
         Err(crate::sparql_executor::ExecuteError::TripleLimitExceeded { count, limit }) => {

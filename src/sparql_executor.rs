@@ -912,10 +912,10 @@ pub fn sparql_finish(
     solutions_json: &str,
     schema_view: &SchemaView,
     limits: ExecuteLimits,
-    dataset: &DatasetSpec,
 ) -> Result<SparqlAnswer, ExecuteError> {
     use crate::sparql_plan::{EngineInput, PassKind};
 
+    let dataset = &plan.dataset;
     dataset.validate()?;
     let Some((vars, ordinal, finish)) = plan.passes.iter().find_map(|pass| match &pass.kind {
         PassKind::Engine(engine) => match &engine.input {
@@ -2189,6 +2189,79 @@ classes:
         // — `LOCAL_ONLY` is a plain literal there — but the schema graph still
         // has to answer "which values does this enum permit?" with all of them.
         assert_eq!(codes, vec!["GSA", "LOCAL_ONLY"], "{answer}");
+    }
+
+    /// **The plan carries its dataset.** The finish reads the schema graph
+    /// because the plan was made for a dataset that serves one; a plan made
+    /// for another dataset finishes under that one, with no second argument
+    /// that could say otherwise.
+    #[test]
+    fn a_finish_reads_the_dataset_its_plan_was_made_under() {
+        use crate::sparql_plan::{EngineInput, PassKind};
+        let sv = schema();
+        let query = format!(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t ?class WHERE {{ ?s a asset360:Signal . \
+             BIND(STRAFTER(STR(?s), \"signal\") AS ?t) \
+             GRAPH <{SCHEMA_GRAPH_IRI}> {{ ?class rdfs:label \"Signal\" }} }}"
+        );
+        let finish_of = |plan: &crate::sparql_plan::ExecutionPlan| {
+            let vars = plan
+                .passes
+                .iter()
+                .find_map(|pass| match &pass.kind {
+                    PassKind::Engine(engine) => match &engine.input {
+                        EngineInput::Solutions { vars, .. } => Some(vars.clone()),
+                        EngineInput::Records => None,
+                    },
+                    PassKind::Sql(_) => None,
+                })
+                .unwrap_or_else(|| panic!("expected the rows route:\n{plan}"));
+            let row: serde_json::Map<String, serde_json::Value> = vars
+                .iter()
+                .map(|var| {
+                    (
+                        var.clone(),
+                        serde_json::json!({"type": "uri", "value": "urn:x:signal"}),
+                    )
+                })
+                .collect();
+            let json = serde_json::json!({
+                "head": {"vars": vars},
+                "results": {"bindings": [row]},
+            })
+            .to_string();
+            let answer = sparql_finish(plan, &json, &sv, ExecuteLimits::default())
+                .unwrap_or_else(|err| panic!("{err}\n{plan}"));
+            let answer: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+            answer["results"]["bindings"].as_array().unwrap().len()
+        };
+
+        let mut plan = crate::sparql_plan::plan_query_refined_in(
+            &query,
+            &sv,
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),
+        )
+        .unwrap();
+        // The planner folds a schema read it can answer into the statement, so
+        // the finish is written by hand to be the one that reads the graph.
+        for pass in &mut plan.passes {
+            if let PassKind::Engine(engine) = &mut pass.kind
+                && let EngineInput::Solutions { finish, .. } = &mut engine.input
+            {
+                *finish = format!(
+                    "SELECT ?s ?class WHERE {{ VALUES ( ?s ) {{  }} \
+                     GRAPH <{SCHEMA_GRAPH_IRI}> {{ ?class \
+                     <http://www.w3.org/2000/01/rdf-schema#label> \"Signal\" }} }}"
+                );
+            }
+        }
+        assert_eq!(finish_of(&plan), 1, "the schema graph names the class");
+        // The same plan, made for a dataset that serves no schema graph: the
+        // graph is not there for the finish to read.
+        plan.dataset = DatasetSpec::default();
+        assert_eq!(finish_of(&plan), 0, "no schema graph, no class");
     }
 
     /// The parity guard, asserted directly rather than trusted: the schema
