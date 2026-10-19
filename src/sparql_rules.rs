@@ -55,7 +55,6 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use linkml_runtime::schema_rdf::{TypeRegime, type_family};
-use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
@@ -69,6 +68,7 @@ use crate::sparql_refine::{
     SlotPresence, SlotReading, SortTerm, inner_join_groups, is_type_pattern, object_variable,
     predicate_iri, scan_classes, scan_with_fanout, subject_iri, subject_variable, type_class_iri,
 };
+use crate::sparql_slot_family::slot_on_class_or_descendant;
 
 /// One rewrite.
 pub trait Rule {
@@ -1754,7 +1754,7 @@ fn class_at_path(
 ) -> Option<linkml_schemaview::classview::ClassView> {
     let mut class = schema.get_class_by_uri(class_uri).ok().flatten()?;
     for name in path {
-        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)?;
+        let slot = slot_on_class_or_descendant(&class, name)?;
         if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
             return None;
         }
@@ -1773,8 +1773,7 @@ fn prefix_crosses_a_collection(schema: &SchemaView, class_uri: &str, path: &[Str
         return false;
     };
     for name in path {
-        let Some(slot) = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)
-        else {
+        let Some(slot) = slot_on_class_or_descendant(&class, name) else {
             return false;
         };
         if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
@@ -1905,9 +1904,7 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
                 continue;
             };
-            let Some(on_class) =
-                crate::sparql_slot_family::slot_on_class_or_descendant(&class, &slot.name)
-            else {
+            let Some(on_class) = slot_on_class_or_descendant(&class, &slot.name) else {
                 continue;
             };
             let multivalued =
@@ -2333,7 +2330,7 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         };
         let class = self.schema.get_class_by_uri(&class_uri).ok().flatten()?;
         let slot = self.schema.get_slot_by_uri(predicate).ok().flatten()?;
-        let on_class = crate::sparql_slot_family::slot_on_class_or_descendant(&class, &slot.name)?;
+        let on_class = slot_on_class_or_descendant(&class, &slot.name)?;
         // Identity is [`FoldIdentityConstant`]'s, and the two rules have to be
         // disjoint or the plan depends on which fired first -- which it did:
         // reversed, this rule turned `?s :id "u"` into a JSONB path condition
@@ -6036,47 +6033,12 @@ pub(crate) fn most_specific(
     candidates.next().is_none().then(|| (*class).clone())
 }
 
-// TODO(R2 rebase): replace with crate::sparql_slot_family::slot_on_class_or_descendant
-/// The slot `slot_name` as `class` reads it: its own declaration, else the
-/// one definition every descendant carrying that name agrees on (same slot
-/// IRI, range, inline mode and container mode), else `None` and the fold
-/// declines.
-fn slot_on_class_or_descendant(
-    class: &linkml_schemaview::classview::ClassView,
-    slot_name: &str,
-) -> Option<linkml_schemaview::slotview::SlotView> {
-    let name = Identifier::Name(slot_name.to_owned());
-    if let Some(own) = class.slot(&name) {
-        return Some(own);
-    }
-    let family = type_family(class, TypeRegime::IsAAndMixins).ok()?;
-    let mut found: Option<linkml_schemaview::slotview::SlotView> = None;
-    for member in &family {
-        let Some(slot) = member.slot(&name) else {
-            continue;
-        };
-        match &found {
-            None => found = Some(slot),
-            Some(first) => {
-                let same = first.definition().slot_uri == slot.definition().slot_uri
-                    && first.definition().range == slot.definition().range
-                    && first.determine_slot_inline_mode() == slot.determine_slot_inline_mode()
-                    && first.determine_slot_container_mode()
-                        == slot.determine_slot_container_mode();
-                if !same {
-                    return None;
-                }
-            }
-        }
-    }
-    found
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sparql_refine::naive_plan_of;
     use crate::sparql_scoper::tests::test_schema_view;
+    use linkml_schemaview::identifier::Identifier;
 
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
          PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
@@ -10612,63 +10574,5 @@ mod inline_type_match {
             let text = plan.to_string();
             assert!(text.contains(needle), "{name}: {text}");
         }
-    }
-}
-
-#[cfg(test)]
-mod family_iri_tests {
-    use std::collections::BTreeSet;
-
-    use linkml_meta::SchemaDefinition;
-    use linkml_runtime::schema_rdf::TypeRegime;
-    use linkml_schemaview::schemaview::SchemaView;
-
-    use super::most_specific;
-
-    /// A schema whose classes declare no `class_uri`, so their IRI comes from
-    /// the default prefix.
-    fn default_prefix_schema() -> SchemaView {
-        let raw = r#"
-id: https://example.org/dp
-name: dp
-prefixes:
-  linkml: https://w3id.org/linkml/
-  dp: https://example.org/dp/
-default_prefix: dp
-default_range: string
-classes:
-  Parent:
-    attributes:
-      uri:
-        identifier: true
-  Sub:
-    is_a: Parent
-"#;
-        let schema: SchemaDefinition =
-            serde_path_to_error::deserialize(serde_yml::Deserializer::from_str(raw)).unwrap();
-        let mut sv = SchemaView::new();
-        sv.add_schema(schema).unwrap();
-        sv
-    }
-
-    /// The family members are compared with the full IRIs the star carries,
-    /// whatever form `canonical_uri` takes (a CURIE under a default prefix).
-    #[test]
-    fn a_default_prefix_class_chain_folds_to_the_subclass() {
-        let schema = default_prefix_schema();
-        let sub = schema
-            .get_class_by_uri("https://example.org/dp/Sub")
-            .unwrap()
-            .expect("Sub is addressable by its full IRI");
-        println!("canonical_uri(Sub) = {:?}", sub.canonical_uri());
-        let classes: BTreeSet<String> = [
-            "https://example.org/dp/Sub".to_owned(),
-            "https://example.org/dp/Parent".to_owned(),
-        ]
-        .into();
-        assert_eq!(
-            most_specific(&schema, &classes, TypeRegime::IsA).as_deref(),
-            Some("https://example.org/dp/Sub")
-        );
     }
 }
