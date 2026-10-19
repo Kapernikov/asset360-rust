@@ -37,6 +37,7 @@ use std::collections::BTreeSet;
 use linkml_runtime::schema_rdf::TypeRegime;
 use linkml_schemaview::schemaview::SchemaView;
 
+use crate::sparql_dataset::GraphReads;
 use crate::sparql_plan::{Obligation, ObligationId};
 use crate::sparql_refine::{Executor, Expr, Node, NodeId, NodeKey, Plan, PlanOp};
 use crate::sparql_rules::Rule;
@@ -635,7 +636,7 @@ impl Rule for RestrictScopeAtBoundary<'_> {
 fn types_itself(plan: &Plan, side: NodeId, var: &str) -> bool {
     (0..plan.nodes.len()).any(|id| {
         plan.feeds(id, side)
-            && matches!(&plan.nodes[id].op, PlanOp::Match { pattern, regime: Some(_) }
+            && matches!(&plan.nodes[id].op, PlanOp::Match { pattern, reads: GraphReads::Data(_) }
                 if crate::sparql_refine::subject_variable(pattern) == Some(var)
                     && crate::sparql_refine::type_class_iri(pattern).is_some())
     })
@@ -651,7 +652,7 @@ fn only_reference_reads(plan: &Plan, schema: &SchemaView, side: NodeId, var: &st
             PlanOp::Scan { star_var, .. } => Some(star_var.clone()),
             PlanOp::Match {
                 pattern,
-                regime: Some(_),
+                reads: GraphReads::Data(_),
             } if crate::sparql_refine::type_class_iri(pattern).is_some() => {
                 crate::sparql_refine::subject_variable(pattern).map(str::to_owned)
             }
@@ -1465,7 +1466,7 @@ mod tests {
             plan.nodes.iter().any(|node| matches!(
                 &node.op,
                 PlanOp::Match {
-                    regime: Some(TypeRegime::Asserted),
+                    reads: GraphReads::Data(TypeRegime::Asserted),
                     ..
                 }
             )),

@@ -4211,7 +4211,9 @@ mod tests {
             crate::sparql_refine::Node::engine(
                 crate::sparql_refine::PlanOp::Match {
                     pattern: Box::new(pattern),
-                    regime: Some(linkml_runtime::schema_rdf::TypeRegime::Asserted),
+                    reads: crate::sparql_dataset::GraphReads::Data(
+                        linkml_runtime::schema_rdf::TypeRegime::Asserted,
+                    ),
                 },
                 Vec::new(),
             ),

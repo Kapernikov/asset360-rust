@@ -195,7 +195,7 @@ impl<'s> MostSpecificTypeIsTheDirectType<'s> {
 
 /// A match `?subject a ?object`, both variables, in a data graph.
 fn typed_pair(plan: &Plan, id: NodeId) -> Option<(String, String, TypeRegime)> {
-    let PlanOp::Match { pattern, regime } = &plan.nodes[id].op else {
+    let PlanOp::Match { pattern, reads } = &plan.nodes[id].op else {
         return None;
     };
     if plan.nodes[id].executor != Executor::Engine || !is_type_pattern(pattern) {
@@ -204,7 +204,7 @@ fn typed_pair(plan: &Plan, id: NodeId) -> Option<(String, String, TypeRegime)> {
     Some((
         subject_variable(pattern)?.to_owned(),
         object_variable(pattern)?.to_owned(),
-        (*regime)?,
+        reads.data_regime()?,
     ))
 }
 

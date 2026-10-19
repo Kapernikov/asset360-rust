@@ -64,6 +64,7 @@ use spargebra::algebra::AggregateExpression;
 use spargebra::term::{GroundTerm, Term, TermPattern, TriplePattern};
 
 use crate::sparql_dataset::DatasetSpec;
+use crate::sparql_dataset::GraphReads;
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
     CompareOp, Executor, Expr, Measure, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot,
@@ -313,7 +314,7 @@ impl<'s> FoldMatchesIntoScan<'s> {
             // under a `GRAPH`, which no scan reads.
             let PlanOp::Match {
                 pattern,
-                regime: Some(match_regime),
+                reads: GraphReads::Data(match_regime),
             } = &node.op
             else {
                 continue;
@@ -410,7 +411,7 @@ fn same_regime(plan: &Plan, matched: NodeId, scan: NodeId) -> bool {
     match (&plan.nodes[matched].op, &plan.nodes[scan].op) {
         (
             PlanOp::Match {
-                regime: Some(on_match),
+                reads: GraphReads::Data(on_match),
                 ..
             },
             PlanOp::Scan {
@@ -461,10 +462,10 @@ impl Rule for FoldMatchesIntoScan<'_> {
             ) = match &node.op {
                 // A type match under a `GRAPH` is not about the data graph
                 // and folds into nothing.
-                PlanOp::Match { regime: None, .. } => continue,
+                PlanOp::Match { reads, .. } if reads.data_regime().is_none() => continue,
                 PlanOp::Match {
                     pattern,
-                    regime: Some(regime),
+                    reads: GraphReads::Data(regime),
                 } => {
                     // A constant subject is a star of one record: the
                     // query named the identity, so the scan carries it as
@@ -553,8 +554,8 @@ impl Rule for FoldMatchesIntoScan<'_> {
                 .filter_map(|(other_id, other)| match &other.op {
                     PlanOp::Match {
                         pattern,
-                        regime: other_regime,
-                    } if *other_regime == Some(regime)
+                        reads: other_reads,
+                    } if other_reads.data_regime() == Some(regime)
                         && subject_star(&keys, pattern).as_deref() == Some(star) =>
                     {
                         type_class_iri(pattern).map(|class| (other_id, class.to_owned()))
@@ -817,7 +818,7 @@ impl Rule for FoldDirectTypeIntoScan {
             }
             let PlanOp::Match {
                 pattern,
-                regime: Some(regime),
+                reads: GraphReads::Data(regime),
             } = &plan.nodes[id].op
             else {
                 continue;
@@ -975,7 +976,7 @@ impl Rule for TypeVariableBecomesTypeTable<'_> {
             }
             let PlanOp::Match {
                 pattern,
-                regime: Some(regime),
+                reads: GraphReads::Data(regime),
             } = &plan.nodes[id].op
             else {
                 continue;
@@ -1000,7 +1001,7 @@ impl Rule for TypeVariableBecomesTypeTable<'_> {
             let waits = plan.nodes.iter().enumerate().any(|(other, node)| {
                 other != id
                     && node.executor == Executor::Engine
-                    && matches!(&node.op, PlanOp::Match { pattern, regime: Some(r) }
+                    && matches!(&node.op, PlanOp::Match { pattern, reads: GraphReads::Data(r) }
                         if *r == regime
                             && is_direct_type_pattern(pattern)
                             && subject_variable(pattern) == Some(star.as_str()))
@@ -2557,11 +2558,11 @@ impl Rule for InlineTypeMatchBecomesFilter<'_> {
             if plan.nodes[id].executor != Executor::Engine {
                 continue;
             }
-            let PlanOp::Match { pattern, regime } = &plan.nodes[id].op else {
+            let PlanOp::Match { pattern, reads } = &plan.nodes[id].op else {
                 continue;
             };
             // Not a data graph: no rule about type triples applies.
-            let Some(regime) = *regime else {
+            let Some(regime) = reads.data_regime() else {
                 continue;
             };
             let (Some(subject), Some(class_uri)) =

@@ -441,8 +441,13 @@ impl DatasetSpec {
 }
 
 /// What one graph holds, as far as the planner can tell.
+///
+/// What a [`crate::sparql_refine::PlanOp::Match`] says it reads, so the cases
+/// a rule must tell apart stay apart: the records (under a regime), the
+/// datamodel, nothing at all, and a graph only the engine can speak for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GraphReads {
+#[non_exhaustive]
+pub enum GraphReads {
     /// The golden records, under this regime. The SQL route reads them.
     Data(TypeRegime),
     /// The datamodel. Only the engine, or a schema-only region, reads it.
@@ -454,6 +459,18 @@ pub(crate) enum GraphReads {
     /// Anything else: a graph the endpoint does not serve, or a set of graphs
     /// no single regime stands for. Only the engine can say what it holds.
     Other,
+}
+
+impl GraphReads {
+    /// The regime the records are read under: `Some` for [`Self::Data`] and
+    /// for nothing else. What a rule about type triples asks, since only the
+    /// data graph holds records a scan could read.
+    pub fn data_regime(&self) -> Option<TypeRegime> {
+        match self {
+            Self::Data(regime) => Some(*regime),
+            _ => None,
+        }
+    }
 }
 
 /// A query's view of the dataset: [`DatasetSpec`] and the `FROM` / `FROM
