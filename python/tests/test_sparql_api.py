@@ -9,6 +9,7 @@ import pytest
 from asset360_rust import (
     DatasetSpec,
     SchemaView,
+    TypePartition,
     TypeRegime,
     sparql_execute,
     sparql_finish,
@@ -79,3 +80,33 @@ def test_the_schema_graph_is_asked_for_by_regime_alone():
     assert "<https://example.org/s/Tunnel> " + subclass_of + " <https://example.org/s/Asset>" in asserted
     assert asserted != sparql_schema_graph_ntriples(sv, TypeRegime.IsA)
     assert sparql_schema_graph_skipped(sv, TypeRegime.Asserted) == []
+
+
+def test_a_dataset_can_be_read_back():
+    dataset = DatasetSpec(
+        TypeRegime.Asserted,
+        data_graphs={A: TypeRegime.IsA},
+        default_graph=A,
+        partition_graphs={TypePartition.Own: "urn:graph:own"},
+        schema_graphs={S: TypeRegime.IsAAndMixins},
+    )
+    # The default graph is a data graph, so its regime is the default regime.
+    assert dataset.default_regime == TypeRegime.IsA
+    assert dataset.data_graphs == {A: TypeRegime.IsA}
+    assert dataset.default_graph == A
+    assert dataset.partition_graphs == {TypePartition.Own: "urn:graph:own"}
+    assert dataset.schema_graphs == {S: TypeRegime.IsAAndMixins}
+    assert repr(dataset) == (
+        "DatasetSpec(TypeRegime.IsA, data_graphs={'urn:graph:asserted': TypeRegime.IsA}"
+        ", default_graph='urn:graph:asserted'"
+        ", partition_graphs={TypePartition.Own: 'urn:graph:own'}"
+        ", schema_graphs={'urn:graph:schema': TypeRegime.IsAAndMixins})"
+    )
+
+
+def test_a_bare_dataset_reads_back_empty():
+    dataset = DatasetSpec(TypeRegime.Asserted)
+    assert dataset.default_regime == TypeRegime.Asserted
+    assert dataset.data_graphs == {} and dataset.schema_graphs == {}
+    assert dataset.default_graph is None and dataset.partition_graphs == {}
+    assert repr(dataset) == "DatasetSpec(TypeRegime.Asserted)"

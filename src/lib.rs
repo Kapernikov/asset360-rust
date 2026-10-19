@@ -3973,6 +3973,120 @@ impl PyDatasetSpec {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner })
     }
+
+    /// The regime a triple pattern outside any ``GRAPH`` is matched under: the
+    /// regime of ``default_graph`` when one is declared, else the one given to
+    /// the constructor.
+    #[getter]
+    fn default_regime(&self) -> linkml_runtime_python::PyTypeRegime {
+        py_regime(self.inner.default_regime())
+    }
+
+    /// Every data graph, IRI to regime.
+    #[getter]
+    fn data_graphs(
+        &self,
+    ) -> std::collections::BTreeMap<String, linkml_runtime_python::PyTypeRegime> {
+        self.inner
+            .data_graphs()
+            .map(|(iri, regime)| (iri.to_owned(), py_regime(regime)))
+            .collect()
+    }
+
+    /// The IRI of the data graph that is the default graph, if one is declared.
+    #[getter]
+    fn default_graph(&self) -> Option<String> {
+        self.inner.default_graph().map(str::to_owned)
+    }
+
+    /// The graph that holds each :class:`TypePartition`, for the partitions
+    /// that have one.
+    #[getter]
+    fn partition_graphs(
+        &self,
+    ) -> std::collections::HashMap<linkml_runtime_python::PyTypePartition, String> {
+        linkml_runtime::schema_rdf::TypePartition::ALL
+            .into_iter()
+            .filter_map(|partition| {
+                self.inner
+                    .partition_graph(partition)
+                    .map(|iri| (partition.into(), iri.to_owned()))
+            })
+            .collect()
+    }
+
+    /// Every schema graph, IRI to the regime it publishes its subclass edges
+    /// under.
+    #[getter]
+    fn schema_graphs(
+        &self,
+    ) -> std::collections::BTreeMap<String, linkml_runtime_python::PyTypeRegime> {
+        self.inner
+            .schema_graphs()
+            .map(|(iri, regime)| (iri.to_owned(), py_regime(regime)))
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        let regime = |regime| format!("TypeRegime.{}", regime_name(regime));
+        let mut parts = vec![regime(self.inner.default_regime())];
+        let graphs = |graphs: Vec<(&str, linkml_runtime::schema_rdf::TypeRegime)>| {
+            let entries: Vec<String> = graphs
+                .into_iter()
+                .map(|(iri, r)| format!("'{iri}': {}", regime(r)))
+                .collect();
+            format!("{{{}}}", entries.join(", "))
+        };
+        let data: Vec<_> = self.inner.data_graphs().collect();
+        if !data.is_empty() {
+            parts.push(format!("data_graphs={}", graphs(data)));
+        }
+        if let Some(iri) = self.inner.default_graph() {
+            parts.push(format!("default_graph='{iri}'"));
+        }
+        let partitions: Vec<String> = linkml_runtime::schema_rdf::TypePartition::ALL
+            .into_iter()
+            .filter_map(|partition| {
+                self.inner
+                    .partition_graph(partition)
+                    .map(|iri| format!("TypePartition.{partition:?}: '{iri}'"))
+            })
+            .collect();
+        if !partitions.is_empty() {
+            parts.push(format!("partition_graphs={{{}}}", partitions.join(", ")));
+        }
+        let schema: Vec<_> = self.inner.schema_graphs().collect();
+        if !schema.is_empty() {
+            parts.push(format!("schema_graphs={}", graphs(schema)));
+        }
+        format!("DatasetSpec({})", parts.join(", "))
+    }
+}
+
+/// The Python spelling of a regime. `linkml_runtime_python` converts the other
+/// way only.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+fn py_regime(
+    regime: linkml_runtime::schema_rdf::TypeRegime,
+) -> linkml_runtime_python::PyTypeRegime {
+    use linkml_runtime::schema_rdf::TypeRegime;
+    use linkml_runtime_python::PyTypeRegime;
+    match regime {
+        TypeRegime::Asserted => PyTypeRegime::Asserted,
+        TypeRegime::IsA => PyTypeRegime::IsA,
+        TypeRegime::IsAAndMixins => PyTypeRegime::IsAAndMixins,
+    }
+}
+
+/// The name a regime has in Python (`TypeRegime.<name>`).
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+fn regime_name(regime: linkml_runtime::schema_rdf::TypeRegime) -> &'static str {
+    use linkml_runtime::schema_rdf::TypeRegime;
+    match regime {
+        TypeRegime::Asserted => "Asserted",
+        TypeRegime::IsA => "IsA",
+        TypeRegime::IsAAndMixins => "IsAAndMixins",
+    }
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]

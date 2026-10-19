@@ -1696,8 +1696,38 @@ class DatasetSpec:
         ValueError: the default graph is not a data graph, or one IRI is
             registered with two meanings.
     """
+    @property
+    def default_regime(self) -> TypeRegime:
+        r"""
+        The regime a triple pattern outside any ``GRAPH`` is matched under: the
+        regime of ``default_graph`` when one is declared, else the one given to
+        the constructor.
+        """
+    @property
+    def data_graphs(self) -> builtins.dict[builtins.str, TypeRegime]:
+        r"""
+        Every data graph, IRI to regime.
+        """
+    @property
+    def default_graph(self) -> typing.Optional[builtins.str]:
+        r"""
+        The IRI of the data graph that is the default graph, if one is declared.
+        """
+    @property
+    def partition_graphs(self) -> builtins.dict[TypePartition, builtins.str]:
+        r"""
+        The graph that holds each :class:`TypePartition`, for the partitions
+        that have one.
+        """
+    @property
+    def schema_graphs(self) -> builtins.dict[builtins.str, TypeRegime]:
+        r"""
+        Every schema graph, IRI to the regime it publishes its subclass edges
+        under.
+        """
     def __eq__(self, other:builtins.object) -> builtins.bool: ...
     def __new__(cls, default_regime:TypeRegime, *, data_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None, default_graph:typing.Optional[builtins.str]=None, partition_graphs:typing.Optional[typing.Mapping[TypePartition, builtins.str]]=None, schema_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None) -> DatasetSpec: ...
+    def __repr__(self) -> builtins.str: ...
 
 class Definition:
     @property
