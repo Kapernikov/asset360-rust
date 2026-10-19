@@ -2307,6 +2307,14 @@ pub enum PlanOp {
         /// `asset_type` column, once a rule has folded
         /// `sesame:directType ?t` into the scan. `None` until then.
         direct_type: Option<String>,
+        /// The classes the query fixed the record's *direct type* to
+        /// (`?s sesame:directType <C>`), canonical IRIs sorted. Empty: no
+        /// constraint. A record is read only when its `asset_type` is in
+        /// here *and* in [`classes`](PlanOp::Scan::classes), so the lowering
+        /// renders `asset_type = ANY(classes ∩ direct_type_in)`; `classes`
+        /// itself stays `type_family` of the class, which is the invariant
+        /// [`Plan::scan_classes_agree`] checks.
+        direct_type_in: Vec<String>,
         slots: Vec<ScanSlot>,
         /// Values the query fixed the record's *identity* to.
         ///
@@ -2599,6 +2607,7 @@ pub fn scan_with_fanout(
             regime,
             classes,
             direct_type: None,
+            direct_type_in: Vec::new(),
             slots,
             identifier_values,
         },
@@ -3339,9 +3348,14 @@ impl Plan {
         let node = &self.nodes[id];
         match &node.op {
             PlanOp::Scan {
-                star_var, slots, ..
+                star_var,
+                slots,
+                direct_type,
+                ..
             } => {
                 out.insert(star_var.clone());
+                // The direct type is read from a column every record has.
+                out.extend(direct_type.clone());
                 // Every slot that *binds* a variable, whatever its presence:
                 // an absorbed optional read binds a nullable column, and a
                 // variable in scope and possibly unbound is still in scope
@@ -3439,9 +3453,13 @@ impl Plan {
             // `variables_of` already says, for the same reason -- a delivered
             // (`Optional`) read may come back null.
             PlanOp::Scan {
-                star_var, slots, ..
+                star_var,
+                slots,
+                direct_type,
+                ..
             } => {
                 out.insert(star_var.clone());
+                out.extend(direct_type.clone());
                 out.extend(
                     slots
                         .iter()
@@ -3860,9 +3878,11 @@ impl PlanOp {
                 classes,
                 slots,
                 identifier_values,
+                direct_type,
+                direct_type_in,
                 ..
             } => format!(
-                "{}{}{} as ?{star_var}{}, requires [{}]",
+                "{}{}{} as ?{star_var}{}{}{}, requires [{}]",
                 shorten(class_uri),
                 regime_label(*regime)
                     .map(|label| format!(" [{label}]"))
@@ -3883,6 +3903,22 @@ impl PlanOp {
                     String::new()
                 } else {
                     format!(" is {}", identifier_values.join(", "))
+                },
+                if direct_type_in.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", type in {{{}}}",
+                        direct_type_in
+                            .iter()
+                            .map(|class| shorten(class))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+                match direct_type {
+                    Some(var) => format!(", type→?{var}"),
+                    None => String::new(),
                 },
                 slots
                     .iter()
@@ -5310,6 +5346,7 @@ mod tests {
                 regime: TypeRegime::Asserted,
                 classes: vec!["https://data.infrabel.be/asset360/Signal".to_owned()],
                 direct_type: None,
+                direct_type_in: Vec::new(),
                 identifier_values: Vec::new(),
                 slots: vec![ScanSlot {
                     path: vec!["trafficKinds".to_owned()],

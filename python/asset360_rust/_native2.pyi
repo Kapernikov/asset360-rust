@@ -3246,6 +3246,13 @@ class JoinColumn:
         r"""
         The relation column's name, when ``source`` is a relation alias.
         """
+    @property
+    def direct_type(self) -> builtins.bool:
+        r"""
+        ``True`` when the column is the star's *direct type* (its
+        ``asset_type``, an IRI) rather than its identity: both have an empty
+        ``path``.
+        """
     def __repr__(self) -> builtins.str: ...
 
 class JoinEdge:
@@ -4038,6 +4045,13 @@ class PlanOp:
         JSONB payload.
         """
     @property
+    def direct_type(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"scan"``: the variable bound to the record's direct type, or
+        ``None``. Render ``asset_type AS <col>`` and answer it as an IRI
+        (``classes`` already holds only the direct types the query allows).
+        """
+    @property
     def required_slots(self) -> builtins.list[builtins.str]:
         r"""
         For ``"scan"``: slots that must be present (``object_data ? 'slot'``).
@@ -4601,6 +4615,12 @@ class PushdownBinding:
         column the binding otherwise names (a relation column, a star's
         identity, a constant's key column) -- ``true`` exactly where that
         join's right side matched. Its term is ``xsd:boolean``.
+        """
+    @property
+    def direct_type(self) -> builtins.bool:
+        r"""
+        ``True`` when the column is the star's *direct type*: render the
+        star's ``asset_type`` column, as an IRI. ``slot_path`` is empty.
         """
     @property
     def numeric(self) -> builtins.bool:

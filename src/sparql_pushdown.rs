@@ -72,6 +72,10 @@ pub struct BindingSpec {
     /// a column of the join's right side that is non-`NULL` on every joined
     /// row (its identity, or its key). `descriptor` is `xsd:boolean`.
     pub witness: bool,
+    /// Whether the column is the star's *direct type* rather than a slot:
+    /// the record's `asset_type` column, an IRI (`sesame:directType`).
+    /// `slot_path` is empty, as for the identity; `descriptor` is an IRI.
+    pub direct_type: bool,
 }
 
 /// How one step of a path is stored, mirroring the schema's own three-way
@@ -382,6 +386,7 @@ pub(crate) fn binding_spec(
         relation: None,
         occurrence: false,
         witness: false,
+        direct_type: false,
     })
 }
 
@@ -418,7 +423,24 @@ pub(crate) fn occurrence_spec(
         relation: None,
         occurrence: true,
         witness: false,
+        direct_type: false,
     })
+}
+
+/// A binding for a star's direct type: its `asset_type`, as an IRI.
+pub(crate) fn direct_type_spec(star_var: &str, class_uri: &str, var_name: &str) -> BindingSpec {
+    BindingSpec {
+        var: var_name.to_owned(),
+        star_var: star_var.to_owned(),
+        slot_path: Vec::new(),
+        containers: Vec::new(),
+        class_uri: class_uri.to_owned(),
+        descriptor: TermDescriptor::subject_iri(),
+        relation: None,
+        occurrence: false,
+        witness: false,
+        direct_type: true,
+    }
 }
 
 /// A binding for a column of a relation, by alias and column name.
@@ -439,5 +461,6 @@ pub(crate) fn relation_spec(
         relation: Some(alias.to_owned()),
         occurrence,
         witness: false,
+        direct_type: false,
     }
 }

@@ -376,6 +376,9 @@ impl Translation<'_> {
                 class_uri,
                 slots,
                 identifier_values,
+                direct_type,
+                direct_type_in,
+                regime,
                 ..
             } => {
                 let type_iri = NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?;
@@ -384,6 +387,38 @@ impl Translation<'_> {
                     predicate: NamedNodePattern::NamedNode(type_iri),
                     object: TermPattern::NamedNode(NamedNode::new(class_uri.clone()).ok()?),
                 }];
+                // The direct type the scan binds, and the ones it is held to:
+                // the record's one `sesame:directType` triple where the
+                // regime writes it. Where it does not (asserted), the
+                // record's only `rdf:type` triple is its own class, which is
+                // the same thing.
+                let direct_predicate = if regime
+                    .partitions()
+                    .contains(&linkml_runtime::schema_rdf::TypePartition::Direct)
+                {
+                    linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE
+                } else {
+                    crate::sparql_scoper::RDF_TYPE
+                };
+                let direct = |object: TermPattern| -> Option<TriplePattern> {
+                    Some(TriplePattern {
+                        subject: TermPattern::Variable(Variable::new_unchecked(star_var.clone())),
+                        predicate: NamedNodePattern::NamedNode(
+                            NamedNode::new(direct_predicate).ok()?,
+                        ),
+                        object,
+                    })
+                };
+                if let Some(var) = direct_type {
+                    required.push(direct(TermPattern::Variable(Variable::new_unchecked(
+                        var.clone(),
+                    )))?);
+                }
+                for class in direct_type_in {
+                    required.push(direct(TermPattern::NamedNode(
+                        NamedNode::new(class.clone()).ok()?,
+                    ))?);
+                }
                 let mut optional: Vec<Vec<TriplePattern>> = Vec::new();
                 let mut exists: Vec<Vec<TriplePattern>> = Vec::new();
                 let mut counter = 0usize;
@@ -1124,7 +1159,8 @@ pub(crate) mod equivalence {
     use crate::sparql_rules::{Rule, tier_one_rules};
     use crate::sparql_scoper::tests::test_schema_view;
 
-    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+         PREFIX sesame: <http://www.openrdf.org/schema/sesame#> ";
 
     /// Bags compared with a blank node standing for "some blank node" -- the
     /// oracle already spells one so -- and the rows of the query's own
@@ -1142,11 +1178,30 @@ pub(crate) mod equivalence {
         oracle: &Oracle,
         rules: &[&dyn Rule],
     ) -> Plan {
+        each_rewrite_preserves_answers_in(
+            query,
+            schema,
+            oracle,
+            rules,
+            &crate::sparql_dataset::DatasetSpec::default(),
+        )
+    }
+
+    /// [`each_rewrite_preserves_answers`] over a dataset: the plan reads the
+    /// type regime the dataset says, and `oracle` has to hold records written
+    /// under that regime ([`Oracle::new_in`]).
+    pub(crate) fn each_rewrite_preserves_answers_in(
+        query: &str,
+        schema: &SchemaView,
+        oracle: &Oracle,
+        rules: &[&dyn Rule],
+        dataset: &crate::sparql_dataset::DatasetSpec,
+    ) -> Plan {
         let text = format!("{PREFIX}{query}");
         let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
         let expected = answers(oracle, &parsed);
-        let mut plan =
-            crate::sparql_refine::naive_plan(&parsed).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let mut plan = crate::sparql_refine::naive_plan_in(&parsed, dataset)
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
         let naive = plan_to_query(&plan, schema).unwrap_or_else(|| panic!("{query}\n{plan}"));
         assert_eq!(answers(oracle, &naive), expected, "naive: {query}\n{plan}");
 

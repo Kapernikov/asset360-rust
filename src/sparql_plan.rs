@@ -54,6 +54,12 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// a planner/executor version skew a loud failure rather than a wrong number,
 /// which is the failure this whole module is shaped around.
 ///
+/// 7 added [`crate::sparql_ops::Op::Scan`]'s `direct_type`, a column the
+/// scan binds (`asset_type AS <col>`, an IRI), and the `direct_type` flag of
+/// a binding and of a join key's column: `slot_path` is empty for it as for
+/// the identity, so a consumer built against 6 reads the star's identity
+/// where the record's direct type is meant -- a wrong answer with no error.
+///
 /// 6 added the two mechanisms of `docs/design/sparql-schema-relations-and-
 /// row-finish.md` (asset360 issue #494): [`crate::sparql_ops::Op::Constant`],
 /// an inline table the statement joins, with
@@ -101,7 +107,7 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// conjunction into one obligation per conjunct did *not* bump it: that
 /// changes how many `Filter` obligations a query raises, not what kinds exist,
 /// and a consumer that reads the list rather than counting it is unaffected.
-pub const PLAN_CONTRACT: u32 = 6;
+pub const PLAN_CONTRACT: u32 = 7;
 
 /// Index into [`ExecutionPlan::obligations`]. Printed as `o1`, `o2`, ... so a
 /// human can check the ledger by eye.
@@ -582,6 +588,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
 fn column_name(column: &crate::sparql_ops::ColumnRef) -> String {
     match (&column.column, column.path.as_slice()) {
         (Some(name), _) => name.clone(),
+        (None, []) if column.direct_type => "<direct type>".to_owned(),
         (None, []) => "<identity>".to_owned(),
         (None, path) => path.join("."),
     }
@@ -681,12 +688,17 @@ fn write_ops(
                 identifier_values,
                 required_paths,
                 is_optional,
+                direct_type,
                 ..
             } => {
                 writeln!(
                     f,
-                    "{indent}scan      {}  as ?{star_var}{}",
+                    "{indent}scan      {}  as ?{star_var}{}{}",
                     shorten(class_uri),
+                    match direct_type {
+                        Some(var) => format!("   type→?{var}"),
+                        None => String::new(),
+                    },
                     if *is_optional { "   optional" } else { "" }
                 )?;
                 if !identifier_values.is_empty() {

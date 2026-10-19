@@ -284,3 +284,52 @@ def test_the_dataset_is_required_and_validated():
         served,
     )
     assert plan.is_accounted
+
+
+_PARENT_YAML = _SCHEMA_YAML.replace(
+    "classes:\n  Signal:\n    class_uri: asset360:Signal\n",
+    "classes:\n  Asset:\n    class_uri: asset360:Asset\n    attributes:\n      asset360_uri:\n"
+    "        identifier: true\n  Signal:\n    is_a: Asset\n    class_uri: asset360:Signal\n",
+)
+_SESAME = "PREFIX sesame: <http://www.openrdf.org/schema/sesame#> "
+
+
+def _is_a_scan(query):
+    sv = SchemaView()
+    sv.add_schema_str(_PARENT_YAML)
+    plan = _plan_with_dataset(PREFIX + _SESAME + query, sv, DatasetSpec(TypeRegime.IsA))
+    scans = [
+        op for p in plan.passes if p.kind == "sql" for op in p.ops if op.kind == "scan"
+    ]
+    assert len(scans) == 1
+    return plan, scans[0]
+
+
+def test_a_direct_type_is_a_column_of_the_scan():
+    """`sesame:directType ?t` is the scan's `asset_type`, bound as `?t`; a constant
+    one narrows `classes` (what the renderer filters `asset_type` by)."""
+    _, scan = _is_a_scan(
+        "SELECT ?s ?t WHERE { ?s a asset360:Asset ; sesame:directType ?t }"
+    )
+    assert scan.direct_type == "t"
+    assert len(scan.classes) == 2
+
+    _, scan = _is_a_scan(
+        "SELECT ?s WHERE { ?s a asset360:Asset ; sesame:directType asset360:Signal }"
+    )
+    assert scan.direct_type is None
+    assert [c.rsplit("/", 1)[1] for c in scan.classes] == ["Signal"]
+
+    plan, scan = _is_a_scan(
+        "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Signal ; a ?t } GROUP BY ?t"
+    )
+    assert scan.direct_type is not None
+    joins = [
+        op for p in plan.passes if p.kind == "sql" for op in p.ops if op.kind == "join"
+    ]
+    assert any(
+        column.direct_type
+        for join in joins
+        for column in (join.join_key_left, join.join_key_right)
+        if column is not None
+    )

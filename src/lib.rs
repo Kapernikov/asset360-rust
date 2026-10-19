@@ -2117,6 +2117,13 @@ impl PushdownBinding {
         self.inner.witness
     }
 
+    /// ``True`` when the column is the star's *direct type*: render the
+    /// star's ``asset_type`` column, as an IRI. ``slot_path`` is empty.
+    #[getter]
+    fn direct_type(&self) -> bool {
+        self.inner.direct_type
+    }
+
     /// ``True`` when the slot's values are numbers.
     ///
     /// The renderer needs this twice over: a numeric column is cast before
@@ -2598,10 +2605,18 @@ impl JoinColumn {
         self.inner.column.clone()
     }
 
+    /// ``True`` when the column is the star's *direct type* (its
+    /// ``asset_type``, an IRI) rather than its identity: both have an empty
+    /// ``path``.
+    #[getter]
+    fn direct_type(&self) -> bool {
+        self.inner.direct_type
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "JoinColumn(source={:?}, path={:?}, column={:?})",
-            self.inner.source, self.inner.path, self.inner.column
+            "JoinColumn(source={:?}, path={:?}, column={:?}, direct_type={})",
+            self.inner.source, self.inner.path, self.inner.column, self.inner.direct_type
         )
     }
 }
@@ -2913,6 +2928,18 @@ impl PlanOp {
                 identifier_values, ..
             } => identifier_values.clone(),
             _ => Vec::new(),
+        }
+    }
+
+    /// For ``"scan"``: the variable bound to the record's direct type, or
+    /// ``None``. Render ``asset_type AS <col>`` and answer it as an IRI
+    /// (``classes`` already holds only the direct types the query allows).
+    #[getter]
+    fn direct_type(&self) -> Option<String> {
+        use crate::sparql_ops::Op;
+        match &self.inner.op {
+            Op::Scan { direct_type, .. } => direct_type.clone(),
+            _ => None,
         }
     }
 

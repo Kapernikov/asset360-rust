@@ -137,6 +137,11 @@ pub enum Op {
         /// Values bound against the class's identifier slot, compared against
         /// the indexed `asset360_uri` column rather than the payload.
         identifier_values: Vec<String>,
+        /// The variable bound to the record's direct type, when a rule
+        /// folded `sesame:directType ?t` into the scan: render
+        /// `asset_type AS <col>` and answer it as an IRI. `classes` is
+        /// already narrowed by any direct type the query fixed.
+        direct_type: Option<String>,
         /// Slots that must be present: `object_data ? 'slot'`.
         required_slots: Vec<String>,
         /// Slots that may be absent, so no existence check.
@@ -514,6 +519,9 @@ pub struct ColumnRef {
     pub path: Vec<String>,
     /// The relation column's name, when `source` is a relation alias.
     pub column: Option<String>,
+    /// The star's direct type (`asset_type`) rather than its identity:
+    /// `path` is empty for both, this tells them apart.
+    pub direct_type: bool,
 }
 
 /// One export of a relation: what the outside reads of the derived table.
@@ -666,6 +674,7 @@ pub fn lower_sql_pass(
                 // The classes the star's regime says its type stands for.
                 classes: star.classes.clone(),
                 identifier_values: star.identifier_values.clone(),
+                direct_type: None,
                 required_slots: star.required_fields.clone(),
                 optional_slots: star.optional_fields.clone(),
                 required_paths: star.required_paths.clone(),
@@ -1387,6 +1396,8 @@ fn lower_island(
             identifier_values,
             slots,
             regime,
+            direct_type,
+            direct_type_in,
             ..
         } = &plan.nodes[id].op
         else {
@@ -1451,6 +1462,31 @@ fn lower_island(
                 // longer address. The identifier is the exception the identity
                 // fold makes -- it becomes a value against the indexed column
                 // rather than a slot of the payload.
+                // **A scan claiming a `sesame:directType` read must make it**:
+                // bind the variable the pattern names to the record's
+                // `asset_type`, or hold the scan to the class the pattern
+                // names (`classes ∩ direct_type_in`, lowered).
+                Some(
+                    claim @ crate::sparql_plan::Obligation::Triple {
+                        subject,
+                        predicate,
+                        object,
+                    },
+                ) if predicate.trim_matches(['<', '>'])
+                    == linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE =>
+                {
+                    let on_this_star = subject.strip_prefix('?') == Some(star_var.as_str());
+                    let read = match object.strip_prefix('?') {
+                        Some(variable) => direct_type.as_deref() == Some(variable),
+                        None => direct_type_in.iter().any(|class| {
+                            crate::sparql_plan::shorten(class) == *object
+                                || class == object.trim_matches(['<', '>'])
+                        }),
+                    };
+                    if !on_this_star || !read {
+                        return wrong(claim);
+                    }
+                }
                 Some(claim @ crate::sparql_plan::Obligation::Triple { predicate, .. }) => {
                     // The predicate names a slot through the schema, the way
                     // every rule that folded the read resolved it -- not by
@@ -1548,6 +1584,12 @@ impl Lowering<'_> {
             TermOf::Identity { class_uri } => ColumnKind::Identity {
                 class_uri: class_uri.clone(),
             },
+            TermOf::DirectType {
+                star_var,
+                class_uri,
+            } => ColumnKind::Slot(crate::sparql_pushdown::direct_type_spec(
+                star_var, class_uri, var,
+            )),
             TermOf::Slot {
                 star_var,
                 path,
@@ -1612,11 +1654,19 @@ impl Lowering<'_> {
                 source: star_var,
                 path,
                 column: None,
+                direct_type: false,
+            },
+            Column::DirectType { star_var, .. } => ColumnRef {
+                source: star_var,
+                path: Vec::new(),
+                column: None,
+                direct_type: true,
             },
             Column::Relation { alias, column } => ColumnRef {
                 source: alias,
                 path: Vec::new(),
                 column: Some(column.var.clone()),
+                direct_type: false,
             },
             // A witness is never a key: it is a fresh name nothing else binds.
             Column::Witness { .. } => return None,
@@ -1637,6 +1687,7 @@ impl Lowering<'_> {
                         source: var.to_owned(),
                         path: Vec::new(),
                         column: None,
+                        direct_type: false,
                     });
                 }
                 crate::sparql_refine::PlanOp::Unnest {
@@ -1649,6 +1700,7 @@ impl Lowering<'_> {
                         source: star_var.clone(),
                         path: slot_path.clone(),
                         column: None,
+                        direct_type: false,
                     });
                 }
                 crate::sparql_refine::PlanOp::SubSelect { vars, .. }
@@ -1661,6 +1713,7 @@ impl Lowering<'_> {
                         source: alias.clone(),
                         path: Vec::new(),
                         column: Some(var.to_owned()),
+                        direct_type: false,
                     });
                 }
                 _ => {}
@@ -1704,6 +1757,7 @@ impl Lowering<'_> {
                     source: crate::sparql_constant::constant_alias(self.plan, facts.values),
                     path: Vec::new(),
                     column: Some(var.clone()),
+                    direct_type: false,
                 };
                 let other = self
                     .value_column_ref(facts.other, var)
@@ -1807,6 +1861,8 @@ impl Lowering<'_> {
                     classes: scanned_classes,
                     slots,
                     identifier_values,
+                    direct_type,
+                    direct_type_in,
                     ..
                 } => {
                     // Only a slot of the record itself is an existence check.
@@ -1825,7 +1881,19 @@ impl Lowering<'_> {
                         op: Op::Scan {
                             star_var: star_var.clone(),
                             class_uri: class_uri.clone(),
-                            classes: scanned_classes.clone(),
+                            // The family, narrowed by the direct types the query
+                            // fixed: `asset_type = ANY(classes)` is then exactly
+                            // "the record's direct type is one of these".
+                            classes: if direct_type_in.is_empty() {
+                                scanned_classes.clone()
+                            } else {
+                                scanned_classes
+                                    .iter()
+                                    .filter(|class| direct_type_in.contains(class))
+                                    .cloned()
+                                    .collect()
+                            },
+                            direct_type: direct_type.clone(),
                             // What the query fixed the identity to, plus anything
                             // the filters below hoist here: both belong against
                             // the indexed column rather than the JSONB payload.
@@ -2900,10 +2968,9 @@ impl Lowering<'_> {
                     class_uri,
                     ..
                 } => {
-                    if bindings
-                        .iter()
-                        .any(|spec| spec.star_var == *star_var && spec.slot_path.is_empty())
-                    {
+                    if bindings.iter().any(|spec| {
+                        spec.star_var == *star_var && spec.slot_path.is_empty() && !spec.direct_type
+                    }) {
                         continue;
                     }
                     let spec = crate::sparql_pushdown::binding_spec(
@@ -2970,6 +3037,12 @@ impl Lowering<'_> {
                 class_uri,
                 path,
             } => element_spec(self.schema, &star_var, &class_uri, name, path),
+            Column::DirectType {
+                star_var,
+                class_uri,
+            } => Some(crate::sparql_pushdown::direct_type_spec(
+                &star_var, &class_uri, name,
+            )),
             Column::Relation { alias, column } => Some(crate::sparql_pushdown::relation_spec(
                 &alias,
                 name,
@@ -3045,6 +3118,7 @@ impl Lowering<'_> {
             existing.star_var == spec.star_var
                 && existing.slot_path == spec.slot_path
                 && existing.relation == spec.relation
+                && existing.direct_type == spec.direct_type
         }) {
             return Some(index);
         }
@@ -3172,6 +3246,7 @@ impl Lowering<'_> {
                     star_var,
                     class_uri,
                     slots,
+                    direct_type,
                     ..
                 } => {
                     let optional = optional_side(id);
@@ -3185,6 +3260,19 @@ impl Lowering<'_> {
                                 star_var: star_var.clone(),
                                 class_uri: class_uri.clone(),
                                 path: slot.path.clone(),
+                            },
+                        ));
+                    }
+                    // Or the record's direct type, read from `asset_type`.
+                    if slots.iter().all(|slot| slot.var.as_deref() != Some(var))
+                        && direct_type.as_deref() == Some(var)
+                    {
+                        candidates.push((
+                            optional,
+                            0,
+                            Column::DirectType {
+                                star_var: star_var.clone(),
+                                class_uri: class_uri.clone(),
                             },
                         ));
                     }
@@ -3336,6 +3424,8 @@ enum Column {
         alias: String,
         column: Box<RelationColumn>,
     },
+    /// A star's direct type: its `asset_type` column, as an IRI.
+    DirectType { star_var: String, class_uri: String },
     /// A left join's match witness, read off `anchor`: a column of the
     /// join's right side that is non-`NULL` on every row the right side
     /// joined.

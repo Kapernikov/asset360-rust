@@ -361,6 +361,13 @@ pub fn key_facts(schema: &SchemaView, plan: &Plan, join: NodeId) -> Result<KeyFa
             TermDescriptor::subject_iri(),
             "identity".to_owned(),
         ),
+        // A record's direct type: the `asset_type` column holds the class's
+        // IRI text, so the cell's own text is the key.
+        Some(TermOf::DirectType { .. }) => (
+            KeyTranslation::Identity,
+            TermDescriptor::subject_iri(),
+            "direct type".to_owned(),
+        ),
         Some(TermOf::Slot {
             class_uri,
             path,

@@ -54,7 +54,9 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use linkml_runtime::schema_rdf::{TypeRegime, type_family};
+use linkml_runtime::schema_rdf::{
+    SESAME_DIRECT_TYPE, TypePartition, TypeRegime, rdf_types, type_family,
+};
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
@@ -648,6 +650,408 @@ impl Rule for FoldMatchesIntoScan<'_> {
                 identifier_values,
                 slots,
             );
+            return true;
+        }
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sesame:directType and `?s a ?t`
+// ---------------------------------------------------------------------------
+
+/// The writer's two facts both rules below rest on (rust-linkml-core
+/// `schema_rdf`/`turtle`), stated once:
+///
+/// * a record's direct type is its designated class, which is the
+///   `asset_type` column the scan reads;
+/// * in the graph of regime `r` the writer emits `(s rdf:type t)` iff
+///   `t ∈ rdf_types(direct_type(s), r)`, and emits `(s sesame:directType d)`
+///   iff [`TypePartition::Direct`] is among `r.partitions()` and
+///   `d = direct_type(s)` -- exactly one such triple per record.
+fn writes_direct_type(regime: TypeRegime) -> bool {
+    regime.partitions().contains(&TypePartition::Direct)
+}
+
+/// A `sesame:directType` triple pattern.
+fn is_direct_type_pattern(pattern: &TriplePattern) -> bool {
+    predicate_iri(pattern) == Some(SESAME_DIRECT_TYPE)
+}
+
+/// The variables a triple pattern's subject and object bind, in that order.
+fn pattern_variables(pattern: &TriplePattern) -> Vec<spargebra::term::Variable> {
+    [&pattern.subject, &pattern.object]
+        .into_iter()
+        .filter_map(|term| match term {
+            TermPattern::Variable(variable) => Some(variable.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `Match` a type-reading rule works on and the one plain join that
+/// applies it: its node, the join above it, the side that stays, and the
+/// `Sql` scan of the subject's star that mandatorily feeds that side under
+/// the match's own regime.
+struct TypeReadSite {
+    consumer: NodeId,
+    other: NodeId,
+    scan: NodeId,
+}
+
+/// Where a `match` on a star's type reads from: `None` unless the match is
+/// applied by a single plain join, and a scan of the subject star -- the
+/// star itself, in the match's regime -- feeds the other side by plain joins
+/// only. The shape [`FoldIdentityConstant`] asks for, for the same reasons:
+/// anywhere else the match is a constraint on a row set the scan does not
+/// stand for (an `OPTIONAL`'s optional side, a `UNION` arm).
+fn type_read_site(plan: &Plan, id: NodeId, star: &str) -> Option<TypeReadSite> {
+    let above = consumers(plan, id);
+    let [consumer] = above.as_slice() else {
+        return None;
+    };
+    let PlanOp::Join {
+        left,
+        right,
+        reference: None,
+        key: None,
+        ..
+    } = &plan.nodes[*consumer].op
+    else {
+        return None;
+    };
+    let other = if *left == id { *right } else { *left };
+    let site = subject_site(plan, other, star)?;
+    if !site.prefix.is_empty() || !same_regime(plan, id, site.scan) {
+        return None;
+    }
+    Some(TypeReadSite {
+        consumer: *consumer,
+        other,
+        scan: site.scan,
+    })
+}
+
+/// The one plain join's `on`, which both rules need to be exactly the star
+/// (or the star and one named variable).
+fn join_on(plan: &Plan, join: NodeId) -> BTreeSet<String> {
+    match &plan.nodes[join].op {
+        PlanOp::Join { on, .. } => on.iter().cloned().collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// Replace a `match` by the empty relation over the same variables, in place.
+///
+/// Zero rows over `variables` is what a pattern with no triples to match
+/// answers: no solution, whatever it is joined with.
+fn replace_match_with_empty_relation(plan: &mut Plan, id: NodeId) {
+    let PlanOp::Match { pattern, .. } = &plan.nodes[id].op else {
+        return;
+    };
+    let variables = pattern_variables(pattern);
+    plan.nodes[id].op = PlanOp::Values {
+        variables,
+        rows: Vec::new(),
+    };
+}
+
+/// `?s sesame:directType O` is answered from the scan's `asset_type` column.
+///
+/// Three shapes, each an equivalence under the writer's facts (see
+/// [`writes_direct_type`]):
+///
+/// * **O is a variable `?t`, and the regime writes the direct type.** The
+///   triples `(s sesame:directType d)` in the graph are exactly one per
+///   record, `d = direct_type(s)`, and the scan's rows are the records; so
+///   joining the match to the scan on `?s` is the scan with one more column,
+///   `?t` = the record's `asset_type`. The scan binds it
+///   ([`PlanOp::Scan::direct_type`]) and the match, with the join that
+///   carried it, goes. Declines unless the join is on `?s` alone: a `?t`
+///   the other side already binds is a join on a value, not a column.
+/// * **O is a constant IRI `C`, and the regime writes the direct type.** The
+///   match keeps exactly the records whose direct type is `C`: the scan's
+///   [`PlanOp::Scan::direct_type_in`] gains `C`, and the lowering reads
+///   `asset_type = ANY(classes ∩ direct_type_in)`. `classes` itself stays the
+///   type family -- the invariant [`Plan::scan_classes_agree`] checks. When
+///   `C` is not among the scan's classes no record qualifies, and the match
+///   becomes the empty relation. A second, different constant is an
+///   intersection of two direct types and declines (the empty set cannot be
+///   written in a list that means "no constraint when empty").
+/// * **The regime does not write the direct type (asserted).** The graph holds
+///   no `sesame:directType` triple, so the pattern matches nothing: the match
+///   becomes the empty relation, wherever it sits.
+///
+/// An untyped subject (`?s sesame:directType ?t` with no class on `?s`) has no
+/// scan to read the column from and stays with the engine.
+pub struct FoldDirectTypeIntoScan;
+
+impl Rule for FoldDirectTypeIntoScan {
+    fn name(&self) -> &'static str {
+        "fold_direct_type_into_scan"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match {
+                pattern,
+                regime: Some(regime),
+            } = &plan.nodes[id].op
+            else {
+                continue;
+            };
+            if !is_direct_type_pattern(pattern) {
+                continue;
+            }
+            let regime = *regime;
+            if !writes_direct_type(regime) {
+                replace_match_with_empty_relation(plan, id);
+                return true;
+            }
+            let Some(star) = subject_variable(pattern).map(str::to_owned) else {
+                continue;
+            };
+            enum Object {
+                Variable(String),
+                Class(String),
+            }
+            let object = match &pattern.object {
+                TermPattern::Variable(variable) if variable.as_str() != star => {
+                    Object::Variable(variable.as_str().to_owned())
+                }
+                TermPattern::NamedNode(node) => Object::Class(node.as_str().to_owned()),
+                _ => continue,
+            };
+            let Some(site) = type_read_site(plan, id, &star) else {
+                continue;
+            };
+            if join_on(plan, site.consumer) != BTreeSet::from([star.clone()]) {
+                continue;
+            }
+            let PlanOp::Scan {
+                classes,
+                direct_type,
+                direct_type_in,
+                ..
+            } = &plan.nodes[site.scan].op
+            else {
+                continue;
+            };
+            let (classes, direct_type, direct_type_in) =
+                (classes.clone(), direct_type.clone(), direct_type_in.clone());
+            match object {
+                Object::Variable(var) => {
+                    if direct_type.is_some() {
+                        continue;
+                    }
+                    if let PlanOp::Scan { direct_type, .. } = &mut plan.nodes[site.scan].op {
+                        *direct_type = Some(var);
+                    }
+                }
+                Object::Class(class) => {
+                    if !classes.contains(&class) {
+                        // No record of the scan has this direct type.
+                        replace_match_with_empty_relation(plan, id);
+                        return true;
+                    }
+                    if !direct_type_in.is_empty() && direct_type_in != [class.clone()] {
+                        continue;
+                    }
+                    if let PlanOp::Scan { direct_type_in, .. } = &mut plan.nodes[site.scan].op {
+                        *direct_type_in = vec![class];
+                    }
+                }
+            }
+            let mut claims = plan.nodes[id].discharges.clone();
+            claims.extend(plan.nodes[site.consumer].discharges.iter().copied());
+            plan.nodes[site.scan].discharges.extend(claims);
+            plan.nodes[site.scan].discharges.sort_unstable();
+            collapse_leaf_into(plan, id, site.consumer, site.other);
+            refresh_join_variables(plan);
+            return true;
+        }
+        false
+    }
+}
+
+/// `?s a ?t` over a scanned star becomes a join with the table of the types
+/// each class has.
+///
+/// **Match.** `(?s rdf:type ?t)` under regime `r`, applied by a plain join to
+/// a side a scan of `?s` mandatorily feeds, in regime `r`.
+///
+/// **Edit.** The scan binds the record's direct type to `?d`
+/// ([`PlanOp::Scan::direct_type`]: fresh, or the variable it already binds),
+/// and the match becomes the inline table `T(?d, ?t)`, one row per pair
+/// `(c, t)` with `c` a class the scan reads and `t ∈ rdf_types(c, r)`. The
+/// join keeps its place; it is now on `?d`, a column of the scan, which is
+/// what [`crate::sparql_constant::LowerConstantRelation`] lowers.
+///
+/// **Equivalence.** `?s` ranges over the scan's records. For each record the
+/// triples `(s rdf:type t)` of graph `r` are exactly `t ∈ rdf_types(direct(s),
+/// r)` (the writer's fact), so the solutions of the match joined to the
+/// scan are `{(s, t) | t ∈ rdf_types(direct(s), r)}`, which is the scan
+/// joined with `T` on `?d = direct(s)`. Not distinct: a record with two
+/// inferred types has two `rdf:type` triples and so two rows, as `T` has.
+/// Under the asserted regime `rdf_types(c) = {c}`, so `T` is the identity.
+///
+/// **Redundancy.** When `?t` *is* the variable the scan binds as the direct
+/// type (`?s sesame:directType ?t ; a ?t`), the match holds of every record
+/// -- `direct(s) ∈ rdf_types(direct(s), r)` -- exactly once, and is dropped.
+///
+/// **Waits** while a `sesame:directType` match is still on the star, for
+/// [`FoldDirectTypeIntoScan`] to bind its column or narrow its classes:
+/// without that the fixpoint (the table's rows, the column's name) would
+/// depend on which of the two ran first.
+pub struct TypeVariableBecomesTypeTable<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> TypeVariableBecomesTypeTable<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+
+    /// `T`: `(class, type)` for every class of `classes` and every type its
+    /// records carry under `regime`. `None` when a class is unknown to the
+    /// schema.
+    fn table(&self, classes: &[String], regime: TypeRegime) -> Option<Vec<(String, String)>> {
+        let mut rows = Vec::new();
+        for class in classes {
+            let view = self.schema.get_class_by_uri(class).ok().flatten()?;
+            for ty in rdf_types(&view, regime).ok()? {
+                rows.push((class.clone(), ty.canonical_uri().to_string()));
+            }
+        }
+        Some(rows)
+    }
+}
+
+/// A variable name no node of the plan binds, derived from `base`.
+fn fresh_variable(plan: &Plan, base: &str) -> String {
+    let taken: BTreeSet<String> = (0..plan.nodes.len())
+        .flat_map(|id| plan.variables_of(id))
+        .collect();
+    let mut name = base.to_owned();
+    let mut n = 1;
+    while taken.contains(&name) {
+        n += 1;
+        name = format!("{base}{n}");
+    }
+    name
+}
+
+impl Rule for TypeVariableBecomesTypeTable<'_> {
+    fn name(&self) -> &'static str {
+        "type_variable_becomes_type_table"
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        for id in 0..plan.nodes.len() {
+            if plan.nodes[id].executor != Executor::Engine {
+                continue;
+            }
+            let PlanOp::Match {
+                pattern,
+                regime: Some(regime),
+            } = &plan.nodes[id].op
+            else {
+                continue;
+            };
+            if !is_type_pattern(pattern) {
+                continue;
+            }
+            let regime = *regime;
+            let (Some(star), Some(ty)) = (subject_variable(pattern), object_variable(pattern))
+            else {
+                continue;
+            };
+            if star == ty {
+                continue;
+            }
+            let (star, ty) = (star.to_owned(), ty.to_owned());
+            let Some(site) = type_read_site(plan, id, &star) else {
+                continue;
+            };
+            // A directType read still to fold binds the scan's column (or
+            // narrows its classes) first.
+            let waits = plan.nodes.iter().enumerate().any(|(other, node)| {
+                other != id
+                    && node.executor == Executor::Engine
+                    && matches!(&node.op, PlanOp::Match { pattern, regime: Some(r) }
+                        if *r == regime
+                            && is_direct_type_pattern(pattern)
+                            && subject_variable(pattern) == Some(star.as_str()))
+            });
+            if waits {
+                continue;
+            }
+            let PlanOp::Scan {
+                classes,
+                direct_type,
+                direct_type_in,
+                ..
+            } = &plan.nodes[site.scan].op
+            else {
+                continue;
+            };
+            let (classes, existing, direct_type_in) =
+                (classes.clone(), direct_type.clone(), direct_type_in.clone());
+            let on = join_on(plan, site.consumer);
+
+            // `?s sesame:directType ?t ; a ?t`: the second holds of every
+            // record, once.
+            if existing.as_deref() == Some(ty.as_str()) {
+                if on != BTreeSet::from([star.clone(), ty.clone()]) {
+                    continue;
+                }
+                let mut claims = plan.nodes[id].discharges.clone();
+                claims.extend(plan.nodes[site.consumer].discharges.iter().copied());
+                plan.nodes[site.scan].discharges.extend(claims);
+                plan.nodes[site.scan].discharges.sort_unstable();
+                collapse_leaf_into(plan, id, site.consumer, site.other);
+                refresh_join_variables(plan);
+                return true;
+            }
+
+            // Only the classes the scan can still yield.
+            let reads: Vec<String> = classes
+                .iter()
+                .filter(|class| direct_type_in.is_empty() || direct_type_in.contains(class))
+                .cloned()
+                .collect();
+            let Some(table) = self.table(&reads, regime) else {
+                continue;
+            };
+            let direct = match existing {
+                Some(var) => var,
+                None => fresh_variable(plan, &format!("_type_of_{star}")),
+            };
+            if direct == ty {
+                continue;
+            }
+            if let PlanOp::Scan { direct_type, .. } = &mut plan.nodes[site.scan].op {
+                *direct_type = Some(direct.clone());
+            }
+            let iri = |text: &str| {
+                Some(GroundTerm::NamedNode(
+                    spargebra::term::NamedNode::new_unchecked(text),
+                ))
+            };
+            plan.nodes[id].op = PlanOp::Values {
+                variables: vec![
+                    spargebra::term::Variable::new_unchecked(direct),
+                    spargebra::term::Variable::new_unchecked(ty),
+                ],
+                rows: table
+                    .iter()
+                    .map(|(class, ty)| vec![iri(class), iri(ty)])
+                    .collect(),
+            };
+            refresh_join_variables(plan);
             return true;
         }
         false
@@ -4393,9 +4797,13 @@ fn variables_bound_by(plan: &Plan, side: NodeId) -> BTreeSet<String> {
         }
         match &node.op {
             PlanOp::Scan {
-                star_var, slots, ..
+                star_var,
+                slots,
+                direct_type,
+                ..
             } => {
                 out.insert(star_var.clone());
+                out.extend(direct_type.clone());
                 out.extend(slots.iter().filter_map(|slot| slot.var.clone()));
             }
             PlanOp::Unnest { var, .. } => {
@@ -4536,10 +4944,14 @@ impl<'s> PushGrouping<'s> {
             return crate::sparql_scopes::representable(self.schema, plan, input, key, serialise);
         }
         // Or a column of a constant table the statement joins (M1): one kind
-        // of term per column, so it both represents and serialises.
+        // of term per column, so it both represents and serialises. Or a
+        // scan's direct type, which is an IRI column of every record.
         matches!(
             crate::sparql_scopes::resolve_terms(plan.term_of(self.schema, input, key)),
-            Some(crate::sparql_scopes::TermOf::Constant { .. })
+            Some(
+                crate::sparql_scopes::TermOf::Constant { .. }
+                    | crate::sparql_scopes::TermOf::DirectType { .. }
+            )
         )
     }
 
@@ -5418,6 +5830,11 @@ pub fn tier_one_rules<'a>(
         ),
         Box::new(InlineTypeMatchBecomesFilter::new(schema)),
         Box::new(FoldMatchesIntoScan::new(schema)),
+        // A star's direct type is its `asset_type` column: `sesame:directType`
+        // folds into the scan, and `?s a ?t` becomes a join with the table of
+        // types each class has.
+        Box::new(FoldDirectTypeIntoScan),
+        Box::new(TypeVariableBecomesTypeTable::new(schema)),
         Box::new(FoldNestedMatchIntoPath::new(schema)),
         Box::new(DeliverOptionalRead::new(schema)),
         Box::new(AbsorbOptionalRead::new(schema)),
@@ -8807,8 +9224,9 @@ mod tests {
     /// class.
     ///
     /// `?s a ?t . ?s a :CivilEngineeringAsset` (the subclass roll-up) wants
-    /// every asset of that class, which is what the scan fetches; the engine
-    /// binds `?t` from the instance's own types. An *intersection* of two
+    /// every asset of that class, which is what the scan fetches; `?t` is
+    /// read from the records' direct type through the table of types per
+    /// class. An *intersection* of two
     /// constant classes is a different question and still declines -- a
     /// statement holding one of them counts every instance of it.
     #[test]
@@ -8824,11 +9242,11 @@ mod tests {
         let scans = plan.find("scan");
         assert_eq!(scans.len(), 1, "the class is scanned:\n{plan}");
         assert_eq!(plan.nodes[scans[0]].executor, Executor::Sql, "{plan}");
-        // And the grouping is not pushed: `?t` is not a column any scan binds,
-        // so this is a fetch the engine groups -- which is today's plan for
-        // this query.
+        // And the grouping is pushed: `?t` is the column of the table of
+        // types the scan's direct type joins (`TypeVariableBecomesTypeTable`),
+        // so the statement groups and no engine pass runs.
         let group = plan.find("group")[0];
-        assert_eq!(plan.nodes[group].executor, Executor::Engine, "{plan}");
+        assert_eq!(plan.nodes[group].executor, Executor::Sql, "{plan}");
 
         let plan = refined(
             "SELECT ?s WHERE { ?s a asset360:Signal ; a asset360:Track }",
@@ -10668,6 +11086,379 @@ mod inline_type_match {
             crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
             let text = plan.to_string();
             assert!(text.contains(needle), "{name}: {text}");
+        }
+    }
+}
+
+/// `sesame:directType` and `?s a ?t` answered from the scan's `asset_type`
+/// column: [`FoldDirectTypeIntoScan`] and [`TypeVariableBecomesTypeTable`].
+///
+/// The planner-level tests read the refined plan; the oracle test holds every
+/// rewrite to an engine answering over records *written in the regime the
+/// plan reads*, so the proofs in the two rules' doc comments are tested and
+/// not only stated.
+#[cfg(test)]
+mod direct_type {
+    use super::*;
+    use crate::sparql_refine::naive_plan_in;
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+         PREFIX sesame: <http://www.openrdf.org/schema/sesame#> ";
+
+    fn refined_in(query: &str, schema: &SchemaView, regime: TypeRegime) -> Plan {
+        let parsed =
+            crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
+        let mut plan = naive_plan_in(&parsed, &DatasetSpec::new(regime)).expect("naive plan");
+        let rules = tier_one_rules(schema, crate::sparql_dataset::default_dataset());
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}"));
+        plan
+    }
+
+    fn scan_of(plan: &Plan) -> (Option<String>, Vec<String>, Vec<String>) {
+        let scans = plan.find("scan");
+        assert_eq!(scans.len(), 1, "{plan}");
+        let PlanOp::Scan {
+            direct_type,
+            direct_type_in,
+            classes,
+            ..
+        } = &plan.nodes[scans[0]].op
+        else {
+            panic!("{plan}")
+        };
+        (direct_type.clone(), direct_type_in.clone(), classes.clone())
+    }
+
+    fn short(iris: &[String]) -> Vec<&str> {
+        iris.iter()
+            .map(|iri| iri.rsplit('/').next().unwrap())
+            .collect()
+    }
+
+    fn table_of(plan: &Plan) -> Vec<(String, String)> {
+        let values = plan.find("values");
+        assert_eq!(values.len(), 1, "{plan}");
+        let PlanOp::Values { rows, .. } = &plan.nodes[values[0]].op else {
+            panic!("{plan}")
+        };
+        rows.iter()
+            .map(|row| {
+                let cell = |i: usize| match &row[i] {
+                    Some(GroundTerm::NamedNode(node)) => {
+                        node.as_str().rsplit('/').next().unwrap().to_owned()
+                    }
+                    other => panic!("{other:?}"),
+                };
+                (cell(0), cell(1))
+            })
+            .collect()
+    }
+
+    fn row_count(plan: &Plan) -> usize {
+        let values = plan.find("values");
+        assert_eq!(values.len(), 1, "{plan}");
+        let PlanOp::Values { rows, .. } = &plan.nodes[values[0]].op else {
+            panic!("{plan}")
+        };
+        rows.len()
+    }
+
+    /// `?s sesame:directType ?t` under a regime that writes it is a column of
+    /// the scan: no match, no join, the whole plan in SQL.
+    #[test]
+    fn a_direct_type_variable_folds_into_the_scan() {
+        let schema = test_schema_view();
+        let plan = refined_in(
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t }",
+            &schema,
+            TypeRegime::IsA,
+        );
+        println!("{plan}");
+        let (direct, narrowed, classes) = scan_of(&plan);
+        assert_eq!(direct.as_deref(), Some("t"), "{plan}");
+        assert!(narrowed.is_empty(), "{plan}");
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert!(plan.find("join").is_empty(), "{plan}");
+        assert_eq!(
+            plan.nodes[plan.find("scan")[0]].executor,
+            Executor::Sql,
+            "{plan}"
+        );
+        assert!(plan.to_string().contains("type→?t"), "{plan}");
+        // The family is untouched: narrowing is a condition, not a class edit.
+        assert!(plan.scan_classes_agree(&schema).is_ok(), "{plan}");
+        assert!(classes.len() > 1, "{classes:?}");
+    }
+
+    /// A constant direct type narrows the fetch and lowers to the one class
+    /// in the statement; one outside the family is the empty relation.
+    #[test]
+    fn a_constant_direct_type_narrows_the_scan() {
+        let schema = test_schema_view();
+        let plan = refined_in(
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:Relay }",
+            &schema,
+            TypeRegime::IsA,
+        );
+        println!("{plan}");
+        let (direct, narrowed, classes) = scan_of(&plan);
+        assert_eq!(direct, None, "{plan}");
+        assert_eq!(short(&narrowed), ["Relay"], "{plan}");
+        assert!(classes.len() > 1, "the family is kept: {classes:?}");
+        assert!(plan.scan_classes_agree(&schema).is_ok(), "{plan}");
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert_eq!(
+            plan.nodes[plan.find("scan")[0]].executor,
+            Executor::Sql,
+            "{plan}"
+        );
+        let tree = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
+        let [scan] = tree.find("scan")[..] else {
+            panic!("one scan:\n{plan}")
+        };
+        let crate::sparql_ops::Op::Scan { classes, .. } = &tree.nodes[scan].op else {
+            panic!("{plan}")
+        };
+        assert_eq!(short(classes), ["Relay"], "asset_type = the one class");
+
+        // Outside the family: no record can have it.
+        let plan = refined_in(
+            "SELECT ?s WHERE { ?s a asset360:Relay ; sesame:directType asset360:Switch }",
+            &schema,
+            TypeRegime::IsA,
+        );
+        println!("{plan}");
+        assert!(plan.find("match").is_empty(), "{plan}");
+        assert_eq!(row_count(&plan), 0, "{plan}");
+    }
+
+    /// The asserted graph holds no `sesame:directType` triple: the pattern is
+    /// the empty relation, and no scan carries a type column for it.
+    #[test]
+    fn a_direct_type_under_the_asserted_regime_is_the_empty_relation() {
+        let schema = test_schema_view();
+        for query in [
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:Equipment }",
+        ] {
+            let plan = refined_in(query, &schema, TypeRegime::Asserted);
+            println!("{plan}");
+            assert!(plan.find("match").is_empty(), "{plan}");
+            assert_eq!(row_count(&plan), 0, "{plan}");
+            let (direct, narrowed, _) = scan_of(&plan);
+            assert_eq!((direct, narrowed.len()), (None, 0), "{plan}");
+        }
+    }
+
+    /// `?s a ?t` is a join with the table of types per class: a record with
+    /// two inferred types has two rows, and the asserted regime's table is
+    /// the identity.
+    #[test]
+    fn a_type_variable_becomes_a_type_table() {
+        let schema = test_schema_view();
+        let plan = refined_in(
+            "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
+            &schema,
+            TypeRegime::IsA,
+        );
+        println!("{plan}");
+        let (direct, _, classes) = scan_of(&plan);
+        assert_eq!(direct.as_deref(), Some("_type_of_s"), "{plan}");
+        assert_eq!(short(&classes), ["LatchRelay", "Relay"], "{plan}");
+        let mut rows = table_of(&plan);
+        rows.sort();
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            rows,
+            vec![
+                pair("LatchRelay", "Equipment"),
+                pair("LatchRelay", "LatchRelay"),
+                pair("LatchRelay", "Relay"),
+                pair("Relay", "Equipment"),
+                pair("Relay", "Relay"),
+            ],
+            "not distinct: one row per inferred type\n{plan}"
+        );
+        assert!(plan.to_string().contains("type→?_type_of_s"), "{plan}");
+        assert!(
+            plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+            "the table is a constant the statement joins:\n{plan}"
+        );
+        assert!(plan.scan_classes_agree(&schema).is_ok(), "{plan}");
+
+        let plan = refined_in(
+            "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
+            &schema,
+            TypeRegime::Asserted,
+        );
+        println!("{plan}");
+        assert_eq!(
+            table_of(&plan),
+            vec![("Relay".to_owned(), "Relay".to_owned())],
+            "{plan}"
+        );
+
+        // `?t` read both as the direct type and as a type: one column, the
+        // second read redundant.
+        let plan = refined_in(
+            "SELECT ?s ?t WHERE { ?s a asset360:Relay ; sesame:directType ?t ; a ?t }",
+            &schema,
+            TypeRegime::IsA,
+        );
+        println!("{plan}");
+        assert_eq!(scan_of(&plan).0.as_deref(), Some("t"), "{plan}");
+        assert!(plan.find("values").is_empty(), "{plan}");
+        assert!(plan.find("match").is_empty(), "{plan}");
+    }
+
+    /// The statement reads the column: the scan binds `asset_type`, the group
+    /// keys on it, and the type table is a constant joined on it.
+    #[test]
+    fn the_lowering_reads_the_direct_type_column() {
+        use crate::sparql_ops::{JoinKey, Op};
+        let schema = test_schema_view();
+        let plan = refined_in(
+            "SELECT ?d (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; \
+             sesame:directType ?d } GROUP BY ?d",
+            &schema,
+            TypeRegime::IsA,
+        );
+        println!("{plan}");
+        let tree = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
+        println!("{tree:?}");
+        let Op::Scan { direct_type, .. } = &tree.nodes[tree.find("scan")[0]].op else {
+            panic!("{plan}")
+        };
+        assert_eq!(direct_type.as_deref(), Some("d"));
+        let Op::Group { bindings, keys, .. } = &tree.nodes[tree.find("group")[0]].op else {
+            panic!("{plan}")
+        };
+        let key = &bindings[keys[0]];
+        assert!(key.direct_type && key.slot_path.is_empty(), "{key:?}");
+        assert_eq!(key.star_var, "s");
+
+        let plan = refined_in(
+            "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; a ?t } GROUP BY ?t",
+            &schema,
+            TypeRegime::IsA,
+        );
+        println!("{plan}");
+        let tree = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
+            .unwrap_or_else(|refusal| panic!("{refusal}\n{plan}"));
+        let Op::Join {
+            key: JoinKey::Value { left, right },
+            ..
+        } = &tree.nodes[tree.find("join")[0]].op
+        else {
+            panic!("a join on the table's key:\n{plan}")
+        };
+        assert!(
+            [left, right]
+                .iter()
+                .any(|column| column.direct_type && column.source == "s"),
+            "{left:?} {right:?}"
+        );
+        assert!(!tree.find("constant").is_empty(), "{plan}");
+    }
+
+    /// A subject no class constrains has no scan to read the column from, and
+    /// the planner has no scan over every record: both stay with the engine.
+    #[test]
+    fn an_untyped_subject_stays_with_the_engine() {
+        let schema = test_schema_view();
+        for query in [
+            "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s sesame:directType ?t } GROUP BY ?t",
+            "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a ?t } GROUP BY ?t",
+        ] {
+            let plan = refined_in(query, &schema, TypeRegime::IsA);
+            assert!(plan.find("scan").is_empty(), "{query}\n{plan}");
+            assert_eq!(plan.find("match").len(), 1, "{query}\n{plan}");
+        }
+    }
+
+    /// Whatever order the rules run in, the plan is the same.
+    #[test]
+    fn the_order_does_not_decide_the_direct_type_fixpoint() {
+        let schema = test_schema_view();
+        for query in [
+            "SELECT ?s ?d ?t WHERE { ?s a asset360:Relay ; sesame:directType ?d ; a ?t }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t ; sesame:directType asset360:Relay }",
+        ] {
+            let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
+            let naive = naive_plan_in(&parsed, &DatasetSpec::new(TypeRegime::IsA)).unwrap();
+            let mut texts = Vec::new();
+            for reverse in [false, true] {
+                let mut rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
+                if reverse {
+                    rules.reverse();
+                }
+                let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+                let mut plan = naive.clone();
+                refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}"));
+                texts.push(plan.to_string());
+            }
+            assert_eq!(texts[0], texts[1], "{query}");
+        }
+    }
+
+    /// Every rewrite of the type queries answers what the engine answers over
+    /// records written in the regime the plan reads.
+    #[cfg(feature = "sparql-endpoint")]
+    #[test]
+    fn every_rewrite_answers_what_the_engine_answers_in_the_same_regime() {
+        use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers_in;
+        let schema = test_schema_view();
+        let base = "https://data.infrabel.be/asset360/eq";
+        let records: Vec<(&str, String)> = vec![
+            (
+                "Equipment",
+                format!(r#"{{"asset360_uri": "{base}/E1", "label": "e"}}"#),
+            ),
+            (
+                "Equipment",
+                format!(r#"{{"asset360_uri": "{base}/E2", "label": "e"}}"#),
+            ),
+            (
+                "Relay",
+                format!(r#"{{"asset360_uri": "{base}/R1", "label": "r", "voltage": 5}}"#),
+            ),
+            (
+                "LatchRelay",
+                format!(r#"{{"asset360_uri": "{base}/L1", "label": "l", "voltage": 5}}"#),
+            ),
+            (
+                "Switch",
+                format!(r#"{{"asset360_uri": "{base}/S1", "label": "s"}}"#),
+            ),
+        ];
+        let records: Vec<(&str, &str)> = records.iter().map(|(c, j)| (*c, j.as_str())).collect();
+        let queries = [
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:Relay }",
+            "SELECT ?s WHERE { ?s a asset360:Relay ; sesame:directType asset360:Switch }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t }",
+            "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; a ?t } GROUP BY ?t",
+            "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; \
+             sesame:directType ?t } GROUP BY ?t",
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t ; a ?t }",
+            "SELECT ?s ?d ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?d ; a ?t }",
+            "SELECT ?s ?t ?u WHERE { ?s a asset360:Relay ; a ?t ; a ?u }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; asset360:label ?l ; a ?t . \
+             OPTIONAL { ?s sesame:directType ?d } }",
+        ];
+        for regime in TypeRegime::ALL {
+            let oracle = crate::sparql_oracle::Oracle::new_in(&schema, &records, regime);
+            let dataset = DatasetSpec::new(regime);
+            let rules = tier_one_rules(&schema, &dataset);
+            let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            for query in queries {
+                each_rewrite_preserves_answers_in(query, &schema, &oracle, &borrowed, &dataset);
+            }
         }
     }
 }

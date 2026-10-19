@@ -1421,6 +1421,11 @@ fn collect_scopes(
                     continue;
                 };
                 let entry = scopes[scope].subjects.entry(subject).or_default();
+                // `sesame:directType` is the record's own class, as `rdf:type`
+                // is: no slot carries it, and so none has to.
+                if predicate.as_str() == linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE {
+                    continue;
+                }
                 if predicate.as_str() == RDF_TYPE {
                     if let TermPattern::NamedNode(class) = &triple.object {
                         entry.types.insert(class.as_str().to_owned());
@@ -2439,6 +2444,10 @@ classes:
             ),
             // A scalar slot's object is a value, not a node.
             format!("SELECT ?n WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> ?v . ?v <{ZONE_NAME}> ?n }}"),
+            // `sesame:directType` is the record's own class: no slot carries it.
+            format!(
+                "SELECT ?t WHERE {{ ?z a <{ZONE}> ; <http://www.openrdf.org/schema/sesame#directType> ?t }}"
+            ),
         ] {
             let mut parsed = crate::sparql_scoper::parse_query(&accepted).expect("parses");
             canonicalize(&mut parsed, &sv).unwrap_or_else(|e| panic!("{accepted}: {e}"));

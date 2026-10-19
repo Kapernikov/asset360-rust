@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 
 use linkml_runtime::LinkMLInstance;
+use linkml_runtime::schema_rdf::TypeRegime;
 use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
@@ -34,6 +35,13 @@ impl Oracle {
     /// turtled the way the engine leg turtles them (`skolem: false`, so an
     /// inlined element is a blank node of its own).
     pub fn new(schema: &SchemaView, records: &[(&str, &str)]) -> Self {
+        Self::new_in(schema, records, TypeRegime::Asserted)
+    }
+
+    /// [`Oracle::new`] with the records written under type regime `regime`:
+    /// the graph a dataset of that regime holds (`rdf:type` of every class
+    /// the regime lists, and `sesame:directType` where it writes one).
+    pub fn new_in(schema: &SchemaView, records: &[(&str, &str)], regime: TypeRegime) -> Self {
         let store = Store::new().unwrap();
         let conv = schema.converter();
         let primary = schema.primary_schema().unwrap();
@@ -51,7 +59,9 @@ impl Oracle {
                 schema,
                 &primary,
                 &conv,
-                TurtleOptions::default().with_skolem(false),
+                TurtleOptions::default()
+                    .with_skolem(false)
+                    .with_regime(regime),
             )
             .unwrap();
             store
