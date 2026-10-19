@@ -1591,6 +1591,7 @@ fn scope_qualified(
     // constructs along the way (UNION, MINUS, property paths).
     let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
     tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
+    refuse_paths_outside_the_schema_graph(pattern, schema_graph_iri)?;
 
     // Phase 0b: forget what a `GRAPH` clause asked of the *schema* graph.
     //
@@ -3224,6 +3225,7 @@ fn scope_union(
     let pattern = query_pattern(query);
     let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
     tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
+    refuse_paths_outside_the_schema_graph(pattern, schema_graph_iri)?;
 
     let mut stars: Vec<Star> = Vec::new();
     let mut joins: Vec<JoinEdge> = Vec::new();
@@ -3436,6 +3438,22 @@ pub(crate) fn tag_triples_by_depth<'a>(
     depth: usize,
     out: &mut Vec<(&'a TriplePattern, usize)>,
 ) -> Result<(), ScopeError> {
+    tag_triples_walk(pattern, depth, out, false)
+}
+
+/// [`tag_triples_by_depth`] with the one thing a `GRAPH` block changes:
+/// `in_graph` says the walk is inside a `GRAPH` clause, where a property path
+/// is not refused here. A path over the schema graph is the engine's — the
+/// schema graph subtree already goes there, and a path contributes no triple
+/// pattern to tag. Whether the graph *is* the schema graph is not knowable
+/// from here (no schema IRI); [`refuse_paths_outside_the_schema_graph`] asks
+/// that, where the IRI is known.
+fn tag_triples_walk<'a>(
+    pattern: &'a GraphPattern,
+    depth: usize,
+    out: &mut Vec<(&'a TriplePattern, usize)>,
+    in_graph: bool,
+) -> Result<(), ScopeError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             for tp in patterns {
@@ -3444,8 +3462,8 @@ pub(crate) fn tag_triples_by_depth<'a>(
             Ok(())
         }
         GraphPattern::Join { left, right } => {
-            tag_triples_by_depth(left, depth, out)?;
-            tag_triples_by_depth(right, depth, out)
+            tag_triples_walk(left, depth, out, in_graph)?;
+            tag_triples_walk(right, depth, out, in_graph)
         }
         GraphPattern::LeftJoin {
             left,
@@ -3454,15 +3472,15 @@ pub(crate) fn tag_triples_by_depth<'a>(
         } => {
             // Left side stays at the current depth — it's the mandatory
             // pattern from the point of view of this OPTIONAL.
-            tag_triples_by_depth(left, depth, out)?;
+            tag_triples_walk(left, depth, out, in_graph)?;
             // Right side is one level deeper — it's inside the OPTIONAL.
-            tag_triples_by_depth(right, depth + 1, out)?;
+            tag_triples_walk(right, depth + 1, out, in_graph)?;
             // The condition spargebra lifted out of `OPTIONAL { ... FILTER }`,
             // which may hold an `EXISTS` like any other filter. Read last, so
             // the order is the one the obligation enumeration and the plan
             // builder both walk: left, right, then the condition.
             match expression {
-                Some(expression) => read_exists_patterns(expression, depth, out),
+                Some(expression) => read_exists_patterns(expression, depth, out, in_graph),
                 None => Ok(()),
             }
         }
@@ -3475,14 +3493,14 @@ pub(crate) fn tag_triples_by_depth<'a>(
         // all, so the filter held for every row and the endpoint answered a
         // different question without saying so.
         GraphPattern::Filter { expr, inner } => {
-            tag_triples_by_depth(inner, depth, out)?;
-            read_exists_patterns(expr, depth, out)
+            tag_triples_walk(inner, depth, out, in_graph)?;
+            read_exists_patterns(expr, depth, out, in_graph)
         }
         GraphPattern::Extend {
             inner, expression, ..
         } => {
-            tag_triples_by_depth(inner, depth, out)?;
-            read_exists_patterns(expression, depth, out)
+            tag_triples_walk(inner, depth, out, in_graph)?;
+            read_exists_patterns(expression, depth, out, in_graph)
         }
         // `ORDER BY EXISTS { ... }` and `SUM(?x + EXISTS { ... })` are read by
         // nothing here: the ordering and the aggregate are computed over rows
@@ -3494,7 +3512,7 @@ pub(crate) fn tag_triples_by_depth<'a>(
                 let (OrderExpression::Asc(expr) | OrderExpression::Desc(expr)) = term;
                 refuse_exists_patterns(expr, "an ORDER BY expression")?;
             }
-            tag_triples_by_depth(inner, depth, out)
+            tag_triples_walk(inner, depth, out, in_graph)
         }
         GraphPattern::Group {
             inner, aggregates, ..
@@ -3504,14 +3522,14 @@ pub(crate) fn tag_triples_by_depth<'a>(
                     refuse_exists_patterns(expr, "an aggregate's argument")?;
                 }
             }
-            tag_triples_by_depth(inner, depth, out)
+            tag_triples_walk(inner, depth, out, in_graph)
         }
         GraphPattern::Project { inner, .. }
         | GraphPattern::Distinct { inner }
         | GraphPattern::Reduced { inner }
         | GraphPattern::Slice { inner, .. }
-        | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => tag_triples_by_depth(inner, depth, out),
+        | GraphPattern::Service { inner, .. } => tag_triples_walk(inner, depth, out, in_graph),
+        GraphPattern::Graph { inner, .. } => tag_triples_walk(inner, depth, out, true),
         GraphPattern::Values { .. } => Ok(()),
         // Both arms, left then right — the order
         // `sparql_refine::Builder::pattern` walks them in, because the
@@ -3530,8 +3548,8 @@ pub(crate) fn tag_triples_by_depth<'a>(
         // so two arms typing the same variable differently cannot collapse
         // into one class.
         GraphPattern::Union { left, right } => {
-            tag_triples_by_depth(left, depth + 1, out)?;
-            tag_triples_by_depth(right, depth + 1, out)
+            tag_triples_walk(left, depth + 1, out, in_graph)?;
+            tag_triples_walk(right, depth + 1, out, in_graph)
         }
         GraphPattern::Lateral { .. } => Err(ScopeError::UnsupportedConstruct(
             "LATERAL is not supported; it is a SPARQL extension this endpoint does not serve"
@@ -3540,11 +3558,74 @@ pub(crate) fn tag_triples_by_depth<'a>(
         GraphPattern::Minus { .. } => Err(ScopeError::UnsupportedConstruct(
             "MINUS is not supported yet".into(),
         )),
-        GraphPattern::Path { .. } => Err(ScopeError::UnsupportedConstruct(
-            "SPARQL property paths are not supported; use explicit triple patterns".into(),
-        )),
+        GraphPattern::Path { .. } if in_graph => Ok(()),
+        GraphPattern::Path { .. } => Err(ScopeError::UnsupportedConstruct(PATH_REFUSAL.into())),
     }
 }
+
+/// Refuse a property path inside a `GRAPH` that is not the schema graph.
+///
+/// [`tag_triples_walk`] lets a path through inside any `GRAPH`, because it has
+/// no schema IRI to ask. This is the question, asked where the IRI is known:
+/// a path whose innermost enclosing `GRAPH` is the named schema graph is the
+/// engine's to answer (the schema graph is the one graph that holds the
+/// triples such a path walks, and its subtree already goes to the engine). A
+/// path in any other graph -- another constant IRI, a `GRAPH ?g` that may
+/// range over data graphs, or any graph at all when no schema graph is
+/// configured -- is refused with the refusal a path outside a `GRAPH` gets.
+fn refuse_paths_outside_the_schema_graph(
+    pattern: &GraphPattern,
+    schema_graph_iri: Option<&str>,
+) -> Result<(), ScopeError> {
+    use spargebra::term::NamedNodePattern;
+
+    /// `inside`: `None` outside every `GRAPH`; otherwise whether the innermost
+    /// one is the schema graph.
+    fn walk(
+        pattern: &GraphPattern,
+        inside: Option<bool>,
+        schema_graph_iri: Option<&str>,
+    ) -> Result<(), ScopeError> {
+        for block in exists_patterns_in_expressions_of(pattern) {
+            walk(block, inside, schema_graph_iri)?;
+        }
+        match pattern {
+            GraphPattern::Path { .. } => match inside {
+                Some(false) => Err(ScopeError::UnsupportedConstruct(PATH_REFUSAL.into())),
+                _ => Ok(()),
+            },
+            GraphPattern::Graph { name, inner } => {
+                let is_schema = match (name, schema_graph_iri) {
+                    (NamedNodePattern::NamedNode(node), Some(iri)) => node.as_str() == iri,
+                    _ => false,
+                };
+                walk(inner, Some(is_schema), schema_graph_iri)
+            }
+            GraphPattern::Join { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
+            | GraphPattern::Minus { left, right }
+            | GraphPattern::LeftJoin { left, right, .. } => {
+                walk(left, inside, schema_graph_iri)?;
+                walk(right, inside, schema_graph_iri)
+            }
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => walk(inner, inside, schema_graph_iri),
+            GraphPattern::Bgp { .. } | GraphPattern::Values { .. } => Ok(()),
+        }
+    }
+    walk(pattern, None, schema_graph_iri)
+}
+
+/// The refusal for a property path nothing here can answer.
+const PATH_REFUSAL: &str = "SPARQL property paths are not supported; use explicit triple patterns";
 
 /// Read every `EXISTS` block this expression holds into the fetch.
 ///
@@ -3559,11 +3640,12 @@ fn read_exists_patterns<'a>(
     expr: &'a Expression,
     depth: usize,
     out: &mut Vec<(&'a TriplePattern, usize)>,
+    in_graph: bool,
 ) -> Result<(), ScopeError> {
     let mut patterns = Vec::new();
     exists_patterns_of(expr, &mut patterns);
     for pattern in patterns {
-        tag_triples_by_depth(pattern, depth + 1, out)?;
+        tag_triples_walk(pattern, depth + 1, out, in_graph)?;
     }
     Ok(())
 }

@@ -4730,4 +4730,69 @@ classes:
             );
         }
     }
+
+    /// #515, spelling 1: `?s a/rdfs:subClassOf* C` walks a hierarchy no data
+    /// graph holds, so it is its zero-length step -- the class scan. It plans
+    /// as that scan: same plan, on the SQL route, no engine pass, where it
+    /// used to be refused as a property path. A path over a slot predicate,
+    /// and one inside a `GRAPH` that is not the schema graph, are still
+    /// refused with the same message; one inside the schema graph is the
+    /// engine's.
+    #[test]
+    fn a_class_hierarchy_path_plans_as_the_class_scan() {
+        let sv = test_schema_view();
+        let prefix = format!("{PREFIX}PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ");
+        let schema_graph = "https://data.infrabel.be/asset360/schema";
+        for (path, scan) in [
+            (
+                "SELECT (COUNT(?s) AS ?n) WHERE { ?s a/rdfs:subClassOf* asset360:Signal }",
+                "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Signal }",
+            ),
+            (
+                "SELECT ?s ?n WHERE { ?s a/rdfs:subClassOf* asset360:Signal . ?s asset360:name ?n }",
+                "SELECT ?s ?n WHERE { ?s a asset360:Signal . ?s asset360:name ?n }",
+            ),
+        ] {
+            let got = plan_query_refined(&format!("{prefix}{path}"), &sv)
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            let want = plan_query_refined(&format!("{prefix}{scan}"), &sv).expect("the scan plans");
+            assert_eq!(got.to_string(), want.to_string(), "{path}");
+            assert_eq!(got.sql_only(), want.sql_only(), "{path}");
+            assert!(got.is_accounted(), "{got}");
+        }
+
+        for refused in [
+            "SELECT ?s WHERE { ?s asset360:documents* asset360:X }",
+            "SELECT ?s WHERE { GRAPH ?g { ?s rdfs:subClassOf* asset360:Signal } }",
+            "SELECT ?s ?t WHERE { ?s rdfs:subClassOf* ?t }",
+        ] {
+            let error = plan_query_refined_with_schema_graph(
+                &format!("{prefix}{refused}"),
+                &sv,
+                Some(schema_graph),
+            )
+            .expect_err(refused);
+            assert!(
+                error
+                    .to_string()
+                    .contains("property paths are not supported"),
+                "{refused}: {error}"
+            );
+        }
+
+        // Mixed: a record read beside a path over the schema graph.
+        let mixed = plan_query_refined_with_schema_graph(
+            &format!(
+                "{prefix}SELECT ?s ?c WHERE {{ ?s a asset360:Signal . \
+                 GRAPH <{schema_graph}> {{ ?c rdfs:subClassOf+ asset360:Signal }} }}"
+            ),
+            &sv,
+            Some(schema_graph),
+        )
+        .expect("a path over the schema graph is not refused");
+        assert!(
+            !mixed.sql_only(),
+            "the engine answers the schema part: {mixed}"
+        );
+    }
 }

@@ -53,6 +53,7 @@ pub mod sparql_materialise;
 pub mod sparql_ops;
 pub mod sparql_optional_binding;
 pub mod sparql_oracle;
+pub mod sparql_paths;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;

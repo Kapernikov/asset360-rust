@@ -425,6 +425,11 @@ pub struct Rewrite {
 /// Resolve every spelling in the query to the one the data uses, and refuse
 /// the ones the data cannot carry.
 ///
+/// Before the three steps, [`crate::sparql_paths::reduce_paths`] replaces a
+/// property path whose walk is only its zero-length step (a hierarchy no data
+/// graph holds) by that step, so the class it leaves in an `rdf:type` object
+/// is resolved below like any other.
+///
 /// Three steps on one parse, in this order: predicates that name a slot by its
 /// native spelling become the declared IRI ([`canonicalize_predicates`]); the
 /// constant object of an `rdf:type` that names a class by its native spelling
@@ -442,6 +447,7 @@ pub fn canonicalize(
     query: &mut Query,
     schema_view: &SchemaView,
 ) -> Result<Vec<Rewrite>, SpellingError> {
+    crate::sparql_paths::reduce_paths(query, schema_view);
     let mut rewrites = canonicalize_predicates(query, schema_view)?;
     rewrites.extend(canonicalize_classes(query, schema_view)?);
     rewrites.sort_by(|a, b| a.from.cmp(&b.from));
