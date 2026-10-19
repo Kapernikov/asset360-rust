@@ -11121,8 +11121,9 @@ mod inline_type_match {
     #[test]
     fn an_inline_element_is_one_node_across_the_graphs_of_a_written_dataset() {
         use linkml_runtime::load_json_str;
+        use linkml_runtime::rdf_export::{RdfOutputFormat, RdfStreamWriter};
         use linkml_runtime::schema_rdf::TypePartition;
-        use linkml_runtime::turtle::{WriteOptions, write_nquads};
+        use linkml_runtime::turtle::WriteOptions;
         use linkml_schemaview::identifier::Identifier;
         use oxigraph::io::RdfFormat;
         use oxigraph::model::{GraphName, NamedNode};
@@ -11173,16 +11174,17 @@ mod inline_type_match {
             }
         };
         for skolem in [false, true] {
-            let mut quads = Vec::new();
-            write_nquads(
-                &instance,
+            let mut writer = RdfStreamWriter::new(
+                Vec::new(),
+                RdfOutputFormat::NQuads,
                 &sv,
                 &primary,
                 &conv,
-                &mut quads,
                 &WriteOptions::quads(graphs.clone()).with_skolem(skolem),
             )
             .unwrap();
+            writer.write(&instance).unwrap();
+            let quads = writer.finish().unwrap();
             let store = Store::new().unwrap();
             store
                 .load_from_reader(RdfFormat::NQuads, quads.as_slice())
