@@ -1179,7 +1179,9 @@ pub fn class_at_path_of(schema: &SchemaView, class_uri: &str, path: &[String]) -
     use linkml_schemaview::slotview::SlotInlineMode;
     let mut class = schema.get_class_by_uri(class_uri).ok().flatten()?;
     for name in path {
-        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)
+            .ok()
+            .flatten()?;
         if slot.determine_slot_inline_mode() == SlotInlineMode::Reference {
             return None;
         }

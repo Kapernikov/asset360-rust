@@ -344,6 +344,8 @@ pub(crate) fn path_multiplies(
     for (i, slot_name) in slot_path.iter().enumerate() {
         let Some(slot) =
             crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, slot_name)
+                .ok()
+                .flatten()
         else {
             return false;
         };
@@ -406,7 +408,9 @@ pub(crate) fn occurrence_spec(
     let mut class_view = schema_view.get_class_by_uri(class_uri).ok()??;
     let mut containers = Vec::with_capacity(slot_path.len());
     for name in &slot_path {
-        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, name)?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, name)
+            .ok()
+            .flatten()?;
         if slot.determine_slot_inline_mode() == SlotInlineMode::Reference {
             return None;
         }

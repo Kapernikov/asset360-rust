@@ -3,23 +3,29 @@
 /// The classes whose records may stand where a `class` record is
 /// expected, itself excluded: its `is_a` and mixin descendants.
 ///
-/// One function, so every walk of a path asks the same question.
-// Slot resolution is about the schema, not the triples, so the regime is the
-// widest one: a subclass by `is_a` or by mixin is a family member either way.
+/// One function, so every walk of a path asks the same question. The family
+/// is schema-level: every `is_a` and mixin descendant, recursively. Slot
+/// resolution reads the schema, not the triples, so the family does not
+/// depend on the type regime.
+///
+/// `get_descendants` terminates on a class that mixes itself in (a class is
+/// recorded once and not recursed into again) and then lists it as its own
+/// descendant; the caller asks the class first, so it is dropped here.
+///
+/// An `Err` means the schema could not be read; the caller propagates it or
+/// declines on it, it is never an empty family.
 pub(crate) fn descendants_for_slot_resolution(
     class: &linkml_schemaview::classview::ClassView,
-) -> Vec<linkml_schemaview::classview::ClassView> {
-    use linkml_runtime::schema_rdf::{TypeRegime, type_family};
-    // `type_family` includes `class` itself and is cycle-safe (a class may mix
-    // itself in); the caller asks the class first, so it is dropped here. A
-    // schema error yields no family, which declines the hop: the behaviour
-    // before family resolution existed, never a wider answer.
+) -> Result<
+    Vec<linkml_schemaview::classview::ClassView>,
+    linkml_schemaview::schemaview::SchemaViewError,
+> {
     let own = class.canonical_uri();
-    type_family(class, TypeRegime::IS_A_AND_MIXINS)
-        .unwrap_or_default()
+    Ok(class
+        .get_descendants(true, true)?
         .into_iter()
         .filter(|member| member.canonical_uri() != own)
-        .collect()
+        .collect())
 }
 
 /// The slot `slot_name` as a path hop sees it on `class`: the class's own
@@ -27,9 +33,10 @@ pub(crate) fn descendants_for_slot_resolution(
 ///
 /// A hop's declared range names a *family*: the stored element may be any
 /// descendant, and a slot declared only on a subclass is still a hop of the
-/// path. Returns `None` when no member carries the slot, or when the members
-/// that do disagree (different slot, range, inline or container mode), which
-/// is what a path walk did before for every slot it could not find.
+/// path. Returns `Ok(None)` when no member carries the slot, or when the
+/// members that do disagree (different slot, range, inline or container
+/// mode), which is what a path walk did before for every slot it could not
+/// find. `Err` is a schema that could not be read.
 ///
 /// Equivalence argument. Slot resolution reads the schema, not the triples,
 /// so it does not depend on the type regime. The stored JSON keys a slot by
@@ -45,7 +52,10 @@ pub(crate) fn descendants_for_slot_resolution(
 pub(crate) fn slot_on_class_or_descendant(
     class: &linkml_schemaview::classview::ClassView,
     slot_name: &str,
-) -> Option<linkml_schemaview::slotview::SlotView> {
+) -> Result<
+    Option<linkml_schemaview::slotview::SlotView>,
+    linkml_schemaview::schemaview::SchemaViewError,
+> {
     use linkml_schemaview::identifier::Identifier;
     let id = Identifier::Name(slot_name.to_owned());
     resolve_in_family(class, |member| member.slot(&id))
@@ -79,7 +89,10 @@ pub(crate) fn slot_for_predicate_on_class_or_descendant(
     schema: &linkml_schemaview::schemaview::SchemaView,
     class: &linkml_schemaview::classview::ClassView,
     predicate_iri: &str,
-) -> Option<linkml_schemaview::slotview::SlotView> {
+) -> Result<
+    Option<linkml_schemaview::slotview::SlotView>,
+    linkml_schemaview::schemaview::SchemaViewError,
+> {
     let conv = schema.converter();
     let canonical = |slot: &linkml_schemaview::slotview::SlotView| -> Option<String> {
         slot.canonical_uri().to_uri(&conv).ok().map(|iri| iri.0)
@@ -93,22 +106,26 @@ pub(crate) fn slot_for_predicate_on_class_or_descendant(
                 .cloned()
         })
     };
-    if let Some(slot) = in_family(predicate_iri) {
-        return Some(slot);
+    if let Some(slot) = in_family(predicate_iri)? {
+        return Ok(Some(slot));
     }
     // Not carried by the family under that spelling. If any slot of the schema
     // writes it, it is a real predicate the family does not have: declined.
     if schema
-        .slot_views()
-        .unwrap_or_default()
+        .slot_views()?
         .iter()
         .any(|slot| canonical(slot).as_deref() == Some(predicate_iri))
     {
-        return None;
+        return Ok(None);
     }
     // Otherwise it can only be a native spelling.
-    let wanted = canonical(&schema.get_slot_by_uri(predicate_iri).ok().flatten()?)?;
-    in_family(&wanted)
+    let Some(named) = schema.get_slot_by_uri(predicate_iri)? else {
+        return Ok(None);
+    };
+    match canonical(&named) {
+        Some(wanted) => in_family(&wanted),
+        None => Ok(None),
+    }
 }
 
 /// The one definition of a slot over a hop's family: `find` asked of the
@@ -118,22 +135,25 @@ fn resolve_in_family(
     find: impl Fn(
         &linkml_schemaview::classview::ClassView,
     ) -> Option<linkml_schemaview::slotview::SlotView>,
-) -> Option<linkml_schemaview::slotview::SlotView> {
+) -> Result<
+    Option<linkml_schemaview::slotview::SlotView>,
+    linkml_schemaview::schemaview::SchemaViewError,
+> {
     if let Some(own) = find(class) {
-        return Some(own);
+        return Ok(Some(own));
     }
     let mut found: Option<linkml_schemaview::slotview::SlotView> = None;
-    for descendant in descendants_for_slot_resolution(class) {
+    for descendant in descendants_for_slot_resolution(class)? {
         let Some(slot) = find(&descendant) else {
             continue;
         };
         match &found {
             None => found = Some(slot),
             Some(first) if same_hop(first, &slot) => {}
-            Some(_) => return None,
+            Some(_) => return Ok(None),
         }
     }
-    found
+    Ok(found)
 }
 
 /// Two slot views that a path walk cannot tell apart: the same slot, ranging
@@ -170,22 +190,43 @@ mod tests {
         let place = class("Place");
         // Own slot first.
         assert_eq!(
-            slot_on_class_or_descendant(&place, "label").unwrap().name,
+            slot_on_class_or_descendant(&place, "label")
+                .unwrap()
+                .unwrap()
+                .name,
             "label"
         );
         // Subclass-only slot, and its range is what the next hop starts from.
-        let coords = slot_on_class_or_descendant(&place, "coords").unwrap();
+        let coords = slot_on_class_or_descendant(&place, "coords")
+            .unwrap()
+            .unwrap();
         let fix = coords.get_range_class().unwrap();
         assert_eq!(fix.name(), "Fix");
-        let lat = slot_on_class_or_descendant(&fix, "lat").unwrap();
+        let lat = slot_on_class_or_descendant(&fix, "lat").unwrap().unwrap();
         assert_eq!(lat.name, "lat");
         // Two descendants, two definitions: no answer.
-        assert!(slot_on_class_or_descendant(&place, "tag").is_none());
+        assert!(
+            slot_on_class_or_descendant(&place, "tag")
+                .unwrap()
+                .is_none()
+        );
         // Nobody has it, and the descendants' slots do not leak upwards.
-        assert!(slot_on_class_or_descendant(&place, "nope").is_none());
-        assert!(slot_on_class_or_descendant(&class("Fix"), "label").is_none());
+        assert!(
+            slot_on_class_or_descendant(&place, "nope")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            slot_on_class_or_descendant(&class("Fix"), "label")
+                .unwrap()
+                .is_none()
+        );
         // A leaf class has no family beyond itself.
-        assert!(slot_on_class_or_descendant(&class("SpotPlace"), "tag").is_none());
+        assert!(
+            slot_on_class_or_descendant(&class("SpotPlace"), "tag")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A slot is asked for by predicate, not by name: a descendant's attribute
@@ -198,6 +239,7 @@ mod tests {
             r#"
   Anchor:
     class_uri: asset360:Anchor
+    mixins: [Anchor]
     attributes:
       asset360_uri:
         identifier: true
@@ -217,15 +259,30 @@ mod tests {
             .unwrap()
             .unwrap();
         let iri = |local: &str| format!("https://data.infrabel.be/asset360/{local}");
+        // `Anchor` mixes itself in: the family walk terminates and the class
+        // is not its own family member.
+        let family: Vec<String> = descendants_for_slot_resolution(&anchor)
+            .unwrap()
+            .iter()
+            .map(|member| member.name().to_owned())
+            .collect();
+        assert_eq!(family, ["AnchorKid"]);
         // By name the descendant's `name` is "the" slot: the walk of a JSON key.
-        assert!(slot_on_class_or_descendant(&anchor, "name").is_some());
+        assert!(
+            slot_on_class_or_descendant(&anchor, "name")
+                .unwrap()
+                .is_some()
+        );
         // By predicate it is not: `asset360:name` is written by other slots.
         assert!(
-            slot_for_predicate_on_class_or_descendant(&schema, &anchor, &iri("name")).is_none()
+            slot_for_predicate_on_class_or_descendant(&schema, &anchor, &iri("name"))
+                .unwrap()
+                .is_none()
         );
         // Its own predicate finds it.
-        let own =
-            slot_for_predicate_on_class_or_descendant(&schema, &anchor, &iri("kidName")).unwrap();
+        let own = slot_for_predicate_on_class_or_descendant(&schema, &anchor, &iri("kidName"))
+            .unwrap()
+            .unwrap();
         assert_eq!(own.name, "name");
     }
 }

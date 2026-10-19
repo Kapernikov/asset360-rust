@@ -4526,7 +4526,9 @@ pub(crate) fn nested_presence_of(
     let mut class = schema_view.get_class_by_uri(class_uri).ok().flatten()?;
     let mut containers = Vec::with_capacity(slot_path.len());
     for (index, name) in slot_path.iter().enumerate() {
-        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)
+            .ok()
+            .flatten()?;
         let mode = slot.determine_slot_container_mode();
         containers.push(mode);
         if index + 1 == slot_path.len() {
@@ -5221,7 +5223,9 @@ fn walk_paths(
             schema_view,
             current_class,
             predicate,
-        ) else {
+        )
+        .ok()
+        .flatten() else {
             continue;
         };
 

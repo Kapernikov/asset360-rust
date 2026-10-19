@@ -112,7 +112,9 @@ impl Translation<'_> {
         // By name: `slot` is a segment of a stored JSON path, a key, and the
         // predicate is what this derives from it -- the opposite direction of
         // a triple's predicate, which is resolved by IRI.
-        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, slot)?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, slot)
+            .ok()
+            .flatten()?;
         // A type designator is not a triple: the writer states the element's
         // class as `rdf:type` and skips the slot. Its value (a `uri` range
         // stores the very IRI the writer types the element with) is what that

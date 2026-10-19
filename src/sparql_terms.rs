@@ -130,7 +130,9 @@ pub fn resolve_column(
 
     for (i, slot_name) in slot_path.iter().enumerate() {
         // The class's own name index, rather than a scan of its slots.
-        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, slot_name)?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, slot_name)
+            .ok()
+            .flatten()?;
         containers.push(slot.determine_slot_container_mode());
 
         if i + 1 == slot_path.len() {

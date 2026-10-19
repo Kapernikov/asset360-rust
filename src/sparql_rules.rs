@@ -337,6 +337,8 @@ impl<'s> FoldMatchesIntoScan<'s> {
             // class simply has no value for it.
             let Some(on_class) =
                 slot_for_predicate_on_class_or_descendant(self.schema, &class, predicate)
+                    .ok()
+                    .flatten()
             else {
                 continue;
             };
@@ -1705,6 +1707,8 @@ impl Rule for DeliverOptionalRead<'_> {
             };
             let Some(on_class) =
                 slot_for_predicate_on_class_or_descendant(self.schema, &class, &predicate)
+                    .ok()
+                    .flatten()
             else {
                 continue;
             };
@@ -2175,7 +2179,7 @@ fn class_at_path(
 ) -> Option<linkml_schemaview::classview::ClassView> {
     let mut class = schema.get_class_by_uri(class_uri).ok().flatten()?;
     for name in path {
-        let slot = slot_on_class_or_descendant(&class, name)?;
+        let slot = slot_on_class_or_descendant(&class, name).ok().flatten()?;
         if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
             return None;
         }
@@ -2194,7 +2198,7 @@ fn prefix_crosses_a_collection(schema: &SchemaView, class_uri: &str, path: &[Str
         return false;
     };
     for name in path {
-        let Some(slot) = slot_on_class_or_descendant(&class, name) else {
+        let Some(slot) = slot_on_class_or_descendant(&class, name).ok().flatten() else {
             return false;
         };
         if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
@@ -2324,6 +2328,8 @@ impl Rule for FoldNestedMatchIntoPath<'_> {
             };
             let Some(on_class) =
                 slot_for_predicate_on_class_or_descendant(self.schema, &class, &predicate)
+                    .ok()
+                    .flatten()
             else {
                 continue;
             };
@@ -2490,6 +2496,8 @@ fn is_inline_element(plan: &Plan, schema: &SchemaView, var: &str) -> bool {
                     .and_then(|holder| schema.get_class_by_uri(&holder).ok().flatten())
                     .and_then(|holder| {
                         crate::sparql_slot_family::slot_on_class_or_descendant(&holder, last)
+                            .ok()
+                            .flatten()
                     })
                     .is_some_and(|slot| slot.determine_slot_inline_mode() == SlotInlineMode::Inline)
             }),
@@ -2749,7 +2757,9 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
                 .to_string()
         };
         let class = self.schema.get_class_by_uri(&class_uri).ok().flatten()?;
-        let on_class = slot_for_predicate_on_class_or_descendant(self.schema, &class, predicate)?;
+        let on_class = slot_for_predicate_on_class_or_descendant(self.schema, &class, predicate)
+            .ok()
+            .flatten()?;
         // Identity is [`FoldIdentityConstant`]'s, and the two rules have to be
         // disjoint or the plan depends on which fired first -- which it did:
         // reversed, this rule turned `?s :id "u"` into a JSONB path condition
@@ -4034,7 +4044,11 @@ impl<'s> PushReferenceJoin<'s> {
             .get_class_by_uri(class_uri)
             .ok()
             .flatten()
-            .and_then(|class| slot_on_class_or_descendant(&class, slot_name))
+            .and_then(|class| {
+                slot_on_class_or_descendant(&class, slot_name)
+                    .ok()
+                    .flatten()
+            })
             .is_some_and(|slot| slot.determine_slot_inline_mode() == SlotInlineMode::Reference)
     }
 }
@@ -4329,6 +4343,8 @@ impl Rule for AbsorbOptionalReference<'_> {
             };
             let Some(on_class) =
                 slot_for_predicate_on_class_or_descendant(self.schema, &class, &predicate)
+                    .ok()
+                    .flatten()
             else {
                 continue;
             };
@@ -5427,6 +5443,8 @@ impl Rule for NarrowByAKeptHop<'_> {
             };
             let Some(on_class) =
                 slot_for_predicate_on_class_or_descendant(self.schema, &class, &predicate)
+                    .ok()
+                    .flatten()
             else {
                 continue;
             };
