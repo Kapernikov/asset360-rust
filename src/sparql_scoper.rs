@@ -178,6 +178,12 @@ pub struct QueryPlan {
     /// refusal is final (design, *The pipeline*). Their triples are among
     /// `unconsumed` and the plan is inexact.
     pub untyped: Vec<String>,
+
+    /// The one regime the query reads its records under
+    /// ([`crate::sparql_graph_clauses::single_data_regime`]): the engine loads
+    /// the records flat under it, and every star above reads its type under
+    /// it. A query that reads no records has its dataset's default.
+    pub data_regime: TypeRegime,
 }
 
 /// What a scoping does with a star its domain leaves untyped.
@@ -1272,7 +1278,26 @@ pub enum ScopeError {
     /// a scan stands for). The query is not at fault, and a plan built on a
     /// guess would return fewer rows than it should.
     SchemaError(String),
+    /// The query reads more than one data regime: data graphs of different
+    /// regimes, or a graph variable that can range over them. Refused by both
+    /// routes, because the engine loads the records of **one** regime
+    /// (`WriteOptions::flat(regime)`) and the SQL route must not answer a
+    /// question the engine cannot. `graphs` names what the query read.
+    CrossDataGraph { graphs: Vec<String> },
 }
+
+impl From<crate::sparql_graph_clauses::CrossDataGraph> for ScopeError {
+    fn from(error: crate::sparql_graph_clauses::CrossDataGraph) -> Self {
+        ScopeError::CrossDataGraph {
+            graphs: error.graphs,
+        }
+    }
+}
+
+/// The stable code a refusal for reading several data graphs opens with. The
+/// text after it is prose and may be reworded; this token is what a caller
+/// maps (the same contract as `unsupported_construct`).
+pub const CROSS_DATA_GRAPH: &str = "cross_data_graph";
 
 impl From<crate::sparql_refine::ScanClassesError> for ScopeError {
     fn from(error: crate::sparql_refine::ScanClassesError) -> Self {
@@ -1312,6 +1337,12 @@ impl std::fmt::Display for ScopeError {
                 write!(f, "unsupported_construct: {msg}")
             }
             ScopeError::SchemaError(msg) => write!(f, "schema error: {msg}"),
+            ScopeError::CrossDataGraph { graphs } => write!(
+                f,
+                "{CROSS_DATA_GRAPH}: a query can read one data graph; rewrite it per graph \
+                 (this one read {})",
+                graphs.join(", ")
+            ),
         }
     }
 }
@@ -1558,7 +1589,7 @@ fn scope_qualified(
     // yet evaluate by name. It used to be refused outright, because nothing
     // downstream carried it and one route answered the clause while the other
     // ignored it -- see doc 28h.
-    let graphs = QueryGraphs::new(dataset, dataset_of(query));
+    let graphs = QueryGraphs::new(dataset, query)?;
 
     // An `OPTIONAL` joined to what precedes it only through a variable that
     // may be unbound there is a cartesian product per the algebra, and never
@@ -1631,7 +1662,7 @@ fn scope_qualified(
         .map(|graph| graph.reads)
     {
         Some(GraphReads::Data(regime)) => regime,
-        _ => graphs.variable_graph_regime(),
+        _ => graphs.regime(),
     };
 
     // Anything dropped along the way is recorded here, at the point it is
@@ -2835,6 +2866,7 @@ fn scope_qualified(
         path_bindings,
         inexact,
         untyped,
+        data_regime: graphs.regime(),
     })
 }
 
@@ -3456,6 +3488,7 @@ fn scope_union(
         // a fact about a pattern this plan no longer has a node for.
         inexact: Some(Inexact::UnionBranch),
         untyped,
+        data_regime: crate::sparql_graph_clauses::single_data_regime(query, dataset)?,
     })
 }
 
@@ -3912,7 +3945,7 @@ fn graphs_of_triples(
                         {
                             GraphReads::Schema
                         } else {
-                            GraphReads::Data(graphs.variable_graph_regime())
+                            GraphReads::Data(graphs.regime())
                         },
                         foreign: true,
                     },
@@ -8917,7 +8950,7 @@ classes:
         assert_eq!(regime_of(&plain), TypeRegime::ASSERTED);
         assert_eq!(plain.inexact, None);
 
-        // A clause naming data graphs: the regime of their union, exactly.
+        // A clause naming data graphs: the regime they share.
         let from_asserted = scoped(&format!(
             "SELECT ?s FROM <{A}> WHERE {{ ?s a asset360:Signal }}"
         ));
@@ -8927,10 +8960,20 @@ classes:
         ));
         assert_eq!(regime_of(&from_inferred), TypeRegime::IS_A);
         assert_eq!(from_inferred.inexact, None);
-        let from_both = scoped(&format!(
-            "ASK FROM <{A}> FROM <{I}> WHERE {{ ?s a asset360:Signal }}"
-        ));
-        assert_eq!(regime_of(&from_both), TypeRegime::IS_A);
+        // Data graphs of different regimes are two data regimes: refused.
+        let refused = sparql_scope(
+            &format!(
+                "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                 ASK FROM <{A}> FROM <{I}> WHERE {{ ?s a asset360:Signal }}"
+            ),
+            &sv,
+            &dataset,
+        )
+        .expect_err("two regimes");
+        assert!(
+            matches!(refused, ScopeError::CrossDataGraph { ref graphs } if graphs.len() == 2),
+            "{refused:?}"
+        );
 
         // A graph of the dataset inside the pattern: the same read, per
         // pattern, with no inexactness for a data graph.
@@ -8956,21 +8999,19 @@ classes:
         // `FROM NAMED` narrows the named graphs: one outside the set matches
         // nothing, which only the engine can say.
         let outside = scoped(&format!(
-            "SELECT ?s FROM NAMED <{A}> WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
+            "SELECT ?s FROM NAMED <urn:empty> WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
         ));
         assert_eq!(outside.inexact, Some(Inexact::NamedGraph));
         // `FROM NAMED` alone leaves the default graph empty (SPARQL 1.1
         // 13.2), so a pattern outside a `GRAPH` is not the records either.
-        let empty_default = scoped(&format!(
-            "SELECT ?s FROM NAMED <{A}> WHERE {{ ?s a asset360:Signal }}"
-        ));
+        let empty_default =
+            scoped("SELECT ?s FROM NAMED <urn:empty> WHERE { ?s a asset360:Signal }");
         assert_eq!(empty_default.inexact, Some(Inexact::NamedGraph));
     }
 
-    /// A star reads its records under the regime of its `rdf:type` triple's
-    /// graph, and so stands for the classes that regime says: a mix across
-    /// graphs types one star once, by the type triple (the slots read in
-    /// another graph are the same in every regime).
+    /// A star reads its records under the query's one data regime, and so
+    /// stands for the classes that regime says. A mix of regimes across graphs
+    /// is not a star typed once by its type triple: it is refused.
     #[test]
     fn a_star_reads_its_type_under_its_own_graphs_regime() {
         const A: &str = "urn:graph:asserted";
@@ -9010,15 +9051,31 @@ classes:
             ))),
             vec![beacon.clone(), signal.clone()]
         );
-        // The type in one graph, a slot in another: one star, typed by the
-        // type triple's regime.
-        let mixed = scope(&format!(
-            "SELECT ?s ?n WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} \
-             GRAPH <{A}> {{ ?s asset360:name ?n }} }}"
+        // The type in one graph, a slot in a graph of another regime: refused.
+        let mixed = sparql_scope(
+            &format!(
+                "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                 SELECT ?s ?n WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} \
+                 GRAPH <{A}> {{ ?s asset360:name ?n }} }}"
+            ),
+            &sv,
+            &dataset,
+        )
+        .expect_err("two regimes");
+        assert!(
+            mixed.to_string().starts_with(
+                "cross_data_graph: a query can read one data graph; rewrite it per graph"
+            ),
+            "{mixed}"
+        );
+        // Both in the inferred graph: one star, one regime.
+        let both = scope(&format!(
+            "SELECT ?s ?n WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal ; asset360:name ?n }} }}"
         ));
-        assert_eq!(mixed.root.all_stars().len(), 1);
-        assert_eq!(classes(&mixed), vec![beacon, signal]);
-        assert_eq!(mixed.root.all_stars()[0].regime, TypeRegime::IS_A);
+        assert_eq!(both.root.all_stars().len(), 1);
+        assert_eq!(classes(&both), vec![beacon, signal]);
+        assert_eq!(both.root.all_stars()[0].regime, TypeRegime::IS_A);
+        assert_eq!(both.data_regime, TypeRegime::IS_A);
     }
 
     #[test]

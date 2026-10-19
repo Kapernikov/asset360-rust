@@ -391,32 +391,21 @@ impl DatasetSpec {
         !self.schema_graphs.is_empty()
     }
 
-    /// The regime a pattern matched against exactly the graphs `iris` is
-    /// matched under: `Some` when every one is a data graph, the union of
-    /// their regimes' partitions. Any non-empty set is a regime: every
-    /// computation that depends on it (`type_family`, `rdf_types`, the scan's
-    /// classes, the schema graph's edges, whether `sesame:directType` is
-    /// written) is derived from the set, not from a named variant. `None` for
-    /// anything else -- a schema graph, an unknown IRI, or an empty set.
-    ///
-    /// `ASSERTED` together with `IS_A` is `IS_A` (the second contains the
-    /// first); two sets that overlap only partly give their union.
+    /// The regime the data graphs `iris` share: `Some` when every one is a
+    /// data graph and they all carry one regime, `None` for anything else -- a
+    /// schema graph, an unknown IRI, data graphs of different regimes, or no
+    /// graph. A query that reads graphs of different regimes is refused before
+    /// it gets here ([`crate::sparql_graph_clauses::single_data_regime`]), so
+    /// the planner never has to say what a mixture means.
     pub(crate) fn regime_of_graph_set(&self, iris: &[&str]) -> Option<TypeRegime> {
-        let mut union = TypeRegime::empty();
+        let mut shared = None;
         for iri in iris {
-            union = union.union(self.data_regime(iri)?);
+            let regime = self.data_regime(iri)?;
+            if *shared.get_or_insert(regime) != regime {
+                return None;
+            }
         }
-        (union != TypeRegime::empty()).then_some(union)
-    }
-
-    /// The widest regime any graph a `GRAPH ?g` can bind to carries: what a
-    /// scan must read so that no graph's records are missed. The union of
-    /// every data graph's partitions.
-    pub(crate) fn widest_data_regime(&self) -> TypeRegime {
-        self.data_graphs()
-            .fold(self.default_regime(), |widest, (_, regime)| {
-                widest.union(regime)
-            })
+        shared
     }
 }
 
@@ -462,6 +451,9 @@ impl GraphReads {
 #[derive(Debug, Clone)]
 pub(crate) struct QueryGraphs<'a> {
     dataset: &'a DatasetSpec,
+    /// The one regime the query reads its records under
+    /// ([`crate::sparql_graph_clauses::single_data_regime`]).
+    regime: TypeRegime,
     from: Vec<String>,
     /// Whether the query wrote a `FROM` / `FROM NAMED` clause at all.
     clause_written: bool,
@@ -471,13 +463,30 @@ pub(crate) struct QueryGraphs<'a> {
 }
 
 impl<'a> QueryGraphs<'a> {
-    /// The view of a query that writes `clause` (its `FROM` / `FROM NAMED`),
-    /// if it writes one.
+    /// The view of `query` over `dataset`, or the refusal that it reads more
+    /// than one data regime (see
+    /// [`crate::sparql_graph_clauses::single_data_regime`]).
     pub(crate) fn new(
+        dataset: &'a DatasetSpec,
+        query: &spargebra::Query,
+    ) -> Result<Self, crate::sparql_graph_clauses::CrossDataGraph> {
+        let regime = crate::sparql_graph_clauses::single_data_regime(query, dataset)?;
+        Ok(Self {
+            regime,
+            ..Self::view(dataset, crate::sparql_scoper::dataset_of(query))
+        })
+    }
+
+    /// The view of a query that writes `clause` (its `FROM` / `FROM NAMED`),
+    /// if it writes one, before its regime is known: what
+    /// [`crate::sparql_graph_clauses::single_data_regime`] reads the graphs
+    /// through. The regime is the dataset's default until [`Self::new`] says.
+    pub(crate) fn view(
         dataset: &'a DatasetSpec,
         clause: Option<&spargebra::algebra::QueryDataset>,
     ) -> Self {
         Self {
+            regime: dataset.default_regime(),
             dataset,
             clause_written: clause.is_some(),
             from: clause
@@ -543,10 +552,9 @@ impl<'a> QueryGraphs<'a> {
         }
     }
 
-    /// The regime to fetch under for a `GRAPH ?g`, which can bind any data
-    /// graph: the widest regime among them, so no graph's records are missed.
-    pub(crate) fn variable_graph_regime(&self) -> TypeRegime {
-        self.dataset.widest_data_regime()
+    /// The one regime the query reads its records under.
+    pub(crate) fn regime(&self) -> TypeRegime {
+        self.regime
     }
 }
 
@@ -725,27 +733,19 @@ mod tests {
     }
 
     #[test]
-    fn a_set_of_graphs_is_the_regime_whose_partitions_it_unions_to() {
+    fn a_set_of_graphs_has_a_regime_only_when_they_share_one() {
         let dataset = served();
         let regime = |iris: &[&str]| dataset.regime_of_graph_set(iris);
         assert_eq!(regime(&[A]), Some(TypeRegime::ASSERTED));
-        assert_eq!(regime(&[A, I]), Some(TypeRegime::IS_A));
-        assert_eq!(regime(&[I, A]), Some(TypeRegime::IS_A));
-        assert_eq!(regime(&[I, M]), Some(TypeRegime::IS_A_AND_MIXINS));
-        assert_eq!(regime(&[A, I, M]), Some(TypeRegime::IS_A_AND_MIXINS));
+        assert_eq!(regime(&[A, A]), Some(TypeRegime::ASSERTED));
+        assert_eq!(regime(&[I]), Some(TypeRegime::IS_A));
+        // Different regimes are a refusal upstream, never a regime here.
+        assert_eq!(regime(&[A, I]), None);
+        assert_eq!(regime(&[I, M]), None);
         // A schema graph or an unknown graph is no data: no regime.
         assert_eq!(regime(&[A, S]), None);
         assert_eq!(regime(&[S]), None);
         assert_eq!(regime(&["urn:unknown"]), None);
         assert_eq!(regime(&[]), None);
-    }
-
-    #[test]
-    fn a_graph_variable_reads_the_widest_regime_served() {
-        assert_eq!(served().widest_data_regime(), TypeRegime::IS_A_AND_MIXINS);
-        assert_eq!(
-            DatasetSpec::asserted().widest_data_regime(),
-            TypeRegime::ASSERTED
-        );
     }
 }

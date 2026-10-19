@@ -305,6 +305,15 @@ pub struct ExecutionPlan {
     /// [`crate::sparql_executor::sparql_finish`] reads it from here rather than
     /// being handed a second one that could disagree.
     pub dataset: DatasetSpec,
+    /// The query the plan answers, as the planner read it: parsed and with
+    /// every slot and class spelled canonically. What the engine evaluates
+    /// ([`crate::sparql_executor::sparql_execute_plan`]), so the planned query
+    /// and the evaluated one cannot be two.
+    pub query: Query,
+    /// The one regime the query reads its records under (a query cannot read
+    /// two, see [`crate::sparql_graph_clauses::single_data_regime`]): the
+    /// engine loads the fetched records flat under it.
+    pub data_regime: linkml_runtime::schema_rdf::TypeRegime,
 }
 
 impl ExecutionPlan {
@@ -1465,6 +1474,7 @@ pub fn plan_query_refined_with_options(
                 error.to_string(),
                 None,
                 dataset,
+                &parsed,
             ));
         }
     };
@@ -1531,6 +1541,7 @@ pub fn plan_query_refined_with_options(
             format!("a rule broke the plan: {failure}"),
             None,
             dataset,
+            &parsed,
         ));
     }
     // `resolve`: every recorded star is typed from the refined plan's scan
@@ -1558,6 +1569,7 @@ pub fn plan_query_refined_with_options(
                 format!("not lowerable: {refusal}"),
                 Some((&refined, schema_view)),
                 dataset,
+                &parsed,
             ));
         }
     };
@@ -1577,6 +1589,8 @@ pub fn plan_query_refined_with_options(
         // Decided by `answers_alone` below; both arms overwrite it.
         refinement: Refinement::Used(None),
         dataset: dataset.clone(),
+        query: parsed.clone(),
+        data_regime: scoped.data_regime,
     };
 
     match answers_alone(&plan, &ops) {
@@ -1947,6 +1961,9 @@ pub(crate) fn rows_placement(
         obligations: obligations.to_vec(),
         refinement: Refinement::UsedRows(note),
         dataset: dataset.clone(),
+        query: parsed.clone(),
+        data_regime: crate::sparql_graph_clauses::single_data_regime(parsed, dataset)
+            .map_err(|error| ScopeError::from(error).to_string())?,
     };
     Ok(RowsPlacement {
         plan,
@@ -2424,6 +2441,7 @@ fn fetch_only(
     why: String,
     refined: Option<(&crate::sparql_refine::Plan, &SchemaView)>,
     dataset: &DatasetSpec,
+    query: &Query,
 ) -> ExecutionPlan {
     let triple_count = obligations
         .iter()
@@ -2483,6 +2501,8 @@ fn fetch_only(
             narrowings: Box::new(narrowings),
         },
         dataset: dataset.clone(),
+        query: query.clone(),
+        data_regime: scoped.data_regime,
     }
 }
 
@@ -3523,7 +3543,7 @@ classes:
         .build()
         .expect("a valid dataset");
         let query = format!(
-            "{PREFIX}SELECT ?s ?nm FROM NAMED <urn:g:a> WHERE {{ ?s a asset360:Signal ; \
+            "{PREFIX}SELECT ?s ?nm FROM NAMED <urn:g:other> WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm }}"
         );
         let text = refined_plan_text(&query, &sv, &dataset).expect("should plan");
@@ -3538,9 +3558,25 @@ classes:
             "{plan}"
         );
         // The same query with the clause dropped is answered from the table.
-        let plain = plan_query_refined(&query.replace("FROM NAMED <urn:g:a> ", ""), &sv, &dataset)
-            .expect("should plan");
+        let plain = plan_query_refined(
+            &query.replace("FROM NAMED <urn:g:other> ", ""),
+            &sv,
+            &dataset,
+        )
+        .expect("should plan");
         assert!(plain.sql_only(), "{plain}");
+        // A data graph in `FROM NAMED` is a second data read of the query:
+        // refused by name, like every read of more than one data graph.
+        let refused = plan_query_refined(
+            &format!("{PREFIX}SELECT ?s FROM NAMED <urn:g:a> WHERE {{ ?s a asset360:Signal }}"),
+            &sv,
+            &dataset,
+        )
+        .expect_err("a data graph in FROM NAMED");
+        assert!(
+            refused.to_string().starts_with("cross_data_graph: "),
+            "{refused}"
+        );
     }
 
     /// A statement that does not answer alone hands the engine its rows when
@@ -4192,6 +4228,8 @@ classes:
             residual: vec![1],
             refinement: Refinement::Used(None),
             dataset: DatasetSpec::asserted(),
+            query: parse_query("SELECT * WHERE { ?s ?p ?o }").unwrap(),
+            data_regime: linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
         };
         assert!(balanced.ledger_balances().is_ok());
         assert!(
@@ -4381,6 +4419,8 @@ classes:
             residual: Vec::new(),
             refinement: Refinement::UsedAlone("hand-built".to_owned()),
             dataset: DatasetSpec::asserted(),
+            query: parsed.clone(),
+            data_regime: scoped.data_regime,
         };
         plan.ledger_balances().unwrap();
 

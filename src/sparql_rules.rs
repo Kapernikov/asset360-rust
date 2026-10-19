@@ -11082,11 +11082,10 @@ mod inline_type_match {
         );
     }
 
-    /// The regime of an inlined element's type triple is that of *its own*
-    /// graph: asking for the range class itself is a bare test under the
+    /// The regime of an inlined element's type triple is the query's one data
+    /// regime: asking for the range class itself is a bare test under the
     /// asserted regime (an element may name no designator), and discharged
-    /// under the inferred one (every element is a place). The slot triples'
-    /// graph does not decide it.
+    /// under the inferred one (every element is a place).
     #[test]
     fn an_inline_type_triple_is_judged_in_its_own_graph() {
         use crate::sparql_dataset::DatasetSpec;
@@ -11113,18 +11112,29 @@ mod inline_type_match {
             crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
             plan.to_string()
         };
-        for site_graph in [A, I] {
-            let asserted = refined(site_graph, A);
-            assert!(
-                asserted.contains("match     ?p a asset360:Place"),
-                "asserted: the element may name no designator, the engine keeps it:\n{asserted}"
-            );
-            let inferred = refined(site_graph, I);
-            assert!(
-                !inferred.contains("match     ?p a asset360:Place"),
-                "inferred: every element is a place, the triple is discharged:\n{inferred}"
-            );
-        }
+        // One graph per query: the site and its element's type are read in
+        // the same graph, whose regime decides.
+        let asserted = refined(A, A);
+        assert!(
+            asserted.contains("match     ?p a asset360:Place"),
+            "asserted: the element may name no designator, the engine keeps it:\n{asserted}"
+        );
+        let inferred = refined(I, I);
+        assert!(
+            !inferred.contains("match     ?p a asset360:Place"),
+            "inferred: every element is a place, the triple is discharged:\n{inferred}"
+        );
+        // Two graphs of different regimes are two data regimes: refused.
+        let parsed = crate::sparql_scoper::parse_query_for(
+            &format!(
+                "PREFIX asset360: <{NS}/> SELECT ?s WHERE {{ \
+                 GRAPH <{A}> {{ ?s a asset360:Site ; asset360:places ?p }} \
+                 GRAPH <{I}> {{ ?p a asset360:Place }} }}"
+            ),
+            &sv,
+        )
+        .unwrap();
+        assert!(crate::sparql_refine::naive_plan(&parsed, &dataset).is_err());
     }
 
     /// What [`an_inline_type_triple_is_judged_in_its_own_graph`] relies on: an

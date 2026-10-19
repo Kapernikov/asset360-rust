@@ -11,10 +11,12 @@ from asset360_rust import (
     SchemaView,
     TypePartition,
     TypeRegime,
+    plan_query_refined,
     sparql_execute,
     sparql_finish,
     sparql_schema_graph_ntriples,
     sparql_schema_graph_skipped,
+    sparql_scope,
 )
 
 A = "urn:graph:asserted"
@@ -120,3 +122,25 @@ def test_a_bare_dataset_reads_back_empty():
     assert dataset.data_graphs == {} and dataset.schema_graphs == {}
     assert dataset.default_graph is None and dataset.partition_graphs == {}
     assert repr(dataset) == "DatasetSpec(TypeRegime.ASSERTED)"
+
+
+def test_a_query_reading_two_data_graphs_is_refused_by_name_on_every_route():
+    sv = SchemaView()
+    sv.add_schema_str(_SCHEMA_YAML)
+    inferred = "urn:graph:inferred"
+    dataset = DatasetSpec(
+        TypeRegime.ASSERTED,
+        data_graphs={A: TypeRegime.ASSERTED, inferred: TypeRegime.IS_A},
+    )
+    query = f"SELECT ?s FROM <{A}> FROM <{inferred}> WHERE {{ ?s a <https://example.org/s/Asset> }}"
+    refusal = "cross_data_graph: a query can read one data graph; rewrite it per graph"
+    with pytest.raises(ValueError, match=refusal):
+        plan_query_refined(query, sv, dataset)
+    with pytest.raises(ValueError, match=refusal):
+        sparql_scope(query, sv, dataset)
+    with pytest.raises(RuntimeError, match=refusal):
+        sparql_execute(query, [], sv, dataset)
+    # One graph is a query like any other.
+    one = f"SELECT ?s FROM <{inferred}> WHERE {{ ?s a <https://example.org/s/Asset> }}"
+    plan = plan_query_refined(one, sv, dataset)
+    assert plan.data_regime == TypeRegime.IS_A

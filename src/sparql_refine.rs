@@ -4116,7 +4116,7 @@ pub fn naive_plan_for(
 ///
 /// The caller's dataset decides all of it.
 pub fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
-    let graphs = QueryGraphs::new(dataset, crate::sparql_scoper::dataset_of(query));
+    let graphs = QueryGraphs::new(dataset, query).map_err(ScopeError::from)?;
     let default_reads = graphs.default_reads();
     let default_regime = default_reads.data_regime();
     let obligations = crate::sparql_plan::obligations_of(query)?;
@@ -5543,9 +5543,9 @@ mod tests {
 
     /// The dataset decides which graph each pattern reads: `FROM`, a `GRAPH`
     /// naming a data graph (which dissolves -- each `Match` says its graph),
-    /// and `GRAPH ?g` / the schema graph (which stay, reading no regime).
-    /// Mixed per pattern, the type of one graph and the slot of another are
-    /// read under their own regimes, so the fold keeps to one regime.
+    /// and the schema graph (which stays, reading no regime). A query reads
+    /// **one** data regime: a read of two is refused, by the one function both
+    /// routes use.
     #[test]
     fn the_dataset_decides_each_patterns_regime() {
         const A: &str = "urn:graph:asserted";
@@ -5561,10 +5561,22 @@ mod tests {
             .with_schema_graph(S, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
-        let plan = |query: &str| {
+        let try_plan = |query: &str| {
             let parsed =
                 crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
-            naive_plan(&parsed, &dataset).unwrap()
+            naive_plan(&parsed, &dataset)
+        };
+        let plan = |query: &str| try_plan(query).unwrap();
+        let refused = |query: &str| {
+            let message = try_plan(query).expect_err(query).to_string();
+            assert!(
+                message.starts_with(
+                    "cross_data_graph: a query can read one data graph; \
+                                     rewrite it per graph"
+                ),
+                "{query}: {message}"
+            );
+            message
         };
         // `(has a Graph node above it, regime)` per match, in node order.
         let matches = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
@@ -5592,7 +5604,7 @@ mod tests {
         };
 
         // No `FROM`: the dataset's default regime. `FROM <A>` / `FROM <I>`:
-        // that graph's. Both: the one regime whose partitions they union to.
+        // that graph's.
         let body = "{ ?s a asset360:Signal ; asset360:name ?n }";
         assert_eq!(
             regimes(&plan(&format!("SELECT ?s WHERE {body}"))),
@@ -5606,9 +5618,10 @@ mod tests {
             regimes(&plan(&format!("SELECT ?s FROM <{I}> WHERE {body}"))),
             vec![Some(TypeRegime::IS_A); 2]
         );
+        // The same graph twice is one graph.
         assert_eq!(
             regimes(&plan(&format!(
-                "SELECT ?s FROM <{A}> FROM <{I}> WHERE {body}"
+                "SELECT ?s FROM <{I}> FROM <{I}> WHERE {body}"
             ))),
             vec![Some(TypeRegime::IS_A); 2]
         );
@@ -5626,6 +5639,9 @@ mod tests {
         let in_inferred = plan(&format!("SELECT ?s WHERE {{ GRAPH <{I}> {body} }}"));
         assert_eq!(regimes(&in_inferred), vec![Some(TypeRegime::IS_A); 2]);
         assert_eq!(graph_nodes(&in_inferred), 0, "{in_inferred}");
+        // A plan that reads the regime of another graph than the dataset's
+        // default says so in its text.
+        assert!(in_inferred.to_string().contains("[is_a]"), "{in_inferred}");
         // A `FROM` alone leaves no named graph (it parses as an empty
         // `FROM NAMED` list, SPARQL 1.1 13.2): `GRAPH <I>` reads nothing the
         // plan can name, and is the engine's to say so.
@@ -5634,26 +5650,28 @@ mod tests {
         ));
         assert_eq!(regimes(&from_and_graph), vec![None; 2]);
         assert_eq!(graph_nodes(&from_and_graph), 1);
-        // `GRAPH ?g` and the schema graph stay, and read no regime.
-        for graph in ["?g".to_owned(), format!("<{S}>")] {
-            let kept = plan(&format!("SELECT ?s WHERE {{ GRAPH {graph} {body} }}"));
-            assert_eq!(regimes(&kept), vec![None; 2], "{graph}");
-            assert_eq!(graph_nodes(&kept), 1, "{kept}");
-        }
+        // The schema graph stays, and reads no regime.
+        let kept = plan(&format!("SELECT ?s WHERE {{ GRAPH <{S}> {body} }}"));
+        assert_eq!(regimes(&kept), vec![None; 2]);
+        assert_eq!(graph_nodes(&kept), 1, "{kept}");
+        // A data graph beside the schema graph is one data regime.
+        let beside = plan(&format!(
+            "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} \
+             GRAPH <{S}> {{ ?c a asset360:Signal }} }}"
+        ));
+        assert_eq!(regimes(&beside), vec![Some(TypeRegime::IS_A), None]);
         // Under `FROM NAMED` a graph outside the set matches nothing: kept as
         // a `GRAPH` for the engine to say so.
         let outside = plan(&format!(
-            "SELECT ?s FROM NAMED <{A}> WHERE {{ GRAPH <{I}> {body} }}"
+            "SELECT ?s FROM NAMED <{S}> WHERE {{ GRAPH <{I}> {body} }}"
         ));
         assert_eq!(regimes(&outside), vec![None; 2]);
         assert_eq!(graph_nodes(&outside), 1);
 
         // `FROM NAMED` and no `FROM`: the default graph is the empty graph
         // (SPARQL 1.1 13.2). A pattern outside any `GRAPH` is the empty
-        // relation -- no match left for anything to find out about -- while
-        // `GRAPH <named>` inside the same query still reads the graph it
-        // lists, under that graph's regime.
-        let empty_default = plan(&format!("SELECT ?s FROM NAMED <{I}> WHERE {body}"));
+        // relation -- no match left for anything to find out about.
+        let empty_default = plan(&format!("SELECT ?s FROM NAMED <{S}> WHERE {body}"));
         assert!(matches(&empty_default).is_empty(), "{empty_default}");
         let empty_rows = empty_default
             .nodes
@@ -5661,69 +5679,44 @@ mod tests {
             .filter(|node| matches!(&node.op, PlanOp::Values { rows, .. } if rows.is_empty()))
             .count();
         assert_eq!(empty_rows, 2, "{empty_default}");
-        let listed = plan(&format!(
-            "SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {body} }}"
-        ));
-        assert_eq!(regimes(&listed), vec![Some(TypeRegime::IS_A); 2]);
-        assert_eq!(graph_nodes(&listed), 0);
-        // Both at once: the `FROM` graph is the default, the `FROM NAMED`
-        // graph the named one.
-        let both = plan(&format!(
-            "SELECT ?s FROM <{A}> FROM NAMED <{I}> WHERE {{ {body} GRAPH <{I}> {{ ?s asset360:code ?c }} }}"
-        ));
-        assert_eq!(
-            regimes(&both),
-            vec![
-                Some(TypeRegime::ASSERTED),
-                Some(TypeRegime::ASSERTED),
-                Some(TypeRegime::IS_A)
-            ]
-        );
 
-        // Per pattern: the type of one graph, the type of another.
-        let mixed = plan(&format!(
+        // **The refusals**: every read of a second data regime, or of a graph
+        // that can be one.
+        // Data graphs of different regimes in one `FROM`.
+        let message = refused(&format!("SELECT ?s FROM <{A}> FROM <{I}> WHERE {body}"));
+        assert!(message.contains(A) && message.contains(I), "{message}");
+        // Two `GRAPH` blocks over data graphs of different regimes.
+        refused(&format!(
             "SELECT ?s WHERE {{ GRAPH <{A}> {{ ?s a asset360:Signal }} \
              GRAPH <{I}> {{ ?s a asset360:ShuntSignal }} }}"
         ));
-        assert_eq!(
-            regimes(&mixed),
-            vec![Some(TypeRegime::ASSERTED), Some(TypeRegime::IS_A)]
-        );
-        assert_eq!(graph_nodes(&mixed), 0);
-
-        // The fold keeps to one regime: the type from `A` makes a scan of
-        // `Signal` (asserted); the slot read in `I` is another regime's and
-        // stays a match.
-        let split = plan(&format!(
-            "SELECT ?s ?n WHERE {{ GRAPH <{A}> {{ ?s a asset360:Signal }} \
-             GRAPH <{I}> {{ ?s asset360:name ?n }} }}"
+        // A `GRAPH` over a data graph whose regime differs from the default
+        // graph's, which the query also reads.
+        let message = refused(&format!(
+            "SELECT ?s ?n WHERE {{ ?s a asset360:Signal GRAPH <{I}> {{ ?s asset360:name ?n }} }}"
         ));
-        let rules = crate::sparql_rules::tier_one_rules(&sv, &dataset);
-        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
-            rules.iter().map(|rule| rule.as_ref()).collect();
-        let mut refined = split.clone();
-        crate::sparql_rules::refine(&mut refined, &borrowed).expect("every invariant holds");
-        refined.check_with(&sv).unwrap();
-        let scans: Vec<(TypeRegime, Vec<ScanSlot>)> = refined
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.op {
-                PlanOp::Scan { regime, slots, .. } => Some((*regime, slots.clone())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(scans.len(), 1, "{refined}");
-        assert_eq!(scans[0].0, TypeRegime::ASSERTED);
-        assert!(scans[0].1.is_empty(), "{refined}");
-        assert_eq!(
-            regimes(&refined),
-            vec![Some(TypeRegime::IS_A)],
-            "the slot match of the other graph stays: {refined}"
+        assert!(
+            message.contains("the default graph") && message.contains(I),
+            "{message}"
         );
-
-        // A plan that reads the regime of another graph than its default
-        // says so in its text.
-        assert!(mixed.to_string().contains("[is_a]"), "{mixed}");
+        // `GRAPH ?g` while the dataset serves data graphs.
+        let message = refused(&format!("SELECT ?s WHERE {{ GRAPH ?g {body} }}"));
+        assert!(message.contains("GRAPH ?g"), "{message}");
+        // A data graph in `FROM NAMED`, listed or not read.
+        refused(&format!(
+            "SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {body} }}"
+        ));
+        refused(&format!("SELECT ?s FROM NAMED <{A}> WHERE {body}"));
+        // Both a `FROM` and a `FROM NAMED` of data.
+        refused(&format!(
+            "SELECT ?s FROM <{A}> FROM NAMED <{I}> WHERE {body}"
+        ));
+        // The same regime from two graphs is allowed: the default graph
+        // (asserted) and `GRAPH <A>`.
+        let same = plan(&format!(
+            "SELECT ?s ?n WHERE {{ ?s a asset360:Signal GRAPH <{A}> {{ ?s asset360:name ?n }} }}"
+        ));
+        assert_eq!(regimes(&same), vec![Some(TypeRegime::ASSERTED); 2]);
     }
 
     /// Review F9: the text tells a match that reads no data graph from one
@@ -5851,8 +5844,27 @@ mod tests {
             "SELECT ?s WHERE {{ GRAPH <urn:unknown> {{ {body} }} }}"
         ));
         assert_eq!(reads, vec![GraphReads::Other]);
-        let (reads, _) = reads_of(&format!("SELECT ?s WHERE {{ GRAPH ?g {{ {body} }} }}"));
-        assert_eq!(reads, vec![GraphReads::Other]);
+        // `GRAPH ?g` reads whatever graph it binds: only the engine can say
+        // which. (Over a dataset that serves a data graph it is refused: it
+        // could read several.)
+        let schema_only = crate::sparql_dataset::schema_dataset(S);
+        let parsed = crate::sparql_scoper::parse_query_for(
+            &format!("{PREFIX}SELECT ?s WHERE {{ GRAPH ?g {{ {body} }} }}"),
+            &sv,
+        )
+        .unwrap();
+        let variable = naive_plan(&parsed, &schema_only).unwrap();
+        assert!(
+            variable.nodes.iter().any(|node| matches!(
+                &node.op,
+                PlanOp::Match {
+                    reads: GraphReads::Other,
+                    ..
+                }
+            )),
+            "{variable}"
+        );
+        assert!(naive_plan(&parsed, &dataset).is_err());
         // Outside any `GRAPH`, a `FROM` that names the schema graph reads it,
         // and the printout says so rather than "no data graph".
         let (reads, text) = reads_of(&format!("SELECT ?s FROM <{S}> WHERE {{ {body} }}"));

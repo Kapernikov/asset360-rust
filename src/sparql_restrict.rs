@@ -1422,27 +1422,24 @@ mod tests {
     }
 
     /// A restriction carries the regime of the scan it was derived from, and
-    /// the fold reads it as that scan's regime: with the type in graph `I`
-    /// (`is_a`) and the slot read in graph `A` (asserted), the restriction is
-    /// `∈ Signal [is_a]` and the asserted slot match is not folded under it --
-    /// the fold used to take the regime of the earliest match instead, and
-    /// would have scanned the star under the wrong graph.
+    /// the fold reads it as that scan's regime: with the star read in graph `I`
+    /// (`is_a`), the restriction is `∈ Signal [is_a]` and both scans read under
+    /// it. (A query reads one data regime, so there is no second regime for the
+    /// restriction to be confused with.)
     #[test]
     fn a_restriction_carries_the_regime_of_the_scan_it_came_from() {
         use crate::sparql_dataset::DatasetSpec;
         use linkml_runtime::schema_rdf::TypeRegime;
-        const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let schema = test_schema_view();
         let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
-            .with_data_graph(A, TypeRegime::ASSERTED)
             .with_data_graph(I, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let query = format!(
             "{PREFIX}SELECT ?nm WHERE {{ \
              {{ SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }} ORDER BY ?s LIMIT 3 }} \
-             GRAPH <{A}> {{ ?s asset360:name ?nm }} }}"
+             GRAPH <{I}> {{ ?s asset360:name ?nm }} }}"
         );
         let parsed = crate::sparql_scoper::parse_query_for(&query, &schema).unwrap();
         let mut plan = crate::sparql_refine::naive_plan(&parsed, &dataset).unwrap();
@@ -1464,11 +1461,10 @@ mod tests {
             },
             "{plan}"
         );
-        // Only the inner star is a scan; the asserted slot match is another
-        // regime's and stays a match under the restriction.
-        assert_eq!(plan.find("scan").len(), 1, "{plan}");
+        // Both stars are scans, under the one regime.
+        assert_eq!(plan.find("scan").len(), 2, "{plan}");
         assert!(
-            plan.nodes.iter().any(|node| matches!(
+            plan.nodes.iter().all(|node| !matches!(
                 &node.op,
                 PlanOp::Match {
                     reads: GraphReads::Data(TypeRegime::ASSERTED),
@@ -1477,8 +1473,9 @@ mod tests {
             )),
             "{plan}"
         );
-        assert!(
-            plan.to_string().contains("∈ asset360:Signal [is_a]"),
+        assert_eq!(
+            plan.to_string().matches("asset360:Signal [is_a]").count(),
+            2,
             "{plan}"
         );
     }

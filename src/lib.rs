@@ -3773,6 +3773,15 @@ impl ExecutionPlan {
         self.inner.sql_only()
     }
 
+    /// The one :class:`TypeRegime` the query reads its records under. A query
+    /// reads one data graph (one that reads two is refused with
+    /// ``cross_data_graph``), so the records its SQL pass fetches are written
+    /// flat under this regime.
+    #[getter]
+    fn data_regime(&self, py: Python<'_>) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
+        py_regime(py, self.inner.data_regime)
+    }
+
     #[getter]
     fn passes(&self) -> Vec<PlanPass> {
         self.inner
@@ -4137,8 +4146,9 @@ fn regime_repr(regime: linkml_runtime::schema_rdf::TypeRegime) -> String {
 ///     it to read the ledger.
 ///
 /// Raises:
-///     ValueError: the query does not parse, is an update, or cannot be
-///         scoped at all.
+///     ValueError: the query does not parse, is an update, cannot be
+///         scoped at all, or reads more than one data graph (the message
+///         opens ``cross_data_graph``).
 fn py_plan_query_refined(
     py: Python<'_>,
     query: &str,
@@ -4263,7 +4273,9 @@ fn sparql_inexact_reasons() -> Vec<&'static str> {
 ///     QueryPlan with stars, joins, and optional sql_limit.
 ///
 /// Raises:
-///     ValueError: SPARQL parse error, unscoped query, or SPARQL Update.
+///     ValueError: SPARQL parse error, unscoped query, SPARQL Update, or a
+///         query that reads more than one data graph (the message opens
+///         ``cross_data_graph``).
 fn sparql_scope(
     py: Python<'_>,
     query: &str,
@@ -4364,13 +4376,15 @@ fn load_json_batch(
 ///     instances: List of LinkMLInstance objects to query against.
 ///     schema_view: The LinkML schema (for RDF conversion).
 ///     dataset: The :class:`DatasetSpec` the endpoint serves: which schema
-///         graphs to build (only the ones the query names), and the type
-///         regime the records are loaded under. There is deliberately no
-///         default: the correct graphs depend on which datamodel is deployed,
-///         and guessing would put an infrabel-named graph into an unrelated
-///         deployment. A query naming a *data* graph (``GRAPH``, ``FROM``,
-///         ``FROM NAMED``) is refused for now: the engine holds the records
-///         in the default graph only.
+///         graphs to build (only the ones the query names), and the data
+///         graphs whose regimes the records are loaded under. There is
+///         deliberately no default: the correct graphs depend on which
+///         datamodel is deployed, and guessing would put an infrabel-named
+///         graph into an unrelated deployment. The records are loaded flat
+///         under the one regime the query reads (the default graph's, or that
+///         of the one data graph its ``FROM`` / ``GRAPH`` names). A query that
+///         reads two is refused with a ``RuntimeError`` whose text opens
+///         ``cross_data_graph``, exactly as the planner refuses it.
 ///     max_triples: Maximum triples in the store (keyword-only, default
 ///         500 000).
 ///     max_result_rows: Maximum result rows (keyword-only, default 10 000).

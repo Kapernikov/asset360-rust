@@ -404,6 +404,8 @@ mod tests {
                 obligations: plan.obligations.clone(),
                 refinement: crate::sparql_plan::Refinement::UsedAlone(String::new()),
                 dataset: crate::sparql_dataset::DatasetSpec::asserted(),
+                query: crate::sparql_scoper::parse_query("SELECT * WHERE { ?s ?p ?o }").unwrap(),
+                data_regime: linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
             }
         );
         println!("{printed}");
