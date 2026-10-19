@@ -13,7 +13,7 @@
 //! The full SPARQL query is always executed in Oxigraph against the loaded
 //! data. The plan only determines *what* to load efficiently.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
@@ -1709,7 +1709,8 @@ fn scope_qualified(
                 type_iri: None,
                 type_depth: usize::MAX,
                 slot_depth: HashMap::new(),
-                object_variables: HashMap::new(),
+                object_variables: BTreeMap::new(),
+                variable_depth: HashMap::new(),
                 inline_filters: HashMap::new(),
                 claimed: Vec::new(),
             });
@@ -1765,30 +1766,41 @@ fn scope_qualified(
                 .insert(slot_name.clone(), current.min(*depth));
             match &tp.object {
                 TermPattern::Variable(v) => {
-                    // One slot bound to two variables — `:kinds ?x ; :kinds ?y`
-                    // — is a self-join over the slot's values, and the map holds
-                    // one variable per slot. Keep the first and leave this
-                    // triple unconsumed: overwriting silently described a
-                    // single read where the query has two. The mirror of the
-                    // one-variable-on-two-slots case, which is caught.
-                    match builder.object_variables.get(&slot_name) {
-                        Some(existing) if existing != v.as_str() => {}
-                        // A constant already read this slot. On a multivalued
-                        // slot that is the same self-join in the other
-                        // direction: `:kinds "p" ; :kinds ?x` pairs the values
-                        // with each other, while the plan describes one
-                        // filtered read. Single-valued is different — the
-                        // constant just fixes what the variable binds.
-                        _ if multivalued && builder.inline_filters.contains_key(&slot_name) => {
-                            record_loss(Inexact::ConstantAndVariableOnSlot);
+                    // A constant already read this slot. On a multivalued slot
+                    // that is a self-join: `:kinds "p" ; :kinds ?x` pairs the
+                    // values with each other, while the plan describes one
+                    // filtered read. Single-valued is different — the constant
+                    // just fixes what the variable binds.
+                    if multivalued && builder.inline_filters.contains_key(&slot_name) {
+                        record_loss(Inexact::ConstantAndVariableOnSlot);
+                    } else {
+                        // One slot bound to two variables — `:kinds ?x ; :kinds
+                        // ?y`, or `:sections ?s1` here and `:sections ?s2` in a
+                        // sibling OPTIONAL — is a self-join over the slot's
+                        // values. Every variable is kept, so the path walk
+                        // reaches what each one introduces (a variable dropped
+                        // here was never walked, and its own triples were then
+                        // refused as untyped), but the plan cannot say it:
+                        // `slot_variables` holds one variable per slot and a
+                        // path binding does not name the element it reads, so
+                        // two reads of one array look like one. Honestly
+                        // inexact, and the engine finishes the query.
+                        let variables = builder.object_variables.entry(slot_name).or_default();
+                        if !variables.iter().any(|known| known == v.as_str()) {
+                            variables.push(v.as_str().to_owned());
+                            if variables.len() > 1 {
+                                record_loss(Inexact::DuplicateSlotBinding);
+                            }
                         }
-                        _ => {
-                            builder
-                                .object_variables
-                                .insert(slot_name, v.as_str().to_owned());
-                            unconsumed.remove(&index);
-                            builder.claimed.push(index);
-                        }
+                        // Each variable is as optional as its own read: the
+                        // slot's depth is the shallowest of all of them.
+                        let own = builder
+                            .variable_depth
+                            .entry(v.as_str().to_owned())
+                            .or_insert(usize::MAX);
+                        *own = (*own).min(*depth);
+                        unconsumed.remove(&index);
+                        builder.claimed.push(index);
                     }
                 }
                 // Inline NamedNode constant: `?s :foo <uri>` →
@@ -2091,7 +2103,13 @@ fn scope_qualified(
             // above. FILTER(...)/VALUES filters from Phase 3 are merged
             // in below.
             filters: inline_filters,
-            slot_variables: builder.object_variables.clone(),
+            // One variable per slot: the first. A second is a self-join the
+            // plan records as inexact (`DuplicateSlotBinding`).
+            slot_variables: builder
+                .object_variables
+                .iter()
+                .filter_map(|(slot, vars)| vars.first().map(|var| (slot.clone(), var.clone())))
+                .collect(),
         });
     }
 
@@ -2129,9 +2147,7 @@ fn scope_qualified(
         if !var_to_class.contains_key(&builder.variable) {
             continue;
         }
-        let mut sorted_slots: Vec<(&String, &String)> = builder.object_variables.iter().collect();
-        sorted_slots.sort_by(|a, b| a.0.cmp(b.0));
-        for (slot_name, obj_var) in sorted_slots {
+        for (slot_name, obj_var) in builder.object_pairs() {
             if var_to_class.contains_key(obj_var) {
                 // A join edge says "this slot holds the other class's URI".
                 // That is only true of a *reference*: an inlined slot holds the
@@ -2280,9 +2296,8 @@ fn scope_qualified(
                     .chain(discarded_claims.iter().copied())
                     .flat_map(|builder| {
                         builder
-                            .object_variables
-                            .values()
-                            .map(move |object| (builder.variable.as_str(), object.as_str()))
+                            .object_pairs()
+                            .map(move |(_, object)| (builder.variable.as_str(), object.as_str()))
                     }),
             )
             .collect();
@@ -2311,7 +2326,7 @@ fn scope_qualified(
         if !var_to_class.contains_key(&builder.variable) {
             continue;
         }
-        for (slot_name, obj_var) in &builder.object_variables {
+        for (slot_name, obj_var) in builder.object_pairs() {
             if !var_to_class.contains_key(obj_var) {
                 // obj_var is a value variable (not another star's subject)
                 var_to_field.insert(
@@ -2641,7 +2656,7 @@ fn scope_qualified(
         let represented = (discarded.inline_filters.is_empty()
             || carried_constants.contains(&discarded.variable))
             && discarded.type_iri.is_none()
-            && discarded.object_variables.values().all(|var| {
+            && discarded.object_pairs().all(|(_, var)| {
                 // A leaf comes back as a path binding. An *intermediate* node
                 // deliberately does not — it serialises as a blank node, so the
                 // walk records it as a step and keeps going — and the paths that
@@ -2679,7 +2694,7 @@ fn scope_qualified(
     let mut bound_once: HashSet<&String> = HashSet::new();
     let mut bound_twice = false;
     for builder in star_map.values() {
-        for object_var in builder.object_variables.values() {
+        for (_, object_var) in builder.object_pairs() {
             if var_to_class.contains_key(object_var) {
                 // A typed object variable is a join edge, which the plan does
                 // carry.
@@ -2775,7 +2790,14 @@ struct StarBuilder {
     /// referenced on this subject.
     slot_depth: HashMap<String, usize>,
     /// Map: slot_name → object variable name (for join detection + filters).
-    object_variables: HashMap<String, String>,
+    ///
+    /// Several variables on one slot is a self-join over its values; they are
+    /// kept in the order the query wrote them, slots in name order.
+    object_variables: BTreeMap<String, Vec<String>>,
+    /// Variable → the shallowest OPTIONAL depth at which a triple of this star
+    /// binds it as an object. Needed because `slot_depth` is per slot, and two
+    /// variables on one slot can sit in different blocks.
+    variable_depth: HashMap<String, usize>,
     /// Filters extracted from triples whose object is an inline literal
     /// or NamedNode (e.g. `?s :hasName "X"` or `?s :foo <some/uri>`).
     /// Only collected at OPTIONAL depth 0 — inside an OPTIONAL block
@@ -2788,6 +2810,15 @@ struct StarBuilder {
     /// still be discarded, and its triples are then represented by nothing
     /// unless the path walk picks them up. Kept so they can be handed back.
     claimed: Vec<usize>,
+}
+
+impl StarBuilder {
+    /// Every `(slot, object variable)` pair, slots in name order.
+    fn object_pairs(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.object_variables
+            .iter()
+            .flat_map(|(slot, vars)| vars.iter().map(move |var| (slot, var)))
+    }
 }
 
 /// Resolve the LinkML class (and identifier slot name) for one star.
@@ -5004,10 +5035,7 @@ fn walk_paths(
         }
     }
 
-    let mut slots: Vec<(&String, &String)> = builder.object_variables.iter().collect();
-    slots.sort_by(|a, b| a.0.cmp(b.0));
-
-    for (slot_name, object_var) in slots {
+    for (slot_name, object_var) in builder.object_pairs() {
         // The class's own O(1) name index rather than a scan. It hands back an
         // owned SlotView, which this did not need before — worth it for a wide
         // class (TunnelComplex has 95 slots), a wash for a narrow one.
@@ -5019,10 +5047,13 @@ fn walk_paths(
 
         let mut path = path_so_far.to_vec();
         path.push(slot_name.clone());
-        let hop_optional = builder
-            .slot_depth
-            .get(slot_name)
-            .is_some_and(|depth| *depth > 0);
+        // The slot's shallowest read, unless several variables share it: then
+        // each is as optional as its own read.
+        let hop_depth = match builder.object_variables.get(slot_name) {
+            Some(vars) if vars.len() > 1 => builder.variable_depth.get(object_var),
+            _ => builder.slot_depth.get(slot_name),
+        };
+        let hop_optional = hop_depth.is_some_and(|depth| *depth > 0);
         let hop_multivalued = slot.determine_slot_container_mode()
             != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
 
@@ -5199,8 +5230,7 @@ fn untyped_subject_refusal(
         let class_uri = var_to_class.get(&builder.variable)?;
         let class = schema_view.get_class_by_uri(class_uri).ok().flatten()?;
         builder
-            .object_variables
-            .iter()
+            .object_pairs()
             .find(|(_, object_var)| object_var.as_str() == var)
             .and_then(|(slot_name, _)| {
                 let slot = class.slot(&Identifier::Name(slot_name.clone()))?;
@@ -5235,18 +5265,15 @@ fn untyped_subject_refusal(
             let Some(class_uri) = var_to_class.get(&builder.variable) else {
                 return false;
             };
-            builder
-                .object_variables
-                .iter()
-                .any(|(slot_name, object_var)| {
-                    object_var == var
-                        && schema_view
-                            .get_class_by_uri(class_uri)
-                            .ok()
-                            .flatten()
-                            .and_then(|cv| cv.slot(&Identifier::Name(slot_name.clone())))
-                            .is_some_and(|slot| slot.get_range_class().is_none())
-                })
+            builder.object_pairs().any(|(slot_name, object_var)| {
+                object_var == var
+                    && schema_view
+                        .get_class_by_uri(class_uri)
+                        .ok()
+                        .flatten()
+                        .and_then(|cv| cv.slot(&Identifier::Name(slot_name.clone())))
+                        .is_some_and(|slot| slot.get_range_class().is_none())
+            })
         });
     if is_value {
         return ScopeError::Unscoped {
@@ -5327,8 +5354,7 @@ fn holder_candidates(
         return Vec::new();
     };
     let mut typed_slots: Vec<(&String, &String)> = builder
-        .object_variables
-        .iter()
+        .object_pairs()
         .filter_map(|(slot, object_var)| var_to_class.get(object_var).map(|class| (slot, class)))
         .collect();
     typed_slots.sort();
@@ -8938,6 +8964,158 @@ classes:
                 && msg.contains("Add `?t a <https://data.infrabel.be/asset360/Track>`"),
             "{msg}"
         );
+    }
+
+    /// Two sibling OPTIONALs through the same inline list (#553): each
+    /// variable on the slot is walked, so the values below it are paths and the
+    /// query is no longer refused as untyped. The two reads pair the list with
+    /// itself, which a path binding (it names a slot path, not an element)
+    /// cannot say: the plan stays inexact and the engine finishes. And each
+    /// variable is as optional as *its own* block -- a mandatory first read
+    /// must not make the second one required.
+    #[test]
+    fn two_reads_of_one_inline_list_are_walked_and_inexact() {
+        let sv = asset360_fixture_schema_view();
+        let both_optional = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex . \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a } \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }",
+            &sv,
+        )
+        .unwrap();
+        assert_eq!(
+            both_optional.inexact,
+            Some(Inexact::DuplicateSlotBinding),
+            "{:?}",
+            both_optional.unconsumed
+        );
+        assert!(
+            both_optional.untyped.is_empty(),
+            "{:?}",
+            both_optional.untyped
+        );
+        for (var, slot) in [("a", "hasSequenceNumber"), ("b", "hasSequenceNumber")] {
+            let binding = &both_optional.path_bindings[var];
+            assert_eq!(
+                binding.slot_path,
+                vec!["hasCoveredSection".to_owned(), slot.to_owned()]
+            );
+            assert!(binding.optional, "{var}");
+        }
+
+        let first_mandatory = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex ; \
+                 asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a . \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }",
+            &sv,
+        )
+        .unwrap();
+        assert!(!first_mandatory.path_bindings["a"].optional);
+        assert!(first_mandatory.path_bindings["b"].optional);
+        assert_eq!(first_mandatory.inexact, Some(Inexact::DuplicateSlotBinding));
+    }
+
+    /// Nothing is lost on the way: the refined plan is accepted and every
+    /// rewrite the rules make still answers what the oracle does -- over a
+    /// complex with two sections, one with none, and one with a single one.
+    #[test]
+    fn two_reads_of_one_inline_list_agree_with_the_oracle() {
+        use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+        use crate::sparql_oracle::Oracle;
+        use crate::sparql_rules::{Rule, tier_one_rules};
+
+        let sv = asset360_fixture_schema_view();
+        let oracle = Oracle::new(
+            &sv,
+            &[
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/1", "typeURI": "https://example.org/TC",
+                        "hasCoveredSection": [
+                          {"hasSequenceNumber": 1}, {"hasSequenceNumber": 2}]}"#,
+                ),
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/2", "typeURI": "https://example.org/TC"}"#,
+                ),
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/3", "typeURI": "https://example.org/TC",
+                        "hasCoveredSection": [{"hasSequenceNumber": 7}]}"#,
+                ),
+            ],
+        );
+        let rules = tier_one_rules(&sv, None);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let query = "SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex . \
+             OPTIONAL { ?s asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a } \
+             OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }";
+        each_rewrite_preserves_answers(query, &sv, &oracle, &borrowed);
+
+        let plan = crate::sparql_plan::plan_query_refined(
+            &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+            &sv,
+        )
+        .unwrap();
+        // The refined plan reads each block as a scope of its own, one unnest
+        // per block, left-joined on the identity: independent reads of the
+        // list, which *is* the cross product the query asks for. SQL answers
+        // alone, with no engine step to pair them.
+        assert!(plan.sql_only(), "{plan}");
+        assert_eq!(
+            plan.to_string()
+                .matches("unnest    hasCoveredSection")
+                .count(),
+            2
+        );
+    }
+
+    /// The advice for an untyped second read must not lead to another refusal
+    /// (#553): the typed spelling is no longer "disconnected", because the
+    /// triple that introduces the variable counts as sharing it.
+    #[test]
+    fn a_typed_second_read_is_not_refused_as_disconnected() {
+        let sv = asset360_fixture_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex . \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a } \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 a asset360:CoveredSection ; \
+                          asset360:hasSequenceNumber ?b } }",
+            &sv,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// The same shape through a keyed-map inline slot (`documents`): two
+    /// sibling OPTIONALs, and a mandatory read beside an optional one.
+    #[test]
+    fn two_reads_of_one_keyed_map_agree_with_the_oracle() {
+        use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+        use crate::sparql_rules::{Rule, tier_one_rules};
+
+        let sv = test_schema_view();
+        let oracle = crate::sparql_oracle::fixture(&sv);
+        let rules = tier_one_rules(&sv, None);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        for query in [
+            "SELECT ?s ?t1 ?t2 WHERE { ?s a asset360:Signal . \
+               OPTIONAL { ?s asset360:documents ?d1 . ?d1 asset360:title ?t1 } \
+               OPTIONAL { ?s asset360:documents ?d2 . ?d2 asset360:title ?t2 } }",
+            "SELECT ?s ?t1 ?t2 WHERE { ?s a asset360:Signal ; asset360:documents ?d1 . \
+               ?d1 asset360:title ?t1 . \
+               OPTIONAL { ?s asset360:documents ?d2 . ?d2 asset360:title ?t2 } }",
+        ] {
+            each_rewrite_preserves_answers(query, &sv, &oracle, &borrowed);
+            let plan = sparql_scope(
+                &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+                &sv,
+            )
+            .unwrap();
+            assert_eq!(plan.inexact, Some(Inexact::DuplicateSlotBinding), "{query}");
+        }
     }
 
     /// Two schemas, two datamodel prefixes — the shape `irsm:` has in
