@@ -530,10 +530,7 @@ classes:
     /// A dataset whose default graph is data of regime `data` and which serves
     /// `G` as a schema graph publishing `graph`.
     fn serving(data: TypeRegime, graph: TypeRegime) -> DatasetSpec {
-        DatasetSpec::builder(data)
-            .with_schema_graph(G, graph)
-            .build()
-            .expect("a valid dataset")
+        crate::sparql_dataset::dataset_with(data, &[], &[(G, graph)])
     }
 
     #[test]
@@ -570,12 +567,11 @@ classes:
     fn a_from_clause_hides_the_schema_graph_and_the_rule_declines() {
         const A: &str = "urn:graph:a";
         let sv = schema_view();
-        let dataset =
-            DatasetSpec::builder(crate::sparql_dataset::DefaultGraph::DataGraph(A.into()))
-                .with_data_graph(A, TypeRegime::IS_A)
-                .with_schema_graph(G, TypeRegime::IS_A)
-                .build()
-                .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeRegime::IS_A,
+            &[(A, TypeRegime::IS_A)],
+            &[(G, TypeRegime::IS_A)],
+        );
         let with_clause = |clause: &str| {
             canonical(G).replace(
                 "SELECT ?s ?t WHERE",
@@ -750,11 +746,14 @@ classes:
         const ASSERTED: &str = "https://example.org/schema/asserted";
         let sv = schema_view();
         let both = |data| {
-            DatasetSpec::builder(data)
-                .with_schema_graph(INFERRED_MIXINS, TypeRegime::IS_A_AND_MIXINS)
-                .with_schema_graph(ASSERTED, TypeRegime::ASSERTED)
-                .build()
-                .expect("a valid dataset")
+            crate::sparql_dataset::dataset_with(
+                data,
+                &[],
+                &[
+                    (INFERRED_MIXINS, TypeRegime::IS_A_AND_MIXINS),
+                    (ASSERTED, TypeRegime::ASSERTED),
+                ],
+            )
         };
         let (fired, plan) = refined(&sv, &both(TypeRegime::IS_A), &canonical(INFERRED_MIXINS));
         assert!(fired && plan.contains("directType"), "{plan}");

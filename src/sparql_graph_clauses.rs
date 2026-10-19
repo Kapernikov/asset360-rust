@@ -192,7 +192,7 @@ pub fn schema_graphs_read_in(
     read.into_iter().collect()
 }
 
-/// A query that reads more than one data regime: what it read, as text.
+/// A query that reads more than one data graph: what it read, as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrossDataGraph {
     /// The graphs the query read, each as it would be written in the query
@@ -200,72 +200,128 @@ pub(crate) struct CrossDataGraph {
     pub(crate) graphs: Vec<String>,
 }
 
-/// **The query's one data regime**, or the refusal that it has several.
+/// Where a query reads its records: **at most one named data graph**, and the
+/// regime they are read under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DataRead {
+    /// The data graph the query reads, if it reads one by name. `None`: it
+    /// reads the default graph only (or no record at all).
+    pub(crate) graph: Option<String>,
+    /// The regime the records are read under: the graph's if there is one,
+    /// else the dataset's default.
+    pub(crate) regime: TypeRegime,
+}
+
+/// **The query's one data graph**, or the refusal that it reads several.
 ///
-/// The engine loads the records of one regime flat into its default graph
-/// (`WriteOptions::flat(regime)`), so a query it answers reads the records
-/// under exactly one regime. A graph `G` of the dataset holds the triples of
-/// `flat(regime of G)` over the records (that is what the data graph *is*), so
-/// a query whose every data read is under one regime reads the same triples
-/// whether the engine names the graph or reads its default graph.
+/// A query reads at most one named data graph `G` (through `FROM`, `FROM
+/// NAMED` or `GRAPH <G>`), plus the default graph, plus any schema graphs. The
+/// engine writes the records into `G` (or into its default graph, if the query
+/// names none) and oxigraph evaluates `GRAPH`, `FROM` and `FROM NAMED` over
+/// them as written; nothing is rewritten.
+///
+/// The default graph beside `G` is allowed only when `G` holds what the default
+/// graph holds, that is when their regimes are equal (the default graph is then
+/// an alias of `G`'s content); otherwise the query reads two regimes of the
+/// same records, which no one store graph can show.
 ///
 /// What the query reads, per SPARQL 1.1 13.2 (the same reads as
 /// [`QueryGraphs::default_reads`] and [`QueryGraphs::graph_reads`]):
 ///
 /// * a pattern outside any `GRAPH` reads the default graph: the dataset's, or
-///   the data graphs a `FROM` names;
+///   the `FROM` graphs when the query writes any;
 /// * a pattern inside `GRAPH <data graph>` reads that graph, unless the
 ///   query's `FROM NAMED` leaves it out (then it reads nothing);
-/// * a pattern inside `GRAPH ?g` reads every named graph, so while the
-///   dataset serves data graphs (and the query has no dataset clause to
-///   narrow them away) it can read several: refused;
-/// * a data graph in `FROM NAMED`: refused;
-/// * `FROM` over data graphs of different regimes: refused.
-///
-/// A data graph beside schema graphs is one regime. A query that reads no data
-/// at all (a datamodel question) has the regime of its default graph.
-pub(crate) fn single_data_regime(
+/// * a pattern inside `GRAPH ?g` reads every named graph: the `FROM NAMED`
+///   list when the query writes a dataset clause (refused when that lists more
+///   than one data graph), every served graph otherwise (refused while the
+///   dataset serves a data graph).
+pub(crate) fn single_data_graph(
     query: &spargebra::Query,
     dataset: &DatasetSpec,
-) -> Result<TypeRegime, CrossDataGraph> {
-    use crate::sparql_dataset::{GraphReads, QueryGraphs};
+) -> Result<DataRead, CrossDataGraph> {
     use spargebra::algebra::GraphPattern;
     use spargebra::term::NamedNodePattern;
 
-    /// Which graph the walk is in, as far as the regime question goes.
+    /// Which graph the walk is in, as far as the records go.
     #[derive(Clone)]
     enum Reading {
         /// The default graph.
         Default,
-        /// A data graph: its regime and how the query would write it.
-        Data(TypeRegime, String),
+        /// A data graph.
+        Data(String),
         /// Anything that is no data graph, which reads no record.
         NoData,
     }
 
     struct Walk<'a> {
-        graphs: &'a QueryGraphs<'a>,
         dataset: &'a DatasetSpec,
-        /// What the default graph reads, when it is data.
-        default: Option<(TypeRegime, String)>,
-        /// Whether `GRAPH ?g` ranges over the dataset's whole set of named
-        /// graphs (the query writes no dataset clause).
-        variable_sees_every_graph: bool,
-        read: Vec<(TypeRegime, String)>,
+        clause: Option<&'a spargebra::algebra::QueryDataset>,
+        /// Whether a pattern read the dataset's default graph.
+        default_read: bool,
+        /// The named data graphs read, in the order they were met.
+        named: Vec<String>,
         refusal: Option<CrossDataGraph>,
     }
 
     impl Walk<'_> {
         fn record(&mut self, reading: &Reading) {
-            let found = match reading {
-                Reading::Default => self.default.clone(),
-                Reading::Data(regime, label) => Some((*regime, label.clone())),
-                Reading::NoData => None,
+            let graphs: Vec<String> = match reading {
+                Reading::Default => match self.clause {
+                    None => {
+                        self.default_read = true;
+                        Vec::new()
+                    }
+                    Some(clause) => clause
+                        .default
+                        .iter()
+                        .map(|graph| graph.as_str().to_owned())
+                        .filter(|iri| self.dataset.data_regime(iri).is_some())
+                        .collect(),
+                },
+                Reading::Data(iri) => vec![iri.clone()],
+                Reading::NoData => Vec::new(),
             };
-            if let Some(found) = found
-                && !self.read.contains(&found)
-            {
-                self.read.push(found);
+            for iri in graphs {
+                if !self.named.contains(&iri) {
+                    self.named.push(iri);
+                }
+            }
+        }
+
+        /// What `GRAPH ?g` reads.
+        fn variable(&mut self, name: &NamedNodePattern) -> Reading {
+            let candidates: Vec<String> = match self.clause {
+                // A dataset clause names the graphs a `GRAPH` can reach.
+                Some(clause) => clause
+                    .named
+                    .iter()
+                    .flatten()
+                    .map(|graph| graph.as_str().to_owned())
+                    .filter(|iri| self.dataset.data_regime(iri).is_some())
+                    .collect(),
+                None => self
+                    .dataset
+                    .data_graphs()
+                    .map(|(iri, _)| iri.to_owned())
+                    .collect(),
+            };
+            match candidates.as_slice() {
+                [] => Reading::NoData,
+                [one] if self.clause.is_some() => Reading::Data(one.clone()),
+                _ => {
+                    if self.refusal.is_none() {
+                        let served: Vec<String> =
+                            candidates.iter().map(|iri| format!("<{iri}>")).collect();
+                        self.refusal = Some(CrossDataGraph {
+                            graphs: vec![format!(
+                                "GRAPH {name}, which ranges over the data graphs {}",
+                                served.join(", ")
+                            )],
+                        });
+                    }
+                    Reading::NoData
+                }
             }
         }
 
@@ -283,32 +339,23 @@ pub(crate) fn single_data_regime(
                 GraphPattern::Graph { name, inner } => {
                     let inside = match name {
                         NamedNodePattern::NamedNode(graph) => {
-                            match self.graphs.graph_reads(graph.as_str()) {
-                                GraphReads::Data(regime) => {
-                                    Reading::Data(regime, format!("<{}>", graph.as_str()))
-                                }
-                                _ => Reading::NoData,
+                            let iri = graph.as_str();
+                            // Under `FROM NAMED` a graph outside the list
+                            // matches nothing.
+                            let visible = self.clause.is_none_or(|clause| {
+                                clause
+                                    .named
+                                    .iter()
+                                    .flatten()
+                                    .any(|named| named.as_str() == iri)
+                            });
+                            if visible && self.dataset.data_regime(iri).is_some() {
+                                Reading::Data(iri.to_owned())
+                            } else {
+                                Reading::NoData
                             }
                         }
-                        NamedNodePattern::Variable(_) => {
-                            if self.variable_sees_every_graph
-                                && !self.dataset.graph_variable_is_schema_only()
-                                && self.refusal.is_none()
-                            {
-                                let served: Vec<String> = self
-                                    .dataset
-                                    .data_graphs()
-                                    .map(|(iri, _)| format!("<{iri}>"))
-                                    .collect();
-                                self.refusal = Some(CrossDataGraph {
-                                    graphs: vec![format!(
-                                        "GRAPH {name}, which ranges over the data graphs {}",
-                                        served.join(", ")
-                                    )],
-                                });
-                            }
-                            Reading::NoData
-                        }
+                        NamedNodePattern::Variable(_) => self.variable(name),
                     };
                     self.walk(inner, &inside);
                 }
@@ -337,56 +384,6 @@ pub(crate) fn single_data_regime(
         }
     }
 
-    let clause = crate::sparql_scoper::dataset_of(query);
-    let graphs = QueryGraphs::view(dataset, clause);
-
-    // The default graph: the dataset's, or what a `FROM` makes of it.
-    let default = match clause {
-        None => Some((
-            dataset.default_regime(),
-            dataset
-                .default_graph()
-                .map(|iri| format!("<{iri}>"))
-                .unwrap_or_else(|| "the default graph".to_owned()),
-        )),
-        Some(clause) => {
-            if let Some(named) = clause
-                .named
-                .iter()
-                .flatten()
-                .find(|graph| dataset.data_regime(graph.as_str()).is_some())
-            {
-                return Err(CrossDataGraph {
-                    graphs: vec![format!("FROM NAMED <{}>", named.as_str())],
-                });
-            }
-            let from: Vec<(TypeRegime, String)> = clause
-                .default
-                .iter()
-                .filter_map(|graph| {
-                    dataset
-                        .data_regime(graph.as_str())
-                        .map(|regime| (regime, format!("<{}>", graph.as_str())))
-                })
-                .collect();
-            match from.first() {
-                Some((first, _)) if from.iter().any(|(regime, _)| regime != first) => {
-                    return Err(CrossDataGraph {
-                        graphs: from.into_iter().map(|(_, label)| label).collect(),
-                    });
-                }
-                Some((first, _)) => Some((
-                    *first,
-                    from.iter()
-                        .map(|(_, label)| label.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )),
-                None => None,
-            }
-        }
-    };
-
     let pattern = match query {
         spargebra::Query::Select { pattern, .. }
         | spargebra::Query::Construct { pattern, .. }
@@ -394,27 +391,45 @@ pub(crate) fn single_data_regime(
         | spargebra::Query::Ask { pattern, .. } => pattern,
     };
     let mut walk = Walk {
-        graphs: &graphs,
         dataset,
-        default: default.clone(),
-        variable_sees_every_graph: clause.is_none(),
-        read: Vec::new(),
+        clause: crate::sparql_scoper::dataset_of(query),
+        default_read: false,
+        named: Vec::new(),
         refusal: None,
     };
     walk.walk(pattern, &Reading::Default);
     if let Some(refusal) = walk.refusal {
         return Err(refusal);
     }
-    match walk.read.first() {
-        Some((first, _)) if walk.read.iter().any(|(regime, _)| regime != first) => {
-            Err(CrossDataGraph {
-                graphs: walk.read.into_iter().map(|(_, label)| label).collect(),
+    let labels = |walk: &Walk<'_>| -> Vec<String> {
+        let default = walk.default_read.then(|| "the default graph".to_owned());
+        default
+            .into_iter()
+            .chain(walk.named.iter().map(|iri| format!("<{iri}>")))
+            .collect()
+    };
+    match walk.named.as_slice() {
+        [] => Ok(DataRead {
+            graph: None,
+            regime: dataset.default_regime(),
+        }),
+        [graph] => {
+            let regime = dataset
+                .data_regime(graph)
+                .expect("only data graphs are recorded");
+            if walk.default_read && regime != dataset.default_regime() {
+                return Err(CrossDataGraph {
+                    graphs: labels(&walk),
+                });
+            }
+            Ok(DataRead {
+                graph: Some(graph.clone()),
+                regime,
             })
         }
-        Some((first, _)) => Ok(*first),
-        None => Ok(default
-            .map(|(regime, _)| regime)
-            .unwrap_or_else(|| dataset.default_regime())),
+        _ => Err(CrossDataGraph {
+            graphs: labels(&walk),
+        }),
     }
 }
 
@@ -531,7 +546,10 @@ pub fn reads_only_the_schema_graph(
     // that can bind nothing else. Any other constant graph names something the
     // endpoint does not serve, and a query reading only that has no scope and
     // no answer here -- which is what the unscoped refusal already says.
-    let graphs = QueryGraphs::view(dataset, crate::sparql_scoper::dataset_of(&parsed));
+    // A query that reads several data graphs is refused elsewhere.
+    let Ok(graphs) = QueryGraphs::new(dataset, &parsed) else {
+        return false;
+    };
     let reads_the_schema_graph = |name: &NamedNodePattern| match name {
         NamedNodePattern::NamedNode(node) => {
             graphs.graph_reads(node.as_str()) == GraphReads::Schema
@@ -568,7 +586,7 @@ mod tests {
     fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
         let dataset = match schema_graph_iri {
             Some(iri) => crate::sparql_dataset::schema_dataset(iri),
-            None => crate::sparql_dataset::DatasetSpec::asserted(),
+            None => crate::sparql_dataset::default_dataset().clone(),
         };
         super::reads_only_the_schema_graph(query, &test_schema_view(), &dataset)
     }
@@ -731,18 +749,19 @@ mod tests {
     fn a_graph_variable_is_schema_only_until_a_data_graph_is_served() {
         use linkml_runtime::schema_rdf::TypeRegime;
         let schema_view = test_schema_view();
-        let only_schema = crate::sparql_dataset::DatasetSpec::builder(
+        let only_schema = crate::sparql_dataset::dataset_with(
             linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-        )
-        .with_schema_graph(SCHEMA_GRAPH, TypeRegime::ASSERTED)
-        .build()
-        .expect("a valid dataset");
-        let with_data = crate::sparql_dataset::DatasetSpec::builder(TypeRegime::ASSERTED)
-            .with_schema_graph(SCHEMA_GRAPH, TypeRegime::ASSERTED)
-            .with_data_graph("urn:graph:inferred", TypeRegime::IS_A)
-            .with_schema_graph("urn:graph:schema-inferred", TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+            &[],
+            &[(SCHEMA_GRAPH, TypeRegime::ASSERTED)],
+        );
+        let with_data = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[("urn:graph:inferred", TypeRegime::IS_A)],
+            &[
+                (SCHEMA_GRAPH, TypeRegime::ASSERTED),
+                ("urn:graph:schema-inferred", TypeRegime::IS_A),
+            ],
+        );
         let variable = "SELECT ?c WHERE { GRAPH ?g { ?c ?p ?o } }";
         assert!(super::reads_only_the_schema_graph(
             variable,

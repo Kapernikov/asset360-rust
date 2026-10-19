@@ -304,19 +304,34 @@ pub struct ExecutionPlan {
     /// schema graphs a finish query may read were decided under it, so
     /// [`crate::sparql_executor::sparql_finish`] reads it from here rather than
     /// being handed a second one that could disagree.
-    pub dataset: DatasetSpec,
+    pub(crate) dataset: DatasetSpec,
     /// The query the plan answers, as the planner read it: parsed and with
     /// every slot and class spelled canonically. What the engine evaluates
     /// ([`crate::sparql_executor::sparql_execute_plan`]), so the planned query
     /// and the evaluated one cannot be two.
-    pub query: Query,
+    pub(crate) query: Query,
     /// The one regime the query reads its records under (a query cannot read
-    /// two, see [`crate::sparql_graph_clauses::single_data_regime`]): the
+    /// two, see [`crate::sparql_graph_clauses::single_data_graph`]): the
     /// engine loads the fetched records flat under it.
-    pub data_regime: linkml_runtime::schema_rdf::TypeRegime,
+    pub(crate) data_regime: linkml_runtime::schema_rdf::TypeRegime,
 }
 
 impl ExecutionPlan {
+    /// The dataset the plan was made for.
+    pub fn dataset(&self) -> &DatasetSpec {
+        &self.dataset
+    }
+
+    /// The query the plan answers, parsed and canonicalised.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    /// The regime the query reads its records under.
+    pub fn data_regime(&self) -> linkml_runtime::schema_rdf::TypeRegime {
+        self.data_regime
+    }
+
     /// Whether every obligation has a pass to enforce it.
     ///
     /// False means the plan answers a *different* question than the one asked,
@@ -1956,8 +1971,9 @@ pub(crate) fn rows_placement(
         refinement: Refinement::UsedRows(note),
         dataset: dataset.clone(),
         query: parsed.clone(),
-        data_regime: crate::sparql_graph_clauses::single_data_regime(parsed, dataset)
-            .map_err(|error| ScopeError::from(error).to_string())?,
+        data_regime: crate::sparql_graph_clauses::single_data_graph(parsed, dataset)
+            .map_err(|error| ScopeError::from(error).to_string())?
+            .regime,
     };
     Ok(RowsPlacement {
         plan,
@@ -3464,13 +3480,14 @@ classes:
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
-        let dataset = crate::sparql_dataset::DatasetSpec::builder(
+        let dataset = crate::sparql_dataset::dataset_with(
             linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-        )
-        .with_data_graph(A, linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
-        .with_data_graph(I, linkml_runtime::schema_rdf::TypeRegime::IS_A)
-        .build()
-        .expect("a valid dataset");
+            &[
+                (A, linkml_runtime::schema_rdf::TypeRegime::ASSERTED),
+                (I, linkml_runtime::schema_rdf::TypeRegime::IS_A),
+            ],
+            &[],
+        );
         let body = "?s a asset360:Signal ; asset360:name ?nm . FILTER(?nm > \"A\") \
                     FILTER(REGEX(STR(?s), \"^x\"))";
         let finish_of = |query: String| {
@@ -3539,7 +3556,7 @@ classes:
     #[test]
     fn the_refined_plan_text_prints_the_refusal_production_gives() {
         let sv = test_schema_view();
-        let dataset = crate::sparql_dataset::DatasetSpec::asserted();
+        let dataset = crate::sparql_dataset::default_dataset().clone();
         let query =
             format!("{PREFIX}SELECT ?lo WHERE {{ ?c a asset360:Track ; asset360:longitude ?lo }}");
         let production = plan_of(&query, &sv, &dataset).expect_err("refused");
@@ -3555,12 +3572,11 @@ classes:
     #[test]
     fn from_named_alone_plans_an_empty_default_graph() {
         let sv = test_schema_view();
-        let dataset = crate::sparql_dataset::DatasetSpec::builder(
+        let dataset = crate::sparql_dataset::dataset_with(
             linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-        )
-        .with_data_graph("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
-        .build()
-        .expect("a valid dataset");
+            &[("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::ASSERTED)],
+            &[],
+        );
         let query = format!(
             "{PREFIX}SELECT ?s ?nm FROM NAMED <urn:g:other> WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm }}"
@@ -3584,18 +3600,13 @@ classes:
         )
         .expect("should plan");
         assert!(plain.sql_only(), "{plain}");
-        // A data graph in `FROM NAMED` is a second data read of the query:
-        // refused by name, like every read of more than one data graph.
-        let refused = plan_of(
+        // A data graph in `FROM NAMED` that nothing reads is no data read.
+        plan_of(
             &format!("{PREFIX}SELECT ?s FROM NAMED <urn:g:a> WHERE {{ ?s a asset360:Signal }}"),
             &sv,
             &dataset,
         )
-        .expect_err("a data graph in FROM NAMED");
-        assert!(
-            refused.to_string().starts_with("cross_data_graph: "),
-            "{refused}"
-        );
+        .expect("should plan");
     }
 
     /// A statement that does not answer alone hands the engine its rows when
@@ -4249,7 +4260,7 @@ classes:
             }],
             residual: vec![1],
             refinement: Refinement::Used(None),
-            dataset: DatasetSpec::asserted(),
+            dataset: crate::sparql_dataset::default_dataset().clone(),
             query: parse_query("SELECT * WHERE { ?s ?p ?o }", None).unwrap(),
             data_regime: linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
         };
@@ -4439,7 +4450,7 @@ classes:
             }],
             residual: Vec::new(),
             refinement: Refinement::UsedAlone("hand-built".to_owned()),
-            dataset: DatasetSpec::asserted(),
+            dataset: crate::sparql_dataset::default_dataset().clone(),
             query: parsed.clone(),
             data_regime: scoped.data_regime,
         };

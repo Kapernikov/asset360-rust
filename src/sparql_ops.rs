@@ -4378,9 +4378,7 @@ mod tests {
         sv: &SchemaView,
         regime: linkml_runtime::schema_rdf::TypeRegime,
     ) -> Result<OpTree, LoweringRefusal> {
-        let dataset = crate::sparql_dataset::DatasetSpec::builder(regime)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(regime, &[], &[]);
         let rules = crate::sparql_rules::tier_one_rules(sv, &dataset);
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();

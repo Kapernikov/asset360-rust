@@ -1428,14 +1428,14 @@ mod tests {
     /// restriction to be confused with.)
     #[test]
     fn a_restriction_carries_the_regime_of_the_scan_it_came_from() {
-        use crate::sparql_dataset::DatasetSpec;
         use linkml_runtime::schema_rdf::TypeRegime;
         const I: &str = "urn:graph:inferred";
         let schema = test_schema_view();
-        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
-            .with_data_graph(I, TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+            &[(I, TypeRegime::IS_A)],
+            &[],
+        );
         let query = format!(
             "{PREFIX}SELECT ?nm WHERE {{ \
              {{ SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }} ORDER BY ?s LIMIT 3 }} \

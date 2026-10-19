@@ -335,22 +335,29 @@ pub fn sparql_execute(
         .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
 
     // The planner's own refusal, from the same function: the records are
-    // loaded under one regime, so a query that reads two is refused here as
-    // it is by the plan.
-    let regime =
-        crate::sparql_graph_clauses::single_data_regime(&parsed, dataset).map_err(|e| {
-            ExecuteError::QueryError(crate::sparql_scoper::ScopeError::from(e).to_string())
-        })?;
-    evaluate_over_records(parsed, regime, instances, schema_view, dataset, limits)
+    // loaded into one graph, so a query that reads two is refused here as it
+    // is by the plan.
+    let read = data_read_of(&parsed, dataset)?;
+    evaluate_over_records(parsed, read, instances, schema_view, dataset, limits)
+}
+
+/// The data graph a query reads, or the planner's refusal in its words.
+#[cfg(feature = "sparql-endpoint")]
+fn data_read_of(
+    query: &spargebra::Query,
+    dataset: &DatasetSpec,
+) -> Result<crate::sparql_graph_clauses::DataRead, ExecuteError> {
+    crate::sparql_graph_clauses::single_data_graph(query, dataset).map_err(|e| {
+        ExecuteError::QueryError(crate::sparql_scoper::ScopeError::from(e).to_string())
+    })
 }
 
 /// Execute the query a plan was made for against the records its SQL pass
-/// fetched, under the dataset and the one data regime the plan was made for.
+/// fetched, under the dataset the plan was made for.
 ///
-/// The plan carries all three (`ExecutionPlan::query`, `dataset`,
-/// `data_regime`), so the records route cannot read the records under one
-/// dataset and evaluate under another -- the mismatch [`sparql_finish`] avoids
-/// the same way. Everything else is as for [`sparql_execute`], which remains
+/// The plan carries the query and the dataset, so the records route cannot read
+/// the records under one dataset and evaluate under another -- the mismatch
+/// [`sparql_finish`] avoids the same way. Everything else is as for [`sparql_execute`], which remains
 /// the entry for a query that was not planned.
 #[cfg(feature = "sparql-endpoint")]
 pub fn sparql_execute_plan(
@@ -360,12 +367,13 @@ pub fn sparql_execute_plan(
     limits: ExecuteLimits,
 ) -> Result<SparqlAnswer, ExecuteError> {
     refuse_a_full_backlog(&limits)?;
+    let read = data_read_of(plan.query(), plan.dataset())?;
     evaluate_over_records(
-        plan.query.clone(),
-        plan.data_regime,
+        plan.query().clone(),
+        read,
         instances,
         schema_view,
-        &plan.dataset,
+        plan.dataset(),
         limits,
     )
 }
@@ -388,26 +396,66 @@ fn refuse_a_full_backlog(limits: &ExecuteLimits) -> Result<(), ExecuteError> {
     Ok(())
 }
 
-/// Load `instances` flat under `regime` and evaluate `parsed` (parsed and
-/// canonicalised) over them.
+/// Load `instances` flat under the query's regime and evaluate `parsed`
+/// (parsed and canonicalised) over them.
 ///
-/// **The records are where the query is told they are.** They go into the
-/// store's default graph, written with `WriteOptions::flat(regime)`. A data
-/// graph `G` of the dataset holds the triples of `flat(regime of G)` over the
-/// records -- that is what makes it a data graph -- and the query reads one
-/// data regime (`regime`), so for every data graph it names, `G`'s triples
-/// *are* the default graph's. The query is rewritten to say so
-/// ([`over_flat_records`]).
+/// **The records are where the query is told they are.** A query reads at most
+/// one named data graph `G` ([`crate::sparql_graph_clauses::single_data_graph`]),
+/// so the records are written, with `WriteOptions::flat(G's regime)`, into the
+/// store graph named `G` -- or into the default graph, when the query names
+/// none. oxigraph then evaluates `GRAPH`, `FROM` and `FROM NAMED` as written.
+/// The one thing the query leaves implicit is that its default graph is the
+/// dataset's: when the records are in `G` and the query writes no dataset
+/// clause, the evaluation's default graph is set to `G` (the query read the
+/// default graph only if `G`'s regime is the default regime).
 #[cfg(feature = "sparql-endpoint")]
 fn evaluate_over_records(
     mut parsed: spargebra::Query,
-    regime: linkml_runtime::schema_rdf::TypeRegime,
+    read: crate::sparql_graph_clauses::DataRead,
     instances: &[&LinkMLInstance],
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
     limits: ExecuteLimits,
 ) -> Result<SparqlAnswer, ExecuteError> {
-    let default_graphs = over_flat_records(&mut parsed, dataset);
+    use oxigraph::model::{GraphName, NamedNode};
+
+    let records_graph = match &read.graph {
+        Some(iri) => GraphName::NamedNode(
+            NamedNode::new(iri.as_str()).expect("an IRI the query parser accepted"),
+        ),
+        None => GraphName::DefaultGraph,
+    };
+    // A graph a clause names twice is one graph (the dataset is a set of
+    // graphs, SPARQL 1.1 13.2); the engine reads the lists as written, so
+    // `FROM <g> FROM <g>` would show every triple of `g` twice.
+    let (spargebra::Query::Select {
+        dataset: clause, ..
+    }
+    | spargebra::Query::Construct {
+        dataset: clause, ..
+    }
+    | spargebra::Query::Describe {
+        dataset: clause, ..
+    }
+    | spargebra::Query::Ask {
+        dataset: clause, ..
+    }) = &mut parsed;
+    if let Some(clause) = clause {
+        let once = |graphs: &mut Vec<NamedNode>| {
+            let mut seen = Vec::new();
+            graphs.retain(|graph| {
+                let new = !seen.contains(graph);
+                seen.push(graph.clone());
+                new
+            });
+        };
+        once(&mut clause.default);
+        clause.named.iter_mut().for_each(once);
+    }
+    let default_graphs = (read.graph.is_some()
+        && crate::sparql_scoper::dataset_of(&parsed).is_none())
+    .then(|| vec![records_graph.clone()]);
+    let regime = read.regime;
 
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
@@ -465,10 +513,12 @@ fn evaluate_over_records(
                 .rename_blank_nodes()
                 .for_slice(turtle_str.as_bytes())
             {
-                quads.push(quad.map_err(|e| ExecuteError::ConversionError {
+                let mut quad = quad.map_err(|e| ExecuteError::ConversionError {
                     object_uri: object_uri.clone(),
                     message: format!("Failed to load turtle into store: {e}"),
-                })?);
+                })?;
+                quad.graph_name = records_graph.clone();
+                quads.push(quad);
             }
         }
         store
@@ -539,196 +589,6 @@ fn insert_schema_graphs(
         }
     }
     Ok(())
-}
-
-/// Say in the query that the records are in the store's default graph.
-///
-/// The engine holds the records of one regime in its default graph, flat. A
-/// data graph `G` of the dataset holds `flat(regime of G)` over the records,
-/// and the query reads one data regime ([`crate::sparql_graph_clauses::single_data_regime`]),
-/// so every data graph the query names holds exactly what the default graph
-/// does. Two rewrites follow, and nothing else changes:
-///
-/// * `GRAPH <data graph> { P }` becomes `P`. It reads that graph; the
-///   triples are the default graph's. Only where the graph is *visible*
-///   (a `FROM NAMED` that leaves it out makes the clause match nothing, which
-///   is what the untouched clause says to the engine: the store has no graph
-///   of that name).
-/// * A `FROM` that lists data graphs reads the store's default graph in their
-///   place, beside whatever schema graphs it also lists. Returned as the list
-///   of graphs the evaluator takes as the default graph (the algebra's
-///   `FROM` cannot spell the store's default graph).
-///
-/// Schema graphs, graphs the endpoint does not serve and `GRAPH ?g` are left
-/// alone.
-#[cfg(feature = "sparql-endpoint")]
-fn over_flat_records(
-    query: &mut spargebra::Query,
-    dataset: &DatasetSpec,
-) -> Option<Vec<oxigraph::model::GraphName>> {
-    use oxigraph::model::{GraphName, NamedNode};
-    use spargebra::Query;
-    use spargebra::algebra::{Expression, GraphPattern};
-    use spargebra::term::NamedNodePattern;
-
-    let graphs =
-        crate::sparql_dataset::QueryGraphs::view(dataset, crate::sparql_scoper::dataset_of(query));
-    let is_data = |name: &NamedNodePattern| match name {
-        NamedNodePattern::NamedNode(graph) => matches!(
-            graphs.graph_reads(graph.as_str()),
-            crate::sparql_dataset::GraphReads::Data(_)
-        ),
-        NamedNodePattern::Variable(_) => false,
-    };
-
-    fn pattern(node: &mut GraphPattern, is_data: &dyn Fn(&NamedNodePattern) -> bool) {
-        while let GraphPattern::Graph { name, inner } = node
-            && is_data(name)
-        {
-            let inner = std::mem::replace(
-                inner.as_mut(),
-                GraphPattern::Bgp {
-                    patterns: Vec::new(),
-                },
-            );
-            *node = inner;
-        }
-        match node {
-            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
-            GraphPattern::Join { left, right }
-            | GraphPattern::Union { left, right }
-            | GraphPattern::Lateral { left, right }
-            | GraphPattern::Minus { left, right } => {
-                pattern(left, is_data);
-                pattern(right, is_data);
-            }
-            GraphPattern::LeftJoin {
-                left,
-                right,
-                expression,
-            } => {
-                pattern(left, is_data);
-                pattern(right, is_data);
-                if let Some(expression) = expression {
-                    in_expression(expression, is_data);
-                }
-            }
-            GraphPattern::Filter { expr, inner } => {
-                pattern(inner, is_data);
-                in_expression(expr, is_data);
-            }
-            GraphPattern::Extend {
-                inner, expression, ..
-            } => {
-                pattern(inner, is_data);
-                in_expression(expression, is_data);
-            }
-            GraphPattern::Group {
-                inner, aggregates, ..
-            } => {
-                pattern(inner, is_data);
-                for (_, aggregate) in aggregates {
-                    if let spargebra::algebra::AggregateExpression::FunctionCall { expr, .. } =
-                        aggregate
-                    {
-                        in_expression(expr, is_data);
-                    }
-                }
-            }
-            GraphPattern::OrderBy { inner, expression } => {
-                pattern(inner, is_data);
-                for term in expression {
-                    let (spargebra::algebra::OrderExpression::Asc(expr)
-                    | spargebra::algebra::OrderExpression::Desc(expr)) = term;
-                    in_expression(expr, is_data);
-                }
-            }
-            GraphPattern::Graph { inner, .. }
-            | GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. }
-            | GraphPattern::Service { inner, .. } => pattern(inner, is_data),
-        }
-    }
-
-    fn in_expression(expr: &mut Expression, is_data: &dyn Fn(&NamedNodePattern) -> bool) {
-        match expr {
-            Expression::Exists(block) => pattern(block, is_data),
-            Expression::Or(left, right)
-            | Expression::And(left, right)
-            | Expression::Equal(left, right)
-            | Expression::SameTerm(left, right)
-            | Expression::Greater(left, right)
-            | Expression::GreaterOrEqual(left, right)
-            | Expression::Less(left, right)
-            | Expression::LessOrEqual(left, right)
-            | Expression::Add(left, right)
-            | Expression::Subtract(left, right)
-            | Expression::Multiply(left, right)
-            | Expression::Divide(left, right) => {
-                in_expression(left, is_data);
-                in_expression(right, is_data);
-            }
-            Expression::In(value, candidates) => {
-                in_expression(value, is_data);
-                for candidate in candidates.iter_mut() {
-                    in_expression(candidate, is_data);
-                }
-            }
-            Expression::UnaryPlus(inner)
-            | Expression::UnaryMinus(inner)
-            | Expression::Not(inner) => in_expression(inner, is_data),
-            Expression::If(condition, then, otherwise) => {
-                in_expression(condition, is_data);
-                in_expression(then, is_data);
-                in_expression(otherwise, is_data);
-            }
-            Expression::Coalesce(parts) | Expression::FunctionCall(_, parts) => {
-                for part in parts.iter_mut() {
-                    in_expression(part, is_data);
-                }
-            }
-            Expression::NamedNode(_)
-            | Expression::Literal(_)
-            | Expression::Variable(_)
-            | Expression::Bound(_) => {}
-        }
-    }
-
-    let from: Vec<String> = crate::sparql_scoper::dataset_of(query)
-        .map(|clause| {
-            clause
-                .default
-                .iter()
-                .map(|graph| graph.as_str().to_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let (Query::Select { pattern: root, .. }
-    | Query::Construct { pattern: root, .. }
-    | Query::Describe { pattern: root, .. }
-    | Query::Ask { pattern: root, .. }) = query;
-    pattern(root, &is_data);
-
-    if !from
-        .iter()
-        .any(|graph| dataset.data_regime(graph).is_some())
-    {
-        return None;
-    }
-    let mut default_graphs = vec![GraphName::DefaultGraph];
-    default_graphs.extend(
-        from.iter()
-            .filter(|graph| dataset.data_regime(graph).is_none())
-            .map(|graph| {
-                GraphName::NamedNode(
-                    NamedNode::new(graph.as_str()).expect("an IRI the query parser accepted"),
-                )
-            }),
-    );
-    Some(default_graphs)
 }
 
 /// Evaluate a parsed query over a loaded store under the caller's limits,
@@ -1282,17 +1142,20 @@ classes:
     }
 
     /// **A query reads one data graph, and the engine answers it where the
-    /// records are.** Every data graph the query names is the records flat under
-    /// that graph's regime, so `FROM <inferred>` and `GRAPH <inferred> { .. }`
-    /// work, and agree with the SQL route: asserted reads no `Signal` of a
-    /// `Beacon` record, inferred reads it. A data graph beside a schema graph is
-    /// still one data regime. Every query that reads a second data regime is
+    /// records are.** The records are written into the graph the query names, so
+    /// `FROM <inferred>`, `FROM NAMED <inferred>` and `GRAPH <inferred> { .. }`
+    /// are evaluated natively, and agree with the SQL route: asserted reads no
+    /// `Signal` of a `Beacon` record, inferred reads it. The default graph may
+    /// be read beside the data graph only if they hold the same regime; schema
+    /// graphs may always be read beside it, and a data graph may sit anywhere
+    /// inside a schema graph. Every query that reads a second data graph is
     /// refused, with the planner's own text.
     #[test]
-    fn a_data_graph_query_reads_the_records_flat_under_its_regime() {
+    fn a_query_reads_one_data_graph_and_the_engine_answers_where_the_records_are() {
         use linkml_runtime::schema_rdf::TypeRegime;
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
+        const M: &str = "urn:graph:mixins";
         const S: &str = "urn:graph:schema";
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "
@@ -1317,13 +1180,15 @@ classes:
             .unwrap()
         };
         let refs: Vec<&LinkMLInstance> = vec![&beacon];
-        let dataset =
-            DatasetSpec::builder(crate::sparql_dataset::DefaultGraph::DataGraph(A.into()))
-                .with_data_graph(A, TypeRegime::ASSERTED)
-                .with_data_graph(I, TypeRegime::IS_A)
-                .with_schema_graph(S, TypeRegime::IS_A)
-                .build()
-                .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[
+                (A, TypeRegime::ASSERTED),
+                (I, TypeRegime::IS_A),
+                (M, TypeRegime::IS_A_AND_MIXINS),
+            ],
+            &[(S, TypeRegime::IS_A)],
+        );
         let prefixed =
             |query: &str| format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}");
         let rows_of = |answer: SparqlAnswer| -> usize {
@@ -1351,74 +1216,104 @@ classes:
             }
         };
         let body = "?s a asset360:Signal ; asset360:name ?name";
+        let rows = |query: String, expected: usize| {
+            assert_eq!(run(&query), Ok(expected), "{query}");
+        };
 
-        // The default graph is `A`: asserted types, so no `Signal`.
-        assert_eq!(run(&format!("SELECT ?s WHERE {{ {body} }}")), Ok(0));
-        assert_eq!(
-            run(&format!("SELECT ?s FROM <{A}> WHERE {{ {body} }}")),
-            Ok(0)
+        // The default graph is asserted: no `Signal`.
+        rows(format!("SELECT ?s WHERE {{ {body} }}"), 0);
+        rows(format!("SELECT ?s FROM <{A}> WHERE {{ {body} }}"), 0);
+        rows(format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"), 0);
+        // `I` types the record by its ancestors too; `M` by its mixins as well.
+        rows(format!("SELECT ?s FROM <{I}> WHERE {{ {body} }}"), 1);
+        rows(
+            format!("SELECT ?s FROM <{I}> FROM <{I}> WHERE {{ {body} }}"),
+            1,
         );
-        assert_eq!(
-            run(&format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}")),
-            Ok(0)
-        );
-        // `I` types the record by its ancestors too.
-        assert_eq!(
-            run(&format!("SELECT ?s FROM <{I}> WHERE {{ {body} }}")),
-            Ok(1)
-        );
-        assert_eq!(
-            run(&format!(
-                "SELECT ?s FROM <{I}> FROM <{I}> WHERE {{ {body} }}"
-            )),
-            Ok(1)
-        );
-        assert_eq!(
-            run(&format!("SELECT ?s WHERE {{ GRAPH <{I}> {{ {body} }} }}")),
-            Ok(1)
-        );
-        // Inside an expression, too.
-        assert_eq!(
-            run(&format!(
+        rows(format!("SELECT ?s WHERE {{ GRAPH <{I}> {{ {body} }} }}"), 1);
+        rows(format!("SELECT ?s FROM <{M}> WHERE {{ {body} }}"), 1);
+        rows(
+            format!(
                 "SELECT ?s WHERE {{ GRAPH <{I}> {{ {body} \
                  FILTER EXISTS {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }} }} }}"
-            )),
-            Ok(1)
+            ),
+            1,
+        );
+        // `FROM NAMED` of the one data graph: the default graph is empty, and
+        // the clause reaches the graph by name.
+        rows(
+            format!("SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {{ {body} }} }}"),
+            1,
+        );
+        rows(
+            format!("SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH ?g {{ {body} }} }}"),
+            1,
         );
         // A `FROM` alone leaves no named graph (SPARQL 1.1 13.2): the
-        // `GRAPH` matches nothing, and says so.
-        assert_eq!(
-            run(&format!(
-                "SELECT ?s FROM <{A}> WHERE {{ GRAPH <{I}> {{ {body} }} }}"
-            )),
-            Ok(0)
+        // `GRAPH` matches nothing.
+        rows(
+            format!("SELECT ?s FROM <{A}> WHERE {{ GRAPH <{I}> {{ {body} }} }}"),
+            0,
+        );
+        // The default graph beside a data graph of its own regime.
+        rows(
+            format!(
+                "SELECT ?s WHERE {{ ?s asset360:name ?name GRAPH <{A}> {{ ?s a asset360:Beacon }} }}"
+            ),
+            1,
         );
 
-        // A data graph beside a schema graph is one data regime.
+        // A data graph beside a schema graph.
         let sub = "?sub rdfs:subClassOf asset360:Signal";
-        assert_eq!(
-            run(&format!(
-                "SELECT ?s ?sub WHERE {{ GRAPH <{I}> {{ {body} }} GRAPH <{S}> {{ {sub} }} }}"
-            )),
-            Ok(1)
+        rows(
+            format!("SELECT ?s ?sub WHERE {{ GRAPH <{I}> {{ {body} }} GRAPH <{S}> {{ {sub} }} }}"),
+            1,
         );
-        assert_eq!(
-            run(&format!(
-                "SELECT ?s ?sub FROM <{I}> FROM <{S}> WHERE {{ {body} . {sub} }}"
-            )),
-            Ok(1)
+        rows(
+            format!("SELECT ?s ?sub FROM <{I}> FROM <{S}> WHERE {{ {body} . {sub} }}"),
+            1,
+        );
+        // A data graph inside a schema graph is still a read of the data graph
+        // (an inner `GRAPH` switches to its own graph, whatever encloses it).
+        rows(
+            format!(
+                "SELECT ?s WHERE {{ GRAPH <{S}> {{ GRAPH <{I}> {{ ?s a asset360:Signal ; \
+                 asset360:name ?n }} }} }}"
+            ),
+            1,
+        );
+        rows(
+            format!(
+                "SELECT ?s WHERE {{ GRAPH <{I}> {{ {body} }} \
+                 GRAPH <{S}> {{ GRAPH <{I}> {{ ?s asset360:name ?m }} }} }}"
+            ),
+            1,
+        );
+        rows(
+            format!(
+                "SELECT ?s ?sub WHERE {{ GRAPH <{I}> {{ {body} }} GRAPH <{S}> {{ {sub} \
+                 FILTER EXISTS {{ GRAPH <{I}> {{ ?s a ?sub }} }} }} }}"
+            ),
+            1,
         );
 
-        // The refusals: a second data regime, in any of its spellings.
+        // The refusals: a second data graph, in any of its spellings.
         for query in [
             format!("SELECT ?s FROM <{A}> FROM <{I}> WHERE {{ {body} }}"),
             format!(
                 "SELECT ?s WHERE {{ GRAPH <{A}> {{ ?s a asset360:Beacon }} \
                  GRAPH <{I}> {{ ?s asset360:name ?name }} }}"
             ),
+            format!("SELECT ?s WHERE {{ GRAPH <{I}> {{ {body} }} GRAPH <{M}> {{ {body} }} }}"),
+            // The default graph is asserted: not the same records as `I`'s.
             format!("SELECT ?s WHERE {{ {body} GRAPH <{I}> {{ ?s asset360:name ?n }} }}"),
+            // `GRAPH ?g` ranges over every served data graph...
             format!("SELECT ?s WHERE {{ GRAPH ?g {{ {body} }} }}"),
-            format!("SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {{ {body} }} }}"),
+            format!("SELECT ?s WHERE {{ VALUES ?g {{ <{I}> }} GRAPH ?g {{ {body} }} }}"),
+            // ...or over every one `FROM NAMED` lists.
+            format!(
+                "SELECT ?s FROM NAMED <{A}> FROM NAMED <{I}> WHERE {{ GRAPH ?g {{ {body} }} }}"
+            ),
         ] {
             let message = run(&query).expect_err(&query);
             assert!(
@@ -2484,7 +2379,7 @@ classes:
         assert_eq!(finish_of(&plan), 1, "the schema graph names the class");
         // The same plan, made for a dataset that serves no schema graph: the
         // graph is not there for the finish to read.
-        plan.dataset = DatasetSpec::asserted();
+        plan.dataset = crate::sparql_dataset::default_dataset().clone();
         assert_eq!(finish_of(&plan), 0, "no schema graph, no class");
     }
 

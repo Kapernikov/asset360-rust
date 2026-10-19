@@ -1191,7 +1191,7 @@ pub(crate) mod equivalence {
             schema,
             oracle,
             rules,
-            &crate::sparql_dataset::DatasetSpec::asserted(),
+            &crate::sparql_dataset::default_dataset().clone(),
         )
     }
 
@@ -1447,9 +1447,7 @@ pub(crate) mod equivalence {
                 regime,
                 &schema,
                 &oracle,
-                &DatasetSpec::builder(regime)
-                    .build()
-                    .expect("a valid dataset"),
+                &crate::sparql_dataset::dataset_with(regime, &[], &[]),
             );
         }
     }
@@ -1542,10 +1540,7 @@ pub(crate) mod equivalence {
             for &graph in TypeRegime::NAMED {
                 let oracle = crate::sparql_oracle::fixture_in(&schema, regime)
                     .with_schema_graph(&schema, G, graph);
-                let dataset = DatasetSpec::builder(regime)
-                    .with_schema_graph(G, graph)
-                    .build()
-                    .expect("a valid dataset");
+                let dataset = crate::sparql_dataset::dataset_with(regime, &[], &[(G, graph)]);
                 let rules = tier_one_rules(&schema, &dataset);
                 let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
                 // #515 spelling 1: the path is reduced to the class scan
@@ -1630,10 +1625,7 @@ pub(crate) mod equivalence {
         let regime = TypeRegime::IS_A;
         let oracle =
             crate::sparql_oracle::fixture_in(&schema, regime).with_schema_graph(&schema, G, regime);
-        let dataset = DatasetSpec::builder(regime)
-            .with_schema_graph(G, regime)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(regime, &[], &[(G, regime)]);
         let rules = tier_one_rules(&schema, &dataset);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         each_rewrite_preserves_answers_in(

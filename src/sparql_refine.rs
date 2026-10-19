@@ -2674,7 +2674,7 @@ pub struct Plan {
     /// said when it does not.
     pub default_reads: GraphReads,
     /// The one regime the query reads its records under
-    /// ([`crate::sparql_graph_clauses::single_data_regime`]): the regime every
+    /// ([`crate::sparql_graph_clauses::single_data_graph`]): the regime every
     /// match of a data graph and every scan is under. What
     /// [`Plan::scan_classes_agree`] derives a scan's classes with.
     pub data_regime: TypeRegime,
@@ -4128,6 +4128,7 @@ pub fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineEr
         domains_opened: 0,
         graphs,
         reads: default_reads,
+        inside_graph_node: false,
     };
     let mut root = builder.pattern(pattern, true);
 
@@ -4349,6 +4350,8 @@ struct Builder<'o> {
     /// planned as the empty relation, not as a match for some rule or the
     /// engine to find out about.
     reads: GraphReads,
+    /// Whether the walk is inside a `GRAPH` that stays in the plan as a node.
+    inside_graph_node: bool,
 }
 
 impl Builder<'_> {
@@ -4732,15 +4735,27 @@ impl Builder<'_> {
                     // the engine's to say.
                     NamedNodePattern::Variable(_) => GraphReads::Other,
                 };
+                // A data graph inside a `GRAPH` that stays is the engine's: an
+                // inner `GRAPH` switches graph, whatever encloses it, but a
+                // `Match` under a kept `Graph` node is read by the rules as
+                // that graph's.
+                let reads = match reads {
+                    GraphReads::Data(_) if self.inside_graph_node => GraphReads::Other,
+                    other => other,
+                };
+                // A data graph holds the records every `Match` reads, so the
+                // `GRAPH` says nothing the matches do not. No node for it,
+                // hence none of the rules that treat a `Graph` as opaque has
+                // anything to decline.
+                let dissolves = matches!(reads, GraphReads::Data(_));
                 // A named graph is never the empty default graph.
                 let outer = std::mem::replace(&mut self.reads, reads);
+                let outer_inside = self.inside_graph_node;
+                self.inside_graph_node |= !dissolves;
                 let input = self.pattern(inner, on_spine);
                 self.reads = outer;
-                // A data graph holds the records every `Match` reads, so the
-                // `GRAPH` says nothing the matches do not: each carries the
-                // graph's regime. No node for it, hence none of the rules
-                // that treat a `Graph` as opaque has anything to decline.
-                if matches!(reads, GraphReads::Data(_)) {
+                self.inside_graph_node = outer_inside;
+                if dissolves {
                     return input;
                 }
                 let vars = self.vars[input].clone();
@@ -5562,13 +5577,15 @@ mod tests {
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
-        let dataset = DatasetSpec::builder(TypeRegime::ASSERTED)
-            .with_data_graph(A, TypeRegime::ASSERTED)
-            .with_data_graph(I, TypeRegime::IS_A)
-            .with_data_graph("urn:graph:mixins", TypeRegime::IS_A_AND_MIXINS)
-            .with_schema_graph(S, TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[
+                (A, TypeRegime::ASSERTED),
+                (I, TypeRegime::IS_A),
+                ("urn:graph:mixins", TypeRegime::IS_A_AND_MIXINS),
+            ],
+            &[(S, TypeRegime::IS_A)],
+        );
         let try_plan = |query: &str| {
             let parsed =
                 crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
@@ -5668,6 +5685,15 @@ mod tests {
              GRAPH <{S}> {{ ?c a asset360:Signal }} }}"
         ));
         assert_eq!(regimes(&beside), vec![Some(TypeRegime::IS_A), None]);
+        // A data graph inside the schema graph is read as the data graph (an
+        // inner `GRAPH` switches graph), but never by the rules: it stays under
+        // both `Graph` nodes, so no rule takes it for a read of the datamodel
+        // (a schema-only region) or folds it into a scan.
+        let nested = plan(&format!(
+            "SELECT ?s WHERE {{ GRAPH <{S}> {{ GRAPH <{I}> {body} }} }}"
+        ));
+        assert_eq!(regimes(&nested), vec![None; 2]);
+        assert_eq!(graph_nodes(&nested), 2, "{nested}");
         // Under `FROM NAMED` a graph outside the set matches nothing: kept as
         // a `GRAPH` for the engine to say so.
         let outside = plan(&format!(
@@ -5710,15 +5736,20 @@ mod tests {
         // `GRAPH ?g` while the dataset serves data graphs.
         let message = refused(&format!("SELECT ?s WHERE {{ GRAPH ?g {body} }}"));
         assert!(message.contains("GRAPH ?g"), "{message}");
-        // A data graph in `FROM NAMED`, listed or not read.
+        // `FROM NAMED` of two data graphs, which `GRAPH ?g` ranges over.
         refused(&format!(
+            "SELECT ?s FROM NAMED <{A}> FROM NAMED <{I}> WHERE {{ GRAPH ?g {body} }}"
+        ));
+        // A data graph in `FROM NAMED` is read only through a `GRAPH`: that one
+        // is the query's data graph, and a listed graph nothing reads is none.
+        let named = plan(&format!(
             "SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {body} }}"
         ));
-        refused(&format!("SELECT ?s FROM NAMED <{A}> WHERE {body}"));
-        // Both a `FROM` and a `FROM NAMED` of data.
-        refused(&format!(
+        assert_eq!(regimes(&named), vec![Some(TypeRegime::IS_A); 2]);
+        let listed = plan(&format!(
             "SELECT ?s FROM <{A}> FROM NAMED <{I}> WHERE {body}"
         ));
+        assert_eq!(regimes(&listed), vec![Some(TypeRegime::ASSERTED); 2]);
         // The same regime from two graphs is allowed: the default graph
         // (asserted) and `GRAPH <A>`.
         let same = plan(&format!(
@@ -5737,11 +5768,11 @@ mod tests {
         const S: &str = "urn:graph:schema";
         let sv = crate::sparql_scoper::tests::test_schema_view();
         let text = |default: TypeRegime, query: &str| {
-            let dataset = DatasetSpec::builder(default)
-                .with_data_graph(A, TypeRegime::ASSERTED)
-                .with_schema_graph(S, TypeRegime::IS_A)
-                .build()
-                .expect("a valid dataset");
+            let dataset = crate::sparql_dataset::dataset_with(
+                default,
+                &[(A, TypeRegime::ASSERTED)],
+                &[(S, TypeRegime::IS_A)],
+            );
             let parsed =
                 crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
             naive_plan(&parsed, &dataset).unwrap().to_string()
@@ -5756,12 +5787,13 @@ mod tests {
             !plain.contains("[asserted]") && !plain.contains("[no data"),
             "{plain}"
         );
-        // Asserted under another default is said.
+        // A query reads one data graph, and the plan's regime is its: asserted
+        // under `A` is bare whatever the dataset's default regime is.
         let in_a = text(
             TypeRegime::IS_A,
             &format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"),
         );
-        assert!(in_a.contains("[asserted]"), "{in_a}");
+        assert!(!in_a.contains("[asserted]"), "{in_a}");
         // No data graph, outside any printed GRAPH: said, and not the same
         // text as the asserted match.
         let nowhere = text(
@@ -5802,9 +5834,7 @@ mod tests {
 
         // The planner surfaces it to the caller instead of planning a scan
         // that reads only `Signal`.
-        let dataset = DatasetSpec::builder(TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]);
         let query =
             format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?n }}");
         let planned = crate::sparql_plan::plan_of(&query, &sv, &dataset)
@@ -5824,11 +5854,11 @@ mod tests {
         const A: &str = "urn:graph:asserted";
         const S: &str = "urn:graph:schema";
         let sv = crate::sparql_scoper::tests::test_schema_view();
-        let dataset = DatasetSpec::builder(TypeRegime::ASSERTED)
-            .with_data_graph(A, TypeRegime::IS_A)
-            .with_schema_graph(S, TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[(A, TypeRegime::IS_A)],
+            &[(S, TypeRegime::IS_A)],
+        );
         let body = "?s asset360:name ?n";
         let reads_of = |query: &str| -> (Vec<GraphReads>, String) {
             let parsed =
@@ -5924,9 +5954,7 @@ mod tests {
 
         let asserted = naive_plan(
             &parsed,
-            &DatasetSpec::builder(TypeRegime::ASSERTED)
-                .build()
-                .expect("a valid dataset"),
+            &crate::sparql_dataset::dataset_with(TypeRegime::ASSERTED, &[], &[]),
         )
         .unwrap();
         let in_graph = |regimes: &[(String, Option<TypeRegime>)]| {
@@ -5948,9 +5976,7 @@ mod tests {
 
         let is_a = naive_plan(
             &parsed,
-            &DatasetSpec::builder(TypeRegime::IS_A)
-                .build()
-                .expect("a valid dataset"),
+            &crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]),
         )
         .unwrap();
         assert_eq!(

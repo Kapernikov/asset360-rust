@@ -27,19 +27,19 @@ S = "urn:graph:schema"
 def test_a_dataset_that_contradicts_itself_raises_with_every_conflict():
     with pytest.raises(ValueError) as raised:
         DatasetSpec(
-            "urn:graph:nowhere",
+            TypeRegime.parse("{}"),
             data_graphs={A: TypeRegime.ASSERTED},
             schema_graphs={A: TypeRegime.IS_A, S: TypeRegime.IS_A},
         )
     message = str(raised.value)
     # Both mistakes are named, not the first one met.
-    assert "urn:graph:nowhere" in message and "not a registered data graph" in message
+    assert "default regime" in message and "lacks the own partition" in message
     assert A in message and "a graph has one meaning" in message
 
 
 def test_a_coherent_dataset_builds():
     DatasetSpec(
-        A,
+        TypeRegime.ASSERTED,
         data_graphs={A: TypeRegime.ASSERTED},
         schema_graphs={S: TypeRegime.IS_A},
     )
@@ -93,18 +93,15 @@ def test_the_schema_graph_is_asked_for_by_regime_alone():
 
 def test_a_dataset_can_be_read_back():
     dataset = DatasetSpec(
-        A,
+        TypeRegime.IS_A,
         data_graphs={A: TypeRegime.IS_A},
         schema_graphs={S: TypeRegime.IS_A_AND_MIXINS},
     )
-    # The default graph is a data graph, so its regime is the default regime.
-    assert dataset.default == A
     assert dataset.default_regime == TypeRegime.IS_A
     assert dataset.data_graphs == {A: TypeRegime.IS_A}
-    assert dataset.default_graph == A
     assert dataset.schema_graphs == {S: TypeRegime.IS_A_AND_MIXINS}
     assert repr(dataset) == (
-        "DatasetSpec('urn:graph:asserted', data_graphs={'urn:graph:asserted': TypeRegime.IS_A}"
+        "DatasetSpec(TypeRegime.IS_A, data_graphs={'urn:graph:asserted': TypeRegime.IS_A}"
         ", schema_graphs={'urn:graph:schema': TypeRegime.IS_A_AND_MIXINS})"
     )
 
@@ -114,16 +111,16 @@ def test_a_dataset_repr_round_trips_and_hashes_with_equality():
     for dataset in (
         DatasetSpec(TypeRegime.ASSERTED),
         DatasetSpec(TypeRegime.IS_A, data_graphs={A: own_and_isa}),
-        DatasetSpec(A, data_graphs={A: own_and_isa}, schema_graphs={S: TypeRegime.IS_A}),
-        DatasetSpec("urn:it's", data_graphs={"urn:it's": TypeRegime.ASSERTED}),
+        DatasetSpec(TypeRegime.IS_A, data_graphs={A: own_and_isa}, schema_graphs={S: TypeRegime.IS_A}),
+        DatasetSpec(TypeRegime.ASSERTED, data_graphs={"urn:it's": TypeRegime.ASSERTED}),
     ):
         again = eval(repr(dataset))  # noqa: S307 -- the repr is the thing under test
         assert again == dataset
         assert hash(again) == hash(dataset)
     assert hash(DatasetSpec(TypeRegime.ASSERTED)) != hash(DatasetSpec(TypeRegime.IS_A))
-    # The default graph is stated one way: a regime is not a data graph.
+    # A served graph is part of the dataset's identity.
     assert DatasetSpec(TypeRegime.ASSERTED) != DatasetSpec(
-        A, data_graphs={A: TypeRegime.ASSERTED}
+        TypeRegime.ASSERTED, data_graphs={A: TypeRegime.ASSERTED}
     )
 
 
@@ -139,10 +136,8 @@ def test_a_regime_that_is_no_named_one_reads_back_as_itself():
 
 def test_a_bare_dataset_reads_back_empty():
     dataset = DatasetSpec(TypeRegime.ASSERTED)
-    assert dataset.default == TypeRegime.ASSERTED
     assert dataset.default_regime == TypeRegime.ASSERTED
     assert dataset.data_graphs == {} and dataset.schema_graphs == {}
-    assert dataset.default_graph is None
     assert repr(dataset) == "DatasetSpec(TypeRegime.ASSERTED)"
 
 

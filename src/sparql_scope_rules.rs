@@ -403,7 +403,7 @@ mod tests {
                 residual: Vec::new(),
                 obligations: plan.obligations.clone(),
                 refinement: crate::sparql_plan::Refinement::UsedAlone(String::new()),
-                dataset: crate::sparql_dataset::DatasetSpec::asserted(),
+                dataset: crate::sparql_dataset::default_dataset().clone(),
                 query: crate::sparql_scoper::parse_query("SELECT * WHERE { ?s ?p ?o }", None)
                     .unwrap(),
                 data_regime: linkml_runtime::schema_rdf::TypeRegime::ASSERTED,

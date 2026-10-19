@@ -265,9 +265,9 @@ def test_the_dataset_is_required_and_validated():
     query = PREFIX + "SELECT ?s WHERE { ?s a asset360:Signal }"
     with pytest.raises(TypeError):
         _plan_with_dataset(query, schema())
-    with pytest.raises(ValueError, match="not a registered data graph"):
+    with pytest.raises(TypeError):
         DatasetSpec("urn:graph:nowhere")
-    with pytest.raises(ValueError, match="registered as"):
+    with pytest.raises(ValueError, match="both a data graph and a schema graph"):
         DatasetSpec(
             TypeRegime.ASSERTED,
             data_graphs={"urn:g": TypeRegime.IS_A},

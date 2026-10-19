@@ -180,7 +180,7 @@ pub struct QueryPlan {
     pub untyped: Vec<String>,
 
     /// The one regime the query reads its records under
-    /// ([`crate::sparql_graph_clauses::single_data_regime`]): the engine loads
+    /// ([`crate::sparql_graph_clauses::single_data_graph`]): the engine loads
     /// the records flat under it, and every star above reads its type under
     /// it. A query that reads no records has its dataset's default.
     pub data_regime: TypeRegime,
@@ -3452,7 +3452,7 @@ fn scope_union(
         // a fact about a pattern this plan no longer has a node for.
         inexact: Some(Inexact::UnionBranch),
         untyped,
-        data_regime: crate::sparql_graph_clauses::single_data_regime(query, dataset)?,
+        data_regime: crate::sparql_graph_clauses::single_data_graph(query, dataset)?.regime,
     })
 }
 
@@ -8890,11 +8890,11 @@ classes:
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
-        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
-            .with_data_graph(A, TypeRegime::ASSERTED)
-            .with_data_graph(I, TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+            &[(A, TypeRegime::ASSERTED), (I, TypeRegime::IS_A)],
+            &[],
+        );
         let scoped = |query: &str| {
             sparql_scope(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
@@ -8986,11 +8986,11 @@ classes:
     is_a: Signal
 ",
         );
-        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
-            .with_data_graph(A, TypeRegime::ASSERTED)
-            .with_data_graph(I, TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+            &[(A, TypeRegime::ASSERTED), (I, TypeRegime::IS_A)],
+            &[],
+        );
         let scope = |query: &str| {
             sparql_scope(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),

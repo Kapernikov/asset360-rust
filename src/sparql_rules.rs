@@ -6505,9 +6505,7 @@ mod tests {
             .expect("should parse");
         crate::sparql_refine::naive_plan(
             &parsed,
-            &crate::sparql_dataset::DatasetSpec::builder(regime)
-                .build()
-                .expect("a valid dataset"),
+            &crate::sparql_dataset::dataset_with(regime, &[], &[]),
         )
         .expect("should build a naive plan")
     }
@@ -11073,16 +11071,15 @@ mod inline_type_match {
     /// under the inferred one (every element is a place).
     #[test]
     fn an_inline_type_triple_is_judged_in_its_own_graph() {
-        use crate::sparql_dataset::DatasetSpec;
         use linkml_runtime::schema_rdf::TypeRegime;
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
-        let dataset = DatasetSpec::builder(TypeRegime::ASSERTED)
-            .with_data_graph(A, TypeRegime::ASSERTED)
-            .with_data_graph(I, TypeRegime::IS_A)
-            .build()
-            .expect("a valid dataset");
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[(A, TypeRegime::ASSERTED), (I, TypeRegime::IS_A)],
+            &[],
+        );
         let refined = |site_graph: &str, type_graph: &str| {
             let query = format!(
                 "PREFIX asset360: <{NS}/> SELECT ?s ?l WHERE {{ \
@@ -11360,9 +11357,7 @@ mod direct_type {
             .expect("should parse");
         let mut plan = naive_plan(
             &parsed,
-            &DatasetSpec::builder(regime)
-                .build()
-                .expect("a valid dataset"),
+            &crate::sparql_dataset::dataset_with(regime, &[], &[]),
         )
         .expect("naive plan");
         let rules = tier_one_rules(schema, crate::sparql_dataset::default_dataset());
@@ -11647,9 +11642,7 @@ mod direct_type {
                 crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap();
             let naive = naive_plan(
                 &parsed,
-                &DatasetSpec::builder(TypeRegime::IS_A)
-                    .build()
-                    .expect("a valid dataset"),
+                &crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]),
             )
             .unwrap();
             let mut texts = Vec::new();
@@ -11715,9 +11708,7 @@ mod direct_type {
         ];
         for &regime in TypeRegime::NAMED {
             let oracle = crate::sparql_oracle::Oracle::new_in(&schema, &records, regime);
-            let dataset = DatasetSpec::builder(regime)
-                .build()
-                .expect("a valid dataset");
+            let dataset = crate::sparql_dataset::dataset_with(regime, &[], &[]);
             let rules = tier_one_rules(&schema, &dataset);
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
             for query in queries {
