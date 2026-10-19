@@ -1527,7 +1527,6 @@ pub(crate) mod equivalence {
     /// most-specific-type rewrite (R1, `sparql_typed_subjects`) changes the
     /// answer. Left failing on purpose: the rule is not R3's to fix.
     #[test]
-    #[ignore = "R1/R2: MostSpecificTypeIsTheDirectType fires with ?sub bound outside the NOT EXISTS (review F2)"]
     fn a_variable_bound_outside_the_not_exists_keeps_the_most_specific_type_rewrite_honest() {
         const G: &str = "https://data.infrabel.be/asset360/schema";
         let schema =
