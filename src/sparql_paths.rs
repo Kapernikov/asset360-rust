@@ -149,7 +149,17 @@ impl Pass<'_> {
             let mut set = BTreeSet::new();
             set.insert(crate::sparql_scoper::RDF_TYPE.to_owned());
             set.insert(SESAME_DIRECT_TYPE.to_owned());
-            for slot in self.schema_view.slot_views().unwrap_or_default() {
+            // The schema's slots, and every class's induced ones: a
+            // `slot_usage` may give an inherited slot another `slot_uri` that
+            // no declared slot carries.
+            let declared = self.schema_view.slot_views().unwrap_or_default();
+            let induced = self
+                .schema_view
+                .class_views()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|class| class.slots().to_vec());
+            for slot in declared.into_iter().chain(induced) {
                 if let Ok(canonical) = slot.canonical_uri().to_uri(&conv) {
                     set.insert(canonical.0);
                 }
@@ -521,6 +531,39 @@ mod tests {
         let empty = reduced("SELECT ?t WHERE { ?t rdfs:subClassOf+ asset360:Signal }");
         assert!(!has_path(&empty), "{empty}");
         assert!(empty.to_string().contains("VALUES"), "{empty}");
+    }
+
+    /// A predicate a class writes under its own `slot_uri` -- an attribute's,
+    /// or a `slot_usage` override of an inherited slot -- is carried by the
+    /// data, so a path over it is not the zero-length step.
+    #[test]
+    fn a_class_local_slot_uri_is_a_carried_predicate() {
+        let sv = crate::sparql_scoper::tests::test_schema_view_plus(
+            r#"
+  Marker:
+    class_uri: asset360:Marker
+    attributes:
+      asset360_uri:
+        identifier: true
+      attrOnly:
+        slot_uri: asset360:attrOnlyPredicate
+        range: string
+  Relabelled:
+    class_uri: asset360:Relabelled
+    is_a: Signal
+    slot_usage:
+      name:
+        slot_uri: asset360:usageOnlyPredicate
+"#,
+        );
+        for predicate in ["attrOnlyPredicate", "usageOnlyPredicate"] {
+            let mut parsed = parse_query(&format!(
+                "{PREFIX}SELECT ?s WHERE {{ ?s asset360:{predicate}* asset360:Signal }}"
+            ))
+            .expect("parses");
+            reduce_paths(&mut parsed, &sv);
+            assert!(has_path(&parsed), "{predicate}: {parsed}");
+        }
     }
 
     /// Everything outside the proof is left as it was, to be refused as before.
