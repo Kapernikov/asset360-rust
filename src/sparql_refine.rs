@@ -4220,6 +4220,24 @@ fn reads_tag(reads: GraphReads, context: RegimeContext) -> Option<String> {
     }
 }
 
+/// `T`: `(class, type)` for every class of `classes` and every type its
+/// records carry under `regime` (canonical IRIs). `None` when a class is
+/// unknown to the schema.
+pub(crate) fn type_table(
+    schema: &SchemaView,
+    classes: &[String],
+    regime: TypeRegime,
+) -> Option<Vec<(String, String)>> {
+    let mut rows = Vec::new();
+    for class in classes {
+        let view = schema.get_class_by_uri(class).ok().flatten()?;
+        for ty in linkml_runtime::schema_rdf::rdf_types(&view, regime).ok()? {
+            rows.push((class.clone(), ty.canonical_uri().to_string()));
+        }
+    }
+    Some(rows)
+}
+
 /// The classes a scan of `class_uri` stands for under `regime`: every class
 /// whose records have `class_uri` among their `rdf:type`s (canonical IRIs,
 /// sorted, deduplicated, `class_uri` included).

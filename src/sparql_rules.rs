@@ -54,9 +54,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use linkml_runtime::schema_rdf::{
-    SESAME_DIRECT_TYPE, TypePartition, TypeRegime, rdf_types, type_family,
-};
+use linkml_runtime::schema_rdf::{SESAME_DIRECT_TYPE, TypePartition, TypeRegime, type_family};
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
@@ -927,20 +925,6 @@ impl<'s> TypeVariableBecomesTypeTable<'s> {
     pub fn new(schema: &'s SchemaView) -> Self {
         Self { schema }
     }
-
-    /// `T`: `(class, type)` for every class of `classes` and every type its
-    /// records carry under `regime`. `None` when a class is unknown to the
-    /// schema.
-    fn table(&self, classes: &[String], regime: TypeRegime) -> Option<Vec<(String, String)>> {
-        let mut rows = Vec::new();
-        for class in classes {
-            let view = self.schema.get_class_by_uri(class).ok().flatten()?;
-            for ty in rdf_types(&view, regime).ok()? {
-                rows.push((class.clone(), ty.canonical_uri().to_string()));
-            }
-        }
-        Some(rows)
-    }
 }
 
 /// A variable name no node of the plan binds, derived from `base`.
@@ -1035,7 +1019,7 @@ impl Rule for TypeVariableBecomesTypeTable<'_> {
                 .filter(|class| direct_type_in.is_empty() || direct_type_in.contains(class))
                 .cloned()
                 .collect();
-            let Some(table) = self.table(&reads, regime) else {
+            let Some(table) = crate::sparql_refine::type_table(self.schema, &reads, regime) else {
                 continue;
             };
             let direct = match existing {
@@ -11111,7 +11095,7 @@ mod inline_type_match {
             !inferred.contains("match     ?p a asset360:Place"),
             "inferred: every element is a place, the triple is discharged:\n{inferred}"
         );
-        // Two graphs of different regimes are two data regimes: refused.
+        // Two data graphs are refused.
         let parsed = crate::sparql_scoper::parse_query(
             &format!(
                 "PREFIX asset360: <{NS}/> SELECT ?s WHERE {{ \
@@ -11124,9 +11108,11 @@ mod inline_type_match {
         assert!(crate::sparql_refine::naive_plan(&parsed, &dataset).is_err());
     }
 
-    /// What [`an_inline_type_triple_is_judged_in_its_own_graph`] relies on: an
-    /// inlined element is the *same node* in every graph of the dataset, so a
-    /// slot triple in one graph and a type triple in another join on it.
+    /// A property of the quad writer, kept for what it says about a written
+    /// dataset (the endpoint itself reads one data graph per query, so no
+    /// query joins across graphs): an inlined element is the *same node* in
+    /// every graph of the dataset, so a slot triple in one graph and a type
+    /// triple in another join on it.
     ///
     /// The writer emits an element as a blank node (or a skolem IRI) and walks
     /// the instance once, so one label serves every partition; the quads are

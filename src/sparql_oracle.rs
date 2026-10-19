@@ -28,6 +28,9 @@ use crate::sparql_algebra::Bag;
 /// A store holding the fixture, ready to answer.
 pub struct Oracle {
     store: Store,
+    /// The named graph the records are in, when they are not in the default
+    /// graph: what a dataset that serves its records as a data graph shows.
+    records_graph: Option<oxigraph::model::NamedNode>,
 }
 
 impl Oracle {
@@ -42,6 +45,30 @@ impl Oracle {
     /// the graph a dataset of that regime holds (`rdf:type` of every class
     /// the regime lists, and `sesame:directType` where it writes one).
     pub fn new_in(schema: &SchemaView, records: &[(&str, &str)], regime: TypeRegime) -> Self {
+        Self::load(schema, records, regime, None)
+    }
+
+    /// [`Oracle::new_in`] with the records in the named graph `graph`, as the
+    /// engine writes them for a query that reads that data graph. A query
+    /// that writes no `FROM` / `FROM NAMED` reads `graph` as its default
+    /// graph, as the engine evaluates it.
+    pub fn new_in_graph(
+        schema: &SchemaView,
+        records: &[(&str, &str)],
+        regime: TypeRegime,
+        graph: &str,
+    ) -> Self {
+        Self::load(schema, records, regime, Some(graph))
+    }
+
+    fn load(
+        schema: &SchemaView,
+        records: &[(&str, &str)],
+        regime: TypeRegime,
+        graph: Option<&str>,
+    ) -> Self {
+        let records_graph =
+            graph.map(|iri| oxigraph::model::NamedNode::new(iri).expect("a graph IRI"));
         let store = Store::new().unwrap();
         let conv = schema.converter();
         let primary = schema.primary_schema().unwrap();
@@ -62,17 +89,34 @@ impl Oracle {
                 &WriteOptions::flat(regime),
             )
             .unwrap();
-            store
-                .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
-                .unwrap_or_else(|e| panic!("{e}\n{turtle}"));
+            for quad in oxigraph::io::RdfParser::from_format(RdfFormat::Turtle)
+                .rename_blank_nodes()
+                .for_slice(turtle.as_bytes())
+            {
+                let mut quad = quad.unwrap_or_else(|e| panic!("{e}\n{turtle}"));
+                if let Some(graph) = &records_graph {
+                    quad.graph_name = oxigraph::model::GraphName::NamedNode(graph.clone());
+                }
+                store.insert(&quad).unwrap();
+            }
         }
-        Self { store }
+        Self {
+            store,
+            records_graph,
+        }
     }
 
     /// The answer to an already-parsed query, as a bag.
     pub fn answers(&self, query: spargebra::Query) -> Bag {
-        let results = crate::sparql_executor::geosparql_evaluator()
-            .for_query(query.clone())
+        let mut prepared = crate::sparql_executor::geosparql_evaluator().for_query(query.clone());
+        if let Some(graph) = &self.records_graph
+            && crate::sparql_scoper::dataset_of(&query).is_none()
+        {
+            prepared
+                .dataset_mut()
+                .set_default_graph(vec![oxigraph::model::GraphName::NamedNode(graph.clone())]);
+        }
+        let results = prepared
             .on_store(&self.store)
             .execute()
             .unwrap_or_else(|e| panic!("{e}\n{query}"));
@@ -169,7 +213,7 @@ pub const MIXIN_CLASSES: &str = r#"
 /// [`fixture`] written under type regime `regime`, plus one record of each
 /// class of the `is_a` chain and a mixin carrier, so that the regimes differ
 /// in what the store holds. `schema` has to carry [`MIXIN_CLASSES`].
-pub fn fixture_in(schema: &SchemaView, regime: TypeRegime) -> Oracle {
+fn records_in_regimes() -> Vec<(&'static str, &'static str)> {
     let mut records = fixture_records();
     records.extend([
         (
@@ -197,7 +241,18 @@ pub fn fixture_in(schema: &SchemaView, regime: TypeRegime) -> Oracle {
             r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/B1", "label": "b"}"#,
         ),
     ]);
-    Oracle::new_in(schema, &records, regime)
+    records
+}
+
+/// [`fixture`] written under type regime `regime`.
+pub fn fixture_in(schema: &SchemaView, regime: TypeRegime) -> Oracle {
+    Oracle::new_in(schema, &records_in_regimes(), regime)
+}
+
+/// [`fixture_in`] with the records in the data graph `graph`
+/// ([`Oracle::new_in_graph`]).
+pub fn fixture_in_graph(schema: &SchemaView, regime: TypeRegime, graph: &str) -> Oracle {
+    Oracle::new_in_graph(schema, &records_in_regimes(), regime, graph)
 }
 
 impl Oracle {
@@ -293,7 +348,11 @@ pub fn probe(turtle: &str, query: &str) -> Bag {
             .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
             .unwrap_or_else(|e| panic!("{e}\n{turtle}"));
     }
-    Oracle { store }.answers_to(query)
+    Oracle {
+        store,
+        records_graph: None,
+    }
+    .answers_to(query)
 }
 
 /// [`probe`], as the sequence the engine emitted.
@@ -305,7 +364,10 @@ pub fn probe_sequence(turtle: &str, query: &str) -> Vec<BTreeMap<String, String>
             .unwrap_or_else(|e| panic!("{e}\n{turtle}"));
     }
     ordered_answers(
-        &Oracle { store },
+        &Oracle {
+            store,
+            records_graph: None,
+        },
         crate::sparql_scoper::parse_query(query, None).unwrap(),
     )
 }
@@ -315,8 +377,15 @@ impl Oracle {
     /// what a statement's rows look like to `sparql_finish`, and what its
     /// answer is compared against.
     pub fn json_rows(&self, query: spargebra::Query) -> (Vec<String>, Vec<serde_json::Value>) {
-        let results = crate::sparql_executor::geosparql_evaluator()
-            .for_query(query.clone())
+        let mut prepared = crate::sparql_executor::geosparql_evaluator().for_query(query.clone());
+        if let Some(graph) = &self.records_graph
+            && crate::sparql_scoper::dataset_of(&query).is_none()
+        {
+            prepared
+                .dataset_mut()
+                .set_default_graph(vec![oxigraph::model::GraphName::NamedNode(graph.clone())]);
+        }
+        let results = prepared
             .on_store(&self.store)
             .execute()
             .unwrap_or_else(|e| panic!("{e}\n{query}"));

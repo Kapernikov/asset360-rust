@@ -397,6 +397,16 @@ impl Translation<'_> {
                 // regime writes it. Where it does not (asserted), the
                 // record's only `rdf:type` triple is its own class, which is
                 // the same thing.
+                //
+                // A regime that writes neither the direct type nor only the
+                // own class (`{own,is_a}`, `{own,mixin}`) has no triple that
+                // says it: `rdf:type` then holds the ancestors too. The
+                // record's own class `d` is the one whose types are all the
+                // types the record has, which the table of the scan's classes
+                // states (`own_by_table` below).
+                let own_by_triple = regime
+                    .contains(linkml_runtime::schema_rdf::TypePartition::Direct)
+                    || regime.is_subset(linkml_runtime::schema_rdf::TypeRegime::ASSERTED);
                 let direct_predicate =
                     if regime.contains(linkml_runtime::schema_rdf::TypePartition::Direct) {
                         linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE
@@ -412,15 +422,85 @@ impl Translation<'_> {
                         object,
                     })
                 };
-                if let Some(var) = direct_type {
-                    required.push(direct(TermPattern::Variable(Variable::new_unchecked(
-                        var.clone(),
-                    )))?);
+                // The classes the record's own class is held to, as variables:
+                // the one the scan binds, and a fresh one per class the query
+                // fixed (bound to it below).
+                let mut own_by_table: Vec<(String, Option<&String>)> = Vec::new();
+                if own_by_triple {
+                    if let Some(var) = direct_type {
+                        required.push(direct(TermPattern::Variable(Variable::new_unchecked(
+                            var.clone(),
+                        )))?);
+                    }
+                    for class in direct_type_in {
+                        required.push(direct(TermPattern::NamedNode(
+                            NamedNode::new(class.clone()).ok()?,
+                        ))?);
+                    }
+                } else {
+                    if let Some(var) = direct_type {
+                        own_by_table.push((var.clone(), None));
+                    }
+                    for class in direct_type_in {
+                        own_by_table.push((self.fresh_var("own"), Some(class)));
+                    }
                 }
-                for class in direct_type_in {
-                    required.push(direct(TermPattern::NamedNode(
-                        NamedNode::new(class.clone()).ok()?,
-                    ))?);
+                let mut own_values: Vec<(String, String)> = Vec::new();
+                let mut own_guards: Vec<Expression> = Vec::new();
+                if !own_by_table.is_empty() {
+                    let family =
+                        crate::sparql_refine::scan_classes(self.schema, class_uri, regime).ok()?;
+                    let table = crate::sparql_refine::type_table(self.schema, &family, regime)?;
+                    for (own, fixed) in own_by_table {
+                        let any = |name: &str| TermPattern::Variable(Variable::new_unchecked(name));
+                        let type_of =
+                            |subject: &str, object: TermPattern| -> Option<TriplePattern> {
+                                Some(TriplePattern {
+                                    subject: any(subject),
+                                    predicate: NamedNodePattern::NamedNode(
+                                        NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?,
+                                    ),
+                                    object,
+                                })
+                            };
+                        required.push(type_of(star_var, any(&own))?);
+                        if let Some(class) = fixed {
+                            own_values.push((own.clone(), class.clone()));
+                        }
+                        // No type of the record lies outside what `own` is
+                        // typed with: `NOT EXISTS { ?s a ?t FILTER NOT EXISTS
+                        // { VALUES (?own ?t) { T } } }`.
+                        let other = self.fresh_var("own_type");
+                        let rows = table
+                            .iter()
+                            .map(|(class, ty)| {
+                                vec![
+                                    Some(GroundTerm::NamedNode(NamedNode::new_unchecked(
+                                        class.clone(),
+                                    ))),
+                                    Some(GroundTerm::NamedNode(NamedNode::new_unchecked(
+                                        ty.clone(),
+                                    ))),
+                                ]
+                            })
+                            .collect();
+                        let known = GraphPattern::Values {
+                            variables: vec![
+                                Variable::new_unchecked(own.clone()),
+                                Variable::new_unchecked(other.clone()),
+                            ],
+                            bindings: rows,
+                        };
+                        let unknown = GraphPattern::Filter {
+                            expr: Expression::Not(Box::new(Expression::Exists(Box::new(known)))),
+                            inner: Box::new(GraphPattern::Bgp {
+                                patterns: vec![type_of(star_var, any(&other))?],
+                            }),
+                        };
+                        own_guards.push(Expression::Not(Box::new(Expression::Exists(Box::new(
+                            unknown,
+                        )))));
+                    }
                 }
                 let mut optional: Vec<Vec<TriplePattern>> = Vec::new();
                 let mut exists: Vec<Vec<TriplePattern>> = Vec::new();
@@ -531,6 +611,23 @@ impl Translation<'_> {
                             variables: vec![variable],
                             bindings,
                         }),
+                    };
+                }
+                for (own, class) in own_values {
+                    pattern = GraphPattern::Join {
+                        left: Box::new(pattern),
+                        right: Box::new(GraphPattern::Values {
+                            variables: vec![Variable::new_unchecked(own)],
+                            bindings: vec![vec![Some(GroundTerm::NamedNode(
+                                NamedNode::new_unchecked(class),
+                            ))]],
+                        }),
+                    };
+                }
+                for guard in own_guards {
+                    pattern = GraphPattern::Filter {
+                        expr: guard,
+                        inner: Box::new(pattern),
                     };
                 }
                 pattern
@@ -1433,6 +1530,17 @@ pub(crate) mod equivalence {
         out
     }
 
+    /// The named regimes, and two that name no direct type and write more than
+    /// the own class: `rdf:type` alone cannot say which class a record is,
+    /// which the translation of a scan's direct type must not assume.
+    fn regimes_under_test() -> Vec<TypeRegime> {
+        use linkml_runtime::schema_rdf::TypePartition;
+        let mut regimes = TypeRegime::NAMED.to_vec();
+        regimes.push(TypeRegime::ASSERTED.with(TypePartition::IsA));
+        regimes.push(TypeRegime::ASSERTED.with(TypePartition::Mixin));
+        regimes
+    }
+
     /// The test schema with an `is_a` chain and a real mixin, and the oracle
     /// holding the fixture written under `regime`: what each corpus test below
     /// runs against once per regime, with the dataset whose default graph is
@@ -1441,7 +1549,7 @@ pub(crate) mod equivalence {
     fn in_each_regime(mut each: impl FnMut(TypeRegime, &SchemaView, &Oracle, &DatasetSpec)) {
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        for &regime in TypeRegime::NAMED {
+        for regime in regimes_under_test() {
             let oracle = crate::sparql_oracle::fixture_in(&schema, regime);
             each(
                 regime,
@@ -1490,6 +1598,11 @@ pub(crate) mod equivalence {
         let queries = [
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t }",
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
+            // The scan's direct type, in a regime with no `directType` triple
+            // that writes more than the own class (review N2).
+            "SELECT ?s ?t WHERE { ?s a asset360:Tag ; a ?t }",
+            "SELECT ?s ?d WHERE { ?s a asset360:Tag ; sesame:directType ?d }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:LatchRelay ; a asset360:Relay }",
             "SELECT ?s ?d WHERE { ?s a asset360:Equipment ; sesame:directType ?d }",
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; asset360:label ?l ; a ?t }",
             "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
@@ -1536,7 +1649,7 @@ pub(crate) mod equivalence {
         ];
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        for &regime in TypeRegime::NAMED {
+        for regime in regimes_under_test() {
             for &graph in TypeRegime::NAMED {
                 let oracle = crate::sparql_oracle::fixture_in(&schema, regime)
                     .with_schema_graph(&schema, G, graph);
@@ -1573,9 +1686,9 @@ pub(crate) mod equivalence {
                         &dataset,
                     );
                 }
-                if regime == TypeRegime::ASSERTED {
+                if !regime.contains(linkml_runtime::schema_rdf::TypePartition::IsA) {
                     // Not vacuous: parent + subclass is empty when the data
-                    // asserts each record's own class only, and not otherwise.
+                    // writes no ancestor, and not otherwise.
                     let both = crate::sparql_scoper::parse_query(
                         &format!(
                             "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
@@ -1613,10 +1726,82 @@ pub(crate) mod equivalence {
         }
     }
 
+    /// **A query reads one data graph**, and every rewrite of the plan it makes
+    /// is held to the oracle holding the records *in that graph*, as the engine
+    /// loads them: `FROM <data>`, `FROM NAMED <data>`, `GRAPH <data>`, and a
+    /// data graph nested in the schema graph (which the plan leaves to the
+    /// engine). The plan reads the data graph's regime, so each graph of a
+    /// different regime is its own run.
+    #[test]
+    fn every_rewrite_of_a_data_graph_query_preserves_the_answer() {
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        const M: &str = "urn:graph:mixins";
+        const G: &str = "https://data.infrabel.be/asset360/schema";
+        let schema =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[
+                (A, TypeRegime::ASSERTED),
+                (I, TypeRegime::IS_A),
+                (M, TypeRegime::IS_A_AND_MIXINS),
+            ],
+            &[(G, TypeRegime::IS_A)],
+        );
+        let rules = tier_one_rules(&schema, &dataset);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        for (graph, regime) in [
+            (A, TypeRegime::ASSERTED),
+            (I, TypeRegime::IS_A),
+            (M, TypeRegime::IS_A_AND_MIXINS),
+        ] {
+            let oracle = crate::sparql_oracle::fixture_in_graph(&schema, regime, graph)
+                .with_schema_graph(&schema, G, TypeRegime::IS_A);
+            // Not vacuous: the records are in the graph, and which types they
+            // carry is the graph's regime.
+            let both = crate::sparql_scoper::parse_query(
+                &format!(
+                    "{PREFIX}SELECT ?s FROM <{graph}> WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
+                ),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                answers(&oracle, &both).is_empty(),
+                regime == TypeRegime::ASSERTED
+            );
+            for body in [
+                "?s a asset360:Equipment ; a ?t",
+                "?s a asset360:Tag ; a ?t",
+                "?s a asset360:Tag ; sesame:directType ?d",
+                "?s a asset360:Equipment ; asset360:label ?l . OPTIONAL { ?s asset360:voltage ?v }",
+                "?s a asset360:Relay , asset360:Equipment",
+            ] {
+                for query in [
+                    format!("SELECT * FROM <{graph}> WHERE {{ {body} }}"),
+                    format!(
+                        "SELECT * FROM NAMED <{graph}> WHERE {{ GRAPH <{graph}> {{ {body} }} }}"
+                    ),
+                    format!("SELECT * WHERE {{ GRAPH <{graph}> {{ {body} }} }}"),
+                    // Nested in the schema graph: the inner `GRAPH` switches
+                    // back to the data graph.
+                    format!("SELECT * WHERE {{ GRAPH <{G}> {{ GRAPH <{graph}> {{ {body} }} }} }}"),
+                ] {
+                    let plan = each_rewrite_preserves_answers_in(
+                        &query, &schema, &oracle, &borrowed, &dataset,
+                    );
+                    assert_eq!(plan.data_regime, regime, "{query}");
+                }
+            }
+        }
+    }
+
     /// Review F2, as the oracle sees it: `?sub` is bound outside the NOT
     /// EXISTS, so the filter does not depend on `?s` and `?t` alone and the
     /// most-specific-type rewrite (R1, `sparql_typed_subjects`) changes the
-    /// answer. Left failing on purpose: the rule is not R3's to fix.
+    /// answer. The rule declines when the NOT EXISTS reads a variable bound
+    /// outside it, which this holds to the oracle.
     #[test]
     fn a_variable_bound_outside_the_not_exists_keeps_the_most_specific_type_rewrite_honest() {
         const G: &str = "https://data.infrabel.be/asset360/schema";
