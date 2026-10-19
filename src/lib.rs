@@ -62,6 +62,7 @@ pub mod sparql_schema_labels;
 pub mod sparql_scope_rules;
 pub mod sparql_scoper;
 pub mod sparql_scopes;
+pub(crate) mod sparql_slot_family;
 pub mod sparql_terms;
 
 #[cfg(feature = "shacl-parser")]

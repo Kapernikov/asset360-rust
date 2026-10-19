@@ -5011,7 +5011,9 @@ fn walk_paths(
         // The class's own O(1) name index rather than a scan. It hands back an
         // owned SlotView, which this did not need before — worth it for a wide
         // class (TunnelComplex has 95 slots), a wash for a narrow one.
-        let Some(slot) = current_class.slot(&Identifier::Name(slot_name.clone())) else {
+        let Some(slot) =
+            crate::sparql_slot_family::slot_on_class_or_descendant(current_class, slot_name)
+        else {
             continue;
         };
 
@@ -5696,6 +5698,58 @@ classes:
     attributes:
       label:
         range: string
+  # Subclass-only slots, two levels deep, for the slot-on-the-family walk: a
+  # `Site` stores a `Place`, but the slot `coords` exists only on
+  # `SpotPlace`, whose range `Fix` again has the slot `lat` only on
+  # `GeoFix`. `tag` is declared on two sibling subclasses with different
+  # ranges, so no one definition can be chosen for it.
+  Site:
+    class_uri: asset360:Site
+    attributes:
+      asset360_uri:
+        identifier: true
+      place:
+        range: Place
+        inlined: true
+      places:
+        range: Place
+        multivalued: true
+        inlined: true
+  Place:
+    class_uri: asset360:Place
+    attributes:
+      label:
+        range: string
+  SpotPlace:
+    is_a: Place
+    class_uri: asset360:SpotPlace
+    attributes:
+      coords:
+        range: Fix
+        inlined: true
+  RoadPlace:
+    is_a: Place
+    class_uri: asset360:RoadPlace
+    attributes:
+      tag:
+        range: string
+  RailPlace:
+    is_a: Place
+    class_uri: asset360:RailPlace
+    attributes:
+      tag:
+        range: integer
+  Fix:
+    class_uri: asset360:Fix
+    attributes:
+      source:
+        range: string
+  GeoFix:
+    is_a: Fix
+    class_uri: asset360:GeoFix
+    attributes:
+      lat:
+        range: integer
 "#;
         let schema: SchemaDefinition =
             p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
