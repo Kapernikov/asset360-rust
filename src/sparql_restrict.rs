@@ -1434,9 +1434,9 @@ mod tests {
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let schema = test_schema_view();
-        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::Asserted)
-            .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
+            .with_data_graph(A, TypeRegime::ASSERTED)
+            .with_data_graph(I, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let query = format!(
@@ -1460,7 +1460,7 @@ mod tests {
             restriction.predicate,
             Predicate::Class {
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
-                regime: TypeRegime::IsA
+                regime: TypeRegime::IS_A
             },
             "{plan}"
         );
@@ -1471,7 +1471,7 @@ mod tests {
             plan.nodes.iter().any(|node| matches!(
                 &node.op,
                 PlanOp::Match {
-                    reads: GraphReads::Data(TypeRegime::Asserted),
+                    reads: GraphReads::Data(TypeRegime::ASSERTED),
                     ..
                 }
             )),

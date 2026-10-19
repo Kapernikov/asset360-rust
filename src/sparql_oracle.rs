@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use linkml_runtime::LinkMLInstance;
 use linkml_runtime::schema_rdf::TypeRegime;
-use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
+use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use oxigraph::io::RdfFormat;
@@ -35,7 +35,7 @@ impl Oracle {
     /// turtled the way the engine leg turtles them (`skolem: false`, so an
     /// inlined element is a blank node of its own).
     pub fn new(schema: &SchemaView, records: &[(&str, &str)]) -> Self {
-        Self::new_in(schema, records, TypeRegime::Asserted)
+        Self::new_in(schema, records, TypeRegime::ASSERTED)
     }
 
     /// [`Oracle::new`] with the records written under type regime `regime`:
@@ -59,9 +59,7 @@ impl Oracle {
                 schema,
                 &primary,
                 &conv,
-                TurtleOptions::default()
-                    .with_skolem(false)
-                    .with_regime(regime),
+                &WriteOptions::flat(regime),
             )
             .unwrap();
             store

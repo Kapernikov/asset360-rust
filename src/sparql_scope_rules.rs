@@ -747,7 +747,7 @@ mod tests {
             PlanOp::Match {
                 pattern: Box::new(triple),
                 reads: crate::sparql_dataset::GraphReads::Data(
-                    linkml_runtime::schema_rdf::TypeRegime::Asserted,
+                    linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
                 ),
             },
             Vec::new(),

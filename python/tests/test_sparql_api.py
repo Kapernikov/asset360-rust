@@ -24,10 +24,10 @@ S = "urn:graph:schema"
 def test_a_dataset_that_contradicts_itself_raises_with_every_conflict():
     with pytest.raises(ValueError) as raised:
         DatasetSpec(
-            TypeRegime.Asserted,
-            data_graphs={A: TypeRegime.Asserted},
+            TypeRegime.ASSERTED,
+            data_graphs={A: TypeRegime.ASSERTED},
             default_graph="urn:graph:nowhere",
-            schema_graphs={A: TypeRegime.IsA, S: TypeRegime.IsA},
+            schema_graphs={A: TypeRegime.IS_A, S: TypeRegime.IS_A},
         )
     message = str(raised.value)
     # Both mistakes are named, not the first one met.
@@ -37,10 +37,10 @@ def test_a_dataset_that_contradicts_itself_raises_with_every_conflict():
 
 def test_a_coherent_dataset_builds():
     DatasetSpec(
-        TypeRegime.Asserted,
-        data_graphs={A: TypeRegime.Asserted},
+        TypeRegime.ASSERTED,
+        data_graphs={A: TypeRegime.ASSERTED},
         default_graph=A,
-        schema_graphs={S: TypeRegime.IsA},
+        schema_graphs={S: TypeRegime.IS_A},
     )
 
 
@@ -76,37 +76,47 @@ def test_the_schema_graph_is_asked_for_by_regime_alone():
     sv = SchemaView()
     sv.add_schema_str(_SCHEMA_YAML)
     subclass_of = "<http://www.w3.org/2000/01/rdf-schema#subClassOf>"
-    asserted = sparql_schema_graph_ntriples(sv, TypeRegime.Asserted)
+    asserted = sparql_schema_graph_ntriples(sv, TypeRegime.ASSERTED)
     assert "<https://example.org/s/Tunnel> " + subclass_of + " <https://example.org/s/Asset>" in asserted
-    assert asserted != sparql_schema_graph_ntriples(sv, TypeRegime.IsA)
-    assert sparql_schema_graph_skipped(sv, TypeRegime.Asserted) == []
+    assert asserted != sparql_schema_graph_ntriples(sv, TypeRegime.IS_A)
+    assert sparql_schema_graph_skipped(sv, TypeRegime.ASSERTED) == []
 
 
 def test_a_dataset_can_be_read_back():
     dataset = DatasetSpec(
-        TypeRegime.Asserted,
-        data_graphs={A: TypeRegime.IsA},
+        TypeRegime.ASSERTED,
+        data_graphs={A: TypeRegime.IS_A},
         default_graph=A,
         partition_graphs={TypePartition.Own: "urn:graph:own"},
-        schema_graphs={S: TypeRegime.IsAAndMixins},
+        schema_graphs={S: TypeRegime.IS_A_AND_MIXINS},
     )
     # The default graph is a data graph, so its regime is the default regime.
-    assert dataset.default_regime == TypeRegime.IsA
-    assert dataset.data_graphs == {A: TypeRegime.IsA}
+    assert dataset.default_regime == TypeRegime.IS_A
+    assert dataset.data_graphs == {A: TypeRegime.IS_A}
     assert dataset.default_graph == A
     assert dataset.partition_graphs == {TypePartition.Own: "urn:graph:own"}
-    assert dataset.schema_graphs == {S: TypeRegime.IsAAndMixins}
+    assert dataset.schema_graphs == {S: TypeRegime.IS_A_AND_MIXINS}
     assert repr(dataset) == (
-        "DatasetSpec(TypeRegime.IsA, data_graphs={'urn:graph:asserted': TypeRegime.IsA}"
+        "DatasetSpec(TypeRegime.IS_A, data_graphs={'urn:graph:asserted': TypeRegime.IS_A}"
         ", default_graph='urn:graph:asserted'"
         ", partition_graphs={TypePartition.Own: 'urn:graph:own'}"
-        ", schema_graphs={'urn:graph:schema': TypeRegime.IsAAndMixins})"
+        ", schema_graphs={'urn:graph:schema': TypeRegime.IS_A_AND_MIXINS})"
+    )
+
+
+def test_a_regime_that_is_no_named_one_reads_back_as_itself():
+    own_and_isa = TypeRegime([TypePartition.Own, TypePartition.IsA])
+    dataset = DatasetSpec(TypeRegime.ASSERTED, data_graphs={A: own_and_isa})
+    assert dataset.data_graphs == {A: own_and_isa}
+    assert repr(dataset) == (
+        "DatasetSpec(TypeRegime.ASSERTED, "
+        "data_graphs={'urn:graph:asserted': TypeRegime.parse('own+isa')})"
     )
 
 
 def test_a_bare_dataset_reads_back_empty():
-    dataset = DatasetSpec(TypeRegime.Asserted)
-    assert dataset.default_regime == TypeRegime.Asserted
+    dataset = DatasetSpec(TypeRegime.ASSERTED)
+    assert dataset.default_regime == TypeRegime.ASSERTED
     assert dataset.data_graphs == {} and dataset.schema_graphs == {}
     assert dataset.default_graph is None and dataset.partition_graphs == {}
-    assert repr(dataset) == "DatasetSpec(TypeRegime.Asserted)"
+    assert repr(dataset) == "DatasetSpec(TypeRegime.ASSERTED)"

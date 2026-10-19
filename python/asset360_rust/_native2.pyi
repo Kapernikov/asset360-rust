@@ -5,7 +5,6 @@ import asset360_rust
 import builtins
 import datetime
 import typing
-from enum import Enum
 
 UNSCOPED_REWRITE_NAMED: builtins.str
 class AltDescription:
@@ -1579,6 +1578,17 @@ class CommonMetadata:
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     def __new__(cls, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> CommonMetadata: ...
 
+class ConflictingDirectTypesError(AmbiguousTypeError):
+    r"""
+    A subject has several distinct sesame:directType values.
+    """
+    @property
+    def subject(self) -> builtins.str: ...
+    @property
+    def direct_types(self) -> builtins.list[builtins.str]: ...
+    @property
+    def candidates(self) -> builtins.list[builtins.str]: ...
+
 class ConstantColumn:
     r"""
     One column of a ``"constant"``: an inline table the statement joins.
@@ -1689,7 +1699,7 @@ class DatasetSpec:
     * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
       subclass edges under a regime.
     
-    ``DatasetSpec(TypeRegime.Asserted)`` is the dataset every endpoint was
+    ``DatasetSpec(TypeRegime.ASSERTED)`` is the dataset every endpoint was
     before graphs had regimes: an asserted default graph and no named graph.
     
     Raises:
@@ -3412,11 +3422,20 @@ class LinkMLInstance:
     def unknown_fields(self) -> dict: ...
     def validation_issues(self) -> builtins.list[ValidationResult]: ...
     def as_python(self) -> typing.Any: ...
-    def as_turtle(self, skolem:typing.Optional[builtins.bool]=None, regime:TypeRegime=TypeRegime.Asserted) -> builtins.str: ...
-    def as_nquads(self, partition_graphs:typing.Mapping[TypePartition, builtins.str], *, skolem:builtins.bool=False) -> builtins.str:
+    def as_turtle(self, *, skolem:builtins.bool=False, regime:TypeRegime=TypeRegime.ASSERTED) -> builtins.str:
+        r"""
+        This instance as Turtle. `regime` picks which type triples are
+        written; Turtle cannot carry graph names.
+        """
+    def as_nquads(self, partition_graphs:typing.Mapping[TypePartition, typing.Optional[builtins.str]], *, skolem:builtins.bool=False) -> builtins.str:
         r"""
         This instance as N-Quads, each type partition in `partition_graphs`
-        written into its named graph (partitions not in the map are omitted).
+        written into its graph IRI (`None` is the default graph); partitions
+        not in the mapping are omitted.
+        """
+    def as_trig(self, partition_graphs:typing.Mapping[TypePartition, typing.Optional[builtins.str]], *, skolem:builtins.bool=False) -> builtins.str:
+        r"""
+        This instance as TriG, routed like `as_nquads`.
         """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
@@ -6986,6 +7005,76 @@ class TypeMapping:
     def keywords(self, value: typing.Optional[builtins.list[builtins.str]]) -> None: ...
     def __new__(cls, framework_key:builtins.str, mapped_type:typing.Optional[builtins.str]=None, string_serialization:typing.Optional[builtins.str]=None, extensions:typing.Optional[builtins.dict[builtins.str, Annotation | Extension]]=None, annotations:typing.Optional[builtins.dict[builtins.str, Annotation]]=None, description:typing.Optional[builtins.str]=None, alt_descriptions:typing.Optional[builtins.dict[builtins.str, AltDescription]]=None, title:typing.Optional[builtins.str]=None, deprecated:typing.Optional[builtins.str]=None, todos:typing.Optional[typing.Sequence[builtins.str]]=None, notes:typing.Optional[typing.Sequence[builtins.str]]=None, comments:typing.Optional[typing.Sequence[builtins.str]]=None, examples:typing.Optional[builtins.list[Example]]=None, in_subset:typing.Optional[typing.Sequence[builtins.str]]=None, from_schema:typing.Optional[builtins.str]=None, imported_from:typing.Optional[builtins.str]=None, source:typing.Optional[builtins.str]=None, in_language:typing.Optional[builtins.str]=None, see_also:typing.Optional[typing.Sequence[builtins.str]]=None, deprecated_element_has_exact_replacement:typing.Optional[builtins.str]=None, deprecated_element_has_possible_replacement:typing.Optional[builtins.str]=None, aliases:typing.Optional[typing.Sequence[builtins.str]]=None, structured_aliases:typing.Optional[builtins.list[StructuredAlias]]=None, mappings:typing.Optional[typing.Sequence[builtins.str]]=None, exact_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, close_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, related_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, narrow_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, broad_mappings:typing.Optional[typing.Sequence[builtins.str]]=None, created_by:typing.Optional[builtins.str]=None, contributors:typing.Optional[typing.Sequence[builtins.str]]=None, created_on:typing.Optional[datetime.datetime]=None, last_updated_on:typing.Optional[datetime.datetime]=None, modified_by:typing.Optional[builtins.str]=None, status:typing.Optional[builtins.str]=None, rank:typing.Optional[builtins.int]=None, categories:typing.Optional[typing.Sequence[builtins.str]]=None, keywords:typing.Optional[typing.Sequence[builtins.str]]=None) -> TypeMapping: ...
 
+class TypePartition:
+    r"""
+    A disjoint slice of an instance's type triples; see `linkml_runtime::schema_rdf::TypePartition`. Not an `enum.Enum`: the four members are class attributes.
+    """
+    Own: TypePartition
+    r"""
+    The instance's own rdf:type and all non-type triples.
+    """
+    IsA: TypePartition
+    r"""
+    rdf:type for each transitive is_a ancestor.
+    """
+    Mixin: TypePartition
+    r"""
+    rdf:type for each class reachable only through a mixin edge.
+    """
+    Direct: TypePartition
+    r"""
+    One sesame:directType naming the instance's own class.
+    """
+    def __eq__(self, other:builtins.object) -> builtins.bool: ...
+    def __hash__(self) -> builtins.int: ...
+
+class TypeRegime:
+    r"""
+    Which type triples the RDF writers emit: a set of `TypePartition`s; see
+    `linkml_runtime::schema_rdf::TypeRegime`. Use the named regimes
+    `TypeRegime.ASSERTED`, `TypeRegime.IS_A`, `TypeRegime.IS_A_AND_MIXINS`,
+    build one from partitions, or `TypeRegime.parse("own+isa")`.
+    """
+    ASSERTED: TypeRegime
+    r"""
+    Only the instance's own class.
+    """
+    IS_A: TypeRegime
+    r"""
+    Own class, transitive is_a ancestors, and sesame:directType.
+    """
+    IS_A_AND_MIXINS: TypeRegime
+    r"""
+    As IS_A, with mixins counted as superclasses.
+    """
+    def __eq__(self, other:builtins.object) -> builtins.bool: ...
+    def __hash__(self) -> builtins.int: ...
+    def __new__(cls, partitions:typing.Iterable[TypePartition]) -> TypeRegime:
+        r"""
+        The regime made of exactly the given partitions.
+        """
+    @staticmethod
+    def parse(s:builtins.str) -> TypeRegime:
+        r"""
+        Parse `str(regime)` output: a named regime, `none`, or partition names
+        (`own`, `isa`, `mixin`, `direct`) joined by `+`. Raises `ValueError`
+        on anything else.
+        """
+    def partitions(self) -> builtins.list[TypePartition]:
+        r"""
+        The partitions in the set, in declaration order.
+        """
+    def __str__(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str: ...
+    def __or__(self, other:TypeRegime) -> TypeRegime:
+        r"""
+        The union of two regimes.
+        """
+    def __contains__(self, partition:TypePartition) -> builtins.bool:
+        r"""
+        Whether the partition is in the set.
+        """
+
 class UniqueKey:
     @property
     def unique_key_name(self) -> builtins.str: ...
@@ -7196,50 +7285,6 @@ class ValidationResult:
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
 
-class TypePartition(Enum):
-    r"""
-    A disjoint slice of an instance's type triples; see
-    `linkml_runtime::schema_rdf::TypePartition`.
-    """
-    Own = ...
-    r"""
-    The instance's own rdf:type and all non-type triples.
-    """
-    IsA = ...
-    r"""
-    rdf:type for each transitive is_a ancestor.
-    """
-    Mixin = ...
-    r"""
-    rdf:type for each class reachable only through a mixin edge.
-    """
-    Direct = ...
-    r"""
-    One sesame:directType naming the instance's own class.
-    """
-
-class TypeRegime(Enum):
-    r"""
-    Which type triples the RDF writers emit; see `linkml_runtime::schema_rdf::TypeRegime`.
-    """
-    Asserted = ...
-    r"""
-    Only the instance's own class (the pre-regime output).
-    """
-    IsA = ...
-    r"""
-    Own class, transitive is_a ancestors, and sesame:directType.
-    """
-    IsAAndMixins = ...
-    r"""
-    As IsA, with mixins counted as superclasses.
-    """
-
-    def partitions(self) -> builtins.list[TypePartition]:
-        r"""
-        The partitions whose union is this regime's output.
-        """
-
 def apply_deltas(base:LinkMLInstance, stages:typing.Sequence[ChangeStage]) -> tuple[LinkMLInstance, dict]: ...
 
 def blame_map_to_path_stage_map(value:asset360_rust.LinkMLInstance, blame_map:dict[int, asset360_rust.Asset360ChangeMeta]) -> list[tuple[list[str], asset360_rust.Asset360ChangeMeta]]: ...
@@ -7329,24 +7374,26 @@ def diff(source:LinkMLInstance, target:LinkMLInstance, treat_missing_as_null:bui
     changes.
     """
 
-def export_nquads(instances:typing.Any, schema_view:SchemaView, writer:typing.Any, partition_graphs:typing.Mapping[TypePartition, builtins.str], *, skolem:builtins.bool=False) -> None:
+def export_nquads(instances:typing.Any, schema_view:SchemaView, writer:typing.Any, partition_graphs:typing.Mapping[TypePartition, typing.Optional[builtins.str]], *, skolem:builtins.bool=False) -> None:
     r"""
     Write LinkML instances as N-Quads into a Python file-like object, each type
-    partition in `partition_graphs` written into its named graph.
+    partition in `partition_graphs` written into its graph IRI (`None` is the
+    default graph).
     """
 
-def export_ntriples(instances:typing.Any, schema_view:SchemaView, writer:typing.Any, *, skolem:builtins.bool=False, regime:TypeRegime=TypeRegime.Asserted) -> None:
+def export_ntriples(instances:typing.Any, schema_view:SchemaView, writer:typing.Any, *, skolem:builtins.bool=False, regime:TypeRegime=TypeRegime.ASSERTED) -> None:
     r"""
     Write LinkML instances as N-Triples into a Python file-like object.
     """
 
-def export_trig(instances:typing.Any, schema_view:SchemaView, writer:typing.Any, partition_graphs:typing.Mapping[TypePartition, builtins.str], *, skolem:builtins.bool=False) -> None:
+def export_trig(instances:typing.Any, schema_view:SchemaView, writer:typing.Any, partition_graphs:typing.Mapping[TypePartition, typing.Optional[builtins.str]], *, skolem:builtins.bool=False) -> None:
     r"""
     Write LinkML instances as TriG into a Python file-like object, each type
-    partition in `partition_graphs` written into its named graph.
+    partition in `partition_graphs` written into its graph IRI (`None` is the
+    default graph).
     """
 
-def export_turtle(instances:typing.Any, schema_view:SchemaView, writer:typing.Any, *, skolem:builtins.bool=False, regime:TypeRegime=TypeRegime.Asserted) -> None:
+def export_turtle(instances:typing.Any, schema_view:SchemaView, writer:typing.Any, *, skolem:builtins.bool=False, regime:TypeRegime=TypeRegime.ASSERTED) -> None:
     r"""
     Write LinkML instances as Turtle into a Python file-like object.
     
@@ -7375,11 +7422,25 @@ def get_foreign_references(instance:asset360_rust.LinkMLInstance, also_include_i
 def import_ntriples(reader:typing.Any, schema_view:SchemaView, root_classes:typing.Sequence[builtins.str], *, disk_path:typing.Optional[builtins.str]=None, strict:builtins.bool=False) -> RdfStream:
     r"""
     Import RDF/N-Triples into a streaming iterator of LinkML instances.
+    
+    `root_classes` names the classes to import. A subject is imported iff its
+    most concrete class (resolved from all its `rdf:type` / `sesame:directType`
+    triples) is one of them or a descendant of one (is_a or mixin), so asserted
+    and inferred data select the same subjects; each is created as that most
+    concrete class. A leaf class selects only its own subjects, never its
+    ancestors or siblings.
     """
 
 def import_turtle(reader:typing.Any, schema_view:SchemaView, root_classes:typing.Sequence[builtins.str], *, disk_path:typing.Optional[builtins.str]=None, strict:builtins.bool=False) -> RdfStream:
     r"""
     Import RDF/Turtle into a streaming iterator of LinkML instances.
+    
+    `root_classes` names the classes to import. A subject is imported iff its
+    most concrete class (resolved from all its `rdf:type` / `sesame:directType`
+    triples) is one of them or a descendant of one (is_a or mixin), so asserted
+    and inferred data select the same subjects; each is created as that most
+    concrete class. A leaf class selects only its own subjects, never its
+    ancestors or siblings.
     """
 
 def lint_element_identity(schema_view:SchemaView) -> builtins.list[ValidationResult]:

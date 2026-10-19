@@ -92,7 +92,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use linkml_runtime::schema_rdf::{RDFS_SUBCLASS_OF, TypeRegime, rdf_types, subclass_edges};
+use linkml_runtime::schema_rdf::{
+    RDFS_SUBCLASS_OF, TypePartition, TypeRegime, rdf_types, subclass_edges,
+};
 use linkml_schemaview::schemaview::SchemaView;
 use spargebra::algebra::PropertyPathExpression;
 use spargebra::term::{NamedNode, NamedNodePattern, TermPattern};
@@ -152,8 +154,17 @@ fn most_specific_is_direct(
     if closure.iter().any(|(sub, sup)| sub == sup) {
         return false;
     }
-    if data_regime == TypeRegime::Asserted {
+    // The rule reads `?s a ?t` and rewrites it to `sesame:directType`: the
+    // data must write its own class, and either nothing else (the own class
+    // is the direct type) or the direct type.
+    if !data_regime.contains(TypePartition::Own) {
+        return false;
+    }
+    if data_regime.is_subset(TypeRegime::ASSERTED) {
         return true;
+    }
+    if !data_regime.contains(TypePartition::Direct) {
+        return false;
     }
     // 2: every type the data regime writes for a class is above it in `E+`.
     let Ok(classes) = sv.class_views() else {
@@ -426,7 +437,7 @@ fn rewrite(plan: &mut Plan, found: &Found) {
         let mut node = node.clone();
         if old == found.matched {
             node.discharges = claims.clone();
-            if found.regime != TypeRegime::Asserted
+            if found.regime.contains(TypePartition::Direct)
                 && let PlanOp::Match { pattern, .. } = &mut node.op
             {
                 pattern.predicate = NamedNodePattern::NamedNode(NamedNode::new_unchecked(
@@ -529,17 +540,17 @@ classes:
     fn the_canonical_spelling_under_is_a_data_is_the_direct_type() {
         let sv = schema_view();
         for graph in [
-            TypeRegime::IsA,
-            TypeRegime::IsAAndMixins,
-            TypeRegime::Asserted,
+            TypeRegime::IS_A,
+            TypeRegime::IS_A_AND_MIXINS,
+            TypeRegime::ASSERTED,
         ] {
-            let (fired, plan) = refined(&sv, &serving(TypeRegime::IsA, graph), &canonical(G));
+            let (fired, plan) = refined(&sv, &serving(TypeRegime::IS_A, graph), &canonical(G));
             assert!(fired, "{graph:?}:\n{plan}");
             assert!(plan.contains("directType"), "{graph:?}:\n{plan}");
         }
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::IsA, TypeRegime::IsA),
+            &serving(TypeRegime::IS_A, TypeRegime::IS_A),
             &canonical(G),
         );
         assert!(fired, "{plan}");
@@ -559,10 +570,10 @@ classes:
     fn a_from_clause_hides_the_schema_graph_and_the_rule_declines() {
         const A: &str = "urn:graph:a";
         let sv = schema_view();
-        let dataset = DatasetSpec::builder(TypeRegime::IsA)
-            .with_data_graph(A, TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(TypeRegime::IS_A)
+            .with_data_graph(A, TypeRegime::IS_A)
             .with_default_graph(A)
-            .with_schema_graph(G, TypeRegime::IsA)
+            .with_schema_graph(G, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let with_clause = |clause: &str| {
@@ -595,7 +606,7 @@ classes:
         let sv = schema_view();
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::Asserted, TypeRegime::Asserted),
+            &serving(TypeRegime::ASSERTED, TypeRegime::ASSERTED),
             &canonical(G),
         );
         assert!(fired, "{plan}");
@@ -614,7 +625,7 @@ classes:
         let sv = schema_view();
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::IsAAndMixins, TypeRegime::IsA),
+            &serving(TypeRegime::IS_A_AND_MIXINS, TypeRegime::IS_A),
             &canonical(G),
         );
         assert!(!fired, "{plan}");
@@ -628,7 +639,7 @@ classes:
         let sv = schema_view();
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::IsA, TypeRegime::IsA),
+            &serving(TypeRegime::IS_A, TypeRegime::IS_A),
             &format!(
                 "SELECT ?s ?t ?n WHERE {{ ?s a ?t . ?s <https://example.org/typed/name> ?n \
                  FILTER NOT EXISTS {{ ?s a ?sub . GRAPH <{G}> {{ ?sub rdfs:subClassOf+ ?t }} }} }}"
@@ -649,7 +660,7 @@ classes:
     #[test]
     fn a_body_variable_bound_on_the_left_leaves_the_plan_alone() {
         let sv = schema_view();
-        let dataset = serving(TypeRegime::IsA, TypeRegime::IsA);
+        let dataset = serving(TypeRegime::IS_A, TypeRegime::IS_A);
         let not_exists = format!(
             "FILTER NOT EXISTS {{ ?s a ?sub . GRAPH <{G}> {{ ?sub rdfs:subClassOf+ ?t }} }}"
         );
@@ -673,7 +684,7 @@ classes:
         let sv = schema_view();
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::IsA, TypeRegime::IsA),
+            &serving(TypeRegime::IS_A, TypeRegime::IS_A),
             &canonical("https://other/g"),
         );
         assert!(!fired, "{plan}");
@@ -686,24 +697,24 @@ classes:
         // Mixin data needs mixin edges; the is-a graph has none for `Tag`.
         assert!(!most_specific_is_direct(
             &sv,
-            TypeRegime::IsA,
-            TypeRegime::IsAAndMixins
+            TypeRegime::IS_A,
+            TypeRegime::IS_A_AND_MIXINS
         ));
         // The asserted graph's direct edges close to the is-a ancestry.
         assert!(most_specific_is_direct(
             &sv,
-            TypeRegime::Asserted,
-            TypeRegime::IsA
+            TypeRegime::ASSERTED,
+            TypeRegime::IS_A
         ));
         assert!(most_specific_is_direct(
             &sv,
-            TypeRegime::IsAAndMixins,
-            TypeRegime::IsAAndMixins
+            TypeRegime::IS_A_AND_MIXINS,
+            TypeRegime::IS_A_AND_MIXINS
         ));
         assert!(!most_specific_is_direct(
             &sv,
-            TypeRegime::Asserted,
-            TypeRegime::IsAAndMixins
+            TypeRegime::ASSERTED,
+            TypeRegime::IS_A_AND_MIXINS
         ));
     }
 
@@ -719,20 +730,24 @@ classes:
         let sv = schema_view();
         let both = |data| {
             DatasetSpec::builder(data)
-                .with_schema_graph(INFERRED_MIXINS, TypeRegime::IsAAndMixins)
-                .with_schema_graph(ASSERTED, TypeRegime::Asserted)
+                .with_schema_graph(INFERRED_MIXINS, TypeRegime::IS_A_AND_MIXINS)
+                .with_schema_graph(ASSERTED, TypeRegime::ASSERTED)
                 .build()
                 .expect("a valid dataset")
         };
-        let (fired, plan) = refined(&sv, &both(TypeRegime::IsA), &canonical(INFERRED_MIXINS));
+        let (fired, plan) = refined(&sv, &both(TypeRegime::IS_A), &canonical(INFERRED_MIXINS));
         assert!(fired && plan.contains("directType"), "{plan}");
         let (fired, plan) = refined(
             &sv,
-            &both(TypeRegime::IsAAndMixins),
+            &both(TypeRegime::IS_A_AND_MIXINS),
             &canonical(INFERRED_MIXINS),
         );
         assert!(fired && plan.contains("directType"), "{plan}");
-        let (fired, plan) = refined(&sv, &both(TypeRegime::IsAAndMixins), &canonical(ASSERTED));
+        let (fired, plan) = refined(
+            &sv,
+            &both(TypeRegime::IS_A_AND_MIXINS),
+            &canonical(ASSERTED),
+        );
         assert!(!fired, "{plan}");
         assert!(plan.contains("antijoin"), "{plan}");
     }
@@ -744,7 +759,7 @@ classes:
     #[test]
     fn subclass_edges_are_irreflexive_in_every_regime() {
         let sv = schema_view();
-        for regime in TypeRegime::ALL {
+        for regime in TypeRegime::NAMED {
             for (sub, sup) in subclass_edges(&sv, regime).unwrap() {
                 assert_ne!(class_key(&sub), class_key(&sup), "{regime:?}");
             }

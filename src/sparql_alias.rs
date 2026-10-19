@@ -1090,7 +1090,7 @@ pub fn check_predicates(
 fn family(class: &ClassView) -> Option<Vec<ClassView>> {
     linkml_runtime::schema_rdf::type_family(
         class,
-        linkml_runtime::schema_rdf::TypeRegime::IsAAndMixins,
+        linkml_runtime::schema_rdf::TypeRegime::IS_A_AND_MIXINS,
     )
     .ok()
 }

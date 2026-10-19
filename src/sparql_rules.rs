@@ -687,10 +687,10 @@ impl Rule for FoldMatchesIntoScan<'_> {
 ///   `asset_type` column the scan reads;
 /// * in the graph of regime `r` the writer emits `(s rdf:type t)` iff
 ///   `t ∈ rdf_types(direct_type(s), r)`, and emits `(s sesame:directType d)`
-///   iff [`TypePartition::Direct`] is among `r.partitions()` and
+///   iff [`TypePartition::Direct`] is in `r` and
 ///   `d = direct_type(s)` -- exactly one such triple per record.
 fn writes_direct_type(regime: TypeRegime) -> bool {
-    regime.partitions().contains(&TypePartition::Direct)
+    regime.contains(TypePartition::Direct)
 }
 
 /// A `sesame:directType` triple pattern.
@@ -6884,7 +6884,7 @@ mod tests {
             "SELECT ?s ?v WHERE { ?s a asset360:Equipment , asset360:LatchRelay , asset360:Relay ; \
              asset360:voltage ?v }",
         ] {
-            let mut plan = plan_in(query, TypeRegime::IsA);
+            let mut plan = plan_in(query, TypeRegime::IS_A);
             let before = plan.obligations.len();
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert_eq!(log.applied.len(), 1, "{query}\n{plan}");
@@ -6919,14 +6919,14 @@ mod tests {
             "SELECT ?s ?v WHERE { ?s a asset360:Relay , asset360:Equipment ; asset360:voltage ?v }",
             "SELECT ?s ?v WHERE { ?s a asset360:Equipment , asset360:Relay ; asset360:voltage ?v }",
         ] {
-            let mut plan = plan_in(query, TypeRegime::Asserted);
+            let mut plan = plan_in(query, TypeRegime::ASSERTED);
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert!(log.applied.is_empty(), "{query}\n{plan}");
             assert!(plan.find("scan").is_empty(), "{query}\n{plan}");
         }
 
         // Siblings: neither family is inside the other, in any regime.
-        for regime in [TypeRegime::Asserted, TypeRegime::IsA] {
+        for regime in [TypeRegime::ASSERTED, TypeRegime::IS_A] {
             let mut plan = plan_in(
                 "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }",
                 regime,
@@ -6978,8 +6978,8 @@ mod tests {
         let rule = FoldMatchesIntoScan::new(&schema);
         let query = "SELECT ?s ?v WHERE { ?s a asset360:Relay ; asset360:voltage ?v }";
         let equipment = "https://data.infrabel.be/asset360/Equipment";
-        for (regime, absorbed) in [(TypeRegime::IsA, true), (TypeRegime::Asserted, false)] {
-            let mut plan = plan_in(query, TypeRegime::IsA);
+        for (regime, absorbed) in [(TypeRegime::IS_A, true), (TypeRegime::ASSERTED, false)] {
+            let mut plan = plan_in(query, TypeRegime::IS_A);
             with_restriction(&mut plan, equipment, regime);
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert_eq!(log.applied.len(), 1, "{regime:?}\n{plan}");
@@ -9386,7 +9386,7 @@ mod tests {
             "SELECT ?s ?l WHERE { ?s a asset360:Equipment , asset360:Relay ; asset360:label ?l . \
              VALUES ?l { \"a\" \"b\" } }",
         ] {
-            let plan = refined_in(query, &schema, TypeRegime::IsA);
+            let plan = refined_in(query, &schema, TypeRegime::IS_A);
             let scans = plan.find("scan");
             assert_eq!(scans.len(), 1, "{plan}");
             assert!(plan.find("values").is_empty(), "narrowing folded:\n{plan}");
@@ -11076,9 +11076,9 @@ mod inline_type_match {
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
-        let dataset = DatasetSpec::builder(TypeRegime::Asserted)
-            .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(TypeRegime::ASSERTED)
+            .with_data_graph(A, TypeRegime::ASSERTED)
+            .with_data_graph(I, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let refined = |site_graph: &str, type_graph: &str| {
@@ -11121,10 +11121,10 @@ mod inline_type_match {
     fn an_inline_element_is_one_node_across_the_graphs_of_a_written_dataset() {
         use linkml_runtime::load_json_str;
         use linkml_runtime::schema_rdf::TypePartition;
-        use linkml_runtime::turtle::{QuadOptions, write_nquads};
+        use linkml_runtime::turtle::{WriteOptions, write_nquads};
         use linkml_schemaview::identifier::Identifier;
         use oxigraph::io::RdfFormat;
-        use oxigraph::model::NamedNode;
+        use oxigraph::model::{GraphName, NamedNode};
         use oxigraph::sparql::QueryResults;
         use oxigraph::store::Store;
         use std::collections::BTreeMap;
@@ -11152,10 +11152,10 @@ mod inline_type_match {
         .unwrap()
         .into_instance_tolerate_errors()
         .unwrap();
-        let graphs: BTreeMap<TypePartition, NamedNode> = [
-            (TypePartition::Own, NamedNode::new(A).unwrap()),
-            (TypePartition::IsA, NamedNode::new(I).unwrap()),
-            (TypePartition::Direct, NamedNode::new(I).unwrap()),
+        let graphs: BTreeMap<TypePartition, GraphName> = [
+            (TypePartition::Own, NamedNode::new(A).unwrap().into()),
+            (TypePartition::IsA, NamedNode::new(I).unwrap().into()),
+            (TypePartition::Direct, NamedNode::new(I).unwrap().into()),
         ]
         .into();
 
@@ -11179,7 +11179,7 @@ mod inline_type_match {
                 &primary,
                 &conv,
                 &mut quads,
-                &QuadOptions::new(graphs.clone()).with_skolem(skolem),
+                &WriteOptions::quads(graphs.clone()).with_skolem(skolem),
             )
             .unwrap();
             let store = Store::new().unwrap();
@@ -11418,7 +11418,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t }",
             &schema,
-            TypeRegime::IsA,
+            TypeRegime::IS_A,
         );
         println!("{plan}");
         let (direct, narrowed, classes) = scan_of(&plan);
@@ -11445,7 +11445,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:Relay }",
             &schema,
-            TypeRegime::IsA,
+            TypeRegime::IS_A,
         );
         println!("{plan}");
         let (direct, narrowed, classes) = scan_of(&plan);
@@ -11473,7 +11473,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s WHERE { ?s a asset360:Relay ; sesame:directType asset360:Switch }",
             &schema,
-            TypeRegime::IsA,
+            TypeRegime::IS_A,
         );
         println!("{plan}");
         assert!(plan.find("match").is_empty(), "{plan}");
@@ -11489,7 +11489,7 @@ mod direct_type {
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t }",
             "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:Equipment }",
         ] {
-            let plan = refined_in(query, &schema, TypeRegime::Asserted);
+            let plan = refined_in(query, &schema, TypeRegime::ASSERTED);
             println!("{plan}");
             assert!(plan.find("match").is_empty(), "{plan}");
             assert_eq!(row_count(&plan), 0, "{plan}");
@@ -11507,7 +11507,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
             &schema,
-            TypeRegime::IsA,
+            TypeRegime::IS_A,
         );
         println!("{plan}");
         let (direct, _, classes) = scan_of(&plan);
@@ -11537,7 +11537,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
             &schema,
-            TypeRegime::Asserted,
+            TypeRegime::ASSERTED,
         );
         println!("{plan}");
         assert_eq!(
@@ -11551,7 +11551,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; sesame:directType ?t ; a ?t }",
             &schema,
-            TypeRegime::IsA,
+            TypeRegime::IS_A,
         );
         println!("{plan}");
         assert_eq!(scan_of(&plan).0.as_deref(), Some("t"), "{plan}");
@@ -11569,7 +11569,7 @@ mod direct_type {
             "SELECT ?d (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; \
              sesame:directType ?d } GROUP BY ?d",
             &schema,
-            TypeRegime::IsA,
+            TypeRegime::IS_A,
         );
         println!("{plan}");
         let tree = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
@@ -11589,7 +11589,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; a ?t } GROUP BY ?t",
             &schema,
-            TypeRegime::IsA,
+            TypeRegime::IS_A,
         );
         println!("{plan}");
         let tree = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
@@ -11619,7 +11619,7 @@ mod direct_type {
             "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s sesame:directType ?t } GROUP BY ?t",
             "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a ?t } GROUP BY ?t",
         ] {
-            let plan = refined_in(query, &schema, TypeRegime::IsA);
+            let plan = refined_in(query, &schema, TypeRegime::IS_A);
             assert!(plan.find("scan").is_empty(), "{query}\n{plan}");
             assert_eq!(plan.find("match").len(), 1, "{query}\n{plan}");
         }
@@ -11636,7 +11636,7 @@ mod direct_type {
             let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
             let naive = naive_plan(
                 &parsed,
-                &DatasetSpec::builder(TypeRegime::IsA)
+                &DatasetSpec::builder(TypeRegime::IS_A)
                     .build()
                     .expect("a valid dataset"),
             )
@@ -11702,7 +11702,7 @@ mod direct_type {
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; asset360:label ?l ; a ?t . \
              OPTIONAL { ?s sesame:directType ?d } }",
         ];
-        for regime in TypeRegime::ALL {
+        for regime in TypeRegime::NAMED {
             let oracle = crate::sparql_oracle::Oracle::new_in(&schema, &records, regime);
             let dataset = DatasetSpec::builder(regime)
                 .build()

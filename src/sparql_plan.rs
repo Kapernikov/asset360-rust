@@ -3426,10 +3426,10 @@ classes:
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
         let dataset = crate::sparql_dataset::DatasetSpec::builder(
-            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
         )
-        .with_data_graph(A, linkml_runtime::schema_rdf::TypeRegime::Asserted)
-        .with_data_graph(I, linkml_runtime::schema_rdf::TypeRegime::IsA)
+        .with_data_graph(A, linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
+        .with_data_graph(I, linkml_runtime::schema_rdf::TypeRegime::IS_A)
         .build()
         .expect("a valid dataset");
         let body = "?s a asset360:Signal ; asset360:name ?nm . FILTER(?nm > \"A\") \
@@ -3517,9 +3517,9 @@ classes:
     fn from_named_alone_plans_an_empty_default_graph() {
         let sv = test_schema_view();
         let dataset = crate::sparql_dataset::DatasetSpec::builder(
-            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
         )
-        .with_data_graph("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::Asserted)
+        .with_data_graph("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
         .build()
         .expect("a valid dataset");
         let query = format!(

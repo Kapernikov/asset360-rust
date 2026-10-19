@@ -1304,7 +1304,7 @@ mod tests {
     fn the_endpoint_serves_exactly_one_named_graph() {
         let quads = crate::sparql_schema_graph::SchemaGraph::build(
             &asset360_schema_view(),
-            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
         )
         .quads_in(SCHEMA_GRAPH)
         .unwrap();

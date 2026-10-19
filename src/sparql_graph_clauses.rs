@@ -494,15 +494,15 @@ mod tests {
         use linkml_runtime::schema_rdf::TypeRegime;
         let schema_view = test_schema_view();
         let only_schema = crate::sparql_dataset::DatasetSpec::builder(
-            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
         )
-        .with_schema_graph(SCHEMA_GRAPH, TypeRegime::Asserted)
+        .with_schema_graph(SCHEMA_GRAPH, TypeRegime::ASSERTED)
         .build()
         .expect("a valid dataset");
-        let with_data = crate::sparql_dataset::DatasetSpec::builder(TypeRegime::Asserted)
-            .with_schema_graph(SCHEMA_GRAPH, TypeRegime::Asserted)
-            .with_data_graph("urn:graph:inferred", TypeRegime::IsA)
-            .with_schema_graph("urn:graph:schema-inferred", TypeRegime::IsA)
+        let with_data = crate::sparql_dataset::DatasetSpec::builder(TypeRegime::ASSERTED)
+            .with_schema_graph(SCHEMA_GRAPH, TypeRegime::ASSERTED)
+            .with_data_graph("urn:graph:inferred", TypeRegime::IS_A)
+            .with_schema_graph("urn:graph:schema-inferred", TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let variable = "SELECT ?c WHERE { GRAPH ?g { ?c ?p ?o } }";

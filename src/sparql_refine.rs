@@ -1725,9 +1725,11 @@ impl fmt::Display for Expr {
                 f,
                 "?{var} ∈ {}{}",
                 shorten(class_uri),
-                regime_label(*regime)
-                    .map(|label| format!(" [{label}]"))
-                    .unwrap_or_default()
+                if *regime == TypeRegime::ASSERTED {
+                    String::new()
+                } else {
+                    format!(" [{regime}]")
+                }
             ),
             Self::Opaque(text) => f.write_str(text),
         }
@@ -2302,7 +2304,7 @@ pub enum PlanOp {
         /// Every class whose records have `class_uri` among their `rdf:type`s
         /// under `regime` (canonical IRIs, sorted, deduplicated, `class_uri`
         /// included): `type_family` of the class. Under
-        /// [`TypeRegime::Asserted`] that is `class_uri` alone. The scan reads
+        /// [`TypeRegime::ASSERTED`] that is `class_uri` alone. The scan reads
         /// the records whose `asset_type` is one of these.
         /// [`Plan::scan_classes_agree`] checks it against the schema.
         classes: Vec<String>,
@@ -4204,25 +4206,26 @@ enum RegimeContext {
     },
 }
 
-/// The tag a node's regime carries in plan text. The regimes other than
-/// asserted always say so ([`regime_label`]); asserted is bare only when it is
-/// what the plan reads by default, and is `[asserted]` otherwise, so it can
-/// never be taken for "no data graph". A match with no regime says
+/// The tag a node's regime carries in plan text: its `Display` spelling, so
+/// the plan and the regime's own name never drift. Asserted is bare only when
+/// it is what the plan reads by default, and is `[asserted]` otherwise, so it
+/// can never be taken for "no data graph". A match with no regime says
 /// `[no data graph]` unless a printed `GRAPH` above it is the explanation.
-fn regime_tag(regime: Option<TypeRegime>, context: RegimeContext) -> Option<&'static str> {
+fn regime_tag(regime: Option<TypeRegime>, context: RegimeContext) -> Option<String> {
     let RegimeContext::Plan {
         default,
         under_graph,
     } = context
     else {
-        return regime.and_then(regime_label);
+        return regime
+            .filter(|regime| *regime != TypeRegime::ASSERTED)
+            .map(|regime| regime.to_string());
     };
     match regime {
-        Some(TypeRegime::Asserted) if default == Some(TypeRegime::Asserted) => None,
-        Some(TypeRegime::Asserted) => Some("asserted"),
-        Some(other) => regime_label(other),
+        Some(TypeRegime::ASSERTED) if default == Some(TypeRegime::ASSERTED) => None,
+        Some(other) => Some(other.to_string()),
         None if under_graph => None,
-        None => Some("no data graph"),
+        None => Some("no data graph".to_owned()),
     }
 }
 
@@ -4230,29 +4233,22 @@ fn regime_tag(regime: Option<TypeRegime>, context: RegimeContext) -> Option<&'st
 /// ([`regime_tag`]); otherwise what it reads, unless a printed `GRAPH` above it
 /// is the explanation. A match that reads no data graph and no graph a printed
 /// `GRAPH` names is told apart from one reading the asserted graph.
-fn reads_tag(reads: GraphReads, context: RegimeContext) -> Option<&'static str> {
+fn reads_tag(reads: GraphReads, context: RegimeContext) -> Option<String> {
     match reads {
         GraphReads::Data(regime) => regime_tag(Some(regime), context),
         other => match context {
             RegimeContext::Plan {
                 under_graph: false, ..
-            } => Some(match other {
-                GraphReads::Schema => "schema graph",
-                GraphReads::Empty => "empty graph",
-                _ => "no data graph",
-            }),
+            } => Some(
+                match other {
+                    GraphReads::Schema => "schema graph",
+                    GraphReads::Empty => "empty graph",
+                    _ => "no data graph",
+                }
+                .to_owned(),
+            ),
             _ => None,
         },
-    }
-}
-
-/// The label a regime carries in plan text. `None` for
-/// [`TypeRegime::Asserted`], so an asserted plan prints as it always did.
-fn regime_label(regime: TypeRegime) -> Option<&'static str> {
-    match regime {
-        TypeRegime::Asserted => None,
-        TypeRegime::IsA => Some("is_a"),
-        TypeRegime::IsAAndMixins => Some("is_a+mixins"),
     }
 }
 
@@ -4310,9 +4306,7 @@ impl fmt::Display for ScanClassesError {
         write!(
             f,
             "the classes a scan of <{}> stands for ({}) cannot be derived from the schema: {}",
-            self.class_uri,
-            regime_label(self.regime).unwrap_or("asserted"),
-            self.message
+            self.class_uri, self.regime, self.message
         )
     }
 }
@@ -5482,7 +5476,7 @@ mod tests {
             PlanOp::Scan {
                 star_var: "s".to_owned(),
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
-                regime: TypeRegime::Asserted,
+                regime: TypeRegime::ASSERTED,
                 classes: vec!["https://data.infrabel.be/asset360/Signal".to_owned()],
                 direct_type: None,
                 direct_type_in: Vec::new(),
@@ -5531,7 +5525,7 @@ mod tests {
             "s",
             "https://data.infrabel.be/asset360/TunnelComplex",
             (
-                TypeRegime::Asserted,
+                TypeRegime::ASSERTED,
                 vec!["https://data.infrabel.be/asset360/TunnelComplex".to_owned()],
             ),
             slots,
@@ -5560,11 +5554,11 @@ mod tests {
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
-        let dataset = DatasetSpec::builder(TypeRegime::Asserted)
-            .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA)
-            .with_data_graph("urn:graph:mixins", TypeRegime::IsAAndMixins)
-            .with_schema_graph(S, TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(TypeRegime::ASSERTED)
+            .with_data_graph(A, TypeRegime::ASSERTED)
+            .with_data_graph(I, TypeRegime::IS_A)
+            .with_data_graph("urn:graph:mixins", TypeRegime::IS_A_AND_MIXINS)
+            .with_schema_graph(S, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let plan = |query: &str| {
@@ -5602,21 +5596,21 @@ mod tests {
         let body = "{ ?s a asset360:Signal ; asset360:name ?n }";
         assert_eq!(
             regimes(&plan(&format!("SELECT ?s WHERE {body}"))),
-            vec![Some(TypeRegime::Asserted); 2]
+            vec![Some(TypeRegime::ASSERTED); 2]
         );
         assert_eq!(
             regimes(&plan(&format!("SELECT ?s FROM <{A}> WHERE {body}"))),
-            vec![Some(TypeRegime::Asserted); 2]
+            vec![Some(TypeRegime::ASSERTED); 2]
         );
         assert_eq!(
             regimes(&plan(&format!("SELECT ?s FROM <{I}> WHERE {body}"))),
-            vec![Some(TypeRegime::IsA); 2]
+            vec![Some(TypeRegime::IS_A); 2]
         );
         assert_eq!(
             regimes(&plan(&format!(
                 "SELECT ?s FROM <{A}> FROM <{I}> WHERE {body}"
             ))),
-            vec![Some(TypeRegime::IsA); 2]
+            vec![Some(TypeRegime::IS_A); 2]
         );
         // A `FROM` that is no data -- a schema graph, an unknown IRI -- reads
         // no regime, and the engine answers.
@@ -5630,7 +5624,7 @@ mod tests {
 
         // `GRAPH <data graph>` dissolves; the matches carry its regime.
         let in_inferred = plan(&format!("SELECT ?s WHERE {{ GRAPH <{I}> {body} }}"));
-        assert_eq!(regimes(&in_inferred), vec![Some(TypeRegime::IsA); 2]);
+        assert_eq!(regimes(&in_inferred), vec![Some(TypeRegime::IS_A); 2]);
         assert_eq!(graph_nodes(&in_inferred), 0, "{in_inferred}");
         // A `FROM` alone leaves no named graph (it parses as an empty
         // `FROM NAMED` list, SPARQL 1.1 13.2): `GRAPH <I>` reads nothing the
@@ -5670,7 +5664,7 @@ mod tests {
         let listed = plan(&format!(
             "SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {body} }}"
         ));
-        assert_eq!(regimes(&listed), vec![Some(TypeRegime::IsA); 2]);
+        assert_eq!(regimes(&listed), vec![Some(TypeRegime::IS_A); 2]);
         assert_eq!(graph_nodes(&listed), 0);
         // Both at once: the `FROM` graph is the default, the `FROM NAMED`
         // graph the named one.
@@ -5680,9 +5674,9 @@ mod tests {
         assert_eq!(
             regimes(&both),
             vec![
-                Some(TypeRegime::Asserted),
-                Some(TypeRegime::Asserted),
-                Some(TypeRegime::IsA)
+                Some(TypeRegime::ASSERTED),
+                Some(TypeRegime::ASSERTED),
+                Some(TypeRegime::IS_A)
             ]
         );
 
@@ -5693,7 +5687,7 @@ mod tests {
         ));
         assert_eq!(
             regimes(&mixed),
-            vec![Some(TypeRegime::Asserted), Some(TypeRegime::IsA)]
+            vec![Some(TypeRegime::ASSERTED), Some(TypeRegime::IS_A)]
         );
         assert_eq!(graph_nodes(&mixed), 0);
 
@@ -5719,11 +5713,11 @@ mod tests {
             })
             .collect();
         assert_eq!(scans.len(), 1, "{refined}");
-        assert_eq!(scans[0].0, TypeRegime::Asserted);
+        assert_eq!(scans[0].0, TypeRegime::ASSERTED);
         assert!(scans[0].1.is_empty(), "{refined}");
         assert_eq!(
             regimes(&refined),
-            vec![Some(TypeRegime::IsA)],
+            vec![Some(TypeRegime::IS_A)],
             "the slot match of the other graph stays: {refined}"
         );
 
@@ -5743,8 +5737,8 @@ mod tests {
         let sv = crate::sparql_scoper::tests::test_schema_view();
         let text = |default: TypeRegime, query: &str| {
             let dataset = DatasetSpec::builder(default)
-                .with_data_graph(A, TypeRegime::Asserted)
-                .with_schema_graph(S, TypeRegime::IsA)
+                .with_data_graph(A, TypeRegime::ASSERTED)
+                .with_schema_graph(S, TypeRegime::IS_A)
                 .build()
                 .expect("a valid dataset");
             let parsed =
@@ -5754,7 +5748,7 @@ mod tests {
         let body = "?s asset360:name ?n";
         // The default regime, asserted: as it always printed.
         let plain = text(
-            TypeRegime::Asserted,
+            TypeRegime::ASSERTED,
             &format!("SELECT ?s WHERE {{ {body} }}"),
         );
         assert!(
@@ -5763,20 +5757,20 @@ mod tests {
         );
         // Asserted under another default is said.
         let in_a = text(
-            TypeRegime::IsA,
+            TypeRegime::IS_A,
             &format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"),
         );
         assert!(in_a.contains("[asserted]"), "{in_a}");
         // No data graph, outside any printed GRAPH: said, and not the same
         // text as the asserted match.
         let nowhere = text(
-            TypeRegime::Asserted,
+            TypeRegime::ASSERTED,
             &format!("SELECT ?s FROM <urn:unknown> WHERE {{ {body} }}"),
         );
         assert!(nowhere.contains("[no data graph]"), "{nowhere}");
         // Under a printed GRAPH the graph is the explanation: no tag.
         let under_graph = text(
-            TypeRegime::Asserted,
+            TypeRegime::ASSERTED,
             &format!("SELECT ?s WHERE {{ GRAPH <{S}> {{ {body} }} }}"),
         );
         assert!(
@@ -5795,18 +5789,18 @@ mod tests {
         let signal = "https://data.infrabel.be/asset360/Signal";
         // Under `asserted` a family is the class alone: nothing to derive.
         assert_eq!(
-            scan_classes(&sv, signal, TypeRegime::Asserted).unwrap(),
+            scan_classes(&sv, signal, TypeRegime::ASSERTED).unwrap(),
             vec![signal.to_owned()]
         );
         // Under `is_a` the family is read off every class, `Broken` included.
-        let error = scan_classes(&sv, signal, TypeRegime::IsA)
+        let error = scan_classes(&sv, signal, TypeRegime::IS_A)
             .expect_err("the schema cannot say what the family is");
         assert_eq!(error.class_uri, signal);
-        assert_eq!(error.regime, TypeRegime::IsA);
+        assert_eq!(error.regime, TypeRegime::IS_A);
 
         // The planner surfaces it to the caller instead of planning a scan
         // that reads only `Signal`.
-        let dataset = DatasetSpec::builder(TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let query =
@@ -5828,9 +5822,9 @@ mod tests {
         const A: &str = "urn:graph:asserted";
         const S: &str = "urn:graph:schema";
         let sv = crate::sparql_scoper::tests::test_schema_view();
-        let dataset = DatasetSpec::builder(TypeRegime::Asserted)
-            .with_data_graph(A, TypeRegime::IsA)
-            .with_schema_graph(S, TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(TypeRegime::ASSERTED)
+            .with_data_graph(A, TypeRegime::IS_A)
+            .with_schema_graph(S, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let body = "?s asset360:name ?n";
@@ -5850,7 +5844,7 @@ mod tests {
         };
 
         let (reads, _) = reads_of(&format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"));
-        assert_eq!(reads, vec![GraphReads::Data(TypeRegime::IsA)]);
+        assert_eq!(reads, vec![GraphReads::Data(TypeRegime::IS_A)]);
         let (reads, _) = reads_of(&format!("SELECT ?s WHERE {{ GRAPH <{S}> {{ {body} }} }}"));
         assert_eq!(reads, vec![GraphReads::Schema]);
         let (reads, _) = reads_of(&format!(
@@ -5869,8 +5863,8 @@ mod tests {
         assert!(text.contains("[no data graph]"), "{text}");
         // Only the data graph answers the one-line question the rules ask.
         assert_eq!(
-            GraphReads::Data(TypeRegime::IsA).data_regime(),
-            Some(TypeRegime::IsA)
+            GraphReads::Data(TypeRegime::IS_A).data_regime(),
+            Some(TypeRegime::IS_A)
         );
         for other in [GraphReads::Schema, GraphReads::Other, GraphReads::Empty] {
             assert_eq!(other.data_regime(), None);
@@ -5909,7 +5903,7 @@ mod tests {
 
         let asserted = naive_plan(
             &parsed,
-            &DatasetSpec::builder(TypeRegime::Asserted)
+            &DatasetSpec::builder(TypeRegime::ASSERTED)
                 .build()
                 .expect("a valid dataset"),
         )
@@ -5923,8 +5917,8 @@ mod tests {
         assert_eq!(
             in_graph(&regimes(&asserted)),
             vec![
-                (false, Some(TypeRegime::Asserted)),
-                (false, Some(TypeRegime::Asserted)),
+                (false, Some(TypeRegime::ASSERTED)),
+                (false, Some(TypeRegime::ASSERTED)),
                 (true, None),
             ]
         );
@@ -5933,7 +5927,7 @@ mod tests {
 
         let is_a = naive_plan(
             &parsed,
-            &DatasetSpec::builder(TypeRegime::IsA)
+            &DatasetSpec::builder(TypeRegime::IS_A)
                 .build()
                 .expect("a valid dataset"),
         )
@@ -5941,8 +5935,8 @@ mod tests {
         assert_eq!(
             in_graph(&regimes(&is_a)),
             vec![
-                (false, Some(TypeRegime::IsA)),
-                (false, Some(TypeRegime::IsA)),
+                (false, Some(TypeRegime::IS_A)),
+                (false, Some(TypeRegime::IS_A)),
                 (true, None),
             ]
         );

@@ -14,7 +14,7 @@ pub use minijinja::*;
 
 use linkml_meta::SchemaDefinition;
 use linkml_runtime::schema_rdf::TypeRegime;
-use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
+use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
 use linkml_runtime::{DiffOptions, LinkMLInstance, diff, load_json_str};
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::enumview::EnumView;
@@ -957,23 +957,22 @@ impl LinkMLInstanceHandle {
     /// `regime` is the type regime the `rdf:type` triples are written under:
     /// `"asserted"` (the instance's own class; the default, and what this
     /// always wrote), `"is_a"` (plus every `is_a` ancestor and
-    /// `sesame:directType`) or `"is_a_and_mixins"` (plus mixins).
+    /// `sesame:directType`), `"is_a_and_mixins"` (plus mixins), or any
+    /// `+`-joined list of partitions (`own`, `isa`, `mixin`, `direct`).
     #[wasm_bindgen(js_name = toTurtle)]
     pub fn to_turtle(
         &self,
         skolem: Option<bool>,
         regime: Option<String>,
     ) -> Result<String, JsValue> {
-        let regime = match regime.as_deref() {
-            None | Some("asserted") => TypeRegime::Asserted,
-            Some("is_a") => TypeRegime::IsA,
-            Some("is_a_and_mixins") => TypeRegime::IsAAndMixins,
-            Some(other) => {
-                return Err(JsValue::from_str(&format!(
-                    "unknown type regime `{other}`: expected \"asserted\", \"is_a\" or \"is_a_and_mixins\""
-                )));
-            }
-        };
+        let regime: TypeRegime = regime
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|e: linkml_runtime::schema_rdf::ParseTypeRegimeError| {
+                JsValue::from_str(&e.to_string())
+            })?
+            .unwrap_or_default();
         let sv = self.inner.schema_view();
         let schema = sv
             .primary_schema()
@@ -984,9 +983,7 @@ impl LinkMLInstanceHandle {
             sv,
             &schema,
             &conv,
-            TurtleOptions::default()
-                .with_skolem(skolem.unwrap_or(false))
-                .with_regime(regime),
+            &WriteOptions::flat(regime).with_skolem(skolem.unwrap_or(false)),
         )
         .map_err(|e| JsValue::from_str(&e.to_string()))
     }

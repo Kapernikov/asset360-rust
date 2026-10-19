@@ -15,7 +15,7 @@ pub(crate) fn descendants_for_slot_resolution(
     // schema error yields no family, which declines the hop: the behaviour
     // before family resolution existed, never a wider answer.
     let own = class.canonical_uri();
-    type_family(class, TypeRegime::IsAAndMixins)
+    type_family(class, TypeRegime::IS_A_AND_MIXINS)
         .unwrap_or_default()
         .into_iter()
         .filter(|member| member.canonical_uri() != own)

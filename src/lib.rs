@@ -3906,7 +3906,7 @@ impl ExecutionPlan {
 /// * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
 ///   subclass edges under a regime.
 ///
-/// ``DatasetSpec(TypeRegime.Asserted)`` is the dataset every endpoint was
+/// ``DatasetSpec(TypeRegime.ASSERTED)`` is the dataset every endpoint was
 /// before graphs had regimes: an asserted default graph and no named graph.
 ///
 /// Raises:
@@ -3978,18 +3978,19 @@ impl PyDatasetSpec {
     /// regime of ``default_graph`` when one is declared, else the one given to
     /// the constructor.
     #[getter]
-    fn default_regime(&self) -> linkml_runtime_python::PyTypeRegime {
-        py_regime(self.inner.default_regime())
+    fn default_regime(&self, py: Python<'_>) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
+        py_regime(py, self.inner.default_regime())
     }
 
     /// Every data graph, IRI to regime.
     #[getter]
     fn data_graphs(
         &self,
-    ) -> std::collections::BTreeMap<String, linkml_runtime_python::PyTypeRegime> {
+        py: Python<'_>,
+    ) -> PyResult<std::collections::BTreeMap<String, Py<linkml_runtime_python::PyTypeRegime>>> {
         self.inner
             .data_graphs()
-            .map(|(iri, regime)| (iri.to_owned(), py_regime(regime)))
+            .map(|(iri, regime)| Ok((iri.to_owned(), py_regime(py, regime)?)))
             .collect()
     }
 
@@ -4020,15 +4021,16 @@ impl PyDatasetSpec {
     #[getter]
     fn schema_graphs(
         &self,
-    ) -> std::collections::BTreeMap<String, linkml_runtime_python::PyTypeRegime> {
+        py: Python<'_>,
+    ) -> PyResult<std::collections::BTreeMap<String, Py<linkml_runtime_python::PyTypeRegime>>> {
         self.inner
             .schema_graphs()
-            .map(|(iri, regime)| (iri.to_owned(), py_regime(regime)))
+            .map(|(iri, regime)| Ok((iri.to_owned(), py_regime(py, regime)?)))
             .collect()
     }
 
     fn __repr__(&self) -> String {
-        let regime = |regime| format!("TypeRegime.{}", regime_name(regime));
+        let regime = regime_repr;
         let mut parts = vec![regime(self.inner.default_regime())];
         let graphs = |graphs: Vec<(&str, linkml_runtime::schema_rdf::TypeRegime)>| {
             let entries: Vec<String> = graphs
@@ -4063,29 +4065,32 @@ impl PyDatasetSpec {
     }
 }
 
-/// The Python spelling of a regime. `linkml_runtime_python` converts the other
-/// way only.
+/// The Python object for a regime. `linkml_runtime_python` converts the other
+/// way only, so this goes through `TypeRegime.parse(str(regime))`, which
+/// round-trips every set.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 fn py_regime(
+    py: Python<'_>,
     regime: linkml_runtime::schema_rdf::TypeRegime,
-) -> linkml_runtime_python::PyTypeRegime {
-    use linkml_runtime::schema_rdf::TypeRegime;
-    use linkml_runtime_python::PyTypeRegime;
-    match regime {
-        TypeRegime::Asserted => PyTypeRegime::Asserted,
-        TypeRegime::IsA => PyTypeRegime::IsA,
-        TypeRegime::IsAAndMixins => PyTypeRegime::IsAAndMixins,
-    }
+) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
+    py.get_type::<linkml_runtime_python::PyTypeRegime>()
+        .call_method1("parse", (regime.to_string(),))?
+        .extract()
 }
 
-/// The name a regime has in Python (`TypeRegime.<name>`).
+/// How Python spells a regime in a `repr`: the named ones as attributes, any
+/// other set as `TypeRegime.parse('own+isa')`.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-fn regime_name(regime: linkml_runtime::schema_rdf::TypeRegime) -> &'static str {
+fn regime_repr(regime: linkml_runtime::schema_rdf::TypeRegime) -> String {
     use linkml_runtime::schema_rdf::TypeRegime;
-    match regime {
-        TypeRegime::Asserted => "Asserted",
-        TypeRegime::IsA => "IsA",
-        TypeRegime::IsAAndMixins => "IsAAndMixins",
+    if regime == TypeRegime::ASSERTED {
+        "TypeRegime.ASSERTED".to_owned()
+    } else if regime == TypeRegime::IS_A {
+        "TypeRegime.IS_A".to_owned()
+    } else if regime == TypeRegime::IS_A_AND_MIXINS {
+        "TypeRegime.IS_A_AND_MIXINS".to_owned()
+    } else {
+        format!("TypeRegime.parse('{regime}')")
     }
 }
 

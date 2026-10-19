@@ -13,7 +13,7 @@ from asset360_rust import plan_query_refined as _plan_with_dataset
 
 # `dataset` is required by the binding (no call can forget it); these tests plan
 # against the endpoint every dataset was before graphs had regimes.
-_DATASET = DatasetSpec(TypeRegime.Asserted)
+_DATASET = DatasetSpec(TypeRegime.ASSERTED)
 
 
 def _plan_query_refined(query, schema_view, **options):
@@ -266,16 +266,16 @@ def test_the_dataset_is_required_and_validated():
     with pytest.raises(TypeError):
         _plan_with_dataset(query, schema())
     with pytest.raises(ValueError, match="not a registered data graph"):
-        DatasetSpec(TypeRegime.Asserted, default_graph="urn:graph:nowhere")
+        DatasetSpec(TypeRegime.ASSERTED, default_graph="urn:graph:nowhere")
     with pytest.raises(ValueError, match="registered as"):
         DatasetSpec(
-            TypeRegime.Asserted,
-            data_graphs={"urn:g": TypeRegime.IsA},
-            schema_graphs={"urn:g": TypeRegime.IsA},
+            TypeRegime.ASSERTED,
+            data_graphs={"urn:g": TypeRegime.IS_A},
+            schema_graphs={"urn:g": TypeRegime.IS_A},
         )
     served = DatasetSpec(
-        TypeRegime.Asserted,
-        data_graphs={"urn:graph:inferred": TypeRegime.IsA},
+        TypeRegime.ASSERTED,
+        data_graphs={"urn:graph:inferred": TypeRegime.IS_A},
     )
     plan = _plan_with_dataset(
         PREFIX
@@ -297,7 +297,7 @@ _SESAME = "PREFIX sesame: <http://www.openrdf.org/schema/sesame#> "
 def _is_a_scan(query):
     sv = SchemaView()
     sv.add_schema_str(_PARENT_YAML)
-    plan = _plan_with_dataset(PREFIX + _SESAME + query, sv, DatasetSpec(TypeRegime.IsA))
+    plan = _plan_with_dataset(PREFIX + _SESAME + query, sv, DatasetSpec(TypeRegime.IS_A))
     scans = [
         op for p in plan.passes if p.kind == "sql" for op in p.ops if op.kind == "scan"
     ]

@@ -9,12 +9,12 @@ fn main() {
     let dir = Path::new(&args[1]);
     let query = std::fs::read_to_string(&args[2]).unwrap();
     let mut dataset = asset360_rust::sparql_dataset::DatasetSpec::builder(
-        linkml_runtime::schema_rdf::TypeRegime::Asserted,
+        linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
     );
     if let Some(iri) = args.get(3) {
         dataset = dataset.with_schema_graph(
             iri.as_str(),
-            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
         );
     }
     let dataset = dataset.build().expect("a valid dataset");

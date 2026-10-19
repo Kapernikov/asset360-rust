@@ -395,14 +395,12 @@ impl Translation<'_> {
                 // regime writes it. Where it does not (asserted), the
                 // record's only `rdf:type` triple is its own class, which is
                 // the same thing.
-                let direct_predicate = if regime
-                    .partitions()
-                    .contains(&linkml_runtime::schema_rdf::TypePartition::Direct)
-                {
-                    linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE
-                } else {
-                    crate::sparql_scoper::RDF_TYPE
-                };
+                let direct_predicate =
+                    if regime.contains(linkml_runtime::schema_rdf::TypePartition::Direct) {
+                        linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE
+                    } else {
+                        crate::sparql_scoper::RDF_TYPE
+                    };
                 let direct = |object: TermPattern| -> Option<TriplePattern> {
                     Some(TriplePattern {
                         subject: TermPattern::Variable(Variable::new_unchecked(star_var.clone())),
@@ -1440,7 +1438,7 @@ pub(crate) mod equivalence {
     fn in_each_regime(mut each: impl FnMut(TypeRegime, &SchemaView, &Oracle, &DatasetSpec)) {
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        for regime in TypeRegime::ALL {
+        for regime in TypeRegime::NAMED {
             let oracle = crate::sparql_oracle::fixture_in(&schema, regime);
             each(
                 regime,
@@ -1537,8 +1535,8 @@ pub(crate) mod equivalence {
         ];
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        for regime in TypeRegime::ALL {
-            for graph in TypeRegime::ALL {
+        for regime in TypeRegime::NAMED {
+            for graph in TypeRegime::NAMED {
                 let oracle = crate::sparql_oracle::fixture_in(&schema, regime)
                     .with_schema_graph(&schema, G, graph);
                 let dataset = DatasetSpec::builder(regime)
@@ -1577,7 +1575,7 @@ pub(crate) mod equivalence {
                         &dataset,
                     );
                 }
-                if regime == TypeRegime::Asserted {
+                if regime == TypeRegime::ASSERTED {
                     // Not vacuous: parent + subclass is empty when the data
                     // asserts each record's own class only, and not otherwise.
                     let both = crate::sparql_scoper::parse_query(&format!(
@@ -1601,7 +1599,7 @@ pub(crate) mod equivalence {
                     // direct type: no anti-join left.
                     if query.contains("NOT EXISTS")
                         && !query.contains("VALUES ?sub")
-                        && regime != TypeRegime::Asserted
+                        && regime != TypeRegime::ASSERTED
                         && graph == regime
                     {
                         assert!(!plan.to_string().contains("antijoin"), "{query}\n{plan}");
@@ -1620,7 +1618,7 @@ pub(crate) mod equivalence {
         const G: &str = "https://data.infrabel.be/asset360/schema";
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        let regime = TypeRegime::IsA;
+        let regime = TypeRegime::IS_A;
         let oracle =
             crate::sparql_oracle::fixture_in(&schema, regime).with_schema_graph(&schema, G, regime);
         let dataset = DatasetSpec::builder(regime)

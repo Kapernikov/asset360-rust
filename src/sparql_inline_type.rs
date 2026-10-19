@@ -42,7 +42,7 @@ pub(crate) enum InlineTypeTest {
 /// `rdf_types(D, regime)` about the element, so `?x a c` holds iff
 /// `c ∈ rdf_types(D, regime)`, i.e. `D ∈ type_family(c, regime)` -- the two are
 /// inverse by definition (`type_family`). `D` ranges over `U = type_family(range,
-/// IsAAndMixins)`, the widest family a slot over `range` may store, so the test
+/// IS_A_AND_MIXINS)`, the widest family a slot over `range` may store, so the test
 /// is decided by `M = U ∩ type_family(c, regime)`:
 ///
 /// * `M = ∅`: no stored element has `c` among its types -- `NeverMatches`.
@@ -60,7 +60,7 @@ pub(crate) fn inline_type_test(
     regime: TypeRegime,
 ) -> Option<InlineTypeTest> {
     let key = |class: &ClassView| class.canonical_uri().to_string();
-    let universe = type_family(range, TypeRegime::IsAAndMixins).ok()?;
+    let universe = type_family(range, TypeRegime::IS_A_AND_MIXINS).ok()?;
     let wanted: std::collections::HashSet<String> =
         type_family(c, regime).ok()?.iter().map(key).collect();
     let matching: Vec<&ClassView> = universe
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn the_verdict_follows_the_regime() {
         use InlineTypeTest::*;
-        for regime in TypeRegime::ALL {
+        for regime in TypeRegime::NAMED {
             // A subclass of the range: the elements designated by it.
             assert_eq!(
                 test("Place", "SpotPlace", regime),
@@ -157,21 +157,27 @@ mod tests {
         // The range itself: asserted, only the elements that are plain
         // `Place`s (designator absent, or naming `Place`); inferred, all.
         assert_eq!(
-            test("Place", "Place", TypeRegime::Asserted),
+            test("Place", "Place", TypeRegime::ASSERTED),
             designator(&["Place"], true)
         );
-        assert_eq!(test("Place", "Place", TypeRegime::IsA), Discharged);
-        assert_eq!(test("Place", "Place", TypeRegime::IsAAndMixins), Discharged);
+        assert_eq!(test("Place", "Place", TypeRegime::IS_A), Discharged);
+        assert_eq!(
+            test("Place", "Place", TypeRegime::IS_A_AND_MIXINS),
+            Discharged
+        );
         // A leaf range is its own whole family.
         assert_eq!(
-            test("SpotPlace", "SpotPlace", TypeRegime::Asserted),
+            test("SpotPlace", "SpotPlace", TypeRegime::ASSERTED),
             Discharged
         );
         // A superclass of the range: asserted, an element is only its own
         // class; inferred, it is the superclass too, always.
-        assert_eq!(test("GeoFix", "Fix", TypeRegime::Asserted), NeverMatches);
-        assert_eq!(test("GeoFix", "Fix", TypeRegime::IsA), Discharged);
-        assert_eq!(test("GeoFix", "Fix", TypeRegime::IsAAndMixins), Discharged);
+        assert_eq!(test("GeoFix", "Fix", TypeRegime::ASSERTED), NeverMatches);
+        assert_eq!(test("GeoFix", "Fix", TypeRegime::IS_A), Discharged);
+        assert_eq!(
+            test("GeoFix", "Fix", TypeRegime::IS_A_AND_MIXINS),
+            Discharged
+        );
     }
 
     /// A class with no designator cannot tell its elements apart: they are all
@@ -179,7 +185,7 @@ mod tests {
     #[test]
     fn a_range_without_a_designator_is_all_one_class() {
         use InlineTypeTest::*;
-        for regime in TypeRegime::ALL {
+        for regime in TypeRegime::NAMED {
             assert_eq!(
                 test("Detail", "Coordinates", regime),
                 NeverMatches,
@@ -187,7 +193,7 @@ mod tests {
             );
             assert_eq!(test("Detail", "Place", regime), NeverMatches, "{regime:?}");
         }
-        assert_eq!(test("Detail", "Detail", TypeRegime::Asserted), Discharged);
-        assert_eq!(test("Detail", "Detail", TypeRegime::IsA), Discharged);
+        assert_eq!(test("Detail", "Detail", TypeRegime::ASSERTED), Discharged);
+        assert_eq!(test("Detail", "Detail", TypeRegime::IS_A), Discharged);
     }
 }

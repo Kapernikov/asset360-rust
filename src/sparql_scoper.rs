@@ -8889,9 +8889,9 @@ classes:
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
-        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::Asserted)
-            .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
+            .with_data_graph(A, TypeRegime::ASSERTED)
+            .with_data_graph(I, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let scoped = |query: &str| {
@@ -8910,30 +8910,30 @@ classes:
 
         // No clause: the dataset's default regime, and the one class.
         let plain = scoped("SELECT ?s WHERE { ?s a asset360:Signal }");
-        assert_eq!(regime_of(&plain), TypeRegime::Asserted);
+        assert_eq!(regime_of(&plain), TypeRegime::ASSERTED);
         assert_eq!(plain.inexact, None);
 
         // A clause naming data graphs: the regime of their union, exactly.
         let from_asserted = scoped(&format!(
             "SELECT ?s FROM <{A}> WHERE {{ ?s a asset360:Signal }}"
         ));
-        assert_eq!(regime_of(&from_asserted), TypeRegime::Asserted);
+        assert_eq!(regime_of(&from_asserted), TypeRegime::ASSERTED);
         let from_inferred = scoped(&format!(
             "SELECT ?s FROM <{I}> WHERE {{ ?s a asset360:Signal }}"
         ));
-        assert_eq!(regime_of(&from_inferred), TypeRegime::IsA);
+        assert_eq!(regime_of(&from_inferred), TypeRegime::IS_A);
         assert_eq!(from_inferred.inexact, None);
         let from_both = scoped(&format!(
             "ASK FROM <{A}> FROM <{I}> WHERE {{ ?s a asset360:Signal }}"
         ));
-        assert_eq!(regime_of(&from_both), TypeRegime::IsA);
+        assert_eq!(regime_of(&from_both), TypeRegime::IS_A);
 
         // A graph of the dataset inside the pattern: the same read, per
         // pattern, with no inexactness for a data graph.
         let in_graph = scoped(&format!(
             "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
         ));
-        assert_eq!(regime_of(&in_graph), TypeRegime::IsA);
+        assert_eq!(regime_of(&in_graph), TypeRegime::IS_A);
         assert_eq!(in_graph.inexact, None);
 
         // A clause naming something the dataset does not serve is the
@@ -8977,9 +8977,9 @@ classes:
     is_a: Signal
 ",
         );
-        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::Asserted)
-            .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
+            .with_data_graph(A, TypeRegime::ASSERTED)
+            .with_data_graph(I, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let scope = |query: &str| {
@@ -9014,7 +9014,7 @@ classes:
         ));
         assert_eq!(mixed.root.all_stars().len(), 1);
         assert_eq!(classes(&mixed), vec![beacon, signal]);
-        assert_eq!(mixed.root.all_stars()[0].regime, TypeRegime::IsA);
+        assert_eq!(mixed.root.all_stars()[0].regime, TypeRegime::IS_A);
     }
 
     #[test]

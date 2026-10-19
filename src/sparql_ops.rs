@@ -4212,7 +4212,7 @@ mod tests {
                 crate::sparql_refine::PlanOp::Match {
                     pattern: Box::new(pattern),
                     reads: crate::sparql_dataset::GraphReads::Data(
-                        linkml_runtime::schema_rdf::TypeRegime::Asserted,
+                        linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
                     ),
                 },
                 Vec::new(),
@@ -4400,7 +4400,7 @@ mod tests {
         use linkml_runtime::schema_rdf::TypeRegime;
         let sv = test_schema_view();
         let query = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment }";
-        let tree = lowered_in(query, &sv, TypeRegime::IsA).expect("should lower under is_a");
+        let tree = lowered_in(query, &sv, TypeRegime::IS_A).expect("should lower under is_a");
         let Op::Scan { class_uri, .. } = &tree.nodes[0].op else {
             panic!("the first node is the scan");
         };
@@ -4410,7 +4410,7 @@ mod tests {
         // declines and nothing folds into one scan claiming both.
         assert!(
             matches!(
-                lowered_in(query, &sv, TypeRegime::Asserted),
+                lowered_in(query, &sv, TypeRegime::ASSERTED),
                 Err(LoweringRefusal::NothingPushed)
             ),
             "asserted: nothing folds, and lowering says so"
@@ -4419,7 +4419,7 @@ mod tests {
         let sibling = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }";
         assert!(
             matches!(
-                lowered_in(sibling, &sv, TypeRegime::IsA),
+                lowered_in(sibling, &sv, TypeRegime::IS_A),
                 Err(LoweringRefusal::NothingPushed)
             ),
             "siblings do not fold, and lowering says so"
@@ -4435,7 +4435,7 @@ mod tests {
         let query = format!(
             "SELECT ?s WHERE {{ VALUES ?s {{ <{iri}> }} ?s a asset360:Relay , asset360:Equipment }}"
         );
-        let tree = lowered_in(&query, &sv, TypeRegime::IsA).expect("should lower under is_a");
+        let tree = lowered_in(&query, &sv, TypeRegime::IS_A).expect("should lower under is_a");
         let Op::Scan {
             class_uri,
             identifier_values,

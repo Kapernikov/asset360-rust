@@ -59,10 +59,10 @@ pub enum GraphRole {
 impl fmt::Display for GraphRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DataGraph(regime) => write!(f, "a data graph ({})", describe(*regime)),
+            Self::DataGraph(regime) => write!(f, "a data graph ({regime})"),
             Self::DefaultGraph => write!(f, "the default graph"),
             Self::PartitionGraph(partition) => write!(f, "the {partition:?} partition graph"),
-            Self::SchemaGraph(regime) => write!(f, "a schema graph ({})", describe(*regime)),
+            Self::SchemaGraph(regime) => write!(f, "a schema graph ({regime})"),
         }
     }
 }
@@ -141,14 +141,6 @@ impl fmt::Display for DatasetSpecError {
 
 impl std::error::Error for DatasetSpecError {}
 
-fn describe(regime: TypeRegime) -> &'static str {
-    match regime {
-        TypeRegime::Asserted => "asserted",
-        TypeRegime::IsA => "is_a",
-        TypeRegime::IsAAndMixins => "is_a+mixins",
-    }
-}
-
 /// A [`DatasetSpec`] under construction: registrations in any order, checked
 /// together by [`Self::build`].
 ///
@@ -186,7 +178,7 @@ impl DatasetSpec {
     /// plans a different endpoint's query.
     pub fn asserted() -> Self {
         Self {
-            default_regime: TypeRegime::Asserted,
+            default_regime: TypeRegime::ASSERTED,
             data_graphs: BTreeMap::new(),
             default_graph: None,
             partition_graphs: BTreeMap::new(),
@@ -400,43 +392,31 @@ impl DatasetSpec {
     }
 
     /// The regime a pattern matched against exactly the graphs `iris` is
-    /// matched under: `Some` when every one is a data graph and the union of
-    /// their regimes' partitions is exactly one regime's partitions
-    /// ([`TypeRegime::ALL`]), `None` for anything else -- a schema graph, an
-    /// unknown IRI, an empty set, or a union no regime stands for.
+    /// matched under: `Some` when every one is a data graph, the union of
+    /// their regimes' partitions. Any non-empty set is a regime: every
+    /// computation that depends on it (`type_family`, `rdf_types`, the scan's
+    /// classes, the schema graph's edges, whether `sesame:directType` is
+    /// written) is derived from the set, not from a named variant. `None` for
+    /// anything else -- a schema graph, an unknown IRI, or an empty set.
     ///
-    /// `Asserted` together with `IsA` is `IsA` (the second contains the
-    /// first); `IsA` with `IsAAndMixins` is `IsAAndMixins`.
+    /// `ASSERTED` together with `IS_A` is `IS_A` (the second contains the
+    /// first); two sets that overlap only partly give their union.
     pub(crate) fn regime_of_graph_set(&self, iris: &[&str]) -> Option<TypeRegime> {
-        let mut union: Vec<TypePartition> = Vec::new();
+        let mut union = TypeRegime::empty();
         for iri in iris {
-            for partition in self.data_regime(iri)?.partitions() {
-                if !union.contains(partition) {
-                    union.push(*partition);
-                }
-            }
+            union = union.union(self.data_regime(iri)?);
         }
-        if union.is_empty() {
-            return None;
-        }
-        union.sort();
-        TypeRegime::ALL.into_iter().find(|regime| {
-            let mut own: Vec<TypePartition> = regime.partitions().to_vec();
-            own.sort();
-            own == union
-        })
+        (union != TypeRegime::empty()).then_some(union)
     }
 
     /// The widest regime any graph a `GRAPH ?g` can bind to carries: what a
-    /// scan must read so that no graph's records are missed.
+    /// scan must read so that no graph's records are missed. The union of
+    /// every data graph's partitions.
     pub(crate) fn widest_data_regime(&self) -> TypeRegime {
-        let mut widest = self.default_regime();
-        for (_, regime) in self.data_graphs() {
-            if regime.partitions().len() > widest.partitions().len() {
-                widest = regime;
-            }
-        }
-        widest
+        self.data_graphs()
+            .fold(self.default_regime(), |widest, (_, regime)| {
+                widest.union(regime)
+            })
     }
 }
 
@@ -582,8 +562,8 @@ pub(crate) fn default_dataset() -> &'static DatasetSpec {
 /// An asserted dataset that serves one schema graph, `iri`.
 #[cfg(test)]
 pub(crate) fn schema_dataset(iri: &str) -> DatasetSpec {
-    DatasetSpec::builder(TypeRegime::Asserted)
-        .with_schema_graph(iri, TypeRegime::Asserted)
+    DatasetSpec::builder(TypeRegime::ASSERTED)
+        .with_schema_graph(iri, TypeRegime::ASSERTED)
         .build()
         .expect("one schema graph is a valid dataset")
 }
@@ -598,11 +578,11 @@ mod tests {
     const S: &str = "urn:graph:schema";
 
     fn served_builder() -> DatasetSpecBuilder {
-        DatasetSpec::builder(TypeRegime::Asserted)
-            .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA)
-            .with_data_graph(M, TypeRegime::IsAAndMixins)
-            .with_schema_graph(S, TypeRegime::IsA)
+        DatasetSpec::builder(TypeRegime::ASSERTED)
+            .with_data_graph(A, TypeRegime::ASSERTED)
+            .with_data_graph(I, TypeRegime::IS_A)
+            .with_data_graph(M, TypeRegime::IS_A_AND_MIXINS)
+            .with_schema_graph(S, TypeRegime::IS_A)
     }
 
     fn served() -> DatasetSpec {
@@ -613,10 +593,10 @@ mod tests {
     fn the_asserted_dataset_is_the_asserted_one_with_no_graphs() {
         let dataset = DatasetSpec::asserted();
         assert_eq!(
-            DatasetSpec::builder(TypeRegime::Asserted).build(),
+            DatasetSpec::builder(TypeRegime::ASSERTED).build(),
             Ok(dataset.clone())
         );
-        assert_eq!(dataset.default_regime(), TypeRegime::Asserted);
+        assert_eq!(dataset.default_regime(), TypeRegime::ASSERTED);
         assert!(!dataset.has_schema_graph());
         assert_eq!(dataset.data_regime(A), None);
     }
@@ -628,9 +608,9 @@ mod tests {
             .with_partition_graph(TypePartition::Own, A)
             .build()
             .expect("a valid dataset");
-        assert_eq!(dataset.default_regime(), TypeRegime::IsA);
-        assert_eq!(dataset.data_regime(M), Some(TypeRegime::IsAAndMixins));
-        assert_eq!(dataset.schema_regime(S), Some(TypeRegime::IsA));
+        assert_eq!(dataset.default_regime(), TypeRegime::IS_A);
+        assert_eq!(dataset.data_regime(M), Some(TypeRegime::IS_A_AND_MIXINS));
+        assert_eq!(dataset.schema_regime(S), Some(TypeRegime::IS_A));
         assert_eq!(dataset.data_regime(S), None);
         assert_eq!(dataset.schema_regime(A), None);
         assert_eq!(dataset.partition_graph(TypePartition::Own), Some(A));
@@ -647,18 +627,18 @@ mod tests {
 
     #[test]
     fn a_dataset_that_contradicts_itself_is_refused_by_name() {
-        let orphan = DatasetSpec::builder(TypeRegime::Asserted).with_default_graph(A);
+        let orphan = DatasetSpec::builder(TypeRegime::ASSERTED).with_default_graph(A);
         assert_eq!(
             conflicts_of(orphan),
             vec![DatasetConflict::DefaultGraphNotADataGraph { iri: A.into() }]
         );
         // The order of the calls does not matter.
-        let ordered = DatasetSpec::builder(TypeRegime::Asserted)
+        let ordered = DatasetSpec::builder(TypeRegime::ASSERTED)
             .with_default_graph(A)
-            .with_data_graph(A, TypeRegime::IsA)
+            .with_data_graph(A, TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
-        assert_eq!(ordered.default_regime(), TypeRegime::IsA);
+        assert_eq!(ordered.default_regime(), TypeRegime::IS_A);
 
         let twice = |iri: &str, first: GraphRole, second: GraphRole| {
             DatasetConflict::GraphRegisteredTwice {
@@ -672,20 +652,20 @@ mod tests {
         let partition = GraphRole::PartitionGraph;
         for (builder, expected) in [
             (
-                served_builder().with_data_graph(A, TypeRegime::IsA),
-                twice(A, data(TypeRegime::Asserted), data(TypeRegime::IsA)),
+                served_builder().with_data_graph(A, TypeRegime::IS_A),
+                twice(A, data(TypeRegime::ASSERTED), data(TypeRegime::IS_A)),
             ),
             (
-                served_builder().with_schema_graph(A, TypeRegime::Asserted),
-                twice(A, data(TypeRegime::Asserted), schema(TypeRegime::Asserted)),
+                served_builder().with_schema_graph(A, TypeRegime::ASSERTED),
+                twice(A, data(TypeRegime::ASSERTED), schema(TypeRegime::ASSERTED)),
             ),
             (
-                served_builder().with_data_graph(S, TypeRegime::IsA),
-                twice(S, schema(TypeRegime::IsA), data(TypeRegime::IsA)),
+                served_builder().with_data_graph(S, TypeRegime::IS_A),
+                twice(S, schema(TypeRegime::IS_A), data(TypeRegime::IS_A)),
             ),
             (
-                served_builder().with_schema_graph(S, TypeRegime::Asserted),
-                twice(S, schema(TypeRegime::IsA), schema(TypeRegime::Asserted)),
+                served_builder().with_schema_graph(S, TypeRegime::ASSERTED),
+                twice(S, schema(TypeRegime::IS_A), schema(TypeRegime::ASSERTED)),
             ),
             (
                 served_builder()
@@ -709,7 +689,7 @@ mod tests {
             ),
             (
                 served_builder().with_partition_graph(TypePartition::Own, S),
-                twice(S, schema(TypeRegime::IsA), partition(TypePartition::Own)),
+                twice(S, schema(TypeRegime::IS_A), partition(TypePartition::Own)),
             ),
         ] {
             assert_eq!(conflicts_of(builder), vec![expected]);
@@ -717,7 +697,7 @@ mod tests {
         // The same registration twice is no contradiction.
         assert!(
             served_builder()
-                .with_data_graph(A, TypeRegime::Asserted)
+                .with_data_graph(A, TypeRegime::ASSERTED)
                 .build()
                 .is_ok()
         );
@@ -728,7 +708,7 @@ mod tests {
     #[test]
     fn every_conflict_is_reported_at_once() {
         let error = served_builder()
-            .with_data_graph(A, TypeRegime::IsA)
+            .with_data_graph(A, TypeRegime::IS_A)
             .with_default_graph("urn:graph:nowhere")
             .with_partition_graph(TypePartition::Own, S)
             .build()
@@ -748,11 +728,11 @@ mod tests {
     fn a_set_of_graphs_is_the_regime_whose_partitions_it_unions_to() {
         let dataset = served();
         let regime = |iris: &[&str]| dataset.regime_of_graph_set(iris);
-        assert_eq!(regime(&[A]), Some(TypeRegime::Asserted));
-        assert_eq!(regime(&[A, I]), Some(TypeRegime::IsA));
-        assert_eq!(regime(&[I, A]), Some(TypeRegime::IsA));
-        assert_eq!(regime(&[I, M]), Some(TypeRegime::IsAAndMixins));
-        assert_eq!(regime(&[A, I, M]), Some(TypeRegime::IsAAndMixins));
+        assert_eq!(regime(&[A]), Some(TypeRegime::ASSERTED));
+        assert_eq!(regime(&[A, I]), Some(TypeRegime::IS_A));
+        assert_eq!(regime(&[I, A]), Some(TypeRegime::IS_A));
+        assert_eq!(regime(&[I, M]), Some(TypeRegime::IS_A_AND_MIXINS));
+        assert_eq!(regime(&[A, I, M]), Some(TypeRegime::IS_A_AND_MIXINS));
         // A schema graph or an unknown graph is no data: no regime.
         assert_eq!(regime(&[A, S]), None);
         assert_eq!(regime(&[S]), None);
@@ -762,10 +742,10 @@ mod tests {
 
     #[test]
     fn a_graph_variable_reads_the_widest_regime_served() {
-        assert_eq!(served().widest_data_regime(), TypeRegime::IsAAndMixins);
+        assert_eq!(served().widest_data_regime(), TypeRegime::IS_A_AND_MIXINS);
         assert_eq!(
             DatasetSpec::asserted().widest_data_regime(),
-            TypeRegime::Asserted
+            TypeRegime::ASSERTED
         );
     }
 }

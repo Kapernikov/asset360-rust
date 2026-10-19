@@ -33,7 +33,7 @@ use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
 use linkml_runtime::LinkMLInstance;
-use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
+use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
 use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_dataset::DatasetSpec;
@@ -401,9 +401,7 @@ pub fn sparql_execute(
                 schema_view,
                 &primary_schema,
                 &converter,
-                TurtleOptions::default()
-                    .with_skolem(false)
-                    .with_regime(dataset.default_regime()),
+                &WriteOptions::flat(dataset.default_regime()),
             )
             .map_err(|e| ExecuteError::ConversionError {
                 object_uri: object_uri.clone(),
@@ -1146,11 +1144,11 @@ classes:
         let sv = test_schema_view();
         let instances = signal_instances(&sv);
         let refs: Vec<&LinkMLInstance> = instances.iter().collect();
-        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::Asserted)
-            .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::ASSERTED)
+            .with_data_graph(A, TypeRegime::ASSERTED)
+            .with_data_graph(I, TypeRegime::IS_A)
             .with_default_graph(A)
-            .with_schema_graph("urn:graph:schema", TypeRegime::IsA)
+            .with_schema_graph("urn:graph:schema", TypeRegime::IS_A)
             .build()
             .expect("a valid dataset");
         let run = |query: &str| {
@@ -2316,9 +2314,7 @@ classes:
                     &sv,
                     &primary,
                     &conv,
-                    TurtleOptions::default()
-                        .with_skolem(false)
-                        .with_regime(linkml_runtime::schema_rdf::TypeRegime::Asserted),
+                    &WriteOptions::flat(linkml_runtime::schema_rdf::TypeRegime::ASSERTED),
                 )
                 .unwrap();
                 store
@@ -2524,7 +2520,7 @@ classes:
     /// next reader will look.
     #[test]
     fn as_wkt_triplifies_as_geo_wkt_literal() {
-        use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
+        use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
 
         let sv = schema();
         let instance = zone(
@@ -2539,9 +2535,7 @@ classes:
             &sv,
             &primary,
             &conv,
-            TurtleOptions::default()
-                .with_skolem(false)
-                .with_regime(linkml_runtime::schema_rdf::TypeRegime::Asserted),
+            &WriteOptions::flat(linkml_runtime::schema_rdf::TypeRegime::ASSERTED),
         )
         .unwrap();
 
