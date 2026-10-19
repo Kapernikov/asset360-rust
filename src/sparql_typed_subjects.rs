@@ -103,9 +103,6 @@ use crate::sparql_refine::{
 };
 use crate::sparql_rules::{Rule, consumers_of};
 
-/// `sesame:directType`.
-pub const SESAME_DIRECT_TYPE: &str = "http://www.openrdf.org/schema/sesame#directType";
-
 // ---------------------------------------------------------------------------
 // Edge arithmetic
 // ---------------------------------------------------------------------------
@@ -432,8 +429,9 @@ fn rewrite(plan: &mut Plan, found: &Found) {
             if found.regime != TypeRegime::Asserted
                 && let PlanOp::Match { pattern, .. } = &mut node.op
             {
-                pattern.predicate =
-                    NamedNodePattern::NamedNode(NamedNode::new_unchecked(SESAME_DIRECT_TYPE));
+                pattern.predicate = NamedNodePattern::NamedNode(NamedNode::new_unchecked(
+                    linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE,
+                ));
             }
         }
         nodes.push(node);

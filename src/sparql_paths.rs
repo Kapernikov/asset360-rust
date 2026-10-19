@@ -91,9 +91,6 @@ use spargebra::term::{NamedNode, TermPattern, TriplePattern};
 
 use linkml_schemaview::schemaview::SchemaView;
 
-/// The predicate the inferred regimes add to a data graph.
-const SESAME_DIRECT_TYPE: &str = "http://www.openrdf.org/schema/sesame#directType";
-
 /// Reduce every path the data graph cannot walk. See the module docs.
 pub fn reduce_paths(query: &mut Query, schema_view: &SchemaView) {
     let (Query::Select { dataset, .. }
@@ -148,7 +145,7 @@ impl Pass<'_> {
             let conv = self.schema_view.converter();
             let mut set = BTreeSet::new();
             set.insert(crate::sparql_scoper::RDF_TYPE.to_owned());
-            set.insert(SESAME_DIRECT_TYPE.to_owned());
+            set.insert(linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE.to_owned());
             // The schema's slots, and every class's induced ones: a
             // `slot_usage` may give an inherited slot another `slot_uri` that
             // no declared slot carries.
