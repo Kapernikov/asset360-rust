@@ -5409,6 +5409,13 @@ pub fn tier_one_rules<'a>(
 ) -> Vec<Box<dyn Rule + 'a>> {
     #[cfg_attr(not(feature = "sparql-endpoint"), allow(unused_mut))]
     let mut rules: Vec<Box<dyn Rule + 'a>> = vec![
+        // First, so the spelling it recognises is still the naive one: a
+        // schema-only subplan inside its NOT EXISTS would otherwise be
+        // evaluated into a table first (`Materialise`, below) and the shape
+        // would be gone.
+        Box::new(
+            crate::sparql_typed_subjects::MostSpecificTypeIsTheDirectType::new(schema, dataset),
+        ),
         Box::new(InlineTypeMatchBecomesFilter::new(schema)),
         Box::new(FoldMatchesIntoScan::new(schema)),
         Box::new(FoldNestedMatchIntoPath::new(schema)),

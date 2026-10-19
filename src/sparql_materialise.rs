@@ -1361,6 +1361,27 @@ mod tests {
 
     /// An instance query pays nothing: no `GRAPH` node names the schema graph,
     /// so no subplan qualifies and the store is never built.
+    /// **A subclass question over the schema graph is a constant table joined
+    /// on the type variable** (#515): `GRAPH <schema> { ?t rdfs:subClassOf+ X }`
+    /// -- one hop or transitive -- reads nothing but the schema, so the
+    /// materialisation pass replaces the `GRAPH` subtree by the `VALUES` of its
+    /// solutions and what is left is `?s a ?t` joined on `?t`. Spelling the
+    /// table as a `VALUES` block gives the same plan shape.
+    #[test]
+    fn a_subclass_question_is_a_constant_table_joined_on_the_type() {
+        for graph_spelling in [
+            format!("GRAPH <{SCHEMA_GRAPH}> {{ ?t rdfs:subClassOf asset360:Asset }}"),
+            format!("GRAPH <{SCHEMA_GRAPH}> {{ ?t rdfs:subClassOf+ asset360:Asset }}"),
+        ] {
+            let plan = refined_for(&format!(
+                "SELECT ?s ?t WHERE {{ ?s a ?t . {graph_spelling} }}"
+            ));
+            assert!(plan.contains("values    ?t"), "{plan}");
+            assert!(plan.contains("join      n0, n1  on ?t"), "{plan}");
+            assert!(!plan.contains("graph "), "{plan}");
+        }
+    }
+
     #[test]
     fn an_instance_query_is_untouched() {
         let plan = refined_for("SELECT ?s WHERE { ?s a asset360:Signal }");
