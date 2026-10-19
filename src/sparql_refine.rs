@@ -2756,6 +2756,13 @@ pub enum PlanDefect {
     MisrecordedScanClasses {
         scan: NodeId,
     },
+    /// A scan whose classes cannot be derived at all, so the invariant cannot
+    /// be checked: the schema's error, not a mismatch. See
+    /// [`ScanClassesError`].
+    ScanClassesUnavailable {
+        scan: NodeId,
+        error: String,
+    },
     /// A rule's edit dropped an export a consumer demanded: the one check
     /// that relates two plans rather than inspecting one. See
     /// [`Plan::check_transition`].
@@ -2802,6 +2809,7 @@ impl fmt::Display for PlanDefect {
                 f,
                 "n{scan}: a scan's classes are not the type family of its class under its regime"
             ),
+            Self::ScanClassesUnavailable { scan, error } => write!(f, "n{scan}: {error}"),
             Self::MisrecordedJoin { join } => write!(
                 f,
                 "n{join} records a reference edge the scans below it do not support"
@@ -3003,9 +3011,16 @@ impl Plan {
                 classes,
                 ..
             } = &node.op
-                && *classes != scan_classes(schema, class_uri, *regime)
             {
-                return Err(PlanDefect::MisrecordedScanClasses { scan: id });
+                let derived = scan_classes(schema, class_uri, *regime).map_err(|error| {
+                    PlanDefect::ScanClassesUnavailable {
+                        scan: id,
+                        error: error.to_string(),
+                    }
+                })?;
+                if *classes != derived {
+                    return Err(PlanDefect::MisrecordedScanClasses { scan: id });
+                }
             }
         }
         Ok(())
@@ -4228,28 +4243,62 @@ fn regime_label(regime: TypeRegime) -> Option<&'static str> {
 ///
 /// The one place this is computed, and [`Plan::scan_classes_agree`] recomputes
 /// it through here. A class the schema does not know stands for itself.
+///
+/// **An error is an error.** When the schema cannot say what the family is
+/// (a cycle in `is_a`, a mixin that does not resolve), the answer is
+/// [`ScanClassesError`] and not a shorter list: a scan standing for fewer
+/// classes than its records belong to returns fewer rows, with nothing to say
+/// so.
 pub(crate) fn scan_classes(
     schema: &SchemaView,
     class_uri: &str,
     regime: TypeRegime,
-) -> Vec<String> {
-    let mut classes: Vec<String> = schema
+) -> Result<Vec<String>, ScanClassesError> {
+    let failed = |message: String| ScanClassesError {
+        class_uri: class_uri.to_owned(),
+        regime,
+        message,
+    };
+    let mut classes: Vec<String> = match schema
         .get_class_by_uri(class_uri)
-        .ok()
-        .flatten()
-        .and_then(|class| type_family(&class, regime).ok())
-        .map(|family| {
-            family
-                .iter()
-                .map(|class| class.canonical_uri().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+        .map_err(|e| failed(e.to_string()))?
+    {
+        Some(class) => type_family(&class, regime)
+            .map_err(|e| failed(e.to_string()))?
+            .iter()
+            .map(|class| class.canonical_uri().to_string())
+            .collect(),
+        // A class the schema does not know stands for itself.
+        None => Vec::new(),
+    };
     classes.push(class_uri.to_owned());
     classes.sort();
     classes.dedup();
-    classes
+    Ok(classes)
 }
+
+/// The schema could not say which classes a scan stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanClassesError {
+    pub class_uri: String,
+    pub regime: TypeRegime,
+    /// The schema's own error.
+    pub message: String,
+}
+
+impl fmt::Display for ScanClassesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the classes a scan of <{}> stands for ({}) cannot be derived from the schema: {}",
+            self.class_uri,
+            regime_label(self.regime).unwrap_or("asserted"),
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for ScanClassesError {}
 
 /// Walks the algebra once, in the same order the obligation enumeration walks
 /// it, so a node can claim the obligation that came from the same place.
@@ -5725,6 +5774,40 @@ mod tests {
         assert!(
             under_graph.contains("graph ") && !under_graph.contains("[no data"),
             "{under_graph}"
+        );
+    }
+
+    /// A class whose family the schema cannot derive is an error, not a scan
+    /// that quietly stands for fewer classes (and so returns fewer rows).
+    #[test]
+    fn a_family_the_schema_cannot_derive_is_an_error_not_a_shorter_scan() {
+        let sv = crate::sparql_scoper::tests::test_schema_view_plus(
+            "  Broken:\n    class_uri: asset360:Broken\n    is_a: nosuchprefix:Thing\n",
+        );
+        let signal = "https://data.infrabel.be/asset360/Signal";
+        // Under `asserted` a family is the class alone: nothing to derive.
+        assert_eq!(
+            scan_classes(&sv, signal, TypeRegime::Asserted).unwrap(),
+            vec![signal.to_owned()]
+        );
+        // Under `is_a` the family is read off every class, `Broken` included.
+        let error = scan_classes(&sv, signal, TypeRegime::IsA)
+            .expect_err("the schema cannot say what the family is");
+        assert_eq!(error.class_uri, signal);
+        assert_eq!(error.regime, TypeRegime::IsA);
+
+        // The planner surfaces it to the caller instead of planning a scan
+        // that reads only `Signal`.
+        let dataset = DatasetSpec::builder(TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
+        let query =
+            format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?n }}");
+        let planned = crate::sparql_plan::plan_query_refined(&query, &sv, &dataset)
+            .expect_err("a planning error, not a plan");
+        assert!(
+            matches!(planned, crate::sparql_scoper::ScopeError::SchemaError(_)),
+            "{planned}"
         );
     }
 

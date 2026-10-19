@@ -917,6 +917,9 @@ pub enum LoweringRefusal {
     /// obligation is claimed once, and says nothing about whether the claimant
     /// does the work.
     ClaimWithoutTheWork { node: usize, claim: String },
+    /// A scan whose classes the schema cannot derive, so what the scan covers
+    /// cannot be checked against what it claims.
+    ScanClassesUnavailable { node: usize, error: String },
     /// A condition on a slot that holds several values, rendered as a
     /// comparison against the column.
     ///
@@ -990,6 +993,7 @@ impl fmt::Display for LoweringRefusal {
                 f,
                 "n{node} claims '{claim}' and renders nothing that discharges it"
             ),
+            Self::ScanClassesUnavailable { node, error } => write!(f, "n{node}: {error}"),
             Self::ConditionReadsACollection { node, slot } => write!(
                 f,
                 "n{node} compares '{slot}' as a column, and that slot holds \
@@ -1442,8 +1446,16 @@ fn lower_island(
                         // Recomputed from `class_uri` rather than read from
                         // the scan's `classes`, which invariant 7 pins to
                         // the same function: this check then stands alone.
-                        let read = crate::sparql_refine::scan_classes(schema, class_uri, *regime);
-                        let wanted = crate::sparql_refine::scan_classes(schema, class_iri, *regime);
+                        let classes_of = |class: &str| {
+                            crate::sparql_refine::scan_classes(schema, class, *regime).map_err(
+                                |error| LoweringRefusal::ScanClassesUnavailable {
+                                    node: id,
+                                    error: error.to_string(),
+                                },
+                            )
+                        };
+                        let read = classes_of(class_uri)?;
+                        let wanted = classes_of(class_iri)?;
                         schema.get_class_by_uri(class_iri).ok().flatten().is_some()
                             && read.iter().all(|class| wanted.contains(class))
                     };

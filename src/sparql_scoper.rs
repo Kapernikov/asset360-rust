@@ -1268,6 +1268,16 @@ pub enum ScopeError {
     /// `OPTIONAL`, `NOT EXISTS`, …). Reject with a clear message rather
     /// than silently returning wrong results.
     UnsupportedConstruct(String),
+    /// The schema could not answer a question the plan rests on (which classes
+    /// a scan stands for). The query is not at fault, and a plan built on a
+    /// guess would return fewer rows than it should.
+    SchemaError(String),
+}
+
+impl From<crate::sparql_refine::ScanClassesError> for ScopeError {
+    fn from(error: crate::sparql_refine::ScanClassesError) -> Self {
+        ScopeError::SchemaError(error.to_string())
+    }
 }
 
 /// What an unscoped refusal that names its own rewrite opens with.
@@ -1301,6 +1311,7 @@ impl std::fmt::Display for ScopeError {
             ScopeError::UnsupportedConstruct(msg) => {
                 write!(f, "unsupported_construct: {msg}")
             }
+            ScopeError::SchemaError(msg) => write!(f, "schema error: {msg}"),
         }
     }
 }
@@ -2135,7 +2146,7 @@ fn scope_qualified(
 
         stars.push(Star {
             variable: builder.variable.clone(),
-            classes: crate::sparql_refine::scan_classes(schema_view, &class_uri, builder.regime),
+            classes: crate::sparql_refine::scan_classes(schema_view, &class_uri, builder.regime)?,
             regime: builder.regime,
             class_uri,
             multivalued_fields,

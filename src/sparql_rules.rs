@@ -653,7 +653,14 @@ impl Rule for FoldMatchesIntoScan<'_> {
             {
                 continue;
             }
-            let classes = scan_classes(self.schema, &class_uri, regime);
+            // A schema that cannot say which classes the scan stands for
+            // cannot have the star folded into one: declined, which is only
+            // ever less refined. The error itself is raised where it can be
+            // returned -- by the scoper for every star the query types, and by
+            // `Plan::scan_classes_agree` for every scan a plan holds.
+            let Ok(classes) = scan_classes(self.schema, &class_uri, regime) else {
+                continue;
+            };
             fold(
                 plan,
                 type_node,
