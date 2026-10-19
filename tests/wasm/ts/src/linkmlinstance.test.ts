@@ -196,6 +196,9 @@ describe('LinkMLInstance wasm bindings', () => {
     expect(ttl).to.include('@prefix');
     expect(ttl).to.include('ex:name');
     expect(ttl).to.include('"Alice"');
+    // No regime is the asserted one, spelled out or not.
+    expect(instance.toTurtle(false, 'asserted')).to.equal(ttl);
+    expect(() => instance.toTurtle(false, 'nonsense')).to.throw();
   });
 
   it('inspects schema views via wasm', () => {

@@ -13,6 +13,7 @@ pub mod minijinja;
 pub use minijinja::*;
 
 use linkml_meta::SchemaDefinition;
+use linkml_runtime::schema_rdf::TypeRegime;
 use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
 use linkml_runtime::{DiffOptions, LinkMLInstance, diff, load_json_str};
 use linkml_schemaview::classview::ClassView;
@@ -952,8 +953,27 @@ impl LinkMLInstanceHandle {
     }
 
     /// Serialize this instance as Turtle (RDF).
+    ///
+    /// `regime` is the type regime the `rdf:type` triples are written under:
+    /// `"asserted"` (the instance's own class; the default, and what this
+    /// always wrote), `"is_a"` (plus every `is_a` ancestor and
+    /// `sesame:directType`) or `"is_a_and_mixins"` (plus mixins).
     #[wasm_bindgen(js_name = toTurtle)]
-    pub fn to_turtle(&self, skolem: Option<bool>) -> Result<String, JsValue> {
+    pub fn to_turtle(
+        &self,
+        skolem: Option<bool>,
+        regime: Option<String>,
+    ) -> Result<String, JsValue> {
+        let regime = match regime.as_deref() {
+            None | Some("asserted") => TypeRegime::Asserted,
+            Some("is_a") => TypeRegime::IsA,
+            Some("is_a_and_mixins") => TypeRegime::IsAAndMixins,
+            Some(other) => {
+                return Err(JsValue::from_str(&format!(
+                    "unknown type regime `{other}`: expected \"asserted\", \"is_a\" or \"is_a_and_mixins\""
+                )));
+            }
+        };
         let sv = self.inner.schema_view();
         let schema = sv
             .primary_schema()
@@ -964,7 +984,9 @@ impl LinkMLInstanceHandle {
             sv,
             &schema,
             &conv,
-            TurtleOptions::default().with_skolem(skolem.unwrap_or(false)),
+            TurtleOptions::default()
+                .with_skolem(skolem.unwrap_or(false))
+                .with_regime(regime),
         )
         .map_err(|e| JsValue::from_str(&e.to_string()))
     }
