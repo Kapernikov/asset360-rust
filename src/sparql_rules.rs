@@ -11083,6 +11083,108 @@ mod inline_type_match {
         }
     }
 
+    /// What [`an_inline_type_triple_is_judged_in_its_own_graph`] relies on: an
+    /// inlined element is the *same node* in every graph of the dataset, so a
+    /// slot triple in one graph and a type triple in another join on it.
+    ///
+    /// The writer emits an element as a blank node (or a skolem IRI) and walks
+    /// the instance once, so one label serves every partition; the quads are
+    /// one document, and a blank node label is scoped to the document, not to
+    /// a graph. Checked against a real store, both ways of naming the element.
+    #[test]
+    fn an_inline_element_is_one_node_across_the_graphs_of_a_written_dataset() {
+        use linkml_runtime::load_json_str;
+        use linkml_runtime::schema_rdf::TypePartition;
+        use linkml_runtime::turtle::{QuadOptions, write_nquads};
+        use linkml_schemaview::identifier::Identifier;
+        use oxigraph::io::RdfFormat;
+        use oxigraph::model::NamedNode;
+        use oxigraph::sparql::QueryResults;
+        use oxigraph::store::Store;
+        use std::collections::BTreeMap;
+
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        let sv = test_schema_view();
+        let conv = sv.converter();
+        let primary = sv.primary_schema().unwrap();
+        let site = sv
+            .get_class(&Identifier::new("Site"), &conv)
+            .unwrap()
+            .unwrap();
+        // A `SpotPlace` element: its own type is stated in A, its ancestor
+        // `Place` and its direct type in I.
+        let instance = load_json_str(
+            &format!(
+                r#"{{"asset360_uri": "{NS}/site/1", "places": [
+                    {{"label": "x", "typeURI": "{NS}/SpotPlace"}}]}}"#
+            ),
+            &sv,
+            &site,
+            &conv,
+        )
+        .unwrap()
+        .into_instance_tolerate_errors()
+        .unwrap();
+        let graphs: BTreeMap<TypePartition, NamedNode> = [
+            (TypePartition::Own, NamedNode::new(A).unwrap()),
+            (TypePartition::IsA, NamedNode::new(I).unwrap()),
+            (TypePartition::Direct, NamedNode::new(I).unwrap()),
+        ]
+        .into();
+
+        let rows = |store: &Store, query: &str| -> usize {
+            let evaluator = oxigraph::sparql::SparqlEvaluator::new();
+            match evaluator
+                .for_query(query.parse::<spargebra::Query>().unwrap())
+                .on_store(store)
+                .execute()
+                .unwrap()
+            {
+                QueryResults::Solutions(solutions) => solutions.count(),
+                _ => panic!("a SELECT"),
+            }
+        };
+        for skolem in [false, true] {
+            let mut quads = Vec::new();
+            write_nquads(
+                &instance,
+                &sv,
+                &primary,
+                &conv,
+                &mut quads,
+                &QuadOptions::new(graphs.clone()).with_skolem(skolem),
+            )
+            .unwrap();
+            let store = Store::new().unwrap();
+            store
+                .load_from_reader(RdfFormat::NQuads, quads.as_slice())
+                .unwrap();
+            let written = String::from_utf8(quads).unwrap();
+
+            // The slot triple is in A, the ancestor type in I: one element.
+            let join = format!(
+                "SELECT ?p WHERE {{ GRAPH <{A}> {{ <{NS}/site/1> <{NS}/places> ?p }} \
+                 GRAPH <{I}> {{ ?p a <{NS}/Place> }} }}"
+            );
+            assert_eq!(
+                rows(&store, &join),
+                1,
+                "skolem={skolem}: the element joins across graphs:\n{written}"
+            );
+            // ...and what I says about it is its ancestors, not the slot's graph.
+            let own_in_i = format!("SELECT ?p WHERE {{ GRAPH <{I}> {{ ?p a <{NS}/SpotPlace> }} }}");
+            assert_eq!(rows(&store, &own_in_i), 0, "skolem={skolem}:\n{written}");
+            let ancestor_in_a =
+                format!("SELECT ?p WHERE {{ GRAPH <{A}> {{ ?p a <{NS}/Place> }} }}");
+            assert_eq!(
+                rows(&store, &ancestor_in_a),
+                0,
+                "skolem={skolem}:\n{written}"
+            );
+        }
+    }
+
     /// What the plan cannot say stays with the engine, and is still right: a
     /// class unrelated to the range matches nothing; the range itself, asserted,
     /// also matches the element that names no designator, which a path
