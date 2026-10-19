@@ -8,6 +8,7 @@ import inspect
 import pytest
 from asset360_rust import (
     DatasetSpec,
+    Finishing,
     SchemaView,
     TypePartition,
     TypeRegime,
@@ -160,14 +161,19 @@ def test_a_query_reading_two_data_graphs_is_refused_by_name_on_every_route():
     # One graph is a query like any other.
     one = f"SELECT ?s FROM <{inferred}> WHERE {{ ?s a <https://example.org/s/Asset> }}"
     plan = plan_query_refined(one, sv, dataset)
-    assert plan.data_regime == TypeRegime.IS_A
+    assert plan.is_accounted
+    records_only = plan_query_refined(one, sv, dataset, finishing=Finishing.RECORDS_ONLY)
+    assert records_only.is_accounted and records_only.refinement != "used_rows"
+    # The default is `Finishing.ROWS`.
+    rows = plan_query_refined(one, sv, dataset, finishing=Finishing.ROWS)
+    assert plan.refinement == rows.refinement
 
 
-def test_the_rows_route_switch_is_keyword_only():
+def test_the_finishing_switch_is_keyword_only():
     signature = inspect.signature(plan_query_refined)
     assert list(signature.parameters)[:3] == ["query", "schema_view", "dataset"]
-    assert signature.parameters["rows_route"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert signature.parameters["rows_route"].default is True
+    assert signature.parameters["finishing"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert Finishing.ROWS != Finishing.RECORDS_ONLY
 
 
 def test_the_records_route_takes_the_plan_and_its_dataset():

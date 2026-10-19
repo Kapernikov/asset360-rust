@@ -1424,7 +1424,7 @@ mod tests {
     /// A restriction carries the regime of the scan it was derived from, and
     /// the fold reads it as that scan's regime: with the star read in graph `I`
     /// (`is_a`), the restriction is `∈ Signal [is_a]` and both scans read under
-    /// it. (A query reads one data regime, so there is no second regime for the
+    /// it. (A query reads one data graph, so there is no second regime for the
     /// restriction to be confused with.)
     #[test]
     fn a_restriction_carries_the_regime_of_the_scan_it_came_from() {

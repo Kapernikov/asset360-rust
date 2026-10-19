@@ -2295,7 +2295,7 @@ pub enum PlanOp {
         star_var: String,
         class_uri: String,
         /// Every class whose records have `class_uri` among their `rdf:type`s
-        /// under the plan's one data regime ([`Plan::data_regime`]; canonical
+        /// under the regime of the plan's one data graph ([`Plan::data_regime`]; canonical
         /// IRIs, sorted, deduplicated, `class_uri` included): `type_family` of
         /// the class. Under [`TypeRegime::ASSERTED`] that is `class_uri` alone.
         /// Under that regime `?s a class_uri` holds for every record of one of
@@ -4173,7 +4173,7 @@ enum RegimeContext {
     Bare,
     /// Printed as part of a plan.
     Plan {
-        /// The plan's one data regime: what its scans and its data matches
+        /// The regime of the plan's one data graph: what its scans and its data matches
         /// read under.
         data: TypeRegime,
         under_graph: bool,
@@ -5744,12 +5744,16 @@ mod tests {
             "SELECT ?s FROM <{A}> FROM NAMED <{I}> WHERE {body}"
         ));
         assert_eq!(regimes(&listed), vec![Some(TypeRegime::ASSERTED); 2]);
-        // The same regime from two graphs is allowed: the default graph
-        // (asserted) and `GRAPH <A>`.
-        let same = plan(&format!(
+        // The default graph beside a named data graph is refused even when
+        // that graph has the default regime (asserted): a query uses the
+        // default graph or names its data graph, never both.
+        let message = refused(&format!(
             "SELECT ?s ?n WHERE {{ ?s a asset360:Signal GRAPH <{A}> {{ ?s asset360:name ?n }} }}"
         ));
-        assert_eq!(regimes(&same), vec![Some(TypeRegime::ASSERTED); 2]);
+        assert!(
+            message.contains("the default graph") && message.contains(A),
+            "{message}"
+        );
     }
 
     /// Review F9: the text tells a match that reads no data graph from one
@@ -5879,7 +5883,7 @@ mod tests {
         assert_eq!(reads, vec![GraphReads::Other]);
         // `GRAPH ?g` reads whatever graph it binds: only the engine can say
         // which. (Over a dataset that serves a data graph it is refused: it
-        // could read several.)
+        // could read several; with exactly one it is that one.)
         let schema_only = crate::sparql_dataset::schema_dataset(S);
         let parsed = crate::sparql_scoper::parse_query(
             &format!("{PREFIX}SELECT ?s WHERE {{ GRAPH ?g {{ {body} }} }}"),
@@ -5897,7 +5901,16 @@ mod tests {
             )),
             "{variable}"
         );
-        assert!(naive_plan(&parsed, &dataset).is_err());
+        assert!(naive_plan(&parsed, &dataset).is_ok(), "one data graph");
+        let two = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[
+                (A, TypeRegime::IS_A),
+                ("urn:graph:other", TypeRegime::ASSERTED),
+            ],
+            &[(S, TypeRegime::IS_A)],
+        );
+        assert!(naive_plan(&parsed, &two).is_err());
         // Outside any `GRAPH`, a `FROM` that names the schema graph reads it,
         // and the printout says so rather than "no data graph".
         let (reads, text) = reads_of(&format!("SELECT ?s FROM <{S}> WHERE {{ {body} }}"));

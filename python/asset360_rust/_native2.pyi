@@ -2800,14 +2800,6 @@ class ExecutionPlan:
         plan, so nothing can run it under another).
         """
     @property
-    def data_regime(self) -> TypeRegime:
-        r"""
-        The one :class:`TypeRegime` the query reads its records under. A query
-        reads one data graph (one that reads two is refused with
-        ``cross_data_graph``), so the records its SQL pass fetches are written
-        flat under this regime.
-        """
-    @property
     def passes(self) -> builtins.list[PlanPass]: ...
     @property
     def refinement(self) -> builtins.str:
@@ -7319,6 +7311,20 @@ class ValidationResult:
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
 
+class Finishing(Enum):
+    r"""
+    Which routes may finish a planned query; see :func:`plan_query_refined`.
+    """
+    ROWS = ...
+    r"""
+    The engine may finish over the statement's rows when the plan allows
+    it, and over fetched records otherwise.
+    """
+    RECORDS_ONLY = ...
+    r"""
+    The engine finishes over fetched records only.
+    """
+
 class PredicateVerdict(Enum):
     r"""
     The verdict on one fixed predicate of one subject; see :func:`check_predicates`.
@@ -7600,7 +7606,7 @@ def naive_plan_text(query:builtins.str, dataset:DatasetSpec) -> builtins.str:
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def plan_query_refined(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec, *, rows_route:builtins.bool=True) -> ExecutionPlan:
+def plan_query_refined(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec, *, finishing:Finishing=Finishing.ROWS) -> ExecutionPlan:
     r"""
     Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
     
@@ -7630,10 +7636,12 @@ def plan_query_refined(query:builtins.str, schema_view:SchemaView, dataset:Datas
             decides which regime each pattern is matched under and which
             graphs are the datamodel's, so a call that forgot it would plan a
             different endpoint's query.
-        rows_route: ``False`` plans without the rows route (``"used_rows"``):
-            what a caller asks for when it cannot render that route's
-            statement. The records route answers every query the rows route
-            does, more slowly, so declining one is never a wrong answer.
+        finishing: Keyword-only, default ``Finishing.ROWS``. Which routes may
+            finish the query. ``Finishing.RECORDS_ONLY`` plans without the rows
+            route (``"used_rows"``): what a caller asks for when it cannot
+            render that route's statement. The records route answers every
+            query the rows route does, more slowly, so declining one is never a
+            wrong answer.
     
     Returns:
         ExecutionPlan. Check ``is_accounted`` before running it — a plan with a
@@ -7723,8 +7731,8 @@ def sparql_execute_plan(plan:ExecutionPlan, instances:typing.Sequence[LinkMLInst
     Execute the query a plan was made for against a list of LinkML instances.
     
     The records route of a planned query: the plan carries the query (parsed
-    and canonical), the dataset and the one data regime it reads the records
-    under, so the records cannot be loaded under one dataset and evaluated under
+    and canonical), the dataset and the one data graph (its regime) it reads the
+    records under, so the records cannot be loaded under one dataset and evaluated under
     another. ``sparql_execute`` stays for a query that was not planned.
     
     Args:

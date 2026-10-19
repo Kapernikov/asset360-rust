@@ -135,16 +135,15 @@ pub(crate) struct DataRead {
 
 /// **The query's one data graph**, or the refusal that it reads several.
 ///
-/// A query reads at most one named data graph `G` (through `FROM`, `FROM
-/// NAMED` or `GRAPH <G>`), plus the default graph, plus any schema graphs. The
-/// engine writes the records into `G` (or into its default graph, if the query
-/// names none) and oxigraph evaluates `GRAPH`, `FROM` and `FROM NAMED` over
-/// them as written; nothing is rewritten.
+/// A query **either** reads the dataset's default graph **or** names its one
+/// data graph `G` (through `FROM`, `FROM NAMED` or `GRAPH <G>`), never both,
+/// plus any schema graphs. The engine writes the records into `G` (or into its
+/// default graph, if the query names none) and oxigraph evaluates `GRAPH`,
+/// `FROM` and `FROM NAMED` over them as written; nothing is rewritten.
 ///
-/// The default graph beside `G` is allowed only when `G` holds what the default
-/// graph holds, that is when their regimes are equal (the default graph is then
-/// an alias of `G`'s content); otherwise the query reads two regimes of the
-/// same records, which no one store graph can show.
+/// Reading the default graph together with a named data graph is refused even
+/// when that graph has the default regime: use either the default graph or
+/// explicit graph names, not both.
 ///
 /// What the query reads, per SPARQL 1.1 13.2 (the same reads as
 /// [`QueryGraphs::default_reads`] and [`QueryGraphs::graph_reads`]):
@@ -155,8 +154,9 @@ pub(crate) struct DataRead {
 ///   query's `FROM NAMED` leaves it out (then it reads nothing);
 /// * a pattern inside `GRAPH ?g` reads every named graph: the `FROM NAMED`
 ///   list when the query writes a dataset clause (refused when that lists more
-///   than one data graph), every served graph otherwise (refused while the
-///   dataset serves a data graph).
+///   than one data graph), every served graph otherwise (refused when the
+///   dataset serves more than one data graph; with exactly one, the variable
+///   ranges over it, and over the schema graphs, which read no record).
 pub(crate) fn single_data_graph(
     query: &spargebra::Query,
     dataset: &DatasetSpec,
@@ -229,7 +229,7 @@ pub(crate) fn single_data_graph(
             };
             match candidates.as_slice() {
                 [] => Reading::NoData,
-                [one] if self.clause.is_some() => Reading::Data(one.clone()),
+                [one] => Reading::Data(one.clone()),
                 _ => {
                     if self.refusal.is_none() {
                         let served: Vec<String> =
@@ -338,7 +338,7 @@ pub(crate) fn single_data_graph(
             let regime = dataset
                 .data_regime(graph)
                 .expect("only data graphs are recorded");
-            if walk.default_read && regime != dataset.default_regime() {
+            if walk.default_read {
                 return Err(CrossDataGraph {
                     graphs: labels(&walk),
                 });

@@ -129,6 +129,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_check_predicates, m)?)?;
         m.add_class::<PyPredicateCheck>()?;
         m.add_class::<PyPredicateVerdict>()?;
+        m.add_class::<PyFinishing>()?;
         m.add_function(wrap_pyfunction!(py_broken_out_column, m)?)?;
         m.add_class::<QueryPlan>()?;
         m.add_class::<PlanNode>()?;
@@ -3785,15 +3786,6 @@ impl ExecutionPlan {
         }
     }
 
-    /// The one :class:`TypeRegime` the query reads its records under. A query
-    /// reads one data graph (one that reads two is refused with
-    /// ``cross_data_graph``), so the records its SQL pass fetches are written
-    /// flat under this regime.
-    #[getter]
-    fn data_regime(&self, py: Python<'_>) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
-        py_regime(py, self.inner.data_regime)
-    }
-
     #[getter]
     fn passes(&self) -> Vec<PlanPass> {
         self.inner
@@ -4059,11 +4051,36 @@ fn regime_repr(regime: linkml_runtime::schema_rdf::TypeRegime) -> String {
     }
 }
 
+/// Which routes may finish a planned query; see :func:`plan_query_refined`.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass_enum)]
+#[pyclass(name = "Finishing", eq, eq_int, hash, frozen)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PyFinishing {
+    /// The engine may finish over the statement's rows when the plan allows
+    /// it, and over fetched records otherwise.
+    #[pyo3(name = "ROWS")]
+    Rows,
+    /// The engine finishes over fetched records only.
+    #[pyo3(name = "RECORDS_ONLY")]
+    RecordsOnly,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+impl From<PyFinishing> for crate::sparql_plan::Finishing {
+    fn from(finishing: PyFinishing) -> Self {
+        match finishing {
+            PyFinishing::Rows => Self::Rows,
+            PyFinishing::RecordsOnly => Self::RecordsOnly,
+        }
+    }
+}
+
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "plan_query_refined")]
-#[pyo3(signature = (query, schema_view, dataset, *, rows_route=true))]
+#[pyo3(signature = (query, schema_view, dataset, *, finishing=PyFinishing::Rows))]
 /// Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
 ///
 /// The only planner. A naive plan of the whole query is refined by rules to a
@@ -4092,10 +4109,12 @@ fn regime_repr(regime: linkml_runtime::schema_rdf::TypeRegime) -> String {
 ///         decides which regime each pattern is matched under and which
 ///         graphs are the datamodel's, so a call that forgot it would plan a
 ///         different endpoint's query.
-///     rows_route: ``False`` plans without the rows route (``"used_rows"``):
-///         what a caller asks for when it cannot render that route's
-///         statement. The records route answers every query the rows route
-///         does, more slowly, so declining one is never a wrong answer.
+///     finishing: Keyword-only, default ``Finishing.ROWS``. Which routes may
+///         finish the query. ``Finishing.RECORDS_ONLY`` plans without the rows
+///         route (``"used_rows"``): what a caller asks for when it cannot
+///         render that route's statement. The records route answers every
+///         query the rows route does, more slowly, so declining one is never a
+///         wrong answer.
 ///
 /// Returns:
 ///     ExecutionPlan. Check ``is_accounted`` before running it — a plan with a
@@ -4111,7 +4130,7 @@ fn py_plan_query_refined(
     query: &str,
     schema_view: Py<PySchemaView>,
     dataset: PyDatasetSpec,
-    rows_route: bool,
+    finishing: PyFinishing,
 ) -> PyResult<ExecutionPlan> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
@@ -4119,12 +4138,7 @@ fn py_plan_query_refined(
 
     let parsed = crate::sparql_scoper::parse_query(query, Some(sv))
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    let finishing = if rows_route {
-        crate::sparql_plan::Finishing::Rows
-    } else {
-        crate::sparql_plan::Finishing::RecordsOnly
-    };
-    crate::sparql_plan::plan_query_refined(&parsed, sv, &dataset.inner, finishing)
+    crate::sparql_plan::plan_query_refined(&parsed, sv, &dataset.inner, finishing.into())
         .map(|inner| ExecutionPlan { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -4427,8 +4441,8 @@ fn sparql_execute(
 /// Execute the query a plan was made for against a list of LinkML instances.
 ///
 /// The records route of a planned query: the plan carries the query (parsed
-/// and canonical), the dataset and the one data regime it reads the records
-/// under, so the records cannot be loaded under one dataset and evaluated under
+/// and canonical), the dataset and the one data graph (its regime) it reads the
+/// records under, so the records cannot be loaded under one dataset and evaluated under
 /// another. ``sparql_execute`` stays for a query that was not planned.
 ///
 /// Args:

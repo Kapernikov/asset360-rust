@@ -790,7 +790,7 @@ pub struct Star {
 
     /// Every class the star reads, canonical IRIs sorted: `class_uri` and the
     /// classes whose records have it among their `rdf:type`s under the plan's
-    /// one data regime ([`QueryPlan::data_regime`]). One element, `class_uri`,
+    /// the regime of the one data graph ([`QueryPlan::data_regime`]). One element, `class_uri`,
     /// under the asserted regime.
     pub classes: Vec<String>,
 
@@ -1273,10 +1273,12 @@ pub enum ScopeError {
     /// a scan stands for). The query is not at fault, and a plan built on a
     /// guess would return fewer rows than it should.
     SchemaError(String),
-    /// The query reads more than one data regime: data graphs of different
-    /// regimes, or a graph variable that can range over them. Refused by both
-    /// routes, because the engine loads the records of **one** regime
-    /// (`WriteOptions::flat(regime)`) and the SQL route must not answer a
+    /// The query reads more than one data graph: several named ones (whatever
+    /// their regimes), the default graph beside any named data graph (use either
+    /// the default graph or explicit graph names, not both), or
+    /// a graph variable that can range over several. Refused by both routes,
+    /// because the engine loads the records into **one** graph, flat under its
+    /// regime (`WriteOptions::flat(regime)`), and the SQL route must not answer a
     /// question the engine cannot. `graphs` names what the query read.
     CrossDataGraph { graphs: Vec<String> },
 }
@@ -1765,7 +1767,7 @@ fn scope_qualified(
                             builder.type_iri.clone().unwrap_or_default(),
                             nn.as_str().to_owned(),
                         ]),
-                        // Judged under the query's one data regime.
+                        // Judged under the regime of the query's one data graph.
                         graphs.regime(),
                     )
                 {
@@ -8924,7 +8926,7 @@ classes:
         ));
         assert_eq!(regime_of(&from_inferred), TypeRegime::IS_A);
         assert_eq!(from_inferred.inexact, None);
-        // Data graphs of different regimes are two data regimes: refused.
+        // Data graphs of different regimes are two data graphs: refused.
         let refused = sparql_scope(
             &format!(
                 "PREFIX asset360: <https://data.infrabel.be/asset360/> \
@@ -8973,7 +8975,7 @@ classes:
         assert_eq!(empty_default.inexact, Some(Inexact::NamedGraph));
     }
 
-    /// A star reads its records under the query's one data regime, and so
+    /// A star reads its records under the regime of the query's one data graph, and so
     /// stands for the classes that regime says. A mix of regimes across graphs
     /// is not a star typed once by its type triple: it is refused.
     #[test]

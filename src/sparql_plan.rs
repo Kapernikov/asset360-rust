@@ -310,10 +310,6 @@ pub struct ExecutionPlan {
     /// ([`crate::sparql_executor::sparql_execute_plan`]), so the planned query
     /// and the evaluated one cannot be two.
     pub(crate) query: Query,
-    /// The one regime the query reads its records under (a query cannot read
-    /// two, see [`crate::sparql_graph_clauses::single_data_graph`]): the
-    /// engine loads the fetched records flat under it.
-    pub(crate) data_regime: linkml_runtime::schema_rdf::TypeRegime,
 }
 
 impl ExecutionPlan {
@@ -325,11 +321,6 @@ impl ExecutionPlan {
     /// The query the plan answers, parsed and canonicalised.
     pub fn query(&self) -> &Query {
         &self.query
-    }
-
-    /// The regime the query reads its records under.
-    pub fn data_regime(&self) -> linkml_runtime::schema_rdf::TypeRegime {
-        self.data_regime
     }
 
     /// Whether every obligation has a pass to enforce it.
@@ -1613,7 +1604,6 @@ pub fn plan_query_refined(
         refinement: Refinement::Used(None),
         dataset: dataset.clone(),
         query: parsed.clone(),
-        data_regime: scoped.data_regime,
     };
 
     match answers_alone(&plan, &ops) {
@@ -1985,9 +1975,6 @@ pub(crate) fn rows_placement(
         refinement: Refinement::UsedRows(note),
         dataset: dataset.clone(),
         query: parsed.clone(),
-        data_regime: crate::sparql_graph_clauses::single_data_graph(parsed, dataset)
-            .map_err(|error| ScopeError::from(error).to_string())?
-            .regime,
     };
     Ok(RowsPlacement {
         plan,
@@ -2526,7 +2513,6 @@ fn fetch_only(
         },
         dataset: dataset.clone(),
         query: query.clone(),
-        data_regime: scoped.data_regime,
     }
 }
 
@@ -4278,7 +4264,6 @@ classes:
             refinement: Refinement::Used(None),
             dataset: crate::sparql_dataset::default_dataset().clone(),
             query: parse_query("SELECT * WHERE { ?s ?p ?o }", None).unwrap(),
-            data_regime: linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
         };
         assert!(balanced.ledger_balances().is_ok());
         assert!(
@@ -4471,7 +4456,6 @@ classes:
             refinement: Refinement::UsedAlone("hand-built".to_owned()),
             dataset: crate::sparql_dataset::default_dataset().clone(),
             query: parsed.clone(),
-            data_regime: scoped.data_regime,
         };
         plan.ledger_balances().unwrap();
 

@@ -1118,7 +1118,7 @@ dependencies = [
 [[package]]
 name = "linkml_meta"
 version = "0.0.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core?branch=feat%2Frdf-type-regimes#9994f7747c4abb107c6fcf7ef5719461bb45192c"
+source = "git+https://github.com/Kapernikov/rust-linkml-core?branch=feat%2Frdf-type-regimes#b40864c5ac2436740bb5c082afff3bf00f58d425"
 dependencies = [
  "chrono",
  "merge",
@@ -1133,7 +1133,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core?branch=feat%2Frdf-type-regimes#9994f7747c4abb107c6fcf7ef5719461bb45192c"
+source = "git+https://github.com/Kapernikov/rust-linkml-core?branch=feat%2Frdf-type-regimes#b40864c5ac2436740bb5c082afff3bf00f58d425"
 dependencies = [
  "linkml_meta",
  "once_cell",
@@ -1154,7 +1154,7 @@ dependencies = [
 [[package]]
 name = "linkml_runtime_python"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core?branch=feat%2Frdf-type-regimes#9994f7747c4abb107c6fcf7ef5719461bb45192c"
+source = "git+https://github.com/Kapernikov/rust-linkml-core?branch=feat%2Frdf-type-regimes#b40864c5ac2436740bb5c082afff3bf00f58d425"
 dependencies = [
  "linkml_meta",
  "linkml_runtime",
@@ -2249,7 +2249,7 @@ dependencies = [
 [[package]]
 name = "schemaview"
 version = "0.1.0"
-source = "git+https://github.com/Kapernikov/rust-linkml-core?branch=feat%2Frdf-type-regimes#9994f7747c4abb107c6fcf7ef5719461bb45192c"
+source = "git+https://github.com/Kapernikov/rust-linkml-core?branch=feat%2Frdf-type-regimes#b40864c5ac2436740bb5c082afff3bf00f58d425"
 dependencies = [
  "arc-swap",
  "curies",

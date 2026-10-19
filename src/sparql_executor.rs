@@ -421,11 +421,8 @@ impl std::io::Write for SharedBuffer {
 /// one named data graph `G` ([`crate::sparql_graph_clauses::single_data_graph`]),
 /// so the records are written, with `WriteOptions::flat(G's regime)`, into the
 /// store graph named `G` -- or into the default graph, when the query names
-/// none. oxigraph then evaluates `GRAPH`, `FROM` and `FROM NAMED` as written.
-/// The one thing the query leaves implicit is that its default graph is the
-/// dataset's: when the records are in `G` and the query writes no dataset
-/// clause, the evaluation's default graph is set to `G` (the query read the
-/// default graph only if `G`'s regime is the default regime).
+/// none. oxigraph then evaluates `GRAPH`, `FROM` and `FROM NAMED` as written;
+/// the query never reads the default graph beside `G`, so nothing is set.
 #[cfg(feature = "sparql-endpoint")]
 fn evaluate_over_records(
     mut parsed: spargebra::Query,
@@ -470,9 +467,6 @@ fn evaluate_over_records(
         once(&mut clause.default);
         clause.named.iter_mut().for_each(once);
     }
-    let default_graphs = (read.graph.is_some()
-        && crate::sparql_scoper::dataset_of(&parsed).is_none())
-    .then(|| vec![records_graph.clone()]);
     let regime = read.regime;
 
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
@@ -585,7 +579,7 @@ fn evaluate_over_records(
     // `spargebra =0.3.5`), and what crossed instead was the query *rendered
     // back to SPARQL* for oxigraph's own parser to read again — a round trip
     // whose only job was to bridge two versions of one crate.
-    evaluate_with_ceiling(parsed, default_graphs, store, limits)
+    evaluate_with_ceiling(parsed, store, limits)
 }
 
 /// Put every schema graph `query` can read into `store`, each in its own
@@ -621,12 +615,11 @@ fn insert_schema_graphs(
 #[cfg(feature = "sparql-endpoint")]
 fn evaluate_with_ceiling(
     parsed: spargebra::Query,
-    default_graphs: Option<Vec<oxigraph::model::GraphName>>,
     store: Store,
     limits: ExecuteLimits,
 ) -> Result<SparqlAnswer, ExecuteError> {
     match limits.max_eval_millis {
-        None => evaluate(parsed, default_graphs, &store, &limits, None),
+        None => evaluate(parsed, &store, &limits, None),
         // The ceiling. Evaluation runs on its own thread and the caller waits
         // for its answer until the deadline; past it the caller gets the
         // refusal and the thread is told to stop through the token.
@@ -682,7 +675,7 @@ fn evaluate_with_ceiling(
                     }
                 }
                 let _ended = Ended(worker_state);
-                let answer = evaluate(parsed, default_graphs, &store, &limits, Some(worker_token));
+                let answer = evaluate(parsed, &store, &limits, Some(worker_token));
                 // The receiver is gone when the caller gave up waiting; the
                 // answer has nobody to go to, and that is fine.
                 let _ = sender.send(answer);
@@ -723,7 +716,6 @@ fn evaluate_with_ceiling(
 #[cfg(feature = "sparql-endpoint")]
 fn evaluate(
     parsed: spargebra::Query,
-    default_graphs: Option<Vec<oxigraph::model::GraphName>>,
     store: &Store,
     limits: &ExecuteLimits,
     token: Option<oxigraph::sparql::CancellationToken>,
@@ -740,10 +732,7 @@ fn evaluate(
     if let Some(token) = token {
         evaluator = evaluator.with_cancellation_token(token);
     }
-    let mut prepared = evaluator.for_query(parsed);
-    if let Some(default_graphs) = default_graphs {
-        prepared.dataset_mut().set_default_graph(default_graphs);
-    }
+    let prepared = evaluator.for_query(parsed);
     let results = prepared.on_store(store).execute().map_err(eval_error)?;
 
     // Serialize results
@@ -1043,7 +1032,7 @@ pub fn sparql_finish(
 
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
     insert_schema_graphs(&store, &parsed, schema_view, dataset)?;
-    evaluate_with_ceiling(parsed, None, store, limits)
+    evaluate_with_ceiling(parsed, store, limits)
 }
 
 /// Convert an RDF term to SPARQL JSON Results format.
@@ -1169,7 +1158,7 @@ classes:
     /// `FROM <inferred>`, `FROM NAMED <inferred>` and `GRAPH <inferred> { .. }`
     /// are evaluated natively, and agree with the SQL route: asserted reads no
     /// `Signal` of a `Beacon` record, inferred reads it. The default graph may
-    /// be read beside the data graph only if they hold the same regime; schema
+    /// never be read beside a named data graph, whatever its regime; schema
     /// graphs may always be read beside it, and a data graph may sit anywhere
     /// inside a schema graph. Every query that reads a second data graph is
     /// refused, with the planner's own text.
@@ -1219,10 +1208,10 @@ classes:
             parsed["results"]["bindings"].as_array().unwrap().len()
         };
         // Unplanned and planned evaluation, which must agree.
-        let run = |query: &str| -> Result<usize, String> {
+        let run_in = |dataset: &DatasetSpec, query: &str| -> Result<usize, String> {
             let query = prefixed(query);
-            let unplanned = sparql_execute(&query, &refs, &sv, &dataset, ExecuteLimits::default());
-            let plan = crate::sparql_plan::plan_of(&query, &sv, &dataset);
+            let unplanned = sparql_execute(&query, &refs, &sv, dataset, ExecuteLimits::default());
+            let plan = crate::sparql_plan::plan_of(&query, &sv, dataset);
             match (unplanned, plan) {
                 (Ok(answer), Ok(plan)) => {
                     let planned = sparql_execute_plan(&plan, &refs, &sv, ExecuteLimits::default())
@@ -1238,6 +1227,7 @@ classes:
                 (engine, plan) => panic!("{query}: the routes disagree: {engine:?} / {plan:?}"),
             }
         };
+        let run = |query: &str| run_in(&dataset, query);
         let body = "?s a asset360:Signal ; asset360:name ?name";
         let rows = |query: String, expected: usize| {
             assert_eq!(run(&query), Ok(expected), "{query}");
@@ -1278,13 +1268,6 @@ classes:
             format!("SELECT ?s FROM <{A}> WHERE {{ GRAPH <{I}> {{ {body} }} }}"),
             0,
         );
-        // The default graph beside a data graph of its own regime.
-        rows(
-            format!(
-                "SELECT ?s WHERE {{ ?s asset360:name ?name GRAPH <{A}> {{ ?s a asset360:Beacon }} }}"
-            ),
-            1,
-        );
 
         // A data graph beside a schema graph.
         let sub = "?sub rdfs:subClassOf asset360:Signal";
@@ -1320,8 +1303,14 @@ classes:
             1,
         );
 
-        // The refusals: a second data graph, in any of its spellings.
+        // The refusals: a second data graph, in any of its spellings, or the
+        // default graph beside a named one (a query uses the default graph or
+        // names its data graph, never both).
         for query in [
+            // `A` has the default regime, and is refused all the same.
+            format!(
+                "SELECT ?s WHERE {{ ?s a asset360:Signal GRAPH <{A}> {{ ?s asset360:name ?name }} }}"
+            ),
             format!("SELECT ?s FROM <{A}> FROM <{I}> WHERE {{ {body} }}"),
             format!(
                 "SELECT ?s WHERE {{ GRAPH <{A}> {{ ?s a asset360:Beacon }} \
@@ -1346,6 +1335,49 @@ classes:
                 "{query}: {message}"
             );
         }
+
+        // **A lone data graph answers `GRAPH ?g`**: with exactly one served,
+        // the variable ranges over it (and over the schema graphs, which hold
+        // no record), so nothing is cross-graph. The engine loads the records
+        // into that graph and the schema graph into its own, and the plan
+        // agrees.
+        let lone = crate::sparql_dataset::dataset_with(
+            TypeRegime::ASSERTED,
+            &[(I, TypeRegime::IS_A)],
+            &[(S, TypeRegime::IS_A)],
+        );
+        let bound_graphs = |query: &str| -> Vec<String> {
+            let answer = sparql_execute(
+                &prefixed(query),
+                &refs,
+                &sv,
+                &lone,
+                ExecuteLimits::default(),
+            )
+            .unwrap_or_else(|e| panic!("`{query}`: {e}"));
+            let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+            let mut graphs: Vec<String> = parsed["results"]["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["g"]["value"].as_str().unwrap().to_owned())
+                .collect();
+            graphs.sort();
+            graphs
+        };
+        let in_graph = format!("SELECT ?g WHERE {{ GRAPH ?g {{ {body} }} }}");
+        assert_eq!(run_in(&lone, &in_graph), Ok(1));
+        assert_eq!(bound_graphs(&in_graph), vec![I.to_owned()]);
+        // The schema graph is a named graph too: the engine loads it for a
+        // `GRAPH ?g` and `?g` binds it where the pattern matches there. (Only
+        // the engine answers this one; the planner, with a data graph served,
+        // reads the variable as a read of records and refuses a pattern that
+        // scopes none as unscoped -- see `reads_only_the_schema_graph`.)
+        let schema_side = "SELECT ?g WHERE { GRAPH ?g { ?sub rdfs:subClassOf asset360:Signal } }";
+        assert_eq!(bound_graphs(schema_side), vec![S.to_owned()]);
+        // Two served data graphs: it stays refused, on both routes.
+        let message = run_in(&dataset, &in_graph).expect_err("two data graphs");
+        assert!(message.starts_with("cross_data_graph:"), "{message}");
     }
 
     /// SPARQL 1.1 section 13.2: with `FROM NAMED` and no `FROM` the default

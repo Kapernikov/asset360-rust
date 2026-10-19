@@ -406,7 +406,6 @@ mod tests {
                 dataset: crate::sparql_dataset::default_dataset().clone(),
                 query: crate::sparql_scoper::parse_query("SELECT * WHERE { ?s ?p ?o }", None)
                     .unwrap(),
-                data_regime: linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
             }
         );
         println!("{printed}");

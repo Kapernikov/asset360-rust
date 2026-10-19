@@ -28,9 +28,6 @@ use crate::sparql_algebra::Bag;
 /// A store holding the fixture, ready to answer.
 pub struct Oracle {
     store: Store,
-    /// The named graph the records are in, when they are not in the default
-    /// graph: what a dataset that serves its records as a data graph shows.
-    records_graph: Option<oxigraph::model::NamedNode>,
 }
 
 impl Oracle {
@@ -49,9 +46,10 @@ impl Oracle {
     }
 
     /// [`Oracle::new_in`] with the records in the named graph `graph`, as the
-    /// engine writes them for a query that reads that data graph. A query
-    /// that writes no `FROM` / `FROM NAMED` reads `graph` as its default
-    /// graph, as the engine evaluates it.
+    /// engine writes them for a query that names that data graph, **and** in
+    /// the default graph: a plan's own translation drops the `FROM` / `GRAPH`
+    /// that named the graph (each match says its graph instead), so it reads
+    /// the default graph, and has to find the same records there.
     pub fn new_in_graph(
         schema: &SchemaView,
         records: &[(&str, &str)],
@@ -94,28 +92,19 @@ impl Oracle {
                 .for_slice(turtle.as_bytes())
             {
                 let mut quad = quad.unwrap_or_else(|e| panic!("{e}\n{turtle}"));
+                store.insert(&quad).unwrap();
                 if let Some(graph) = &records_graph {
                     quad.graph_name = oxigraph::model::GraphName::NamedNode(graph.clone());
+                    store.insert(&quad).unwrap();
                 }
-                store.insert(&quad).unwrap();
             }
         }
-        Self {
-            store,
-            records_graph,
-        }
+        Self { store }
     }
 
     /// The answer to an already-parsed query, as a bag.
     pub fn answers(&self, query: spargebra::Query) -> Bag {
-        let mut prepared = crate::sparql_executor::geosparql_evaluator().for_query(query.clone());
-        if let Some(graph) = &self.records_graph
-            && crate::sparql_scoper::dataset_of(&query).is_none()
-        {
-            prepared
-                .dataset_mut()
-                .set_default_graph(vec![oxigraph::model::GraphName::NamedNode(graph.clone())]);
-        }
+        let prepared = crate::sparql_executor::geosparql_evaluator().for_query(query.clone());
         let results = prepared
             .on_store(&self.store)
             .execute()
@@ -348,11 +337,7 @@ pub fn probe(turtle: &str, query: &str) -> Bag {
             .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
             .unwrap_or_else(|e| panic!("{e}\n{turtle}"));
     }
-    Oracle {
-        store,
-        records_graph: None,
-    }
-    .answers_to(query)
+    Oracle { store }.answers_to(query)
 }
 
 /// [`probe`], as the sequence the engine emitted.
@@ -364,10 +349,7 @@ pub fn probe_sequence(turtle: &str, query: &str) -> Vec<BTreeMap<String, String>
             .unwrap_or_else(|e| panic!("{e}\n{turtle}"));
     }
     ordered_answers(
-        &Oracle {
-            store,
-            records_graph: None,
-        },
+        &Oracle { store },
         crate::sparql_scoper::parse_query(query, None).unwrap(),
     )
 }
@@ -377,14 +359,7 @@ impl Oracle {
     /// what a statement's rows look like to `sparql_finish`, and what its
     /// answer is compared against.
     pub fn json_rows(&self, query: spargebra::Query) -> (Vec<String>, Vec<serde_json::Value>) {
-        let mut prepared = crate::sparql_executor::geosparql_evaluator().for_query(query.clone());
-        if let Some(graph) = &self.records_graph
-            && crate::sparql_scoper::dataset_of(&query).is_none()
-        {
-            prepared
-                .dataset_mut()
-                .set_default_graph(vec![oxigraph::model::GraphName::NamedNode(graph.clone())]);
-        }
+        let prepared = crate::sparql_executor::geosparql_evaluator().for_query(query.clone());
         let results = prepared
             .on_store(&self.store)
             .execute()
