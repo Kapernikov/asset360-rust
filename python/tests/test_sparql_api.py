@@ -13,6 +13,7 @@ from asset360_rust import (
     TypeRegime,
     plan_query_refined,
     sparql_execute,
+    sparql_execute_plan,
     sparql_finish,
     sparql_schema_graph_ntriples,
     sparql_schema_graph_skipped,
@@ -165,3 +166,23 @@ def test_a_query_reading_two_data_graphs_is_refused_by_name_on_every_route():
     one = f"SELECT ?s FROM <{inferred}> WHERE {{ ?s a <https://example.org/s/Asset> }}"
     plan = plan_query_refined(one, sv, dataset)
     assert plan.data_regime == TypeRegime.IS_A
+
+
+def test_the_records_route_takes_the_plan_and_its_dataset():
+    sv = SchemaView()
+    sv.add_schema_str(_SCHEMA_YAML)
+    inferred = "urn:graph:inferred"
+    dataset = DatasetSpec(
+        TypeRegime.ASSERTED,
+        data_graphs={A: TypeRegime.ASSERTED, inferred: TypeRegime.IS_A},
+    )
+    query = f"SELECT ?s FROM <{inferred}> WHERE {{ ?s a <https://example.org/s/Asset> }}"
+    plan = plan_query_refined(query, sv, dataset)
+    assert plan.dataset == dataset
+    signature = inspect.signature(sparql_execute_plan)
+    assert list(signature.parameters)[:3] == ["plan", "instances", "schema_view"]
+    assert "dataset" not in signature.parameters
+    for name in ("max_triples", "max_result_rows", "max_eval_millis"):
+        assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+    content_type, body = sparql_execute_plan(plan, [], sv)
+    assert "json" in content_type and '"bindings":[]' in body

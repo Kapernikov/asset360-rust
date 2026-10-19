@@ -2809,6 +2809,13 @@ class ExecutionPlan:
         consumer with no fallback (a stored question) has to ask.
         """
     @property
+    def dataset(self) -> DatasetSpec:
+        r"""
+        The :class:`DatasetSpec` the plan was made for: the one it is run
+        under (``sparql_execute_plan`` and ``sparql_finish`` read it from the
+        plan, so nothing can run it under another).
+        """
+    @property
     def data_regime(self) -> TypeRegime:
         r"""
         The one :class:`TypeRegime` the query reads its records under. A query
@@ -7692,6 +7699,31 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
     Raises:
         RuntimeError: Conversion failure (with object URI), limit exceeded,
             or query execution error.
+    """
+
+def sparql_execute_plan(plan:ExecutionPlan, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, *, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
+    r"""
+    Execute the query a plan was made for against a list of LinkML instances.
+    
+    The records route of a planned query: the plan carries the query (parsed
+    and canonical), the dataset and the one data regime it reads the records
+    under, so the records cannot be loaded under one dataset and evaluated under
+    another. ``sparql_execute`` stays for a query that was not planned.
+    
+    Args:
+        plan: The :class:`ExecutionPlan` of the query, from
+            ``plan_query_refined``.
+        instances: The LinkMLInstance objects the plan's SQL pass fetched.
+        schema_view: The LinkML schema (for RDF conversion).
+        max_triples: Keyword-only, default 500 000. As for ``sparql_execute``.
+        max_result_rows: Keyword-only, default 10 000.
+        max_eval_millis: Keyword-only. As for ``sparql_execute``.
+    
+    Returns:
+        ``(content_type, body)``, as ``sparql_execute``.
+    
+    Raises:
+        RuntimeError: the same texts ``sparql_execute`` raises.
     """
 
 def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, *, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:

@@ -113,6 +113,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_refined_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(py_naive_plan_text, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_execute, m)?)?;
+        m.add_function(wrap_pyfunction!(sparql_execute_plan, m)?)?;
         m.add_function(wrap_pyfunction!(sparql_finish, m)?)?;
         // The token an unscoped refusal opens with when it names its own
         // rewrite (`sparql_scoper::UNSCOPED_REWRITE_NAMED`): exported so the
@@ -3773,6 +3774,16 @@ impl ExecutionPlan {
         self.inner.sql_only()
     }
 
+    /// The :class:`DatasetSpec` the plan was made for: the one it is run
+    /// under (``sparql_execute_plan`` and ``sparql_finish`` read it from the
+    /// plan, so nothing can run it under another).
+    #[getter]
+    fn dataset(&self) -> PyDatasetSpec {
+        PyDatasetSpec {
+            inner: self.inner.dataset.clone(),
+        }
+    }
+
     /// The one :class:`TypeRegime` the query reads its records under. A query
     /// reads one data graph (one that reads two is refused with
     /// ``cross_data_graph``), so the records its SQL pass fetches are written
@@ -4420,7 +4431,7 @@ fn sparql_execute(
     let bound_instances: Vec<_> = instances.iter().map(|i| i.bind(py).borrow()).collect();
     let instance_refs: Vec<&LinkMLInstance> = bound_instances.iter().map(|b| &b.value).collect();
 
-    match crate::sparql_executor::sparql_execute(
+    execute_answer(crate::sparql_executor::sparql_execute(
         query,
         &instance_refs,
         sv,
@@ -4430,7 +4441,66 @@ fn sparql_execute(
             max_result_rows,
             max_eval_millis,
         },
-    ) {
+    ))
+}
+
+/// Execute the query a plan was made for against a list of LinkML instances.
+///
+/// The records route of a planned query: the plan carries the query (parsed
+/// and canonical), the dataset and the one data regime it reads the records
+/// under, so the records cannot be loaded under one dataset and evaluated under
+/// another. ``sparql_execute`` stays for a query that was not planned.
+///
+/// Args:
+///     plan: The :class:`ExecutionPlan` of the query, from
+///         ``plan_query_refined``.
+///     instances: The LinkMLInstance objects the plan's SQL pass fetched.
+///     schema_view: The LinkML schema (for RDF conversion).
+///     max_triples: Keyword-only, default 500 000. As for ``sparql_execute``.
+///     max_result_rows: Keyword-only, default 10 000.
+///     max_eval_millis: Keyword-only. As for ``sparql_execute``.
+///
+/// Returns:
+///     ``(content_type, body)``, as ``sparql_execute``.
+///
+/// Raises:
+///     RuntimeError: the same texts ``sparql_execute`` raises.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (plan, instances, schema_view, *, max_triples=500_000, max_result_rows=10_000, max_eval_millis=None))]
+fn sparql_execute_plan(
+    py: Python<'_>,
+    plan: &ExecutionPlan,
+    instances: Vec<Py<PyLinkMLInstance>>,
+    schema_view: Py<PySchemaView>,
+    max_triples: usize,
+    max_result_rows: usize,
+    max_eval_millis: Option<u64>,
+) -> PyResult<(String, String)> {
+    let bound_sv = schema_view.bind(py);
+    let sv_ref = bound_sv.borrow();
+    let sv = sv_ref.as_rust();
+    let bound_instances: Vec<_> = instances.iter().map(|i| i.bind(py).borrow()).collect();
+    let instance_refs: Vec<&LinkMLInstance> = bound_instances.iter().map(|b| &b.value).collect();
+    execute_answer(crate::sparql_executor::sparql_execute_plan(
+        &plan.inner,
+        &instance_refs,
+        sv,
+        crate::sparql_executor::ExecuteLimits {
+            max_triples,
+            max_result_rows,
+            max_eval_millis,
+        },
+    ))
+}
+
+/// What either records entry point raises: one text per cause.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+fn execute_answer(
+    result: Result<crate::sparql_executor::SparqlAnswer, crate::sparql_executor::ExecuteError>,
+) -> PyResult<(String, String)> {
+    match result {
         // `(content_type, body)`: the serialisation belongs to the query's form,
         // and the form is something this function has already parsed. A caller
         // asked to name the format can contradict the query — and the caller
