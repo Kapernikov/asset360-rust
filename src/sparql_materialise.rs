@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn without_a_schema_graph_nothing_is_evaluated() {
         let schema_view = asset360_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined_in(
+        let plan = crate::sparql_plan::plan_query_refined(
             &query(&format!(
                 "SELECT ?s ?code WHERE {{ \
                  ?s a asset360:Signal ; asset360:signalType ?t . \
@@ -1183,6 +1183,7 @@ mod tests {
     fn a_second_pass_needs_no_edit_to_the_first() {
         let mut plan = crate::sparql_refine::naive_plan_of(
             "SELECT ?x ?y WHERE { VALUES ?x { 1 2 } VALUES ?y { 3 } }",
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a naive plan");
         let rule = crate::sparql_rules::Materialise::new(ReadsNothing::default());
@@ -1399,7 +1400,7 @@ mod tests {
     /// The lowered execution plan, which is what the endpoint renders.
     fn plan_for(body: &str) -> String {
         let schema_view = asset360_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined_in(
+        let plan = crate::sparql_plan::plan_query_refined(
             &query(body),
             &schema_view,
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
@@ -1655,7 +1656,11 @@ mod tests {
                 false,
             ),
         ] {
-            let plan = crate::sparql_refine::naive_plan_of(&query(body)).expect("the query parses");
+            let plan = crate::sparql_refine::naive_plan_of(
+                &query(body),
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("the query parses");
             let root = plan.nodes.len() - 1;
             assert!(
                 plan.variables_of(root).contains(variable),

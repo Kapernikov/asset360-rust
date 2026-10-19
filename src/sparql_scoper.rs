@@ -1319,7 +1319,8 @@ impl std::fmt::Display for ScopeError {
 
 pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-/// Analyse a SPARQL query and produce a [`QueryPlan`].
+/// Analyse a SPARQL query and produce a [`QueryPlan`], for a deployment whose
+/// dataset is `dataset`.
 ///
 /// Parses the query via `spargebra`, decomposes the BGP into stars,
 /// detects join edges between stars, and collects filter conditions.
@@ -1329,20 +1330,14 @@ pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#ty
 /// - [`ScopeError::ParseError`] — invalid SPARQL syntax.
 /// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
 /// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update.
-pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
-    sparql_scope_in(query_str, schema_view, &DatasetSpec::default())
-}
-
-/// [`sparql_scope`], for a deployment whose dataset is `dataset`.
 ///
 /// `dataset` says which named graphs the endpoint serves: the schema graphs
 /// the datamodel is published in, the data graphs the records are served as,
 /// and what the default graph means. It is a parameter and not a constant
 /// because the deployment decides it — see [`crate::sparql_dataset`] and
-/// [`crate::sparql_schema_graph`]. The default dataset, which plain
-/// [`sparql_scope`] passes, has no schema graph, so no pattern is in one and
-/// every triple is scoped as an instance pattern.
-pub fn sparql_scope_in(
+/// [`crate::sparql_schema_graph`]. A dataset with no schema graph has no
+/// pattern in one, so every triple is scoped as an instance pattern.
+pub fn sparql_scope(
     query_str: &str,
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
@@ -1353,7 +1348,7 @@ pub fn sparql_scope_in(
     // accepts and refuses exactly what the planner and the engine leg do. See
     // [`crate::sparql_alias`].
     crate::sparql_alias::canonicalize(&mut query, schema_view)?;
-    scope_parsed_in(&query, schema_view, dataset)
+    scope_parsed(&query, schema_view, dataset)
 }
 
 /// The vocabularies the parser seeds whatever the datamodel says.
@@ -1507,21 +1502,15 @@ fn parse_with(parser: &SparqlParser, query_str: &str) -> Result<Query, ScopeErro
         .map_err(|e| ScopeError::ParseError(e.to_string()))
 }
 
-/// Plan an already-parsed query.
+/// Plan an already-parsed query, for a deployment whose dataset is `dataset`.
 ///
 /// Separate from [`sparql_scope`] so a caller that needs the parsed algebra for
 /// its own analysis — the aggregate pushdown does — can parse once and share
 /// the result, instead of parsing the same string again with a parser that
 /// might not match.
-pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
-    scope_parsed_in(query, schema_view, &DatasetSpec::default())
-}
-
-/// [`scope_parsed`], for a deployment that serves a schema graph.
 ///
-/// See [`sparql_scope_in`] for what `dataset` is and
-/// why it is not a constant.
-pub fn scope_parsed_in(
+/// See [`sparql_scope`] for what `dataset` is and why it is not a constant.
+pub fn scope_parsed(
     query: &Query,
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
@@ -1529,7 +1518,7 @@ pub fn scope_parsed_in(
     scope_parsed_as(query, schema_view, dataset, Scoping::Refuse)
 }
 
-/// [`scope_parsed_in`] with a choice of what to do with an
+/// [`scope_parsed`] with a choice of what to do with an
 /// untyped star. The pipeline's entry point.
 ///
 /// **A star is a `(naming domain, variable)`.** The query is first read with
@@ -6084,6 +6073,7 @@ classes:
         let plan = sparql_scope(
             "SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6106,7 +6096,7 @@ classes:
         let plan = sparql_scope(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?name . FILTER(?name = \"BX517\") }",
-            &sv,
+            &sv, crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6119,7 +6109,12 @@ classes:
     #[test]
     fn test_single_type_with_limit() {
         let sv = test_schema_view();
-        let plan = sparql_scope("SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10", &sv).unwrap();
+        let plan = sparql_scope(
+            "SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10",
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
 
         assert_eq!(plan.sql_limit, Some(10));
     }
@@ -6134,6 +6129,7 @@ classes:
              SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
              ?loc asset360:longitude ?lon }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6156,6 +6152,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6183,6 +6180,7 @@ classes:
              SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
              ?t asset360:hasName ?tn }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap_err();
 
@@ -6274,7 +6272,7 @@ classes:
                  OPTIONAL { ?k <http://www.w3.org/2004/02/skos/core#prefLabel> ?l } }",
             ),
         ] {
-            let err = sparql_scope_in(
+            let err = sparql_scope(
                 &format!("{prefix}{query}"),
                 &sv,
                 &crate::sparql_dataset::schema_dataset("urn:schema"),
@@ -6300,8 +6298,12 @@ classes:
              GRAPH <urn:other> { ?k <urn:label> ?l } }",
             "SELECT ?s WHERE { ?s a asset360:Signal . SERVICE <urn:remote> { ?x <urn:p> ?o } }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv)
-                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
             assert!(
                 plan.inexact.is_some(),
                 "{query}: the block must still route to the engine"
@@ -6320,6 +6322,7 @@ classes:
                  FILTER(?len > 10) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6344,6 +6347,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . FILTER(10 < ?len) }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6364,6 +6368,7 @@ classes:
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . \
              FILTER(?len >= 10 && ?len <= 20) }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6382,8 +6387,12 @@ classes:
     #[test]
     fn substring_filters_lift_with_their_case_folding() {
         let lifted = |query: &str| -> Vec<FilterCondition> {
-            let scope =
-                sparql_scope(&format!("{PREFIX}{query}"), &test_schema_view()).expect("scopes");
+            let scope = sparql_scope(
+                &format!("{PREFIX}{query}"),
+                &test_schema_view(),
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("scopes");
             all_stars(&scope)
                 .iter()
                 .flat_map(|star| star.filters.values())
@@ -6453,6 +6462,7 @@ classes:
                  FILTER(CONTAINS(?nm, LCASE(\"X5\"))) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6479,6 +6489,7 @@ classes:
                  FILTER(CONTAINS(?k, \"GS\")) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6501,6 +6512,7 @@ classes:
                  FILTER(?nm != \"BX517\") }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         let conditions: Vec<_> = all_stars(&scope)
@@ -6528,6 +6540,7 @@ classes:
                  FILTER(?k != <http://ontorail.org/src/Eulynx/Amb>) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6554,6 +6567,7 @@ classes:
                  FILTER(?nm != \"BX517\") }} LIMIT 10"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert_eq!(plan.sql_limit, Some(10));
@@ -6571,6 +6585,7 @@ classes:
                  OPTIONAL {{ ?s asset360:name ?nm }} FILTER(!bound(?nm)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         let conditions: Vec<_> = all_stars(&plan)
@@ -6597,6 +6612,7 @@ classes:
                  FILTER(!bound(?nm)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(all_stars(&plan).iter().all(|star| star.filters.is_empty()));
@@ -6622,6 +6638,7 @@ classes:
                  ?loc asset360:longitude ?lon . FILTER(!bound(?lon)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         let conditions: Vec<_> = all_stars(&plan)
@@ -6643,8 +6660,12 @@ classes:
         const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
                             PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
         let path_conditions = |query: &str| -> Vec<FilterCondition> {
-            let scope = sparql_scope(&format!("{PREFIX}{GEOF}{query}"), &test_schema_view())
-                .expect("scopes");
+            let scope = sparql_scope(
+                &format!("{PREFIX}{GEOF}{query}"),
+                &test_schema_view(),
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("scopes");
             scope
                 .root
                 .all_stars()
@@ -6720,7 +6741,7 @@ classes:
                  FILTER(geof:sfIntersects(?w, \
                  \"{{\\\"type\\\":\\\"Point\\\",\\\"coordinates\\\":[1,2]}}\"^^geo:geoJSONLiteral)) }}"
             ),
-            &test_schema_view(),
+            &test_schema_view(), crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6750,6 +6771,7 @@ classes:
                  FILTER(geof:sfIntersects(?w, \"POINT(1 2)\"^^geo:wktLiteral)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6773,6 +6795,7 @@ classes:
                  FILTER(geof:sfWithin(?w, \"POINT(1 2)\"^^geo:wktLiteral)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6907,7 +6930,12 @@ classes:
                 "SELECT ?s WHERE { ?s a asset360:Signal . ?s ?p \"x\" } LIMIT 10",
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.sql_limit, None, "sql_limit must be None for: {label}");
         }
     }
@@ -6972,7 +7000,12 @@ classes:
                 "SELECT ?c WHERE { ?c a asset360:CivilEngineeringAsset } LIMIT 50".to_owned(),
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.sql_limit, expected, "for: {label}");
             assert_eq!(plan.sql_limit_scope, scope, "scope, for: {label}");
         }
@@ -7049,7 +7082,12 @@ classes:
                 None,
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.inexact, None, "a walked path is not a loss: {label}");
             let star = &plan.root.all_stars()[0];
             assert_eq!(star.required_paths, expected, "restated, for: {label}");
@@ -7085,6 +7123,7 @@ classes:
                  asset360:location ?c . ?c asset360:onTrack ?t }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(
@@ -7100,6 +7139,7 @@ classes:
                  asset360:location ?c . ?c asset360:onTrack ?t ; asset360:longitude ?lo }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(
@@ -7117,6 +7157,7 @@ classes:
                  OPTIONAL {{ ?s asset360:location ?c . ?c asset360:onTrack ?t }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert!(
@@ -7132,6 +7173,7 @@ classes:
                  asset360:location ?c . ?c asset360:onTrack ?t . ?t a asset360:Track }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert!(
@@ -7155,6 +7197,7 @@ classes:
              OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
              asset360:documents ?d . ?d asset360:title ?n } } LIMIT 50",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None);
@@ -7357,8 +7400,12 @@ classes:
                  asset360:location [ asset360:longitude ?v ] }",
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv)
-                .unwrap_or_else(|e| panic!("scope failed for {query}: {e:?}"));
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap_or_else(|e| panic!("scope failed for {query}: {e:?}"));
             assert_eq!(
                 plan.inexact,
                 Some(expected),
@@ -7385,7 +7432,12 @@ classes:
             "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
             "SELECT ?s WHERE { ?s a asset360:Relay ; a asset360:Switch }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).expect("scopes");
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("scopes");
             assert_eq!(plan.inexact, Some(Inexact::RepeatedType), "{query}");
         }
     }
@@ -7407,7 +7459,7 @@ classes:
         // it is configuration and not a constant -- see
         // `crate::sparql_schema_graph`.
         let schema_graph = "https://data.infrabel.be/asset360/schema";
-        let plan = sparql_scope_in(
+        let plan = sparql_scope(
             &format!(
                 "{prefix}SELECT ?s ?l WHERE {{ ?s a asset360:Signal .                  GRAPH <{schema_graph}> {{                  <https://example.org/term> rdfs:label ?l }} }}"
             ),
@@ -7438,6 +7490,7 @@ classes:
         let result = sparql_scope(
             "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>              SELECT ?c ?l WHERE { GRAPH <https://data.infrabel.be/asset360/schema>              { ?c rdfs:label ?l } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::Unscoped { .. })),
@@ -7517,7 +7570,12 @@ classes:
                 true,
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(
                 plan.inexact.is_none(),
                 pushed,
@@ -7539,6 +7597,7 @@ classes:
              SELECT ?nm WHERE { <https://data.infrabel.be/asset360/signal/A> \
              asset360:name ?nm }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("an ordinary constant-subject query is not a disconnected OPTIONAL");
 
@@ -7570,6 +7629,7 @@ classes:
                  ?c a asset360:Coordinates ; asset360:longitude ?lo }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, Some(Inexact::TypedNestedStructure));
@@ -7592,6 +7652,7 @@ classes:
                  ?c a asset360:Track ; asset360:longitude ?lo }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap_err();
         assert!(
@@ -7606,6 +7667,7 @@ classes:
                  ?c asset360:longitude ?lo }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None);
@@ -7626,7 +7688,8 @@ classes:
                  OPTIONAL {{ ?s asset360:location ?c . ?c asset360:hasName ?x }} }}"
             ),
         ] {
-            let err = sparql_scope(&query, &sv).unwrap_err();
+            let err =
+                sparql_scope(&query, &sv, crate::sparql_dataset::default_dataset()).unwrap_err();
             assert!(
                 matches!(&err, ScopeError::UnsupportedConstruct(msg)
                     if msg.contains("not a slot of Coordinates")
@@ -7642,6 +7705,7 @@ classes:
                  asset360:locatedOnTrack ?t . ?t a asset360:Track ; asset360:hasName ?tn }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None);
@@ -7660,6 +7724,7 @@ classes:
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" ; \
              asset360:name \"BX\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7686,6 +7751,7 @@ classes:
                  asset360:location ?c . ?c asset360:longitude ?lo . FILTER(?lo = 4) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "a nested FILTER is pushable");
@@ -7717,7 +7783,7 @@ classes:
             &format!(
                 "{PREFIX}SELECT ?lat WHERE {{ ?s a asset360:Site ; asset360:place ?p .                  ?p asset360:coords ?c . ?c asset360:lat ?lat }}"
             ),
-            &sv,
+            &sv, crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "{:?}", plan.inexact);
@@ -7737,7 +7803,7 @@ classes:
             &format!(
                 "{PREFIX}SELECT ?t WHERE {{ ?s a asset360:Site ; asset360:place ?p .                  ?p asset360:tag ?t }}"
             ),
-            &sv,
+            &sv, crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert!(
@@ -7756,6 +7822,7 @@ classes:
              SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:location ?c . ?c asset360:longitude 4 }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "a nested constant is pushable");
@@ -7785,6 +7852,7 @@ classes:
                  asset360:kind <http://ontorail.org/src/Eulynx/GSA> }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "an IRI constant on an enum is pushable");
@@ -7801,6 +7869,7 @@ classes:
                  asset360:kind <https://data.infrabel.be/asset360/SignalKind#KSS> }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "a minted IRI is pushable too");
@@ -7821,6 +7890,7 @@ classes:
                     "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"{code}\" }}"
                 ),
                 &sv,
+                crate::sparql_dataset::default_dataset(),
             )
             .unwrap_err();
             let ScopeError::UnsupportedConstruct(msg) = &err else {
@@ -7864,7 +7934,7 @@ classes:
                 FilterCondition::In(vec!["GSA".to_owned(), "KSS".to_owned()]),
             ),
         ] {
-            let plan = sparql_scope(&query, &sv).unwrap();
+            let plan = sparql_scope(&query, &sv, crate::sparql_dataset::default_dataset()).unwrap();
             assert_eq!(plan.inexact, None, "not pushed: {query}");
             assert_eq!(
                 plan.root.all_stars()[0].filters["kind"],
@@ -7886,6 +7956,7 @@ classes:
              SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:length ?len ; \
              asset360:name ?nm . FILTER(?len >= 10) }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7911,7 +7982,12 @@ classes:
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
              FILTER(?t IN (<https://data.infrabel.be/asset360/track/T1>)) }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.inexact, None, "should push: {query}");
         }
 
@@ -7923,7 +7999,12 @@ classes:
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
              FILTER(?nm = <https://data.infrabel.be/asset360/track/T1>) }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert!(plan.inexact.is_some(), "should refuse: {query}");
         }
     }
@@ -7938,7 +8019,7 @@ classes:
                      SELECT ?v WHERE { ?s a asset360:Signal ; asset360:location ?c . \
                      ?c asset360:detail ?d . ?d asset360:value ?v }";
 
-        let plan = sparql_scope(query, &sv).unwrap();
+        let plan = sparql_scope(query, &sv, crate::sparql_dataset::default_dataset()).unwrap();
         assert_eq!(plan.inexact, None, "a walked path is not a loss");
         let binding = plan.path_bindings.get("v").expect("?v is a path binding");
         assert_eq!(binding.slot_path, ["location", "detail", "value"]);
@@ -7980,7 +8061,12 @@ classes:
                 None,
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.sql_limit, expected, "for: {query}");
         }
     }
@@ -7999,6 +8085,7 @@ classes:
                  FILTER(?nm IN (\"a\", \"b\")) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8037,7 +8124,12 @@ classes:
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
              asset360:length ?l . VALUES (?nm ?l) { (\"BX1\" 4) } }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.inexact, None, "should be exact: {query}");
         }
 
@@ -8045,6 +8137,7 @@ classes:
         let plan = sparql_scope(
             &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal }} LIMIT 10"),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.sql_limit, Some(10));
@@ -8062,6 +8155,7 @@ classes:
              FILTER NOT EXISTS { ?component a asset360:CivilEngineeringAsset ; \
              asset360:belongsToTunnelComplex ?complex } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8094,8 +8188,12 @@ classes:
             "SELECT (SUM(IF(EXISTS { ?s asset360:belongsToLine ?l }, 1, 0)) AS ?n) \
              WHERE { ?s a asset360:Signal }",
         ] {
-            let error = sparql_scope(&format!("{prefix}{query}"), &sv)
-                .expect_err("should refuse rather than answer: {query}");
+            let error = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect_err("should refuse rather than answer: {query}");
             let ScopeError::UnsupportedConstruct(message) = &error else {
                 panic!("expected an unsupported-construct refusal, got {error:?}");
             };
@@ -8120,6 +8218,7 @@ classes:
                           asset360:hasName ?componentName . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8179,6 +8278,7 @@ classes:
                ?l a asset360:Line ; asset360:hasName ?ln . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8203,6 +8303,7 @@ classes:
                ?sig a asset360:Signal ; asset360:name ?name . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8229,6 +8330,7 @@ classes:
                ?sig a asset360:Signal ; asset360:locatedOnTrack ?track ; asset360:name ?sn . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8269,6 +8371,7 @@ classes:
                ?tc a asset360:TunnelComplex . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8304,6 +8407,7 @@ classes:
                                                             asset360:hasName ?n . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8329,6 +8433,7 @@ classes:
                <https://data.infrabel.be/asset360/thing/Y> asset360:hasName ?n . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(matches!(result, Err(ScopeError::UnsupportedConstruct(_))));
     }
@@ -8338,7 +8443,11 @@ classes:
     #[test]
     fn test_unscoped_query_rejected() {
         let sv = test_schema_view();
-        let result = sparql_scope("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", &sv);
+        let result = sparql_scope(
+            "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        );
         assert!(matches!(result, Err(ScopeError::Unscoped { .. })));
     }
 
@@ -8348,6 +8457,7 @@ classes:
         let result = sparql_scope(
             "INSERT DATA { <http://example.org/s> <http://example.org/p> \"value\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(matches!(result, Err(ScopeError::UpdateRejected)));
     }
@@ -8355,7 +8465,11 @@ classes:
     #[test]
     fn test_parse_error() {
         let sv = test_schema_view();
-        let result = sparql_scope("NOT VALID {{{", &sv);
+        let result = sparql_scope(
+            "NOT VALID {{{",
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        );
         assert!(matches!(result, Err(ScopeError::ParseError(_))));
     }
 
@@ -8371,6 +8485,7 @@ classes:
                VALUES ?name { \"BX517\" \"BX518\" } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8393,6 +8508,7 @@ classes:
         let plan = sparql_scope(
             "ASK { ?s a asset360:Signal ; asset360:name \"BX517\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8410,6 +8526,7 @@ classes:
             "CONSTRUCT { ?s a asset360:Signal ; asset360:name ?n } \
              WHERE { ?s a asset360:Signal ; asset360:name ?n }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8438,6 +8555,7 @@ classes:
                } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8503,6 +8621,7 @@ classes:
                } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8534,6 +8653,7 @@ classes:
                OPTIONAL { ?s asset360:name ?n } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8555,6 +8675,7 @@ classes:
                OPTIONAL { ?s asset360:locatedOnTrack ?t } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8576,6 +8697,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION is scopable");
         let mut classes: Vec<&str> = plan
@@ -8608,6 +8730,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION is scopable");
         let names: HashSet<&str> = plan
@@ -8645,6 +8768,7 @@ classes:
                  ?t a asset360:TunnelComplex ; asset360:hasName ?tn } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION is scopable");
 
@@ -8684,6 +8808,7 @@ classes:
              SELECT * WHERE { ?s a asset360:Signal . \
              { ?s asset360:name ?n } UNION { ?s asset360:length ?t } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION is scopable");
         for star in plan.root.all_stars() {
@@ -8704,6 +8829,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { { ?s a asset360:Signal } UNION { ?x ?p ?o } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::Unscoped { .. })),
@@ -8725,6 +8851,7 @@ classes:
                 "PREFIX asset360: <https://data.infrabel.be/asset360/> SELECT * WHERE {{ {arms} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("branches")),
@@ -8739,6 +8866,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { ?s a asset360:Signal . MINUS { ?s asset360:name \"X\" } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("MINUS")),
@@ -8747,7 +8875,7 @@ classes:
     }
 
     /// Review finding 4, and what replaced its refusal. A dataset clause used
-    /// to be discarded by the `..` in every arm of [`scope_parsed_in`], so
+    /// to be discarded by the `..` in every arm of [`scope_parsed`], so
     /// `FROM <urn:empty>` was planned as all-in-SQL, admitted, and answered
     /// from the table — `2` for a dataset in which the answer is `0`. It was
     /// refused by name, because nothing downstream carried it. The plan carries
@@ -8759,11 +8887,11 @@ classes:
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
-        let dataset = DatasetSpec::default()
+        let dataset = DatasetSpec::asserted()
             .with_data_graph(A, TypeRegime::Asserted)
             .with_data_graph(I, TypeRegime::IsA);
         let scoped = |query: &str| {
-            sparql_scope_in(
+            sparql_scope(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
                 &sv,
                 &dataset,
@@ -8845,11 +8973,11 @@ classes:
     is_a: Signal
 ",
         );
-        let dataset = DatasetSpec::default()
+        let dataset = DatasetSpec::asserted()
             .with_data_graph(A, TypeRegime::Asserted)
             .with_data_graph(I, TypeRegime::IsA);
         let scope = |query: &str| {
-            sparql_scope_in(
+            sparql_scope(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
                 &sv,
                 &dataset,
@@ -8890,6 +9018,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { ?s a asset360:Signal . LATERAL { ?s asset360:name ?n } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("LATERAL")),
@@ -8911,7 +9040,7 @@ classes:
                ?comp a asset360:CivilEngineeringAsset ; \
                      asset360:belongsToTunnelComplex <https://data.infrabel.be/data/TunnelComplexes/abc> . \
              }",
-            &sv,
+            &sv, crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8943,6 +9072,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8967,6 +9097,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"abc\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8999,6 +9130,7 @@ classes:
                   asset360:asset360_uri <https://data.infrabel.be/data/Signals/abc> . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -9022,6 +9154,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s ?id WHERE { ?s a asset360:Signal ; asset360:asset360_uri ?id }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -9051,6 +9184,7 @@ classes:
                VALUES ?id { \"abc\" \"def\" \"ghi\" } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -9077,6 +9211,7 @@ classes:
                FILTER(?id = \"abc\") \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -9098,6 +9233,7 @@ classes:
                OPTIONAL { ?s asset360:name \"BX517\" } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -9126,9 +9262,9 @@ classes:
                    ?t a asset360:Track ; asset360:hasName ?tn . \
                  }";
         // Run several times — sort order must be stable.
-        let plan1 = sparql_scope(q, &sv).unwrap();
-        let plan2 = sparql_scope(q, &sv).unwrap();
-        let plan3 = sparql_scope(q, &sv).unwrap();
+        let plan1 = sparql_scope(q, &sv, crate::sparql_dataset::default_dataset()).unwrap();
+        let plan2 = sparql_scope(q, &sv, crate::sparql_dataset::default_dataset()).unwrap();
+        let plan3 = sparql_scope(q, &sv, crate::sparql_dataset::default_dataset()).unwrap();
 
         let stars1: Vec<&str> = all_stars(&plan1)
             .iter()
@@ -9175,6 +9311,7 @@ classes:
                OPTIONAL { ?b a asset360:BaliseGroup } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("disconnected")),
@@ -9202,9 +9339,18 @@ classes:
             "{ ?s asset360:hasAccessibleTracks",
             "{ ?s a asset360:TunnelComplex ; asset360:hasAccessibleTracks",
         );
-        let untyped_plan = crate::sparql_plan::plan_query_refined(untyped, &sv)
-            .unwrap_or_else(|error| panic!("refused: {error}"));
-        let typed_plan = crate::sparql_plan::plan_query_refined(&typed, &sv).unwrap();
+        let untyped_plan = crate::sparql_plan::plan_query_refined(
+            untyped,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap_or_else(|error| panic!("refused: {error}"));
+        let typed_plan = crate::sparql_plan::plan_query_refined(
+            &typed,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         // The passes, not the ledger: the typed body owes one more type
         // obligation, and that is the only difference there may be.
         let passes = |plan: &crate::sparql_plan::ExecutionPlan| {
@@ -9261,6 +9407,7 @@ classes:
                ?cs asset360:belongsToTrack ?t . \
                ?t a asset360:Track ; asset360:typeURI ?tn }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -9288,7 +9435,12 @@ classes:
     #[test]
     fn an_optional_through_an_inline_list_is_connected() {
         let sv = asset360_fixture_schema_view();
-        let plan = sparql_scope(TUNNEL_TRACK_OPTIONAL, &sv).unwrap();
+        let plan = sparql_scope(
+            TUNNEL_TRACK_OPTIONAL,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
 
         let joins = all_joins(&plan);
         assert_eq!(joins.len(), 1, "{joins:?}");
@@ -9310,6 +9462,7 @@ classes:
                ?cs asset360:belongsToTrack ?t . ?t a asset360:Track . \
                OPTIONAL { ?u a asset360:Line ; asset360:typeURI ?tn } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("?u") && m.contains("disconnected")),
@@ -9328,7 +9481,12 @@ classes:
     #[test]
     fn the_execution_plan_carries_the_path_edge_into_the_fetch() {
         let sv = asset360_fixture_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(TUNNEL_TRACK_OPTIONAL, &sv).unwrap();
+        let plan = crate::sparql_plan::plan_query_refined(
+            TUNNEL_TRACK_OPTIONAL,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rendered = format!("{plan}");
         assert!(
             rendered.contains("join      ?s.hasCoveredSection.belongsToTrack[each] = ?t"),
@@ -9355,6 +9513,7 @@ classes:
                           ?cs asset360:belongsToTrack ?t . \
                           ?t asset360:typeURI ?tn } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         let Err(ScopeError::Unscoped { .. }) = &result else {
             panic!("expected an unscoped refusal, got {result:?}");
@@ -9382,7 +9541,7 @@ classes:
              SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex . \
                OPTIONAL { ?s asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a } \
                OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }",
-            &sv,
+            &sv, crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(
@@ -9410,7 +9569,7 @@ classes:
              SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex ; \
                  asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a . \
                OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }",
-            &sv,
+            &sv, crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert!(!first_mandatory.path_bindings["a"].optional);
@@ -9458,6 +9617,7 @@ classes:
         let plan = crate::sparql_plan::plan_query_refined(
             &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         // The refined plan reads each block as a scope of its own, one unnest
@@ -9486,6 +9646,7 @@ classes:
                OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 a asset360:CoveredSection ; \
                           asset360:hasSequenceNumber ?b } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(result.is_ok(), "{result:?}");
     }
@@ -9513,6 +9674,7 @@ classes:
             let plan = sparql_scope(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
                 &sv,
+                crate::sparql_dataset::default_dataset(),
             )
             .unwrap();
             assert_eq!(plan.inexact, Some(Inexact::DuplicateSlotBinding), "{query}");

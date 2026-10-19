@@ -1887,7 +1887,12 @@ pub(crate) mod tests {
 
     /// The plan production refines a query to with the lifts on.
     pub(crate) fn lifted_plan(query: &str, schema: &SchemaView) -> Plan {
-        let mut plan = crate::sparql_refine::naive_plan_for(query, schema).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan_for(
+            query,
+            schema,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rules = crate::sparql_plan::refine_rules(
             schema,
             crate::sparql_dataset::default_dataset(),
@@ -1920,7 +1925,12 @@ pub(crate) mod tests {
         schema: &SchemaView,
         oracle: &Oracle,
     ) -> (ExecutionPlan, Vec<serde_json::Value>) {
-        let plan = crate::sparql_plan::plan_query_refined(query, schema).unwrap();
+        let plan = crate::sparql_plan::plan_query_refined(
+            query,
+            schema,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         assert!(
             matches!(plan.refinement, Refinement::UsedRows(_)),
             "expected the rows route:\n{plan}"
@@ -1928,7 +1938,9 @@ pub(crate) mod tests {
         // The same placement, for the island it placed.
         let parsed = crate::sparql_scoper::parse_query_for(query, schema).unwrap();
         let obligations = crate::sparql_plan::obligations_of(&parsed).unwrap();
-        let mut lifted = crate::sparql_refine::naive_plan(&parsed).unwrap();
+        let mut lifted =
+            crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
+                .unwrap();
         let lifts = plan.passes.iter().any(|pass| {
             matches!(&pass.kind, PassKind::Engine(engine)
                 if matches!(&engine.input, EngineInput::Solutions { .. }))
@@ -2095,6 +2107,7 @@ pub(crate) mod tests {
                  BIND(EXISTS {{ ?s asset360:length ?len }} AS ?found) }}"
             ),
             &schema,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         let Refinement::Used(Some(note)) = &plan.refinement else {
@@ -2704,7 +2717,12 @@ mod composition {
         // The lift fires on it.
         let lifted = lifted_plan(&query, &schema).to_string();
         assert!(lifted.contains("R2  "), "{lifted}");
-        let plan = crate::sparql_plan::plan_query_refined(&query, &schema).unwrap();
+        let plan = crate::sparql_plan::plan_query_refined(
+            &query,
+            &schema,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         assert!(
             !matches!(plan.refinement, Refinement::UsedRows(_)),
             "{plan}"
@@ -2743,7 +2761,12 @@ mod composition {
         // Where it stood, M1 declines it on K7 ...
         let unlifted = crate::sparql_plan::with_declined(
             &{
-                let mut plan = crate::sparql_refine::naive_plan_for(&query, &schema).unwrap();
+                let mut plan = crate::sparql_refine::naive_plan_for(
+                    &query,
+                    &schema,
+                    crate::sparql_dataset::default_dataset(),
+                )
+                .unwrap();
                 let rules = crate::sparql_plan::refine_rules(
                     &schema,
                     crate::sparql_dataset::default_dataset(),
@@ -2799,6 +2822,7 @@ mod composition {
                  FILTER(EXISTS {{ ?s asset360:name ?nm }}) }}"
             ),
             &schema,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert!(matches!(plan.refinement, Refinement::Used(_)), "{plan}");
@@ -3004,7 +3028,11 @@ mod grammar_differential {
         let mut routed = 0;
         for body in crate::sparql_algebra::equivalence::grammar() {
             let query = format!("{PREFIX}{body}");
-            let Ok(plan) = crate::sparql_plan::plan_query_refined(&query, &schema) else {
+            let Ok(plan) = crate::sparql_plan::plan_query_refined(
+                &query,
+                &schema,
+                crate::sparql_dataset::default_dataset(),
+            ) else {
                 continue;
             };
             if !matches!(plan.refinement, Refinement::UsedRows(_)) {

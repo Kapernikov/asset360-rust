@@ -3616,7 +3616,12 @@ mod tests {
     /// Every SQL pass of a planned query, as (pass claims, operator tree).
     fn sql_passes(query: &str) -> Vec<(Vec<ObligationId>, OpTree)> {
         let sv = test_schema_view();
-        let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+        let plan = plan_query_refined(
+            &format!("{PREFIX}{query}"),
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("should plan");
         plan.passes
             .iter()
             .filter_map(|pass| match &pass.kind {
@@ -3635,7 +3640,12 @@ mod tests {
     fn a_union_whose_arms_restate_different_reads_declines_the_bound() {
         let sv = test_schema_view();
         let scope = |query: &str| {
-            crate::sparql_scoper::sparql_scope(&format!("{PREFIX}{query}"), &sv).unwrap()
+            crate::sparql_scoper::sparql_scope(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap()
         };
 
         let differing = FetchBounds::of(&scope(
@@ -4334,8 +4344,11 @@ mod tests {
             crate::sparql_rules::tier_one_rules(sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
-        let mut plan = crate::sparql_refine::naive_plan_of(&format!("{PREFIX}{query}"))
-            .expect("should build a naive plan");
+        let mut plan = crate::sparql_refine::naive_plan_of(
+            &format!("{PREFIX}{query}"),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("should build a naive plan");
         crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
         plan
     }
@@ -4356,8 +4369,8 @@ mod tests {
             rules.iter().map(|rule| rule.as_ref()).collect();
         let parsed =
             crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
-        let mut plan = crate::sparql_refine::naive_plan_in(&parsed, &dataset)
-            .expect("should build a naive plan");
+        let mut plan =
+            crate::sparql_refine::naive_plan(&parsed, &dataset).expect("should build a naive plan");
         crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
         lower_refined(&plan, sv, None, None)
     }
@@ -4956,6 +4969,7 @@ mod tests {
                  asset360:kind ?k . FILTER(?nm = \"BX517\" || ?k = \"GSA\") }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect_err("a string against a concept is refused");
         assert!(
@@ -5478,7 +5492,12 @@ mod retrieval_tests {
     /// Every scan's retrieval, in plan order.
     fn retrievals(query: &str) -> Vec<Retrieval> {
         let sv = test_schema_view();
-        let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+        let plan = plan_query_refined(
+            &format!("{PREFIX}{query}"),
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("should plan");
         plan.passes
             .iter()
             .filter_map(|pass| match &pass.kind {

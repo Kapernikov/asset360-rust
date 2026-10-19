@@ -7423,7 +7423,7 @@ def load_yaml(source:typing.Any, sv:SchemaView, class_view:ClassView) -> tuple[t
 
 def make_schema_view(source:typing.Optional[typing.Any]=None) -> SchemaView: ...
 
-def naive_plan_text(query:builtins.str) -> builtins.str:
+def naive_plan_text(query:builtins.str, dataset:DatasetSpec) -> builtins.str:
     r"""
     The plan the refinement pipeline starts from: every node the engine's.
     
@@ -7434,10 +7434,13 @@ def naive_plan_text(query:builtins.str) -> builtins.str:
     
     Takes no schema, unlike :func:`refined_plan_text`: the naive plan is a
     transcription of the query's own algebra and depends on nothing about the
-    data. That is the property the obligation ledger rests on.
+    data. That is the property the obligation ledger rests on. It does take the
+    dataset, which says which graph each pattern reads and so which regime it
+    is matched under.
     
     Args:
         query: SPARQL query string.
+        dataset: The :class:`DatasetSpec` the endpoint serves.
     
     Returns:
         str: the plan, one line per node, with the obligation ledger.

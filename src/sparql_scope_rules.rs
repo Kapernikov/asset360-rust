@@ -355,7 +355,11 @@ mod tests {
 
     fn refined(query: &str) -> Plan {
         let schema = test_schema_view();
-        let mut plan = naive_plan_of(&format!("{PREFIX}{query}")).unwrap();
+        let mut plan = naive_plan_of(
+            &format!("{PREFIX}{query}"),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
@@ -399,7 +403,7 @@ mod tests {
                 residual: Vec::new(),
                 obligations: plan.obligations.clone(),
                 refinement: crate::sparql_plan::Refinement::UsedAlone(String::new()),
-                dataset: crate::sparql_dataset::DatasetSpec::default(),
+                dataset: crate::sparql_dataset::DatasetSpec::asserted(),
             }
         );
         println!("{printed}");
@@ -821,7 +825,12 @@ mod tests {
             outcome_of(&scalar, &fixture, crate::sparql_dataset::default_dataset()),
             Outcome::Statement
         );
-        let plan = crate::sparql_plan::plan_query_refined(&scalar, &fixture).unwrap();
+        let plan = crate::sparql_plan::plan_query_refined(
+            &scalar,
+            &fixture,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let ops = match &plan.passes[0].kind {
             crate::sparql_plan::PassKind::Sql(sql) => &sql.ops,
             _ => unreachable!(),

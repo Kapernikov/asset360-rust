@@ -4041,24 +4041,20 @@ impl From<ScopeError> for RefineError {
 ///
 /// Diagnostics and tests; a query here declares the datamodel's prefixes
 /// itself. See [`crate::sparql_scoper::sparql_parser`].
-pub fn naive_plan_of(query_str: &str) -> Result<Plan, RefineError> {
+pub fn naive_plan_of(query_str: &str, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
     let parsed = crate::sparql_scoper::parse_query(query_str)?;
-    naive_plan(&parsed)
+    naive_plan(&parsed, dataset)
 }
 
-/// Parse a query with the schema-seeded parser and build its naive plan.
-pub fn naive_plan_for(query_str: &str, schema_view: &SchemaView) -> Result<Plan, RefineError> {
-    naive_plan_for_in(query_str, schema_view, &DatasetSpec::default())
-}
-
-/// [`naive_plan_for`] over `dataset` (see [`naive_plan_in`]).
-pub fn naive_plan_for_in(
+/// Parse a query with the schema-seeded parser and build its naive plan over
+/// `dataset` (see [`naive_plan`]).
+pub fn naive_plan_for(
     query_str: &str,
     schema_view: &SchemaView,
     dataset: &DatasetSpec,
 ) -> Result<Plan, RefineError> {
     let parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
-    naive_plan_in(&parsed, dataset)
+    naive_plan(&parsed, dataset)
 }
 
 /// The query, faithfully, with every node engine-executed and nothing folded.
@@ -4084,12 +4080,9 @@ pub fn naive_plan_for_in(
 /// obligation list is ordered the way it walks the algebra; checking turns a
 /// broken assumption into an error instead of a plan that answers a different
 /// question.
-pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
-    naive_plan_in(query, &DatasetSpec::default())
-}
-
-/// [`naive_plan`] over `dataset`: each triple is matched under the type
-/// regime of the graph it reads.
+///
+/// Each triple is matched under the type regime of the graph it reads, under
+/// `dataset`:
 ///
 /// * outside any `GRAPH`: the dataset's default regime, or -- when the query
 ///   writes a `FROM` -- the regime of the union of the graphs it names, and
@@ -4101,10 +4094,8 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
 ///   endpoint does not serve): no regime, under a [`PlanOp::Graph`] that
 ///   stays, so no data rule folds what is not the data graph.
 ///
-/// The caller's dataset decides all of it; [`naive_plan`] is the default
-/// one -- asserted, no named graphs -- what every dataset was before graphs
-/// had regimes.
-pub fn naive_plan_in(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
+/// The caller's dataset decides all of it.
+pub fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
     let graphs = QueryGraphs::new(dataset, crate::sparql_scoper::dataset_of(query));
     let default_regime = match graphs.default_reads() {
         GraphReads::Data(regime) => Some(regime),
@@ -4999,7 +4990,11 @@ mod tests {
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
     fn plan_of(query: &str) -> Plan {
-        naive_plan_of(&format!("{PREFIX}{query}")).expect("should build a naive plan")
+        naive_plan_of(
+            &format!("{PREFIX}{query}"),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("should build a naive plan")
     }
 
     /// The shapes a naive plan has to hold, and the ledger balancing on every
@@ -5337,8 +5332,11 @@ mod tests {
             "SELECT ?s WHERE { ?s a asset360:Signal MINUS { ?s asset360:name ?nm } }",
             "SELECT ?nm WHERE { ?s asset360:locatedOnTrack+/asset360:hasName ?nm }",
         ] {
-            let error = naive_plan_of(&format!("{PREFIX}{query}"))
-                .expect_err("obligation enumeration refuses this");
+            let error = naive_plan_of(
+                &format!("{PREFIX}{query}"),
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect_err("obligation enumeration refuses this");
             assert!(
                 matches!(error, RefineError::Scope(_)),
                 "refused for the enumeration's reason, not a defect: {error} for {query}"
@@ -5515,7 +5513,7 @@ mod tests {
         let plan = |query: &str| {
             let parsed =
                 crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
-            naive_plan_in(&parsed, &dataset).unwrap()
+            naive_plan(&parsed, &dataset).unwrap()
         };
         // `(has a Graph node above it, regime)` per match, in node order.
         let matches = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
@@ -5690,7 +5688,7 @@ mod tests {
                 .with_schema_graph(S, TypeRegime::IsA);
             let parsed =
                 crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
-            naive_plan_in(&parsed, &dataset).unwrap().to_string()
+            naive_plan(&parsed, &dataset).unwrap().to_string()
         };
         let body = "?s asset360:name ?n";
         // The default regime, asserted: as it always printed.
@@ -5754,7 +5752,7 @@ mod tests {
                 .collect()
         };
 
-        let asserted = naive_plan_in(&parsed, &DatasetSpec::new(TypeRegime::Asserted)).unwrap();
+        let asserted = naive_plan(&parsed, &DatasetSpec::new(TypeRegime::Asserted)).unwrap();
         let in_graph = |regimes: &[(String, Option<TypeRegime>)]| {
             regimes
                 .iter()
@@ -5772,7 +5770,7 @@ mod tests {
         // Asserted plan text carries no regime label, on a match or a scan.
         assert!(!asserted.to_string().contains("[is_a"), "{asserted}");
 
-        let is_a = naive_plan_in(&parsed, &DatasetSpec::new(TypeRegime::IsA)).unwrap();
+        let is_a = naive_plan(&parsed, &DatasetSpec::new(TypeRegime::IsA)).unwrap();
         assert_eq!(
             in_graph(&regimes(&is_a)),
             vec![

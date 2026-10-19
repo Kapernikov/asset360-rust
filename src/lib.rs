@@ -4042,6 +4042,7 @@ fn py_plan_query_refined(
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "naive_plan_text")]
+#[pyo3(signature = (query, dataset))]
 /// The plan the refinement pipeline starts from: every node the engine's.
 ///
 /// The counterpart to :func:`refined_plan_text`. A refined plan alone shows
@@ -4051,18 +4052,22 @@ fn py_plan_query_refined(
 ///
 /// Takes no schema, unlike :func:`refined_plan_text`: the naive plan is a
 /// transcription of the query's own algebra and depends on nothing about the
-/// data. That is the property the obligation ledger rests on.
+/// data. That is the property the obligation ledger rests on. It does take the
+/// dataset, which says which graph each pattern reads and so which regime it
+/// is matched under.
 ///
 /// Args:
 ///     query: SPARQL query string.
+///     dataset: The :class:`DatasetSpec` the endpoint serves.
 ///
 /// Returns:
 ///     str: the plan, one line per node, with the obligation ledger.
 ///
 /// Raises:
 ///     ValueError: the query does not parse or cannot be represented.
-fn py_naive_plan_text(query: &str) -> PyResult<String> {
-    crate::sparql_plan::naive_plan_text(query).map_err(pyo3::exceptions::PyValueError::new_err)
+fn py_naive_plan_text(query: &str, dataset: PyDatasetSpec) -> PyResult<String> {
+    crate::sparql_plan::naive_plan_text(query, &dataset.inner)
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -4152,7 +4157,7 @@ fn sparql_scope(
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    match crate::sparql_scoper::sparql_scope_in(query, sv, &dataset.inner) {
+    match crate::sparql_scoper::sparql_scope(query, sv, &dataset.inner) {
         Ok(plan) => Ok(plan.into()),
         // ScopeError's Display produces exactly these strings, so there is one
         // place to change when a variant is added — rather than two blocks

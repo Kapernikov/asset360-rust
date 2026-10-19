@@ -1254,7 +1254,7 @@ pub enum Outcome {
 
 /// [`Outcome`] of planning a query.
 pub fn outcome_of(query: &str, schema: &SchemaView, dataset: &DatasetSpec) -> Outcome {
-    match plan_query_refined_in(query, schema, dataset) {
+    match plan_query_refined(query, schema, dataset) {
         Ok(plan) => match &plan.refinement {
             Refinement::UsedAlone(_) => Outcome::Statement,
             Refinement::UsedRows(_) => Outcome::Rows,
@@ -1276,9 +1276,11 @@ pub fn outcome_of(query: &str, schema: &SchemaView, dataset: &DatasetSpec) -> Ou
 /// Takes no schema: the naive plan is a transcription of the query's own
 /// algebra, and nothing about it depends on what the data looks like. That is
 /// the property the ledger rests on -- the obligations are read off the query,
-/// so a rule can only ever discharge them, never invent one.
-pub fn naive_plan_text(query: &str) -> Result<String, String> {
-    crate::sparql_refine::naive_plan_of(query)
+/// so a rule can only ever discharge them, never invent one. It does take the
+/// dataset, which says which graph each pattern reads and so which regime it
+/// is matched under.
+pub fn naive_plan_text(query: &str, dataset: &DatasetSpec) -> Result<String, String> {
+    crate::sparql_refine::naive_plan_of(query, dataset)
         .map(|plan| plan.to_string())
         .map_err(|e| e.to_string())
 }
@@ -1309,10 +1311,10 @@ pub fn refined_plan_text(
     crate::sparql_alias::canonicalize(&mut parsed, schema)
         .map_err(|e| ScopeError::from(e).to_string())?;
     let parsed = parsed;
-    let naive = crate::sparql_refine::naive_plan_in(&parsed, dataset).map_err(|e| e.to_string())?;
+    let naive = crate::sparql_refine::naive_plan(&parsed, dataset).map_err(|e| e.to_string())?;
     // The plan production builds: with the lifts when they reach the rows
     // route, without them otherwise (see `plan_query_refined`).
-    let lifts = plan_query_refined_in(query, schema, dataset)
+    let lifts = plan_query_refined(query, schema, dataset)
         .is_ok_and(|plan| matches!(plan.refinement, Refinement::UsedRows(_)));
     let visible = dataset.seen_through(crate::sparql_scoper::dataset_of(&parsed));
     let rules = refine_rules(schema, &visible, lifts);
@@ -1400,23 +1402,12 @@ pub fn with_declined(
 pub fn plan_query_refined(
     query_str: &str,
     schema_view: &SchemaView,
-) -> Result<ExecutionPlan, ScopeError> {
-    plan_query_refined_in(query_str, schema_view, &DatasetSpec::default())
-}
-
-/// [`plan_query_refined`], for a deployment whose dataset is `dataset`.
-///
-/// See [`crate::sparql_scoper::sparql_scope_in`] for what `dataset` is and why
-/// it is not a constant.
-pub fn plan_query_refined_in(
-    query_str: &str,
-    schema_view: &SchemaView,
     dataset: &DatasetSpec,
 ) -> Result<ExecutionPlan, ScopeError> {
     plan_query_refined_with_options(query_str, schema_view, dataset, true)
 }
 
-/// [`plan_query_refined_in`], with the rows route
+/// [`plan_query_refined`], with the rows route
 /// (`Refinement::UsedRows`) switched off when `rows_route` is `false`: the
 /// plan the records route would run. What a consumer asks for when it cannot
 /// render the rows route's statement -- the records route answers every
@@ -1460,7 +1451,7 @@ pub fn plan_query_refined_with_options(
     // much as for the engine.
     let visible = dataset.seen_through(crate::sparql_scoper::dataset_of(&parsed));
     let dataset_in_force = &visible;
-    let naive = match crate::sparql_refine::naive_plan_in(&parsed, dataset) {
+    let naive = match crate::sparql_refine::naive_plan(&parsed, dataset) {
         Ok(plan) => plan,
         // A naive plan the builder cannot make is a query this pipeline does
         // not represent. The scoper has already accepted it, so there are rows
@@ -2605,6 +2596,7 @@ mod tests {
                  UNION {{ ?s a asset360:BaliseGroup }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION plans");
 
@@ -2707,7 +2699,8 @@ classes:
         }
         let query = format!("{PREFIX}SELECT * WHERE {{ {body} }} ORDER BY ?name");
         let started = std::time::Instant::now();
-        let plan = plan_query_refined(&query, &sv).expect("the wide query plans");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("the wide query plans");
         let elapsed = started.elapsed();
         assert!(plan.is_accounted(), "{plan}");
         assert!(
@@ -2760,6 +2753,7 @@ classes:
             let plan = plan_query_refined(
                 &format!("{PREFIX}SELECT ?s ?n WHERE {{ {arms} }} {modifiers}"),
                 &sv,
+                crate::sparql_dataset::default_dataset(),
             )
             .expect("a UNION plans");
             let Some(crate::sparql_plan::PassKind::Sql(sql)) =
@@ -2796,6 +2790,7 @@ classes:
                  UNION {{ ?s a asset360:BaliseGroup }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION plans");
 
@@ -2848,6 +2843,7 @@ classes:
                      UNION {{ ?s a {second} }} }}"
                 ),
                 &sv,
+                crate::sparql_dataset::default_dataset(),
             )
             .expect("a UNION plans");
 
@@ -2886,6 +2882,7 @@ classes:
                  FILTER(STRLEN(?nm) > 3) }} }} LIMIT 1"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION plans");
 
@@ -2921,6 +2918,7 @@ classes:
         let native = plan_query_refined(
             &format!("{PREFIX}SELECT ?n WHERE {{ ?t a asset360:Track ; asset360:rsmName ?n }}"),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("the readable spelling plans");
         let canonical = plan_query_refined(
@@ -2929,6 +2927,7 @@ classes:
                  {{ ?t a asset360:Track ; <http://ontorail.org/src/Eulynx/EAID_NAME> ?n }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("the declared spelling plans");
 
@@ -2955,6 +2954,7 @@ classes:
                  WHERE {{ ?s a asset360:Signal ; asset360:name ?name }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("an aggregate no rule takes still plans -- the engine answers it");
 
@@ -3062,6 +3062,7 @@ classes:
                  OPTIONAL {{ ?s asset360:name ?nm . FILTER(?nm > \"A\") }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         plan.ledger_balances().unwrap();
@@ -3084,6 +3085,7 @@ classes:
                  VALUES ?k {{ \"KSS\" }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         plan.ledger_balances().unwrap();
@@ -3108,6 +3110,7 @@ classes:
                  asset360:name ?nm . VALUES ?nm {{ \"BX1\" \"BX2\" }} }} GROUP BY ?nm"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         plan.ledger_balances().unwrap();
@@ -3133,7 +3136,8 @@ classes:
              asset360:name ?nm ; asset360:trafficKinds ?k }} GROUP BY ?nm"
         );
 
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("should plan");
         assert!(
             matches!(plan.refinement, Refinement::UsedAlone(_)),
             "expected the statement to answer alone, got {:?}",
@@ -3223,7 +3227,12 @@ classes:
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm } GROUP BY ?nm HAVING (COUNT(*) > 1)",
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let plan = plan_query_refined(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("should plan");
             assert!(
                 matches!(
                     plan.refinement,
@@ -3279,7 +3288,12 @@ classes:
                 "an equality filter",
             ),
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let plan = plan_query_refined(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("should plan");
             let reason = plan.refinement.reason().unwrap_or_else(|| {
                 panic!("{spelling} answered an aggregate: {:?}", plan.refinement)
             });
@@ -3312,6 +3326,7 @@ classes:
                  asset360:name ?nm }} GROUP BY ?nm"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3331,6 +3346,7 @@ classes:
                  asset360:name ?nm . FILTER(?nm > \"A\") }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3350,6 +3366,7 @@ classes:
                  FILTER(REGEX(STR(?s), \"^x\")) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3369,6 +3386,7 @@ classes:
                  FILTER(EXISTS {{ ?s asset360:length ?len }}) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3387,6 +3405,7 @@ classes:
                  asset360:name ?nm . FILTER(REGEX(?nm, \"^A\")) }} GROUP BY ?nm"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3408,13 +3427,13 @@ classes:
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
-        let dataset = crate::sparql_dataset::DatasetSpec::default()
+        let dataset = crate::sparql_dataset::DatasetSpec::asserted()
             .with_data_graph(A, linkml_runtime::schema_rdf::TypeRegime::Asserted)
             .with_data_graph(I, linkml_runtime::schema_rdf::TypeRegime::IsA);
         let body = "?s a asset360:Signal ; asset360:name ?nm . FILTER(?nm > \"A\") \
                     FILTER(REGEX(STR(?s), \"^x\"))";
         let finish_of = |query: String| {
-            let plan = plan_query_refined_in(&query, &sv, &dataset).expect("should plan");
+            let plan = plan_query_refined(&query, &sv, &dataset).expect("should plan");
             assert!(
                 matches!(plan.refinement, Refinement::UsedRows(_)),
                 "{:?}",
@@ -3479,10 +3498,10 @@ classes:
     #[test]
     fn the_refined_plan_text_prints_the_refusal_production_gives() {
         let sv = test_schema_view();
-        let dataset = crate::sparql_dataset::DatasetSpec::default();
+        let dataset = crate::sparql_dataset::DatasetSpec::asserted();
         let query =
             format!("{PREFIX}SELECT ?lo WHERE {{ ?c a asset360:Track ; asset360:longitude ?lo }}");
-        let production = plan_query_refined_in(&query, &sv, &dataset).expect_err("refused");
+        let production = plan_query_refined(&query, &sv, &dataset).expect_err("refused");
         let text = refined_plan_text(&query, &sv, &dataset).expect_err("a refusal, not a plan");
         assert_eq!(text, production.to_string());
         assert!(text.contains("not a slot of Track"), "{text}");
@@ -3495,7 +3514,7 @@ classes:
     #[test]
     fn from_named_alone_plans_an_empty_default_graph() {
         let sv = test_schema_view();
-        let dataset = crate::sparql_dataset::DatasetSpec::default()
+        let dataset = crate::sparql_dataset::DatasetSpec::asserted()
             .with_data_graph("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::Asserted);
         let query = format!(
             "{PREFIX}SELECT ?s ?nm FROM NAMED <urn:g:a> WHERE {{ ?s a asset360:Signal ; \
@@ -3504,7 +3523,7 @@ classes:
         let text = refined_plan_text(&query, &sv, &dataset).expect("should plan");
         assert!(!text.contains("scan"), "{text}");
         assert!(text.contains("values"), "{text}");
-        let plan = plan_query_refined_in(&query, &sv, &dataset).expect("should plan");
+        let plan = plan_query_refined(&query, &sv, &dataset).expect("should plan");
         assert!(!plan.sql_only(), "the table cannot answer for it:\n{plan}");
         assert!(
             plan.passes
@@ -3513,9 +3532,8 @@ classes:
             "{plan}"
         );
         // The same query with the clause dropped is answered from the table.
-        let plain =
-            plan_query_refined_in(&query.replace("FROM NAMED <urn:g:a> ", ""), &sv, &dataset)
-                .expect("should plan");
+        let plain = plan_query_refined(&query.replace("FROM NAMED <urn:g:a> ", ""), &sv, &dataset)
+            .expect("should plan");
         assert!(plain.sql_only(), "{plain}");
     }
 
@@ -3532,7 +3550,8 @@ classes:
             "{PREFIX}SELECT (GROUP_CONCAT(?nm) AS ?names) WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("should plan");
         let note = match &plan.refinement {
             Refinement::UsedRows(note) => note.clone(),
             other => panic!("expected the rows route, got {other:?}"),
@@ -3549,7 +3568,8 @@ classes:
             "{PREFIX}SELECT (GROUP_CONCAT(?nm) AS ?names) WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm FILTER(EXISTS {{ ?s asset360:length ?len }}) }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("should plan");
         let note = match &plan.refinement {
             Refinement::Used(Some(note)) => note.clone(),
             other => panic!("expected a fetch with a reason, got {other:?}"),
@@ -3572,7 +3592,8 @@ classes:
             "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm }} GROUP BY ?nm"
         );
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("should plan");
 
         assert!(
             matches!(plan.refinement, Refinement::UsedAlone(_)),
@@ -3638,7 +3659,8 @@ classes:
             "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL {{ ?s asset360:name ?nm }} FILTER(REGEX(STR(?s), \"^x\")) }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("should plan");
 
         assert!(
             matches!(
@@ -3703,7 +3725,12 @@ classes:
                 "identifier restriction",
             ),
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let plan = plan_query_refined(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("should plan");
             assert!(
                 !matches!(plan.refinement, Refinement::UsedAlone(_)),
                 "{query} answered alone: {:?}",
@@ -3740,7 +3767,8 @@ classes:
             "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
              FILTER(?nm > \"A\") FILTER(REGEX(?nm, \"^A\")) }}"
         );
-        let refined = plan_query_refined(&query, &sv).expect("should plan");
+        let refined = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("should plan");
         assert!(
             matches!(refined.refinement, Refinement::UsedRows(_)),
             "the regex reads only the rows, so the engine finishes over them: {:?}",
@@ -3803,7 +3831,8 @@ classes:
                 .and_then(crate::sparql_ops::fetch_bound_of)
         };
 
-        let refined = plan_query_refined(&query, &sv).expect("should plan");
+        let refined = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("should plan");
         assert!(
             matches!(refined.refinement, Refinement::Used(_)),
             "{refined}"
@@ -3829,7 +3858,8 @@ classes:
         // read the claimed slice as one would drop its offset (issue 457,
         // consolidator-server).
         let query = format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal }} LIMIT 1");
-        let answered = plan_query_refined(&query, &sv).expect("should plan");
+        let answered = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("should plan");
         assert!(answered.sql_only(), "{answered}");
         assert_eq!(bound_of(&answered), None, "{answered}");
         let claimed: Vec<&Pass> = answered.passes.iter().collect();
@@ -3889,6 +3919,7 @@ classes:
                  ?c asset360:longitude ?v }} LIMIT 50"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert_eq!(
@@ -3916,6 +3947,7 @@ classes:
                  ?d asset360:docId ?k }} LIMIT 50"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(answered.sql_only(), "{answered}");
@@ -3961,7 +3993,12 @@ classes:
             "SELECT ?s ?t WHERE { ?s a asset360:Signal ; \
              asset360:location ?c . ?c asset360:onTrack ?t }",
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let plan = plan_query_refined(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("should plan");
             assert!(plan.sql_only(), "{plan}");
             assert_eq!(paths_of(&plan), on_track, "{plan}");
         }
@@ -3974,6 +4011,7 @@ classes:
         let plan = plan_query_refined(
             &format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal }}"),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -4028,6 +4066,7 @@ classes:
                  ?s a asset360:Signal ; asset360:kind ?kind }} GROUP BY ?kind"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -4054,6 +4093,7 @@ classes:
                  FILTER(REGEX(?nm, \"^BX\")) }} GROUP BY ?nm"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -4108,7 +4148,12 @@ classes:
             "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
              ?t a asset360:Track ; asset360:hasName ?tn }",
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).unwrap();
+            let plan = plan_query_refined(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             plan.ledger_balances()
                 .unwrap_or_else(|err| panic!("{err} for {query}\n{plan}"));
         }
@@ -4140,7 +4185,7 @@ classes:
             }],
             residual: vec![1],
             refinement: Refinement::Used(None),
-            dataset: DatasetSpec::default(),
+            dataset: DatasetSpec::asserted(),
         };
         assert!(balanced.ledger_balances().is_ok());
         assert!(
@@ -4199,7 +4244,8 @@ classes:
              ?s a asset360:Signal ; asset360:kind ?kind }} GROUP BY ?kind"
         );
 
-        let naive = naive_plan_text(&query).expect("the naive plan is a transcription");
+        let naive = naive_plan_text(&query, crate::sparql_dataset::default_dataset())
+            .expect("the naive plan is a transcription");
         let refined = refined_plan_text(&query, &sv, crate::sparql_dataset::default_dataset())
             .expect("this shape refines");
 
@@ -4234,7 +4280,8 @@ classes:
              FILTER NOT EXISTS {{ ?component a asset360:CivilEngineeringAsset ; \
              asset360:belongsToTunnelComplex ?complex }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).unwrap();
+        let plan =
+            plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset()).unwrap();
         let printed = plan.to_string();
 
         assert!(
@@ -4276,7 +4323,8 @@ classes:
              FILTER NOT EXISTS {{ ?g a asset360:LineGroup ; \
              asset360:groupsLines ?l }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).unwrap();
+        let plan =
+            plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset()).unwrap();
         let printed = plan.to_string();
 
         // The class the filter asks about is fetched, and fetched optionally:
@@ -4305,7 +4353,12 @@ classes:
         );
         let parsed = parse_query(&query).unwrap();
         let obligations = obligations_of(&parsed).unwrap();
-        let scoped = crate::sparql_scoper::scope_parsed(&parsed, &sv).unwrap();
+        let scoped = crate::sparql_scoper::scope_parsed(
+            &parsed,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
 
         let plan = ExecutionPlan {
             contract: PLAN_CONTRACT,
@@ -4321,7 +4374,7 @@ classes:
             }],
             residual: Vec::new(),
             refinement: Refinement::UsedAlone("hand-built".to_owned()),
-            dataset: DatasetSpec::default(),
+            dataset: DatasetSpec::asserted(),
         };
         plan.ledger_balances().unwrap();
 
@@ -4367,7 +4420,8 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?nm . \
              VALUES (?nm ?tag) {{ (\"a\" \"x\") (\"b\" \"y\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("plans");
 
         let Refinement::Fallback {
             ref why,
@@ -4389,7 +4443,7 @@ classes:
         // The control. The decomposition on its own derives nothing here, so
         // the condition above is the refined plan's and not the scoper's.
         let parsed = parse_query(&query).expect("parses");
-        let scoped = crate::sparql_scoper::scope_parsed_in(
+        let scoped = crate::sparql_scoper::scope_parsed(
             &parsed,
             &sv,
             crate::sparql_dataset::default_dataset(),
@@ -4417,7 +4471,8 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?h . \
              VALUES (?lo ?tag) {{ (1 \"x\") (2 \"y\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("plans");
         let printed = plan.to_string();
         assert!(
             printed.contains("location.longitude IN ('1', '2')") && printed.contains("numeric"),
@@ -4439,7 +4494,8 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?h . \
              VALUES (?k ?tag) {{ (\"m\" \"x\") (\"f\" \"y\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("plans");
         let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
             panic!("{plan}");
         };
@@ -4501,8 +4557,12 @@ classes:
                      OPTIONAL {{ ?s asset360:typeURI ?nm . BIND({bind} AS ?inv) }} }}"
                 )
             };
-            let lifted =
-                plan_query_refined(&query_with("STRAFTER(STR(?nm), \"x\")"), &sv).expect("plans");
+            let lifted = plan_query_refined(
+                &query_with("STRAFTER(STR(?nm), \"x\")"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("plans");
             assert!(
                 matches!(lifted.refinement, Refinement::UsedRows(_)),
                 "typed={typed}: {lifted}"
@@ -4525,7 +4585,8 @@ classes:
                 "typed={typed}: the answering statement reads the element it bound: {lifted}"
             );
             let query = query_with("CONCAT(STR(?nm), STRUUID())");
-            let plan = plan_query_refined(&query, &sv).expect("plans");
+            let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+                .expect("plans");
             let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
                 panic!("{plan}");
             };
@@ -4597,7 +4658,9 @@ classes:
              VALUES (?nm ?tag) {{ (\"a\" \"x\") (\"b\" \"y\") }} }}"
         );
         let parsed = parse_query(&query).expect("parses");
-        let mut refined = crate::sparql_refine::naive_plan(&parsed).expect("a naive plan");
+        let mut refined =
+            crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
+                .expect("a naive plan");
         let rules =
             crate::sparql_rules::tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
@@ -4619,7 +4682,7 @@ classes:
             Vec::new(),
         ));
 
-        let mut scoped = crate::sparql_scoper::scope_parsed_in(
+        let mut scoped = crate::sparql_scoper::scope_parsed(
             &parsed,
             &sv,
             crate::sparql_dataset::default_dataset(),
@@ -4662,7 +4725,8 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?h . \
              VALUES (?id ?tag) {{ (\"one\" \"x\") (\"two\" \"y\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("plans");
         let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
             panic!("{plan}");
         };
@@ -4709,7 +4773,8 @@ classes:
              FILTER NOT EXISTS { ?s asset360:kind ?k } }",
         ] {
             let query = format!("{PREFIX}{query}");
-            let plan = plan_query_refined(&query, &sv).expect("plans");
+            let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+                .expect("plans");
             assert!(
                 matches!(plan.refinement, Refinement::Fallback { .. }),
                 "this test only says anything about the fallback: {plan}"
@@ -4758,7 +4823,8 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?nm . \
              VALUES (?nm ?tag) {{ (\"a\" \"x\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_query_refined(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("plans");
         let Some(PassKind::Sql(sql)) = plan.passes.first().map(|pass| &pass.kind) else {
             panic!("{plan}");
         };
@@ -4878,7 +4944,9 @@ classes:
              asset360:name ?x } } } } }",
         ] {
             let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
-            let plan = crate::sparql_refine::naive_plan(&parsed).unwrap();
+            let plan =
+                crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
+                    .unwrap();
             let barrier_domains: std::collections::BTreeSet<usize> = plan
                 .barriers()
                 .into_iter()
@@ -4924,9 +4992,18 @@ classes:
                 "SELECT ?s ?n WHERE { ?s a asset360:Signal . ?s asset360:name ?n }",
             ),
         ] {
-            let got = plan_query_refined(&format!("{prefix}{path}"), &sv)
-                .unwrap_or_else(|e| panic!("{path}: {e}"));
-            let want = plan_query_refined(&format!("{prefix}{scan}"), &sv).expect("the scan plans");
+            let got = plan_query_refined(
+                &format!("{prefix}{path}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+            let want = plan_query_refined(
+                &format!("{prefix}{scan}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("the scan plans");
             assert_eq!(got.to_string(), want.to_string(), "{path}");
             assert_eq!(got.sql_only(), want.sql_only(), "{path}");
             assert!(got.is_accounted(), "{got}");
@@ -4937,7 +5014,7 @@ classes:
             "SELECT ?s WHERE { GRAPH ?g { ?s rdfs:subClassOf* asset360:Signal } }",
             "SELECT ?s ?t WHERE { ?s rdfs:subClassOf* ?t }",
         ] {
-            let error = plan_query_refined_in(
+            let error = plan_query_refined(
                 &format!("{prefix}{refused}"),
                 &sv,
                 &crate::sparql_dataset::schema_dataset(schema_graph),
@@ -4952,7 +5029,7 @@ classes:
         }
 
         // Mixed: a record read beside a path over the schema graph.
-        let mixed = plan_query_refined_in(
+        let mixed = plan_query_refined(
             &format!(
                 "{prefix}SELECT ?s ?c WHERE {{ ?s a asset360:Signal . \
                  GRAPH <{schema_graph}> {{ ?c rdfs:subClassOf+ asset360:Signal }} }}"

@@ -8,7 +8,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = Path::new(&args[1]);
     let query = std::fs::read_to_string(&args[2]).unwrap();
-    let mut dataset = asset360_rust::sparql_dataset::DatasetSpec::default();
+    let mut dataset = asset360_rust::sparql_dataset::DatasetSpec::asserted();
     if let Some(iri) = args.get(3) {
         dataset = dataset.with_schema_graph(
             iri.as_str(),
@@ -35,7 +35,7 @@ fn main() {
         sv.add_schema(schema).unwrap();
     }
     let t = Instant::now();
-    let plan = asset360_rust::sparql_plan::plan_query_refined_in(&query, &sv, &dataset);
+    let plan = asset360_rust::sparql_plan::plan_query_refined(&query, &sv, &dataset);
     let elapsed = t.elapsed();
     match plan {
         Ok(_) => println!("planned in {elapsed:?}"),

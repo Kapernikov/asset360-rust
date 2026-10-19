@@ -799,7 +799,12 @@ pub(crate) mod tests {
 
     fn refined_text(query: &str, schema: &SchemaView) -> String {
         let text = format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}");
-        let mut plan = crate::sparql_refine::naive_plan_for(&text, schema).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan_for(
+            &text,
+            schema,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rules = rules(schema);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
@@ -838,7 +843,7 @@ pub(crate) mod tests {
             refined.contains("by value ?t (signalType, enum→code)  [S]"),
             "{refined}"
         );
-        let plan = crate::sparql_plan::plan_query_refined_in(
+        let plan = crate::sparql_plan::plan_query_refined(
             &q,
             &sv,
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
@@ -938,7 +943,12 @@ pub(crate) mod tests {
              SELECT ?s ?lat ?lbl WHERE { ?s a asset360:Signal . \
              OPTIONAL { ?s asset360:location ?loc . ?loc asset360:latitude ?lat ; asset360:detail ?d . \
              ?d asset360:value ?v . OPTIONAL { VALUES (?v ?lbl) { (\"x\" \"X\") } } } }";
-        let plan = crate::sparql_plan::plan_query_refined(query, &schema).unwrap();
+        let plan = crate::sparql_plan::plan_query_refined(
+            query,
+            &schema,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         assert_eq!(plan.refinement.as_str(), "used_alone", "{plan}");
         let printed = plan.to_string();
         assert!(
@@ -1033,7 +1043,12 @@ pub(crate) mod tests {
              SELECT ?s ?lbl WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL {{ VALUES (?k ?lbl) {{ (<{gsa}> \"gsa\") }} }} }}"
         );
-        let mut plan = crate::sparql_refine::naive_plan_for(&text, &schema).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan_for(
+            &text,
+            &schema,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rules = rules(&schema);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let leftjoin = plan.find("leftjoin")[0];

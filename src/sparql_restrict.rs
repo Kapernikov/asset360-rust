@@ -1330,7 +1330,11 @@ mod tests {
 
     fn refined(query: &str) -> Plan {
         let schema = test_schema_view();
-        let mut plan = crate::sparql_refine::naive_plan_of(&format!("{PREFIX}{query}")).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan_of(
+            &format!("{PREFIX}{query}"),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}\n{plan}"));
@@ -1424,7 +1428,7 @@ mod tests {
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let schema = test_schema_view();
-        let dataset = DatasetSpec::default()
+        let dataset = DatasetSpec::asserted()
             .with_data_graph(A, TypeRegime::Asserted)
             .with_data_graph(I, TypeRegime::IsA);
         let query = format!(
@@ -1433,7 +1437,7 @@ mod tests {
              GRAPH <{A}> {{ ?s asset360:name ?nm }} }}"
         );
         let parsed = crate::sparql_scoper::parse_query_for(&query, &schema).unwrap();
-        let mut plan = crate::sparql_refine::naive_plan_in(&parsed, &dataset).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan(&parsed, &dataset).unwrap();
         let rules = tier_one_rules(&schema, &dataset);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}\n{plan}"));
@@ -1864,7 +1868,12 @@ mod tests {
             outcome_of(&query, &schema, crate::sparql_dataset::default_dataset()),
             Outcome::Statement
         );
-        let plan = crate::sparql_plan::plan_query_refined(&query, &schema).unwrap();
+        let plan = crate::sparql_plan::plan_query_refined(
+            &query,
+            &schema,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rendered = format!("{plan}");
         assert!(
             rendered.contains("filter    hasCoveredSection.hasSequenceNumber = '1'"),

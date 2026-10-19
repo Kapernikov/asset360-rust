@@ -1155,7 +1155,7 @@ classes:
         let sv = test_schema_view();
         let instances = signal_instances(&sv);
         let refs: Vec<&LinkMLInstance> = instances.iter().collect();
-        let dataset = DatasetSpec::default()
+        let dataset = DatasetSpec::asserted()
             .with_data_graph(A, TypeRegime::Asserted)
             .with_data_graph(I, TypeRegime::IsA)
             .with_default_graph(A)
@@ -1195,7 +1195,7 @@ classes:
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
         assert_eq!(parsed["results"]["bindings"].as_array().unwrap().len(), 2);
         // An invalid dataset is refused before anything is loaded.
-        let invalid = DatasetSpec::default().with_default_graph(A);
+        let invalid = DatasetSpec::asserted().with_default_graph(A);
         assert!(matches!(
             sparql_execute(
                 "SELECT ?s WHERE { ?s ?p ?o }",
@@ -1934,7 +1934,8 @@ classes:
                 let triple = format!("asset360:{slot} {constant}");
                 let query =
                     format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; {triple} }}");
-                let plan = sparql_scope(&query, &sv).expect("scopes");
+                let plan = sparql_scope(&query, &sv, crate::sparql_dataset::default_dataset())
+                    .expect("scopes");
 
                 // An inexact plan has already said it does not describe the
                 // query; nothing is claimed and nothing is owed.
@@ -1996,6 +1997,7 @@ classes:
             let plan = sparql_scope(
                 &format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; {triple} }}"),
                 &sv,
+                crate::sparql_dataset::default_dataset(),
             )
             .expect("scopes");
             assert_eq!(
@@ -2238,7 +2240,7 @@ classes:
             answer["results"]["bindings"].as_array().unwrap().len()
         };
 
-        let mut plan = crate::sparql_plan::plan_query_refined_in(
+        let mut plan = crate::sparql_plan::plan_query_refined(
             &query,
             &sv,
             &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),
@@ -2260,7 +2262,7 @@ classes:
         assert_eq!(finish_of(&plan), 1, "the schema graph names the class");
         // The same plan, made for a dataset that serves no schema graph: the
         // graph is not there for the finish to read.
-        plan.dataset = DatasetSpec::default();
+        plan.dataset = DatasetSpec::asserted();
         assert_eq!(finish_of(&plan), 0, "no schema graph, no class");
     }
 

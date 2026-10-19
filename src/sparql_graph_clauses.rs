@@ -330,7 +330,7 @@ mod tests {
     fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
         let dataset = match schema_graph_iri {
             Some(iri) => crate::sparql_dataset::schema_dataset(iri),
-            None => crate::sparql_dataset::DatasetSpec::default(),
+            None => crate::sparql_dataset::DatasetSpec::asserted(),
         };
         super::reads_only_the_schema_graph(query, &dataset, &test_schema_view())
     }
@@ -493,7 +493,7 @@ mod tests {
     fn a_graph_variable_is_schema_only_until_a_data_graph_is_served() {
         use linkml_runtime::schema_rdf::TypeRegime;
         let schema_view = test_schema_view();
-        let only_schema = crate::sparql_dataset::DatasetSpec::default()
+        let only_schema = crate::sparql_dataset::DatasetSpec::asserted()
             .with_schema_graph(SCHEMA_GRAPH, TypeRegime::Asserted);
         let with_data = only_schema
             .clone()

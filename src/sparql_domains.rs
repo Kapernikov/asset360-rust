@@ -404,7 +404,9 @@ mod tests {
             "{qualified}"
         );
 
-        let plan = crate::sparql_refine::naive_plan(&query).unwrap();
+        let plan =
+            crate::sparql_refine::naive_plan(&query, crate::sparql_dataset::default_dataset())
+                .unwrap();
         let domains: Vec<usize> = plan
             .barriers()
             .into_iter()

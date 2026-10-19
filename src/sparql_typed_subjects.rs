@@ -501,7 +501,7 @@ classes:
     fn refined(sv: &SchemaView, dataset: &DatasetSpec, spelling: &str) -> (bool, String) {
         let query = format!("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {spelling}");
         let parsed = crate::sparql_scoper::parse_query_for(&query, sv).expect("parses");
-        let mut plan = crate::sparql_refine::naive_plan_in(&parsed, dataset).expect("plans");
+        let mut plan = crate::sparql_refine::naive_plan(&parsed, dataset).expect("plans");
         // The graphs the query can see, as production hands the rules.
         let visible = dataset.seen_through(crate::sparql_scoper::dataset_of(&parsed));
         let rule = MostSpecificTypeIsTheDirectType::new(sv, &visible);

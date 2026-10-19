@@ -27,10 +27,10 @@ use linkml_runtime::schema_rdf::{TypePartition, TypeRegime};
 /// Which named graphs the endpoint serves and what the default graph means.
 ///
 /// Built with the `with_*` methods, checked with [`Self::validate`] at every
-/// entry point that takes one. [`Default`] is the dataset every endpoint was
-/// before graphs had regimes: an asserted default graph, no named graphs, no
-/// schema graph.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// entry point that takes one. [`Self::asserted`] is the dataset every endpoint
+/// was before graphs had regimes: an asserted default graph, no named graphs,
+/// no schema graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatasetSpec {
     default_regime: TypeRegime,
     data_graphs: BTreeMap<String, TypeRegime>,
@@ -88,8 +88,21 @@ impl DatasetSpec {
     pub fn new(default_regime: TypeRegime) -> Self {
         Self {
             default_regime,
-            ..Self::default()
+            data_graphs: BTreeMap::new(),
+            default_graph: None,
+            partition_graphs: BTreeMap::new(),
+            schema_graphs: BTreeMap::new(),
+            conflicts: Vec::new(),
         }
+    }
+
+    /// The dataset every endpoint was before graphs had regimes: an asserted
+    /// default graph and no named graph. Stated by name where a caller wants
+    /// it, because there is deliberately no [`Default`]: a dataset is
+    /// something a deployment decides, and one that is defaulted by accident
+    /// plans a different endpoint's query.
+    pub fn asserted() -> Self {
+        Self::new(TypeRegime::Asserted)
     }
 
     /// Serve the golden records as a named graph under `regime`.
@@ -442,17 +455,19 @@ impl<'a> QueryGraphs<'a> {
     }
 }
 
-/// The default dataset, borrowed for as long as a test's rules need it.
+/// The dataset a test that is not about datasets plans under, stated
+/// explicitly rather than defaulted: an asserted default graph and no named
+/// graph. Borrowed for as long as a test's rules need it.
 #[cfg(test)]
 pub(crate) fn default_dataset() -> &'static DatasetSpec {
     static DEFAULT: std::sync::OnceLock<DatasetSpec> = std::sync::OnceLock::new();
-    DEFAULT.get_or_init(DatasetSpec::default)
+    DEFAULT.get_or_init(|| DatasetSpec::new(TypeRegime::Asserted))
 }
 
 /// An asserted dataset that serves one schema graph, `iri`.
 #[cfg(test)]
 pub(crate) fn schema_dataset(iri: &str) -> DatasetSpec {
-    DatasetSpec::default().with_schema_graph(iri, TypeRegime::Asserted)
+    DatasetSpec::new(TypeRegime::Asserted).with_schema_graph(iri, TypeRegime::Asserted)
 }
 
 #[cfg(test)]
@@ -474,7 +489,7 @@ mod tests {
 
     #[test]
     fn the_default_dataset_is_the_asserted_one_with_no_graphs() {
-        let dataset = DatasetSpec::default();
+        let dataset = DatasetSpec::asserted();
         assert_eq!(dataset.validate(), Ok(()));
         assert_eq!(dataset.default_regime(), TypeRegime::Asserted);
         assert!(!dataset.has_schema_graph());
@@ -558,7 +573,7 @@ mod tests {
     fn a_graph_variable_reads_the_widest_regime_served() {
         assert_eq!(served().widest_data_regime(), TypeRegime::IsAAndMixins);
         assert_eq!(
-            DatasetSpec::default().widest_data_regime(),
+            DatasetSpec::asserted().widest_data_regime(),
             TypeRegime::Asserted
         );
     }

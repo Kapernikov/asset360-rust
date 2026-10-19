@@ -1032,7 +1032,9 @@ mod tests {
             "SELECT ?s ?d WHERE { ?s a asset360:Signal . BIND(?s AS ?d) }",
         ] {
             let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
-            let plan = crate::sparql_refine::naive_plan(&parsed).unwrap();
+            let plan =
+                crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
+                    .unwrap();
             let translated =
                 plan_to_query(&plan, &schema).unwrap_or_else(|| panic!("{query}\n{plan}"));
             // Structurally the same up to how a basic graph pattern is
@@ -1188,7 +1190,7 @@ pub(crate) mod equivalence {
             schema,
             oracle,
             rules,
-            &crate::sparql_dataset::DatasetSpec::default(),
+            &crate::sparql_dataset::DatasetSpec::asserted(),
         )
     }
 
@@ -1205,7 +1207,7 @@ pub(crate) mod equivalence {
         let text = format!("{PREFIX}{query}");
         let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
         let expected = answers(oracle, &parsed);
-        let mut plan = crate::sparql_refine::naive_plan_in(&parsed, dataset)
+        let mut plan = crate::sparql_refine::naive_plan(&parsed, dataset)
             .unwrap_or_else(|e| panic!("{query}: {e}"));
         let naive = plan_to_query(&plan, schema).unwrap_or_else(|| panic!("{query}\n{plan}"));
         assert_eq!(answers(oracle, &naive), expected, "naive: {query}\n{plan}");
@@ -1658,7 +1660,7 @@ pub(crate) mod equivalence {
                 let text = format!("{PREFIX}{query}");
                 let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
                 let expected = answers(oracle, &parsed);
-                let mut plan = crate::sparql_refine::naive_plan_in(&parsed, dataset).unwrap();
+                let mut plan = crate::sparql_refine::naive_plan(&parsed, dataset).unwrap();
                 for rule in &borrowed {
                     rule.apply(&mut plan);
                 }
