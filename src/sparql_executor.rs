@@ -33,7 +33,8 @@ use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 
 use linkml_runtime::LinkMLInstance;
-use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
+use linkml_runtime::rdf_export::{RdfOutputFormat, RdfStreamWriter};
+use linkml_runtime::turtle::WriteOptions;
 use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_dataset::DatasetSpec;
@@ -396,6 +397,23 @@ fn refuse_a_full_backlog(limits: &ExecuteLimits) -> Result<(), ExecuteError> {
     Ok(())
 }
 
+/// The buffer the record stream writes into, shared with the loop that reads
+/// each record's triples back out of it.
+#[cfg(feature = "sparql-endpoint")]
+struct SharedBuffer(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+#[cfg(feature = "sparql-endpoint")]
+impl std::io::Write for SharedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Load `instances` flat under the query's regime and evaluate `parsed`
 /// (parsed and canonicalised) over them.
 ///
@@ -471,16 +489,16 @@ fn evaluate_over_records(
     // instance was serialised to Turtle and handed to `load_from_reader` on
     // its own: one store transaction per record, which measured ~2.4 ms per
     // record on DEV -- a fixed floor under every query the engine answers
-    // (#494, pepibru GitLab). Now each record is still *parsed* on its own,
-    // and a chunk of `CHUNK` records is inserted in one transaction.
+    // (#494, pepibru GitLab). Now a chunk of `CHUNK` records is inserted in
+    // one transaction.
     //
-    // Parsed on its own, and not as one concatenated document: a record's
-    // inlined structures are blank nodes, and a blank-node label is scoped to
-    // the document it appears in. Concatenated, two records' `_:b0` became
-    // one node, and a query over an inlined structure answered a cross
-    // product of every record in the chunk (found by the consolidator's
-    // oracle over `sourceMetaInfo`). Each parse renames its blank nodes
-    // apart, which is what loading the records one by one always did.
+    // The records are written as N-Triples through **one** stream writer, so
+    // every blank node of the load has a label of its own (a record's inlined
+    // structures are blank nodes, and two records sharing `_:b0` made a query
+    // over an inlined structure answer a cross product of every record in the
+    // chunk, found by the consolidator's oracle over `sourceMetaInfo`). Each
+    // record's triples are still read back on their own, which keeps a bad
+    // record attributable.
     //
     // And the triple ceiling was checked only once everything was in. The
     // all-CivilEngineeringAssets query spent ~45 s loading 1.76 M triples in
@@ -493,29 +511,34 @@ fn evaluate_over_records(
     // a bounded amount of loading. At the tens of triples a record makes, 64
     // records is a few hundred triples of overshoot.
     const CHUNK: usize = 64;
+    let written = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+    let mut stream = RdfStreamWriter::new(
+        SharedBuffer(written.clone()),
+        RdfOutputFormat::NTriples,
+        schema_view,
+        &primary_schema,
+        &converter,
+        &WriteOptions::flat(regime),
+    )
+    .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
     let mut quads: Vec<oxigraph::model::Quad> = Vec::new();
     for batch in instances.chunks(CHUNK) {
         quads.clear();
         for instance in batch {
             let object_uri = instance.node_id().to_string();
-            let turtle_str = turtle_to_string(
-                instance,
-                schema_view,
-                &primary_schema,
-                &converter,
-                &WriteOptions::flat(regime),
-            )
-            .map_err(|e| ExecuteError::ConversionError {
-                object_uri: object_uri.clone(),
-                message: e.to_string(),
-            })?;
-            for quad in oxigraph::io::RdfParser::from_format(RdfFormat::Turtle)
-                .rename_blank_nodes()
-                .for_slice(turtle_str.as_bytes())
+            stream
+                .write(instance)
+                .map_err(|e| ExecuteError::ConversionError {
+                    object_uri: object_uri.clone(),
+                    message: e.to_string(),
+                })?;
+            let triples = std::mem::take(&mut *written.borrow_mut());
+            for quad in
+                oxigraph::io::RdfParser::from_format(RdfFormat::NTriples).for_slice(&triples)
             {
                 let mut quad = quad.map_err(|e| ExecuteError::ConversionError {
                     object_uri: object_uri.clone(),
-                    message: format!("Failed to load turtle into store: {e}"),
+                    message: format!("Failed to load the record's triples into the store: {e}"),
                 })?;
                 quad.graph_name = records_graph.clone();
                 quads.push(quad);
@@ -2443,6 +2466,7 @@ classes:
             .unwrap_or_else(|err| panic!("{forced}: {err}"));
 
             // The same query against a store holding instance data only.
+            use linkml_runtime::turtle::turtle_to_string;
             let store = Store::new().unwrap();
             let conv = sv.converter();
             let primary = sv.primary_schema().unwrap();
