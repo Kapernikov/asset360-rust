@@ -120,6 +120,7 @@ use spargebra::Query;
 use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
 use spargebra::term::{GroundTerm, NamedNodePattern, Variable};
 
+use crate::sparql_dataset::DatasetSpec;
 use crate::sparql_refine::{NodeId, Plan, PlanOp};
 
 /// A relation, as the pair a [`PlanOp::Values`] holds: its columns, and its
@@ -177,15 +178,18 @@ pub trait Materialisation {
 
 /// Whether this subplan depends on nothing outside the schema graph.
 ///
-/// `schema_graph_iri` is the graph the active datamodel serves its schema in —
-/// a parameter and never a constant, see [`crate::sparql_schema_graph`].
+/// `dataset` says which graphs are the schema's -- a parameter and never a
+/// constant, see [`crate::sparql_schema_graph`]. Data-graph `GRAPH` nodes are
+/// not in a plan at all (the naive plan dissolves them into each `Match`'s
+/// regime), so a `Graph` node here is the schema graph, a variable, or a graph
+/// the endpoint does not serve.
 ///
 /// The walk carries one bit of context, *which graph a read would read from*,
 /// because that is the only thing a `GRAPH` node changes about the nodes below
 /// it. Everything that is not a read inherits the answer from its inputs, which
 /// is why a node kind added later needs no entry here unless it reads.
-pub fn schema_only(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
-    fn walk(plan: &Plan, node: NodeId, in_schema_graph: bool, iri: &str) -> bool {
+pub fn schema_only(plan: &Plan, node: NodeId, dataset: &DatasetSpec) -> bool {
+    fn walk(plan: &Plan, node: NodeId, in_schema_graph: bool, dataset: &DatasetSpec) -> bool {
         match &plan.nodes[node].op {
             // A read: schema-only exactly when it reads the schema graph.
             PlanOp::Match { .. } | PlanOp::Path { .. } => in_schema_graph,
@@ -193,7 +197,7 @@ pub fn schema_only(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
             // the context rather than inheriting it. A nested one naming
             // something else takes its subtree back out of the schema.
             PlanOp::Graph { input, name } => {
-                walk(plan, *input, names_the_schema_graph(name, iri), iri)
+                walk(plan, *input, names_a_schema_graph(name, dataset), dataset)
             }
             // Somebody else's dataset.
             PlanOp::Service { .. } => false,
@@ -205,10 +209,10 @@ pub fn schema_only(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
             other => other
                 .inputs()
                 .iter()
-                .all(|input| walk(plan, *input, in_schema_graph, iri)),
+                .all(|input| walk(plan, *input, in_schema_graph, dataset)),
         }
     }
-    walk(plan, node, false, schema_graph_iri)
+    walk(plan, node, false, dataset)
 }
 
 /// Whether every variable the subplan *uses* is one it also binds.
@@ -326,15 +330,22 @@ pub fn replace_subtree(plan: &mut Plan, root: NodeId, op: PlanOp) {
 /// The name is `NamedNodePattern::to_string()` — `<iri>` for a constant, `?g`
 /// for a variable (see the naive plan's `Graph` arm).
 ///
-/// **A variable counts**, and that rests on a dataset invariant rather than on
-/// optimism: this endpoint serves exactly one named graph, and the instances
-/// live in the default graph (see [`crate::sparql_schema_graph`]). So
-/// `GRAPH ?g { … }` can only bind `?g` to the schema graph. The probe evaluates
-/// against a store shaped the same way — the schema quads in that one named
-/// graph, the default graph empty — so `?g` binds there exactly as it would in
-/// the engine, and the invariant is executed rather than assumed.
-fn names_the_schema_graph(name: &str, schema_graph_iri: &str) -> bool {
-    name.starts_with('?') || name == format!("<{schema_graph_iri}>")
+/// **A variable counts only while the dataset serves no data graph**, and
+/// that rests on a dataset invariant rather than on optimism: with no named
+/// graph holding records, the named graphs are the schema graphs and the
+/// instances live in the default graph, which `GRAPH` never reaches (see
+/// [`crate::sparql_schema_graph`]). So `GRAPH ?g { … }` can only bind `?g` to a
+/// schema graph, and the probe's store is shaped the same way. Once a data
+/// graph is served, `?g` ranges over it too, a probe over the schema store
+/// alone would answer for a fraction of the graphs, and the variable no longer
+/// counts ([`DatasetSpec::graph_variable_is_schema_only`]).
+fn names_a_schema_graph(name: &str, dataset: &DatasetSpec) -> bool {
+    if name.starts_with('?') {
+        return dataset.has_schema_graph() && dataset.graph_variable_is_schema_only();
+    }
+    name.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|iri| dataset.schema_regime(iri).is_some())
 }
 
 /// **Whether this subplan is a region `pass` can evaluate.**
@@ -763,15 +774,15 @@ fn graph_name(name: &str) -> Option<NamedNodePattern> {
 /// nothing; a plan that does asks once, however many subplans it has.
 pub struct SchemaGraphMaterialisation<'a> {
     schema_view: &'a SchemaView,
-    schema_graph_iri: &'a str,
+    dataset: &'a DatasetSpec,
     store: OnceCell<Option<Store>>,
 }
 
 impl<'a> SchemaGraphMaterialisation<'a> {
-    pub fn new(schema_view: &'a SchemaView, schema_graph_iri: &'a str) -> Self {
+    pub fn new(schema_view: &'a SchemaView, dataset: &'a DatasetSpec) -> Self {
         Self {
             schema_view,
-            schema_graph_iri,
+            dataset,
             store: OnceCell::new(),
         }
     }
@@ -783,28 +794,34 @@ impl Materialisation for SchemaGraphMaterialisation<'_> {
     }
 
     fn qualifies(&self, plan: &Plan, node: NodeId) -> bool {
-        schema_only(plan, node, self.schema_graph_iri)
+        schema_only(plan, node, self.dataset)
     }
 
     fn dataset(&self) -> Option<&Store> {
         self.store
             .get_or_init(|| {
-                let graph = crate::sparql_schema_graph::SchemaGraph::build(
-                    self.schema_view,
-                    self.schema_graph_iri,
-                )
-                .ok()?;
+                // Every schema graph the dataset serves, each in its own
+                // named graph under its own regime: the shape the engine leg
+                // loads, so a probe answers what the engine would answer.
                 let store = Store::new().ok()?;
-                let name = GraphName::NamedNode(NamedNode::new(self.schema_graph_iri).ok()?);
-                for quad in graph.quads {
-                    store
-                        .insert(&Quad::new(
-                            quad.subject,
-                            quad.predicate,
-                            quad.object,
-                            name.clone(),
-                        ))
-                        .ok()?;
+                for (iri, regime) in self.dataset.schema_graphs() {
+                    let graph = crate::sparql_schema_graph::SchemaGraph::build(
+                        self.schema_view,
+                        iri,
+                        regime,
+                    )
+                    .ok()?;
+                    let name = GraphName::NamedNode(NamedNode::new(iri).ok()?);
+                    for quad in graph.quads {
+                        store
+                            .insert(&Quad::new(
+                                quad.subject,
+                                quad.predicate,
+                                quad.object,
+                                name.clone(),
+                            ))
+                            .ok()?;
+                    }
                 }
                 Some(store)
             })
@@ -952,7 +969,7 @@ mod tests {
     #[test]
     fn without_a_schema_graph_nothing_is_evaluated() {
         let schema_view = asset360_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined_with_schema_graph(
+        let plan = crate::sparql_plan::plan_query_refined_in(
             &query(&format!(
                 "SELECT ?s ?code WHERE {{ \
                  ?s a asset360:Signal ; asset360:signalType ?t . \
@@ -960,7 +977,7 @@ mod tests {
                  FILTER(CONTAINS(?code, \"GS\")) }}"
             )),
             &schema_view,
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("the query scopes");
         assert!(
@@ -1294,9 +1311,12 @@ mod tests {
     /// `names_the_schema_graph` has to be narrowed with it.
     #[test]
     fn the_endpoint_serves_exactly_one_named_graph() {
-        let graph =
-            crate::sparql_schema_graph::SchemaGraph::build(&asset360_schema_view(), SCHEMA_GRAPH)
-                .unwrap();
+        let graph = crate::sparql_schema_graph::SchemaGraph::build(
+            &asset360_schema_view(),
+            SCHEMA_GRAPH,
+            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+        )
+        .unwrap();
         let names: std::collections::BTreeSet<String> = graph
             .quads
             .iter()
@@ -1358,10 +1378,10 @@ mod tests {
     /// The lowered execution plan, which is what the endpoint renders.
     fn plan_for(body: &str) -> String {
         let schema_view = asset360_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined_with_schema_graph(
+        let plan = crate::sparql_plan::plan_query_refined_in(
             &query(body),
             &schema_view,
-            Some(SCHEMA_GRAPH),
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
         )
         .expect("the query scopes");
         format!("{plan}")
@@ -1373,7 +1393,7 @@ mod tests {
         crate::sparql_plan::refined_plan_text(
             &query(body),
             &asset360_schema_view(),
-            Some(SCHEMA_GRAPH),
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
         )
         .expect("the query refines")
     }

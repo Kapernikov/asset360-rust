@@ -25,6 +25,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use linkml_runtime::schema_rdf::TypeRegime;
+
 use linkml_schemaview::schemaview::SchemaView;
 
 use spargebra::algebra::{AggregateExpression, AggregateFunction};
@@ -615,6 +617,28 @@ impl Plan {
         // An identity beside a slot binding of the same variable (a reference
         // join) is still an identity: on a join both hold the same IRI.
         Some(class)
+    }
+
+    /// The type regime the scans that make `var` the identity of `class_uri`
+    /// at `node` read under -- the one regime they all agree on, or `None`
+    /// when they disagree (or there is no such scan). A restriction derived
+    /// from that identity carries it, so it never changes which graph a star
+    /// reads.
+    pub fn identity_regime(&self, node: NodeId, var: &str, class_uri: &str) -> Option<TypeRegime> {
+        let mut regimes =
+            self.producers_of(node, var)
+                .into_iter()
+                .filter_map(|producer| match &self.nodes[producer].op {
+                    PlanOp::Scan {
+                        star_var,
+                        class_uri: scanned,
+                        regime,
+                        ..
+                    } if star_var == var && scanned == class_uri => Some(*regime),
+                    _ => None,
+                });
+        let regime = regimes.next()?;
+        regimes.all(|other| other == regime).then_some(regime)
     }
 
     /// The outer variables a subtree reads: empty everywhere but the right

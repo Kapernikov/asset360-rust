@@ -8,7 +8,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = Path::new(&args[1]);
     let query = std::fs::read_to_string(&args[2]).unwrap();
-    let graph = args.get(3).map(|s| s.as_str());
+    let mut dataset = asset360_rust::sparql_dataset::DatasetSpec::default();
+    if let Some(iri) = args.get(3) {
+        dataset = dataset.with_schema_graph(
+            iri.as_str(),
+            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+        );
+    }
     let mut sv = SchemaView::new();
     for name in [
         "types.yaml",
@@ -29,7 +35,7 @@ fn main() {
         sv.add_schema(schema).unwrap();
     }
     let t = Instant::now();
-    let plan = asset360_rust::sparql_plan::plan_query_refined_with_schema_graph(&query, &sv, graph);
+    let plan = asset360_rust::sparql_plan::plan_query_refined_in(&query, &sv, &dataset);
     let elapsed = t.elapsed();
     match plan {
         Ok(_) => println!("planned in {elapsed:?}"),

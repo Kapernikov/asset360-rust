@@ -71,6 +71,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use crate::sparql_dataset::{DatasetSpec, GraphReads, QueryGraphs};
 use linkml_runtime::schema_rdf::{TypeRegime, type_family};
 use linkml_schemaview::schemaview::SchemaView;
 
@@ -368,9 +369,15 @@ pub enum Expr {
     /// a rule places at a scope root with the semi-join proof and what op
     /// 3b carries down to the scan, where the fold reads it as the star's
     /// type. Written back for the oracle as `EXISTS { ?var a <class> }`.
+    ///
+    /// `regime` is the type regime of the match or scan the restriction was
+    /// derived from: `?var` is a record whose `rdf:type`s *under that regime*
+    /// include `class_uri`. The fold reads it as the regime of the scan it
+    /// makes, so a restriction never changes which graph a star reads.
     InClass {
         var: String,
         class_uri: String,
+        regime: TypeRegime,
     },
     /// An expression carrying a graph pattern -- `EXISTS`, `NOT EXISTS` --
     /// kept as the text the query wrote.
@@ -1417,17 +1424,19 @@ impl Expr {
             }
             // `?v` is the identity of a record of the class: exactly the
             // records with that type.
-            Self::InClass { var, class_uri } => Expression::Exists(Box::new(GraphPattern::Bgp {
-                patterns: vec![TriplePattern {
-                    subject: TermPattern::Variable(Variable::new_unchecked(var.clone())),
-                    predicate: NamedNodePattern::NamedNode(
-                        spargebra::term::NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?,
-                    ),
-                    object: TermPattern::NamedNode(
-                        spargebra::term::NamedNode::new(class_uri.clone()).ok()?,
-                    ),
-                }],
-            })),
+            Self::InClass { var, class_uri, .. } => {
+                Expression::Exists(Box::new(GraphPattern::Bgp {
+                    patterns: vec![TriplePattern {
+                        subject: TermPattern::Variable(Variable::new_unchecked(var.clone())),
+                        predicate: NamedNodePattern::NamedNode(
+                            spargebra::term::NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?,
+                        ),
+                        object: TermPattern::NamedNode(
+                            spargebra::term::NamedNode::new(class_uri.clone()).ok()?,
+                        ),
+                    }],
+                }))
+            }
             Self::Slot { .. } => return None,
             Self::Opaque(_) => return None,
         })
@@ -1708,7 +1717,18 @@ impl fmt::Display for Expr {
             Self::Or(parts) => write!(f, "({})", join_exprs(parts, " || ")),
             Self::Not(inner) => write!(f, "!{inner}"),
             Self::Function { name, args } => write!(f, "{name}({})", join_exprs(args, ", ")),
-            Self::InClass { var, class_uri } => write!(f, "?{var} ∈ {}", shorten(class_uri)),
+            Self::InClass {
+                var,
+                class_uri,
+                regime,
+            } => write!(
+                f,
+                "?{var} ∈ {}{}",
+                shorten(class_uri),
+                regime_label(*regime)
+                    .map(|label| format!(" [{label}]"))
+                    .unwrap_or_default()
+            ),
             Self::Opaque(text) => f.write_str(text),
         }
     }
@@ -3960,8 +3980,17 @@ pub fn naive_plan_of(query_str: &str) -> Result<Plan, RefineError> {
 
 /// Parse a query with the schema-seeded parser and build its naive plan.
 pub fn naive_plan_for(query_str: &str, schema_view: &SchemaView) -> Result<Plan, RefineError> {
+    naive_plan_for_in(query_str, schema_view, &DatasetSpec::default())
+}
+
+/// [`naive_plan_for`] over `dataset` (see [`naive_plan_in`]).
+pub fn naive_plan_for_in(
+    query_str: &str,
+    schema_view: &SchemaView,
+    dataset: &DatasetSpec,
+) -> Result<Plan, RefineError> {
     let parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
-    naive_plan(&parsed)
+    naive_plan_in(&parsed, dataset)
 }
 
 /// The query, faithfully, with every node engine-executed and nothing folded.
@@ -3988,20 +4017,31 @@ pub fn naive_plan_for(query_str: &str, schema_view: &SchemaView) -> Result<Plan,
 /// broken assumption into an error instead of a plan that answers a different
 /// question.
 pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
-    naive_plan_in(query, DEFAULT_TYPE_REGIME)
+    naive_plan_in(query, &DatasetSpec::default())
 }
 
-/// The regime a plan is read under when its caller names none: what every
-/// dataset was before regimes existed. The plan builder and the scoper both
-/// start here, so a decision the scoper takes about a star's types is taken
-/// under the regime the plan's matches will carry.
-pub(crate) const DEFAULT_TYPE_REGIME: TypeRegime = TypeRegime::Asserted;
-
-/// [`naive_plan`] over a dataset whose data graph has type regime
-/// `default_regime`: every triple outside a `GRAPH` is matched against it.
-/// The caller's dataset decides the regime; [`naive_plan`] is the asserted
-/// one, what every dataset was before regimes existed.
-pub fn naive_plan_in(query: &Query, default_regime: TypeRegime) -> Result<Plan, RefineError> {
+/// [`naive_plan`] over `dataset`: each triple is matched under the type
+/// regime of the graph it reads.
+///
+/// * outside any `GRAPH`: the dataset's default regime, or -- when the query
+///   writes a `FROM` -- the regime of the union of the graphs it names, and
+///   none when that union is no data (a schema graph, an unknown IRI);
+/// * inside `GRAPH <data graph>`: that graph's regime, and the `GRAPH` node is
+///   not in the plan -- it said which graph the patterns read, which each
+///   `Match` now says itself;
+/// * inside any other `GRAPH` (the schema graph, a variable, a graph the
+///   endpoint does not serve): no regime, under a [`PlanOp::Graph`] that
+///   stays, so no data rule folds what is not the data graph.
+///
+/// The caller's dataset decides all of it; [`naive_plan`] is the default
+/// one -- asserted, no named graphs -- what every dataset was before graphs
+/// had regimes.
+pub fn naive_plan_in(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
+    let graphs = QueryGraphs::new(dataset, crate::sparql_scoper::dataset_of(query));
+    let default_regime = match graphs.default_reads() {
+        GraphReads::Data(regime) => Some(regime),
+        GraphReads::Schema | GraphReads::Other => None,
+    };
     let obligations = crate::sparql_plan::obligations_of(query)?;
     let form = QueryForm::of(query);
     let pattern = match query {
@@ -4030,8 +4070,8 @@ pub fn naive_plan_in(query: &Query, default_regime: TypeRegime) -> Result<Plan, 
         next_triple: 0,
         next_modifier: triple_count,
         domains_opened: 0,
-        default_regime,
-        in_graph: false,
+        graphs,
+        regime: default_regime,
     };
     let mut root = builder.pattern(pattern, true);
 
@@ -4127,21 +4167,19 @@ struct Builder<'o> {
     /// Naming domains opened so far: each off-spine sub-`SELECT` gets the
     /// next one, in walk order. The scoper counts the same way.
     domains_opened: usize,
-    /// The type regime of the dataset's data graph: the regime of every
-    /// triple matched outside a `GRAPH`. The caller's dataset decides it;
-    /// a builder starts with [`TypeRegime::Asserted`], what every dataset
-    /// was before regimes existed.
-    default_regime: TypeRegime,
-    /// Whether the walk is inside a `GRAPH`: a triple there is not matched
-    /// against the data graph, so it carries no regime.
-    in_graph: bool,
+    /// The dataset, and the `FROM` clause the query put over it.
+    graphs: QueryGraphs<'o>,
+    /// The regime a triple matched here carries: that of the graph the walk
+    /// is in. `None` where the graph is not a data graph (the schema graph,
+    /// a variable, a graph the endpoint does not serve), which no data rule
+    /// may fold.
+    regime: Option<TypeRegime>,
 }
 
 impl Builder<'_> {
-    /// The regime a triple matched here carries: the default regime outside
-    /// any `GRAPH`, `None` inside one.
+    /// The regime a triple matched here carries.
     fn match_regime(&self) -> Option<TypeRegime> {
-        (!self.in_graph).then_some(self.default_regime)
+        self.regime
     }
 
     fn push(
@@ -4518,9 +4556,26 @@ impl Builder<'_> {
                 self.push(PlanOp::Project { input, vars }, Vec::new(), bound)
             }
             GraphPattern::Graph { name, inner } => {
-                let outer = std::mem::replace(&mut self.in_graph, true);
+                let reads = match name {
+                    NamedNodePattern::NamedNode(graph) => self.graphs.graph_reads(graph.as_str()),
+                    // May bind a data graph or the schema graph; which one is
+                    // the engine's to say.
+                    NamedNodePattern::Variable(_) => GraphReads::Other,
+                };
+                let regime = match reads {
+                    GraphReads::Data(regime) => Some(regime),
+                    GraphReads::Schema | GraphReads::Other => None,
+                };
+                let outer = std::mem::replace(&mut self.regime, regime);
                 let input = self.pattern(inner, on_spine);
-                self.in_graph = outer;
+                self.regime = outer;
+                // A data graph holds the records every `Match` reads, so the
+                // `GRAPH` says nothing the matches do not: each carries the
+                // graph's regime. No node for it, hence none of the rules
+                // that treat a `Graph` as opaque has anything to decline.
+                if matches!(reads, GraphReads::Data(_)) {
+                    return input;
+                }
                 let vars = self.vars[input].clone();
                 self.push(
                     PlanOp::Graph {
@@ -5316,6 +5371,153 @@ mod tests {
         );
     }
 
+    /// The dataset decides which graph each pattern reads: `FROM`, a `GRAPH`
+    /// naming a data graph (which dissolves -- each `Match` says its graph),
+    /// and `GRAPH ?g` / the schema graph (which stay, reading no regime).
+    /// Mixed per pattern, the type of one graph and the slot of another are
+    /// read under their own regimes, so the fold keeps to one regime.
+    #[test]
+    fn the_dataset_decides_each_patterns_regime() {
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        const S: &str = "urn:graph:schema";
+        let sv = crate::sparql_scoper::tests::test_schema_view_plus(
+            "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
+        );
+        let dataset = DatasetSpec::new(TypeRegime::Asserted)
+            .with_data_graph(A, TypeRegime::Asserted)
+            .with_data_graph(I, TypeRegime::IsA)
+            .with_data_graph("urn:graph:mixins", TypeRegime::IsAAndMixins)
+            .with_schema_graph(S, TypeRegime::IsA);
+        let plan = |query: &str| {
+            let parsed =
+                crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
+            naive_plan_in(&parsed, &dataset).unwrap()
+        };
+        // `(has a Graph node above it, regime)` per match, in node order.
+        let matches = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
+            plan.nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    PlanOp::Match { pattern, regime } => Some((triple_text(pattern), *regime)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let regimes = |plan: &Plan| -> Vec<Option<TypeRegime>> {
+            matches(plan)
+                .into_iter()
+                .map(|(_, regime)| regime)
+                .collect()
+        };
+        let graph_nodes = |plan: &Plan| {
+            plan.nodes
+                .iter()
+                .filter(|node| matches!(node.op, PlanOp::Graph { .. }))
+                .count()
+        };
+
+        // No `FROM`: the dataset's default regime. `FROM <A>` / `FROM <I>`:
+        // that graph's. Both: the one regime whose partitions they union to.
+        let body = "{ ?s a asset360:Signal ; asset360:name ?n }";
+        assert_eq!(
+            regimes(&plan(&format!("SELECT ?s WHERE {body}"))),
+            vec![Some(TypeRegime::Asserted); 2]
+        );
+        assert_eq!(
+            regimes(&plan(&format!("SELECT ?s FROM <{A}> WHERE {body}"))),
+            vec![Some(TypeRegime::Asserted); 2]
+        );
+        assert_eq!(
+            regimes(&plan(&format!("SELECT ?s FROM <{I}> WHERE {body}"))),
+            vec![Some(TypeRegime::IsA); 2]
+        );
+        assert_eq!(
+            regimes(&plan(&format!(
+                "SELECT ?s FROM <{A}> FROM <{I}> WHERE {body}"
+            ))),
+            vec![Some(TypeRegime::IsA); 2]
+        );
+        // A `FROM` that is no data -- a schema graph, an unknown IRI -- reads
+        // no regime, and the engine answers.
+        for graph in [S, "urn:unknown"] {
+            assert_eq!(
+                regimes(&plan(&format!("SELECT ?s FROM <{graph}> WHERE {body}"))),
+                vec![None; 2],
+                "{graph}"
+            );
+        }
+
+        // `GRAPH <data graph>` dissolves; the matches carry its regime.
+        let in_inferred = plan(&format!("SELECT ?s WHERE {{ GRAPH <{I}> {body} }}"));
+        assert_eq!(regimes(&in_inferred), vec![Some(TypeRegime::IsA); 2]);
+        assert_eq!(graph_nodes(&in_inferred), 0, "{in_inferred}");
+        // A `FROM` alone restricts no named graph (it parses as an empty
+        // `FROM NAMED` list).
+        let from_and_graph = plan(&format!(
+            "SELECT ?s FROM <{A}> WHERE {{ GRAPH <{I}> {body} }}"
+        ));
+        assert_eq!(regimes(&from_and_graph), vec![Some(TypeRegime::IsA); 2]);
+        // `GRAPH ?g` and the schema graph stay, and read no regime.
+        for graph in ["?g".to_owned(), format!("<{S}>")] {
+            let kept = plan(&format!("SELECT ?s WHERE {{ GRAPH {graph} {body} }}"));
+            assert_eq!(regimes(&kept), vec![None; 2], "{graph}");
+            assert_eq!(graph_nodes(&kept), 1, "{kept}");
+        }
+        // Under `FROM NAMED` a graph outside the set matches nothing: kept as
+        // a `GRAPH` for the engine to say so.
+        let outside = plan(&format!(
+            "SELECT ?s FROM NAMED <{A}> WHERE {{ GRAPH <{I}> {body} }}"
+        ));
+        assert_eq!(regimes(&outside), vec![None; 2]);
+        assert_eq!(graph_nodes(&outside), 1);
+
+        // Per pattern: the type of one graph, the type of another.
+        let mixed = plan(&format!(
+            "SELECT ?s WHERE {{ GRAPH <{A}> {{ ?s a asset360:Signal }} \
+             GRAPH <{I}> {{ ?s a asset360:ShuntSignal }} }}"
+        ));
+        assert_eq!(
+            regimes(&mixed),
+            vec![Some(TypeRegime::Asserted), Some(TypeRegime::IsA)]
+        );
+        assert_eq!(graph_nodes(&mixed), 0);
+
+        // The fold keeps to one regime: the type from `A` makes a scan of
+        // `Signal` (asserted); the slot read in `I` is another regime's and
+        // stays a match.
+        let split = plan(&format!(
+            "SELECT ?s ?n WHERE {{ GRAPH <{A}> {{ ?s a asset360:Signal }} \
+             GRAPH <{I}> {{ ?s asset360:name ?n }} }}"
+        ));
+        let rules = crate::sparql_rules::tier_one_rules(&sv, &dataset);
+        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+            rules.iter().map(|rule| rule.as_ref()).collect();
+        let mut refined = split.clone();
+        crate::sparql_rules::refine(&mut refined, &borrowed).expect("every invariant holds");
+        refined.check_with(&sv).unwrap();
+        let scans: Vec<(TypeRegime, Vec<ScanSlot>)> = refined
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                PlanOp::Scan { regime, slots, .. } => Some((*regime, slots.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scans.len(), 1, "{refined}");
+        assert_eq!(scans[0].0, TypeRegime::Asserted);
+        assert!(scans[0].1.is_empty(), "{refined}");
+        assert_eq!(
+            regimes(&refined),
+            vec![Some(TypeRegime::IsA)],
+            "the slot match of the other graph stays: {refined}"
+        );
+
+        // A plan that reads the regime of another graph than its default
+        // says so in its text.
+        assert!(mixed.to_string().contains("[is_a]"), "{mixed}");
+    }
+
     /// A regime is on every matched triple and every scan: a triple outside
     /// `GRAPH` carries the dataset's, one inside carries none; a scan under
     /// `is_a` lists the subclasses it reads, in the plan text and in
@@ -5344,7 +5546,7 @@ mod tests {
                 .collect()
         };
 
-        let asserted = naive_plan_in(&parsed, TypeRegime::Asserted).unwrap();
+        let asserted = naive_plan_in(&parsed, &DatasetSpec::new(TypeRegime::Asserted)).unwrap();
         let in_graph = |regimes: &[(String, Option<TypeRegime>)]| {
             regimes
                 .iter()
@@ -5362,7 +5564,7 @@ mod tests {
         // Asserted plan text carries no regime label, on a match or a scan.
         assert!(!asserted.to_string().contains("[is_a"), "{asserted}");
 
-        let is_a = naive_plan_in(&parsed, TypeRegime::IsA).unwrap();
+        let is_a = naive_plan_in(&parsed, &DatasetSpec::new(TypeRegime::IsA)).unwrap();
         assert_eq!(
             in_graph(&regimes(&is_a)),
             vec![
@@ -5379,7 +5581,8 @@ mod tests {
             (&asserted, vec![signal.clone()]),
             (&is_a, vec![shunt.clone(), signal.clone()]),
         ] {
-            let rules = crate::sparql_rules::tier_one_rules(&sv, None);
+            let rules =
+                crate::sparql_rules::tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
             let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
                 rules.iter().map(|rule| rule.as_ref()).collect();
             let mut plan = plan.clone();
@@ -5409,7 +5612,8 @@ mod tests {
 
         // The invariant: a scan that lists the wrong family is refused.
         let mut refined = is_a.clone();
-        let rules = crate::sparql_rules::tier_one_rules(&sv, None);
+        let rules =
+            crate::sparql_rules::tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut refined, &borrowed).unwrap();
@@ -6311,7 +6515,8 @@ mod tests {
     /// -- kept local rather than shared because that one is private to its
     /// own module's `mod tests`.
     fn refined_plan(query: &str, sv: &SchemaView) -> Plan {
-        let rules = crate::sparql_rules::tier_one_rules(sv, None);
+        let rules =
+            crate::sparql_rules::tier_one_rules(sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         let mut plan = plan_of(query);

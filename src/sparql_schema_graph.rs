@@ -46,7 +46,7 @@
 //! there is no defensible default.
 
 #[cfg(feature = "sparql-endpoint")]
-use linkml_runtime::schema_rdf::{SchemaRdfOptions, schema_triples};
+use linkml_runtime::schema_rdf::{SchemaRdfOptions, TypeRegime, schema_triples};
 #[cfg(feature = "sparql-endpoint")]
 use linkml_schemaview::schemaview::SchemaView;
 #[cfg(feature = "sparql-endpoint")]
@@ -111,14 +111,22 @@ impl SchemaGraph {
     /// The triples come from [`linkml_runtime::schema_rdf`], plus what this
     /// crate adds on top: slot aliases ([`Self::alias_quads`]) and the
     /// language-tagged enum labels of [`crate::sparql_schema_labels`].
-    pub fn build(sv: &SchemaView, graph_iri: &str) -> Result<Self, InvalidGraphIri> {
+    ///
+    /// `regime` is the type regime the subclass edges are published under
+    /// (see [`linkml_runtime::schema_rdf::TypeRegime`]): one schema graph per
+    /// regime the dataset serves.
+    pub fn build(
+        sv: &SchemaView,
+        graph_iri: &str,
+        regime: TypeRegime,
+    ) -> Result<Self, InvalidGraphIri> {
         let graph =
             GraphName::NamedNode(NamedNode::new(graph_iri).map_err(|err| InvalidGraphIri {
                 iri: graph_iri.to_owned(),
                 reason: err.to_string(),
             })?);
 
-        let built = schema_triples(sv, &SchemaRdfOptions::default());
+        let built = schema_triples(sv, &SchemaRdfOptions::default().with_regime(regime));
         let mut quads: Vec<Quad> = built
             .triples
             .into_iter()
@@ -283,7 +291,12 @@ mod tests {
     /// consolidator-server test suite pins that count.)
     #[test]
     fn the_fixture_quad_count_is_pinned() {
-        let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
+        let graph = SchemaGraph::build(
+            &asset360_schema_view(),
+            ASSET360_SCHEMA_GRAPH,
+            TypeRegime::Asserted,
+        )
+        .unwrap();
         assert_eq!(graph.quads.len(), 5826);
     }
 
@@ -300,7 +313,7 @@ mod tests {
     #[test]
     fn the_quad_count_reconciles_with_the_restrictions() {
         let sv = asset360_schema_view();
-        let graph = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH).unwrap();
+        let graph = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH, TypeRegime::Asserted).unwrap();
 
         let count = |predicate: &str| {
             graph
@@ -528,7 +541,7 @@ classes:
 
     /// The schema graph in an oxigraph store, ready to be queried.
     fn store_of(sv: &SchemaView) -> Store {
-        let graph = SchemaGraph::build(sv, ASSET360_SCHEMA_GRAPH).unwrap();
+        let graph = SchemaGraph::build(sv, ASSET360_SCHEMA_GRAPH, TypeRegime::Asserted).unwrap();
         let store = Store::new().unwrap();
         for quad in &graph.quads {
             store.insert(quad).unwrap();
@@ -684,7 +697,7 @@ classes:
         assert_eq!(ask(&native), vec![format!("<{canonical}>")]);
         assert_eq!(ask(&canonical), vec![format!("<{native}>")]);
         assert!(
-            SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
+            SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH, TypeRegime::Asserted)
                 .unwrap()
                 .to_ntriples()
                 .contains(&format!("<{canonical}> <{RDF_TYPE}> <{OWL_CLASS}>")),
@@ -694,7 +707,12 @@ classes:
 
     #[test]
     fn every_quad_lands_in_the_graph_the_caller_named() {
-        let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
+        let graph = SchemaGraph::build(
+            &asset360_schema_view(),
+            ASSET360_SCHEMA_GRAPH,
+            TypeRegime::Asserted,
+        )
+        .unwrap();
         assert!(!graph.quads.is_empty(), "expected a non-empty schema graph");
 
         let expected = GraphName::NamedNode(NamedNode::new(ASSET360_SCHEMA_GRAPH).unwrap());
@@ -708,7 +726,8 @@ classes:
     #[test]
     fn a_non_asset360_graph_iri_contains_no_infrabel_graph_name() {
         let rinf_graph = "http://data.europa.eu/949/schema";
-        let graph = SchemaGraph::build(&asset360_schema_view(), rinf_graph).unwrap();
+        let graph =
+            SchemaGraph::build(&asset360_schema_view(), rinf_graph, TypeRegime::Asserted).unwrap();
         let expected = GraphName::NamedNode(NamedNode::new(rinf_graph).unwrap());
         for quad in &graph.quads {
             assert_eq!(quad.graph_name, expected);
@@ -722,14 +741,19 @@ classes:
     /// A misconfigured IRI is an error the operator sees, never a substitution.
     #[test]
     fn a_relative_graph_iri_is_refused() {
-        let err = SchemaGraph::build(&asset360_schema_view(), "not an iri")
+        let err = SchemaGraph::build(&asset360_schema_view(), "not an iri", TypeRegime::Asserted)
             .expect_err("a relative IRI must be refused");
         assert!(err.to_string().contains("not an iri"));
     }
 
     #[test]
     fn every_emitted_iri_is_absolute() {
-        let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
+        let graph = SchemaGraph::build(
+            &asset360_schema_view(),
+            ASSET360_SCHEMA_GRAPH,
+            TypeRegime::Asserted,
+        )
+        .unwrap();
         for quad in &graph.quads {
             // `NamedNode::new` on the way in already rejected relative IRIs;
             // re-check here so the invariant is asserted on the output, not on
@@ -765,7 +789,7 @@ classes:
     fn class_subject_matches_the_instance_rdf_type_spelling() {
         let sv = asset360_schema_view();
         let conv = sv.converter();
-        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
+        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH, TypeRegime::Asserted)
             .unwrap()
             .to_ntriples();
 
@@ -803,7 +827,7 @@ classes:
     fn enum_values_with_a_meaning_get_their_code_as_a_label() {
         let sv = asset360_schema_view();
         let conv = sv.converter();
-        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
+        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH, TypeRegime::Asserted)
             .unwrap()
             .to_ntriples();
 
@@ -917,7 +941,7 @@ classes:
         );
 
         // The untagged code stays where it was, on both predicates.
-        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
+        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH, TypeRegime::Asserted)
             .unwrap()
             .to_ntriples();
         let conv = sv.converter();
@@ -938,10 +962,10 @@ classes:
     #[test]
     fn output_is_deterministic() {
         let sv = asset360_schema_view();
-        let first = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
+        let first = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH, TypeRegime::Asserted)
             .unwrap()
             .to_ntriples();
-        let second = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
+        let second = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH, TypeRegime::Asserted)
             .unwrap()
             .to_ntriples();
         assert_eq!(first, second, "schema graph must not depend on map order");

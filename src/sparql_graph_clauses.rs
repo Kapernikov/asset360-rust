@@ -5,14 +5,16 @@
 //! routes* — there is nothing generic here, which is why this sits beside the
 //! scoper and not in the upstream LinkML crates:
 //!
-//! * [`query_reads_named_graphs`] decides whether building the schema graph is
-//!   worth anything at all for this request.
+//! * [`query_reads_named_graphs`] and [`schema_graphs_read`] decide whether
+//!   building a schema graph is worth anything at all for this request, and
+//!   which ones.
 //! * [`reads_only_the_schema_graph`] decides whether the scoper's "unscoped"
 //!   refusal is the right answer or the wrong one.
 //!
-//! The schema graph's IRI is a parameter, never a constant: see
-//! [`crate::sparql_schema_graph`] for why. `None` means the active datamodel
-//! configures no schema graph, in which case no query can be reading it.
+//! The schema graphs' IRIs are a parameter, never a constant: they are the
+//! [`DatasetSpec`]'s, see [`crate::sparql_schema_graph`] for why. A dataset
+//! with none means the active datamodel configures no schema graph, in which
+//! case no query can be reading one.
 //!
 //! Both parse with [`crate::sparql_scoper::sparql_parser`], the parser the
 //! endpoint's other entry points use. A bare `SparqlParser::new()` here knew
@@ -22,7 +24,10 @@
 //! query came back refused as *unscoped*: a parse failure reported as a
 //! question about scope.
 
+use linkml_runtime::schema_rdf::TypeRegime;
 use linkml_schemaview::schemaview::SchemaView;
+
+use crate::sparql_dataset::DatasetSpec;
 
 /// Whether a query could observe a named graph at all.
 ///
@@ -87,7 +92,95 @@ pub fn query_reads_named_graphs(query: &str, schema_view: &SchemaView) -> bool {
     walk(pattern)
 }
 
-/// Whether every triple pattern in the query reads the schema graph.
+/// The schema graphs a query can observe: the ones it names with a `GRAPH`
+/// constant, `FROM` or `FROM NAMED`, and every one of them for a `GRAPH ?g`.
+///
+/// What the executor builds and loads: one store entry per schema graph the
+/// query can reach, each under its own regime, so a query that reads one pays
+/// for one and an instance query pays for none. A query that does not parse is
+/// treated as possibly reading all of them, so oxigraph reports the real parse
+/// error rather than this function inventing one.
+pub fn schema_graphs_read(
+    query: &str,
+    schema_view: &SchemaView,
+    dataset: &DatasetSpec,
+) -> Vec<(String, TypeRegime)> {
+    use spargebra::Query;
+    use spargebra::algebra::GraphPattern;
+    use spargebra::term::NamedNodePattern;
+
+    fn walk(pattern: &GraphPattern, out: &mut Vec<NamedNodePattern>) {
+        for block in crate::sparql_scoper::exists_patterns_in_expressions_of(pattern) {
+            walk(block, out);
+        }
+        match pattern {
+            GraphPattern::Graph { name, inner } => {
+                out.push(name.clone());
+                walk(inner, out);
+            }
+            GraphPattern::Join { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
+            | GraphPattern::Minus { left, right } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            GraphPattern::LeftJoin { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => walk(inner, out),
+            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+        }
+    }
+
+    let all = || -> Vec<(String, TypeRegime)> {
+        dataset
+            .schema_graphs()
+            .map(|(iri, regime)| (iri.to_owned(), regime))
+            .collect()
+    };
+    let Ok(parsed) = crate::sparql_scoper::parse_query_for(query, schema_view) else {
+        return all();
+    };
+    let pattern = match &parsed {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    };
+    let mut names = Vec::new();
+    walk(pattern, &mut names);
+    let mut read: std::collections::BTreeMap<String, TypeRegime> = Default::default();
+    for name in names {
+        match name {
+            NamedNodePattern::NamedNode(graph) => {
+                if let Some(regime) = dataset.schema_regime(graph.as_str()) {
+                    read.insert(graph.as_str().to_owned(), regime);
+                }
+            }
+            NamedNodePattern::Variable(_) => return all(),
+        }
+    }
+    if let Some(clause) = crate::sparql_scoper::dataset_of(&parsed) {
+        for graph in clause.default.iter().chain(clause.named.iter().flatten()) {
+            if let Some(regime) = dataset.schema_regime(graph.as_str()) {
+                read.insert(graph.as_str().to_owned(), regime);
+            }
+        }
+    }
+    read.into_iter().collect()
+}
+
+/// Whether every triple pattern in the query reads a schema graph.
 ///
 /// Such a query asks about the datamodel and about no golden record, so the
 /// scoper — whose whole job is deciding which records to fetch — correctly
@@ -95,34 +188,31 @@ pub fn query_reads_named_graphs(query: &str, schema_view: &SchemaView) -> bool {
 /// no instances loaded, and this is the predicate that says when that is the
 /// right thing to do rather than a query with a genuinely missing scope.
 ///
-/// `schema_graph_iri` is the graph the active datamodel serves its schema in.
-/// `None` — no schema graph configured for this datamodel — makes this always
-/// false: there is no schema graph, so no query reads only it, and the unscoped
-/// refusal stands.
+/// `dataset` says which graphs are the schema's. With no schema graph
+/// configured for this datamodel this is always false: there is none, so no
+/// query reads only it, and the unscoped refusal stands.
+///
+/// A `GRAPH ?g` counts only while it can bind nothing but a schema graph --
+/// while the dataset serves no data graph
+/// ([`DatasetSpec::graph_variable_is_schema_only`]). Once it does, the
+/// variable ranges over records too, and a query that reads only through it
+/// is not a question about the datamodel.
 ///
 /// A query that does not parse is not schema-only: the real parse error must
 /// surface, not be turned into an empty answer.
 pub fn reads_only_the_schema_graph(
     query: &str,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
     schema_view: &SchemaView,
 ) -> bool {
+    use crate::sparql_dataset::{GraphReads, QueryGraphs};
     use spargebra::Query;
     use spargebra::algebra::GraphPattern;
     use spargebra::term::NamedNodePattern;
 
-    let Some(schema_graph_iri) = schema_graph_iri else {
+    if !dataset.has_schema_graph() {
         return false;
-    };
-
-    // Same rule the scoper applies: the named schema graph, or a variable that
-    // might bind to it. Any other constant graph names something the endpoint
-    // does not have, and a query reading only that has no scope and no answer
-    // here — which is what the unscoped refusal already says.
-    let reads_the_schema_graph = |name: &NamedNodePattern| match name {
-        NamedNodePattern::NamedNode(node) => node.as_str() == schema_graph_iri,
-        NamedNodePattern::Variable(_) => true,
-    };
+    }
 
     /// `(triples seen, triples seen inside the schema graph)`.
     fn walk(
@@ -158,7 +248,7 @@ pub fn reads_only_the_schema_graph(
             }
             GraphPattern::Graph { name, inner } => walk(
                 inner,
-                inside || is_schema_graph(name),
+                is_schema_graph(name),
                 total,
                 in_graph,
                 is_schema_graph,
@@ -198,10 +288,24 @@ pub fn reads_only_the_schema_graph(
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     };
+    // The scoper's rule, from the same place: a `GRAPH` constant naming a
+    // schema graph (and visible under the query's `FROM NAMED`), or a variable
+    // that can bind nothing else. Any other constant graph names something the
+    // endpoint does not serve, and a query reading only that has no scope and
+    // no answer here -- which is what the unscoped refusal already says.
+    let graphs = QueryGraphs::new(dataset, crate::sparql_scoper::dataset_of(&parsed));
+    let reads_the_schema_graph = |name: &NamedNodePattern| match name {
+        NamedNodePattern::NamedNode(node) => {
+            graphs.graph_reads(node.as_str()) == GraphReads::Schema
+        }
+        NamedNodePattern::Variable(_) => dataset.graph_variable_is_schema_only(),
+    };
     let (mut total, mut in_graph) = (0usize, 0usize);
+    // Outside any `GRAPH` a pattern reads the default graph, which a `FROM`
+    // can make a schema graph.
     walk(
         pattern,
-        false,
+        graphs.default_reads() == GraphReads::Schema,
         &mut total,
         &mut in_graph,
         &reads_the_schema_graph,
@@ -224,7 +328,11 @@ mod tests {
     }
 
     fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
-        super::reads_only_the_schema_graph(query, schema_graph_iri, &test_schema_view())
+        let dataset = match schema_graph_iri {
+            Some(iri) => crate::sparql_dataset::schema_dataset(iri),
+            None => crate::sparql_dataset::DatasetSpec::default(),
+        };
+        super::reads_only_the_schema_graph(query, &dataset, &test_schema_view())
     }
 
     #[test]
@@ -374,6 +482,68 @@ mod tests {
             &rinf_query,
             Some(SCHEMA_GRAPH)
         ));
+    }
+
+    /// `GRAPH ?g` is a question about the datamodel only while it can bind
+    /// nothing else. Once the dataset serves a data graph the variable ranges
+    /// over records too, so a query that reads only through it is not
+    /// schema-only -- and the schema graphs a query can read are the ones it
+    /// names, every one of them for the variable.
+    #[test]
+    fn a_graph_variable_is_schema_only_until_a_data_graph_is_served() {
+        use linkml_runtime::schema_rdf::TypeRegime;
+        let schema_view = test_schema_view();
+        let only_schema = crate::sparql_dataset::DatasetSpec::default()
+            .with_schema_graph(SCHEMA_GRAPH, TypeRegime::Asserted);
+        let with_data = only_schema
+            .clone()
+            .with_data_graph("urn:graph:inferred", TypeRegime::IsA)
+            .with_schema_graph("urn:graph:schema-inferred", TypeRegime::IsA);
+        let variable = "SELECT ?c WHERE { GRAPH ?g { ?c ?p ?o } }";
+        assert!(super::reads_only_the_schema_graph(
+            variable,
+            &only_schema,
+            &schema_view
+        ));
+        assert!(!super::reads_only_the_schema_graph(
+            variable,
+            &with_data,
+            &schema_view
+        ));
+        // A data graph is no schema graph, by name.
+        assert!(!super::reads_only_the_schema_graph(
+            "SELECT ?c WHERE { GRAPH <urn:graph:inferred> { ?c ?p ?o } }",
+            &with_data,
+            &schema_view
+        ));
+        // A `FROM` makes the default graph one.
+        assert!(super::reads_only_the_schema_graph(
+            &format!("SELECT ?c FROM <{SCHEMA_GRAPH}> WHERE {{ ?c ?p ?o }}"),
+            &with_data,
+            &schema_view
+        ));
+
+        let read = |query: &str| -> Vec<String> {
+            super::schema_graphs_read(query, &schema_view, &with_data)
+                .into_iter()
+                .map(|(iri, _)| iri)
+                .collect()
+        };
+        assert!(read("SELECT ?s WHERE { ?s ?p ?o }").is_empty());
+        assert_eq!(
+            read(&format!(
+                "SELECT ?c WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c ?p ?o }} }}"
+            )),
+            vec![SCHEMA_GRAPH.to_owned()]
+        );
+        assert_eq!(
+            read(&format!(
+                "SELECT ?c FROM NAMED <{SCHEMA_GRAPH}> WHERE {{ ?c ?p ?o }}"
+            )),
+            vec![SCHEMA_GRAPH.to_owned()]
+        );
+        assert_eq!(read(variable).len(), 2, "a variable can bind either");
+        assert_eq!(read("SELECT ?s WHERE {").len(), 2, "unparseable: all");
     }
 
     /// No schema graph configured: nothing reads only it, not even a query

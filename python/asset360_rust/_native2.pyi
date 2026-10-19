@@ -1662,6 +1662,34 @@ class ConstraintSet:
         """
     def __repr__(self) -> builtins.str: ...
 
+class DatasetSpec:
+    r"""
+    Which named graphs the SPARQL endpoint serves and what the default graph
+    means: the one value every planning and evaluating entry point takes, so no
+    call can forget it.
+    
+    * ``default_regime`` -- the :class:`TypeRegime` a triple pattern outside any
+      ``GRAPH`` is matched under (unless ``default_graph`` names a data graph,
+      whose regime it then is).
+    * ``data_graphs`` -- named graphs over the golden records, each under a
+      regime: ``GRAPH <iri> { ... }`` reads the records under that regime.
+    * ``default_graph`` -- the IRI of one of the data graphs that *is* the
+      default graph.
+    * ``partition_graphs`` -- the graph that holds one :class:`TypePartition` of
+      the type triples.
+    * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
+      subclass edges under a regime.
+    
+    ``DatasetSpec(TypeRegime.Asserted)`` is the dataset every endpoint was
+    before graphs had regimes: an asserted default graph and no named graph.
+    
+    Raises:
+        ValueError: the default graph is not a data graph, or one IRI is
+            registered with two meanings.
+    """
+    def __eq__(self, other:builtins.object) -> builtins.bool: ...
+    def __new__(cls, default_regime:TypeRegime, *, data_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None, default_graph:typing.Optional[builtins.str]=None, partition_graphs:typing.Optional[typing.Mapping[TypePartition, builtins.str]]=None, schema_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None) -> DatasetSpec: ...
+
 class Definition:
     @property
     def is_a(self) -> typing.Optional[builtins.str]: ...
@@ -7374,7 +7402,7 @@ def naive_plan_text(query:builtins.str) -> builtins.str:
 
 def patch(source:LinkMLInstance, deltas:typing.Sequence[Delta], treat_missing_as_null:builtins.bool=True, ignore_no_ops:builtins.bool=True) -> PatchResult: ...
 
-def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None, rows_route:builtins.bool=True) -> ExecutionPlan:
+def plan_query_refined(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec, rows_route:builtins.bool=True) -> ExecutionPlan:
     r"""
     Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
     
@@ -7402,7 +7430,10 @@ def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_
     Args:
         query: SPARQL query string.
         schema_view: The LinkML schema.
-        schema_graph_iri: The active datamodel's schema graph, or ``None``.
+        dataset: The :class:`DatasetSpec` the endpoint serves. Required: it
+            decides which regime each pattern is matched under and which
+            graphs are the datamodel's, so a call that forgot it would plan a
+            different endpoint's query.
         rows_route: ``False`` plans without the rows route (``"used_rows"``):
             what a caller asks for when it cannot render that route's
             statement. The records route answers every query the rows route
@@ -7418,7 +7449,7 @@ def plan_query_refined(query:builtins.str, schema_view:SchemaView, schema_graph_
             scoped at all.
     """
 
-def refined_plan_text(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None) -> builtins.str:
+def refined_plan_text(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec) -> builtins.str:
     r"""
     The refined plan for a query, as the text the Rust tests print.
     
@@ -7431,10 +7462,9 @@ def refined_plan_text(query:builtins.str, schema_view:SchemaView, schema_graph_i
     Args:
         query: SPARQL query string.
         schema_view: The LinkML schema.
-        schema_graph_iri: The named graph the active datamodel serves its schema
-            in -- ``asset360_model.datamodel_config.get_schema_graph_iri()``.
-            Leave it out and the plan printed is the one a deployment without a
-            schema graph builds, which is not the one production runs.
+        dataset: The :class:`DatasetSpec` the endpoint serves. Required: the
+            plan printed is the one production builds only for the dataset
+            production serves.
     
     Returns:
         str: the plan, one line per node, with the obligation ledger.
@@ -7443,7 +7473,7 @@ def refined_plan_text(query:builtins.str, schema_view:SchemaView, schema_graph_i
         ValueError: the query does not parse or cannot be represented.
     """
 
-def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
+def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance], schema_view:SchemaView, max_triples:builtins.int, max_result_rows:builtins.int, dataset:DatasetSpec, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
     r"""
     Execute a SPARQL query against a list of LinkML instances.
     
@@ -7457,14 +7487,16 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
         schema_view: The LinkML schema (for RDF conversion).
         format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
             ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
-        max_triples: Maximum triples in the store (default 500,000).
-        max_result_rows: Maximum result rows (default 10,000).
-        schema_graph_iri: The named graph to serve the active datamodel's
-            schema in — ``asset360_model.datamodel_config.get_schema_graph_iri()``.
-            ``None`` means this datamodel serves no schema graph, and then none
-            is built. There is deliberately no default: the correct IRI depends
-            on which datamodel is deployed, and guessing would put an
-            infrabel-named graph into an unrelated deployment.
+        max_triples: Maximum triples in the store.
+        max_result_rows: Maximum result rows.
+        dataset: The :class:`DatasetSpec` the endpoint serves: which schema
+            graphs to build (only the ones the query names), and the type
+            regime the records are loaded under. There is deliberately no
+            default: the correct graphs depend on which datamodel is deployed,
+            and guessing would put an infrabel-named graph into an unrelated
+            deployment. A query naming a *data* graph (``GRAPH``, ``FROM``,
+            ``FROM NAMED``) is refused for now: the engine holds the records
+            in the default graph only.
         max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
             milliseconds, counted once the store is loaded. ``None`` (the
             default) is no ceiling. The caller is answered at the deadline
@@ -7489,7 +7521,7 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
             or query execution error.
     """
 
-def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, max_triples:builtins.int=500000, max_result_rows:builtins.int=10000, schema_graph_iri:typing.Optional[builtins.str]=None, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
+def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:SchemaView, max_triples:builtins.int, max_result_rows:builtins.int, dataset:DatasetSpec, max_eval_millis:typing.Optional[builtins.int]=None) -> tuple[builtins.str, builtins.str]:
     r"""
     Finish a ``refinement == "used_rows"`` plan over its statement's rows.
     
@@ -7509,7 +7541,7 @@ def sparql_finish(plan:ExecutionPlan, solutions_json:builtins.str, schema_view:S
             triple it would have been on the records route. Over it, the
             call raises ``RuntimeError("Triple limit exceeded: …")``.
         max_result_rows: Maximum rows of the answer.
-        schema_graph_iri: As for ``sparql_execute``.
+        dataset: As for ``sparql_execute``.
         max_eval_millis: As for ``sparql_execute``.
     
     Returns:
@@ -7537,7 +7569,7 @@ def sparql_predeclared_prefixes(schema_view:SchemaView) -> builtins.dict[builtin
     The prefixes a SPARQL query here may leave undeclared, label to namespace.
     
     What the endpoint's parser seeds: the W3C vocabularies (``rdf``, ``rdfs``,
-    ``owl``, ``xsd``, ``skos``, ``schema``) and every prefix the datamodel's
+    ``owl``, ``xsd``, ``skos``, ``schema``, ``sesame``) and every prefix the datamodel's
     own schemas declare (``asset360``, ``irsm``, …). A query may declare any
     of them again; its own declaration wins. Read this rather than keeping a
     copy: it is the parser's own map, so documentation built from it cannot
@@ -7547,9 +7579,9 @@ def sparql_predeclared_prefixes(schema_view:SchemaView) -> builtins.dict[builtin
         schema_view: The LinkML schema whose ``prefixes:`` seed the parser.
     """
 
-def sparql_reads_only_the_schema_graph(query:builtins.str, schema_graph_iri:typing.Optional[builtins.str], schema_view:SchemaView) -> builtins.bool:
+def sparql_reads_only_the_schema_graph(query:builtins.str, dataset:DatasetSpec, schema_view:SchemaView) -> builtins.bool:
     r"""
-    Whether every triple pattern in the query reads the schema graph.
+    Whether every triple pattern in the query reads a schema graph.
     
     Such a query asks about the datamodel and about no golden record, so the
     scoper refuses it as unscoped — correctly, since there is nothing to fetch.
@@ -7558,16 +7590,17 @@ def sparql_reads_only_the_schema_graph(query:builtins.str, schema_graph_iri:typi
     
     Args:
         query: SPARQL query string.
-        schema_graph_iri: The named graph the active datamodel serves its
-            schema in, or ``None`` when it serves none — in which case no
-            query reads only it.
+        dataset: The :class:`DatasetSpec` the endpoint serves. With no schema
+            graph in it no query reads only one. A ``GRAPH ?g`` counts as
+            reading the schema graph only while the dataset serves no data
+            graph (the variable can bind nothing else).
         schema_view: The LinkML schema, whose prefixes seed the parser — the
             same parser the planner used, so a query the planner refused as
             unscoped parses here too rather than being reported as not
             schema-only because a datamodel prefix was left undeclared.
     """
 
-def sparql_schema_graph_ntriples(schema_view:SchemaView, schema_graph_iri:builtins.str) -> builtins.str:
+def sparql_schema_graph_ntriples(schema_view:SchemaView, dataset:DatasetSpec, graph_iri:builtins.str) -> builtins.str:
     r"""
     The datamodel's schema graph, as N-Triples.
     
@@ -7576,15 +7609,17 @@ def sparql_schema_graph_ntriples(schema_view:SchemaView, schema_graph_iri:builti
     
     Args:
         schema_view: The LinkML schema.
-        schema_graph_iri: The named graph to put them in — see
-            ``sparql_execute``. Only the graph name depends on it; the triples
-            are the same either way.
+        dataset: The :class:`DatasetSpec` that serves the graph.
+        graph_iri: The schema graph to build -- one of the dataset's
+            ``schema_graphs``, whose regime decides which subclass edges it
+            publishes.
     
     Raises:
-        ValueError: ``schema_graph_iri`` is not an absolute IRI.
+        ValueError: ``graph_iri`` is not a schema graph of the dataset, or is
+            not an absolute IRI.
     """
 
-def sparql_schema_graph_skipped(schema_view:SchemaView, schema_graph_iri:builtins.str) -> builtins.list[builtins.str]:
+def sparql_schema_graph_skipped(schema_view:SchemaView, dataset:DatasetSpec, graph_iri:builtins.str) -> builtins.list[builtins.str]:
     r"""
     Schema terms left out of the graph because their IRI was not absolute.
     
@@ -7593,10 +7628,11 @@ def sparql_schema_graph_skipped(schema_view:SchemaView, schema_graph_iri:builtin
     reporting, not a query failure, so the graph is served without them.
     
     Raises:
-        ValueError: ``schema_graph_iri`` is not an absolute IRI.
+        ValueError: ``graph_iri`` is not a schema graph of the dataset, or is
+            not an absolute IRI.
     """
 
-def sparql_scope(query:builtins.str, schema_view:SchemaView, schema_graph_iri:typing.Optional[builtins.str]=None) -> QueryPlan:
+def sparql_scope(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec) -> QueryPlan:
     r"""
     Analyse a SPARQL query and produce a structured fetch plan.
     
@@ -7608,6 +7644,7 @@ def sparql_scope(query:builtins.str, schema_view:SchemaView, schema_graph_iri:ty
         query: SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
         schema_view: The LinkML schema, used to resolve predicate IRIs to
             slot names and class IRIs to class names.
+        dataset: The :class:`DatasetSpec` the endpoint serves (required).
     
     Returns:
         QueryPlan with stars, joins, and optional sql_limit.

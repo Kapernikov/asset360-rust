@@ -356,7 +356,7 @@ mod tests {
     fn refined(query: &str) -> Plan {
         let schema = test_schema_view();
         let mut plan = naive_plan_of(&format!("{PREFIX}{query}")).unwrap();
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}\n{plan}"));
@@ -816,7 +816,10 @@ mod tests {
              ?track a asset360:Track ; asset360:typeURI ?trackName }";
         // Scalar projection: statement, `?cs` pruned.
         let scalar = format!("{prefix}SELECT ?name ?seq ?track ?trackName WHERE {{ {body} }}");
-        assert_eq!(outcome_of(&scalar, &fixture, None), Outcome::Statement);
+        assert_eq!(
+            outcome_of(&scalar, &fixture, crate::sparql_dataset::default_dataset()),
+            Outcome::Statement
+        );
         let plan = crate::sparql_plan::plan_query_refined(&scalar, &fixture).unwrap();
         let ops = match &plan.passes[0].kind {
             crate::sparql_plan::PassKind::Sql(sql) => &sql.ops,
@@ -884,9 +887,12 @@ mod tests {
         // `SELECT *`: a fetch, since a structure has no term to emit.
         let star = format!("{prefix}SELECT * WHERE {{ {body} }}");
         assert!(
-            matches!(outcome_of(&star, &fixture, None), Outcome::Fetch(_)),
+            matches!(
+                outcome_of(&star, &fixture, crate::sparql_dataset::default_dataset()),
+                Outcome::Fetch(_)
+            ),
             "{:?}",
-            outcome_of(&star, &fixture, None)
+            outcome_of(&star, &fixture, crate::sparql_dataset::default_dataset())
         );
 
         // An element joined in an enclosing scope, on the test schema's
@@ -906,7 +912,11 @@ mod tests {
             "{plan}"
         );
         assert_eq!(
-            outcome_of(&format!("{PREFIX}{joined}"), &schema, None),
+            outcome_of(
+                &format!("{PREFIX}{joined}"),
+                &schema,
+                crate::sparql_dataset::default_dataset()
+            ),
             Outcome::Statement
         );
         let lowered = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
@@ -926,7 +936,7 @@ mod tests {
                      asset360:parts ?p . ?p asset360:children ?c }} GROUP BY ?p }} }}"
                 ),
                 &schema,
-                None
+                crate::sparql_dataset::default_dataset()
             ),
             Outcome::Fetch(_)
         ));

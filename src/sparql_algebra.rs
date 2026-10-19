@@ -1377,7 +1377,7 @@ pub(crate) mod equivalence {
     fn every_rewrite_of_every_grammar_query_preserves_the_answer() {
         let schema = test_schema_view();
         let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let grammar = grammar();
         assert!(grammar.len() > 100, "{}", grammar.len());
@@ -1402,7 +1402,7 @@ pub(crate) mod equivalence {
     fn every_schedule_answers_the_same() {
         let schema = test_schema_view();
         let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let forwards: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let backwards: Vec<&dyn Rule> = rules.iter().rev().map(|rule| rule.as_ref()).collect();
         let mut permuted: Vec<&dyn Rule> = forwards.clone();
@@ -1423,7 +1423,7 @@ pub(crate) mod equivalence {
     fn one_round_leaves_a_correct_plan() {
         let schema = test_schema_view();
         let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         for query in grammar().iter().step_by(5) {
             let text = format!("{PREFIX}{query}");
@@ -1452,7 +1452,7 @@ pub(crate) mod equivalence {
     fn the_scan_and_unnest_translations_are_the_matches_they_replaced() {
         let schema = test_schema_view();
         let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         for (query, expected_rows) in [
             // A required read: the record without a name is not a row.

@@ -8,8 +8,16 @@ shape against the actual PyO3 surface, not against what a docstring claims.
 
 from __future__ import annotations
 
-from asset360_rust import FilterCondition, PlanOp, SchemaView
-from asset360_rust import plan_query_refined as _plan_query_refined
+from asset360_rust import DatasetSpec, FilterCondition, PlanOp, SchemaView, TypeRegime
+from asset360_rust import plan_query_refined as _plan_with_dataset
+
+# `dataset` is required by the binding (no call can forget it); these tests plan
+# against the endpoint every dataset was before graphs had regimes.
+_DATASET = DatasetSpec(TypeRegime.Asserted)
+
+
+def _plan_query_refined(query, schema_view, **options):
+    return _plan_with_dataset(query, schema_view, _DATASET, **options)
 
 lr = __import__("asset360_rust")
 
@@ -248,3 +256,31 @@ def test_plan_op_broken_out_column_is_none_for_an_ordinary_slot():
     ops = _sql_filter_ops(plan)
     assert len(ops) == 1
     assert ops[0].broken_out_column is None
+
+
+def test_the_dataset_is_required_and_validated():
+    """No call can forget the dataset, and one that contradicts itself is refused."""
+    import pytest
+
+    query = PREFIX + "SELECT ?s WHERE { ?s a asset360:Signal }"
+    with pytest.raises(TypeError):
+        _plan_with_dataset(query, schema())
+    with pytest.raises(ValueError, match="not a registered data graph"):
+        DatasetSpec(TypeRegime.Asserted, default_graph="urn:graph:nowhere")
+    with pytest.raises(ValueError, match="registered as"):
+        DatasetSpec(
+            TypeRegime.Asserted,
+            data_graphs={"urn:g": TypeRegime.IsA},
+            schema_graphs={"urn:g": TypeRegime.IsA},
+        )
+    served = DatasetSpec(
+        TypeRegime.Asserted,
+        data_graphs={"urn:graph:inferred": TypeRegime.IsA},
+    )
+    plan = _plan_with_dataset(
+        PREFIX
+        + "SELECT ?s WHERE { GRAPH <urn:graph:inferred> { ?s a asset360:Signal } }",
+        schema(),
+        served,
+    )
+    assert plan.is_accounted

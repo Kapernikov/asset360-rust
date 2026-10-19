@@ -34,6 +34,7 @@
 
 use std::collections::BTreeSet;
 
+use linkml_runtime::schema_rdf::TypeRegime;
 use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_plan::{Obligation, ObligationId};
@@ -72,9 +73,10 @@ pub enum Step {
 /// nothing but that record.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
-    /// `?v` is the identity of a record of this class. The fold reads it
-    /// as the star's type when 3b carries it to the matches.
-    Class(String),
+    /// `?v` is the identity of a record of this class, read under this type
+    /// regime (that of the scan it was derived from). The fold reads it as
+    /// the star's type when 3b carries it to the matches.
+    Class(String, TypeRegime),
     /// A condition over slots of `?v`'s record -- `?v.kind = 'GSA'` -- that
     /// the other side's every row satisfies. It lands as a filter above
     /// the side's scan of `?v`, where SQL applies it; it is never the type.
@@ -84,7 +86,7 @@ pub enum Predicate {
 impl std::fmt::Display for Predicate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Class(class_uri) => write!(f, "∈ {}", crate::sparql_plan::shorten(class_uri)),
+            Self::Class(class_uri, _) => write!(f, "∈ {}", crate::sparql_plan::shorten(class_uri)),
             Self::Condition(condition) => write!(f, "where {condition}"),
         }
     }
@@ -111,7 +113,7 @@ impl Restriction {
             self.at.side,
             &self.var,
             match &self.predicate {
-                Predicate::Class(class_uri) => class_uri.clone(),
+                Predicate::Class(class_uri, _) => class_uri.clone(),
                 Predicate::Condition(condition) => format!("{condition}"),
             },
         )
@@ -120,7 +122,7 @@ impl Restriction {
     /// The class this restriction carries, when it is one.
     pub fn class_uri(&self) -> Option<&str> {
         match &self.predicate {
-            Predicate::Class(class_uri) => Some(class_uri),
+            Predicate::Class(class_uri, _) => Some(class_uri),
             Predicate::Condition(_) => None,
         }
     }
@@ -128,9 +130,10 @@ impl Restriction {
     /// The filter condition that spells this restriction in a plan.
     pub fn condition(&self) -> Expr {
         match &self.predicate {
-            Predicate::Class(class_uri) => Expr::InClass {
+            Predicate::Class(class_uri, regime) => Expr::InClass {
                 var: self.var.clone(),
                 class_uri: class_uri.clone(),
+                regime: *regime,
             },
             Predicate::Condition(condition) => condition.clone(),
         }
@@ -174,7 +177,7 @@ impl Restriction {
 pub fn restriction_of(plan: &Plan, node: NodeId) -> Option<(String, String)> {
     match &plan.nodes[node].op {
         PlanOp::Filter {
-            condition: Expr::InClass { var, class_uri },
+            condition: Expr::InClass { var, class_uri, .. },
             ..
         } => Some((var.clone(), class_uri.clone())),
         _ => None,
@@ -463,6 +466,12 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                     let Some(class_uri) = plan.identity_class(self.schema, other, var) else {
                         continue;
                     };
+                    // The restriction is read under the regime of the scan it
+                    // comes from. Scans that disagree about it leave nothing
+                    // to carry, so nothing is restricted.
+                    let Some(regime) = plan.identity_regime(other, var, &class_uri) else {
+                        continue;
+                    };
                     let join_key = plan.key_of(id);
                     // The insertion point: inside the barrier, or above the
                     // side.
@@ -554,11 +563,12 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                                 condition: Expr::InClass {
                                     var: var.clone(),
                                     class_uri: class_uri.clone(),
+                                    regime,
                                 },
                             },
                             Vec::new(),
                         );
-                        placed(plan, Predicate::Class(class_uri), filter);
+                        placed(plan, Predicate::Class(class_uri, regime), filter);
                         return true;
                     }
 
@@ -1321,7 +1331,7 @@ mod tests {
     fn refined(query: &str) -> Plan {
         let schema = test_schema_view();
         let mut plan = crate::sparql_refine::naive_plan_of(&format!("{PREFIX}{query}")).unwrap();
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}\n{plan}"));
         plan.check_with(&schema)
@@ -1380,7 +1390,7 @@ mod tests {
                      ORDER BY ?s LIMIT 3 }} ?s asset360:name ?nm }}"
                 ),
                 &schema,
-                None
+                crate::sparql_dataset::default_dataset()
             ),
             Outcome::Statement
         );
@@ -1395,9 +1405,69 @@ mod tests {
                      ?s asset360:name ?nm }}"
                 ),
                 &schema,
-                None
+                crate::sparql_dataset::default_dataset()
             ),
             Outcome::Statement
+        );
+    }
+
+    /// A restriction carries the regime of the scan it was derived from, and
+    /// the fold reads it as that scan's regime: with the type in graph `I`
+    /// (`is_a`) and the slot read in graph `A` (asserted), the restriction is
+    /// `∈ Signal [is_a]` and the asserted slot match is not folded under it --
+    /// the fold used to take the regime of the earliest match instead, and
+    /// would have scanned the star under the wrong graph.
+    #[test]
+    fn a_restriction_carries_the_regime_of_the_scan_it_came_from() {
+        use crate::sparql_dataset::DatasetSpec;
+        use linkml_runtime::schema_rdf::TypeRegime;
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        let schema = test_schema_view();
+        let dataset = DatasetSpec::default()
+            .with_data_graph(A, TypeRegime::Asserted)
+            .with_data_graph(I, TypeRegime::IsA);
+        let query = format!(
+            "{PREFIX}SELECT ?nm WHERE {{ \
+             {{ SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }} ORDER BY ?s LIMIT 3 }} \
+             GRAPH <{A}> {{ ?s asset360:name ?nm }} }}"
+        );
+        let parsed = crate::sparql_scoper::parse_query_for(&query, &schema).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan_in(&parsed, &dataset).unwrap();
+        let rules = tier_one_rules(&schema, &dataset);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}\n{plan}"));
+        plan.check_with(&schema)
+            .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+
+        let found = restrictions(&plan);
+        let [restriction] = found.as_slice() else {
+            panic!("one restriction:\n{plan}");
+        };
+        assert_eq!(
+            restriction.predicate,
+            Predicate::Class(
+                "https://data.infrabel.be/asset360/Signal".to_owned(),
+                TypeRegime::IsA
+            ),
+            "{plan}"
+        );
+        // Only the inner star is a scan; the asserted slot match is another
+        // regime's and stays a match under the restriction.
+        assert_eq!(plan.find("scan").len(), 1, "{plan}");
+        assert!(
+            plan.nodes.iter().any(|node| matches!(
+                &node.op,
+                PlanOp::Match {
+                    regime: Some(TypeRegime::Asserted),
+                    ..
+                }
+            )),
+            "{plan}"
+        );
+        assert!(
+            plan.to_string().contains("∈ asset360:Signal [is_a]"),
+            "{plan}"
         );
     }
 
@@ -1441,7 +1511,7 @@ mod tests {
                  {{ SELECT ?s WHERE {{ ?s asset360:name ?x }} ORDER BY ?s LIMIT 1 }} }}"
             ),
             &schema,
-            None,
+            crate::sparql_dataset::default_dataset(),
         ) else {
             panic!("rejected");
         };
@@ -1500,7 +1570,11 @@ mod tests {
         assert!(!rule.apply(&mut again), "{again}");
         assert_eq!(restrictions(&again).len(), 1);
         assert_eq!(
-            outcome_of(&format!("{PREFIX}{query}"), &schema, None),
+            outcome_of(
+                &format!("{PREFIX}{query}"),
+                &schema,
+                crate::sparql_dataset::default_dataset()
+            ),
             Outcome::Statement
         );
     }
@@ -1559,12 +1633,27 @@ mod tests {
         let slice = plan.nodes[filter].op.inputs()[0];
         let below = plan.nodes[slice].op.inputs()[0];
         let claim = plan.nodes[filter].discharges[0];
-        let (var, class_uri) = restriction_of(&plan, filter).unwrap();
+        let PlanOp::Filter {
+            condition:
+                Expr::InClass {
+                    var,
+                    class_uri,
+                    regime,
+                },
+            ..
+        } = plan.nodes[filter].op.clone()
+        else {
+            panic!("a class restriction");
+        };
         let mut bad = plan.clone();
         let moved = Node::engine(
             PlanOp::Filter {
                 input: below,
-                condition: Expr::InClass { var, class_uri },
+                condition: Expr::InClass {
+                    var,
+                    class_uri,
+                    regime,
+                },
             },
             vec![claim],
         );
@@ -1593,7 +1682,9 @@ mod tests {
                 "{PREFIX}SELECT ?s ?n WHERE {{ ?s a asset360:Signal . \
                  {{ SELECT (COUNT(*) AS ?n) WHERE {{ {inner} asset360:length 3 }} }} }}"
             );
-            let Outcome::Rejected(message) = outcome_of(&query, &schema, None) else {
+            let Outcome::Rejected(message) =
+                outcome_of(&query, &schema, crate::sparql_dataset::default_dataset())
+            else {
                 panic!("{inner}: rejected");
             };
             assert!(message.contains("(in sub-select 1)"), "{message}");
@@ -1602,7 +1693,10 @@ mod tests {
             "{PREFIX}SELECT ?s ?n WHERE {{ ?s a asset360:Signal . \
              {{ SELECT ?s (COUNT(?len) AS ?n) WHERE {{ ?s asset360:length ?len }} GROUP BY ?s }} }}"
         );
-        assert_eq!(outcome_of(&exported, &schema, None), Outcome::Statement);
+        assert_eq!(
+            outcome_of(&exported, &schema, crate::sparql_dataset::default_dataset()),
+            Outcome::Statement
+        );
         let plan = refined(
             "SELECT ?s ?n WHERE { ?s a asset360:Signal . \
              { SELECT ?s (COUNT(?len) AS ?n) WHERE { ?s asset360:length ?len } GROUP BY ?s } }",
@@ -1675,7 +1769,11 @@ mod tests {
                 "{plan}"
             );
             assert_eq!(
-                outcome_of(&format!("{PREFIX}{query}"), &schema, None),
+                outcome_of(
+                    &format!("{PREFIX}{query}"),
+                    &schema,
+                    crate::sparql_dataset::default_dataset()
+                ),
                 Outcome::Statement,
                 "{plan}"
             );
@@ -1762,7 +1860,10 @@ mod tests {
              asset360:belongsToLine ?line . ?t a asset360:Track ; asset360:typeURI ?tn . \
              OPTIONAL {{ ?t asset360:refersToLine ?l2 }} }} }}"
         );
-        assert_eq!(outcome_of(&query, &schema, None), Outcome::Statement);
+        assert_eq!(
+            outcome_of(&query, &schema, crate::sparql_dataset::default_dataset()),
+            Outcome::Statement
+        );
         let plan = crate::sparql_plan::plan_query_refined(&query, &schema).unwrap();
         let rendered = format!("{plan}");
         assert!(

@@ -36,6 +36,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::sparql_dataset::DatasetSpec;
 use crate::sparql_refine::{
     Executor, Expr, LiftedExport, Node, NodeId, Plan, PlanOp, ScopeTransfer, SortOrigin, SortTerm,
     variables_used,
@@ -149,12 +150,14 @@ fn var_list(vars: &BTreeSet<String>) -> String {
 pub fn reads_schema_only(
     plan: &Plan,
     region: &[NodeId],
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Result<(), String> {
     let mut in_schema_graph: BTreeSet<NodeId> = BTreeSet::new();
     for &id in region {
         if let PlanOp::Graph { input, name } = &plan.nodes[id].op
-            && schema_graph_iri.is_some_and(|iri| name.trim_matches(['<', '>']) == iri)
+            && dataset
+                .schema_regime(name.trim_matches(['<', '>']))
+                .is_some()
         {
             in_schema_graph.extend(subtree(plan, *input));
         }
@@ -166,7 +169,9 @@ pub fn reads_schema_only(
                 return Err(format!("n{id} reads a triple of the default graph"));
             }
             PlanOp::Graph { name, .. }
-                if schema_graph_iri.is_none_or(|iri| name.trim_matches(['<', '>']) != iri) =>
+                if dataset
+                    .schema_regime(name.trim_matches(['<', '>']))
+                    .is_none() =>
             {
                 return Err(format!(
                     "n{id} reads the graph {name}, not the schema graph"
@@ -745,18 +750,15 @@ impl Rule for LiftOptionalExtension {
 /// obligation stays in its scope* validates.
 pub struct LiftOptionalRightSide<'a> {
     schema: &'a linkml_schemaview::schemaview::SchemaView,
-    schema_graph_iri: Option<&'a str>,
+    dataset: &'a DatasetSpec,
 }
 
 impl<'a> LiftOptionalRightSide<'a> {
     pub fn new(
         schema: &'a linkml_schemaview::schemaview::SchemaView,
-        schema_graph_iri: Option<&'a str>,
+        dataset: &'a DatasetSpec,
     ) -> Self {
-        Self {
-            schema,
-            schema_graph_iri,
-        }
+        Self { schema, dataset }
     }
 }
 
@@ -837,7 +839,7 @@ impl LiftOptionalRightSide<'_> {
             if inner_witness.is_some() {
                 return Err("the inner left join carries a witness of its own".to_owned());
             }
-            reads_schema_only(plan, &c_nodes, self.schema_graph_iri)
+            reads_schema_only(plan, &c_nodes, self.dataset)
                 .map_err(|why| format!("C (n{c}) reads more than the schema graph: {why}"))?;
             let scope_a = plan.variables_of(a);
             let bound_b = plan.definitely_bound_of(b);
@@ -1807,11 +1809,11 @@ impl Rule for PageBelowOneToOne<'_> {
 /// then the paging.
 pub fn lifting_rules<'a>(
     schema: &'a linkml_schemaview::schemaview::SchemaView,
-    schema_graph_iri: Option<&'a str>,
+    dataset: &'a DatasetSpec,
 ) -> Vec<Box<dyn Rule + 'a>> {
     vec![
         Box::new(LiftOptionalExtension),
-        Box::new(LiftOptionalRightSide::new(schema, schema_graph_iri)),
+        Box::new(LiftOptionalRightSide::new(schema, dataset)),
         Box::new(LiftExtensionOverJoin),
         Box::new(PageBelowOneToOne::new(schema)),
     ]
@@ -1821,13 +1823,13 @@ pub fn lifting_rules<'a>(
 pub fn declined(
     plan: &Plan,
     schema: &linkml_schemaview::schemaview::SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Vec<(&'static str, NodeId, String)> {
     let mut out = Vec::new();
     for (node, why) in LiftOptionalExtension::declined(plan) {
         out.push((R2, node, why));
     }
-    for (node, why) in LiftOptionalRightSide::new(schema, schema_graph_iri).declined(plan) {
+    for (node, why) in LiftOptionalRightSide::new(schema, dataset).declined(plan) {
         out.push((R1, node, why));
     }
     for (node, why) in LiftExtensionOverJoin::declined(plan) {
@@ -1886,7 +1888,11 @@ pub(crate) mod tests {
     /// The plan production refines a query to with the lifts on.
     pub(crate) fn lifted_plan(query: &str, schema: &SchemaView) -> Plan {
         let mut plan = crate::sparql_refine::naive_plan_for(query, schema).unwrap();
-        let rules = crate::sparql_plan::refine_rules(schema, None, true);
+        let rules = crate::sparql_plan::refine_rules(
+            schema,
+            crate::sparql_dataset::default_dataset(),
+            true,
+        );
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut plan, &borrowed)
@@ -1896,7 +1902,11 @@ pub(crate) mod tests {
 
     /// What the refined printout says, `declined` section included.
     pub(crate) fn printout(query: &str, schema: &SchemaView) -> String {
-        crate::sparql_plan::with_declined(&lifted_plan(query, schema), schema, None)
+        crate::sparql_plan::with_declined(
+            &lifted_plan(query, schema),
+            schema,
+            crate::sparql_dataset::default_dataset(),
+        )
     }
 
     /// **The rows route, end to end on the oracle.** The query is planned
@@ -1923,7 +1933,11 @@ pub(crate) mod tests {
             matches!(&pass.kind, PassKind::Engine(engine)
                 if matches!(&engine.input, EngineInput::Solutions { .. }))
         });
-        let rules = crate::sparql_plan::refine_rules(schema, None, lifts);
+        let rules = crate::sparql_plan::refine_rules(
+            schema,
+            crate::sparql_dataset::default_dataset(),
+            lifts,
+        );
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut lifted, &borrowed).unwrap();
@@ -1932,7 +1946,7 @@ pub(crate) mod tests {
             &lifted,
             &parsed,
             schema,
-            None,
+            crate::sparql_dataset::default_dataset(),
             &Default::default(),
         )
         .unwrap_or_else(|why| panic!("{why}\n{lifted}"));
@@ -1954,7 +1968,7 @@ pub(crate) mod tests {
             &json,
             schema,
             crate::sparql_executor::ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap_or_else(|error| panic!("{error}\n{plan}"));
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
@@ -2731,13 +2745,17 @@ mod composition {
         let unlifted = crate::sparql_plan::with_declined(
             &{
                 let mut plan = crate::sparql_refine::naive_plan_for(&query, &schema).unwrap();
-                let rules = crate::sparql_plan::refine_rules(&schema, None, false);
+                let rules = crate::sparql_plan::refine_rules(
+                    &schema,
+                    crate::sparql_dataset::default_dataset(),
+                    false,
+                );
                 let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
                 crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
                 plan
             },
             &schema,
-            None,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             unlifted.contains("K7: column ?tag is not uniform"),

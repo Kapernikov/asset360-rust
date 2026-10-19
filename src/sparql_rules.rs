@@ -61,6 +61,7 @@ use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 use spargebra::algebra::AggregateExpression;
 use spargebra::term::{GroundTerm, Term, TermPattern, TriplePattern};
 
+use crate::sparql_dataset::DatasetSpec;
 use crate::sparql_plan::ObligationId;
 use crate::sparql_refine::{
     CompareOp, Executor, Expr, Measure, Node, NodeId, Plan, PlanOp, ReferenceEdge, ScanSlot,
@@ -449,11 +450,11 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // fact, derived by 3a from the other side of a join. A
             // restriction is read exactly where a type match is, so an
             // untyped body gets its scan by the same edit as a typed one.
-            let (identifier_values, star, class_uri, type_regime): (
+            let (identifier_values, star, class_uri, regime): (
                 Vec<String>,
                 String,
                 String,
-                Option<TypeRegime>,
+                TypeRegime,
             ) = match &node.op {
                 // A type match under a `GRAPH` is not about the data graph
                 // and folds into nothing.
@@ -483,14 +484,20 @@ impl Rule for FoldMatchesIntoScan<'_> {
                     if is_inline_element(plan, self.schema, &star) {
                         continue;
                     }
-                    (identifier_values, star, class_uri.to_owned(), Some(*regime))
+                    (identifier_values, star, class_uri.to_owned(), *regime)
                 }
-                // A restriction does not say which graph it was derived
-                // from; its regime is that of the matches it folds (below).
+                // A restriction carries the regime of the scan it was
+                // derived from, so it folds with the matches of that regime
+                // and no other.
                 PlanOp::Filter {
-                    condition: crate::sparql_refine::Expr::InClass { var, class_uri },
+                    condition:
+                        crate::sparql_refine::Expr::InClass {
+                            var,
+                            class_uri,
+                            regime,
+                        },
                     ..
-                } => (Vec::new(), var.clone(), class_uri.clone(), None),
+                } => (Vec::new(), var.clone(), class_uri.clone(), *regime),
                 _ => continue,
             };
             let star = star.as_str();
@@ -527,29 +534,9 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // (design, *What a relational subtree derives*). Two types on one
             // variable *in one scope* still decline.
             let scopes = plan.scopes();
-            // A type match carries its regime. A restriction takes the regime
-            // of the earliest data-graph match on its star in its group, so
-            // the matches of one regime fold and the others stay put.
-            let Some(regime) = type_regime.or_else(|| {
-                plan.nodes
-                    .iter()
-                    .enumerate()
-                    .find_map(|(id, other)| match &other.op {
-                        PlanOp::Match {
-                            pattern,
-                            regime: Some(regime),
-                        } if other.executor == Executor::Engine
-                            && groups[id] == groups[type_node]
-                            && subject_star(&keys, pattern).as_deref() == Some(star)
-                            && !is_type_pattern(pattern) =>
-                        {
-                            Some(*regime)
-                        }
-                        _ => None,
-                    })
-            }) else {
-                continue;
-            };
+            // The regime is the type source's own -- a type match's, or the
+            // restriction's -- so the matches of that regime fold and the
+            // others stay put.
             // Counted as *classes*, not as nodes: a restriction beside a
             // type match of the same class is one class said twice.
             let type_nodes: Vec<(NodeId, String)> = plan
@@ -570,7 +557,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
                         type_class_iri(pattern).map(|class| (other_id, class.to_owned()))
                     }
                     PlanOp::Filter {
-                        condition: crate::sparql_refine::Expr::InClass { var, class_uri },
+                        condition: crate::sparql_refine::Expr::InClass { var, class_uri, .. },
                         ..
                     } if var == star => Some((other_id, class_uri.clone())),
                     _ => None,
@@ -627,6 +614,9 @@ impl Rule for FoldMatchesIntoScan<'_> {
             }
             let star = star.to_owned();
             let class_uri = class_uri.to_owned();
+            // The regime is the type source's own -- a type match's, or the
+            // restriction's -- so the matches of that regime fold and the
+            // others stay put.
             let slots = self.foldable_slots(
                 plan,
                 &keys,
@@ -5415,7 +5405,7 @@ impl PushProjection<'_> {
 /// so running the fold first reaches the fixpoint in fewer passes.
 pub fn tier_one_rules<'a>(
     schema: &'a SchemaView,
-    schema_graph_iri: Option<&'a str>,
+    dataset: &'a DatasetSpec,
 ) -> Vec<Box<dyn Rule + 'a>> {
     #[cfg_attr(not(feature = "sparql-endpoint"), allow(unused_mut))]
     let mut rules: Vec<Box<dyn Rule + 'a>> = vec![
@@ -5466,20 +5456,20 @@ pub fn tier_one_rules<'a>(
     // subplan can depend on nothing but the schema, so the rule would ask a
     // question with no answers.
     #[cfg(feature = "sparql-endpoint")]
-    if let Some(iri) = schema_graph_iri {
+    if dataset.has_schema_graph() {
         // Two lines per materialisation pass, and this is the only place a
         // second one would be added: one rule to sink a filter into the pass's
         // regions, one to materialise them.
         rules.push(Box::new(SinkFilterIntoAnEvaluableSide::new(
             schema,
-            crate::sparql_materialise::SchemaGraphMaterialisation::new(schema, iri),
+            crate::sparql_materialise::SchemaGraphMaterialisation::new(schema, dataset),
         )));
         rules.push(Box::new(Materialise::new(
-            crate::sparql_materialise::SchemaGraphMaterialisation::new(schema, iri),
+            crate::sparql_materialise::SchemaGraphMaterialisation::new(schema, dataset),
         )));
     }
     #[cfg(not(feature = "sparql-endpoint"))]
-    let _ = schema_graph_iri;
+    let _ = dataset;
     rules
 }
 
@@ -5490,14 +5480,14 @@ pub fn tier_one_rules<'a>(
 pub fn declined(
     plan: &Plan,
     schema: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Vec<(&'static str, NodeId, String)> {
     let mut out = Vec::new();
     let lower = crate::sparql_constant::LowerConstantRelation::new(schema);
     for (node, why) in lower.declined(plan) {
         out.push((lower.name(), node, why));
     }
-    out.extend(crate::sparql_lift::declined(plan, schema, schema_graph_iri));
+    out.extend(crate::sparql_lift::declined(plan, schema, dataset));
     out
 }
 
@@ -6062,7 +6052,11 @@ mod tests {
     fn plan_in(query: &str, regime: TypeRegime) -> Plan {
         let parsed =
             crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
-        crate::sparql_refine::naive_plan_in(&parsed, regime).expect("should build a naive plan")
+        crate::sparql_refine::naive_plan_in(
+            &parsed,
+            &crate::sparql_dataset::DatasetSpec::new(regime),
+        )
+        .expect("should build a naive plan")
     }
 
     /// Every slot the scan folded, as (slot, variable, multivalued).
@@ -8190,7 +8184,7 @@ mod tests {
             "SELECT ?k WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" ; \
              asset360:trafficKinds ?k }",
         );
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).expect("every invariant holds");
 
@@ -8520,7 +8514,8 @@ mod tests {
     /// leaves out entirely.
     #[cfg(feature = "sparql-endpoint")]
     fn refine_naive_with_schema_graph(naive: &Plan, schema: &SchemaView, reverse: bool) -> Plan {
-        let mut rules = tier_one_rules(schema, Some(CORPUS_SCHEMA_GRAPH));
+        let dataset = crate::sparql_dataset::schema_dataset(CORPUS_SCHEMA_GRAPH);
+        let mut rules = tier_one_rules(schema, &dataset);
         if reverse {
             rules.reverse();
         }
@@ -8531,7 +8526,7 @@ mod tests {
     }
 
     fn refine_naive(naive: &Plan, schema: &SchemaView, reverse: bool) -> Plan {
-        let mut rules = tier_one_rules(schema, None);
+        let mut rules = tier_one_rules(schema, crate::sparql_dataset::default_dataset());
         if reverse {
             rules.reverse();
         }
@@ -9783,7 +9778,7 @@ mod tests {
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm . FILTER(REGEX(?nm, \"^A\")) } GROUP BY ?nm",
         );
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).expect("the regex keeps the grouping with the engine");
         assert_eq!(
@@ -9862,7 +9857,7 @@ mod tests {
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm ; asset360:trafficKinds ?k } GROUP BY ?nm",
         );
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).expect("the fold inserts the unnest below everything");
         assert_eq!(plan.find("unnest").len(), 1, "{plan}");
@@ -9931,7 +9926,8 @@ mod tests {
     #[test]
     fn every_invariant_holds_after_every_application_with_a_schema_graph() {
         let schema = test_schema_view();
-        let rules = tier_one_rules(&schema, Some(CORPUS_SCHEMA_GRAPH));
+        let dataset = crate::sparql_dataset::schema_dataset(CORPUS_SCHEMA_GRAPH);
+        let rules = tier_one_rules(&schema, &dataset);
         for query in CORPUS.iter().chain(SCHEMA_CORPUS.iter()) {
             let mut plan = plan_of(query);
             plan.check()
@@ -9963,7 +9959,8 @@ mod tests {
     #[test]
     fn the_schema_corpus_reaches_both_schema_graph_rules() {
         let schema = test_schema_view();
-        let rules = tier_one_rules(&schema, Some(CORPUS_SCHEMA_GRAPH));
+        let dataset = crate::sparql_dataset::schema_dataset(CORPUS_SCHEMA_GRAPH);
+        let rules = tier_one_rules(&schema, &dataset);
         let mut fired: std::collections::BTreeSet<&str> = Default::default();
         for query in CORPUS.iter().chain(SCHEMA_CORPUS.iter()) {
             let mut plan = plan_of(query);
@@ -10042,7 +10039,7 @@ mod tests {
     #[test]
     fn every_invariant_holds_after_every_application_of_every_rule() {
         let schema = test_schema_view();
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         for query in CORPUS {
             let mut plan = plan_of(query);
             plan.check()
@@ -10332,7 +10329,7 @@ mod element_held_optional_reference {
                 ),
             ],
         );
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let query = "SELECT ?s ?t ?tn ?l WHERE { ?s a asset360:TunnelComplex . \
              OPTIONAL { ?s asset360:hasCoveredSection ?cs . ?cs asset360:belongsToTrack ?t . \
@@ -10411,7 +10408,7 @@ mod inline_type_match {
     fn refine_and_check(query: &str) -> crate::sparql_refine::Plan {
         let sv = test_schema_view();
         let oracle = oracle(&sv);
-        let rules = tier_one_rules(&sv, None);
+        let rules = tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         each_rewrite_preserves_answers(query, &sv, &oracle, &borrowed)
     }
@@ -10503,7 +10500,7 @@ mod inline_type_match {
             "{text}"
         );
 
-        let rules = tier_one_rules(&sv, None);
+        let rules = tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let mut plan = crate::sparql_refine::naive_plan_of(query).unwrap();
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
@@ -10514,6 +10511,49 @@ mod inline_type_match {
                 && text.contains("locations.typeURI[each] = <"),
             "the type is a designator condition on the folded collection:\n{text}"
         );
+    }
+
+    /// The regime of an inlined element's type triple is that of *its own*
+    /// graph: asking for the range class itself is a bare test under the
+    /// asserted regime (an element may name no designator), and discharged
+    /// under the inferred one (every element is a place). The slot triples'
+    /// graph does not decide it.
+    #[test]
+    fn an_inline_type_triple_is_judged_in_its_own_graph() {
+        use crate::sparql_dataset::DatasetSpec;
+        use linkml_runtime::schema_rdf::TypeRegime;
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        let sv = test_schema_view();
+        let dataset = DatasetSpec::new(TypeRegime::Asserted)
+            .with_data_graph(A, TypeRegime::Asserted)
+            .with_data_graph(I, TypeRegime::IsA);
+        let refined = |site_graph: &str, type_graph: &str| {
+            let query = format!(
+                "PREFIX asset360: <{NS}/> SELECT ?s ?l WHERE {{ \
+                 GRAPH <{site_graph}> {{ ?s a asset360:Site ; asset360:places ?p . \
+                   ?p asset360:label ?l }} \
+                 GRAPH <{type_graph}> {{ ?p a asset360:Place }} }}"
+            );
+            let parsed = crate::sparql_scoper::parse_query_for(&query, &sv).unwrap();
+            let mut plan = crate::sparql_refine::naive_plan_in(&parsed, &dataset).unwrap();
+            let rules = tier_one_rules(&sv, &dataset);
+            let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
+            plan.to_string()
+        };
+        for site_graph in [A, I] {
+            let asserted = refined(site_graph, A);
+            assert!(
+                asserted.contains("match     ?p a asset360:Place"),
+                "asserted: the element may name no designator, the engine keeps it:\n{asserted}"
+            );
+            let inferred = refined(site_graph, I);
+            assert!(
+                !inferred.contains("match     ?p a asset360:Place"),
+                "inferred: every element is a place, the triple is discharged:\n{inferred}"
+            );
+        }
     }
 
     /// What the plan cannot say stays with the engine, and is still right: a
@@ -10615,7 +10655,7 @@ mod inline_type_match {
                 .unwrap()
                 .to_string();
             assert!(production.contains("all in SQL"), "{name}: {production}");
-            let rules = tier_one_rules(&sv, None);
+            let rules = tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
             let mut plan = crate::sparql_refine::naive_plan_of(&query).unwrap();
             crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();

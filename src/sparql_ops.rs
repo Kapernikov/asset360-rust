@@ -663,9 +663,8 @@ pub fn lower_sql_pass(
             op: Op::Scan {
                 star_var: star.variable.clone(),
                 class_uri: star.class_uri.clone(),
-                // The scoper decomposes under the asserted regime only: a
-                // star is its own class.
-                classes: vec![star.class_uri.clone()],
+                // The classes the star's regime says its type stands for.
+                classes: star.classes.clone(),
                 identifier_values: star.identifier_values.clone(),
                 required_slots: star.required_fields.clone(),
                 optional_slots: star.optional_fields.clone(),
@@ -4215,7 +4214,8 @@ mod tests {
 
     /// A refined plan, to fixpoint.
     fn refined_plan(query: &str, sv: &SchemaView) -> crate::sparql_refine::Plan {
-        let rules = crate::sparql_rules::tier_one_rules(sv, None);
+        let rules =
+            crate::sparql_rules::tier_one_rules(sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         let mut plan = crate::sparql_refine::naive_plan_of(&format!("{PREFIX}{query}"))

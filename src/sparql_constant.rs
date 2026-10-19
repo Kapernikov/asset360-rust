@@ -787,7 +787,7 @@ pub(crate) mod tests {
     }
 
     fn rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
-        tier_one_rules(schema, None)
+        tier_one_rules(schema, crate::sparql_dataset::default_dataset())
     }
 
     fn refined_text(query: &str, schema: &SchemaView) -> String {
@@ -796,7 +796,7 @@ pub(crate) mod tests {
         let rules = rules(schema);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
-        crate::sparql_plan::with_declined(&plan, schema, None)
+        crate::sparql_plan::with_declined(&plan, schema, crate::sparql_dataset::default_dataset())
     }
 
     fn lowered_tables(plan: &Plan) -> usize {
@@ -817,7 +817,12 @@ pub(crate) mod tests {
              OPTIONAL {{ ?s asset360:signalType ?t . \
              OPTIONAL {{ GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }} }} }}"
         ));
-        let refined = crate::sparql_plan::refined_plan_text(&q, &sv, Some(SCHEMA_GRAPH)).unwrap();
+        let refined = crate::sparql_plan::refined_plan_text(
+            &q,
+            &sv,
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
+        )
+        .unwrap();
         assert!(
             refined.contains("lowered as c1, key ?t: enum→code, 1 kept, 2 outside enum [S]"),
             "{refined}"
@@ -826,9 +831,12 @@ pub(crate) mod tests {
             refined.contains("by value ?t (signalType, enum→code)  [S]"),
             "{refined}"
         );
-        let plan =
-            crate::sparql_plan::plan_query_refined_with_schema_graph(&q, &sv, Some(SCHEMA_GRAPH))
-                .unwrap();
+        let plan = crate::sparql_plan::plan_query_refined_in(
+            &q,
+            &sv,
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
+        )
+        .unwrap();
         let printed = plan.to_string();
         assert_eq!(plan.refinement.as_str(), "used_alone", "{printed}");
         assert!(
@@ -857,7 +865,12 @@ pub(crate) mod tests {
              OPTIONAL {{ ?s asset360:signalType ?t }} \
              OPTIONAL {{ GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }} }}"
         ));
-        let refined = crate::sparql_plan::refined_plan_text(&q, &sv, Some(SCHEMA_GRAPH)).unwrap();
+        let refined = crate::sparql_plan::refined_plan_text(
+            &q,
+            &sv,
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
+        )
+        .unwrap();
         assert!(refined.contains("  declined\n"), "{refined}");
         assert!(
             refined.contains(
@@ -1023,7 +1036,11 @@ pub(crate) mod tests {
             *condition = Some(crate::sparql_refine::Expr::Var("s".to_owned()));
         }
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
-        let refined = crate::sparql_plan::with_declined(&plan, &schema, None);
+        let refined = crate::sparql_plan::with_declined(
+            &plan,
+            &schema,
+            crate::sparql_dataset::default_dataset(),
+        );
         assert!(
             refined.contains("K6: the left join carries a condition"),
             "{refined}"

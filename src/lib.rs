@@ -42,6 +42,7 @@ pub mod sparql_algebra;
 pub mod sparql_alias;
 pub mod sparql_columns;
 pub mod sparql_constant;
+pub mod sparql_dataset;
 pub mod sparql_domains;
 #[cfg(feature = "sparql-endpoint")]
 pub mod sparql_executor;
@@ -133,6 +134,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<FilterCondition>()?;
         m.add_class::<FilterNode>()?;
         m.add_class::<ExecutionPlan>()?;
+        m.add_class::<PyDatasetSpec>()?;
         m.add_class::<PlanPass>()?;
         m.add_class::<PlanOp>()?;
         m.add_class::<PushdownBinding>()?;
@@ -3860,11 +3862,95 @@ impl ExecutionPlan {
     }
 }
 
+/// Which named graphs the SPARQL endpoint serves and what the default graph
+/// means: the one value every planning and evaluating entry point takes, so no
+/// call can forget it.
+///
+/// * ``default_regime`` -- the :class:`TypeRegime` a triple pattern outside any
+///   ``GRAPH`` is matched under (unless ``default_graph`` names a data graph,
+///   whose regime it then is).
+/// * ``data_graphs`` -- named graphs over the golden records, each under a
+///   regime: ``GRAPH <iri> { ... }`` reads the records under that regime.
+/// * ``default_graph`` -- the IRI of one of the data graphs that *is* the
+///   default graph.
+/// * ``partition_graphs`` -- the graph that holds one :class:`TypePartition` of
+///   the type triples.
+/// * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
+///   subclass edges under a regime.
+///
+/// ``DatasetSpec(TypeRegime.Asserted)`` is the dataset every endpoint was
+/// before graphs had regimes: an asserted default graph and no named graph.
+///
+/// Raises:
+///     ValueError: the default graph is not a data graph, or one IRI is
+///         registered with two meanings.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(name = "DatasetSpec", frozen, eq)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyDatasetSpec {
+    inner: crate::sparql_dataset::DatasetSpec,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PyDatasetSpec {
+    #[new]
+    #[pyo3(signature = (default_regime, *, data_graphs=None, default_graph=None, partition_graphs=None, schema_graphs=None))]
+    fn new(
+        default_regime: linkml_runtime_python::PyTypeRegime,
+        data_graphs: Option<std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>>,
+        default_graph: Option<String>,
+        partition_graphs: Option<
+            std::collections::HashMap<linkml_runtime_python::PyTypePartition, String>,
+        >,
+        schema_graphs: Option<
+            std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>,
+        >,
+    ) -> PyResult<Self> {
+        // Sorted, so the same arguments build the same value (and report the
+        // same conflict) whatever the dict's order.
+        let data_graphs: std::collections::BTreeMap<_, _> =
+            data_graphs.unwrap_or_default().into_iter().collect();
+        let schema_graphs: std::collections::BTreeMap<_, _> =
+            schema_graphs.unwrap_or_default().into_iter().collect();
+        let partition_graphs: std::collections::BTreeMap<_, _> = partition_graphs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(partition, iri)| {
+                (
+                    linkml_runtime::schema_rdf::TypePartition::from(partition),
+                    iri,
+                )
+            })
+            .collect();
+
+        let mut inner = crate::sparql_dataset::DatasetSpec::new(default_regime.into());
+        for (iri, regime) in data_graphs {
+            inner = inner.with_data_graph(iri, regime.into());
+        }
+        if let Some(iri) = default_graph {
+            inner = inner.with_default_graph(iri);
+        }
+        for (partition, iri) in partition_graphs {
+            inner = inner.with_partition_graph(partition, iri);
+        }
+        for (iri, regime) in schema_graphs {
+            inner = inner.with_schema_graph(iri, regime.into());
+        }
+        inner
+            .validate()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+}
+
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "plan_query_refined")]
-#[pyo3(signature = (query, schema_view, schema_graph_iri=None, rows_route=true))]
+#[pyo3(signature = (query, schema_view, dataset, rows_route=true))]
 /// Plan a SPARQL query: one parse, one scope, one refinement, one artifact.
 ///
 /// The only planner. A naive plan of the whole query is refined by rules to a
@@ -3891,7 +3977,10 @@ impl ExecutionPlan {
 /// Args:
 ///     query: SPARQL query string.
 ///     schema_view: The LinkML schema.
-///     schema_graph_iri: The active datamodel's schema graph, or ``None``.
+///     dataset: The :class:`DatasetSpec` the endpoint serves. Required: it
+///         decides which regime each pattern is matched under and which
+///         graphs are the datamodel's, so a call that forgot it would plan a
+///         different endpoint's query.
 ///     rows_route: ``False`` plans without the rows route (``"used_rows"``):
 ///         what a caller asks for when it cannot render that route's
 ///         statement. The records route answers every query the rows route
@@ -3909,21 +3998,16 @@ fn py_plan_query_refined(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
-    schema_graph_iri: Option<String>,
+    dataset: PyDatasetSpec,
     rows_route: bool,
 ) -> PyResult<ExecutionPlan> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    crate::sparql_plan::plan_query_refined_with_options(
-        query,
-        sv,
-        schema_graph_iri.as_deref(),
-        rows_route,
-    )
-    .map(|inner| ExecutionPlan { inner })
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    crate::sparql_plan::plan_query_refined_with_options(query, sv, &dataset.inner, rows_route)
+        .map(|inner| ExecutionPlan { inner })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -3957,7 +4041,7 @@ fn py_naive_plan_text(query: &str) -> PyResult<String> {
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(name = "refined_plan_text")]
-#[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
+#[pyo3(signature = (query, schema_view, dataset))]
 /// The refined plan for a query, as the text the Rust tests print.
 ///
 /// Diagnostics, and the one thing the `ExecutionPlan` artifact cannot show: on
@@ -3969,10 +4053,9 @@ fn py_naive_plan_text(query: &str) -> PyResult<String> {
 /// Args:
 ///     query: SPARQL query string.
 ///     schema_view: The LinkML schema.
-///     schema_graph_iri: The named graph the active datamodel serves its schema
-///         in -- ``asset360_model.datamodel_config.get_schema_graph_iri()``.
-///         Leave it out and the plan printed is the one a deployment without a
-///         schema graph builds, which is not the one production runs.
+///     dataset: The :class:`DatasetSpec` the endpoint serves. Required: the
+///         plan printed is the one production builds only for the dataset
+///         production serves.
 ///
 /// Returns:
 ///     str: the plan, one line per node, with the obligation ledger.
@@ -3983,12 +4066,12 @@ fn py_refined_plan_text(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
-    schema_graph_iri: Option<String>,
+    dataset: PyDatasetSpec,
 ) -> PyResult<String> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
-    crate::sparql_plan::refined_plan_text(query, sv, schema_graph_iri.as_deref())
+    crate::sparql_plan::refined_plan_text(query, sv, &dataset.inner)
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
@@ -4013,7 +4096,7 @@ fn sparql_inexact_reasons() -> Vec<&'static str> {
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, schema_view, schema_graph_iri=None))]
+#[pyo3(signature = (query, schema_view, dataset))]
 /// Analyse a SPARQL query and produce a structured fetch plan.
 ///
 /// Decomposes the query into stars (one per ``rdf:type``), detects
@@ -4024,6 +4107,7 @@ fn sparql_inexact_reasons() -> Vec<&'static str> {
 ///     query: SPARQL query string (SELECT, ASK, CONSTRUCT, or DESCRIBE).
 ///     schema_view: The LinkML schema, used to resolve predicate IRIs to
 ///         slot names and class IRIs to class names.
+///     dataset: The :class:`DatasetSpec` the endpoint serves (required).
 ///
 /// Returns:
 ///     QueryPlan with stars, joins, and optional sql_limit.
@@ -4034,17 +4118,13 @@ fn sparql_scope(
     py: Python<'_>,
     query: &str,
     schema_view: Py<PySchemaView>,
-    schema_graph_iri: Option<String>,
+    dataset: PyDatasetSpec,
 ) -> PyResult<QueryPlan> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     let sv = sv_ref.as_rust();
 
-    match crate::sparql_scoper::sparql_scope_with_schema_graph(
-        query,
-        sv,
-        schema_graph_iri.as_deref(),
-    ) {
+    match crate::sparql_scoper::sparql_scope_in(query, sv, &dataset.inner) {
         Ok(plan) => Ok(plan.into()),
         // ScopeError's Display produces exactly these strings, so there is one
         // place to change when a variant is added — rather than two blocks
@@ -4122,7 +4202,7 @@ fn load_json_batch(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, instances, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None, max_eval_millis=None))]
+#[pyo3(signature = (query, instances, schema_view, max_triples, max_result_rows, dataset, max_eval_millis=None))]
 /// Execute a SPARQL query against a list of LinkML instances.
 ///
 /// Converts each instance to RDF, loads into an in-memory store (with
@@ -4135,14 +4215,16 @@ fn load_json_batch(
 ///     schema_view: The LinkML schema (for RDF conversion).
 ///     format: Output format — ``"json"`` for SELECT/ASK (SPARQL JSON Results),
 ///         ``"turtle"`` for CONSTRUCT/DESCRIBE (N-Triples).
-///     max_triples: Maximum triples in the store (default 500,000).
-///     max_result_rows: Maximum result rows (default 10,000).
-///     schema_graph_iri: The named graph to serve the active datamodel's
-///         schema in — ``asset360_model.datamodel_config.get_schema_graph_iri()``.
-///         ``None`` means this datamodel serves no schema graph, and then none
-///         is built. There is deliberately no default: the correct IRI depends
-///         on which datamodel is deployed, and guessing would put an
-///         infrabel-named graph into an unrelated deployment.
+///     max_triples: Maximum triples in the store.
+///     max_result_rows: Maximum result rows.
+///     dataset: The :class:`DatasetSpec` the endpoint serves: which schema
+///         graphs to build (only the ones the query names), and the type
+///         regime the records are loaded under. There is deliberately no
+///         default: the correct graphs depend on which datamodel is deployed,
+///         and guessing would put an infrabel-named graph into an unrelated
+///         deployment. A query naming a *data* graph (``GRAPH``, ``FROM``,
+///         ``FROM NAMED``) is refused for now: the engine holds the records
+///         in the default graph only.
 ///     max_eval_millis: Wall-clock ceiling on the engine's evaluation, in
 ///         milliseconds, counted once the store is loaded. ``None`` (the
 ///         default) is no ceiling. The caller is answered at the deadline
@@ -4176,7 +4258,7 @@ fn sparql_execute(
     schema_view: Py<PySchemaView>,
     max_triples: usize,
     max_result_rows: usize,
-    schema_graph_iri: Option<String>,
+    dataset: PyDatasetSpec,
     max_eval_millis: Option<u64>,
 ) -> PyResult<(String, String)> {
     let bound_sv = schema_view.bind(py);
@@ -4196,7 +4278,7 @@ fn sparql_execute(
             max_result_rows,
             max_eval_millis,
         },
-        schema_graph_iri.as_deref(),
+        &dataset.inner,
     ) {
         // `(content_type, body)`: the serialisation belongs to the query's form,
         // and the form is something this function has already parsed. A caller
@@ -4234,7 +4316,7 @@ fn sparql_execute(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (plan, solutions_json, schema_view, max_triples=500_000, max_result_rows=10_000, schema_graph_iri=None, max_eval_millis=None))]
+#[pyo3(signature = (plan, solutions_json, schema_view, max_triples, max_result_rows, dataset, max_eval_millis=None))]
 /// Finish a ``refinement == "used_rows"`` plan over its statement's rows.
 ///
 /// The engine pass's ``finish`` query is evaluated with the rows in place of
@@ -4253,7 +4335,7 @@ fn sparql_execute(
 ///         triple it would have been on the records route. Over it, the
 ///         call raises ``RuntimeError("Triple limit exceeded: …")``.
 ///     max_result_rows: Maximum rows of the answer.
-///     schema_graph_iri: As for ``sparql_execute``.
+///     dataset: As for ``sparql_execute``.
 ///     max_eval_millis: As for ``sparql_execute``.
 ///
 /// Returns:
@@ -4270,7 +4352,7 @@ fn sparql_finish(
     schema_view: Py<PySchemaView>,
     max_triples: usize,
     max_result_rows: usize,
-    schema_graph_iri: Option<String>,
+    dataset: PyDatasetSpec,
     max_eval_millis: Option<u64>,
 ) -> PyResult<(String, String)> {
     let bound_sv = schema_view.bind(py);
@@ -4285,7 +4367,7 @@ fn sparql_finish(
             max_result_rows,
             max_eval_millis,
         },
-        schema_graph_iri.as_deref(),
+        &dataset.inner,
     ) {
         Ok(answer) => Ok((answer.content_type, answer.body)),
         Err(crate::sparql_executor::ExecuteError::TripleLimitExceeded { count, limit }) => {
@@ -4317,22 +4399,40 @@ fn sparql_finish(
 ///
 /// Args:
 ///     schema_view: The LinkML schema.
-///     schema_graph_iri: The named graph to put them in — see
-///         ``sparql_execute``. Only the graph name depends on it; the triples
-///         are the same either way.
+///     dataset: The :class:`DatasetSpec` that serves the graph.
+///     graph_iri: The schema graph to build -- one of the dataset's
+///         ``schema_graphs``, whose regime decides which subclass edges it
+///         publishes.
 ///
 /// Raises:
-///     ValueError: ``schema_graph_iri`` is not an absolute IRI.
+///     ValueError: ``graph_iri`` is not a schema graph of the dataset, or is
+///         not an absolute IRI.
 fn sparql_schema_graph_ntriples(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
-    schema_graph_iri: &str,
+    dataset: PyDatasetSpec,
+    graph_iri: &str,
 ) -> PyResult<String> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
-    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), schema_graph_iri)
+    let regime = schema_graph_regime(&dataset.inner, graph_iri)?;
+    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), graph_iri, regime)
         .map(|graph| graph.to_ntriples())
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// The regime of the schema graph `graph_iri` in `dataset`, or the
+/// `ValueError` that says it is none.
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+fn schema_graph_regime(
+    dataset: &crate::sparql_dataset::DatasetSpec,
+    graph_iri: &str,
+) -> PyResult<linkml_runtime::schema_rdf::TypeRegime> {
+    dataset.schema_regime(graph_iri).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "<{graph_iri}> is not a schema graph of the dataset"
+        ))
+    })
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -4345,15 +4445,18 @@ fn sparql_schema_graph_ntriples(
 /// reporting, not a query failure, so the graph is served without them.
 ///
 /// Raises:
-///     ValueError: ``schema_graph_iri`` is not an absolute IRI.
+///     ValueError: ``graph_iri`` is not a schema graph of the dataset, or is
+///         not an absolute IRI.
 fn sparql_schema_graph_skipped(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
-    schema_graph_iri: &str,
+    dataset: PyDatasetSpec,
+    graph_iri: &str,
 ) -> PyResult<Vec<String>> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
-    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), schema_graph_iri)
+    let regime = schema_graph_regime(&dataset.inner, graph_iri)?;
+    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), graph_iri, regime)
         .map(|graph| graph.skipped)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -4361,8 +4464,8 @@ fn sparql_schema_graph_skipped(
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (query, schema_graph_iri, schema_view))]
-/// Whether every triple pattern in the query reads the schema graph.
+#[pyo3(signature = (query, dataset, schema_view))]
+/// Whether every triple pattern in the query reads a schema graph.
 ///
 /// Such a query asks about the datamodel and about no golden record, so the
 /// scoper refuses it as unscoped — correctly, since there is nothing to fetch.
@@ -4371,9 +4474,10 @@ fn sparql_schema_graph_skipped(
 ///
 /// Args:
 ///     query: SPARQL query string.
-///     schema_graph_iri: The named graph the active datamodel serves its
-///         schema in, or ``None`` when it serves none — in which case no
-///         query reads only it.
+///     dataset: The :class:`DatasetSpec` the endpoint serves. With no schema
+///         graph in it no query reads only one. A ``GRAPH ?g`` counts as
+///         reading the schema graph only while the dataset serves no data
+///         graph (the variable can bind nothing else).
 ///     schema_view: The LinkML schema, whose prefixes seed the parser — the
 ///         same parser the planner used, so a query the planner refused as
 ///         unscoped parses here too rather than being reported as not
@@ -4381,14 +4485,14 @@ fn sparql_schema_graph_skipped(
 fn sparql_reads_only_the_schema_graph(
     py: Python<'_>,
     query: &str,
-    schema_graph_iri: Option<String>,
+    dataset: PyDatasetSpec,
     schema_view: Py<PySchemaView>,
 ) -> bool {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
     crate::sparql_graph_clauses::reads_only_the_schema_graph(
         query,
-        schema_graph_iri.as_deref(),
+        &dataset.inner,
         sv_ref.as_rust(),
     )
 }
@@ -4400,7 +4504,7 @@ fn sparql_reads_only_the_schema_graph(
 /// The prefixes a SPARQL query here may leave undeclared, label to namespace.
 ///
 /// What the endpoint's parser seeds: the W3C vocabularies (``rdf``, ``rdfs``,
-/// ``owl``, ``xsd``, ``skos``, ``schema``) and every prefix the datamodel's
+/// ``owl``, ``xsd``, ``skos``, ``schema``, ``sesame``) and every prefix the datamodel's
 /// own schemas declare (``asset360``, ``irsm``, …). A query may declare any
 /// of them again; its own declaration wins. Read this rather than keeping a
 /// copy: it is the parser's own map, so documentation built from it cannot

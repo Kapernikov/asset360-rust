@@ -36,6 +36,8 @@ use linkml_runtime::LinkMLInstance;
 use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
 use linkml_schemaview::schemaview::SchemaView;
 
+use crate::sparql_dataset::DatasetSpec;
+
 /// Errors that can occur during SPARQL query execution.
 #[derive(Debug)]
 pub enum ExecuteError {
@@ -307,7 +309,7 @@ pub fn sparql_execute(
     instances: &[&LinkMLInstance],
     schema_view: &SchemaView,
     limits: ExecuteLimits,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Result<SparqlAnswer, ExecuteError> {
     // The bound on the backlog, before anything is allocated: what a full
     // backlog is bounding is memory, and the store built below is up to
@@ -322,6 +324,38 @@ pub fn sparql_execute(
             });
         }
     }
+
+    dataset.validate()?;
+
+    // Parse with the parser the rest of the endpoint uses
+    // ([`crate::sparql_scoper::sparql_parser`]) and execute *that*, rather than
+    // handing oxigraph the string to parse again with a bare parser of its own.
+    //
+    // Two entry points with two parsers accept two different languages, which
+    // is the bug this fixes: the scoper pre-registers `rdf`, `rdfs` and `xsd`,
+    // so it planned `?s rdf:type <Class>` — the canonical scoped pattern — and
+    // oxigraph then refused the same string as a syntax error, reported as a
+    // 500 naming no prefix. `parse_query` also rejects a SPARQL Update by name
+    // instead of leaving the engine to fail on it.
+    //
+    // Parsed *before* the records are loaded, so a query the engine will
+    // refuse costs nothing to refuse.
+    let mut parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)
+        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+
+    // One slot, two spellings -- and one class, two spellings. The data
+    // carries the canonical IRI (the declared `slot_uri` / `class_uri`); a
+    // query author writes the readable native one. The planner resolves the
+    // alias on its own parse, so this leg has to resolve it on this one --
+    // otherwise the SQL leg answers the native spelling and the engine answers
+    // nothing, which is a silent route-dependent answer rather than the silent
+    // empty column it replaced. The same pass refuses a predicate the
+    // subject's class cannot carry, so the two legs refuse the same queries
+    // too. See [`crate::sparql_alias`].
+    crate::sparql_alias::canonicalize(&mut parsed, schema_view)
+        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
+
+    refuse_named_data_graphs(&mut parsed, dataset)?;
 
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
@@ -369,7 +403,9 @@ pub fn sparql_execute(
                 schema_view,
                 &primary_schema,
                 &converter,
-                TurtleOptions::default().with_skolem(false),
+                TurtleOptions::default()
+                    .with_skolem(false)
+                    .with_regime(dataset.default_regime()),
             )
             .map_err(|e| ExecuteError::ConversionError {
                 object_uri: object_uri.clone(),
@@ -413,33 +449,12 @@ pub fn sparql_execute(
     // the work would be pure waste. It also means this feature adds exactly
     // zero cost to every request that existed before it.
     //
-    // Which graph it goes in is the caller's, threaded down from the active
-    // datamodel's configuration: `None` means this datamodel serves no schema
-    // graph, and then there is nothing to insert.
-    if let Some(schema_graph_iri) = schema_graph_iri
-        && crate::sparql_graph_clauses::query_reads_named_graphs(query_str, schema_view)
-    {
-        let schema_graph =
-            crate::sparql_schema_graph::SchemaGraph::build(schema_view, schema_graph_iri)
-                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-        for quad in &schema_graph.quads {
-            store
-                .insert(quad)
-                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-        }
-    }
+    // Which graphs it goes in is the caller's, threaded down from the active
+    // datamodel's configuration: a dataset with no schema graph has nothing to
+    // insert, and one with several (one per regime its subclass edges are
+    // published under) gets exactly the ones this query names.
+    insert_schema_graphs(&store, query_str, schema_view, dataset)?;
 
-    // Parse with the parser the rest of the endpoint uses
-    // ([`crate::sparql_scoper::sparql_parser`]) and execute *that*, rather than
-    // handing oxigraph the string to parse again with a bare parser of its own.
-    //
-    // Two entry points with two parsers accept two different languages, which
-    // is the bug this fixes: the scoper pre-registers `rdf`, `rdfs` and `xsd`,
-    // so it planned `?s rdf:type <Class>` — the canonical scoped pattern — and
-    // oxigraph then refused the same string as a syntax error, reported as a
-    // 500 naming no prefix. `parse_query` also rejects a SPARQL Update by name
-    // instead of leaving the engine to fail on it.
-    //
     // The parsed algebra goes to oxigraph as-is. oxigraph 0.5 pins the same
     // `spargebra 0.4.7` this crate parses with, so its `Query` wrapper wraps
     // *this crate's* `spargebra::Query`, and the `From<spargebra::Query>` impl
@@ -447,22 +462,142 @@ pub fn sparql_execute(
     // `spargebra =0.3.5`), and what crossed instead was the query *rendered
     // back to SPARQL* for oxigraph's own parser to read again — a round trip
     // whose only job was to bridge two versions of one crate.
-    let mut parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)
-        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-
-    // One slot, two spellings -- and one class, two spellings. The data
-    // carries the canonical IRI (the declared `slot_uri` / `class_uri`); a
-    // query author writes the readable native one. The planner resolves the
-    // alias on its own parse, so this leg has to resolve it on this one --
-    // otherwise the SQL leg answers the native spelling and the engine answers
-    // nothing, which is a silent route-dependent answer rather than the silent
-    // empty column it replaced. The same pass refuses a predicate the
-    // subject's class cannot carry, so the two legs refuse the same queries
-    // too. See [`crate::sparql_alias`].
-    crate::sparql_alias::canonicalize(&mut parsed, schema_view)
-        .map_err(|e| ExecuteError::QueryError(e.to_string()))?;
-
     evaluate_with_ceiling(parsed, store, limits)
+}
+
+impl From<crate::sparql_dataset::DatasetSpecError> for ExecuteError {
+    fn from(error: crate::sparql_dataset::DatasetSpecError) -> Self {
+        ExecuteError::QueryError(format!("the dataset is invalid: {error}"))
+    }
+}
+
+/// Put every schema graph `query` can read into `store`, each in its own
+/// named graph under its own regime.
+///
+/// Only the ones the query names (see
+/// [`crate::sparql_graph_clauses::schema_graphs_read`]): a query that reads
+/// none pays nothing, and one that reads one pays for one.
+#[cfg(feature = "sparql-endpoint")]
+fn insert_schema_graphs(
+    store: &Store,
+    query: &str,
+    schema_view: &SchemaView,
+    dataset: &DatasetSpec,
+) -> Result<(), ExecuteError> {
+    for (iri, regime) in
+        crate::sparql_graph_clauses::schema_graphs_read(query, schema_view, dataset)
+    {
+        let schema_graph =
+            crate::sparql_schema_graph::SchemaGraph::build(schema_view, &iri, regime)
+                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+        for quad in &schema_graph.quads {
+            store
+                .insert(quad)
+                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a query that names a data graph the engine does not hold.
+///
+/// **Temporary.** The engine loads every record into the default graph under
+/// the dataset's default regime and nothing else, so a `GRAPH <data graph>`,
+/// a `FROM <data graph>` or a `FROM NAMED <data graph>` would be evaluated
+/// against a graph that is empty -- a silently wrong answer where the SQL
+/// route, which reads each pattern under its graph's regime, gives the right
+/// one. Refused by name until the engine evaluates named data graphs.
+///
+/// A `FROM` naming only the default graph's own IRI is the default graph
+/// said out loud, and is accepted: the clause is dropped, since the store has
+/// no graph of that name and the engine would otherwise read an empty one.
+#[cfg(feature = "sparql-endpoint")]
+fn refuse_named_data_graphs(
+    query: &mut spargebra::Query,
+    dataset: &DatasetSpec,
+) -> Result<(), ExecuteError> {
+    use spargebra::Query;
+    use spargebra::algebra::GraphPattern;
+    use spargebra::term::NamedNodePattern;
+
+    fn named(pattern: &GraphPattern, dataset: &DatasetSpec, out: &mut Vec<String>) {
+        for block in crate::sparql_scoper::exists_patterns_in_expressions_of(pattern) {
+            named(block, dataset, out);
+        }
+        match pattern {
+            GraphPattern::Graph { name, inner } => {
+                if let NamedNodePattern::NamedNode(graph) = name
+                    && dataset.data_regime(graph.as_str()).is_some()
+                {
+                    out.push(graph.as_str().to_owned());
+                }
+                named(inner, dataset, out);
+            }
+            GraphPattern::Join { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
+            | GraphPattern::Minus { left, right } => {
+                named(left, dataset, out);
+                named(right, dataset, out);
+            }
+            GraphPattern::LeftJoin { left, right, .. } => {
+                named(left, dataset, out);
+                named(right, dataset, out);
+            }
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => named(inner, dataset, out),
+            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+        }
+    }
+
+    let mut offending: Vec<String> = Vec::new();
+    {
+        let pattern = match &*query {
+            Query::Select { pattern, .. }
+            | Query::Construct { pattern, .. }
+            | Query::Describe { pattern, .. }
+            | Query::Ask { pattern, .. } => pattern,
+        };
+        named(pattern, dataset, &mut offending);
+    }
+    let clause = match query {
+        Query::Select { dataset, .. }
+        | Query::Construct { dataset, .. }
+        | Query::Describe { dataset, .. }
+        | Query::Ask { dataset, .. } => dataset,
+    };
+    if let Some(spec) = clause.as_ref() {
+        // The default graph said out loud, and only that.
+        let only_the_default = spec.named.as_ref().is_none_or(Vec::is_empty)
+            && !spec.default.is_empty()
+            && spec
+                .default
+                .iter()
+                .all(|graph| dataset.default_graph() == Some(graph.as_str()));
+        if only_the_default {
+            *clause = None;
+        } else {
+            for graph in spec.default.iter().chain(spec.named.iter().flatten()) {
+                if dataset.data_regime(graph.as_str()).is_some() {
+                    offending.push(graph.as_str().to_owned());
+                }
+            }
+        }
+    }
+    if let Some(graph) = offending.first() {
+        return Err(ExecuteError::QueryError(format!(
+            "named data graphs are not yet evaluated by the engine: <{graph}> is a data graph \
+             of this dataset, and only the SQL route reads one"
+        )));
+    }
+    Ok(())
 }
 
 /// Evaluate a parsed query over a loaded store under the caller's limits,
@@ -784,10 +919,11 @@ pub fn sparql_finish(
     solutions_json: &str,
     schema_view: &SchemaView,
     limits: ExecuteLimits,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Result<SparqlAnswer, ExecuteError> {
     use crate::sparql_plan::{EngineInput, PassKind};
 
+    dataset.validate()?;
     let Some((vars, ordinal, finish)) = plan.passes.iter().find_map(|pass| match &pass.kind {
         PassKind::Engine(engine) => match &engine.input {
             EngineInput::Solutions {
@@ -891,18 +1027,7 @@ pub fn sparql_finish(
     }
 
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-    if let Some(schema_graph_iri) = schema_graph_iri
-        && crate::sparql_graph_clauses::query_reads_named_graphs(finish, schema_view)
-    {
-        let schema_graph =
-            crate::sparql_schema_graph::SchemaGraph::build(schema_view, schema_graph_iri)
-                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-        for quad in &schema_graph.quads {
-            store
-                .insert(quad)
-                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-        }
-    }
+    insert_schema_graphs(&store, finish, schema_view, dataset)?;
     evaluate_with_ceiling(parsed, store, limits)
 }
 
@@ -1013,7 +1138,7 @@ classes:
             &refs,
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -1022,6 +1147,74 @@ classes:
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[0]["name"]["value"], "BX517");
         assert_eq!(bindings[1]["name"]["value"], "BX518");
+    }
+
+    /// The engine holds the records in the default graph only, so a query
+    /// naming a data graph is refused by name until it evaluates them -- never
+    /// answered from a graph that is empty. The default graph's own IRI in a
+    /// `FROM` is the default graph said out loud and is accepted; a schema
+    /// graph is not a data graph.
+    #[test]
+    fn a_named_data_graph_is_refused_until_the_engine_evaluates_it() {
+        use linkml_runtime::schema_rdf::TypeRegime;
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        let sv = test_schema_view();
+        let instances = signal_instances(&sv);
+        let refs: Vec<&LinkMLInstance> = instances.iter().collect();
+        let dataset = DatasetSpec::default()
+            .with_data_graph(A, TypeRegime::Asserted)
+            .with_data_graph(I, TypeRegime::IsA)
+            .with_default_graph(A)
+            .with_schema_graph("urn:graph:schema", TypeRegime::IsA);
+        let run = |query: &str| {
+            sparql_execute(
+                &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+                &refs,
+                &sv,
+                ExecuteLimits::default(),
+                &dataset,
+            )
+        };
+        let body = "?s a asset360:Signal ; asset360:name ?name";
+        for query in [
+            format!("SELECT ?s WHERE {{ GRAPH <{I}> {{ {body} }} }}"),
+            format!("SELECT ?s FROM <{I}> WHERE {{ {body} }}"),
+            format!("SELECT ?s FROM <{A}> FROM <{I}> WHERE {{ {body} }}"),
+            format!("SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {{ {body} }} }}"),
+            // The default graph by its own name is still a *graph* in a
+            // `GRAPH` clause, which the store has no such name for.
+            format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"),
+        ] {
+            match run(&query) {
+                Err(ExecuteError::QueryError(message)) => assert!(
+                    message.contains("named data graphs are not yet evaluated"),
+                    "{query}: {message}"
+                ),
+                other => panic!("`{query}` must be refused, got {other:?}"),
+            }
+        }
+        // The default graph said out loud, and no clause at all, answer.
+        for query in [
+            format!("SELECT ?s WHERE {{ {body} }}"),
+            format!("SELECT ?s FROM <{A}> WHERE {{ {body} }}"),
+        ] {
+            let answer = run(&query).unwrap_or_else(|e| panic!("`{query}`: {e}"));
+            let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+            assert_eq!(parsed["results"]["bindings"].as_array().unwrap().len(), 2);
+        }
+        // An invalid dataset is refused before anything is loaded.
+        let invalid = DatasetSpec::default().with_default_graph(A);
+        assert!(matches!(
+            sparql_execute(
+                "SELECT ?s WHERE { ?s ?p ?o }",
+                &refs,
+                &sv,
+                ExecuteLimits::default(),
+                &invalid
+            ),
+            Err(ExecuteError::QueryError(m)) if m.contains("not a registered data graph")
+        ));
     }
 
     #[test]
@@ -1035,7 +1228,7 @@ classes:
             &refs,
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -1054,7 +1247,7 @@ classes:
             &refs,
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -1077,7 +1270,7 @@ classes:
                 max_result_rows: 1,
                 max_eval_millis: None,
             },
-            None,
+            crate::sparql_dataset::default_dataset(),
         );
 
         assert!(matches!(
@@ -1115,7 +1308,7 @@ classes:
                 max_result_rows: 10,
                 max_eval_millis: Some(1),
             },
-            None,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(
@@ -1152,7 +1345,7 @@ classes:
                 max_result_rows: 10_000,
                 max_eval_millis: Some(30_000),
             },
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a query under the ceiling answers");
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
@@ -1186,8 +1379,20 @@ classes:
         // Stand in for evaluations the ceiling gave up on and that are still
         // running; undone below whatever the assertions say.
         ABANDONED_EVALUATIONS.fetch_add(MAX_ABANDONED_EVALUATIONS, Ordering::SeqCst);
-        let refused = sparql_execute(query, &refs, &sv, with_ceiling, None);
-        let unbounded = sparql_execute(query, &refs, &sv, ExecuteLimits::default(), None);
+        let refused = sparql_execute(
+            query,
+            &refs,
+            &sv,
+            with_ceiling,
+            crate::sparql_dataset::default_dataset(),
+        );
+        let unbounded = sparql_execute(
+            query,
+            &refs,
+            &sv,
+            ExecuteLimits::default(),
+            crate::sparql_dataset::default_dataset(),
+        );
         ABANDONED_EVALUATIONS.fetch_sub(MAX_ABANDONED_EVALUATIONS, Ordering::SeqCst);
 
         assert!(
@@ -1212,7 +1417,7 @@ classes:
                 max_result_rows: 10_000,
                 max_eval_millis: Some(30_000),
             },
-            None,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(answered.is_ok(), "{answered:?}");
     }
@@ -1232,7 +1437,7 @@ classes:
                 max_result_rows: 10_000,
                 max_eval_millis: None,
             },
-            None,
+            crate::sparql_dataset::default_dataset(),
         );
 
         assert!(matches!(
@@ -1271,7 +1476,7 @@ classes:
                 max_result_rows: 10_000,
                 max_eval_millis: None,
             },
-            None,
+            crate::sparql_dataset::default_dataset(),
         );
 
         let Err(ExecuteError::TripleLimitExceeded { count, limit }) = result else {
@@ -1324,7 +1529,7 @@ classes:
             &refs,
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result.body).unwrap();
@@ -1348,7 +1553,7 @@ classes:
             &refs,
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -1375,7 +1580,7 @@ classes:
             &refs,
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -1400,7 +1605,7 @@ classes:
             &refs,
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -1419,7 +1624,7 @@ classes:
             &[],
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         );
 
         let message = match result {
@@ -1548,7 +1753,7 @@ classes:
             &refs,
             sv,
             super::ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("query executes");
         let parsed: serde_json::Value = serde_json::from_str(&json.body).unwrap();
@@ -1790,7 +1995,7 @@ classes:
             &refs,
             &sv,
             super::ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("query executes");
 
@@ -1895,7 +2100,7 @@ classes:
             &refs,
             sv,
             ExecuteLimits::default(),
-            Some(SCHEMA_GRAPH_IRI),
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),
         )
         .unwrap_or_else(|err| panic!("query failed: {err}\n{query}"));
         serde_json::from_str(&raw.body).unwrap()
@@ -2001,7 +2206,7 @@ classes:
                 &refs,
                 &sv,
                 ExecuteLimits::default(),
-                Some(SCHEMA_GRAPH_IRI),
+                &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),
             )
             .unwrap_or_else(|err| panic!("{query}: {err}"));
             let with_schema_loaded = sparql_execute(
@@ -2009,7 +2214,7 @@ classes:
                 &refs,
                 &sv,
                 ExecuteLimits::default(),
-                Some(SCHEMA_GRAPH_IRI),
+                &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH_IRI),
             )
             .unwrap_or_else(|err| panic!("{forced}: {err}"));
 
@@ -2299,7 +2504,7 @@ classes:
             &refs,
             &sv,
             super::ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("query executes");
 
@@ -2421,7 +2626,7 @@ classes:
             &refs,
             &sv,
             ExecuteLimits::default(),
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
