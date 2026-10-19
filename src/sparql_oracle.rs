@@ -150,71 +150,127 @@ pub fn ordered_answers(oracle: &Oracle, query: spargebra::Query) -> Vec<BTreeMap
 /// `parts[0].children[1]` equals `parts[1].children[1]`, and a reference hop
 /// with and without a target.
 pub fn fixture(schema: &SchemaView) -> Oracle {
-    Oracle::new(
-        schema,
-        &[
-            (
-                "Track",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/T1", "hasName": "Main"}"#,
-            ),
-            (
-                "Track",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/T2", "hasName": "Side"}"#,
-            ),
-            // Two signals identical in every read slot: duplicate mappings.
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/A", "name": "Alpha", "length": 3,
+    Oracle::new(schema, &fixture_records())
+}
+
+/// Classes to append to the test schema ([`crate::sparql_scoper::tests::test_schema_view_plus`])
+/// for [`fixture_in`]: a real mixin (`Tag`) and a class that carries it
+/// (`Trip`, an `Equipment`), so a regime that lists mixins as types has
+/// something to list. The `is_a` chain (`Equipment` > `Relay` > `LatchRelay`)
+/// is already in the base schema.
+pub const MIXIN_CLASSES: &str = r#"
+  Tag:
+    class_uri: asset360:Tag
+    mixin: true
+  Trip:
+    class_uri: asset360:Trip
+    is_a: Equipment
+    mixins: [Tag]
+"#;
+
+/// [`fixture`] written under type regime `regime`, plus one record of each
+/// class of the `is_a` chain and a mixin carrier, so that the regimes differ
+/// in what the store holds. `schema` has to carry [`MIXIN_CLASSES`].
+pub fn fixture_in(schema: &SchemaView, regime: TypeRegime) -> Oracle {
+    let mut records = fixture_records();
+    records.extend([
+        (
+            "Equipment",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/E1", "label": "e"}"#,
+        ),
+        (
+            "Relay",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/R1", "label": "r", "voltage": 5}"#,
+        ),
+        (
+            "LatchRelay",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/L1", "label": "l", "voltage": 5}"#,
+        ),
+        (
+            "Trip",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/T1", "label": "t"}"#,
+        ),
+    ]);
+    Oracle::new_in(schema, &records, regime)
+}
+
+impl Oracle {
+    /// The datamodel as one more graph of the store, named `iri` and
+    /// publishing the schema under `regime`: what a dataset serving a schema
+    /// graph shows a `GRAPH <iri> { ... }`.
+    pub fn with_schema_graph(self, schema: &SchemaView, iri: &str, regime: TypeRegime) -> Self {
+        let graph = crate::sparql_schema_graph::SchemaGraph::build(schema, iri, regime)
+            .unwrap_or_else(|e| panic!("{e}"));
+        for quad in &graph.quads {
+            self.store.insert(quad).unwrap();
+        }
+        self
+    }
+}
+
+fn fixture_records() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "Track",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/T1", "hasName": "Main"}"#,
+        ),
+        (
+            "Track",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/T2", "hasName": "Side"}"#,
+        ),
+        // Two signals identical in every read slot: duplicate mappings.
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/A", "name": "Alpha", "length": 3,
                     "trafficKinds": ["m", "m", "p"],
                     "documents": {"d1": {"docId": "d1", "title": "One"}, "d2": {"docId": "d2", "title": "Two"}},
                     "locatedOnTrack": "https://data.infrabel.be/asset360/track/T1"}"#,
-            ),
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/B", "name": "Alpha", "length": 3,
+        ),
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/B", "name": "Alpha", "length": 3,
                     "trafficKinds": ["m", "m", "p"],
                     "documents": {"d1": {"docId": "d1", "title": "One"}, "d2": {"docId": "d2", "title": "Two"}},
                     "locatedOnTrack": "https://data.infrabel.be/asset360/track/T1"}"#,
-            ),
-            // No array entries, no track, no name.
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/C", "length": 7}"#,
-            ),
-            // A track reference to a record that is not there.
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/D", "name": "Delta", "length": 3,
+        ),
+        // No array entries, no track, no name.
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/C", "length": 7}"#,
+        ),
+        // A track reference to a record that is not there.
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/D", "name": "Delta", "length": 3,
                     "trafficKinds": ["p"],
                     "documents": {"d9": {"docId": "d9", "title": "Nine"}},
                     "locatedOnTrack": "https://data.infrabel.be/asset360/track/T-missing"}"#,
-            ),
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/E", "name": "Echo", "length": 1,
+        ),
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/E", "name": "Echo", "length": 1,
                     "locatedOnTrack": "https://data.infrabel.be/asset360/track/T2"}"#,
-            ),
-            (
-                "BaliseGroup",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/bg/G1", "refersToSignal": "https://data.infrabel.be/asset360/signal/A"}"#,
-            ),
-            (
-                "BaliseGroup",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/bg/G2", "refersToSignal": "https://data.infrabel.be/asset360/signal/A"}"#,
-            ),
-            // The nested occurrence: parts[0].children[1] = parts[1].children[1];
-            // and a duplicated structure, parts[2] = parts[3], which are two
-            // blank nodes (`documents` is a mapping, so it cannot hold one).
-            (
-                "Assembly",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/assembly/X",
+        ),
+        (
+            "BaliseGroup",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/bg/G1", "refersToSignal": "https://data.infrabel.be/asset360/signal/A"}"#,
+        ),
+        (
+            "BaliseGroup",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/bg/G2", "refersToSignal": "https://data.infrabel.be/asset360/signal/A"}"#,
+        ),
+        // The nested occurrence: parts[0].children[1] = parts[1].children[1];
+        // and a duplicated structure, parts[2] = parts[3], which are two
+        // blank nodes (`documents` is a mapping, so it cannot hold one).
+        (
+            "Assembly",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/assembly/X",
                     "parts": [{"label": "p0", "children": [{"label": "c0"}, {"label": "same"}]},
                               {"label": "p1", "children": [{"label": "c1"}, {"label": "same"}]},
                               {"label": "dup", "children": [{"label": "d"}]},
                               {"label": "dup", "children": [{"label": "d"}]}]}"#,
-            ),
-        ],
-    )
+        ),
+    ]
 }
 
 /// A design probe: `query` over a store holding exactly `turtle` (N-Triples

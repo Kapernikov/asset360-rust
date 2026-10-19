@@ -1158,9 +1158,11 @@ mod tests {
 #[cfg(all(test, feature = "sparql-endpoint"))]
 pub(crate) mod equivalence {
     use super::*;
+    use crate::sparql_dataset::DatasetSpec;
     use crate::sparql_oracle::{Oracle, fixture};
     use crate::sparql_rules::{Rule, tier_one_rules};
     use crate::sparql_scoper::tests::test_schema_view;
+    use linkml_runtime::schema_rdf::TypeRegime;
 
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
          PREFIX sesame: <http://www.openrdf.org/schema/sesame#> ";
@@ -1428,29 +1430,123 @@ pub(crate) mod equivalence {
         out
     }
 
+    /// The test schema with an `is_a` chain and a real mixin, and the oracle
+    /// holding the fixture written under `regime`: what each corpus test below
+    /// runs against once per regime, with the dataset whose default graph is
+    /// that regime. A rule that is only sound under the asserted regime is
+    /// caught here and not by the asserted-only oracle.
+    fn in_each_regime(mut each: impl FnMut(TypeRegime, &SchemaView, &Oracle, &DatasetSpec)) {
+        let schema =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        for regime in TypeRegime::ALL {
+            let oracle = crate::sparql_oracle::fixture_in(&schema, regime);
+            each(regime, &schema, &oracle, &DatasetSpec::new(regime));
+        }
+    }
+
     /// (a) a fixpoint with every invariant holding, (b) lowers or names the
     /// node that stopped it, (d) each rewrite alone answer-preserving --
     /// over the whole grammar, exhaustively.
     #[test]
     fn every_rewrite_of_every_grammar_query_preserves_the_answer() {
-        let schema = test_schema_view();
-        let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
-        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let grammar = grammar();
         assert!(grammar.len() > 100, "{}", grammar.len());
         let mut lowered = 0;
-        for query in &grammar {
-            let plan = each_rewrite_preserves_answers(query, &schema, &oracle, &borrowed);
-            match crate::sparql_ops::lower_refined(&plan, &schema, None, None) {
-                Ok(_) => lowered += 1,
-                Err(refusal) => {
-                    // Names the node, or the shape: never a panic.
-                    let _ = refusal.to_string();
+        in_each_regime(|regime, schema, oracle, dataset| {
+            let rules = tier_one_rules(schema, dataset);
+            let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            for query in &grammar {
+                let plan =
+                    each_rewrite_preserves_answers_in(query, schema, oracle, &borrowed, dataset);
+                match crate::sparql_ops::lower_refined(&plan, schema, None, None) {
+                    Ok(_) => lowered += 1,
+                    Err(refusal) => {
+                        // Names the node, or the shape: never a panic.
+                        let _ = format!("{regime:?}: {refusal}");
+                    }
+                }
+            }
+        });
+        assert!(lowered > 0);
+    }
+
+    /// The type queries -- `?s a ?t`, `sesame:directType`, and the spelling
+    /// of "the most specific type" over the schema graph -- under every data
+    /// regime and every regime the schema graph can publish. The grammar
+    /// above never types a subject by a variable, so the rules about types
+    /// (the type table, the direct type, the parent-type fold) are held to the
+    /// oracle here, over an `is_a` chain and a mixin.
+    #[test]
+    fn every_rewrite_of_the_type_queries_preserves_the_answer_in_every_regime() {
+        const G: &str = "https://data.infrabel.be/asset360/schema";
+        let queries = [
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
+            "SELECT ?s ?d WHERE { ?s a asset360:Equipment ; sesame:directType ?d }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; asset360:label ?l ; a ?t }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Tag }",
+            "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; a ?t } GROUP BY ?t",
+            // The most specific type, spelt over the schema graph.
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t WHERE { ?s a ?t FILTER NOT EXISTS { ?s a ?sub . \
+             GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t FILTER NOT EXISTS { ?s a ?sub . \
+             GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
+        ];
+        let schema =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        for regime in TypeRegime::ALL {
+            for graph in TypeRegime::ALL {
+                let oracle = crate::sparql_oracle::fixture_in(&schema, regime)
+                    .with_schema_graph(&schema, G, graph);
+                let dataset = DatasetSpec::new(regime).with_schema_graph(G, graph);
+                let rules = tier_one_rules(&schema, &dataset);
+                let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+                for query in queries {
+                    let plan = each_rewrite_preserves_answers_in(
+                        query, &schema, &oracle, &borrowed, &dataset,
+                    );
+                    // Not vacuous: where the data says its types and the
+                    // schema graph agrees with it, the NOT EXISTS is the
+                    // direct type: no anti-join left.
+                    if query.contains("NOT EXISTS")
+                        && regime != TypeRegime::Asserted
+                        && graph == regime
+                    {
+                        assert!(!plan.to_string().contains("antijoin"), "{query}\n{plan}");
+                    }
                 }
             }
         }
-        assert!(lowered > 0);
+    }
+
+    /// Review F2, as the oracle sees it: `?sub` is bound outside the NOT
+    /// EXISTS, so the filter does not depend on `?s` and `?t` alone and the
+    /// most-specific-type rewrite (R1, `sparql_typed_subjects`) changes the
+    /// answer. Left failing on purpose: the rule is not R3's to fix.
+    #[test]
+    #[ignore = "R1/R2: MostSpecificTypeIsTheDirectType fires with ?sub bound outside the NOT EXISTS (review F2)"]
+    fn a_variable_bound_outside_the_not_exists_keeps_the_most_specific_type_rewrite_honest() {
+        const G: &str = "https://data.infrabel.be/asset360/schema";
+        let schema =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let regime = TypeRegime::IsA;
+        let oracle =
+            crate::sparql_oracle::fixture_in(&schema, regime).with_schema_graph(&schema, G, regime);
+        let dataset = DatasetSpec::new(regime).with_schema_graph(G, regime);
+        let rules = tier_one_rules(&schema, &dataset);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        each_rewrite_preserves_answers_in(
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t WHERE { VALUES ?sub { asset360:Equipment } ?s a ?t FILTER NOT EXISTS { \
+             ?s a ?sub . GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
+            &schema,
+            &oracle,
+            &borrowed,
+            &dataset,
+        );
     }
 
     /// The same, under the three legal schedules: the list, the list
@@ -1458,20 +1554,20 @@ pub(crate) mod equivalence {
     /// plans; both must answer the query.
     #[test]
     fn every_schedule_answers_the_same() {
-        let schema = test_schema_view();
-        let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
-        let forwards: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
-        let backwards: Vec<&dyn Rule> = rules.iter().rev().map(|rule| rule.as_ref()).collect();
-        let mut permuted: Vec<&dyn Rule> = forwards.clone();
-        // A fixed permutation: rotate by a third.
-        let third = permuted.len() / 3;
-        permuted.rotate_left(third);
-        for query in grammar().iter().step_by(3) {
-            for schedule in [&forwards, &backwards, &permuted] {
-                each_rewrite_preserves_answers(query, &schema, &oracle, schedule);
+        in_each_regime(|_, schema, oracle, dataset| {
+            let rules = tier_one_rules(schema, dataset);
+            let forwards: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            let backwards: Vec<&dyn Rule> = rules.iter().rev().map(|rule| rule.as_ref()).collect();
+            let mut permuted: Vec<&dyn Rule> = forwards.clone();
+            // A fixed permutation: rotate by a third.
+            let third = permuted.len() / 3;
+            permuted.rotate_left(third);
+            for query in grammar().iter().step_by(3) {
+                for schedule in [&forwards, &backwards, &permuted] {
+                    each_rewrite_preserves_answers_in(query, schema, oracle, schedule, dataset);
+                }
             }
-        }
+        });
     }
 
     /// `MAX_ROUNDS = 1` over the grammar: every plan passes every invariant,
@@ -1479,24 +1575,24 @@ pub(crate) mod equivalence {
     /// leaves a correct, less refined plan (design test 11(v)).
     #[test]
     fn one_round_leaves_a_correct_plan() {
-        let schema = test_schema_view();
-        let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
-        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
-        for query in grammar().iter().step_by(5) {
-            let text = format!("{PREFIX}{query}");
-            let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
-            let expected = answers(&oracle, &parsed);
-            let mut plan = crate::sparql_refine::naive_plan(&parsed).unwrap();
-            for rule in &borrowed {
-                rule.apply(&mut plan);
+        in_each_regime(|_, schema, oracle, dataset| {
+            let rules = tier_one_rules(schema, dataset);
+            let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            for query in grammar().iter().step_by(5) {
+                let text = format!("{PREFIX}{query}");
+                let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
+                let expected = answers(oracle, &parsed);
+                let mut plan = crate::sparql_refine::naive_plan_in(&parsed, dataset).unwrap();
+                for rule in &borrowed {
+                    rule.apply(&mut plan);
+                }
+                plan.check_with(schema)
+                    .unwrap_or_else(|d| panic!("{d}\n{query}\n{plan}"));
+                let translated = plan_to_query(&plan, schema).unwrap();
+                assert_eq!(answers(oracle, &translated), expected, "{query}\n{plan}");
+                let _ = crate::sparql_ops::lower_refined(&plan, schema, None, None);
             }
-            plan.check_with(&schema)
-                .unwrap_or_else(|d| panic!("{d}\n{query}\n{plan}"));
-            let translated = plan_to_query(&plan, &schema).unwrap();
-            assert_eq!(answers(&oracle, &translated), expected, "{query}\n{plan}");
-            let _ = crate::sparql_ops::lower_refined(&plan, &schema, None, None);
-        }
+        });
     }
 
     /// **Direct tests for the nodes the round trip never exercises**: a
