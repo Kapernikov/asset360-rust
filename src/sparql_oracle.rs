@@ -190,6 +190,14 @@ pub fn fixture_in(schema: &SchemaView, regime: TypeRegime) -> Oracle {
             "Trip",
             r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/T1", "label": "t"}"#,
         ),
+        (
+            "Switch",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/S1", "label": "s"}"#,
+        ),
+        (
+            "Breaker",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/B1", "label": "b"}"#,
+        ),
     ]);
     Oracle::new_in(schema, &records, regime)
 }

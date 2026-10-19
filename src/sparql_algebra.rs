@@ -1487,6 +1487,32 @@ pub(crate) mod equivalence {
             "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
             "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Tag }",
             "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; a ?t } GROUP BY ?t",
+            // #511 chain fold: both orders, VALUES-narrowed, a three-class
+            // chain, a mixin, and siblings (no fold) as the control. Under
+            // the asserted regime parent + sub is empty.
+            "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment , asset360:Relay }",
+            "SELECT ?s WHERE { VALUES ?s { <https://data.infrabel.be/asset360/eq/L1> } \
+             ?s a asset360:Equipment , asset360:LatchRelay }",
+            "SELECT ?s WHERE { VALUES ?s { <https://data.infrabel.be/asset360/eq/L1> } \
+             ?s a asset360:LatchRelay , asset360:Equipment }",
+            "SELECT ?s WHERE { ?s a asset360:LatchRelay , asset360:Relay , asset360:Equipment }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment , asset360:LatchRelay , asset360:Relay }",
+            "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment , asset360:LatchRelay }",
+            "SELECT ?s WHERE { ?s a asset360:Trip , asset360:Equipment , asset360:Tag }",
+            "SELECT ?s WHERE { ?s a asset360:Tag , asset360:Trip }",
+            "SELECT ?s WHERE { ?s a asset360:Switch , asset360:Breaker }",
+            "SELECT ?s WHERE { ?s a asset360:Switch , asset360:Relay }",
+            // The lowering discharge check: a subclass scan discharges the
+            // parent's type claim.
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment . ?s a asset360:Relay }",
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Relay . ?s a asset360:Equipment }",
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment . ?s a asset360:Tag }",
+            // #512: a slot only the subclass declares, on a parent-typed subject.
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment ; asset360:voltage ?v }",
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment . OPTIONAL { ?s asset360:voltage ?v } }",
+            "SELECT ?s ?l ?v WHERE { ?s a asset360:Equipment ; asset360:label ?l . \
+             OPTIONAL { ?s asset360:voltage ?v } }",
             // The most specific type, spelt over the schema graph.
             "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
              SELECT ?s ?t WHERE { ?s a ?t FILTER NOT EXISTS { ?s a ?sub . \
@@ -1494,6 +1520,11 @@ pub(crate) mod equivalence {
             "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
              SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t FILTER NOT EXISTS { ?s a ?sub . \
              GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
+            // Review F2: `?sub` is bound outside the NOT EXISTS, so this is
+            // not the most-specific-type spelling and must not be rewritten.
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t WHERE { VALUES ?sub { asset360:Equipment } ?s a ?t FILTER NOT EXISTS { \
+             ?s a ?sub . GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
         ];
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
@@ -1504,6 +1535,51 @@ pub(crate) mod equivalence {
                 let dataset = DatasetSpec::new(regime).with_schema_graph(G, graph);
                 let rules = tier_one_rules(&schema, &dataset);
                 let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+                // #515 spelling 1: the path is reduced to the class scan
+                // before planning (`sparql_paths`), so the engine's answer
+                // to the query as written is the bar for the reduced query
+                // and for the plan built from it.
+                for query in [
+                    "SELECT ?s WHERE { ?s a/rdfs:subClassOf* asset360:Equipment }",
+                    "SELECT ?s WHERE { ?s a/rdfs:subClassOf* asset360:Relay }",
+                    "SELECT ?s WHERE { ?s a/rdfs:subClassOf* asset360:Tag }",
+                    "SELECT (COUNT(?s) AS ?n) WHERE { ?s a/rdfs:subClassOf* asset360:Equipment }",
+                    "SELECT ?s ?l WHERE { ?s a/rdfs:subClassOf* asset360:Equipment ; asset360:label ?l }",
+                ] {
+                    let text = format!(
+                        "{PREFIX}PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {query}"
+                    );
+                    let original = crate::sparql_scoper::parse_query(&text).unwrap();
+                    let mut reduced = original.clone();
+                    crate::sparql_paths::reduce_paths(&mut reduced, &schema);
+                    assert_eq!(
+                        answers(&oracle, &reduced),
+                        answers(&oracle, &original),
+                        "{regime:?}/{graph:?} reduction vs engine: {query}\n{reduced}"
+                    );
+                    each_rewrite_preserves_answers_in(
+                        &reduced.to_string(),
+                        &schema,
+                        &oracle,
+                        &borrowed,
+                        &dataset,
+                    );
+                }
+                if regime == TypeRegime::Asserted {
+                    // Not vacuous: parent + subclass is empty when the data
+                    // asserts each record's own class only, and not otherwise.
+                    let both = crate::sparql_scoper::parse_query(&format!(
+                        "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
+                    ))
+                    .unwrap();
+                    assert!(answers(&oracle, &both).is_empty());
+                } else {
+                    let both = crate::sparql_scoper::parse_query(&format!(
+                        "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
+                    ))
+                    .unwrap();
+                    assert!(!answers(&oracle, &both).is_empty());
+                }
                 for query in queries {
                     let plan = each_rewrite_preserves_answers_in(
                         query, &schema, &oracle, &borrowed, &dataset,
@@ -1512,6 +1588,7 @@ pub(crate) mod equivalence {
                     // schema graph agrees with it, the NOT EXISTS is the
                     // direct type: no anti-join left.
                     if query.contains("NOT EXISTS")
+                        && !query.contains("VALUES ?sub")
                         && regime != TypeRegime::Asserted
                         && graph == regime
                     {
