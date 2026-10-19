@@ -1369,7 +1369,7 @@ pub fn sparql_scope(
 /// ([`crate::sparql_schema_graph`]) writes `https://schema.org/domainIncludes`.
 /// A parser that took the schema's spelling would parse a discovery query
 /// into IRIs the graph never carries — a silent empty answer.
-pub const ENDPOINT_PREFIXES: [(&str, &str); 7] = [
+pub const ENDPOINT_PREFIXES: &[(&str, &str)] = &[
     ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
     ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
     ("owl", "http://www.w3.org/2002/07/owl#"),
@@ -1421,7 +1421,7 @@ pub fn predeclared_prefixes(
     schema_view: &SchemaView,
 ) -> std::collections::BTreeMap<String, String> {
     let mut out = schema_prefixes(schema_view);
-    for (label, namespace) in ENDPOINT_PREFIXES {
+    for &(label, namespace) in ENDPOINT_PREFIXES {
         out.insert(label.to_owned(), namespace.to_owned());
     }
     out
@@ -1473,7 +1473,7 @@ pub fn sparql_parser_for(schema_view: &SchemaView) -> SparqlParser {
 /// client takes the other one.
 pub fn sparql_parser() -> SparqlParser {
     let mut parser = SparqlParser::new();
-    for (label, namespace) in ENDPOINT_PREFIXES {
+    for &(label, namespace) in ENDPOINT_PREFIXES {
         parser = parser
             .with_prefix(label, namespace)
             .expect("hardcoded prefix");
@@ -9792,7 +9792,7 @@ classes:
         // The metamodel's own prefixes name nothing a query could bind.
         assert!(!predeclared.contains_key("linkml"));
         assert!(!predeclared.contains_key("shex"));
-        for (label, _) in ENDPOINT_PREFIXES {
+        for &(label, _) in ENDPOINT_PREFIXES {
             assert!(predeclared.contains_key(label), "{label}");
         }
         let parsed =
