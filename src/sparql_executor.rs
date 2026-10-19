@@ -479,10 +479,10 @@ fn insert_schema_graphs(
     for (iri, regime) in
         crate::sparql_graph_clauses::schema_graphs_read(query, schema_view, dataset)
     {
-        let schema_graph =
-            crate::sparql_schema_graph::SchemaGraph::build(schema_view, &iri, regime)
-                .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
-        for quad in &schema_graph.quads {
+        let quads = crate::sparql_schema_graph::SchemaGraph::build(schema_view, regime)
+            .quads_in(&iri)
+            .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
+        for quad in &quads {
             store
                 .insert(quad)
                 .map_err(|e| ExecuteError::StoreError(e.to_string()))?;

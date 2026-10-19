@@ -207,9 +207,10 @@ impl Oracle {
     /// publishing the schema under `regime`: what a dataset serving a schema
     /// graph shows a `GRAPH <iri> { ... }`.
     pub fn with_schema_graph(self, schema: &SchemaView, iri: &str, regime: TypeRegime) -> Self {
-        let graph = crate::sparql_schema_graph::SchemaGraph::build(schema, iri, regime)
+        let quads = crate::sparql_schema_graph::SchemaGraph::build(schema, regime)
+            .quads_in(iri)
             .unwrap_or_else(|e| panic!("{e}"));
-        for quad in &graph.quads {
+        for quad in &quads {
             self.store.insert(quad).unwrap();
         }
         self

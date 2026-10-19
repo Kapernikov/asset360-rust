@@ -7652,7 +7652,7 @@ def sparql_reads_only_the_schema_graph(query:builtins.str, schema_view:SchemaVie
             graph (the variable can bind nothing else).
     """
 
-def sparql_schema_graph_ntriples(schema_view:SchemaView, dataset:DatasetSpec, graph_iri:builtins.str) -> builtins.str:
+def sparql_schema_graph_ntriples(schema_view:SchemaView, regime:TypeRegime) -> builtins.str:
     r"""
     The datamodel's schema graph, as N-Triples.
     
@@ -7661,17 +7661,11 @@ def sparql_schema_graph_ntriples(schema_view:SchemaView, dataset:DatasetSpec, gr
     
     Args:
         schema_view: The LinkML schema.
-        dataset: The :class:`DatasetSpec` that serves the graph.
-        graph_iri: The schema graph to build -- one of the dataset's
-            ``schema_graphs``, whose regime decides which subclass edges it
-            publishes.
-    
-    Raises:
-        ValueError: ``graph_iri`` is not a schema graph of the dataset, or is
-            not an absolute IRI.
+        regime: The :class:`TypeRegime` the subclass edges are published
+            under (a schema graph of a dataset publishes under its own).
     """
 
-def sparql_schema_graph_skipped(schema_view:SchemaView, dataset:DatasetSpec, graph_iri:builtins.str) -> builtins.list[builtins.str]:
+def sparql_schema_graph_skipped(schema_view:SchemaView, regime:TypeRegime) -> builtins.list[builtins.str]:
     r"""
     Schema terms left out of the graph because their IRI was not absolute.
     
@@ -7679,9 +7673,9 @@ def sparql_schema_graph_skipped(schema_view:SchemaView, dataset:DatasetSpec, gra
     means a prefix the schema's converter never saw — a schema defect worth
     reporting, not a query failure, so the graph is served without them.
     
-    Raises:
-        ValueError: ``graph_iri`` is not a schema graph of the dataset, or is
-            not an absolute IRI.
+    Args:
+        schema_view: The LinkML schema.
+        regime: The :class:`TypeRegime` the graph is published under.
     """
 
 def sparql_scope(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec) -> QueryPlan:

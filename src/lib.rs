@@ -4434,40 +4434,16 @@ fn sparql_finish(
 ///
 /// Args:
 ///     schema_view: The LinkML schema.
-///     dataset: The :class:`DatasetSpec` that serves the graph.
-///     graph_iri: The schema graph to build -- one of the dataset's
-///         ``schema_graphs``, whose regime decides which subclass edges it
-///         publishes.
-///
-/// Raises:
-///     ValueError: ``graph_iri`` is not a schema graph of the dataset, or is
-///         not an absolute IRI.
+///     regime: The :class:`TypeRegime` the subclass edges are published
+///         under (a schema graph of a dataset publishes under its own).
 fn sparql_schema_graph_ntriples(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
-    dataset: PyDatasetSpec,
-    graph_iri: &str,
-) -> PyResult<String> {
+    regime: linkml_runtime_python::PyTypeRegime,
+) -> String {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
-    let regime = schema_graph_regime(&dataset.inner, graph_iri)?;
-    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), graph_iri, regime)
-        .map(|graph| graph.to_ntriples())
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-}
-
-/// The regime of the schema graph `graph_iri` in `dataset`, or the
-/// `ValueError` that says it is none.
-#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-fn schema_graph_regime(
-    dataset: &crate::sparql_dataset::DatasetSpec,
-    graph_iri: &str,
-) -> PyResult<linkml_runtime::schema_rdf::TypeRegime> {
-    dataset.schema_regime(graph_iri).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "<{graph_iri}> is not a schema graph of the dataset"
-        ))
-    })
+    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), regime.into()).to_ntriples()
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -4479,21 +4455,17 @@ fn schema_graph_regime(
 /// means a prefix the schema's converter never saw — a schema defect worth
 /// reporting, not a query failure, so the graph is served without them.
 ///
-/// Raises:
-///     ValueError: ``graph_iri`` is not a schema graph of the dataset, or is
-///         not an absolute IRI.
+/// Args:
+///     schema_view: The LinkML schema.
+///     regime: The :class:`TypeRegime` the graph is published under.
 fn sparql_schema_graph_skipped(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
-    dataset: PyDatasetSpec,
-    graph_iri: &str,
-) -> PyResult<Vec<String>> {
+    regime: linkml_runtime_python::PyTypeRegime,
+) -> Vec<String> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
-    let regime = schema_graph_regime(&dataset.inner, graph_iri)?;
-    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), graph_iri, regime)
-        .map(|graph| graph.skipped)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), regime.into()).skipped
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]

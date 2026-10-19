@@ -113,7 +113,7 @@
 use std::cell::OnceCell;
 
 use linkml_schemaview::schemaview::SchemaView;
-use oxigraph::model::{GraphName, NamedNode, Quad, Term as OxTerm};
+use oxigraph::model::Term as OxTerm;
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use spargebra::Query;
@@ -805,22 +805,12 @@ impl Materialisation for SchemaGraphMaterialisation<'_> {
                 // loads, so a probe answers what the engine would answer.
                 let store = Store::new().ok()?;
                 for (iri, regime) in self.dataset.schema_graphs() {
-                    let graph = crate::sparql_schema_graph::SchemaGraph::build(
-                        self.schema_view,
-                        iri,
-                        regime,
-                    )
-                    .ok()?;
-                    let name = GraphName::NamedNode(NamedNode::new(iri).ok()?);
-                    for quad in graph.quads {
-                        store
-                            .insert(&Quad::new(
-                                quad.subject,
-                                quad.predicate,
-                                quad.object,
-                                name.clone(),
-                            ))
+                    let quads =
+                        crate::sparql_schema_graph::SchemaGraph::build(self.schema_view, regime)
+                            .quads_in(iri)
                             .ok()?;
+                    for quad in &quads {
+                        store.insert(quad).ok()?;
                     }
                 }
                 Some(store)
@@ -1312,14 +1302,13 @@ mod tests {
     /// `names_the_schema_graph` has to be narrowed with it.
     #[test]
     fn the_endpoint_serves_exactly_one_named_graph() {
-        let graph = crate::sparql_schema_graph::SchemaGraph::build(
+        let quads = crate::sparql_schema_graph::SchemaGraph::build(
             &asset360_schema_view(),
-            SCHEMA_GRAPH,
             linkml_runtime::schema_rdf::TypeRegime::Asserted,
         )
+        .quads_in(SCHEMA_GRAPH)
         .unwrap();
-        let names: std::collections::BTreeSet<String> = graph
-            .quads
+        let names: std::collections::BTreeSet<String> = quads
             .iter()
             .map(|quad| quad.graph_name.to_string())
             .collect();
