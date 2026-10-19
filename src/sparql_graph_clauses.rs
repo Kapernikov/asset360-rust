@@ -493,12 +493,18 @@ mod tests {
     fn a_graph_variable_is_schema_only_until_a_data_graph_is_served() {
         use linkml_runtime::schema_rdf::TypeRegime;
         let schema_view = test_schema_view();
-        let only_schema = crate::sparql_dataset::DatasetSpec::asserted()
-            .with_schema_graph(SCHEMA_GRAPH, TypeRegime::Asserted);
-        let with_data = only_schema
-            .clone()
+        let only_schema = crate::sparql_dataset::DatasetSpec::builder(
+            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+        )
+        .with_schema_graph(SCHEMA_GRAPH, TypeRegime::Asserted)
+        .build()
+        .expect("a valid dataset");
+        let with_data = crate::sparql_dataset::DatasetSpec::builder(TypeRegime::Asserted)
+            .with_schema_graph(SCHEMA_GRAPH, TypeRegime::Asserted)
             .with_data_graph("urn:graph:inferred", TypeRegime::IsA)
-            .with_schema_graph("urn:graph:schema-inferred", TypeRegime::IsA);
+            .with_schema_graph("urn:graph:schema-inferred", TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         let variable = "SELECT ?c WHERE { GRAPH ?g { ?c ?p ?o } }";
         assert!(super::reads_only_the_schema_graph(
             variable,

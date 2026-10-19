@@ -325,8 +325,6 @@ pub fn sparql_execute(
         }
     }
 
-    dataset.validate()?;
-
     // Parse with the parser the rest of the endpoint uses
     // ([`crate::sparql_scoper::sparql_parser`]) and execute *that*, rather than
     // handing oxigraph the string to parse again with a bare parser of its own.
@@ -463,12 +461,6 @@ pub fn sparql_execute(
     // back to SPARQL* for oxigraph's own parser to read again — a round trip
     // whose only job was to bridge two versions of one crate.
     evaluate_with_ceiling(parsed, store, limits)
-}
-
-impl From<crate::sparql_dataset::DatasetSpecError> for ExecuteError {
-    fn from(error: crate::sparql_dataset::DatasetSpecError) -> Self {
-        ExecuteError::QueryError(format!("the dataset is invalid: {error}"))
-    }
 }
 
 /// Put every schema graph `query` can read into `store`, each in its own
@@ -916,7 +908,6 @@ pub fn sparql_finish(
     use crate::sparql_plan::{EngineInput, PassKind};
 
     let dataset = &plan.dataset;
-    dataset.validate()?;
     let Some((vars, ordinal, finish)) = plan.passes.iter().find_map(|pass| match &pass.kind {
         PassKind::Engine(engine) => match &engine.input {
             EngineInput::Solutions {
@@ -1155,11 +1146,13 @@ classes:
         let sv = test_schema_view();
         let instances = signal_instances(&sv);
         let refs: Vec<&LinkMLInstance> = instances.iter().collect();
-        let dataset = DatasetSpec::asserted()
+        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::Asserted)
             .with_data_graph(A, TypeRegime::Asserted)
             .with_data_graph(I, TypeRegime::IsA)
             .with_default_graph(A)
-            .with_schema_graph("urn:graph:schema", TypeRegime::IsA);
+            .with_schema_graph("urn:graph:schema", TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         let run = |query: &str| {
             sparql_execute(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
@@ -1194,18 +1187,6 @@ classes:
         let answer = run(&query).unwrap_or_else(|e| panic!("`{query}`: {e}"));
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
         assert_eq!(parsed["results"]["bindings"].as_array().unwrap().len(), 2);
-        // An invalid dataset is refused before anything is loaded.
-        let invalid = DatasetSpec::asserted().with_default_graph(A);
-        assert!(matches!(
-            sparql_execute(
-                "SELECT ?s WHERE { ?s ?p ?o }",
-                &refs,
-                &sv,
-                &invalid,
-                ExecuteLimits::default()
-            ),
-            Err(ExecuteError::QueryError(m)) if m.contains("not a registered data graph")
-        ));
     }
 
     /// SPARQL 1.1 section 13.2: with `FROM NAMED` and no `FROM` the default

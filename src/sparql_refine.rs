@@ -5505,11 +5505,13 @@ mod tests {
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
-        let dataset = DatasetSpec::new(TypeRegime::Asserted)
+        let dataset = DatasetSpec::builder(TypeRegime::Asserted)
             .with_data_graph(A, TypeRegime::Asserted)
             .with_data_graph(I, TypeRegime::IsA)
             .with_data_graph("urn:graph:mixins", TypeRegime::IsAAndMixins)
-            .with_schema_graph(S, TypeRegime::IsA);
+            .with_schema_graph(S, TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         let plan = |query: &str| {
             let parsed =
                 crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
@@ -5683,9 +5685,11 @@ mod tests {
         const S: &str = "urn:graph:schema";
         let sv = crate::sparql_scoper::tests::test_schema_view();
         let text = |default: TypeRegime, query: &str| {
-            let dataset = DatasetSpec::new(default)
+            let dataset = DatasetSpec::builder(default)
                 .with_data_graph(A, TypeRegime::Asserted)
-                .with_schema_graph(S, TypeRegime::IsA);
+                .with_schema_graph(S, TypeRegime::IsA)
+                .build()
+                .expect("a valid dataset");
             let parsed =
                 crate::sparql_scoper::parse_query_for(&format!("{PREFIX}{query}"), &sv).unwrap();
             naive_plan(&parsed, &dataset).unwrap().to_string()
@@ -5752,7 +5756,13 @@ mod tests {
                 .collect()
         };
 
-        let asserted = naive_plan(&parsed, &DatasetSpec::new(TypeRegime::Asserted)).unwrap();
+        let asserted = naive_plan(
+            &parsed,
+            &DatasetSpec::builder(TypeRegime::Asserted)
+                .build()
+                .expect("a valid dataset"),
+        )
+        .unwrap();
         let in_graph = |regimes: &[(String, Option<TypeRegime>)]| {
             regimes
                 .iter()
@@ -5770,7 +5780,13 @@ mod tests {
         // Asserted plan text carries no regime label, on a match or a scan.
         assert!(!asserted.to_string().contains("[is_a"), "{asserted}");
 
-        let is_a = naive_plan(&parsed, &DatasetSpec::new(TypeRegime::IsA)).unwrap();
+        let is_a = naive_plan(
+            &parsed,
+            &DatasetSpec::builder(TypeRegime::IsA)
+                .build()
+                .expect("a valid dataset"),
+        )
+        .unwrap();
         assert_eq!(
             in_graph(&regimes(&is_a)),
             vec![

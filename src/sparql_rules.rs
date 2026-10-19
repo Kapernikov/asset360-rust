@@ -6491,8 +6491,13 @@ mod tests {
     fn plan_in(query: &str, regime: TypeRegime) -> Plan {
         let parsed =
             crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
-        crate::sparql_refine::naive_plan(&parsed, &crate::sparql_dataset::DatasetSpec::new(regime))
-            .expect("should build a naive plan")
+        crate::sparql_refine::naive_plan(
+            &parsed,
+            &crate::sparql_dataset::DatasetSpec::builder(regime)
+                .build()
+                .expect("a valid dataset"),
+        )
+        .expect("should build a naive plan")
     }
 
     /// Every slot the scan folded, as (slot, variable, multivalued).
@@ -11063,9 +11068,11 @@ mod inline_type_match {
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
-        let dataset = DatasetSpec::new(TypeRegime::Asserted)
+        let dataset = DatasetSpec::builder(TypeRegime::Asserted)
             .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA);
+            .with_data_graph(I, TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         let refined = |site_graph: &str, type_graph: &str| {
             let query = format!(
                 "PREFIX asset360: <{NS}/> SELECT ?s ?l WHERE {{ \
@@ -11333,7 +11340,13 @@ mod direct_type {
     fn refined_in(query: &str, schema: &SchemaView, regime: TypeRegime) -> Plan {
         let parsed =
             crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("should parse");
-        let mut plan = naive_plan(&parsed, &DatasetSpec::new(regime)).expect("naive plan");
+        let mut plan = naive_plan(
+            &parsed,
+            &DatasetSpec::builder(regime)
+                .build()
+                .expect("a valid dataset"),
+        )
+        .expect("naive plan");
         let rules = tier_one_rules(schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         refine(&mut plan, &borrowed).unwrap_or_else(|failure| panic!("{failure}"));
@@ -11613,7 +11626,13 @@ mod direct_type {
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t ; sesame:directType asset360:Relay }",
         ] {
             let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
-            let naive = naive_plan(&parsed, &DatasetSpec::new(TypeRegime::IsA)).unwrap();
+            let naive = naive_plan(
+                &parsed,
+                &DatasetSpec::builder(TypeRegime::IsA)
+                    .build()
+                    .expect("a valid dataset"),
+            )
+            .unwrap();
             let mut texts = Vec::new();
             for reverse in [false, true] {
                 let mut rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
@@ -11677,7 +11696,9 @@ mod direct_type {
         ];
         for regime in TypeRegime::ALL {
             let oracle = crate::sparql_oracle::Oracle::new_in(&schema, &records, regime);
-            let dataset = DatasetSpec::new(regime);
+            let dataset = DatasetSpec::builder(regime)
+                .build()
+                .expect("a valid dataset");
             let rules = tier_one_rules(&schema, &dataset);
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
             for query in queries {

@@ -3954,7 +3954,7 @@ impl PyDatasetSpec {
             })
             .collect();
 
-        let mut inner = crate::sparql_dataset::DatasetSpec::new(default_regime.into());
+        let mut inner = crate::sparql_dataset::DatasetSpec::builder(default_regime.into());
         for (iri, regime) in data_graphs {
             inner = inner.with_data_graph(iri, regime.into());
         }
@@ -3967,8 +3967,9 @@ impl PyDatasetSpec {
         for (iri, regime) in schema_graphs {
             inner = inner.with_schema_graph(iri, regime.into());
         }
-        inner
-            .validate()
+        // Every conflict at once, so the message is the whole list.
+        let inner = inner
+            .build()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner })
     }

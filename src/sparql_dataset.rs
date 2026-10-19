@@ -26,10 +26,11 @@ use linkml_runtime::schema_rdf::{TypePartition, TypeRegime};
 
 /// Which named graphs the endpoint serves and what the default graph means.
 ///
-/// Built with the `with_*` methods, checked with [`Self::validate`] at every
-/// entry point that takes one. [`Self::asserted`] is the dataset every endpoint
-/// was before graphs had regimes: an asserted default graph, no named graphs,
-/// no schema graph.
+/// Always valid: the only way to make one is [`DatasetSpecBuilder::build`]
+/// (through [`DatasetSpec::builder`]), which refuses a dataset that contradicts
+/// itself, so an entry point that takes a `DatasetSpec` has nothing to check.
+/// [`Self::asserted`] is the dataset every endpoint was before graphs had
+/// regimes: an asserted default graph, no named graphs, no schema graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatasetSpec {
     default_regime: TypeRegime,
@@ -37,38 +38,104 @@ pub struct DatasetSpec {
     default_graph: Option<String>,
     partition_graphs: BTreeMap<TypePartition, String>,
     schema_graphs: BTreeMap<String, TypeRegime>,
-    /// Registrations that contradicted an earlier one. Kept rather than
-    /// refused on the spot, because a builder cannot fail: [`Self::validate`]
-    /// names them.
-    conflicts: Vec<DatasetSpecError>,
 }
 
-/// A dataset that does not describe one coherent endpoint.
+/// What a graph IRI was registered as. Names the two sides of a
+/// [`DatasetConflict::GraphRegisteredTwice`], so the error says what each
+/// registration claimed rather than quoting a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GraphRole {
+    /// A named graph over the golden records, under this regime.
+    DataGraph(TypeRegime),
+    /// The default graph, declared to be one of the data graphs.
+    DefaultGraph,
+    /// The graph that holds this partition of the type triples.
+    PartitionGraph(TypePartition),
+    /// The datamodel, its subclass edges published under this regime.
+    SchemaGraph(TypeRegime),
+}
+
+impl fmt::Display for GraphRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DataGraph(regime) => write!(f, "a data graph ({})", describe(*regime)),
+            Self::DefaultGraph => write!(f, "the default graph"),
+            Self::PartitionGraph(partition) => write!(f, "the {partition:?} partition graph"),
+            Self::SchemaGraph(regime) => write!(f, "a schema graph ({})", describe(*regime)),
+        }
+    }
+}
+
+/// One way a dataset contradicts itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DatasetSpecError {
+#[non_exhaustive]
+pub enum DatasetConflict {
     /// The default graph names an IRI that is not a registered data graph.
     DefaultGraphNotADataGraph { iri: String },
     /// One IRI was registered with two different meanings (a data graph and a
-    /// schema graph, or two regimes, or two partitions).
-    IriRegisteredTwice {
+    /// schema graph, two regimes, or two partitions).
+    GraphRegisteredTwice {
         iri: String,
+        first: GraphRole,
+        second: GraphRole,
+    },
+    /// One partition of the type triples was given two different graphs.
+    PartitionHasTwoGraphs {
+        partition: TypePartition,
         first: String,
         second: String,
     },
 }
 
-impl fmt::Display for DatasetSpecError {
+impl fmt::Display for DatasetConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DefaultGraphNotADataGraph { iri } => write!(
                 f,
                 "the default graph <{iri}> is not a registered data graph"
             ),
-            Self::IriRegisteredTwice { iri, first, second } => write!(
+            Self::GraphRegisteredTwice { iri, first, second } => write!(
                 f,
                 "<{iri}> is registered as {first} and as {second}; a graph has one meaning"
             ),
+            Self::PartitionHasTwoGraphs {
+                partition,
+                first,
+                second,
+            } => write!(
+                f,
+                "the {partition:?} partition graph is both <{first}> and <{second}>; \
+                 a partition is held by one graph"
+            ),
         }
+    }
+}
+
+/// A dataset that does not describe one coherent endpoint: **every** conflict
+/// found, in the order they were met, never fewer than one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DatasetSpecError {
+    conflicts: Vec<DatasetConflict>,
+}
+
+impl DatasetSpecError {
+    /// Every conflict, in the order they were met. Never empty.
+    pub fn conflicts(&self) -> &[DatasetConflict] {
+        &self.conflicts
+    }
+}
+
+impl fmt::Display for DatasetSpecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (n, conflict) in self.conflicts.iter().enumerate() {
+            if n > 0 {
+                write!(f, "; ")?;
+            }
+            write!(f, "{conflict}")?;
+        }
+        Ok(())
     }
 }
 
@@ -82,16 +149,32 @@ fn describe(regime: TypeRegime) -> &'static str {
     }
 }
 
+/// A [`DatasetSpec`] under construction: registrations in any order, checked
+/// together by [`Self::build`].
+///
+/// A registration that contradicts an earlier one is not refused on the spot
+/// (a builder method cannot fail, and the order of the calls is free); it is
+/// remembered, and `build` reports it together with every other conflict.
+#[derive(Debug, Clone)]
+#[must_use = "a builder does nothing until `build()` is called"]
+pub struct DatasetSpecBuilder {
+    spec: DatasetSpec,
+    /// Registrations that contradicted an earlier one.
+    conflicts: Vec<DatasetConflict>,
+}
+
 impl DatasetSpec {
-    /// A dataset whose default graph carries `default_regime` and which
-    /// serves no named graph.
-    pub fn new(default_regime: TypeRegime) -> Self {
-        Self {
-            default_regime,
-            data_graphs: BTreeMap::new(),
-            default_graph: None,
-            partition_graphs: BTreeMap::new(),
-            schema_graphs: BTreeMap::new(),
+    /// Start a dataset whose default graph carries `default_regime` and which
+    /// serves no named graph, until the `with_*` methods say otherwise.
+    pub fn builder(default_regime: TypeRegime) -> DatasetSpecBuilder {
+        DatasetSpecBuilder {
+            spec: DatasetSpec {
+                default_regime,
+                data_graphs: BTreeMap::new(),
+                default_graph: None,
+                partition_graphs: BTreeMap::new(),
+                schema_graphs: BTreeMap::new(),
+            },
             conflicts: Vec::new(),
         }
     }
@@ -102,30 +185,38 @@ impl DatasetSpec {
     /// something a deployment decides, and one that is defaulted by accident
     /// plans a different endpoint's query.
     pub fn asserted() -> Self {
-        Self::new(TypeRegime::Asserted)
+        Self {
+            default_regime: TypeRegime::Asserted,
+            data_graphs: BTreeMap::new(),
+            default_graph: None,
+            partition_graphs: BTreeMap::new(),
+            schema_graphs: BTreeMap::new(),
+        }
     }
+}
 
+impl DatasetSpecBuilder {
     /// Serve the golden records as a named graph under `regime`.
     pub fn with_data_graph(mut self, iri: impl Into<String>, regime: TypeRegime) -> Self {
         let iri = iri.into();
-        if let Some(seen) = self.schema_graphs.get(&iri) {
-            self.conflicts.push(DatasetSpecError::IriRegisteredTwice {
-                first: format!("a schema graph ({})", describe(*seen)),
-                second: format!("a data graph ({})", describe(regime)),
+        if let Some(seen) = self.spec.schema_graphs.get(&iri) {
+            self.conflicts.push(DatasetConflict::GraphRegisteredTwice {
+                first: GraphRole::SchemaGraph(*seen),
+                second: GraphRole::DataGraph(regime),
                 iri,
             });
             return self;
         }
-        match self.data_graphs.get(&iri) {
+        match self.spec.data_graphs.get(&iri) {
             Some(seen) if *seen != regime => {
-                self.conflicts.push(DatasetSpecError::IriRegisteredTwice {
-                    first: format!("a data graph ({})", describe(*seen)),
-                    second: format!("a data graph ({})", describe(regime)),
+                self.conflicts.push(DatasetConflict::GraphRegisteredTwice {
+                    first: GraphRole::DataGraph(*seen),
+                    second: GraphRole::DataGraph(regime),
                     iri,
                 });
             }
             _ => {
-                self.data_graphs.insert(iri, regime);
+                self.spec.data_graphs.insert(iri, regime);
             }
         }
         self
@@ -133,9 +224,9 @@ impl DatasetSpec {
 
     /// Make the default graph one of the data graphs: its regime becomes the
     /// default regime. The IRI must be registered with [`Self::with_data_graph`]
-    /// (checked by [`Self::validate`], so the order of the calls is free).
+    /// (checked by [`Self::build`], so the order of the calls is free).
     pub fn with_default_graph(mut self, iri: impl Into<String>) -> Self {
-        self.default_graph = Some(iri.into());
+        self.spec.default_graph = Some(iri.into());
         self
     }
 
@@ -146,16 +237,16 @@ impl DatasetSpec {
         iri: impl Into<String>,
     ) -> Self {
         let iri = iri.into();
-        match self.partition_graphs.get(&partition) {
+        match self.spec.partition_graphs.get(&partition) {
             Some(seen) if *seen != iri => {
-                self.conflicts.push(DatasetSpecError::IriRegisteredTwice {
-                    first: format!("the {partition:?} partition graph <{seen}>"),
-                    second: format!("the {partition:?} partition graph <{iri}>"),
-                    iri,
+                self.conflicts.push(DatasetConflict::PartitionHasTwoGraphs {
+                    partition,
+                    first: seen.clone(),
+                    second: iri,
                 });
             }
             _ => {
-                self.partition_graphs.insert(partition, iri);
+                self.spec.partition_graphs.insert(partition, iri);
             }
         }
         self
@@ -165,60 +256,67 @@ impl DatasetSpec {
     /// under `regime`.
     pub fn with_schema_graph(mut self, iri: impl Into<String>, regime: TypeRegime) -> Self {
         let iri = iri.into();
-        if let Some(seen) = self.data_graphs.get(&iri) {
-            self.conflicts.push(DatasetSpecError::IriRegisteredTwice {
-                first: format!("a data graph ({})", describe(*seen)),
-                second: format!("a schema graph ({})", describe(regime)),
+        if let Some(seen) = self.spec.data_graphs.get(&iri) {
+            self.conflicts.push(DatasetConflict::GraphRegisteredTwice {
+                first: GraphRole::DataGraph(*seen),
+                second: GraphRole::SchemaGraph(regime),
                 iri,
             });
             return self;
         }
-        match self.schema_graphs.get(&iri) {
+        match self.spec.schema_graphs.get(&iri) {
             Some(seen) if *seen != regime => {
-                self.conflicts.push(DatasetSpecError::IriRegisteredTwice {
-                    first: format!("a schema graph ({})", describe(*seen)),
-                    second: format!("a schema graph ({})", describe(regime)),
+                self.conflicts.push(DatasetConflict::GraphRegisteredTwice {
+                    first: GraphRole::SchemaGraph(*seen),
+                    second: GraphRole::SchemaGraph(regime),
                     iri,
                 });
             }
             _ => {
-                self.schema_graphs.insert(iri, regime);
+                self.spec.schema_graphs.insert(iri, regime);
             }
         }
         self
     }
 
-    /// Whether the dataset describes one coherent endpoint. Called at every
-    /// entry point that takes a dataset.
-    pub fn validate(&self) -> Result<(), DatasetSpecError> {
-        if let Some(conflict) = self.conflicts.first() {
-            return Err(conflict.clone());
-        }
-        if let Some(iri) = &self.default_graph
-            && !self.data_graphs.contains_key(iri)
+    /// The dataset, if it describes one coherent endpoint; otherwise **every**
+    /// way it does not.
+    pub fn build(self) -> Result<DatasetSpec, DatasetSpecError> {
+        let Self {
+            spec,
+            mut conflicts,
+        } = self;
+        if let Some(iri) = &spec.default_graph
+            && !spec.data_graphs.contains_key(iri)
         {
-            return Err(DatasetSpecError::DefaultGraphNotADataGraph { iri: iri.clone() });
+            conflicts.push(DatasetConflict::DefaultGraphNotADataGraph { iri: iri.clone() });
         }
         let mut partitions: BTreeMap<&str, TypePartition> = BTreeMap::new();
-        for (partition, iri) in &self.partition_graphs {
-            if let Some(regime) = self.schema_graphs.get(iri) {
-                return Err(DatasetSpecError::IriRegisteredTwice {
+        for (partition, iri) in &spec.partition_graphs {
+            if let Some(regime) = spec.schema_graphs.get(iri) {
+                conflicts.push(DatasetConflict::GraphRegisteredTwice {
                     iri: iri.clone(),
-                    first: format!("a schema graph ({})", describe(*regime)),
-                    second: format!("the {partition:?} partition graph"),
+                    first: GraphRole::SchemaGraph(*regime),
+                    second: GraphRole::PartitionGraph(*partition),
                 });
             }
             if let Some(seen) = partitions.insert(iri, *partition) {
-                return Err(DatasetSpecError::IriRegisteredTwice {
+                conflicts.push(DatasetConflict::GraphRegisteredTwice {
                     iri: iri.clone(),
-                    first: format!("the {seen:?} partition graph"),
-                    second: format!("the {partition:?} partition graph"),
+                    first: GraphRole::PartitionGraph(seen),
+                    second: GraphRole::PartitionGraph(*partition),
                 });
             }
         }
-        Ok(())
+        if conflicts.is_empty() {
+            Ok(spec)
+        } else {
+            Err(DatasetSpecError { conflicts })
+        }
     }
+}
 
+impl DatasetSpec {
     /// The regime a triple pattern outside any `GRAPH` is matched under when
     /// the query names no `FROM`: the default graph's.
     pub fn default_regime(&self) -> TypeRegime {
@@ -461,13 +559,16 @@ impl<'a> QueryGraphs<'a> {
 #[cfg(test)]
 pub(crate) fn default_dataset() -> &'static DatasetSpec {
     static DEFAULT: std::sync::OnceLock<DatasetSpec> = std::sync::OnceLock::new();
-    DEFAULT.get_or_init(|| DatasetSpec::new(TypeRegime::Asserted))
+    DEFAULT.get_or_init(DatasetSpec::asserted)
 }
 
 /// An asserted dataset that serves one schema graph, `iri`.
 #[cfg(test)]
 pub(crate) fn schema_dataset(iri: &str) -> DatasetSpec {
-    DatasetSpec::new(TypeRegime::Asserted).with_schema_graph(iri, TypeRegime::Asserted)
+    DatasetSpec::builder(TypeRegime::Asserted)
+        .with_schema_graph(iri, TypeRegime::Asserted)
+        .build()
+        .expect("one schema graph is a valid dataset")
 }
 
 #[cfg(test)]
@@ -479,18 +580,25 @@ mod tests {
     const M: &str = "urn:graph:mixins";
     const S: &str = "urn:graph:schema";
 
-    fn served() -> DatasetSpec {
-        DatasetSpec::new(TypeRegime::Asserted)
+    fn served_builder() -> DatasetSpecBuilder {
+        DatasetSpec::builder(TypeRegime::Asserted)
             .with_data_graph(A, TypeRegime::Asserted)
             .with_data_graph(I, TypeRegime::IsA)
             .with_data_graph(M, TypeRegime::IsAAndMixins)
             .with_schema_graph(S, TypeRegime::IsA)
     }
 
+    fn served() -> DatasetSpec {
+        served_builder().build().expect("a valid dataset")
+    }
+
     #[test]
-    fn the_default_dataset_is_the_asserted_one_with_no_graphs() {
+    fn the_asserted_dataset_is_the_asserted_one_with_no_graphs() {
         let dataset = DatasetSpec::asserted();
-        assert_eq!(dataset.validate(), Ok(()));
+        assert_eq!(
+            DatasetSpec::builder(TypeRegime::Asserted).build(),
+            Ok(dataset.clone())
+        );
         assert_eq!(dataset.default_regime(), TypeRegime::Asserted);
         assert!(!dataset.has_schema_graph());
         assert_eq!(dataset.data_regime(A), None);
@@ -498,10 +606,11 @@ mod tests {
 
     #[test]
     fn a_dataset_answers_for_each_graph_it_serves() {
-        let dataset = served()
+        let dataset = served_builder()
             .with_default_graph(I)
-            .with_partition_graph(TypePartition::Own, A);
-        assert_eq!(dataset.validate(), Ok(()));
+            .with_partition_graph(TypePartition::Own, A)
+            .build()
+            .expect("a valid dataset");
         assert_eq!(dataset.default_regime(), TypeRegime::IsA);
         assert_eq!(dataset.data_regime(M), Some(TypeRegime::IsAAndMixins));
         assert_eq!(dataset.schema_regime(S), Some(TypeRegime::IsA));
@@ -511,46 +620,111 @@ mod tests {
         assert_eq!(dataset.partition_graph(TypePartition::Mixin), None);
     }
 
+    fn conflicts_of(builder: DatasetSpecBuilder) -> Vec<DatasetConflict> {
+        builder
+            .build()
+            .expect_err("the dataset contradicts itself")
+            .conflicts()
+            .to_vec()
+    }
+
     #[test]
     fn a_dataset_that_contradicts_itself_is_refused_by_name() {
-        let orphan = DatasetSpec::new(TypeRegime::Asserted).with_default_graph(A);
+        let orphan = DatasetSpec::builder(TypeRegime::Asserted).with_default_graph(A);
         assert_eq!(
-            orphan.validate(),
-            Err(DatasetSpecError::DefaultGraphNotADataGraph { iri: A.into() })
+            conflicts_of(orphan),
+            vec![DatasetConflict::DefaultGraphNotADataGraph { iri: A.into() }]
         );
         // The order of the calls does not matter.
-        let ordered = DatasetSpec::new(TypeRegime::Asserted)
+        let ordered = DatasetSpec::builder(TypeRegime::Asserted)
             .with_default_graph(A)
-            .with_data_graph(A, TypeRegime::IsA);
-        assert_eq!(ordered.validate(), Ok(()));
+            .with_data_graph(A, TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         assert_eq!(ordered.default_regime(), TypeRegime::IsA);
 
-        for twice in [
-            served().with_data_graph(A, TypeRegime::IsA),
-            served().with_schema_graph(A, TypeRegime::Asserted),
-            served().with_data_graph(S, TypeRegime::IsA),
-            served().with_schema_graph(S, TypeRegime::Asserted),
-            served()
-                .with_partition_graph(TypePartition::Own, "urn:x")
-                .with_partition_graph(TypePartition::Own, "urn:y"),
-            served()
-                .with_partition_graph(TypePartition::Own, "urn:x")
-                .with_partition_graph(TypePartition::IsA, "urn:x"),
-            served().with_partition_graph(TypePartition::Own, S),
-        ] {
-            assert!(
-                matches!(
-                    twice.validate(),
-                    Err(DatasetSpecError::IriRegisteredTwice { .. })
+        let twice = |iri: &str, first: GraphRole, second: GraphRole| {
+            DatasetConflict::GraphRegisteredTwice {
+                iri: iri.into(),
+                first,
+                second,
+            }
+        };
+        let data = GraphRole::DataGraph;
+        let schema = GraphRole::SchemaGraph;
+        let partition = GraphRole::PartitionGraph;
+        for (builder, expected) in [
+            (
+                served_builder().with_data_graph(A, TypeRegime::IsA),
+                twice(A, data(TypeRegime::Asserted), data(TypeRegime::IsA)),
+            ),
+            (
+                served_builder().with_schema_graph(A, TypeRegime::Asserted),
+                twice(A, data(TypeRegime::Asserted), schema(TypeRegime::Asserted)),
+            ),
+            (
+                served_builder().with_data_graph(S, TypeRegime::IsA),
+                twice(S, schema(TypeRegime::IsA), data(TypeRegime::IsA)),
+            ),
+            (
+                served_builder().with_schema_graph(S, TypeRegime::Asserted),
+                twice(S, schema(TypeRegime::IsA), schema(TypeRegime::Asserted)),
+            ),
+            (
+                served_builder()
+                    .with_partition_graph(TypePartition::Own, "urn:x")
+                    .with_partition_graph(TypePartition::Own, "urn:y"),
+                DatasetConflict::PartitionHasTwoGraphs {
+                    partition: TypePartition::Own,
+                    first: "urn:x".into(),
+                    second: "urn:y".into(),
+                },
+            ),
+            (
+                served_builder()
+                    .with_partition_graph(TypePartition::Own, "urn:x")
+                    .with_partition_graph(TypePartition::IsA, "urn:x"),
+                twice(
+                    "urn:x",
+                    partition(TypePartition::Own),
+                    partition(TypePartition::IsA),
                 ),
-                "{twice:?}"
-            );
+            ),
+            (
+                served_builder().with_partition_graph(TypePartition::Own, S),
+                twice(S, schema(TypeRegime::IsA), partition(TypePartition::Own)),
+            ),
+        ] {
+            assert_eq!(conflicts_of(builder), vec![expected]);
         }
         // The same registration twice is no contradiction.
-        assert_eq!(
-            served().with_data_graph(A, TypeRegime::Asserted).validate(),
-            Ok(())
+        assert!(
+            served_builder()
+                .with_data_graph(A, TypeRegime::Asserted)
+                .build()
+                .is_ok()
         );
+    }
+
+    /// Every conflict is reported, not the first one met: a deployment fixing
+    /// its configuration should not have to rebuild once per mistake.
+    #[test]
+    fn every_conflict_is_reported_at_once() {
+        let error = served_builder()
+            .with_data_graph(A, TypeRegime::IsA)
+            .with_default_graph("urn:graph:nowhere")
+            .with_partition_graph(TypePartition::Own, S)
+            .build()
+            .expect_err("three conflicts");
+        assert_eq!(error.conflicts().len(), 3, "{error}");
+        let text = error.to_string();
+        for mention in [
+            "urn:graph:asserted",
+            "urn:graph:nowhere",
+            "urn:graph:schema",
+        ] {
+            assert!(text.contains(mention), "{text}");
+        }
     }
 
     #[test]

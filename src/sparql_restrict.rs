@@ -1428,9 +1428,11 @@ mod tests {
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let schema = test_schema_view();
-        let dataset = DatasetSpec::asserted()
+        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::Asserted)
             .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA);
+            .with_data_graph(I, TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         let query = format!(
             "{PREFIX}SELECT ?nm WHERE {{ \
              {{ SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }} ORDER BY ?s LIMIT 3 }} \

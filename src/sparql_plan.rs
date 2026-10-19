@@ -1301,7 +1301,6 @@ pub fn refined_plan_text(
     schema: &linkml_schemaview::schemaview::SchemaView,
     dataset: &DatasetSpec,
 ) -> Result<String, String> {
-    dataset.validate().map_err(|e| e.to_string())?;
     let mut parsed =
         crate::sparql_scoper::parse_query_for(query, schema).map_err(|e| e.to_string())?;
     // The pass production runs before it reads anything (see
@@ -1419,7 +1418,6 @@ pub fn plan_query_refined_with_options(
     dataset: &DatasetSpec,
     rows_route: bool,
 ) -> Result<ExecutionPlan, ScopeError> {
-    dataset.validate()?;
     let mut parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
     // Before anything reads a predicate or a type: one slot has two
     // legitimate IRIs when it declares a `slot_uri`, one class when it declares
@@ -3427,9 +3425,13 @@ classes:
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
-        let dataset = crate::sparql_dataset::DatasetSpec::asserted()
-            .with_data_graph(A, linkml_runtime::schema_rdf::TypeRegime::Asserted)
-            .with_data_graph(I, linkml_runtime::schema_rdf::TypeRegime::IsA);
+        let dataset = crate::sparql_dataset::DatasetSpec::builder(
+            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+        )
+        .with_data_graph(A, linkml_runtime::schema_rdf::TypeRegime::Asserted)
+        .with_data_graph(I, linkml_runtime::schema_rdf::TypeRegime::IsA)
+        .build()
+        .expect("a valid dataset");
         let body = "?s a asset360:Signal ; asset360:name ?nm . FILTER(?nm > \"A\") \
                     FILTER(REGEX(STR(?s), \"^x\"))";
         let finish_of = |query: String| {
@@ -3514,8 +3516,12 @@ classes:
     #[test]
     fn from_named_alone_plans_an_empty_default_graph() {
         let sv = test_schema_view();
-        let dataset = crate::sparql_dataset::DatasetSpec::asserted()
-            .with_data_graph("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::Asserted);
+        let dataset = crate::sparql_dataset::DatasetSpec::builder(
+            linkml_runtime::schema_rdf::TypeRegime::Asserted,
+        )
+        .with_data_graph("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::Asserted)
+        .build()
+        .expect("a valid dataset");
         let query = format!(
             "{PREFIX}SELECT ?s ?nm FROM NAMED <urn:g:a> WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm }}"

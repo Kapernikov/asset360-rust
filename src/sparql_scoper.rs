@@ -1280,14 +1280,6 @@ pub enum ScopeError {
 /// endpoint depends on.
 pub const UNSCOPED_REWRITE_NAMED: &str = "Query is unscoped (rewrite named):";
 
-impl From<crate::sparql_dataset::DatasetSpecError> for ScopeError {
-    /// A dataset that contradicts itself describes no endpoint to scope
-    /// against; refused by name rather than planned against.
-    fn from(error: crate::sparql_dataset::DatasetSpecError) -> Self {
-        ScopeError::UnsupportedConstruct(format!("the dataset is invalid: {error}"))
-    }
-}
-
 impl std::fmt::Display for ScopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1533,7 +1525,6 @@ pub fn scope_parsed_as(
     dataset: &DatasetSpec,
     scoping: Scoping<'_>,
 ) -> Result<QueryPlan, ScopeError> {
-    dataset.validate()?;
     let qualified = crate::sparql_domains::qualify(query);
     scope_qualified(&qualified, schema_view, dataset, scoping)
 }
@@ -8887,9 +8878,11 @@ classes:
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
-        let dataset = DatasetSpec::asserted()
+        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::Asserted)
             .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA);
+            .with_data_graph(I, TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         let scoped = |query: &str| {
             sparql_scope(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
@@ -8973,9 +8966,11 @@ classes:
     is_a: Signal
 ",
         );
-        let dataset = DatasetSpec::asserted()
+        let dataset = DatasetSpec::builder(linkml_runtime::schema_rdf::TypeRegime::Asserted)
             .with_data_graph(A, TypeRegime::Asserted)
-            .with_data_graph(I, TypeRegime::IsA);
+            .with_data_graph(I, TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         let scope = |query: &str| {
             sparql_scope(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),

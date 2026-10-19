@@ -521,7 +521,10 @@ classes:
     /// A dataset whose default graph is data of regime `data` and which serves
     /// `G` as a schema graph publishing `graph`.
     fn serving(data: TypeRegime, graph: TypeRegime) -> DatasetSpec {
-        DatasetSpec::new(data).with_schema_graph(G, graph)
+        DatasetSpec::builder(data)
+            .with_schema_graph(G, graph)
+            .build()
+            .expect("a valid dataset")
     }
 
     #[test]
@@ -558,10 +561,12 @@ classes:
     fn a_from_clause_hides_the_schema_graph_and_the_rule_declines() {
         const A: &str = "urn:graph:a";
         let sv = schema_view();
-        let dataset = DatasetSpec::new(TypeRegime::IsA)
+        let dataset = DatasetSpec::builder(TypeRegime::IsA)
             .with_data_graph(A, TypeRegime::IsA)
             .with_default_graph(A)
-            .with_schema_graph(G, TypeRegime::IsA);
+            .with_schema_graph(G, TypeRegime::IsA)
+            .build()
+            .expect("a valid dataset");
         let with_clause = |clause: &str| {
             canonical(G).replace(
                 "SELECT ?s ?t WHERE",
@@ -715,9 +720,11 @@ classes:
         const ASSERTED: &str = "https://example.org/schema/asserted";
         let sv = schema_view();
         let both = |data| {
-            DatasetSpec::new(data)
+            DatasetSpec::builder(data)
                 .with_schema_graph(INFERRED_MIXINS, TypeRegime::IsAAndMixins)
                 .with_schema_graph(ASSERTED, TypeRegime::Asserted)
+                .build()
+                .expect("a valid dataset")
         };
         let (fired, plan) = refined(&sv, &both(TypeRegime::IsA), &canonical(INFERRED_MIXINS));
         assert!(fired && plan.contains("directType"), "{plan}");
