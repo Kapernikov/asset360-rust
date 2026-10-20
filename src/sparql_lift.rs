@@ -156,7 +156,7 @@ pub fn reads_schema_only(
     for &id in region {
         if let PlanOp::Graph { input, name } = &plan.nodes[id].op
             && dataset
-                .schema_regime(name.trim_matches(['<', '>']))
+                .schema_inference(name.trim_matches(['<', '>']))
                 .is_some()
         {
             in_schema_graph.extend(subtree(plan, *input));
@@ -170,7 +170,7 @@ pub fn reads_schema_only(
             }
             PlanOp::Graph { name, .. }
                 if dataset
-                    .schema_regime(name.trim_matches(['<', '>']))
+                    .schema_inference(name.trim_matches(['<', '>']))
                     .is_none() =>
             {
                 return Err(format!(

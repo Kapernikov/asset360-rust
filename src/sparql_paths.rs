@@ -12,7 +12,7 @@
 //!
 //! Which predicates can a data graph hold? Records are written by the
 //! instance writer, and the writer emits exactly three kinds of predicate:
-//! the canonical IRI of a slot, `rdf:type`, and (in the inferred regimes)
+//! the canonical IRI of a slot, `rdf:type`, and (in the inferring inferences)
 //! `sesame:directType`. It never writes a schema triple, so
 //! `rdfs:subClassOf` — or any other IRI that is not one of those — is a
 //! predicate **no data graph carries**. Schema triples live only in the named

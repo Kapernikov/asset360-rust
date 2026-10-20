@@ -6,11 +6,11 @@
 //!
 //! * **data graphs** -- named graphs over the golden records, each under a
 //!   [`TypeRegime`] (which `rdf:type` triples its records carry),
-//! * a **default graph**, the records under a regime, and
-//! * **schema graphs** -- the datamodel itself, one per regime its subclass
+//! * a **default graph**, the records under a inference, and
+//! * **schema graphs** -- the datamodel itself, one per inference its subclass
 //!   edges are published under.
 //!
-//! The planner reads it to decide which regime a triple pattern is matched
+//! The planner reads it to decide which inference a triple pattern is matched
 //! under (and so which classes a scan stands for); the executor reads it to
 //! decide which schema graphs a query can observe. Nothing here knows SPARQL.
 
@@ -39,14 +39,14 @@ pub struct DatasetSpec {
 pub enum DatasetConflict {
     /// One IRI is both a data graph and a schema graph.
     GraphIsDataAndSchema { iri: String },
-    /// A data graph's regime lacks the [`TypePartition::Own`] partition, which
+    /// A data graph's inference lacks the [`TypePartition::Own`] partition, which
     /// holds every non-type triple of a record: such a graph holds no record's
     /// slot values, and a scan over it would claim records the writer never
     /// typed that way.
-    DataGraphWithoutOwn { iri: String, regime: TypeRegime },
-    /// The default regime lacks [`TypePartition::Own`]: the records loaded
+    DataGraphWithoutOwn { iri: String, inference: TypeRegime },
+    /// The default inference lacks [`TypePartition::Own`]: the records loaded
     /// under it would carry no slot values (see [`Self::DataGraphWithoutOwn`]).
-    DefaultRegimeWithoutOwn { regime: TypeRegime },
+    DefaultInferenceWithoutOwn { inference: TypeRegime },
 }
 
 impl fmt::Display for DatasetConflict {
@@ -56,14 +56,14 @@ impl fmt::Display for DatasetConflict {
                 f,
                 "<{iri}> is both a data graph and a schema graph; a graph has one meaning"
             ),
-            Self::DataGraphWithoutOwn { iri, regime } => write!(
+            Self::DataGraphWithoutOwn { iri, inference } => write!(
                 f,
-                "the data graph <{iri}> has regime {regime}, which lacks the own partition; \
+                "the data graph <{iri}> has inference {inference}, which lacks the own partition; \
                  a graph of records holds their slot values in it"
             ),
-            Self::DefaultRegimeWithoutOwn { regime } => write!(
+            Self::DefaultInferenceWithoutOwn { inference } => write!(
                 f,
-                "the default regime {regime} lacks the own partition; \
+                "the default inference {inference} lacks the own partition; \
                  records are written with their slot values in it"
             ),
         }
@@ -101,32 +101,32 @@ impl std::error::Error for DatasetSpecError {}
 
 impl DatasetSpec {
     /// Start a dataset whose default graph holds the records under
-    /// `default_regime`; add the named data graphs (each under its own regime)
+    /// `default_inference`; add the named data graphs (each under its own inference)
     /// and the schema graphs (each publishing its subclass edges under its
-    /// regime) on the builder. The one place a dataset is stated; conflicts
+    /// inference) on the builder. The one place a dataset is stated; conflicts
     /// are reported by [`DatasetSpecBuilder::build`].
-    pub fn builder(default_regime: TypeRegime) -> DatasetSpecBuilder {
+    pub fn builder(default_inference: TypeRegime) -> DatasetSpecBuilder {
         DatasetSpecBuilder {
-            default_regime,
+            default_inference,
             data_graphs: BTreeMap::new(),
             schema_graphs: BTreeMap::new(),
         }
     }
 
-    /// The regime a triple pattern outside any `GRAPH` is matched under when
+    /// The inference a triple pattern outside any `GRAPH` is matched under when
     /// the query names no `FROM`: the default graph's.
-    pub fn default_regime(&self) -> TypeRegime {
+    pub fn default_inference(&self) -> TypeRegime {
         self.default
     }
 
-    /// The regime of the data graph `iri`, if it is one.
-    pub fn data_regime(&self, iri: &str) -> Option<TypeRegime> {
+    /// The inference of the data graph `iri`, if it is one.
+    pub fn data_inference(&self, iri: &str) -> Option<TypeRegime> {
         self.data_graphs.get(iri).copied()
     }
 
-    /// The regime the schema graph `iri` publishes its subclass edges under,
+    /// The inference the schema graph `iri` publishes its subclass edges under,
     /// if it is one.
-    pub fn schema_regime(&self, iri: &str) -> Option<TypeRegime> {
+    pub fn schema_inference(&self, iri: &str) -> Option<TypeRegime> {
         self.schema_graphs.get(iri).copied()
     }
 
@@ -134,14 +134,14 @@ impl DatasetSpec {
     pub fn data_graphs(&self) -> impl Iterator<Item = (&str, TypeRegime)> {
         self.data_graphs
             .iter()
-            .map(|(iri, regime)| (iri.as_str(), *regime))
+            .map(|(iri, inference)| (iri.as_str(), *inference))
     }
 
     /// Every schema graph, IRI order.
     pub fn schema_graphs(&self) -> impl Iterator<Item = (&str, TypeRegime)> {
         self.schema_graphs
             .iter()
-            .map(|(iri, regime)| (iri.as_str(), *regime))
+            .map(|(iri, inference)| (iri.as_str(), *inference))
     }
 
     /// Whether `iri` is a schema graph.
@@ -205,13 +205,13 @@ impl DatasetSpec {
 /// What one graph holds, as far as the planner can tell.
 ///
 /// What a [`crate::sparql_refine::PlanOp::Match`] says it reads, so the cases
-/// a rule must tell apart stay apart: the records (under a regime), the
+/// a rule must tell apart stay apart: the records (under a inference), the
 /// datamodel, nothing at all, and a graph only the engine can speak for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GraphReads {
-    /// The golden records, under the plan's one regime
-    /// ([`crate::sparql_refine::Plan::data_regime`]). The SQL route reads them.
+    /// The golden records, under the plan's one inference
+    /// ([`crate::sparql_refine::Plan::data_inference`]). The SQL route reads them.
     Data,
     /// The datamodel. Only the engine, or a schema-only region, reads it.
     Schema,
@@ -242,9 +242,9 @@ impl GraphReads {
 #[derive(Debug, Clone)]
 pub(crate) struct QueryGraphs<'a> {
     dataset: &'a DatasetSpec,
-    /// The one regime the query reads its records under
+    /// The one inference the query reads its records under
     /// ([`crate::sparql_graph_clauses::single_data_graph`]).
-    regime: TypeRegime,
+    inference: TypeRegime,
     from: Vec<String>,
     /// Whether the query wrote a `FROM` / `FROM NAMED` clause at all.
     clause_written: bool,
@@ -261,10 +261,10 @@ impl<'a> QueryGraphs<'a> {
         dataset: &'a DatasetSpec,
         query: &spargebra::Query,
     ) -> Result<Self, crate::sparql_graph_clauses::CrossDataGraph> {
-        let regime = crate::sparql_graph_clauses::single_data_graph(query, dataset)?.regime;
+        let inference = crate::sparql_graph_clauses::single_data_graph(query, dataset)?.inference;
         let clause = crate::sparql_scoper::dataset_of(query);
         Ok(Self {
-            regime,
+            inference,
             dataset,
             clause_written: clause.is_some(),
             from: clause
@@ -303,11 +303,11 @@ impl<'a> QueryGraphs<'a> {
             return GraphReads::Data;
         }
         // The query reads one data graph, so a `FROM` over data graphs is one
-        // regime: the plan's.
+        // inference: the plan's.
         if self
             .from
             .iter()
-            .all(|iri| self.dataset.data_regime(iri).is_some())
+            .all(|iri| self.dataset.data_inference(iri).is_some())
         {
             GraphReads::Data
         } else if self
@@ -330,7 +330,7 @@ impl<'a> QueryGraphs<'a> {
         {
             return GraphReads::Other;
         }
-        if self.dataset.data_regime(iri).is_some() {
+        if self.dataset.data_inference(iri).is_some() {
             GraphReads::Data
         } else if self.dataset.is_schema_graph(iri) {
             GraphReads::Schema
@@ -339,9 +339,9 @@ impl<'a> QueryGraphs<'a> {
         }
     }
 
-    /// The one regime the query reads its records under.
-    pub(crate) fn regime(&self) -> TypeRegime {
-        self.regime
+    /// The one inference the query reads its records under.
+    pub(crate) fn inference(&self) -> TypeRegime {
+        self.inference
     }
 }
 
@@ -350,53 +350,53 @@ impl<'a> QueryGraphs<'a> {
 #[derive(Debug, Clone)]
 #[must_use = "a builder does nothing until `build` is called"]
 pub struct DatasetSpecBuilder {
-    default_regime: TypeRegime,
+    default_inference: TypeRegime,
     data_graphs: BTreeMap<String, TypeRegime>,
     schema_graphs: BTreeMap<String, TypeRegime>,
 }
 
 impl DatasetSpecBuilder {
-    /// Serve `iri` as a data graph holding its records under `regime`.
-    pub fn with_data_graph(mut self, iri: impl Into<String>, regime: TypeRegime) -> Self {
-        self.data_graphs.insert(iri.into(), regime);
+    /// Serve `iri` as a data graph holding its records under `inference`.
+    pub fn with_data_graph(mut self, iri: impl Into<String>, inference: TypeRegime) -> Self {
+        self.data_graphs.insert(iri.into(), inference);
         self
     }
 
-    /// Serve `iri` as a schema graph publishing the schema under `regime`.
-    pub fn with_schema_graph(mut self, iri: impl Into<String>, regime: TypeRegime) -> Self {
-        self.schema_graphs.insert(iri.into(), regime);
+    /// Serve `iri` as a schema graph publishing the schema under `inference`.
+    pub fn with_schema_graph(mut self, iri: impl Into<String>, inference: TypeRegime) -> Self {
+        self.schema_graphs.insert(iri.into(), inference);
         self
     }
 
     /// Refused, with **every** conflict found: an IRI in both maps, and a
-    /// regime without [`TypePartition::Own`] (for the default and for a data
+    /// inference without [`TypePartition::Own`] (for the default and for a data
     /// graph).
     pub fn build(self) -> Result<DatasetSpec, DatasetSpecError> {
         let Self {
-            default_regime,
+            default_inference,
             data_graphs,
             schema_graphs,
         } = self;
         let mut conflicts = Vec::new();
-        if !default_regime.contains(TypePartition::Own) {
-            conflicts.push(DatasetConflict::DefaultRegimeWithoutOwn {
-                regime: default_regime,
+        if !default_inference.contains(TypePartition::Own) {
+            conflicts.push(DatasetConflict::DefaultInferenceWithoutOwn {
+                inference: default_inference,
             });
         }
-        for (iri, regime) in &data_graphs {
+        for (iri, inference) in &data_graphs {
             if schema_graphs.contains_key(iri) {
                 conflicts.push(DatasetConflict::GraphIsDataAndSchema { iri: iri.clone() });
             }
-            if !regime.contains(TypePartition::Own) {
+            if !inference.contains(TypePartition::Own) {
                 conflicts.push(DatasetConflict::DataGraphWithoutOwn {
                     iri: iri.clone(),
-                    regime: *regime,
+                    inference: *inference,
                 });
             }
         }
         if conflicts.is_empty() {
             Ok(DatasetSpec {
-                default: default_regime,
+                default: default_inference,
                 data_graphs,
                 schema_graphs,
             })
@@ -408,16 +408,16 @@ impl DatasetSpecBuilder {
 
 #[cfg(test)]
 fn build(
-    default_regime: TypeRegime,
+    default_inference: TypeRegime,
     data_graphs: &[(&str, TypeRegime)],
     schema_graphs: &[(&str, TypeRegime)],
 ) -> Result<DatasetSpec, DatasetSpecError> {
-    let mut builder = DatasetSpec::builder(default_regime);
-    for (iri, regime) in data_graphs {
-        builder = builder.with_data_graph(*iri, *regime);
+    let mut builder = DatasetSpec::builder(default_inference);
+    for (iri, inference) in data_graphs {
+        builder = builder.with_data_graph(*iri, *inference);
     }
-    for (iri, regime) in schema_graphs {
-        builder = builder.with_schema_graph(*iri, *regime);
+    for (iri, inference) in schema_graphs {
+        builder = builder.with_schema_graph(*iri, *inference);
     }
     builder.build()
 }
@@ -425,11 +425,11 @@ fn build(
 /// A dataset for a test, from slices instead of maps.
 #[cfg(test)]
 pub(crate) fn dataset_with(
-    default_regime: TypeRegime,
+    default_inference: TypeRegime,
     data_graphs: &[(&str, TypeRegime)],
     schema_graphs: &[(&str, TypeRegime)],
 ) -> DatasetSpec {
-    build(default_regime, data_graphs, schema_graphs).expect("a valid dataset")
+    build(default_inference, data_graphs, schema_graphs).expect("a valid dataset")
 }
 
 /// The dataset a test that is not about datasets plans under, stated
@@ -482,11 +482,11 @@ mod tests {
     #[test]
     fn a_dataset_answers_for_each_graph_it_serves() {
         let dataset = served();
-        assert_eq!(dataset.default_regime(), TypeRegime::IS_A);
-        assert_eq!(dataset.data_regime(M), Some(TypeRegime::IS_A_AND_MIXINS));
-        assert_eq!(dataset.schema_regime(S), Some(TypeRegime::IS_A));
-        assert_eq!(dataset.data_regime(S), None);
-        assert_eq!(dataset.schema_regime(A), None);
+        assert_eq!(dataset.default_inference(), TypeRegime::IS_A);
+        assert_eq!(dataset.data_inference(M), Some(TypeRegime::IS_A_AND_MIXINS));
+        assert_eq!(dataset.schema_inference(S), Some(TypeRegime::IS_A));
+        assert_eq!(dataset.data_inference(S), None);
+        assert_eq!(dataset.schema_inference(A), None);
         assert!(dataset.has_schema_graph());
         assert!(!default_dataset().has_schema_graph());
     }
@@ -505,28 +505,28 @@ mod tests {
 
     /// `Own` holds every non-type triple of a record, so a graph of records
     /// without it holds no slot values: refused, for a data graph and for the
-    /// default regime, and the empty set is one of them.
+    /// default inference, and the empty set is one of them.
     #[test]
-    fn a_regime_without_own_is_no_graph_of_records() {
+    fn a_inference_without_own_is_no_graph_of_records() {
         let is_a_only = TypeRegime::from(TypePartition::IsA);
         assert!(!is_a_only.contains(TypePartition::Own));
         assert!(TypeRegime::IS_A_AND_MIXINS.contains(TypePartition::Own));
-        for regime in [is_a_only, TypeRegime::empty()] {
+        for inference in [is_a_only, TypeRegime::empty()] {
             assert_eq!(
-                conflicts_of(TypeRegime::ASSERTED, &[("urn:graph:odd", regime)], &[]),
+                conflicts_of(TypeRegime::ASSERTED, &[("urn:graph:odd", inference)], &[]),
                 vec![DatasetConflict::DataGraphWithoutOwn {
                     iri: "urn:graph:odd".into(),
-                    regime
+                    inference
                 }]
             );
             assert_eq!(
-                conflicts_of(regime, &[], &[]),
-                vec![DatasetConflict::DefaultRegimeWithoutOwn { regime }]
+                conflicts_of(inference, &[], &[]),
+                vec![DatasetConflict::DefaultInferenceWithoutOwn { inference }]
             );
         }
         let text = DatasetConflict::DataGraphWithoutOwn {
             iri: "urn:graph:odd".into(),
-            regime: is_a_only,
+            inference: is_a_only,
         }
         .to_string();
         assert!(
@@ -550,7 +550,7 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("; ");
-        assert!(text.contains("default regime"), "{text}");
+        assert!(text.contains("default inference"), "{text}");
         assert!(text.contains("urn:graph:schema"), "{text}");
     }
 }

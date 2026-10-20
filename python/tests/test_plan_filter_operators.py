@@ -12,7 +12,7 @@ from asset360_rust import DatasetSpec, FilterCondition, PlanOp, SchemaView, Type
 from asset360_rust import plan_query_refined as _plan_with_dataset
 
 # `dataset` is required by the binding (no call can forget it); these tests plan
-# against the endpoint every dataset was before graphs had regimes.
+# against the endpoint every dataset was before graphs had inferences.
 _DATASET = DatasetSpec(TypeRegime.ASSERTED)
 
 

@@ -1686,45 +1686,45 @@ class DatasetSpec:
     means: the one value every planning and evaluating entry point takes, so no
     call can forget it.
     
-    * ``default_regime`` -- the default graph: the records, written under this
+    * ``default_inference`` -- the default graph: the records, written under this
       :class:`TypeRegime`, with no graph name.
     * ``data_graphs`` -- named graphs over the golden records, each under a
-      regime: ``GRAPH <iri> { ... }`` reads the records under that regime. A
-      regime must contain ``TypePartition.OWN``, which holds every non-type
+      inference: ``GRAPH <iri> { ... }`` reads the records under that inference. A
+      inference must contain ``TypePartition.OWN``, which holds every non-type
       triple of a record.
     * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
-      subclass edges under a regime.
+      subclass edges under a inference.
     
     A query reads **one** data graph (see ``plan_query_refined``), so the
-    engine loads the records flat under that graph's regime.
+    engine loads the records flat under that graph's inference.
     
     ``DatasetSpec(TypeRegime.ASSERTED)`` is an asserted default graph and no
     named graph. ``repr`` round-trips: ``eval(repr(x)) == x``.
     
     Raises:
         ValueError: one IRI is both a data graph and a schema graph, or a
-            regime lacks ``Own``.
+            inference lacks ``Own``.
     """
     @property
-    def default_regime(self) -> TypeRegime:
+    def default_inference(self) -> TypeRegime:
         r"""
-        The regime the default graph holds the records under, which is what a
+        The inference the default graph holds the records under, which is what a
         triple pattern outside any ``GRAPH`` is matched under.
         """
     @property
     def data_graphs(self) -> builtins.dict[builtins.str, TypeRegime]:
         r"""
-        Every data graph, IRI to regime.
+        Every data graph, IRI to inference.
         """
     @property
     def schema_graphs(self) -> builtins.dict[builtins.str, TypeRegime]:
         r"""
-        Every schema graph, IRI to the regime it publishes its subclass edges
+        Every schema graph, IRI to the inference it publishes its subclass edges
         under.
         """
     def __eq__(self, other:builtins.object) -> builtins.bool: ...
     def __hash__(self) -> builtins.int: ...
-    def __new__(cls, default_regime:TypeRegime, *, data_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None, schema_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None) -> DatasetSpec: ...
+    def __new__(cls, default_inference:TypeRegime, *, data_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None, schema_graphs:typing.Optional[typing.Mapping[builtins.str, TypeRegime]]=None) -> DatasetSpec: ...
     def __repr__(self) -> builtins.str: ...
 
 class Definition:
@@ -4086,7 +4086,7 @@ class PlanOp:
         r"""
         For ``"scan"``: records whose ``asset_type`` is one of these,
         canonical IRIs sorted -- ``class_uri`` and the classes whose records
-        have it among their ``rdf:type`` under the plan's data regime, narrowed
+        have it among their ``rdf:type`` under the plan's data inference, narrowed
         to the direct types the query fixed. Render
         ``asset_type = ANY(asset_types)``; one element is the plain
         ``asset_type = class_uri``.
@@ -7375,7 +7375,7 @@ def check_predicates(query:builtins.str, schema_view:SchemaView, dataset:Dataset
     Never refuses. A subject's class is its one ``rdf:type``, the class
     ``bound`` gives its variable, or the range of the slot that reached it, and
     it is judged together with the classes ``rdf:type`` gives its instances
-    under the regime of the data graph the query reads. The query is judged as written,
+    under the inference of the data graph the query reads. The query is judged as written,
     with no alias resolved first: a predicate spelled with the wrong namespace
     is ``NotCarried``, and ``suggestion`` is the IRI the data uses. A subject
     whose class cannot be told is ``Unchecked``, never silently passed.
@@ -7385,7 +7385,7 @@ def check_predicates(query:builtins.str, schema_view:SchemaView, dataset:Dataset
         query: SPARQL query string (a SHACL ``sh:select`` body, say).
         schema_view: The LinkML schema.
         dataset: The :class:`DatasetSpec` the query reads. A subject is judged
-            with the classes its type implies under the regime of the data
+            with the classes its type implies under the inference of the data
             graph the query reads, so a slot only a subclass carries is
             carried by a parent-typed subject under ``IS_A`` and not under
             ``ASSERTED``.
@@ -7590,7 +7590,7 @@ def naive_plan_text(query:builtins.str, dataset:DatasetSpec) -> builtins.str:
     Takes no schema, unlike :func:`refined_plan_text`: the naive plan is a
     transcription of the query's own algebra and depends on nothing about the
     data. That is the property the obligation ledger rests on. It does take the
-    dataset, which says which graph each pattern reads and so which regime it
+    dataset, which says which graph each pattern reads and so which inference it
     is matched under.
     
     Args:
@@ -7633,7 +7633,7 @@ def plan_query_refined(query:builtins.str, schema_view:SchemaView, dataset:Datas
         query: SPARQL query string.
         schema_view: The LinkML schema.
         dataset: The :class:`DatasetSpec` the endpoint serves. Required: it
-            decides which regime each pattern is matched under and which
+            decides which inference each pattern is matched under and which
             graphs are the datamodel's, so a call that forgot it would plan a
             different endpoint's query.
         finishing: Keyword-only, default ``Finishing.ROWS``. Which routes may
@@ -7691,11 +7691,11 @@ def sparql_execute(query:builtins.str, instances:typing.Sequence[LinkMLInstance]
         schema_view: The LinkML schema (for RDF conversion).
         dataset: The :class:`DatasetSpec` the endpoint serves: which schema
             graphs to build (only the ones the query names), and the data
-            graphs whose regimes the records are loaded under. There is
+            graphs whose inferences the records are loaded under. There is
             deliberately no default: the correct graphs depend on which
             datamodel is deployed, and guessing would put an infrabel-named
             graph into an unrelated deployment. The records are loaded flat
-            under the one regime the query reads (the default graph's, or that
+            under the one inference the query reads (the default graph's, or that
             of the one data graph its ``FROM`` / ``GRAPH`` names). A query that
             reads two is refused with a ``RuntimeError`` whose text opens
             ``cross_data_graph``, exactly as the planner refuses it.
@@ -7731,7 +7731,7 @@ def sparql_execute_plan(plan:ExecutionPlan, instances:typing.Sequence[LinkMLInst
     Execute the query a plan was made for against a list of LinkML instances.
     
     The records route of a planned query: the plan carries the query (parsed
-    and canonical), the dataset and the one data graph (its regime) it reads the
+    and canonical), the dataset and the one data graph (its inference) it reads the
     records under, so the records cannot be loaded under one dataset and evaluated under
     another. ``sparql_execute`` stays for a query that was not planned.
     
@@ -7834,7 +7834,7 @@ def sparql_reads_only_the_schema_graph(query:builtins.str, schema_view:SchemaVie
             graph (the variable can bind nothing else).
     """
 
-def sparql_schema_graph_ntriples(schema_view:SchemaView, regime:TypeRegime) -> builtins.str:
+def sparql_schema_graph_ntriples(schema_view:SchemaView, inference:TypeRegime) -> builtins.str:
     r"""
     The datamodel's schema graph, as N-Triples.
     
@@ -7843,11 +7843,11 @@ def sparql_schema_graph_ntriples(schema_view:SchemaView, regime:TypeRegime) -> b
     
     Args:
         schema_view: The LinkML schema.
-        regime: The :class:`TypeRegime` the subclass edges are published
+        inference: The :class:`TypeRegime` the subclass edges are published
             under (a schema graph of a dataset publishes under its own).
     """
 
-def sparql_schema_graph_skipped(schema_view:SchemaView, regime:TypeRegime) -> builtins.list[builtins.str]:
+def sparql_schema_graph_skipped(schema_view:SchemaView, inference:TypeRegime) -> builtins.list[builtins.str]:
     r"""
     Schema terms left out of the graph because their IRI was not absolute.
     
@@ -7857,7 +7857,7 @@ def sparql_schema_graph_skipped(schema_view:SchemaView, regime:TypeRegime) -> bu
     
     Args:
         schema_view: The LinkML schema.
-        regime: The :class:`TypeRegime` the graph is published under.
+        inference: The :class:`TypeRegime` the graph is published under.
     """
 
 def sparql_scope(query:builtins.str, schema_view:SchemaView, dataset:DatasetSpec) -> QueryPlan:

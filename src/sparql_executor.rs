@@ -414,12 +414,12 @@ impl std::io::Write for SharedBuffer {
     }
 }
 
-/// Load `instances` flat under the query's regime and evaluate `parsed`
+/// Load `instances` flat under the query's inference and evaluate `parsed`
 /// (parsed and canonicalised) over them.
 ///
 /// **The records are where the query is told they are.** A query reads at most
 /// one named data graph `G` ([`crate::sparql_graph_clauses::single_data_graph`]),
-/// so the records are written, with `WriteOptions::flat(G's regime)`, into the
+/// so the records are written, with `WriteOptions::flat(G's inference)`, into the
 /// store graph named `G` -- or into the default graph, when the query names
 /// none. oxigraph then evaluates `GRAPH`, `FROM` and `FROM NAMED` as written;
 /// the query never reads the default graph beside `G`, so nothing is set.
@@ -467,7 +467,7 @@ fn evaluate_over_records(
         once(&mut clause.default);
         clause.named.iter_mut().for_each(once);
     }
-    let regime = read.regime;
+    let inference = read.inference;
 
     let store = Store::new().map_err(|e| ExecuteError::StoreError(e.to_string()))?;
 
@@ -512,7 +512,7 @@ fn evaluate_over_records(
         schema_view,
         &primary_schema,
         &converter,
-        &WriteOptions::flat(regime),
+        &WriteOptions::flat(inference),
     )
     .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
     let mut quads: Vec<oxigraph::model::Quad> = Vec::new();
@@ -568,7 +568,7 @@ fn evaluate_over_records(
     //
     // Which graphs it goes in is the caller's, threaded down from the active
     // datamodel's configuration: a dataset with no schema graph has nothing to
-    // insert, and one with several (one per regime its subclass edges are
+    // insert, and one with several (one per inference its subclass edges are
     // published under) gets exactly the ones this query names.
     insert_schema_graphs(&store, &parsed, schema_view, dataset)?;
 
@@ -583,7 +583,7 @@ fn evaluate_over_records(
 }
 
 /// Put every schema graph `query` can read into `store`, each in its own
-/// named graph under its own regime.
+/// named graph under its own inference.
 ///
 /// Only the ones the query names (see
 /// [`crate::sparql_graph_clauses::schema_graphs_read`]): a query that reads
@@ -598,7 +598,8 @@ fn insert_schema_graphs(
     let read = crate::sparql_graph_clauses::schema_graphs_read(query, dataset);
     let quads = crate::sparql_schema_graph::SchemaGraph::quads_of_graphs(
         schema_view,
-        read.iter().map(|(iri, regime)| (iri.as_str(), *regime)),
+        read.iter()
+            .map(|(iri, inference)| (iri.as_str(), *inference)),
     )
     .map_err(|e| ExecuteError::StoreError(e.to_string()))?;
     for quad in &quads {
@@ -1159,7 +1160,7 @@ classes:
     /// `FROM <inferred>`, `FROM NAMED <inferred>` and `GRAPH <inferred> { .. }`
     /// are evaluated natively, and agree with the SQL route: asserted reads no
     /// `Signal` of a `Beacon` record, inferred reads it. The default graph may
-    /// never be read beside a named data graph, whatever its regime; schema
+    /// never be read beside a named data graph, whatever its inference; schema
     /// graphs may always be read beside it, and a data graph may sit anywhere
     /// inside a schema graph. Every query that reads a second data graph is
     /// refused, with the planner's own text.
@@ -1308,7 +1309,7 @@ classes:
         // default graph beside a named one (a query uses the default graph or
         // names its data graph, never both).
         for query in [
-            // `A` has the default regime, and is refused all the same.
+            // `A` has the default inference, and is refused all the same.
             format!(
                 "SELECT ?s WHERE {{ ?s a asset360:Signal GRAPH <{A}> {{ ?s asset360:name ?name }} }}"
             ),

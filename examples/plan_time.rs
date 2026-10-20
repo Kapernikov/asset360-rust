@@ -21,8 +21,8 @@ fn main() {
     let mut dataset = asset360_rust::sparql_dataset::DatasetSpec::builder(
         linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
     );
-    for (iri, regime) in schema_graphs {
-        dataset = dataset.with_schema_graph(iri, regime);
+    for (iri, inference) in schema_graphs {
+        dataset = dataset.with_schema_graph(iri, inference);
     }
     let dataset = dataset.build().expect("a valid dataset");
     let mut sv = SchemaView::new();

@@ -181,7 +181,7 @@ pub trait Materialisation {
 /// `dataset` says which graphs are the schema's -- a parameter and never a
 /// constant, see [`crate::sparql_schema_graph`]. Data-graph `GRAPH` nodes are
 /// not in a plan at all (the naive plan dissolves them into each `Match`'s
-/// regime), so a `Graph` node here is the schema graph, a variable, or a graph
+/// inference), so a `Graph` node here is the schema graph, a variable, or a graph
 /// the endpoint does not serve.
 ///
 /// The walk carries one bit of context, *which graph a read would read from*,
@@ -345,7 +345,7 @@ fn names_a_schema_graph(name: &str, dataset: &DatasetSpec) -> bool {
     }
     name.strip_prefix('<')
         .and_then(|rest| rest.strip_suffix('>'))
-        .is_some_and(|iri| dataset.schema_regime(iri).is_some())
+        .is_some_and(|iri| dataset.schema_inference(iri).is_some())
 }
 
 /// **Whether this subplan is a region `pass` can evaluate.**
@@ -801,11 +801,11 @@ impl Materialisation for SchemaGraphMaterialisation<'_> {
         self.store
             .get_or_init(|| {
                 // Every schema graph the dataset serves, each in its own
-                // named graph under its own regime: the shape the engine leg
+                // named graph under its own inference: the shape the engine leg
                 // loads, so a probe answers what the engine would answer. The
                 // planner hands this the dataset *as the query reads it*
                 // ([`DatasetSpec::read_by`]), so that is the graphs it can
-                // reach and no others; one build per regime.
+                // reach and no others; one build per inference.
                 let store = Store::new().ok()?;
                 let quads = crate::sparql_schema_graph::SchemaGraph::quads_of_graphs(
                     self.schema_view,
@@ -956,11 +956,11 @@ mod tests {
         );
     }
 
-    /// A request pays for the schema graphs it can read, once per regime. A
-    /// dataset serving four (an alias and three regimes) built all four, in
+    /// A request pays for the schema graphs it can read, once per inference. A
+    /// dataset serving four (an alias and three inferences) built all four, in
     /// every rule that asks, for a query naming one: ~300 ms each.
     #[test]
-    fn a_plan_builds_only_the_schema_graphs_the_query_can_read_once_per_regime() {
+    fn a_plan_builds_only_the_schema_graphs_the_query_can_read_once_per_inference() {
         use linkml_runtime::schema_rdf::TypeRegime;
         const ALIAS: &str = "https://data.infrabel.be/asset360/schema-alias";
         const INFERRED: &str = "https://data.infrabel.be/asset360/schema-inferred";
@@ -996,7 +996,7 @@ mod tests {
         };
         // One graph named: one build, not four, and not one per rule.
         assert_eq!(builds_for(&format!("<{SCHEMA_GRAPH}>")), 1);
-        // `GRAPH ?g` can read all four, which are three regimes.
+        // `GRAPH ?g` can read all four, which are three inferences.
         assert_eq!(builds_for("?g"), 3);
     }
 

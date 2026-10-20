@@ -13,14 +13,14 @@ struct TurtleOptions {
     #[serde(default)]
     skolem: bool,
     #[serde(default)]
-    regime: Option<String>,
+    inference: Option<String>,
 }
 
 #[wasm_bindgen(typescript_custom_section)]
 const TURTLE_OPTIONS_TS: &'static str = r#"
 export interface TurtleOptions {
   skolem?: boolean;
-  regime?: string;
+  inference?: string;
 }
 "#;
 use wasm_bindgen::prelude::*;
@@ -972,8 +972,8 @@ impl LinkMLInstanceHandle {
 
     /// Serialize this instance as Turtle (RDF).
     ///
-    /// `options` is `{ skolem?: boolean, regime?: string }`. `regime` is the
-    /// type regime the `rdf:type` triples are written under: `"asserted"` (the
+    /// `options` is `{ skolem?: boolean, inference?: string }`. `inference` is the
+    /// type inference the `rdf:type` triples are written under: `"asserted"` (the
     /// instance's own class; the default), `"is_a"` (plus every `is_a`
     /// ancestor and `sesame:directType`), `"is_a_and_mixins"` (plus mixins), or
     /// any braced partition set such as `{own,is_a}` (`own`, `is_a`, `mixin`, `direct`).
@@ -989,8 +989,8 @@ impl LinkMLInstanceHandle {
             serde_wasm_bindgen::from_value(options)
                 .map_err(|e| JsValue::from_str(&format!("invalid toTurtle options: {e}")))?
         };
-        let TurtleOptions { skolem, regime } = options;
-        let regime: TypeRegime = regime
+        let TurtleOptions { skolem, inference } = options;
+        let inference: TypeRegime = inference
             .as_deref()
             .map(str::parse)
             .transpose()
@@ -1008,7 +1008,7 @@ impl LinkMLInstanceHandle {
             sv,
             &schema,
             &conv,
-            &WriteOptions::flat(regime).with_skolem(skolem),
+            &WriteOptions::flat(inference).with_skolem(skolem),
         )
         .map_err(|e| JsValue::from_str(&e.to_string()))
     }

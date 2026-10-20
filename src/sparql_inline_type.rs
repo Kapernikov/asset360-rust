@@ -34,16 +34,16 @@ pub(crate) enum InlineTypeTest {
 }
 
 /// Decide `?x a c` for an element of a slot whose range is `range`, under
-/// `regime`. `None` when the schema cannot answer (a class family or a
+/// `inference`. `None` when the schema cannot answer (a class family or a
 /// designator value that does not resolve): the caller keeps the triple.
 ///
 /// **Proof.** Let `D` be the element's designated class: the class its
 /// designator names, or `range` when it has none. The writer states exactly
-/// `rdf_types(D, regime)` about the element, so `?x a c` holds iff
-/// `c ∈ rdf_types(D, regime)`, i.e. `D ∈ type_family(c, regime)` -- the two are
+/// `rdf_types(D, inference)` about the element, so `?x a c` holds iff
+/// `c ∈ rdf_types(D, inference)`, i.e. `D ∈ type_family(c, inference)` -- the two are
 /// inverse by definition (`type_family`). `D` ranges over `U = type_family(range,
 /// IS_A_AND_MIXINS)`, the widest family a slot over `range` may store, so the test
-/// is decided by `M = U ∩ type_family(c, regime)`:
+/// is decided by `M = U ∩ type_family(c, inference)`:
 ///
 /// * `M = ∅`: no stored element has `c` among its types -- `NeverMatches`.
 /// * `M = U`: every one has -- `Discharged`. (`range` is in `U`, so this
@@ -57,12 +57,12 @@ pub(crate) fn inline_type_test(
     schema: &SchemaView,
     range: &ClassView,
     c: &ClassView,
-    regime: TypeRegime,
+    inference: TypeRegime,
 ) -> Option<InlineTypeTest> {
     let key = |class: &ClassView| class.canonical_uri().to_string();
     let universe = type_family(range, TypeRegime::IS_A_AND_MIXINS).ok()?;
     let wanted: std::collections::HashSet<String> =
-        type_family(c, regime).ok()?.iter().map(key).collect();
+        type_family(c, inference).ok()?.iter().map(key).collect();
     let matching: Vec<&ClassView> = universe
         .iter()
         .filter(|class| wanted.contains(&key(class)))
@@ -123,9 +123,9 @@ mod tests {
             .unwrap()
     }
 
-    fn test(range: &str, c: &str, regime: TypeRegime) -> InlineTypeTest {
+    fn test(range: &str, c: &str, inference: TypeRegime) -> InlineTypeTest {
         let sv = test_schema_view();
-        inline_type_test(&sv, &class(&sv, range), &class(&sv, c), regime).unwrap()
+        inline_type_test(&sv, &class(&sv, range), &class(&sv, c), inference).unwrap()
     }
 
     fn designator(values: &[&str], includes_absent: bool) -> InlineTypeTest {
@@ -138,21 +138,21 @@ mod tests {
     }
 
     /// `Place` has the subclasses `SpotPlace`, `RoadPlace`, `RailPlace` and a
-    /// designator; `Fix` is unrelated to it. All three regimes, because the
+    /// designator; `Fix` is unrelated to it. All three inferences, because the
     /// answer is where they differ.
     #[test]
-    fn the_verdict_follows_the_regime() {
+    fn the_verdict_follows_the_inference() {
         use InlineTypeTest::*;
-        for &regime in TypeRegime::NAMED {
+        for &inference in TypeRegime::NAMED {
             // A subclass of the range: the elements designated by it.
             assert_eq!(
-                test("Place", "SpotPlace", regime),
+                test("Place", "SpotPlace", inference),
                 designator(&["SpotPlace"], false)
             );
-            // Unrelated to the range: nothing matches, in every regime.
-            assert_eq!(test("Place", "Fix", regime), NeverMatches);
+            // Unrelated to the range: nothing matches, in every inference.
+            assert_eq!(test("Place", "Fix", inference), NeverMatches);
             // A sibling subtree the range does not hold.
-            assert_eq!(test("SpotPlace", "RoadPlace", regime), NeverMatches);
+            assert_eq!(test("SpotPlace", "RoadPlace", inference), NeverMatches);
         }
         // The range itself: asserted, only the elements that are plain
         // `Place`s (designator absent, or naming `Place`); inferred, all.
@@ -185,13 +185,17 @@ mod tests {
     #[test]
     fn a_range_without_a_designator_is_all_one_class() {
         use InlineTypeTest::*;
-        for &regime in TypeRegime::NAMED {
+        for &inference in TypeRegime::NAMED {
             assert_eq!(
-                test("Detail", "Coordinates", regime),
+                test("Detail", "Coordinates", inference),
                 NeverMatches,
-                "{regime:?}"
+                "{inference:?}"
             );
-            assert_eq!(test("Detail", "Place", regime), NeverMatches, "{regime:?}");
+            assert_eq!(
+                test("Detail", "Place", inference),
+                NeverMatches,
+                "{inference:?}"
+            );
         }
         assert_eq!(test("Detail", "Detail", TypeRegime::ASSERTED), Discharged);
         assert_eq!(test("Detail", "Detail", TypeRegime::IS_A), Discharged);

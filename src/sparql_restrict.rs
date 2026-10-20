@@ -75,11 +75,11 @@ pub enum Step {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
     /// `?v` is the identity of a record of this class, read under this type
-    /// regime (that of the scan it was derived from). The fold reads it as
+    /// inference (that of the scan it was derived from). The fold reads it as
     /// the star's type when 3b carries it to the matches.
     Class {
         class_uri: String,
-        regime: TypeRegime,
+        inference: TypeRegime,
     },
     /// A condition over slots of `?v`'s record -- `?v.kind = 'GSA'` -- that
     /// the other side's every row satisfies. It lands as a filter above
@@ -136,10 +136,13 @@ impl Restriction {
     /// The filter condition that spells this restriction in a plan.
     pub fn condition(&self) -> Expr {
         match &self.predicate {
-            Predicate::Class { class_uri, regime } => Expr::InClass {
+            Predicate::Class {
+                class_uri,
+                inference,
+            } => Expr::InClass {
                 var: self.var.clone(),
                 class_uri: class_uri.clone(),
-                regime: *regime,
+                inference: *inference,
             },
             Predicate::Condition(condition) => condition.clone(),
         }
@@ -472,10 +475,10 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                     let Some(class_uri) = plan.identity_class(self.schema, other, var) else {
                         continue;
                     };
-                    // The restriction is read under the regime of the scan it
+                    // The restriction is read under the inference of the scan it
                     // comes from. Scans that disagree about it leave nothing
                     // to carry, so nothing is restricted.
-                    let Some(regime) = plan.identity_regime(other, var, &class_uri) else {
+                    let Some(inference) = plan.identity_inference(other, var, &class_uri) else {
                         continue;
                     };
                     let join_key = plan.key_of(id);
@@ -569,12 +572,19 @@ impl Rule for RestrictScopeAtBoundary<'_> {
                                 condition: Expr::InClass {
                                     var: var.clone(),
                                     class_uri: class_uri.clone(),
-                                    regime,
+                                    inference,
                                 },
                             },
                             Vec::new(),
                         );
-                        placed(plan, Predicate::Class { class_uri, regime }, filter);
+                        placed(
+                            plan,
+                            Predicate::Class {
+                                class_uri,
+                                inference,
+                            },
+                            filter,
+                        );
                         return true;
                     }
 
@@ -1421,13 +1431,13 @@ mod tests {
         );
     }
 
-    /// A restriction carries the regime of the scan it was derived from, and
-    /// the fold reads it as that scan's regime: with the star read in graph `I`
+    /// A restriction carries the inference of the scan it was derived from, and
+    /// the fold reads it as that scan's inference: with the star read in graph `I`
     /// (`is_a`), the restriction is `∈ Signal [is_a]` and both scans read under
-    /// it. (A query reads one data graph, so there is no second regime for the
+    /// it. (A query reads one data graph, so there is no second inference for the
     /// restriction to be confused with.)
     #[test]
-    fn a_restriction_carries_the_regime_of_the_scan_it_came_from() {
+    fn a_restriction_carries_the_inference_of_the_scan_it_came_from() {
         use linkml_runtime::schema_rdf::TypeRegime;
         const I: &str = "urn:graph:inferred";
         let schema = test_schema_view();
@@ -1457,11 +1467,11 @@ mod tests {
             restriction.predicate,
             Predicate::Class {
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
-                regime: TypeRegime::IS_A
+                inference: TypeRegime::IS_A
             },
             "{plan}"
         );
-        // Both stars are scans, under the one regime.
+        // Both stars are scans, under the one inference.
         assert_eq!(plan.find("scan").len(), 2, "{plan}");
         assert!(
             plan.nodes.iter().all(|node| !matches!(
@@ -1647,7 +1657,7 @@ mod tests {
                 Expr::InClass {
                     var,
                     class_uri,
-                    regime,
+                    inference,
                 },
             ..
         } = plan.nodes[filter].op.clone()
@@ -1661,7 +1671,7 @@ mod tests {
                 condition: Expr::InClass {
                     var,
                     class_uri,
-                    regime,
+                    inference,
                 },
             },
             vec![claim],

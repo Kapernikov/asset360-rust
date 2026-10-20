@@ -6,7 +6,7 @@
 /// One function, so every walk of a path asks the same question. The family
 /// is schema-level: every `is_a` and mixin descendant, recursively. Slot
 /// resolution reads the schema, not the triples, so the family does not
-/// depend on the type regime.
+/// depend on the type inference.
 ///
 /// `get_descendants` terminates on a class that mixes itself in (a class is
 /// recorded once and not recursed into again) and then lists it as its own
@@ -39,7 +39,7 @@ pub(crate) fn descendants_for_slot_resolution(
 /// find. `Err` is a schema that could not be read.
 ///
 /// Equivalence argument. Slot resolution reads the schema, not the triples,
-/// so it does not depend on the type regime. The stored JSON keys a slot by
+/// so it does not depend on the type inference. The stored JSON keys a slot by
 /// its name whatever subclass the element is; an element of another subclass
 /// simply lacks the key. The consumers of a resolved hop (a presence test, a
 /// path read, a fan-out) are already defined on a missing key -- absent,

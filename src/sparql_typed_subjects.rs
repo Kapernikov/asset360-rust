@@ -11,7 +11,7 @@
 //!
 //! "the types of `?s` that no other type of `?s` is below" -- the most specific
 //! type. Written that way the engine evaluates a transitive path over the whole
-//! schema once per subject. Under an inferred regime the data already says it:
+//! schema once per subject. Under an inferring inference the data already says it:
 //! `?s sesame:directType ?t`, one triple. This rule recognises the spelling,
 //! proves the two agree under the stated conditions, and says the short form.
 //! It is the plan-level counterpart of the `sesame:directType` fold into a
@@ -21,8 +21,8 @@
 //! # Proof
 //!
 //! Fix a subject `s` whose record is of concrete class `c`, and let `T(c) =
-//! rdf_types(c, r)` be the set of its `rdf:type` objects under the data regime
-//! `r` the two `a` matches share (they must be in the same regime: otherwise
+//! rdf_types(c, r)` be the set of its `rdf:type` objects under the data inference
+//! `r` the two `a` matches share (they must be in the same inference: otherwise
 //! `?t` and `?sub` range over different sets). Let `E` be the closure of the
 //! `rdfs:subClassOf` edges `G` publishes and `E+` its transitive closure, which
 //! is what `rdfs:subClassOf+` over `G` enumerates. `?t` is kept for `s` exactly
@@ -32,9 +32,9 @@
 //!
 //! Conditions, each with the wrong answer it prevents:
 //!
-//! 1. **`G` is a schema graph of known regime `g`** ([`DatasetSpec::schema_regime`]).
+//! 1. **`G` is a schema graph of known inference `g`** ([`DatasetSpec::schema_inference`]).
 //!    For any other graph nothing is known about its edges.
-//! 2. **`G` covers what the data regime uses**: for every class `c` and every
+//! 2. **`G` covers what the data inference uses**: for every class `c` and every
 //!    `t ∈ T(c)`, `t ≠ c`: `(c, t) ∈ E+`. Without it a type of `s` can lack the
 //!    edge that would exclude it, and the NOT EXISTS keeps a non-minimal type
 //!    that `directType` does not name. (Asserted schema under mixin data fails
@@ -48,13 +48,13 @@
 //! `(c, c) ∈ E+`, contradicting 3. Otherwise `(c, sub) ∈ E+` by 2, and with
 //! `(sub, c) ∈ E+` that is `(c, c) ∈ E+`, contradicting 3.
 //!
-//! *`t ≠ c` is dropped.* `c ∈ T(c)` (the `Own` partition is in every regime),
+//! *`t ≠ c` is dropped.* `c ∈ T(c)` (the `Own` partition is in every inference),
 //! and `(c, t) ∈ E+` by 2, so `sub = c` witnesses the NOT EXISTS.
 //!
 //! The multiplicity is one on both sides: the data graph is a set of triples, so
 //! `?s a ?t` has one row per distinct `t`, and `directType` one row per `s`.
 //!
-//! **Under the asserted regime** `T(c) = {c}` and `directType` is not published,
+//! **Under the asserted inference** `T(c) = {c}` and `directType` is not published,
 //! so the rewrite is the *removal* of the NOT EXISTS, leaving `?s a ?t`: the only
 //! candidate `sub` is `c = t`, and `(c, c) ∉ E+` by 3. Conditions 1 and 3 apply;
 //! 2 is vacuous.
@@ -86,8 +86,8 @@
 //!
 //! # The dataset
 //!
-//! The one question this rule asks the dataset is *what regime does the schema
-//! graph with this IRI publish?* ([`DatasetSpec::schema_regime`]). An IRI the
+//! The one question this rule asks the dataset is *what inference does the schema
+//! graph with this IRI publish?* ([`DatasetSpec::schema_inference`]). An IRI the
 //! dataset does not serve as a schema graph leaves the plan alone.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -114,11 +114,11 @@ fn class_key(class: &linkml_schemaview::classview::ClassView) -> String {
 }
 
 /// `E+`: the transitive closure of the `rdfs:subClassOf` edges a schema graph
-/// of regime `regime` publishes, as `(sub, super)` pairs of canonical class
+/// of inference `inference` publishes, as `(sub, super)` pairs of canonical class
 /// IRIs. `None` when the schema cannot enumerate its edges.
-fn subclass_closure(sv: &SchemaView, regime: TypeRegime) -> Option<HashSet<(String, String)>> {
+fn subclass_closure(sv: &SchemaView, inference: TypeRegime) -> Option<HashSet<(String, String)>> {
     let mut above: HashMap<String, Vec<String>> = HashMap::new();
-    for (sub, sup) in subclass_edges(sv, regime).ok()? {
+    for (sub, sup) in subclass_edges(sv, inference).ok()? {
         above
             .entry(class_key(&sub))
             .or_default()
@@ -139,15 +139,15 @@ fn subclass_closure(sv: &SchemaView, regime: TypeRegime) -> Option<HashSet<(Stri
     Some(closure)
 }
 
-/// Conditions 2 and 3 of the proof: whether a schema graph of regime
-/// `graph_regime` makes "no type of `s` lies below `t`" the same as "`t` is
-/// `s`'s direct type" for data of regime `data_regime`.
+/// Conditions 2 and 3 of the proof: whether a schema graph of inference
+/// `graph_inference` makes "no type of `s` lies below `t`" the same as "`t` is
+/// `s`'s direct type" for data of inference `data_inference`.
 fn most_specific_is_direct(
     sv: &SchemaView,
-    graph_regime: TypeRegime,
-    data_regime: TypeRegime,
+    graph_inference: TypeRegime,
+    data_inference: TypeRegime,
 ) -> bool {
-    let Some(closure) = subclass_closure(sv, graph_regime) else {
+    let Some(closure) = subclass_closure(sv, graph_inference) else {
         return false;
     };
     // 3: irreflexive.
@@ -157,21 +157,21 @@ fn most_specific_is_direct(
     // The rule reads `?s a ?t` and rewrites it to `sesame:directType`: the
     // data must write its own class, and either nothing else (the own class
     // is the direct type) or the direct type.
-    if !data_regime.contains(TypePartition::Own) {
+    if !data_inference.contains(TypePartition::Own) {
         return false;
     }
-    if data_regime.is_subset(TypeRegime::ASSERTED) {
+    if data_inference.is_subset(TypeRegime::ASSERTED) {
         return true;
     }
-    if !data_regime.contains(TypePartition::Direct) {
+    if !data_inference.contains(TypePartition::Direct) {
         return false;
     }
-    // 2: every type the data regime writes for a class is above it in `E+`.
+    // 2: every type the data inference writes for a class is above it in `E+`.
     let Ok(classes) = sv.class_views() else {
         return false;
     };
     classes.iter().all(|class| {
-        let Ok(types) = rdf_types(class, data_regime) else {
+        let Ok(types) = rdf_types(class, data_inference) else {
             return false;
         };
         let own = class_key(class);
@@ -212,7 +212,7 @@ fn typed_pair(plan: &Plan, id: NodeId) -> Option<(String, String, TypeRegime)> {
     Some((
         subject_variable(pattern)?.to_owned(),
         object_variable(pattern)?.to_owned(),
-        reads.is_data().then_some(plan.data_regime)?,
+        reads.is_data().then_some(plan.data_inference)?,
     ))
 }
 
@@ -270,7 +270,7 @@ struct Found {
     matched: NodeId,
     /// The NOT EXISTS body, which goes.
     body: BTreeSet<NodeId>,
-    regime: TypeRegime,
+    inference: TypeRegime,
     graph_iri: String,
 }
 
@@ -298,7 +298,7 @@ impl MostSpecificTypeIsTheDirectType<'_> {
             (*b, *a)
         };
         let (graph_iri, path_sub, path_sup, _) = subclass_plus(plan, graph)?;
-        let (s, sub, sub_regime) = typed_pair(plan, sub_match)?;
+        let (s, sub, sub_inference) = typed_pair(plan, sub_match)?;
         if sub != path_sub {
             return None;
         }
@@ -335,17 +335,17 @@ impl MostSpecificTypeIsTheDirectType<'_> {
                     }
                 }
                 PlanOp::Match { .. } => {
-                    if let Some((subject, object, regime)) = typed_pair(plan, id)
+                    if let Some((subject, object, inference)) = typed_pair(plan, id)
                         && subject == s
                         && object == path_sup
                     {
-                        candidates.push((id, regime));
+                        candidates.push((id, inference));
                     }
                 }
                 _ => {}
             }
         }
-        let [(matched, regime)] = candidates.as_slice() else {
+        let [(matched, inference)] = candidates.as_slice() else {
             return None;
         };
         // The spine is a tree: nothing outside it reads a node of it, so
@@ -360,8 +360,8 @@ impl MostSpecificTypeIsTheDirectType<'_> {
                 return None;
             }
         }
-        // Three distinct variables, and the same data regime on both matches.
-        if s == sub || s == path_sup || sub == path_sup || sub_regime != *regime {
+        // Three distinct variables, and the same data inference on both matches.
+        if s == sub || s == path_sup || sub == path_sup || sub_inference != *inference {
             return None;
         }
         // The body is exactly the four nodes the spelling names (the join,
@@ -387,7 +387,7 @@ impl MostSpecificTypeIsTheDirectType<'_> {
             kept,
             matched: *matched,
             body,
-            regime: *regime,
+            inference: *inference,
             graph_iri,
         })
     }
@@ -403,10 +403,10 @@ impl Rule for MostSpecificTypeIsTheDirectType<'_> {
             let Some(found) = self.recognise(plan, anti) else {
                 continue;
             };
-            let Some(graph_regime) = self.dataset.schema_regime(&found.graph_iri) else {
+            let Some(graph_inference) = self.dataset.schema_inference(&found.graph_iri) else {
                 continue;
             };
-            if !most_specific_is_direct(self.schema, graph_regime, found.regime) {
+            if !most_specific_is_direct(self.schema, graph_inference, found.inference) {
                 continue;
             }
             rewrite(plan, &found);
@@ -416,7 +416,7 @@ impl Rule for MostSpecificTypeIsTheDirectType<'_> {
     }
 }
 
-/// Apply the rewrite: the match becomes `directType` (inferred regimes) or
+/// Apply the rewrite: the match becomes `directType` (inferring inferences) or
 /// stays as it is (asserted), the anti-join and its body go, and the match
 /// takes over their obligations.
 fn rewrite(plan: &mut Plan, found: &Found) {
@@ -437,7 +437,7 @@ fn rewrite(plan: &mut Plan, found: &Found) {
         let mut node = node.clone();
         if old == found.matched {
             node.discharges = claims.clone();
-            if found.regime.contains(TypePartition::Direct)
+            if found.inference.contains(TypePartition::Direct)
                 && let PlanOp::Match { pattern, .. } = &mut node.op
             {
                 pattern.predicate = NamedNodePattern::NamedNode(NamedNode::new_unchecked(
@@ -471,7 +471,7 @@ mod tests {
     use linkml_meta::SchemaDefinition;
 
     /// `Root <- Mid <- Leaf` by `is_a`, and `Leaf` also mixes in `Tag`: a
-    /// chain, so the is-a closure matters, and a mixin, so the regimes differ.
+    /// chain, so the is-a closure matters, and a mixin, so the inferences differ.
     const SCHEMA: &str = "
 id: https://example.org/typed
 name: typed
@@ -506,7 +506,7 @@ classes:
 
     const G: &str = "https://example.org/schema";
 
-    /// The canonical spelling, with `data` the regime of the data graph.
+    /// The canonical spelling, with `data` the inference of the data graph.
     fn refined(sv: &SchemaView, dataset: &DatasetSpec, spelling: &str) -> (bool, String) {
         let query = format!("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {spelling}");
         let parsed = crate::sparql_scoper::parse_query(&query, Some(sv)).expect("parses");
@@ -527,7 +527,7 @@ classes:
         )
     }
 
-    /// A dataset whose default graph is data of regime `data` and which serves
+    /// A dataset whose default graph is data of inference `data` and which serves
     /// `G` as a schema graph publishing `graph`.
     fn serving(data: TypeRegime, graph: TypeRegime) -> DatasetSpec {
         crate::sparql_dataset::dataset_with(data, &[], &[(G, graph)])
@@ -714,12 +714,12 @@ classes:
         ));
     }
 
-    /// Every branch of the data-regime judgement. Asserted data is accepted
-    /// (the own class is the direct type); a regime without `Own` is declined
+    /// Every branch of the data-inference judgement. Asserted data is accepted
+    /// (the own class is the direct type); a inference without `Own` is declined
     /// (`?s a ?t` would not read the own class); inferred types without
     /// `Direct` are declined (nothing to rewrite to); `Own + Direct` is accepted.
     #[test]
-    fn the_data_regime_judgement_covers_every_branch() {
+    fn the_data_inference_judgement_covers_every_branch() {
         let sv = schema_view();
         let graph = TypeRegime::IS_A_AND_MIXINS;
         let own_direct = TypeRegime::ASSERTED.with(TypePartition::Direct);
@@ -735,13 +735,13 @@ classes:
         assert!(!most_specific_is_direct(&sv, graph, TypeRegime::empty()));
     }
 
-    /// The dataset names its schema graphs by regime; the rule reads the one the
+    /// The dataset names its schema graphs by inference; the rule reads the one the
     /// query names. `inferred-mixins` over is-a data covers every edge the data
     /// uses, so the rewrite fires; `asserted` over mixin data does not, and is
-    /// left alone. Neither is the default regime, so the dataset (and not a
+    /// left alone. Neither is the default inference, so the dataset (and not a
     /// default) is what decided.
     #[test]
-    fn the_rule_reads_the_named_graphs_own_regime() {
+    fn the_rule_reads_the_named_graphs_own_inference() {
         const INFERRED_MIXINS: &str = "https://example.org/schema/inferred-mixins";
         const ASSERTED: &str = "https://example.org/schema/asserted";
         let sv = schema_view();
@@ -777,16 +777,16 @@ classes:
     /// ever emits a reflexive edge, this fails -- and the rule's closure check
     /// declines in the meantime.
     #[test]
-    fn subclass_edges_are_irreflexive_in_every_regime() {
+    fn subclass_edges_are_irreflexive_in_every_inference() {
         let sv = schema_view();
-        for &regime in TypeRegime::NAMED {
-            for (sub, sup) in subclass_edges(&sv, regime).unwrap() {
-                assert_ne!(class_key(&sub), class_key(&sup), "{regime:?}");
+        for &inference in TypeRegime::NAMED {
+            for (sub, sup) in subclass_edges(&sv, inference).unwrap() {
+                assert_ne!(class_key(&sub), class_key(&sup), "{inference:?}");
             }
-            let closure = subclass_closure(&sv, regime).unwrap();
+            let closure = subclass_closure(&sv, inference).unwrap();
             assert!(
                 closure.iter().all(|(sub, sup)| sub != sup),
-                "{regime:?}: the closure relates a class to itself"
+                "{inference:?}: the closure relates a class to itself"
             );
         }
     }

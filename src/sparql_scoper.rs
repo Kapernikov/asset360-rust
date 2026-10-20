@@ -179,11 +179,11 @@ pub struct QueryPlan {
     /// `unconsumed` and the plan is inexact.
     pub untyped: Vec<String>,
 
-    /// The one regime the query reads its records under
+    /// The one inference the query reads its records under
     /// ([`crate::sparql_graph_clauses::single_data_graph`]): the engine loads
     /// the records flat under it, and every star above reads its type under
     /// it. A query that reads no records has its dataset's default.
-    pub data_regime: TypeRegime,
+    pub data_inference: TypeRegime,
 }
 
 /// What a scoping does with a star its domain leaves untyped.
@@ -790,8 +790,8 @@ pub struct Star {
 
     /// Every class the star reads, canonical IRIs sorted: `class_uri` and the
     /// classes whose records have it among their `rdf:type`s under the plan's
-    /// the regime of the one data graph ([`QueryPlan::data_regime`]). One element, `class_uri`,
-    /// under the asserted regime.
+    /// the inference of the one data graph ([`QueryPlan::data_inference`]). One element, `class_uri`,
+    /// under the asserted inference.
     pub classes: Vec<String>,
 
     /// Values bound to this class's LinkML identifier slot (the slot
@@ -1274,11 +1274,11 @@ pub enum ScopeError {
     /// guess would return fewer rows than it should.
     SchemaError(String),
     /// The query reads more than one data graph: several named ones (whatever
-    /// their regimes), the default graph beside any named data graph (use either
+    /// their inferences), the default graph beside any named data graph (use either
     /// the default graph or explicit graph names, not both), or
     /// a graph variable that can range over several. Refused by both routes,
     /// because the engine loads the records into **one** graph, flat under its
-    /// regime (`WriteOptions::flat(regime)`), and the SQL route must not answer a
+    /// inference (`WriteOptions::flat(inference)`), and the SQL route must not answer a
     /// question the engine cannot. `graphs` names what the query read.
     CrossDataGraph { graphs: Vec<String> },
 }
@@ -1370,7 +1370,7 @@ pub(crate) fn sparql_scope(
 /// The four W3C vocabularies every SPARQL engine pre-registers plus the three
 /// the endpoint's own graphs are written in — `skos` for enum values
 /// (`skos:notation`, `skos:inScheme`), `schema` for slot domains
-/// (`schema:domainIncludes`), and `sesame` for the inferred regimes'
+/// (`schema:domainIncludes`), and `sesame` for the inferring inference'
 /// `sesame:directType` / `sesame:directSubClassOf`. Without those, the only way to write a discovery
 /// query is with declarations that the query it is discovering *for* does not
 /// need, which is a difference no caller can be expected to guess.
@@ -1626,9 +1626,9 @@ fn scope_qualified(
     //
     // A triple in a *data* graph (a `GRAPH` naming one, a `FROM`, the default
     // graph) reads the same records as the default graph and is walked into
-    // the fetch, stamped with the graph's regime. A `GRAPH ?g` ranges over
+    // the fetch, stamped with the graph's inference. A `GRAPH ?g` ranges over
     // data graphs too once the dataset serves any, so it is walked as well,
-    // under the widest regime so no graph's records are missed; what it binds
+    // under the widest inference so no graph's records are missed; what it binds
     // is the engine's (`Inexact::NamedGraph`). Any other graph keeps the
     // behaviour it had: walked into the fetch, the plan marked inexact.
     //
@@ -1769,8 +1769,8 @@ fn scope_qualified(
                             builder.type_iri.clone().unwrap_or_default(),
                             nn.as_str().to_owned(),
                         ]),
-                        // Judged under the regime of the query's one data graph.
-                        graphs.regime(),
+                        // Judged under the inference of the query's one data graph.
+                        graphs.inference(),
                     )
                 {
                     // A parent type beside its subclass (#511): the family of
@@ -2153,7 +2153,11 @@ fn scope_qualified(
 
         stars.push(Star {
             variable: builder.variable.clone(),
-            classes: crate::sparql_refine::scan_classes(schema_view, &class_uri, graphs.regime())?,
+            classes: crate::sparql_refine::scan_classes(
+                schema_view,
+                &class_uri,
+                graphs.inference(),
+            )?,
             class_uri,
             multivalued_fields,
             numeric_fields,
@@ -2841,7 +2845,7 @@ fn scope_qualified(
         path_bindings,
         inexact,
         untyped,
-        data_regime: graphs.regime(),
+        data_inference: graphs.inference(),
     })
 }
 
@@ -3456,7 +3460,7 @@ fn scope_union(
         // a fact about a pattern this plan no longer has a node for.
         inexact: Some(Inexact::UnionBranch),
         untyped,
-        data_regime: crate::sparql_graph_clauses::single_data_graph(query, dataset)?.regime,
+        data_inference: crate::sparql_graph_clauses::single_data_graph(query, dataset)?.inference,
     })
 }
 
@@ -3851,7 +3855,7 @@ pub(crate) fn exists_patterns_in_expressions_of(pattern: &GraphPattern) -> Vec<&
 /// The graph one triple pattern reads, as the scoper needs it.
 #[derive(Debug, Clone, Copy)]
 struct TripleGraph {
-    /// What the graph holds: records under a regime, the datamodel, or
+    /// What the graph holds: records under a inference, the datamodel, or
     /// something else.
     reads: GraphReads,
     /// Whether the triple is somebody else's rather than the default
@@ -3873,7 +3877,7 @@ struct TripleGraph {
 /// a schema graph, so a pattern that might be about the datamodel cannot be
 /// scoped as if it were certainly about golden records -- the schema graph
 /// while the dataset serves no data graph (the variable can bind nothing
-/// else), otherwise a read of data under the widest regime, left to the engine
+/// else), otherwise a read of data under the widest inference, left to the engine
 /// to say which graph it bound. A graph that does not exist reads as `Other`:
 /// the long-standing behaviour, walk the triples into the fetch, mark the plan
 /// inexact, let the engine answer from an empty graph.
@@ -5609,7 +5613,7 @@ fn contains_foreign_scope(pattern: &GraphPattern, graphs: &QueryGraphs<'_>) -> O
     match pattern {
         // A data graph holds the records every star reads, so a `GRAPH`
         // naming one is the same read as the default graph's, under the
-        // graph's regime (which the star decomposition stamps). Any other
+        // graph's inference (which the star decomposition stamps). Any other
         // graph is read from the wrong place.
         GraphPattern::Graph {
             name: NamedNodePattern::NamedNode(graph),
@@ -6016,7 +6020,7 @@ classes:
       lat:
         range: integer
   # An `is_a` chain, additive: `Equipment` > `Relay` > `LatchRelay`, with
-  # `Switch` and `Breaker` as siblings that declare `regime` differently
+  # `Switch` and `Breaker` as siblings that declare `inference` differently
   # (multivalued vs single), so a family can agree on a slot or disagree.
   Equipment:
     class_uri: asset360:Equipment
@@ -6038,14 +6042,14 @@ classes:
     is_a: Equipment
     class_uri: asset360:Switch
     attributes:
-      regime:
+      inference:
         range: string
         multivalued: true
   Breaker:
     is_a: Equipment
     class_uri: asset360:Breaker
     attributes:
-      regime:
+      inference:
         range: string
 "#;
         let schema_yaml = format!("{base}{extra}");
@@ -7421,19 +7425,19 @@ classes:
         }
     }
 
-    /// A parent type beside its subclass is judged in the regime the scoper
+    /// A parent type beside its subclass is judged in the inference the scoper
     /// reads under (#511). Asserted, the two are an empty intersection and the
     /// repeated type is recorded, as for siblings.
     #[test]
     fn a_parent_type_beside_its_subclass_is_one_star() {
         let sv = test_schema_view();
         let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
-        // The scoper reads under the default (asserted) regime, where a
+        // The scoper reads under the default (asserted) inference, where a
         // class's family is the class alone: a parent beside its subclass is
         // an intersection of two classes with nothing in it, so the second
         // type is not absorbed. (Under `is_a` the star would collapse to the
         // subclass; the scoper has no dataset to say so yet, and the plan
-        // rule `FoldMatchesIntoScan` does it where the regime is known.)
+        // rule `FoldMatchesIntoScan` does it where the inference is known.)
         for query in [
             "SELECT ?s WHERE { ?s a asset360:Relay ; a asset360:Equipment }",
             "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
@@ -8887,7 +8891,7 @@ classes:
     /// from the table — `2` for a dataset in which the answer is `0`. It was
     /// refused by name, because nothing downstream carried it. The plan carries
     /// it now: a clause that names graphs of the dataset reads them under their
-    /// regimes, and one that names anything else makes the plan inexact, so the
+    /// inferences, and one that names anything else makes the plan inexact, so the
     /// engine -- which evaluates the clause itself -- answers.
     #[test]
     fn a_dataset_clause_decides_which_graph_each_pattern_reads() {
@@ -8907,28 +8911,28 @@ classes:
             )
             .unwrap_or_else(|e| panic!("`{query}`: {e}"))
         };
-        let regime_of = |plan: &QueryPlan| {
+        let inference_of = |plan: &QueryPlan| {
             let stars = plan.root.all_stars();
             assert_eq!(stars.len(), 1, "{stars:?}");
-            plan.data_regime
+            plan.data_inference
         };
 
-        // No clause: the dataset's default regime, and the one class.
+        // No clause: the dataset's default inference, and the one class.
         let plain = scoped("SELECT ?s WHERE { ?s a asset360:Signal }");
-        assert_eq!(regime_of(&plain), TypeRegime::ASSERTED);
+        assert_eq!(inference_of(&plain), TypeRegime::ASSERTED);
         assert_eq!(plain.inexact, None);
 
-        // A clause naming data graphs: the regime they share.
+        // A clause naming data graphs: the inference they share.
         let from_asserted = scoped(&format!(
             "SELECT ?s FROM <{A}> WHERE {{ ?s a asset360:Signal }}"
         ));
-        assert_eq!(regime_of(&from_asserted), TypeRegime::ASSERTED);
+        assert_eq!(inference_of(&from_asserted), TypeRegime::ASSERTED);
         let from_inferred = scoped(&format!(
             "SELECT ?s FROM <{I}> WHERE {{ ?s a asset360:Signal }}"
         ));
-        assert_eq!(regime_of(&from_inferred), TypeRegime::IS_A);
+        assert_eq!(inference_of(&from_inferred), TypeRegime::IS_A);
         assert_eq!(from_inferred.inexact, None);
-        // Data graphs of different regimes are two data graphs: refused.
+        // Data graphs of different inferences are two data graphs: refused.
         let refused = sparql_scope(
             &format!(
                 "PREFIX asset360: <https://data.infrabel.be/asset360/> \
@@ -8937,7 +8941,7 @@ classes:
             &sv,
             &dataset,
         )
-        .expect_err("two regimes");
+        .expect_err("two inferences");
         assert!(
             matches!(refused, ScopeError::CrossDataGraph { ref graphs } if graphs.len() == 2),
             "{refused:?}"
@@ -8948,7 +8952,7 @@ classes:
         let in_graph = scoped(&format!(
             "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
         ));
-        assert_eq!(regime_of(&in_graph), TypeRegime::IS_A);
+        assert_eq!(inference_of(&in_graph), TypeRegime::IS_A);
         assert_eq!(in_graph.inexact, None);
 
         // A clause naming something the dataset does not serve is the
@@ -8977,11 +8981,11 @@ classes:
         assert_eq!(empty_default.inexact, Some(Inexact::NamedGraph));
     }
 
-    /// A star reads its records under the regime of the query's one data graph, and so
-    /// stands for the classes that regime says. A mix of regimes across graphs
+    /// A star reads its records under the inference of the query's one data graph, and so
+    /// stands for the classes that inference says. A mix of inferences across graphs
     /// is not a star typed once by its type triple: it is refused.
     #[test]
-    fn a_star_reads_its_type_under_its_own_graphs_regime() {
+    fn a_star_reads_its_type_under_its_own_graphs_inference() {
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view_plus(
@@ -9019,7 +9023,7 @@ classes:
             ))),
             vec![beacon.clone(), signal.clone()]
         );
-        // The type in one graph, a slot in a graph of another regime: refused.
+        // The type in one graph, a slot in a graph of another inference: refused.
         let mixed = sparql_scope(
             &format!(
                 "PREFIX asset360: <https://data.infrabel.be/asset360/> \
@@ -9029,20 +9033,20 @@ classes:
             &sv,
             &dataset,
         )
-        .expect_err("two regimes");
+        .expect_err("two inferences");
         assert!(
             mixed.to_string().starts_with(
                 "cross_data_graph: a query can read one data graph; rewrite it per graph"
             ),
             "{mixed}"
         );
-        // Both in the inferred graph: one star, one regime.
+        // Both in the inferred graph: one star, one inference.
         let both = scope(&format!(
             "SELECT ?s ?n WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal ; asset360:name ?n }} }}"
         ));
         assert_eq!(both.root.all_stars().len(), 1);
         assert_eq!(classes(&both), vec![beacon, signal]);
-        assert_eq!(both.data_regime, TypeRegime::IS_A);
+        assert_eq!(both.data_inference, TypeRegime::IS_A);
     }
 
     #[test]

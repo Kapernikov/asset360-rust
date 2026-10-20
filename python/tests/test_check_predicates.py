@@ -65,7 +65,7 @@ def test_a_seeded_this_is_judged_by_its_class_family_as_written():
     assert checks[LENGTH].message is None
 
 
-def test_a_subclass_only_predicate_follows_the_regime():
+def test_a_subclass_only_predicate_follows_the_inference():
     query = f"SELECT ?a WHERE {{ ?a a <{ASSET}> ; <{LENGTH}> ?l }}"
     (is_a,) = check_predicates(query, _schema(), DatasetSpec(TypeRegime.IS_A))
     (asserted,) = check_predicates(query, _schema(), DatasetSpec(TypeRegime.ASSERTED))

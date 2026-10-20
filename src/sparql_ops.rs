@@ -130,7 +130,7 @@ pub enum Op {
         class_uri: String,
         /// Records whose `asset_type` is one of these, canonical IRIs sorted:
         /// the classes whose records have `class_uri` among their `rdf:type`s
-        /// under the plan's data regime (`PlanOp::Scan::classes`), narrowed to
+        /// under the plan's data inference (`PlanOp::Scan::classes`), narrowed to
         /// the direct types the query fixed (`PlanOp::Scan::direct_type_in`).
         /// A renderer filters `asset_type = ANY(asset_types)`; with one element
         /// that is `asset_type = class_uri`.
@@ -672,7 +672,7 @@ pub fn lower_sql_pass(
             op: Op::Scan {
                 star_var: star.variable.clone(),
                 class_uri: star.class_uri.clone(),
-                // The classes the plan's regime says its type stands for.
+                // The classes the plan's inference says its type stands for.
                 asset_types: star.classes.clone(),
                 identifier_values: star.identifier_values.clone(),
                 direct_type: None,
@@ -1407,7 +1407,7 @@ fn lower_island(
         else {
             continue;
         };
-        let regime = &plan.data_regime;
+        let inference = &plan.data_inference;
         for claim in &plan.nodes[id].discharges {
             let wrong = |claim: &crate::sparql_plan::Obligation| {
                 Err(LoweringRefusal::ClaimWithoutTheWork {
@@ -1432,14 +1432,14 @@ fn lower_island(
                     // of D.
                     //
                     // Proof. The scan reads exactly the records whose
-                    // `rdf:type`s include C under its `regime`, i.e. the
-                    // records of `classes = type_family(C, regime)`. A record
+                    // `rdf:type`s include C under its `inference`, i.e. the
+                    // records of `classes = type_family(C, inference)`. A record
                     // of class K in that family is an instance of D under the
-                    // same regime iff K is in `type_family(D, regime)`. So if
-                    // `classes ⊆ type_family(D, regime)`, `?s a D` holds for
+                    // same inference iff K is in `type_family(D, inference)`. So if
+                    // `classes ⊆ type_family(D, inference)`, `?s a D` holds for
                     // every row the scan returns, and rendering nothing for
-                    // the claim loses no row and admits none. The regime must
-                    // be the scan's own: families differ per regime (under
+                    // the claim loses no row and admits none. The inference must
+                    // be the scan's own: families differ per inference (under
                     // Asserted a family is the class alone, so only equality
                     // passes). A class the schema does not know has no
                     // family, so only equality passes.
@@ -1448,7 +1448,7 @@ fn lower_island(
                         // the scan's `classes`, which invariant 7 pins to
                         // the same function: this check then stands alone.
                         let classes_of = |class: &str| {
-                            crate::sparql_refine::scan_classes(schema, class, *regime).map_err(
+                            crate::sparql_refine::scan_classes(schema, class, *inference).map_err(
                                 |error| LoweringRefusal::ScanClassesUnavailable {
                                     node: id,
                                     error: error.to_string(),
@@ -4370,13 +4370,13 @@ mod tests {
         lower_refined(&refined_plan(query, sv), sv, None, None)
     }
 
-    /// [`lowered`] over a dataset whose data graph has type regime `regime`.
+    /// [`lowered`] over a dataset whose data graph has type inference `inference`.
     fn lowered_in(
         query: &str,
         sv: &SchemaView,
-        regime: linkml_runtime::schema_rdf::TypeRegime,
+        inference: linkml_runtime::schema_rdf::TypeRegime,
     ) -> Result<OpTree, LoweringRefusal> {
-        let dataset = crate::sparql_dataset::dataset_with(regime, &[], &[]);
+        let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[]);
         let rules = crate::sparql_rules::tier_one_rules(sv, &dataset);
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();

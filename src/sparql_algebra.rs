@@ -385,7 +385,7 @@ impl Translation<'_> {
                 direct_type_in,
                 ..
             } => {
-                let regime = plan.data_regime;
+                let inference = plan.data_inference;
                 let type_iri = NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?;
                 let mut required: Vec<TriplePattern> = vec![TriplePattern {
                     subject: TermPattern::Variable(Variable::new_unchecked(star_var.clone())),
@@ -394,21 +394,21 @@ impl Translation<'_> {
                 }];
                 // The direct type the scan binds, and the ones it is held to:
                 // the record's one `sesame:directType` triple where the
-                // regime writes it. Where it does not (asserted), the
+                // inference writes it. Where it does not (asserted), the
                 // record's only `rdf:type` triple is its own class, which is
                 // the same thing.
                 //
-                // A regime that writes neither the direct type nor only the
+                // A inference that writes neither the direct type nor only the
                 // own class (`{own,is_a}`, `{own,mixin}`) has no triple that
                 // says it: `rdf:type` then holds the ancestors too. The
                 // record's own class `d` is the one whose types are all the
                 // types the record has, which the table of the scan's classes
                 // states (`own_by_table` below).
-                let own_by_triple = regime
+                let own_by_triple = inference
                     .contains(linkml_runtime::schema_rdf::TypePartition::Direct)
-                    || regime.is_subset(linkml_runtime::schema_rdf::TypeRegime::ASSERTED);
+                    || inference.is_subset(linkml_runtime::schema_rdf::TypeRegime::ASSERTED);
                 let direct_predicate =
-                    if regime.contains(linkml_runtime::schema_rdf::TypePartition::Direct) {
+                    if inference.contains(linkml_runtime::schema_rdf::TypePartition::Direct) {
                         linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE
                     } else {
                         crate::sparql_scoper::RDF_TYPE
@@ -449,8 +449,9 @@ impl Translation<'_> {
                 let mut own_guards: Vec<Expression> = Vec::new();
                 if !own_by_table.is_empty() {
                     let family =
-                        crate::sparql_refine::scan_classes(self.schema, class_uri, regime).ok()?;
-                    let table = crate::sparql_refine::type_table(self.schema, &family, regime)?;
+                        crate::sparql_refine::scan_classes(self.schema, class_uri, inference)
+                            .ok()?;
+                    let table = crate::sparql_refine::type_table(self.schema, &family, inference)?;
                     for (own, fixed) in own_by_table {
                         let any = |name: &str| TermPattern::Variable(Variable::new_unchecked(name));
                         let type_of =
@@ -1293,8 +1294,8 @@ pub(crate) mod equivalence {
     }
 
     /// [`each_rewrite_preserves_answers`] over a dataset: the plan reads the
-    /// type regime the dataset says, and `oracle` has to hold records written
-    /// under that regime ([`Oracle::new_in`]).
+    /// type inference the dataset says, and `oracle` has to hold records written
+    /// under that inference ([`Oracle::new_in`]).
     pub(crate) fn each_rewrite_preserves_answers_in(
         query: &str,
         schema: &SchemaView,
@@ -1530,32 +1531,32 @@ pub(crate) mod equivalence {
         out
     }
 
-    /// The named regimes, and two that name no direct type and write more than
+    /// The named inferences, and two that name no direct type and write more than
     /// the own class: `rdf:type` alone cannot say which class a record is,
     /// which the translation of a scan's direct type must not assume.
-    fn regimes_under_test() -> Vec<TypeRegime> {
+    fn inferences_under_test() -> Vec<TypeRegime> {
         use linkml_runtime::schema_rdf::TypePartition;
-        let mut regimes = TypeRegime::NAMED.to_vec();
-        regimes.push(TypeRegime::ASSERTED.with(TypePartition::IsA));
-        regimes.push(TypeRegime::ASSERTED.with(TypePartition::Mixin));
-        regimes
+        let mut inferences = TypeRegime::NAMED.to_vec();
+        inferences.push(TypeRegime::ASSERTED.with(TypePartition::IsA));
+        inferences.push(TypeRegime::ASSERTED.with(TypePartition::Mixin));
+        inferences
     }
 
     /// The test schema with an `is_a` chain and a real mixin, and the oracle
-    /// holding the fixture written under `regime`: what each corpus test below
-    /// runs against once per regime, with the dataset whose default graph is
-    /// that regime. A rule that is only sound under the asserted regime is
+    /// holding the fixture written under `inference`: what each corpus test below
+    /// runs against once per inference, with the dataset whose default graph is
+    /// that inference. A rule that is only sound under the asserted inference is
     /// caught here and not by the asserted-only oracle.
-    fn in_each_regime(mut each: impl FnMut(TypeRegime, &SchemaView, &Oracle, &DatasetSpec)) {
+    fn in_each_inference(mut each: impl FnMut(TypeRegime, &SchemaView, &Oracle, &DatasetSpec)) {
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        for regime in regimes_under_test() {
-            let oracle = crate::sparql_oracle::fixture_in(&schema, regime);
+        for inference in inferences_under_test() {
+            let oracle = crate::sparql_oracle::fixture_in(&schema, inference);
             each(
-                regime,
+                inference,
                 &schema,
                 &oracle,
-                &crate::sparql_dataset::dataset_with(regime, &[], &[]),
+                &crate::sparql_dataset::dataset_with(inference, &[], &[]),
             );
         }
     }
@@ -1568,7 +1569,7 @@ pub(crate) mod equivalence {
         let grammar = grammar();
         assert!(grammar.len() > 100, "{}", grammar.len());
         let mut lowered = 0;
-        in_each_regime(|regime, schema, oracle, dataset| {
+        in_each_inference(|inference, schema, oracle, dataset| {
             let rules = tier_one_rules(schema, dataset);
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
             for query in &grammar {
@@ -1578,7 +1579,7 @@ pub(crate) mod equivalence {
                     Ok(_) => lowered += 1,
                     Err(refusal) => {
                         // Names the node, or the shape: never a panic.
-                        let _ = format!("{regime:?}: {refusal}");
+                        let _ = format!("{inference:?}: {refusal}");
                     }
                 }
             }
@@ -1588,12 +1589,12 @@ pub(crate) mod equivalence {
 
     /// The type queries -- `?s a ?t`, `sesame:directType`, and the spelling
     /// of "the most specific type" over the schema graph -- under every data
-    /// regime and every regime the schema graph can publish. The grammar
+    /// inference and every inference the schema graph can publish. The grammar
     /// above never types a subject by a variable, so the rules about types
     /// (the type table, the direct type, the parent-type fold) are held to the
     /// oracle here, over an `is_a` chain and a mixin.
     #[test]
-    fn every_rewrite_of_the_type_queries_preserves_the_answer_in_every_regime() {
+    fn every_rewrite_of_the_type_queries_preserves_the_answer_in_every_inference() {
         const G: &str = "https://data.infrabel.be/asset360/schema";
         let queries = [
             // An identifier-less parent whose subclasses carry the identity:
@@ -1603,7 +1604,7 @@ pub(crate) mod equivalence {
             "SELECT ?s ?l WHERE { ?s a asset360:Structure ; asset360:title ?l }",
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t }",
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
-            // The scan's direct type, in a regime with no `directType` triple
+            // The scan's direct type, in a inference with no `directType` triple
             // that writes more than the own class (review N2).
             "SELECT ?s ?t WHERE { ?s a asset360:Tag ; a ?t }",
             "SELECT ?s ?d WHERE { ?s a asset360:Tag ; sesame:directType ?d }",
@@ -1615,7 +1616,7 @@ pub(crate) mod equivalence {
             "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; a ?t } GROUP BY ?t",
             // #511 chain fold: both orders, VALUES-narrowed, a three-class
             // chain, a mixin, and siblings (no fold) as the control. Under
-            // the asserted regime parent + sub is empty.
+            // the asserted inference parent + sub is empty.
             "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment }",
             "SELECT ?s WHERE { ?s a asset360:Equipment , asset360:Relay }",
             "SELECT ?s WHERE { VALUES ?s { <https://data.infrabel.be/asset360/eq/L1> } \
@@ -1654,11 +1655,11 @@ pub(crate) mod equivalence {
         ];
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        for regime in regimes_under_test() {
+        for inference in inferences_under_test() {
             for &graph in TypeRegime::NAMED {
-                let oracle = crate::sparql_oracle::fixture_in(&schema, regime)
+                let oracle = crate::sparql_oracle::fixture_in(&schema, inference)
                     .with_schema_graph(&schema, G, graph);
-                let dataset = crate::sparql_dataset::dataset_with(regime, &[], &[(G, graph)]);
+                let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[(G, graph)]);
                 let rules = tier_one_rules(&schema, &dataset);
                 let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
                 // #515 spelling 1: the path is reduced to the class scan
@@ -1681,7 +1682,7 @@ pub(crate) mod equivalence {
                     assert_eq!(
                         answers(&oracle, &reduced),
                         answers(&oracle, &original),
-                        "{regime:?}/{graph:?} reduction vs engine: {query}\n{reduced}"
+                        "{inference:?}/{graph:?} reduction vs engine: {query}\n{reduced}"
                     );
                     each_rewrite_preserves_answers_in(
                         &reduced.to_string(),
@@ -1691,7 +1692,7 @@ pub(crate) mod equivalence {
                         &dataset,
                     );
                 }
-                if !regime.contains(linkml_runtime::schema_rdf::TypePartition::IsA) {
+                if !inference.contains(linkml_runtime::schema_rdf::TypePartition::IsA) {
                     // Not vacuous: parent + subclass is empty when the data
                     // writes no ancestor, and not otherwise.
                     let both = crate::sparql_scoper::parse_query(
@@ -1721,8 +1722,8 @@ pub(crate) mod equivalence {
                     // direct type: no anti-join left.
                     if query.contains("NOT EXISTS")
                         && !query.contains("VALUES ?sub")
-                        && regime != TypeRegime::ASSERTED
-                        && graph == regime
+                        && inference != TypeRegime::ASSERTED
+                        && graph == inference
                     {
                         assert!(!plan.to_string().contains("antijoin"), "{query}\n{plan}");
                     }
@@ -1735,8 +1736,8 @@ pub(crate) mod equivalence {
     /// is held to the oracle holding the records *in that graph*, as the engine
     /// loads them: `FROM <data>`, `FROM NAMED <data>`, `GRAPH <data>`, and a
     /// data graph nested in the schema graph (which the plan leaves to the
-    /// engine). The plan reads the data graph's regime, so each graph of a
-    /// different regime is its own run.
+    /// engine). The plan reads the data graph's inference, so each graph of a
+    /// different inference is its own run.
     #[test]
     fn every_rewrite_of_a_data_graph_query_preserves_the_answer() {
         const A: &str = "urn:graph:asserted";
@@ -1756,15 +1757,15 @@ pub(crate) mod equivalence {
         );
         let rules = tier_one_rules(&schema, &dataset);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
-        for (graph, regime) in [
+        for (graph, inference) in [
             (A, TypeRegime::ASSERTED),
             (I, TypeRegime::IS_A),
             (M, TypeRegime::IS_A_AND_MIXINS),
         ] {
-            let oracle = crate::sparql_oracle::fixture_in_graph(&schema, regime, graph)
+            let oracle = crate::sparql_oracle::fixture_in_graph(&schema, inference, graph)
                 .with_schema_graph(&schema, G, TypeRegime::IS_A);
             // Not vacuous: the records are in the graph, and which types they
-            // carry is the graph's regime.
+            // carry is the graph's inference.
             let both = crate::sparql_scoper::parse_query(
                 &format!(
                     "{PREFIX}SELECT ?s FROM <{graph}> WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
@@ -1774,7 +1775,7 @@ pub(crate) mod equivalence {
             .unwrap();
             assert_eq!(
                 answers(&oracle, &both).is_empty(),
-                regime == TypeRegime::ASSERTED
+                inference == TypeRegime::ASSERTED
             );
             for body in [
                 "?s a asset360:Equipment ; a ?t",
@@ -1796,7 +1797,7 @@ pub(crate) mod equivalence {
                     let plan = each_rewrite_preserves_answers_in(
                         &query, &schema, &oracle, &borrowed, &dataset,
                     );
-                    assert_eq!(plan.data_regime, regime, "{query}");
+                    assert_eq!(plan.data_inference, inference, "{query}");
                 }
             }
         }
@@ -1812,10 +1813,10 @@ pub(crate) mod equivalence {
         const G: &str = "https://data.infrabel.be/asset360/schema";
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        let regime = TypeRegime::IS_A;
-        let oracle =
-            crate::sparql_oracle::fixture_in(&schema, regime).with_schema_graph(&schema, G, regime);
-        let dataset = crate::sparql_dataset::dataset_with(regime, &[], &[(G, regime)]);
+        let inference = TypeRegime::IS_A;
+        let oracle = crate::sparql_oracle::fixture_in(&schema, inference)
+            .with_schema_graph(&schema, G, inference);
+        let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[(G, inference)]);
         let rules = tier_one_rules(&schema, &dataset);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         each_rewrite_preserves_answers_in(
@@ -1834,7 +1835,7 @@ pub(crate) mod equivalence {
     /// plans; both must answer the query.
     #[test]
     fn every_schedule_answers_the_same() {
-        in_each_regime(|_, schema, oracle, dataset| {
+        in_each_inference(|_, schema, oracle, dataset| {
             let rules = tier_one_rules(schema, dataset);
             let forwards: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
             let backwards: Vec<&dyn Rule> = rules.iter().rev().map(|rule| rule.as_ref()).collect();
@@ -1855,7 +1856,7 @@ pub(crate) mod equivalence {
     /// leaves a correct, less refined plan (design test 11(v)).
     #[test]
     fn one_round_leaves_a_correct_plan() {
-        in_each_regime(|_, schema, oracle, dataset| {
+        in_each_inference(|_, schema, oracle, dataset| {
             let rules = tier_one_rules(schema, dataset);
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
             for query in grammar().iter().step_by(5) {

@@ -370,14 +370,14 @@ pub enum Expr {
     /// 3b carries down to the scan, where the fold reads it as the star's
     /// type. Written back for the oracle as `EXISTS { ?var a <class> }`.
     ///
-    /// `regime` is the type regime of the match or scan the restriction was
-    /// derived from: `?var` is a record whose `rdf:type`s *under that regime*
-    /// include `class_uri`. The fold reads it as the regime of the scan it
+    /// `inference` is the type inference of the match or scan the restriction was
+    /// derived from: `?var` is a record whose `rdf:type`s *under that inference*
+    /// include `class_uri`. The fold reads it as the inference of the scan it
     /// makes, so a restriction never changes which graph a star reads.
     InClass {
         var: String,
         class_uri: String,
-        regime: TypeRegime,
+        inference: TypeRegime,
     },
     /// An expression carrying a graph pattern -- `EXISTS`, `NOT EXISTS` --
     /// kept as the text the query wrote.
@@ -1720,15 +1720,15 @@ impl fmt::Display for Expr {
             Self::InClass {
                 var,
                 class_uri,
-                regime,
+                inference,
             } => write!(
                 f,
                 "?{var} ∈ {}{}",
                 shorten(class_uri),
-                if *regime == TypeRegime::ASSERTED {
+                if *inference == TypeRegime::ASSERTED {
                     String::new()
                 } else {
-                    format!(" [{regime}]")
+                    format!(" [{inference}]")
                 }
             ),
             Self::Opaque(text) => f.write_str(text),
@@ -2089,8 +2089,8 @@ pub enum PlanOp {
         /// The graph this triple is matched against.
         /// [`GraphReads::Data`] for a triple read from the data graph --
         /// outside any `GRAPH`, or under one that names the data graph --
-        /// which holds `rdf:type` triples the way the plan's one regime
-        /// ([`Plan::data_regime`]) writes them.
+        /// which holds `rdf:type` triples the way the plan's one inference
+        /// ([`Plan::data_inference`]) writes them.
         ///
         /// Any other value is a triple under a [`PlanOp::Graph`] that stays:
         /// the datamodel ([`GraphReads::Schema`]), `GRAPH ?g` or a graph the
@@ -2295,10 +2295,10 @@ pub enum PlanOp {
         star_var: String,
         class_uri: String,
         /// Every class whose records have `class_uri` among their `rdf:type`s
-        /// under the regime of the plan's one data graph ([`Plan::data_regime`]; canonical
+        /// under the inference of the plan's one data graph ([`Plan::data_inference`]; canonical
         /// IRIs, sorted, deduplicated, `class_uri` included): `type_family` of
         /// the class. Under [`TypeRegime::ASSERTED`] that is `class_uri` alone.
-        /// Under that regime `?s a class_uri` holds for every record of one of
+        /// Under that inference `?s a class_uri` holds for every record of one of
         /// them. [`Plan::scan_classes_agree`] checks it against the schema.
         classes: Vec<String>,
         /// The variable bound to the record's direct type, read from the
@@ -2573,7 +2573,7 @@ impl Node {
 pub fn scan_with_fanout(
     star_var: &str,
     class_uri: &str,
-    // The classes the scan stands for under the plan's regime
+    // The classes the scan stands for under the plan's inference
     // (`scan_classes`): the caller has the schema, this function does not.
     classes: Vec<String>,
     slots: Vec<ScanSlot>,
@@ -2666,11 +2666,11 @@ pub struct Plan {
     /// consumer still sees the variable -- produced above the barrier
     /// instead of inside it.
     pub lifted_exports: Vec<LiftedExport>,
-    /// The one regime the query reads its records under
-    /// ([`crate::sparql_graph_clauses::single_data_graph`]): the regime every
+    /// The one inference the query reads its records under
+    /// ([`crate::sparql_graph_clauses::single_data_graph`]): the inference every
     /// match of a data graph and every scan is under. What
     /// [`Plan::scan_classes_agree`] derives a scan's classes with.
-    pub data_regime: TypeRegime,
+    pub data_inference: TypeRegime,
 }
 
 /// An export moved out of a barrier by a lifting rule (see
@@ -2750,7 +2750,7 @@ pub enum PlanDefect {
         join: NodeId,
     },
     /// A scan whose `classes` are not the type family of its `class_uri`
-    /// under its `regime`. See [`Plan::scan_classes_agree`].
+    /// under its `inference`. See [`Plan::scan_classes_agree`].
     MisrecordedScanClasses {
         scan: NodeId,
     },
@@ -2805,7 +2805,7 @@ impl fmt::Display for PlanDefect {
             ),
             Self::MisrecordedScanClasses { scan } => write!(
                 f,
-                "n{scan}: a scan's classes are not the type family of its class under its regime"
+                "n{scan}: a scan's classes are not the type family of its class under its inference"
             ),
             Self::ScanClassesUnavailable { scan, error } => write!(f, "n{scan}: {error}"),
             Self::MisrecordedJoin { join } => write!(
@@ -2850,7 +2850,7 @@ impl Plan {
             transfers: Vec::new(),
             rewrites: Vec::new(),
             lifted_exports: Vec::new(),
-            data_regime: TypeRegime::ASSERTED,
+            data_inference: TypeRegime::ASSERTED,
         };
         plan.install(nodes);
         plan.record_origins();
@@ -2995,7 +2995,7 @@ impl Plan {
     /// **Invariant 7.** A scan's `classes` are what the schema says they are.
     ///
     /// `classes` is a fact about the schema -- the classes whose records have
-    /// `class_uri` among their `rdf:type`s under the scan's regime -- recorded
+    /// `class_uri` among their `rdf:type`s under the scan's inference -- recorded
     /// on the scan so a renderer reads it instead of re-deriving it. What
     /// would otherwise be a silently wrong `asset_type` filter (a subclass
     /// dropped: rows missing; a stranger added: rows invented) is checked here
@@ -3008,7 +3008,7 @@ impl Plan {
             } = &node.op
             {
                 let derived =
-                    scan_classes(schema, class_uri, self.data_regime).map_err(|error| {
+                    scan_classes(schema, class_uri, self.data_inference).map_err(|error| {
                         PlanDefect::ScanClassesUnavailable {
                             scan: id,
                             error: error.to_string(),
@@ -3706,8 +3706,8 @@ impl fmt::Display for Plan {
                         .join(" ")
                 )
             };
-            let mut describe = node.op.describe_with(RegimeContext::Plan {
-                data: self.data_regime,
+            let mut describe = node.op.describe_with(InferenceContext::Plan {
+                data: self.data_inference,
                 under_graph: under_graph[id],
             });
             if let Some(note) = crate::sparql_constant::lowered_note(self, id) {
@@ -3755,13 +3755,13 @@ impl PlanOp {
     /// "the same plan" has to be stated in terms of node descriptions rather
     /// than of `n3`.
     pub fn describe(&self) -> String {
-        self.describe_with(RegimeContext::Bare)
+        self.describe_with(InferenceContext::Bare)
     }
 
     /// [`PlanOp::describe`] with the context the plan's printout has, so a
     /// match reading no data graph and one reading the asserted graph are
-    /// told apart (see [`regime_tag`]).
-    fn describe_with(&self, context: RegimeContext) -> String {
+    /// told apart (see [`inference_tag`]).
+    fn describe_with(&self, context: InferenceContext) -> String {
         match self {
             PlanOp::Unit => "{}".to_owned(),
             PlanOp::Match { pattern, reads } => match reads_tag(*reads, context) {
@@ -3926,7 +3926,7 @@ impl PlanOp {
             } => format!(
                 "{}{}{} as ?{star_var}{}{}{}, requires [{}]",
                 shorten(class_uri),
-                scan_regime_tag(context)
+                scan_inference_tag(context)
                     .map(|label| format!(" [{label}]"))
                     .unwrap_or_default(),
                 {
@@ -4071,17 +4071,17 @@ impl From<ScopeError> for RefineError {
 /// broken assumption into an error instead of a plan that answers a different
 /// question.
 ///
-/// Each triple is matched under the type regime of the graph it reads, under
+/// Each triple is matched under the type inference of the graph it reads, under
 /// `dataset`:
 ///
-/// * outside any `GRAPH`: the dataset's default regime, or -- when the query
-///   writes a `FROM` -- the regime of the union of the graphs it names, and
+/// * outside any `GRAPH`: the dataset's default inference, or -- when the query
+///   writes a `FROM` -- the inference of the union of the graphs it names, and
 ///   none when that union is no data (a schema graph, an unknown IRI);
-/// * inside `GRAPH <data graph>`: that graph's regime, and the `GRAPH` node is
+/// * inside `GRAPH <data graph>`: that graph's inference, and the `GRAPH` node is
 ///   not in the plan -- it said which graph the patterns read, which each
 ///   `Match` now says itself;
 /// * inside any other `GRAPH` (the schema graph, a variable, a graph the
-///   endpoint does not serve): no regime, under a [`PlanOp::Graph`] that
+///   endpoint does not serve): no inference, under a [`PlanOp::Graph`] that
 ///   stays, so no data rule folds what is not the data graph.
 ///
 /// The caller's dataset decides all of it.
@@ -4089,7 +4089,7 @@ pub(crate) fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, R
     let graphs = QueryGraphs::new(dataset, query).map_err(ScopeError::from)?;
     let default_reads = graphs.default_reads();
 
-    let data_regime = graphs.regime();
+    let data_inference = graphs.inference();
     let obligations = crate::sparql_plan::obligations_of(query)?;
     let form = QueryForm::of(query);
     let pattern = match query {
@@ -4159,53 +4159,53 @@ pub(crate) fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, R
 
     let nodes = builder.nodes;
     let mut plan = Plan::from_nodes(form, obligations, nodes);
-    plan.data_regime = data_regime;
+    plan.data_inference = data_inference;
     plan.check().map_err(RefineError::Defect)?;
     Ok(plan)
 }
 
-/// How a node's regime is told in plan text. The plan's printout knows its one
-/// data regime and which nodes sit under a printed `GRAPH`; the context-free
+/// How a node's inference is told in plan text. The plan's printout knows its one
+/// data inference and which nodes sit under a printed `GRAPH`; the context-free
 /// [`PlanOp::describe`] does not and keeps the short spelling.
 #[derive(Debug, Clone, Copy)]
-enum RegimeContext {
-    /// No plan around: no regime is told.
+enum InferenceContext {
+    /// No plan around: no inference is told.
     Bare,
     /// Printed as part of a plan.
     Plan {
-        /// The regime of the plan's one data graph: what its scans and its data matches
+        /// The inference of the plan's one data graph: what its scans and its data matches
         /// read under.
         data: TypeRegime,
         under_graph: bool,
     },
 }
 
-/// The tag the plan's data regime carries in plan text: its `Display`
-/// spelling, so the plan and the regime's own name never drift. Asserted is
+/// The tag the plan's data inference carries in plan text: its `Display`
+/// spelling, so the plan and the inference's own name never drift. Asserted is
 /// bare: a match that reads no data graph says so itself ([`reads_tag`]).
-fn regime_tag(regime: TypeRegime) -> Option<String> {
-    (regime != TypeRegime::ASSERTED).then(|| regime.to_string())
+fn inference_tag(inference: TypeRegime) -> Option<String> {
+    (inference != TypeRegime::ASSERTED).then(|| inference.to_string())
 }
 
-/// The tag a scan carries in plan text: the plan's data regime. A scan printed
-/// outside a plan has no regime to tell.
-fn scan_regime_tag(context: RegimeContext) -> Option<String> {
+/// The tag a scan carries in plan text: the plan's data inference. A scan printed
+/// outside a plan has no inference to tell.
+fn scan_inference_tag(context: InferenceContext) -> Option<String> {
     match context {
-        RegimeContext::Plan { data, .. } => regime_tag(data),
-        RegimeContext::Bare => None,
+        InferenceContext::Plan { data, .. } => inference_tag(data),
+        InferenceContext::Bare => None,
     }
 }
 
-/// The tag a match carries in plan text: the plan's regime when it reads the
+/// The tag a match carries in plan text: the plan's inference when it reads the
 /// data graph; otherwise what it reads, unless a printed `GRAPH` above it is
 /// the explanation. A match that reads no data graph and no graph a printed
 /// `GRAPH` names is told apart from one reading the asserted graph.
-fn reads_tag(reads: GraphReads, context: RegimeContext) -> Option<String> {
+fn reads_tag(reads: GraphReads, context: InferenceContext) -> Option<String> {
     match (reads, context) {
-        (GraphReads::Data, _) => scan_regime_tag(context),
+        (GraphReads::Data, _) => scan_inference_tag(context),
         (
             other,
-            RegimeContext::Plan {
+            InferenceContext::Plan {
                 under_graph: false, ..
             },
         ) => Some(
@@ -4221,24 +4221,24 @@ fn reads_tag(reads: GraphReads, context: RegimeContext) -> Option<String> {
 }
 
 /// `T`: `(class, type)` for every class of `classes` and every type its
-/// records carry under `regime` (canonical IRIs). `None` when a class is
+/// records carry under `inference` (canonical IRIs). `None` when a class is
 /// unknown to the schema.
 pub(crate) fn type_table(
     schema: &SchemaView,
     classes: &[String],
-    regime: TypeRegime,
+    inference: TypeRegime,
 ) -> Option<Vec<(String, String)>> {
     let mut rows = Vec::new();
     for class in classes {
         let view = schema.get_class_by_uri(class).ok().flatten()?;
-        for ty in linkml_runtime::schema_rdf::rdf_types(&view, regime).ok()? {
+        for ty in linkml_runtime::schema_rdf::rdf_types(&view, inference).ok()? {
             rows.push((class.clone(), ty.canonical_uri().to_string()));
         }
     }
     Some(rows)
 }
 
-/// The classes a scan of `class_uri` stands for under `regime`: every class
+/// The classes a scan of `class_uri` stands for under `inference`: every class
 /// whose records have `class_uri` among their `rdf:type`s (canonical IRIs,
 /// sorted, deduplicated, `class_uri` included).
 ///
@@ -4255,18 +4255,18 @@ pub(crate) fn type_table(
 pub(crate) fn scan_classes(
     schema: &SchemaView,
     class_uri: &str,
-    regime: TypeRegime,
+    inference: TypeRegime,
 ) -> Result<Vec<String>, ScanClassesError> {
     let failed = |message: String| ScanClassesError {
         class_uri: class_uri.to_owned(),
-        regime,
+        inference,
         message,
     };
     let mut classes: Vec<String> = match schema
         .get_class_by_uri(class_uri)
         .map_err(|e| failed(e.to_string()))?
     {
-        Some(class) => type_family(&class, regime)
+        Some(class) => type_family(&class, inference)
             .map_err(|e| failed(e.to_string()))?
             .iter()
             .map(|class| class.canonical_uri().to_string())
@@ -4285,7 +4285,7 @@ pub(crate) fn scan_classes(
 #[non_exhaustive]
 pub(crate) struct ScanClassesError {
     class_uri: String,
-    regime: TypeRegime,
+    inference: TypeRegime,
     /// The schema's own error.
     message: String,
 }
@@ -4297,9 +4297,9 @@ impl ScanClassesError {
         &self.class_uri
     }
 
-    /// The regime its family was asked for under.
-    pub(crate) fn regime(&self) -> TypeRegime {
-        self.regime
+    /// The inference its family was asked for under.
+    pub(crate) fn inference(&self) -> TypeRegime {
+        self.inference
     }
 
     /// The schema's own error.
@@ -4313,7 +4313,7 @@ impl fmt::Display for ScanClassesError {
         write!(
             f,
             "the classes a scan of <{}> stands for ({}) cannot be derived from the schema: {}",
-            self.class_uri, self.regime, self.message
+            self.class_uri, self.inference, self.message
         )
     }
 }
@@ -5560,11 +5560,11 @@ mod tests {
 
     /// The dataset decides which graph each pattern reads: `FROM`, a `GRAPH`
     /// naming a data graph (which dissolves -- each `Match` says its graph),
-    /// and the schema graph (which stays, reading no regime). A query reads
-    /// **one** data regime: a read of two is refused, by the one function both
+    /// and the schema graph (which stays, reading no inference). A query reads
+    /// **one** data inference: a read of two is refused, by the one function both
     /// routes use.
     #[test]
-    fn the_dataset_decides_each_patterns_regime() {
+    fn the_dataset_decides_each_patterns_inference() {
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         const S: &str = "urn:graph:schema";
@@ -5597,23 +5597,23 @@ mod tests {
             );
             message
         };
-        // `(has a Graph node above it, regime)` per match, in node order.
+        // `(has a Graph node above it, inference)` per match, in node order.
         let matches = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
             plan.nodes
                 .iter()
                 .filter_map(|node| match &node.op {
                     PlanOp::Match { pattern, reads } => Some((
                         triple_text(pattern),
-                        reads.is_data().then_some(plan.data_regime),
+                        reads.is_data().then_some(plan.data_inference),
                     )),
                     _ => None,
                 })
                 .collect()
         };
-        let regimes = |plan: &Plan| -> Vec<Option<TypeRegime>> {
+        let inferences = |plan: &Plan| -> Vec<Option<TypeRegime>> {
             matches(plan)
                 .into_iter()
-                .map(|(_, regime)| regime)
+                .map(|(_, inference)| inference)
                 .collect()
         };
         let graph_nodes = |plan: &Plan| {
@@ -5623,43 +5623,43 @@ mod tests {
                 .count()
         };
 
-        // No `FROM`: the dataset's default regime. `FROM <A>` / `FROM <I>`:
+        // No `FROM`: the dataset's default inference. `FROM <A>` / `FROM <I>`:
         // that graph's.
         let body = "{ ?s a asset360:Signal ; asset360:name ?n }";
         assert_eq!(
-            regimes(&plan(&format!("SELECT ?s WHERE {body}"))),
+            inferences(&plan(&format!("SELECT ?s WHERE {body}"))),
             vec![Some(TypeRegime::ASSERTED); 2]
         );
         assert_eq!(
-            regimes(&plan(&format!("SELECT ?s FROM <{A}> WHERE {body}"))),
+            inferences(&plan(&format!("SELECT ?s FROM <{A}> WHERE {body}"))),
             vec![Some(TypeRegime::ASSERTED); 2]
         );
         assert_eq!(
-            regimes(&plan(&format!("SELECT ?s FROM <{I}> WHERE {body}"))),
+            inferences(&plan(&format!("SELECT ?s FROM <{I}> WHERE {body}"))),
             vec![Some(TypeRegime::IS_A); 2]
         );
         // The same graph twice is one graph.
         assert_eq!(
-            regimes(&plan(&format!(
+            inferences(&plan(&format!(
                 "SELECT ?s FROM <{I}> FROM <{I}> WHERE {body}"
             ))),
             vec![Some(TypeRegime::IS_A); 2]
         );
         // A `FROM` that is no data -- a schema graph, an unknown IRI -- reads
-        // no regime, and the engine answers.
+        // no inference, and the engine answers.
         for graph in [S, "urn:unknown"] {
             assert_eq!(
-                regimes(&plan(&format!("SELECT ?s FROM <{graph}> WHERE {body}"))),
+                inferences(&plan(&format!("SELECT ?s FROM <{graph}> WHERE {body}"))),
                 vec![None; 2],
                 "{graph}"
             );
         }
 
-        // `GRAPH <data graph>` dissolves; the matches carry its regime.
+        // `GRAPH <data graph>` dissolves; the matches carry its inference.
         let in_inferred = plan(&format!("SELECT ?s WHERE {{ GRAPH <{I}> {body} }}"));
-        assert_eq!(regimes(&in_inferred), vec![Some(TypeRegime::IS_A); 2]);
+        assert_eq!(inferences(&in_inferred), vec![Some(TypeRegime::IS_A); 2]);
         assert_eq!(graph_nodes(&in_inferred), 0, "{in_inferred}");
-        // A plan that reads the regime of another graph than the dataset's
+        // A plan that reads the inference of another graph than the dataset's
         // default says so in its text.
         assert!(in_inferred.to_string().contains("[is_a]"), "{in_inferred}");
         // A `FROM` alone leaves no named graph (it parses as an empty
@@ -5668,18 +5668,18 @@ mod tests {
         let from_and_graph = plan(&format!(
             "SELECT ?s FROM <{A}> WHERE {{ GRAPH <{I}> {body} }}"
         ));
-        assert_eq!(regimes(&from_and_graph), vec![None; 2]);
+        assert_eq!(inferences(&from_and_graph), vec![None; 2]);
         assert_eq!(graph_nodes(&from_and_graph), 1);
-        // The schema graph stays, and reads no regime.
+        // The schema graph stays, and reads no inference.
         let kept = plan(&format!("SELECT ?s WHERE {{ GRAPH <{S}> {body} }}"));
-        assert_eq!(regimes(&kept), vec![None; 2]);
+        assert_eq!(inferences(&kept), vec![None; 2]);
         assert_eq!(graph_nodes(&kept), 1, "{kept}");
-        // A data graph beside the schema graph is one data regime.
+        // A data graph beside the schema graph is one data inference.
         let beside = plan(&format!(
             "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} \
              GRAPH <{S}> {{ ?c a asset360:Signal }} }}"
         ));
-        assert_eq!(regimes(&beside), vec![Some(TypeRegime::IS_A), None]);
+        assert_eq!(inferences(&beside), vec![Some(TypeRegime::IS_A), None]);
         // A data graph inside the schema graph is read as the data graph (an
         // inner `GRAPH` switches graph), but never by the rules: it stays under
         // both `Graph` nodes, so no rule takes it for a read of the datamodel
@@ -5687,14 +5687,14 @@ mod tests {
         let nested = plan(&format!(
             "SELECT ?s WHERE {{ GRAPH <{S}> {{ GRAPH <{I}> {body} }} }}"
         ));
-        assert_eq!(regimes(&nested), vec![None; 2]);
+        assert_eq!(inferences(&nested), vec![None; 2]);
         assert_eq!(graph_nodes(&nested), 2, "{nested}");
         // Under `FROM NAMED` a graph outside the set matches nothing: kept as
         // a `GRAPH` for the engine to say so.
         let outside = plan(&format!(
             "SELECT ?s FROM NAMED <{S}> WHERE {{ GRAPH <{I}> {body} }}"
         ));
-        assert_eq!(regimes(&outside), vec![None; 2]);
+        assert_eq!(inferences(&outside), vec![None; 2]);
         assert_eq!(graph_nodes(&outside), 1);
 
         // `FROM NAMED` and no `FROM`: the default graph is the empty graph
@@ -5709,17 +5709,17 @@ mod tests {
             .count();
         assert_eq!(empty_rows, 2, "{empty_default}");
 
-        // **The refusals**: every read of a second data regime, or of a graph
+        // **The refusals**: every read of a second data inference, or of a graph
         // that can be one.
-        // Data graphs of different regimes in one `FROM`.
+        // Data graphs of different inferences in one `FROM`.
         let message = refused(&format!("SELECT ?s FROM <{A}> FROM <{I}> WHERE {body}"));
         assert!(message.contains(A) && message.contains(I), "{message}");
-        // Two `GRAPH` blocks over data graphs of different regimes.
+        // Two `GRAPH` blocks over data graphs of different inferences.
         refused(&format!(
             "SELECT ?s WHERE {{ GRAPH <{A}> {{ ?s a asset360:Signal }} \
              GRAPH <{I}> {{ ?s a asset360:ShuntSignal }} }}"
         ));
-        // A `GRAPH` over a data graph whose regime differs from the default
+        // A `GRAPH` over a data graph whose inference differs from the default
         // graph's, which the query also reads.
         let message = refused(&format!(
             "SELECT ?s ?n WHERE {{ ?s a asset360:Signal GRAPH <{I}> {{ ?s asset360:name ?n }} }}"
@@ -5740,13 +5740,13 @@ mod tests {
         let named = plan(&format!(
             "SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {body} }}"
         ));
-        assert_eq!(regimes(&named), vec![Some(TypeRegime::IS_A); 2]);
+        assert_eq!(inferences(&named), vec![Some(TypeRegime::IS_A); 2]);
         let listed = plan(&format!(
             "SELECT ?s FROM <{A}> FROM NAMED <{I}> WHERE {body}"
         ));
-        assert_eq!(regimes(&listed), vec![Some(TypeRegime::ASSERTED); 2]);
+        assert_eq!(inferences(&listed), vec![Some(TypeRegime::ASSERTED); 2]);
         // The default graph beside a named data graph is refused even when
-        // that graph has the default regime (asserted): a query uses the
+        // that graph has the default inference (asserted): a query uses the
         // default graph or names its data graph, never both.
         let message = refused(&format!(
             "SELECT ?s ?n WHERE {{ ?s a asset360:Signal GRAPH <{A}> {{ ?s asset360:name ?n }} }}"
@@ -5760,7 +5760,7 @@ mod tests {
     /// Review F9: the text tells a match that reads no data graph from one
     /// that reads the asserted graph. Asserted is bare only when it is the
     /// plan's own default; under another default it is said (`[asserted]`),
-    /// and a match outside a printed `GRAPH` that reads no regime says so.
+    /// and a match outside a printed `GRAPH` that reads no inference says so.
     #[test]
     fn the_plan_text_tells_no_data_graph_from_the_asserted_one() {
         const A: &str = "urn:graph:asserted";
@@ -5777,7 +5777,7 @@ mod tests {
             naive_plan(&parsed, &dataset).unwrap().to_string()
         };
         let body = "?s asset360:name ?n";
-        // The default regime, asserted: as it always printed.
+        // The default inference, asserted: as it always printed.
         let plain = text(
             TypeRegime::ASSERTED,
             &format!("SELECT ?s WHERE {{ {body} }}"),
@@ -5786,8 +5786,8 @@ mod tests {
             !plain.contains("[asserted]") && !plain.contains("[no data"),
             "{plain}"
         );
-        // A query reads one data graph, and the plan's regime is its: asserted
-        // under `A` is bare whatever the dataset's default regime is.
+        // A query reads one data graph, and the plan's inference is its: asserted
+        // under `A` is bare whatever the dataset's default inference is.
         let in_a = text(
             TypeRegime::IS_A,
             &format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"),
@@ -5828,7 +5828,7 @@ mod tests {
         let error = scan_classes(&sv, signal, TypeRegime::IS_A)
             .expect_err("the schema cannot say what the family is");
         assert_eq!(error.class_uri(), signal);
-        assert_eq!(error.regime(), TypeRegime::IS_A);
+        assert_eq!(error.inference(), TypeRegime::IS_A);
         assert!(!error.message().is_empty());
 
         // The planner surfaces it to the caller instead of planning a scan
@@ -5845,7 +5845,7 @@ mod tests {
     }
 
     /// A match says what graph it reads, not only whether it is a data graph:
-    /// the data graph (under its regime), the schema graph, and a graph the
+    /// the data graph (under its inference), the schema graph, and a graph the
     /// endpoint does not serve or one only a variable names are four answers,
     /// and the plan text keeps them apart.
     #[test]
@@ -5927,13 +5927,13 @@ mod tests {
         }
     }
 
-    /// A regime is on every matched triple and every scan: a triple outside
+    /// A inference is on every matched triple and every scan: a triple outside
     /// `GRAPH` carries the dataset's, one inside carries none; a scan under
     /// `is_a` lists the subclasses it reads, in the plan text and in
     /// `classes`; and an asserted plan prints as it always did.
     #[test]
-    fn a_regime_reaches_every_match_and_scan() {
-        // A subclass of `Signal`, so a regime other than `asserted` has a
+    fn a_inference_reaches_every_match_and_scan() {
+        // A subclass of `Signal`, so a inference other than `asserted` has a
         // family to list: under `is_a` a scan of `Signal` also reads these.
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
@@ -5945,13 +5945,13 @@ mod tests {
              GRAPH <https://example.org/g> {{ ?g a asset360:Signal }} }}"
         );
         let parsed = crate::sparql_scoper::parse_query(&query, Some(&sv)).unwrap();
-        let regimes = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
+        let inferences = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
             plan.nodes
                 .iter()
                 .filter_map(|node| match &node.op {
                     PlanOp::Match { pattern, reads } => Some((
                         triple_text(pattern),
-                        reads.is_data().then_some(plan.data_regime),
+                        reads.is_data().then_some(plan.data_inference),
                     )),
                     _ => None,
                 })
@@ -5963,21 +5963,21 @@ mod tests {
             &crate::sparql_dataset::dataset_with(TypeRegime::ASSERTED, &[], &[]),
         )
         .unwrap();
-        let in_graph = |regimes: &[(String, Option<TypeRegime>)]| {
-            regimes
+        let in_graph = |inferences: &[(String, Option<TypeRegime>)]| {
+            inferences
                 .iter()
-                .map(|(text, regime)| (text.contains("?g"), *regime))
+                .map(|(text, inference)| (text.contains("?g"), *inference))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            in_graph(&regimes(&asserted)),
+            in_graph(&inferences(&asserted)),
             vec![
                 (false, Some(TypeRegime::ASSERTED)),
                 (false, Some(TypeRegime::ASSERTED)),
                 (true, None),
             ]
         );
-        // Asserted plan text carries no regime label, on a match or a scan.
+        // Asserted plan text carries no inference label, on a match or a scan.
         assert!(!asserted.to_string().contains("[is_a"), "{asserted}");
 
         let is_a = naive_plan(
@@ -5986,7 +5986,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            in_graph(&regimes(&is_a)),
+            in_graph(&inferences(&is_a)),
             vec![
                 (false, Some(TypeRegime::IS_A)),
                 (false, Some(TypeRegime::IS_A)),

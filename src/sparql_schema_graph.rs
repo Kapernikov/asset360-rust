@@ -121,13 +121,13 @@ impl SchemaGraph {
     /// crate adds on top: slot aliases ([`Self::alias_quads`]) and the
     /// language-tagged enum labels of [`crate::sparql_schema_labels`].
     ///
-    /// `regime` is the type regime the subclass edges are published under
+    /// `inference` is the type inference the subclass edges are published under
     /// (see [`linkml_runtime::schema_rdf::TypeRegime`]): one schema graph per
-    /// regime the dataset serves.
-    pub fn build(sv: &SchemaView, regime: TypeRegime) -> Self {
+    /// inference the dataset serves.
+    pub fn build(sv: &SchemaView, inference: TypeRegime) -> Self {
         #[cfg(test)]
         BUILDS.with(|builds| builds.set(builds.get() + 1));
-        let built = schema_triples(sv, &SchemaRdfOptions::default().with_regime(regime));
+        let built = schema_triples(sv, &SchemaRdfOptions::default().with_regime(inference));
         let mut triples = built.triples;
         // The extras are written as quads in the default graph and stripped to
         // triples: their graph is decided by the caller, in `quads_in`.
@@ -147,11 +147,11 @@ impl SchemaGraph {
     /// The quads of several schema graphs, each placed in its own named graph:
     /// what the engine leg and a materialisation load.
     ///
-    /// A graph's triples depend on its regime and on nothing else (the IRI is
+    /// A graph's triples depend on its inference and on nothing else (the IRI is
     /// only the placement, [`Self::quads_in`]), so the datamodel is built once
-    /// per *distinct regime* and re-labelled per graph. Building is the
+    /// per *distinct inference* and re-labelled per graph. Building is the
     /// expensive part (~300 ms on the asset360 datamodel); two graphs
-    /// publishing the same regime must not pay twice. The one place a request
+    /// publishing the same inference must not pay twice. The one place a request
     /// builds schema graphs, so the executor and the planner share the rule.
     ///
     /// # Errors
@@ -163,10 +163,10 @@ impl SchemaGraph {
     ) -> Result<Vec<Quad>, InvalidGraphIri> {
         let mut built: std::collections::HashMap<TypeRegime, SchemaGraph> = Default::default();
         let mut quads = Vec::new();
-        for (iri, regime) in graphs {
+        for (iri, inference) in graphs {
             let graph = built
-                .entry(regime)
-                .or_insert_with(|| SchemaGraph::build(sv, regime));
+                .entry(inference)
+                .or_insert_with(|| SchemaGraph::build(sv, inference));
             quads.extend(graph.quads_in(iri)?);
         }
         Ok(quads)
@@ -981,14 +981,14 @@ classes:
         // The untagged code stays where it was, on both predicates.
         let ntriples = SchemaGraph::build(&sv, TypeRegime::ASSERTED).to_ntriples();
         let conv = sv.converter();
-        let regime = sv
+        let inference = sv
             .enum_views()
             .unwrap()
             .into_iter()
             .find(|ev| ev.name() == "SignalRegime")
             .unwrap();
-        let regime_iri = regime.canonical_uri().to_uri(&conv).unwrap().0;
-        let vns = format!("{regime_iri}#VNS");
+        let inference_iri = inference.canonical_uri().to_uri(&conv).unwrap().0;
+        let vns = format!("{inference_iri}#VNS");
         assert!(ntriples.contains(&format!("<{vns}> <{RDFS_LABEL}> \"VNS\" .")));
         assert!(ntriples.contains(&format!(
             "<{vns}> <http://www.w3.org/2004/02/skos/core#notation> \"VNS\" ."

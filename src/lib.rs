@@ -2908,7 +2908,7 @@ impl PlanOp {
 
     /// For ``"scan"``: records whose ``asset_type`` is one of these,
     /// canonical IRIs sorted -- ``class_uri`` and the classes whose records
-    /// have it among their ``rdf:type`` under the plan's data regime, narrowed
+    /// have it among their ``rdf:type`` under the plan's data inference, narrowed
     /// to the direct types the query fixed. Render
     /// ``asset_type = ANY(asset_types)``; one element is the plain
     /// ``asset_type = class_uri``.
@@ -3908,24 +3908,24 @@ impl ExecutionPlan {
 /// means: the one value every planning and evaluating entry point takes, so no
 /// call can forget it.
 ///
-/// * ``default_regime`` -- the default graph: the records, written under this
+/// * ``default_inference`` -- the default graph: the records, written under this
 ///   :class:`TypeRegime`, with no graph name.
 /// * ``data_graphs`` -- named graphs over the golden records, each under a
-///   regime: ``GRAPH <iri> { ... }`` reads the records under that regime. A
-///   regime must contain ``TypePartition.OWN``, which holds every non-type
+///   inference: ``GRAPH <iri> { ... }`` reads the records under that inference. A
+///   inference must contain ``TypePartition.OWN``, which holds every non-type
 ///   triple of a record.
 /// * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
-///   subclass edges under a regime.
+///   subclass edges under a inference.
 ///
 /// A query reads **one** data graph (see ``plan_query_refined``), so the
-/// engine loads the records flat under that graph's regime.
+/// engine loads the records flat under that graph's inference.
 ///
 /// ``DatasetSpec(TypeRegime.ASSERTED)`` is an asserted default graph and no
 /// named graph. ``repr`` round-trips: ``eval(repr(x)) == x``.
 ///
 /// Raises:
 ///     ValueError: one IRI is both a data graph and a schema graph, or a
-///         regime lacks ``Own``.
+///         inference lacks ``Own``.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass(name = "DatasetSpec", frozen, eq, hash)]
@@ -3939,21 +3939,21 @@ pub struct PyDatasetSpec {
 #[pymethods]
 impl PyDatasetSpec {
     #[new]
-    #[pyo3(signature = (default_regime, *, data_graphs=None, schema_graphs=None))]
+    #[pyo3(signature = (default_inference, *, data_graphs=None, schema_graphs=None))]
     fn new(
-        default_regime: linkml_runtime_python::PyTypeRegime,
+        default_inference: linkml_runtime_python::PyTypeRegime,
         data_graphs: Option<std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>>,
         schema_graphs: Option<
             std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>,
         >,
     ) -> PyResult<Self> {
         // Every conflict at once, so the message is the whole list.
-        let mut builder = crate::sparql_dataset::DatasetSpec::builder(default_regime.into());
-        for (iri, regime) in data_graphs.unwrap_or_default() {
-            builder = builder.with_data_graph(iri, regime.into());
+        let mut builder = crate::sparql_dataset::DatasetSpec::builder(default_inference.into());
+        for (iri, inference) in data_graphs.unwrap_or_default() {
+            builder = builder.with_data_graph(iri, inference.into());
         }
-        for (iri, regime) in schema_graphs.unwrap_or_default() {
-            builder = builder.with_schema_graph(iri, regime.into());
+        for (iri, inference) in schema_graphs.unwrap_or_default() {
+            builder = builder.with_schema_graph(iri, inference.into());
         }
         let inner = builder
             .build()
@@ -3961,14 +3961,17 @@ impl PyDatasetSpec {
         Ok(Self { inner })
     }
 
-    /// The regime the default graph holds the records under, which is what a
+    /// The inference the default graph holds the records under, which is what a
     /// triple pattern outside any ``GRAPH`` is matched under.
     #[getter]
-    fn default_regime(&self, py: Python<'_>) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
-        py_regime(py, self.inner.default_regime())
+    fn default_inference(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
+        py_inference(py, self.inner.default_inference())
     }
 
-    /// Every data graph, IRI to regime.
+    /// Every data graph, IRI to inference.
     #[getter]
     fn data_graphs(
         &self,
@@ -3976,11 +3979,11 @@ impl PyDatasetSpec {
     ) -> PyResult<std::collections::BTreeMap<String, Py<linkml_runtime_python::PyTypeRegime>>> {
         self.inner
             .data_graphs()
-            .map(|(iri, regime)| Ok((iri.to_owned(), py_regime(py, regime)?)))
+            .map(|(iri, inference)| Ok((iri.to_owned(), py_inference(py, inference)?)))
             .collect()
     }
 
-    /// Every schema graph, IRI to the regime it publishes its subclass edges
+    /// Every schema graph, IRI to the inference it publishes its subclass edges
     /// under.
     #[getter]
     fn schema_graphs(
@@ -3989,17 +3992,17 @@ impl PyDatasetSpec {
     ) -> PyResult<std::collections::BTreeMap<String, Py<linkml_runtime_python::PyTypeRegime>>> {
         self.inner
             .schema_graphs()
-            .map(|(iri, regime)| Ok((iri.to_owned(), py_regime(py, regime)?)))
+            .map(|(iri, inference)| Ok((iri.to_owned(), py_inference(py, inference)?)))
             .collect()
     }
 
     fn __repr__(&self) -> String {
-        let regime = regime_repr;
-        let mut parts = vec![regime(self.inner.default_regime())];
+        let inference = inference_repr;
+        let mut parts = vec![inference(self.inner.default_inference())];
         let graphs = |graphs: Vec<(&str, linkml_runtime::schema_rdf::TypeRegime)>| {
             let entries: Vec<String> = graphs
                 .into_iter()
-                .map(|(iri, r)| format!("{}: {}", py_str_repr(iri), regime(r)))
+                .map(|(iri, r)| format!("{}: {}", py_str_repr(iri), inference(r)))
                 .collect();
             format!("{{{}}}", entries.join(", "))
         };
@@ -4021,28 +4024,28 @@ fn py_str_repr(text: &str) -> String {
     format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// The Python object for a regime.
+/// The Python object for a inference.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-fn py_regime(
+fn py_inference(
     py: Python<'_>,
-    regime: linkml_runtime::schema_rdf::TypeRegime,
+    inference: linkml_runtime::schema_rdf::TypeRegime,
 ) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
-    Py::new(py, linkml_runtime_python::PyTypeRegime::from(regime))
+    Py::new(py, linkml_runtime_python::PyTypeRegime::from(inference))
 }
 
-/// How Python spells a regime in a `repr`: the named ones as attributes, any
+/// How Python spells a inference in a `repr`: the named ones as attributes, any
 /// other set as `TypeRegime.parse('{own,is_a}')`.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-fn regime_repr(regime: linkml_runtime::schema_rdf::TypeRegime) -> String {
+fn inference_repr(inference: linkml_runtime::schema_rdf::TypeRegime) -> String {
     use linkml_runtime::schema_rdf::TypeRegime;
-    if regime == TypeRegime::ASSERTED {
+    if inference == TypeRegime::ASSERTED {
         "TypeRegime.ASSERTED".to_owned()
-    } else if regime == TypeRegime::IS_A {
+    } else if inference == TypeRegime::IS_A {
         "TypeRegime.IS_A".to_owned()
-    } else if regime == TypeRegime::IS_A_AND_MIXINS {
+    } else if inference == TypeRegime::IS_A_AND_MIXINS {
         "TypeRegime.IS_A_AND_MIXINS".to_owned()
     } else {
-        format!("TypeRegime.parse('{regime}')")
+        format!("TypeRegime.parse('{inference}')")
     }
 }
 
@@ -4101,7 +4104,7 @@ impl From<PyFinishing> for crate::sparql_plan::Finishing {
 ///     query: SPARQL query string.
 ///     schema_view: The LinkML schema.
 ///     dataset: The :class:`DatasetSpec` the endpoint serves. Required: it
-///         decides which regime each pattern is matched under and which
+///         decides which inference each pattern is matched under and which
 ///         graphs are the datamodel's, so a call that forgot it would plan a
 ///         different endpoint's query.
 ///     finishing: Keyword-only, default ``Finishing.ROWS``. Which routes may
@@ -4153,7 +4156,7 @@ fn py_plan_query_refined(
 /// Takes no schema, unlike :func:`refined_plan_text`: the naive plan is a
 /// transcription of the query's own algebra and depends on nothing about the
 /// data. That is the property the obligation ledger rests on. It does take the
-/// dataset, which says which graph each pattern reads and so which regime it
+/// dataset, which says which graph each pattern reads and so which inference it
 /// is matched under.
 ///
 /// Args:
@@ -4365,11 +4368,11 @@ fn load_json_batch(
 ///     schema_view: The LinkML schema (for RDF conversion).
 ///     dataset: The :class:`DatasetSpec` the endpoint serves: which schema
 ///         graphs to build (only the ones the query names), and the data
-///         graphs whose regimes the records are loaded under. There is
+///         graphs whose inferences the records are loaded under. There is
 ///         deliberately no default: the correct graphs depend on which
 ///         datamodel is deployed, and guessing would put an infrabel-named
 ///         graph into an unrelated deployment. The records are loaded flat
-///         under the one regime the query reads (the default graph's, or that
+///         under the one inference the query reads (the default graph's, or that
 ///         of the one data graph its ``FROM`` / ``GRAPH`` names). A query that
 ///         reads two is refused with a ``RuntimeError`` whose text opens
 ///         ``cross_data_graph``, exactly as the planner refuses it.
@@ -4436,7 +4439,7 @@ fn sparql_execute(
 /// Execute the query a plan was made for against a list of LinkML instances.
 ///
 /// The records route of a planned query: the plan carries the query (parsed
-/// and canonical), the dataset and the one data graph (its regime) it reads the
+/// and canonical), the dataset and the one data graph (its inference) it reads the
 /// records under, so the records cannot be loaded under one dataset and evaluated under
 /// another. ``sparql_execute`` stays for a query that was not planned.
 ///
@@ -4611,16 +4614,16 @@ fn sparql_finish(
 ///
 /// Args:
 ///     schema_view: The LinkML schema.
-///     regime: The :class:`TypeRegime` the subclass edges are published
+///     inference: The :class:`TypeRegime` the subclass edges are published
 ///         under (a schema graph of a dataset publishes under its own).
 fn sparql_schema_graph_ntriples(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
-    regime: linkml_runtime_python::PyTypeRegime,
+    inference: linkml_runtime_python::PyTypeRegime,
 ) -> String {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
-    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), regime.into()).to_ntriples()
+    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), inference.into()).to_ntriples()
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -4634,15 +4637,15 @@ fn sparql_schema_graph_ntriples(
 ///
 /// Args:
 ///     schema_view: The LinkML schema.
-///     regime: The :class:`TypeRegime` the graph is published under.
+///     inference: The :class:`TypeRegime` the graph is published under.
 fn sparql_schema_graph_skipped(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
-    regime: linkml_runtime_python::PyTypeRegime,
+    inference: linkml_runtime_python::PyTypeRegime,
 ) -> Vec<String> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
-    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), regime.into()).skipped
+    crate::sparql_schema_graph::SchemaGraph::build(sv_ref.as_rust(), inference.into()).skipped
 }
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
@@ -4761,7 +4764,7 @@ impl PyPredicateCheck {
 /// Never refuses. A subject's class is its one ``rdf:type``, the class
 /// ``bound`` gives its variable, or the range of the slot that reached it, and
 /// it is judged together with the classes ``rdf:type`` gives its instances
-/// under the regime of the data graph the query reads. The query is judged as written,
+/// under the inference of the data graph the query reads. The query is judged as written,
 /// with no alias resolved first: a predicate spelled with the wrong namespace
 /// is ``NotCarried``, and ``suggestion`` is the IRI the data uses. A subject
 /// whose class cannot be told is ``Unchecked``, never silently passed.
@@ -4771,7 +4774,7 @@ impl PyPredicateCheck {
 ///     query: SPARQL query string (a SHACL ``sh:select`` body, say).
 ///     schema_view: The LinkML schema.
 ///     dataset: The :class:`DatasetSpec` the query reads. A subject is judged
-///         with the classes its type implies under the regime of the data
+///         with the classes its type implies under the inference of the data
 ///         graph the query reads, so a slot only a subclass carries is
 ///         carried by a parent-typed subject under ``IS_A`` and not under
 ///         ``ASSERTED``.

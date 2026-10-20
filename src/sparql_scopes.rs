@@ -636,12 +636,12 @@ impl Plan {
         Some(class)
     }
 
-    /// The type regime the scans that make `var` the identity of `class_uri`
-    /// at `node` read under -- the one regime they all agree on, or `None`
+    /// The type inference the scans that make `var` the identity of `class_uri`
+    /// at `node` read under -- the one inference they all agree on, or `None`
     /// when they disagree (or there is no such scan). A restriction derived
     /// from that identity carries it, so it never changes which graph a star
     /// reads.
-    pub(crate) fn identity_regime(
+    pub(crate) fn identity_inference(
         &self,
         node: NodeId,
         var: &str,
@@ -656,7 +656,7 @@ impl Plan {
                         if star_var == var && scanned == class_uri
                 )
             })
-            .then_some(self.data_regime)
+            .then_some(self.data_inference)
     }
 
     /// The outer variables a subtree reads: empty everywhere but the right

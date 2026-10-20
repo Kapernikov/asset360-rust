@@ -266,7 +266,7 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
 ///   one array are a cross product in SPARQL -- three values answer nine ways
 ///   -- and one unnest restores three. Left to the engine.
 /// * **Two `rdf:type`s on one subject fold only along a chain (#511).**
-///   `?s a C ; a D` is an intersection of classes. Under the inferred regime
+///   `?s a C ; a D` is an intersection of classes. Under the inferring inference
 ///   a subject's type set is the family of its class, so the intersection is
 ///   `family(C) ∩ family(D)`; when `family(C) ⊆ family(D)` that is
 ///   `family(C)`, and the scan of `C` returns exactly those records. Fold to
@@ -402,8 +402,8 @@ fn const_subject_stars(plan: &Plan) -> HashMap<String, String> {
 /// in for one, asks this first. A match under a `GRAPH` that stays reads no
 /// records (the datamodel, a graph the endpoint does not serve), so it is never
 /// the scan's. A match of the data graph is always under the plan's one data
-/// regime ([`Plan::data_regime`]), which is the regime of every scan, so no
-/// regime has to be compared.
+/// inference ([`Plan::data_inference`]), which is the inference of every scan, so no
+/// inference has to be compared.
 fn reads_the_records(plan: &Plan, matched: NodeId) -> bool {
     matches!(
         &plan.nodes[matched].op,
@@ -446,7 +446,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // fact, derived by 3a from the other side of a join. A
             // restriction is read exactly where a type match is, so an
             // untyped body gets its scan by the same edit as a typed one.
-            let (identifier_values, star, class_uri, regime): (
+            let (identifier_values, star, class_uri, inference): (
                 Vec<String>,
                 String,
                 String,
@@ -484,21 +484,21 @@ impl Rule for FoldMatchesIntoScan<'_> {
                         identifier_values,
                         star,
                         class_uri.to_owned(),
-                        plan.data_regime,
+                        plan.data_inference,
                     )
                 }
-                // A restriction carries the regime of the scan it was
-                // derived from, so it folds with the matches of that regime
+                // A restriction carries the inference of the scan it was
+                // derived from, so it folds with the matches of that inference
                 // and no other.
                 PlanOp::Filter {
                     condition:
                         crate::sparql_refine::Expr::InClass {
                             var,
                             class_uri,
-                            regime,
+                            inference,
                         },
                     ..
-                } => (Vec::new(), var.clone(), class_uri.clone(), *regime),
+                } => (Vec::new(), var.clone(), class_uri.clone(), *inference),
                 _ => continue,
             };
             let star = star.as_str();
@@ -535,8 +535,8 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // (design, *What a relational subtree derives*). Two types on one
             // variable *in one scope* still decline.
             let scopes = plan.scopes();
-            // The regime is the type source's own -- a type match's, or the
-            // restriction's -- so the matches of that regime fold and the
+            // The inference is the type source's own -- a type match's, or the
+            // restriction's -- so the matches of that inference fold and the
             // others stay put.
             // Counted as *classes*, not as nodes: a restriction beside a
             // type match of the same class is one class said twice.
@@ -562,10 +562,10 @@ impl Rule for FoldMatchesIntoScan<'_> {
                             crate::sparql_refine::Expr::InClass {
                                 var,
                                 class_uri,
-                                regime: other_regime,
+                                inference: other_inference,
                             },
                         ..
-                    } if var == star && *other_regime == regime => {
+                    } if var == star && *other_inference == inference => {
                         Some((other_id, class_uri.clone()))
                     }
                     _ => None,
@@ -578,7 +578,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // that carries that class, so the answer does not depend on which
             // type the query wrote first.
             //
-            // "Inside" is judged in the star's own regime, the one its type
+            // "Inside" is judged in the star's own inference, the one its type
             // matches carry (counted above only when they share it). Under
             // `Asserted` the family of a class is that class alone, so two
             // different classes never include one another and the fold
@@ -587,15 +587,15 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // intersection is empty and a scan of the subclass would invent
             // answers. Under `IsA` the subclass's family is inside its
             // parent's, `a Child ∧ a Parent ≡ a Child`, and the fold is exact.
-            // An `InClass` restriction carries the regime of the read it was
+            // An `InClass` restriction carries the inference of the read it was
             // derived from, and the collection above counts it only when
-            // that regime is the folding node's own: a restriction in
-            // another regime is not a type read of this star. A folding
-            // node that is itself a restriction folds in the regime the
+            // that inference is the folding node's own: a restriction in
+            // another inference is not a type read of this star. A folding
+            // node that is itself a restriction folds in the inference the
             // restriction carries.
             let mut subsumed: Vec<NodeId> = Vec::new();
             if classes_on_star.len() != 1 {
-                let Some(specific) = most_specific(self.schema, &classes_on_star, regime) else {
+                let Some(specific) = most_specific(self.schema, &classes_on_star, inference) else {
                     continue;
                 };
                 if specific != class_uri {
@@ -626,8 +626,8 @@ impl Rule for FoldMatchesIntoScan<'_> {
             }
             let star = star.to_owned();
             let class_uri = class_uri.to_owned();
-            // The regime is the type source's own -- a type match's, or the
-            // restriction's -- so the matches of that regime fold and the
+            // The inference is the type source's own -- a type match's, or the
+            // restriction's -- so the matches of that inference fold and the
             // others stay put.
             let slots =
                 self.foldable_slots(plan, &keys, &star, &class_uri, &groups, groups[type_node]);
@@ -650,7 +650,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
             // ever less refined. The error itself is raised where it can be
             // returned -- by the scoper for every star the query types, and by
             // `Plan::scan_classes_agree` for every scan a plan holds.
-            let Ok(classes) = scan_classes(self.schema, &class_uri, regime) else {
+            let Ok(classes) = scan_classes(self.schema, &class_uri, inference) else {
                 continue;
             };
             fold(
@@ -676,12 +676,12 @@ impl Rule for FoldMatchesIntoScan<'_> {
 ///
 /// * a record's direct type is its designated class, which is the
 ///   `asset_type` column the scan reads;
-/// * in the graph of regime `r` the writer emits `(s rdf:type t)` iff
+/// * in the graph of inference `r` the writer emits `(s rdf:type t)` iff
 ///   `t ∈ rdf_types(direct_type(s), r)`, and emits `(s sesame:directType d)`
 ///   iff [`TypePartition::Direct`] is in `r` and
 ///   `d = direct_type(s)` -- exactly one such triple per record.
-fn writes_direct_type(regime: TypeRegime) -> bool {
-    regime.contains(TypePartition::Direct)
+fn writes_direct_type(inference: TypeRegime) -> bool {
+    inference.contains(TypePartition::Direct)
 }
 
 /// A `sesame:directType` triple pattern.
@@ -703,7 +703,7 @@ fn pattern_variables(pattern: &TriplePattern) -> Vec<spargebra::term::Variable> 
 /// The `Match` a type-reading rule works on and the one plain join that
 /// applies it: its node, the join above it, the side that stays, and the
 /// `Sql` scan of the subject's star that mandatorily feeds that side under
-/// the match's own regime.
+/// the match's own inference.
 struct TypeReadSite {
     consumer: NodeId,
     other: NodeId,
@@ -712,7 +712,7 @@ struct TypeReadSite {
 
 /// Where a `match` on a star's type reads from: `None` unless the match is
 /// applied by a single plain join, and a scan of the subject star -- the
-/// star itself, in the match's regime -- feeds the other side by plain joins
+/// star itself, in the match's inference -- feeds the other side by plain joins
 /// only. The shape [`FoldIdentityConstant`] asks for, for the same reasons:
 /// anywhere else the match is a constraint on a row set the scan does not
 /// stand for (an `OPTIONAL`'s optional side, a `UNION` arm).
@@ -772,7 +772,7 @@ fn replace_match_with_empty_relation(plan: &mut Plan, id: NodeId) {
 /// Three shapes, each an equivalence under the writer's facts (see
 /// [`writes_direct_type`]):
 ///
-/// * **O is a variable `?t`, and the regime writes the direct type.** The
+/// * **O is a variable `?t`, and the inference writes the direct type.** The
 ///   triples `(s sesame:directType d)` in the graph are exactly one per
 ///   record, `d = direct_type(s)`, and the scan's rows are the records; so
 ///   joining the match to the scan on `?s` is the scan with one more column,
@@ -780,7 +780,7 @@ fn replace_match_with_empty_relation(plan: &mut Plan, id: NodeId) {
 ///   ([`PlanOp::Scan::direct_type`]) and the match, with the join that
 ///   carried it, goes. Declines unless the join is on `?s` alone: a `?t`
 ///   the other side already binds is a join on a value, not a column.
-/// * **O is a constant IRI `C`, and the regime writes the direct type.** The
+/// * **O is a constant IRI `C`, and the inference writes the direct type.** The
 ///   match keeps exactly the records whose direct type is `C`: the scan's
 ///   [`PlanOp::Scan::direct_type_in`] gains `C`, and the lowering reads
 ///   `asset_type = ANY(classes ∩ direct_type_in)`. `classes` itself stays the
@@ -789,7 +789,7 @@ fn replace_match_with_empty_relation(plan: &mut Plan, id: NodeId) {
 ///   becomes the empty relation. A second, different constant is an
 ///   intersection of two direct types and declines (the empty set cannot be
 ///   written in a list that means "no constraint when empty").
-/// * **The regime does not write the direct type (asserted).** The graph holds
+/// * **The inference does not write the direct type (asserted).** The graph holds
 ///   no `sesame:directType` triple, so the pattern matches nothing: the match
 ///   becomes the empty relation, wherever it sits.
 ///
@@ -817,8 +817,8 @@ impl Rule for FoldDirectTypeIntoScan {
             if !is_direct_type_pattern(pattern) {
                 continue;
             }
-            let regime = plan.data_regime;
-            if !writes_direct_type(regime) {
+            let inference = plan.data_inference;
+            if !writes_direct_type(inference) {
                 replace_match_with_empty_relation(plan, id);
                 return true;
             }
@@ -891,8 +891,8 @@ impl Rule for FoldDirectTypeIntoScan {
 /// `?s a ?t` over a scanned star becomes a join with the table of the types
 /// each class has.
 ///
-/// **Match.** `(?s rdf:type ?t)` under regime `r`, applied by a plain join to
-/// a side a scan of `?s` mandatorily feeds, in regime `r`.
+/// **Match.** `(?s rdf:type ?t)` under inference `r`, applied by a plain join to
+/// a side a scan of `?s` mandatorily feeds, in inference `r`.
 ///
 /// **Edit.** The scan binds the record's direct type to `?d`
 /// ([`PlanOp::Scan::direct_type`]: fresh, or the variable it already binds),
@@ -907,7 +907,7 @@ impl Rule for FoldDirectTypeIntoScan {
 /// scan are `{(s, t) | t ∈ rdf_types(direct(s), r)}`, which is the scan
 /// joined with `T` on `?d = direct(s)`. Not distinct: a record with two
 /// inferred types has two `rdf:type` triples and so two rows, as `T` has.
-/// Under the asserted regime `rdf_types(c) = {c}`, so `T` is the identity.
+/// Under the asserted inference `rdf_types(c) = {c}`, so `T` is the identity.
 ///
 /// **Redundancy.** When `?t` *is* the variable the scan binds as the direct
 /// type (`?s sesame:directType ?t ; a ?t`), the match holds of every record
@@ -961,7 +961,7 @@ impl Rule for TypeVariableBecomesTypeTable<'_> {
             if !is_type_pattern(pattern) {
                 continue;
             }
-            let regime = plan.data_regime;
+            let inference = plan.data_inference;
             let (Some(star), Some(ty)) = (subject_variable(pattern), object_variable(pattern))
             else {
                 continue;
@@ -1019,7 +1019,8 @@ impl Rule for TypeVariableBecomesTypeTable<'_> {
                 .filter(|class| direct_type_in.is_empty() || direct_type_in.contains(class))
                 .cloned()
                 .collect();
-            let Some(table) = crate::sparql_refine::type_table(self.schema, &reads, regime) else {
+            let Some(table) = crate::sparql_refine::type_table(self.schema, &reads, inference)
+            else {
                 continue;
             };
             let direct = match existing {
@@ -2490,8 +2491,8 @@ fn is_inline_element(plan: &Plan, schema: &SchemaView, var: &str) -> bool {
 ///
 /// **Equivalence.** The decision, and its proof, are
 /// [`crate::sparql_inline_type::inline_type_test`]: the match holds for an
-/// element iff its designated class is in `type_family(C, regime)`, the regime
-/// being the match's own (`PlanOp::Match::regime`: the graph the triple is
+/// element iff its designated class is in `type_family(C, inference)`, the inference
+/// being the match's own (`PlanOp::Match::inference`: the graph the triple is
 /// read from; none under a non-data graph, where the rule does not apply). The match is one
 /// triple with a constant object, so it joins each element row to at most one
 /// row and adds no column: replacing it, and the join that carried it, with a
@@ -2547,7 +2548,7 @@ impl Rule for InlineTypeMatchBecomesFilter<'_> {
             if !reads.is_data() {
                 continue;
             }
-            let regime = plan.data_regime;
+            let inference = plan.data_inference;
             let (Some(subject), Some(class_uri)) =
                 (subject_variable(pattern), type_class_iri(pattern))
             else {
@@ -2585,7 +2586,7 @@ impl Rule for InlineTypeMatchBecomesFilter<'_> {
             ) else {
                 continue;
             };
-            match inline_type_test(self.schema, &range, &asked, regime) {
+            match inline_type_test(self.schema, &range, &asked, inference) {
                 Some(InlineTypeTest::Discharged) => {
                     fold_into_scan(plan, id, consumer, other, site.scan, None);
                     return true;
@@ -6420,20 +6421,20 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for Materialise<M> {
 /// The classes a type read on `class_iri` ranges over: the class and its
 /// descendants.
 ///
-/// `regime` is the data regime of the reads being compared. Under an
-/// inferred regime an instance of `Signal` is also an `Asset`. Under the
-/// asserted regime the family of a class is the class alone, so two different
+/// `inference` is the data inference of the reads being compared. Under an
+/// inferring inference an instance of `Signal` is also an `Asset`. Under the
+/// asserted inference the family of a class is the class alone, so two different
 /// classes on one subject are an empty intersection and [`most_specific`]
 /// returns `None` for them. Every subsumption decision in this file goes
-/// through here, so the regime is always the caller's.
+/// through here, so the inference is always the caller's.
 fn family_iris(
     schema: &SchemaView,
     class_iri: &str,
-    regime: TypeRegime,
+    inference: TypeRegime,
 ) -> Option<BTreeSet<String>> {
     let class = schema.get_class_by_uri(class_iri).ok().flatten()?;
     let converter = schema.converter();
-    let mut family: BTreeSet<String> = type_family(&class, regime)
+    let mut family: BTreeSet<String> = type_family(&class, inference)
         .ok()?
         .iter()
         .map(|member| member.canonical_uri().to_uri(&converter).map(|uri| uri.0))
@@ -6450,11 +6451,11 @@ fn family_iris(
 pub(crate) fn most_specific(
     schema: &SchemaView,
     classes: &BTreeSet<String>,
-    regime: TypeRegime,
+    inference: TypeRegime,
 ) -> Option<String> {
     let families: Vec<(&String, BTreeSet<String>)> = classes
         .iter()
-        .map(|class| family_iris(schema, class, regime).map(|family| (class, family)))
+        .map(|class| family_iris(schema, class, inference).map(|family| (class, family)))
         .collect::<Option<_>>()?;
     let mut candidates = families.iter().filter(|(class, family)| {
         families
@@ -6486,15 +6487,15 @@ mod tests {
         .expect("should build a naive plan")
     }
 
-    /// [`plan_of`] over a dataset whose data graph has type regime `regime`:
+    /// [`plan_of`] over a dataset whose data graph has type inference `inference`:
     /// what a class's family is, and so whether a parent type beside its
     /// subclass is one class, depends on it.
-    fn plan_in(query: &str, regime: TypeRegime) -> Plan {
+    fn plan_in(query: &str, inference: TypeRegime) -> Plan {
         let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
             .expect("should parse");
         crate::sparql_refine::naive_plan(
             &parsed,
-            &crate::sparql_dataset::dataset_with(regime, &[], &[]),
+            &crate::sparql_dataset::dataset_with(inference, &[], &[]),
         )
         .expect("should build a naive plan")
     }
@@ -6895,15 +6896,15 @@ mod tests {
             let text = plan.to_string();
             assert!(
                 text.contains("[is_a]"),
-                "the scan names its regime:\n{text}"
+                "the scan names its inference:\n{text}"
             );
             assert!(
                 plan.scan_classes_agree(&schema).is_ok(),
-                "the scan's classes are those of its regime:\n{text}"
+                "the scan's classes are those of its inference:\n{text}"
             );
         }
 
-        // Under the asserted regime a class's family is the class alone, so
+        // Under the asserted inference a class's family is the class alone, so
         // the intersection of a parent and its subclass is empty: the fold
         // declines and the engine keeps both reads.
         for query in [
@@ -6916,11 +6917,11 @@ mod tests {
             assert!(plan.find("scan").is_empty(), "{query}\n{plan}");
         }
 
-        // Siblings: neither family is inside the other, in any regime.
-        for regime in [TypeRegime::ASSERTED, TypeRegime::IS_A] {
+        // Siblings: neither family is inside the other, in any inference.
+        for inference in [TypeRegime::ASSERTED, TypeRegime::IS_A] {
             let mut plan = plan_in(
                 "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }",
-                regime,
+                inference,
             );
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert!(log.applied.is_empty(), "{plan}");
@@ -6929,9 +6930,9 @@ mod tests {
     }
 
     /// Wrap the voltage read of `plan` in an `InClass` restriction of
-    /// `class_uri` in `regime`, as one pushed down by an earlier rule sits: on
+    /// `class_uri` in `inference`, as one pushed down by an earlier rule sits: on
     /// one side of the join, inside the star's group.
-    fn with_restriction(plan: &mut Plan, class_uri: &str, regime: TypeRegime) {
+    fn with_restriction(plan: &mut Plan, class_uri: &str, inference: TypeRegime) {
         let join = plan.find("match")[1];
         let mut nodes = plan.nodes.clone();
         nodes.insert(
@@ -6942,7 +6943,7 @@ mod tests {
                     condition: Expr::InClass {
                         var: "s".to_owned(),
                         class_uri: class_uri.to_owned(),
-                        regime,
+                        inference,
                     },
                 },
                 Vec::new(),
@@ -6961,24 +6962,24 @@ mod tests {
         plan.rebuild(nodes, &remap);
     }
 
-    /// A restriction in another regime is not a type read of this star: it
+    /// A restriction in another inference is not a type read of this star: it
     /// does not join the chain (#511), and is left where it was.
     #[test]
-    fn a_restriction_in_another_regime_does_not_join_the_chain() {
+    fn a_restriction_in_another_inference_does_not_join_the_chain() {
         let schema = test_schema_view();
         let rule = FoldMatchesIntoScan::new(&schema);
         let query = "SELECT ?s ?v WHERE { ?s a asset360:Relay ; asset360:voltage ?v }";
         let equipment = "https://data.infrabel.be/asset360/Equipment";
-        for (regime, absorbed) in [(TypeRegime::IS_A, true), (TypeRegime::ASSERTED, false)] {
+        for (inference, absorbed) in [(TypeRegime::IS_A, true), (TypeRegime::ASSERTED, false)] {
             let mut plan = plan_in(query, TypeRegime::IS_A);
-            with_restriction(&mut plan, equipment, regime);
+            with_restriction(&mut plan, equipment, inference);
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
-            assert_eq!(log.applied.len(), 1, "{regime:?}\n{plan}");
-            assert_eq!(plan.find("scan").len(), 1, "{regime:?}\n{plan}");
+            assert_eq!(log.applied.len(), 1, "{inference:?}\n{plan}");
+            assert_eq!(plan.find("scan").len(), 1, "{inference:?}\n{plan}");
             assert_eq!(
                 plan.find("filter").is_empty(),
                 absorbed,
-                "{regime:?}\n{plan}"
+                "{inference:?}\n{plan}"
             );
         }
     }
@@ -7668,7 +7669,7 @@ mod tests {
         };
         assert_eq!(slots[0].presence, SlotPresence::Optional, "{plan}");
 
-        // `regime` is multivalued on Switch and single on Breaker: no single
+        // `inference` is multivalued on Switch and single on Breaker: no single
         // reading of it exists on Equipment, so nothing folds.
         let rule = FoldMatchesIntoScan::new(&schema);
         let mut plan =
@@ -9071,9 +9072,9 @@ mod tests {
         refine_naive(&plan_of(query), schema, reverse)
     }
 
-    /// [`refined`] over a dataset whose data graph has type regime `regime`.
-    fn refined_in(query: &str, schema: &SchemaView, regime: TypeRegime) -> Plan {
-        refine_naive(&plan_in(query, regime), schema, false)
+    /// [`refined`] over a dataset whose data graph has type inference `inference`.
+    fn refined_in(query: &str, schema: &SchemaView, inference: TypeRegime) -> Plan {
+        refine_naive(&plan_in(query, inference), schema, false)
     }
 
     /// The value conditions today's star decomposition pushes, as
@@ -11054,9 +11055,9 @@ mod inline_type_match {
         );
     }
 
-    /// The regime of an inlined element's type triple is the query's one data
-    /// regime: asking for the range class itself is a bare test under the
-    /// asserted regime (an element may name no designator), and discharged
+    /// The inference of an inlined element's type triple is the query's one data
+    /// inference: asking for the range class itself is a bare test under the
+    /// asserted inference (an element may name no designator), and discharged
     /// under the inferred one (every element is a place).
     #[test]
     fn an_inline_type_triple_is_judged_in_its_own_graph() {
@@ -11084,7 +11085,7 @@ mod inline_type_match {
             plan.to_string()
         };
         // One graph per query: the site and its element's type are read in
-        // the same graph, whose regime decides.
+        // the same graph, whose inference decides.
         let asserted = refined(A, A);
         assert!(
             asserted.contains("match     ?p a asset360:Place"),
@@ -11333,7 +11334,7 @@ mod inline_type_match {
 /// column: [`FoldDirectTypeIntoScan`] and [`TypeVariableBecomesTypeTable`].
 ///
 /// The planner-level tests read the refined plan; the oracle test holds every
-/// rewrite to an engine answering over records *written in the regime the
+/// rewrite to an engine answering over records *written in the inference the
 /// plan reads*, so the proofs in the two rules' doc comments are tested and
 /// not only stated.
 #[cfg(test)]
@@ -11345,12 +11346,12 @@ mod direct_type {
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
          PREFIX sesame: <http://www.openrdf.org/schema/sesame#> ";
 
-    fn refined_in(query: &str, schema: &SchemaView, regime: TypeRegime) -> Plan {
+    fn refined_in(query: &str, schema: &SchemaView, inference: TypeRegime) -> Plan {
         let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
             .expect("should parse");
         let mut plan = naive_plan(
             &parsed,
-            &crate::sparql_dataset::dataset_with(regime, &[], &[]),
+            &crate::sparql_dataset::dataset_with(inference, &[], &[]),
         )
         .expect("naive plan");
         let rules = tier_one_rules(schema, crate::sparql_dataset::default_dataset());
@@ -11408,7 +11409,7 @@ mod direct_type {
         rows.len()
     }
 
-    /// `?s sesame:directType ?t` under a regime that writes it is a column of
+    /// `?s sesame:directType ?t` under a inference that writes it is a column of
     /// the scan: no match, no join, the whole plan in SQL.
     #[test]
     fn a_direct_type_variable_folds_into_the_scan() {
@@ -11481,7 +11482,7 @@ mod direct_type {
     /// The asserted graph holds no `sesame:directType` triple: the pattern is
     /// the empty relation, and no scan carries a type column for it.
     #[test]
-    fn a_direct_type_under_the_asserted_regime_is_the_empty_relation() {
+    fn a_direct_type_under_the_asserted_inference_is_the_empty_relation() {
         let schema = test_schema_view();
         for query in [
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t }",
@@ -11497,7 +11498,7 @@ mod direct_type {
     }
 
     /// `?s a ?t` is a join with the table of types per class: a record with
-    /// two inferred types has two rows, and the asserted regime's table is
+    /// two inferred types has two rows, and the asserted inference's table is
     /// the identity.
     #[test]
     fn a_type_variable_becomes_a_type_table() {
@@ -11654,10 +11655,10 @@ mod direct_type {
     }
 
     /// Every rewrite of the type queries answers what the engine answers over
-    /// records written in the regime the plan reads.
+    /// records written in the inference the plan reads.
     #[cfg(feature = "sparql-endpoint")]
     #[test]
-    fn every_rewrite_answers_what_the_engine_answers_in_the_same_regime() {
+    fn every_rewrite_answers_what_the_engine_answers_in_the_same_inference() {
         use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers_in;
         let schema = test_schema_view();
         let base = "https://data.infrabel.be/asset360/eq";
@@ -11699,9 +11700,9 @@ mod direct_type {
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; asset360:label ?l ; a ?t . \
              OPTIONAL { ?s sesame:directType ?d } }",
         ];
-        for &regime in TypeRegime::NAMED {
-            let oracle = crate::sparql_oracle::Oracle::new_in(&schema, &records, regime);
-            let dataset = crate::sparql_dataset::dataset_with(regime, &[], &[]);
+        for &inference in TypeRegime::NAMED {
+            let oracle = crate::sparql_oracle::Oracle::new_in(&schema, &records, inference);
+            let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[]);
             let rules = tier_one_rules(&schema, &dataset);
             let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
             for query in queries {

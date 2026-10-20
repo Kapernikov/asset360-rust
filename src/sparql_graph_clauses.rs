@@ -33,7 +33,7 @@ use crate::sparql_dataset::DatasetSpec;
 /// constant, `FROM` or `FROM NAMED`, and every one of them for a `GRAPH ?g`.
 ///
 /// What the executor builds and loads: one store entry per schema graph the
-/// query can reach, each under its own regime, so a query that reads one pays
+/// query can reach, each under its own inference, so a query that reads one pays
 /// for one and an instance query pays for none (a named graph is invisible
 /// unless the query says `GRAPH`, `FROM` or `FROM NAMED`).
 pub(crate) fn schema_graphs_read(
@@ -80,7 +80,7 @@ pub(crate) fn schema_graphs_read(
     let all = || -> Vec<(String, TypeRegime)> {
         dataset
             .schema_graphs()
-            .map(|(iri, regime)| (iri.to_owned(), regime))
+            .map(|(iri, inference)| (iri.to_owned(), inference))
             .collect()
     };
     let pattern = match parsed {
@@ -95,8 +95,8 @@ pub(crate) fn schema_graphs_read(
     for name in names {
         match name {
             NamedNodePattern::NamedNode(graph) => {
-                if let Some(regime) = dataset.schema_regime(graph.as_str()) {
-                    read.insert(graph.as_str().to_owned(), regime);
+                if let Some(inference) = dataset.schema_inference(graph.as_str()) {
+                    read.insert(graph.as_str().to_owned(), inference);
                 }
             }
             NamedNodePattern::Variable(_) => return all(),
@@ -104,8 +104,8 @@ pub(crate) fn schema_graphs_read(
     }
     if let Some(clause) = crate::sparql_scoper::dataset_of(parsed) {
         for graph in clause.default.iter().chain(clause.named.iter().flatten()) {
-            if let Some(regime) = dataset.schema_regime(graph.as_str()) {
-                read.insert(graph.as_str().to_owned(), regime);
+            if let Some(inference) = dataset.schema_inference(graph.as_str()) {
+                read.insert(graph.as_str().to_owned(), inference);
             }
         }
     }
@@ -121,15 +121,15 @@ pub(crate) struct CrossDataGraph {
 }
 
 /// Where a query reads its records: **at most one named data graph**, and the
-/// regime they are read under.
+/// inference they are read under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DataRead {
     /// The data graph the query reads, if it reads one by name. `None`: it
     /// reads the default graph only (or no record at all).
     pub(crate) graph: Option<String>,
-    /// The regime the records are read under: the graph's if there is one,
+    /// The inference the records are read under: the graph's if there is one,
     /// else the dataset's default.
-    pub(crate) regime: TypeRegime,
+    pub(crate) inference: TypeRegime,
 }
 
 /// **The query's one data graph**, or the refusal that it reads several.
@@ -141,7 +141,7 @@ pub(crate) struct DataRead {
 /// `FROM` and `FROM NAMED` over them as written; nothing is rewritten.
 ///
 /// Reading the default graph together with a named data graph is refused even
-/// when that graph has the default regime: use either the default graph or
+/// when that graph has the default inference: use either the default graph or
 /// explicit graph names, not both.
 ///
 /// What the query reads, per SPARQL 1.1 13.2 (the same reads as
@@ -196,7 +196,7 @@ pub(crate) fn single_data_graph(
                         .default
                         .iter()
                         .map(|graph| graph.as_str().to_owned())
-                        .filter(|iri| self.dataset.data_regime(iri).is_some())
+                        .filter(|iri| self.dataset.data_inference(iri).is_some())
                         .collect(),
                 },
                 Reading::Data(iri) => vec![iri.clone()],
@@ -218,7 +218,7 @@ pub(crate) fn single_data_graph(
                     .iter()
                     .flatten()
                     .map(|graph| graph.as_str().to_owned())
-                    .filter(|iri| self.dataset.data_regime(iri).is_some())
+                    .filter(|iri| self.dataset.data_inference(iri).is_some())
                     .collect(),
                 None => self
                     .dataset
@@ -269,7 +269,7 @@ pub(crate) fn single_data_graph(
                                     .flatten()
                                     .any(|named| named.as_str() == iri)
                             });
-                            if visible && self.dataset.data_regime(iri).is_some() {
+                            if visible && self.dataset.data_inference(iri).is_some() {
                                 Reading::Data(iri.to_owned())
                             } else {
                                 Reading::NoData
@@ -331,11 +331,11 @@ pub(crate) fn single_data_graph(
     match walk.named.as_slice() {
         [] => Ok(DataRead {
             graph: None,
-            regime: dataset.default_regime(),
+            inference: dataset.default_inference(),
         }),
         [graph] => {
-            let regime = dataset
-                .data_regime(graph)
+            let inference = dataset
+                .data_inference(graph)
                 .expect("only data graphs are recorded");
             if walk.default_read {
                 return Err(CrossDataGraph {
@@ -344,7 +344,7 @@ pub(crate) fn single_data_graph(
             }
             Ok(DataRead {
                 graph: Some(graph.clone()),
-                regime,
+                inference,
             })
         }
         _ => Err(CrossDataGraph {

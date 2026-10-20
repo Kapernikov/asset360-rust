@@ -300,7 +300,7 @@ pub struct ExecutionPlan {
     /// How this plan is to be run, and what the engine was left. See
     /// [`plan_query_refined`].
     pub refinement: Refinement,
-    /// The dataset the plan was made for. The regime of every scan and the
+    /// The dataset the plan was made for. The inference of every scan and the
     /// schema graphs a finish query may read were decided under it, so
     /// [`crate::sparql_executor::sparql_finish`] reads it from here rather than
     /// being handed a second one that could disagree.
@@ -1305,7 +1305,7 @@ pub(crate) fn plan_texts_of(
 /// algebra, and nothing about it depends on what the data looks like. That is
 /// the property the ledger rests on -- the obligations are read off the query,
 /// so a rule can only ever discharge them, never invent one. It does take the
-/// dataset, which says which graph each pattern reads and so which regime it
+/// dataset, which says which graph each pattern reads and so which inference it
 /// is matched under.
 pub fn naive_plan_text(query: &Query, dataset: &DatasetSpec) -> Result<String, String> {
     crate::sparql_refine::naive_plan(query, dataset)
@@ -1322,7 +1322,7 @@ pub fn naive_plan_text(query: &Query, dataset: &DatasetSpec) -> Result<String, S
 ///
 /// `dataset` says which graphs the endpoint serves, and it is a parameter here
 /// for the same reason it is one everywhere else: it decides which rules exist
-/// and which regime each pattern is matched under, so a diagnostic that left it
+/// and which inference each pattern is matched under, so a diagnostic that left it
 /// out would print a plan production never builds.
 pub fn refined_plan_text(
     query: &Query,
@@ -1449,7 +1449,7 @@ pub enum Finishing {
 ///
 /// `dataset` says which graphs the endpoint serves and what the default graph
 /// means. The scoper needs it to tell a pattern about the datamodel apart from
-/// a pattern about a golden record, and the plan to say which type regime each
+/// a pattern about a golden record, and the plan to say which type inference each
 /// pattern is matched under; it is a parameter and not a constant because the
 /// deployment decides it (see [`crate::sparql_dataset`] and
 /// [`crate::sparql_schema_graph`]).
@@ -3490,8 +3490,8 @@ classes:
     /// The dataset is a field of the plan: the finish query carries the
     /// query's own `FROM` / `FROM NAMED` (the engine evaluates the clause
     /// itself, where it used to be refused outright), and a pattern under a
-    /// data graph's regime is answered by a statement that scans the classes
-    /// of *that* regime.
+    /// data graph's inference is answered by a statement that scans the classes
+    /// of *that* inference.
     #[test]
     fn the_finish_query_keeps_the_dataset() {
         const A: &str = "urn:graph:asserted";
@@ -3544,7 +3544,7 @@ classes:
         };
 
         // The clause rides along into the finish, and the scan reads the
-        // regime of the graph the clause names.
+        // inference of the graph the clause names.
         let (finish, classes) = finish_of(format!(
             "{PREFIX}SELECT ?s ?nm FROM <{I}> WHERE {{ {body} }}"
         ));
@@ -3560,7 +3560,7 @@ classes:
             vec![vec!["https://data.infrabel.be/asset360/Signal".to_owned()]]
         );
 
-        // A `GRAPH` naming a data graph dissolves: the regime is the
+        // A `GRAPH` naming a data graph dissolves: the inference is the
         // matches', and there is no graph left to write into the finish.
         let (finish, classes) = finish_of(format!(
             "{PREFIX}SELECT ?s ?nm WHERE {{ GRAPH <{I}> {{ {body} }} }}"
