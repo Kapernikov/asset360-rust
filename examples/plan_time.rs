@@ -8,7 +8,23 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = Path::new(&args[1]);
     let query = std::fs::read_to_string(&args[2]).unwrap();
-    let graph = args.get(3).map(|s| s.as_str());
+    let schema_graphs: Vec<_> = args
+        .get(3)
+        .map(|iri| {
+            (
+                iri.clone(),
+                linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            )
+        })
+        .into_iter()
+        .collect();
+    let mut dataset = asset360_rust::sparql_dataset::DatasetSpec::builder(
+        linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+    );
+    for (iri, inference) in schema_graphs {
+        dataset = dataset.with_schema_graph(iri, inference);
+    }
+    let dataset = dataset.build().expect("a valid dataset");
     let mut sv = SchemaView::new();
     for name in [
         "types.yaml",
@@ -28,8 +44,14 @@ fn main() {
         let schema: SchemaDefinition = serde_path_to_error::deserialize(deser).unwrap();
         sv.add_schema(schema).unwrap();
     }
+    let parsed = asset360_rust::sparql_scoper::parse_query(&query, Some(&sv)).unwrap();
     let t = Instant::now();
-    let plan = asset360_rust::sparql_plan::plan_query_refined_with_schema_graph(&query, &sv, graph);
+    let plan = asset360_rust::sparql_plan::plan_query_refined(
+        &parsed,
+        &sv,
+        &dataset,
+        asset360_rust::sparql_plan::Finishing::Rows,
+    );
     let elapsed = t.elapsed();
     match plan {
         Ok(_) => println!("planned in {elapsed:?}"),

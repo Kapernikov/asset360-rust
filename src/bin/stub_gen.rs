@@ -3,7 +3,7 @@
 //! Run without arguments to write the stubs; run with `--check` to fail when
 //! the committed stubs differ from what a fresh generation would produce. The
 //! `--check` mode is what `tests/stub_up_to_date.rs` exercises, so a stale
-//! `python/asset360_rust/_native2.pyi` fails `cargo test`.
+//! `python/asset360_rust/_native2/__init__.pyi` fails `cargo test`.
 //!
 //! # Why this binary post-processes the generator's output
 //!
@@ -25,25 +25,18 @@
 //! in a field this pass does not cover, generation fails loudly rather than
 //! writing an unparseable stub.
 //!
-//! # The second post-processing pass: detached property setters
 //!
-//! `pyo3-stub-gen`'s `generate/class.rs` renders *all* of a class's getters in
-//! one loop and then *all* of its setters in a second, so `@x.setter` never
-//! immediately follows the `@property def x` it decorates. Python's
-//! property protocol requires adjacency, and mypy answers the detached form by
-//! treating every settable PyO3 attribute as **read-only** — `obj.attr = value`
-//! is rejected in consumer code that is perfectly valid at runtime. It also
-//! accounts for the bulk of the errors mypy reports inside the stub
-//! (`no-redef`, `untyped-decorator`, `attr-defined`), one triple per setter.
+//! # Layout
 //!
-//! [`interleave_property_setters`] moves each setter block up to its getter.
-//! It does not re-render anything: `GetterDisplay` and `SetterDisplay` are
-//! public, so the exact block text the generator emits is reproduced by the
-//! generator's own code and only *reordered*. The getters-then-setters run is
-//! located by exact string match, and a run that cannot be found is a hard
-//! error rather than a silent no-op — if upstream changes its layout we want to
-//! hear about it. [`assert_setters_follow_their_property`] then re-checks the
-//! adjacency invariant on the finished text.
+//! `pyo3-stub-gen` 0.23 writes a PyO3 module's stub as `<module>/__init__.pyi`
+//! (a stub package directory), not `<module>.pyi`; here that is
+//! `python/asset360_rust/_native2/__init__.pyi`. [`stub_path`] mirrors
+//! `StubInfo::generate` so `--check` compares the file that ships.
+//!
+//! Property getters and setters are interleaved by the generator itself since
+//! 0.23 (it keeps them in `ClassDef::getter_setters`), so the pass that used
+//! to re-order detached setters is gone. `tests/stub_up_to_date.rs` still
+//! audits adjacency with Python's own `ast`, as the authority.
 
 #[cfg(feature = "stubgen")]
 use asset360_rust::stub_info;
@@ -51,8 +44,8 @@ use asset360_rust::stub_info;
 use pyo3_stub_gen::{
     Result, StubInfo,
     generate::{
-        Arg, ClassDef, EnumDef, FunctionDef, GetterDisplay, MemberDef, MethodDef, Module,
-        SetterDisplay, VariableDef,
+        ClassDef, EnumDef, FunctionDef, MemberDef, MethodDef, Module, Parameter, Parameters,
+        VariableDef,
     },
 };
 #[cfg(feature = "stubgen")]
@@ -127,14 +120,18 @@ fn sanitize_module(module: &mut Module) {
 #[cfg(feature = "stubgen")]
 fn sanitize_class(class: &mut ClassDef) {
     class.name = unraw(class.name);
-    for member in class
-        .attrs
-        .iter_mut()
-        .chain(class.getters.iter_mut())
-        .chain(class.setters.iter_mut())
-    {
+    for member in &mut class.attrs {
         sanitize_member(member);
     }
+    class.getter_setters = std::mem::take(&mut class.getter_setters)
+        .into_iter()
+        .map(|(name, (mut getter, mut setter))| {
+            for member in getter.iter_mut().chain(setter.iter_mut()) {
+                sanitize_member(member);
+            }
+            (unraw_owned(name), (getter, setter))
+        })
+        .collect();
     class.methods = std::mem::take(&mut class.methods)
         .into_iter()
         .map(|(name, mut defs)| {
@@ -190,17 +187,13 @@ fn sanitize_member(member: &mut MemberDef) {
 #[cfg(feature = "stubgen")]
 fn sanitize_method(method: &mut MethodDef) {
     method.name = unraw(method.name);
-    for arg in &mut method.args {
-        sanitize_arg(arg);
-    }
+    sanitize_parameters(&mut method.parameters);
 }
 
 #[cfg(feature = "stubgen")]
 fn sanitize_function(function: &mut FunctionDef) {
     function.name = unraw(function.name);
-    for arg in &mut function.args {
-        sanitize_arg(arg);
-    }
+    sanitize_parameters(&mut function.parameters);
 }
 
 #[cfg(feature = "stubgen")]
@@ -209,19 +202,31 @@ fn sanitize_variable(variable: &mut VariableDef) {
 }
 
 #[cfg(feature = "stubgen")]
-fn sanitize_arg(arg: &mut Arg) {
-    arg.name = unraw(arg.name);
+fn sanitize_parameters(parameters: &mut Parameters) {
+    for parameter in parameters
+        .positional_only
+        .iter_mut()
+        .chain(parameters.positional_or_keyword.iter_mut())
+        .chain(parameters.keyword_only.iter_mut())
+        .chain(parameters.varargs.iter_mut())
+        .chain(parameters.varkw.iter_mut())
+    {
+        sanitize_parameter(parameter);
+    }
 }
 
-/// Where each module's stub file belongs, mirroring `StubInfo::generate`.
 #[cfg(feature = "stubgen")]
-fn stub_path(stub: &StubInfo, name: &str, module: &Module) -> PathBuf {
+fn sanitize_parameter(parameter: &mut Parameter) {
+    parameter.name = unraw(parameter.name);
+}
+
+/// Where each module's stub file belongs, mirroring `StubInfo::generate` for a
+/// mixed Python/Rust layout (`python-source` in pyproject.toml): the stub is a
+/// package directory's `__init__.pyi`.
+#[cfg(feature = "stubgen")]
+fn stub_path(stub: &StubInfo, name: &str) -> PathBuf {
     let path = name.replace('-', "_").replace('.', "/");
-    if module.submodules.is_empty() {
-        stub.python_root.join(format!("{path}.pyi"))
-    } else {
-        stub.python_root.join(&path).join("__init__.pyi")
-    }
+    stub.python_root.join(&path).join("__init__.pyi")
 }
 
 /// Fail rather than emit a stub that no Python parser can read.
@@ -267,239 +272,21 @@ fn assert_no_raw_identifiers(rendered: &str, module_name: &str) -> Result<()> {
     Err(std::io::Error::other(msg).into())
 }
 
-/// One class's or enum's getter and setter blocks, in the order upstream emits
-/// them and in the order Python needs them.
-///
-/// Both strings are built with the generator's own `GetterDisplay` /
-/// `SetterDisplay`, so `emitted` is byte-identical to the run that appears in
-/// the rendered module and `wanted` differs from it only in block order.
 #[cfg(feature = "stubgen")]
-struct PropertyRun {
-    owner: String,
-    emitted: String,
-    wanted: String,
-}
-
-/// A nested class is embedded by re-indenting its rendering line by line, so
-/// its blocks appear in the module text one level deeper than they render.
-#[cfg(feature = "stubgen")]
-fn reindent(text: &str, depth: usize) -> String {
-    if depth == 0 {
-        return text.to_owned();
-    }
-    let prefix = "    ".repeat(depth);
-    text.lines()
-        .map(|line| {
-            if line.is_empty() {
-                String::from("\n")
-            } else {
-                format!("{prefix}{line}\n")
-            }
-        })
-        .collect()
-}
-
-#[cfg(feature = "stubgen")]
-fn property_run(
-    owner: &str,
-    depth: usize,
-    getters: &[MemberDef],
-    setters: &[MemberDef],
-) -> Option<PropertyRun> {
-    if setters.is_empty() {
-        return None;
-    }
-
-    let mut emitted = String::new();
-    for getter in getters {
-        emitted.push_str(&GetterDisplay(getter).to_string());
-    }
-    for setter in setters {
-        emitted.push_str(&SetterDisplay(setter).to_string());
-    }
-
-    let mut wanted = String::new();
-    for getter in getters {
-        wanted.push_str(&GetterDisplay(getter).to_string());
-        for setter in setters.iter().filter(|s| s.name == getter.name) {
-            wanted.push_str(&SetterDisplay(setter).to_string());
-        }
-    }
-    // A setter with no matching getter is not a property at all; leave those
-    // where upstream put them rather than inventing a position for them.
-    for setter in setters
-        .iter()
-        .filter(|s| !getters.iter().any(|g| g.name == s.name))
-    {
-        wanted.push_str(&SetterDisplay(setter).to_string());
-    }
-
-    if emitted == wanted {
-        return None;
-    }
-    Some(PropertyRun {
-        owner: owner.to_owned(),
-        emitted: reindent(&emitted, depth),
-        wanted: reindent(&wanted, depth),
-    })
-}
-
-#[cfg(feature = "stubgen")]
-fn collect_property_runs(module: &Module, runs: &mut Vec<PropertyRun>) {
-    fn visit_class(class: &ClassDef, depth: usize, runs: &mut Vec<PropertyRun>) {
-        if let Some(run) = property_run(class.name, depth, &class.getters, &class.setters) {
-            runs.push(run);
-        }
-        for nested in &class.classes {
-            visit_class(nested, depth + 1, runs);
-        }
-    }
-
-    for class in module.class.values() {
-        visit_class(class, 0, runs);
-    }
-    for enum_ in module.enum_.values() {
-        if let Some(run) = property_run(enum_.name, 0, &enum_.getters, &enum_.setters) {
-            runs.push(run);
-        }
-    }
-}
-
-/// Move each `@X.setter` block up to sit directly after its `@property def X`.
-///
-/// Upstream renders all getters, then all setters, which Python's property
-/// protocol does not accept: a detached `@x.setter` re-binds the name instead
-/// of completing the property, and mypy then reports the attribute as
-/// read-only. Nothing is re-rendered here — only the generator's own block text
-/// is relocated.
-#[cfg(feature = "stubgen")]
-fn interleave_property_setters(
-    rendered: String,
-    module: &Module,
-    module_name: &str,
-) -> Result<String> {
-    let mut runs = Vec::new();
-    collect_property_runs(module, &mut runs);
-
-    let mut out = rendered;
-    let mut unmatched = Vec::new();
-    for run in runs {
-        match out.find(&run.emitted) {
-            Some(at) => out.replace_range(at..at + run.emitted.len(), &run.wanted),
-            None => unmatched.push(run.owner),
-        }
-    }
-
-    if !unmatched.is_empty() {
-        // The run is built from the generator's own Display impls, so failing to
-        // find it means upstream changed how a class body is laid out. Refuse
-        // rather than write a stub whose setters are silently still detached.
-        return Err(std::io::Error::other(format!(
-            "module `{module_name}`: could not locate the getter/setter run for {unmatched:?} \
-             in the rendered stub. `pyo3-stub-gen`'s class layout has changed; revisit \
-             `interleave_property_setters` in src/bin/stub_gen.rs."
-        ))
-        .into());
-    }
-
-    assert_setters_follow_their_property(&out, module_name)?;
-    Ok(out)
-}
-
-/// Every `@X.setter` must be preceded by the `@property def X` it completes.
-///
-/// Checked on the finished text rather than trusted from the transform above,
-/// because the failure is invisible to a parse: the file is still valid Python,
-/// it just describes a read-only attribute.
-#[cfg(feature = "stubgen")]
-fn assert_setters_follow_their_property(rendered: &str, module_name: &str) -> Result<()> {
-    /// The name a `def <name>(` line declares.
-    fn declared_name(trimmed: &str) -> Option<&str> {
-        trimmed
-            .strip_prefix("def ")
-            .and_then(|rest| rest.split('(').next())
-    }
-
-    let indent_of = |line: &str| line.len() - line.trim_start().len();
-
-    let mut offenders = Vec::new();
-    // The property whose getter was declared last, per indentation level: a
-    // docstring body is indented deeper and so cannot clear it, while the next
-    // declaration at the same level does.
-    let mut last_property: Option<(usize, String)> = None;
-    let mut pending_property_at: Option<usize> = None;
-
-    for (idx, line) in rendered.lines().enumerate() {
-        let trimmed = line.trim_start();
-        let indent = indent_of(line);
-
-        if trimmed == "@property" {
-            pending_property_at = Some(indent);
-            continue;
-        }
-        if let Some(name) = trimmed
-            .strip_prefix('@')
-            .and_then(|rest| rest.strip_suffix(".setter"))
-        {
-            match &last_property {
-                Some((property_indent, property))
-                    if *property_indent == indent && property == name => {}
-                _ => offenders.push(format!(
-                    "line {}: `@{name}.setter` does not directly follow `@property def {name}`",
-                    idx + 1
-                )),
-            }
-            // The setter's own `def` line must not be read as a new property.
-            pending_property_at = None;
-            continue;
-        }
-        if let Some(name) = declared_name(trimmed) {
-            if pending_property_at == Some(indent) {
-                last_property = Some((indent, name.to_owned()));
-            } else if last_property
-                .as_ref()
-                .is_some_and(|(i, n)| *i == indent && n != name)
-            {
-                last_property = None;
-            }
-            pending_property_at = None;
-            continue;
-        }
-        if trimmed.starts_with("class ") {
-            last_property = None;
-            pending_property_at = None;
-        }
-    }
-
-    if offenders.is_empty() {
-        return Ok(());
-    }
-    let mut msg = format!(
-        "module `{module_name}`: property setters are detached from their getters. \
-         Python needs `@x.setter` to directly follow `@property def x`; detached, \
-         mypy reports every settable attribute as read-only. Check \
-         `interleave_property_setters` in src/bin/stub_gen.rs:\n"
-    );
-    for offender in &offenders {
-        msg.push_str("  - ");
-        msg.push_str(offender);
-        msg.push('\n');
-    }
-    Err(std::io::Error::other(msg).into())
-}
-
-#[cfg(feature = "stubgen")]
-fn render(module: &Module, module_name: &str) -> Result<String> {
-    let rendered = module.to_string();
+fn render(stub: &StubInfo, module: &Module, module_name: &str) -> Result<String> {
+    let rendered = module.format_with_config(stub.config.use_type_statement);
     assert_no_raw_identifiers(&rendered, module_name)?;
-    interleave_property_setters(rendered, module, module_name)
+    Ok(rendered)
 }
 
 #[cfg(feature = "stubgen")]
 fn write_stubs(stub: &StubInfo) -> Result<()> {
     for (name, module) in &stub.modules {
-        let rendered = render(module, name)?;
-        let dest = stub_path(stub, name, module);
+        if module.is_empty() {
+            continue;
+        }
+        let rendered = render(stub, module, name)?;
+        let dest = stub_path(stub, name);
         if let Some(dir) = dest.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -514,8 +301,11 @@ fn check_stubs(stub: &StubInfo) -> Result<()> {
     let mut issues = Vec::new();
 
     for (name, module) in &stub.modules {
-        let dest = stub_path(stub, name, module);
-        let expected = render(module, name)?;
+        if module.is_empty() {
+            continue;
+        }
+        let dest = stub_path(stub, name);
+        let expected = render(stub, module, name)?;
         match fs::read_to_string(&dest) {
             Ok(actual) => {
                 if actual != expected {

@@ -82,14 +82,18 @@
 //! the sibling of the untyped-subject refusal in [`crate::sparql_scoper`]: a
 //! typed subject with a predicate its class cannot carry.
 //!
+//! A subject the query types itself is judged by its class and that class's
+//! subclasses: `?s a C` binds instances of any subclass of `C`, so a slot only
+//! a subclass carries is accepted, and only a predicate no class in the family
+//! carries is refused.
+//!
 //! A node the query does not type is judged all the same when a slot reached
 //! it: `?s :refersToLocatedNetEntity ?e` makes `?e` a `LocatedNetEntity`, or
 //! a subclass of one, because that is the slot's range and nothing else is
 //! ever written there. So `?e asset360:name ?n` — the shape #447's reporter
 //! actually wrote — is refused naming the hop, the class, and the spelling
 //! to write. The
-//! judgement covers the range's whole family: a slot only a subclass carries
-//! is accepted, and a predicate none of them carries is refused. It follows
+//! judgement covers the range's whole family, as for a typed subject. It follows
 //! the `[ … ]` blank-node form, a second hop, and a reference whose object
 //! the query leaves untyped. That is
 //! [#459](https://gitlab.pp.kapernikov.com/asset360/consolidator-server/-/issues/459).
@@ -105,6 +109,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use linkml_runtime::schema_rdf::TypeInference;
+use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::schemaview::SchemaView;
 use spargebra::Query;
 use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
@@ -179,8 +185,9 @@ pub struct NotASlotOfClass {
     /// own: the slot it was reached through, whose range it is. `None` when
     /// the query typed the subject itself.
     pub reached_through: Option<ReachedThrough>,
-    /// Whether the class has subclasses. A reached node may be any of them,
-    /// so the judgement covered the whole family and the message says so.
+    /// Whether the class has subclasses. The subject may be any of them,
+    /// typed or reached, so the judgement covered the whole family and the
+    /// message says so.
     pub polymorphic: bool,
     /// The predicate and the suggestion as CURIEs, where the schema's prefixes
     /// can compress them. For the message only.
@@ -419,6 +426,11 @@ pub struct Rewrite {
 /// Resolve every spelling in the query to the one the data uses, and refuse
 /// the ones the data cannot carry.
 ///
+/// Before the three steps, [`crate::sparql_paths::reduce_paths`] replaces a
+/// property path whose walk is only its zero-length step (a hierarchy no data
+/// graph holds) by that step, so the class it leaves in an `rdf:type` object
+/// is resolved below like any other.
+///
 /// Three steps on one parse, in this order: predicates that name a slot by its
 /// native spelling become the declared IRI ([`canonicalize_predicates`]); the
 /// constant object of an `rdf:type` that names a class by its native spelling
@@ -436,6 +448,7 @@ pub fn canonicalize(
     query: &mut Query,
     schema_view: &SchemaView,
 ) -> Result<Vec<Rewrite>, SpellingError> {
+    crate::sparql_paths::reduce_paths(query, schema_view);
     let mut rewrites = canonicalize_predicates(query, schema_view)?;
     rewrites.extend(canonicalize_classes(query, schema_view)?);
     rewrites.sort_by(|a, b| a.from.cmp(&b.from));
@@ -878,6 +891,9 @@ fn walk_expression_mut(expr: &mut Expression, visit: &mut dyn FnMut(&mut Vec<Tri
 #[derive(Debug, Default)]
 struct SubjectSpellings {
     types: BTreeSet<String>,
+    /// The classes `?s sesame:directType <C>` names: the record's own class,
+    /// exactly, in every inference — its family is `C` alone.
+    exact_types: BTreeSet<String>,
     predicates: BTreeSet<String>,
     /// The string literals the subject is matched against, per predicate.
     /// Only the lexical form: a typed or language-tagged literal is no more
@@ -915,11 +931,88 @@ struct Scope {
 ///
 /// Runs after both alias resolutions, so the predicate it judges is the one
 /// the data would have to carry. See the module docs for what it leaves alone
-/// and why.
+/// and why. It is the first [`PredicateVerdict::NotCarried`] of
+/// [`check_predicates`], so the planner's refusal and the linter's report
+/// cannot drift.
 pub fn refuse_uncarried_predicates(
     query: &Query,
     schema_view: &SchemaView,
 ) -> Result<(), Box<NotASlotOfClass>> {
+    match judge_predicates(query, schema_view, &[], WIDEST_INFERENCE)
+        .into_iter()
+        .find_map(|check| match check.verdict {
+            PredicateVerdict::NotCarried(refusal) => Some(refusal),
+            _ => None,
+        }) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// What [`check_predicates`] found for one fixed predicate on one subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateCheck {
+    /// The subject as the query wrote it: `?t`, `<iri>` or `_:b`.
+    pub subject: String,
+    /// The predicate IRI, exactly as the query spelled it.
+    pub predicate: String,
+    pub verdict: PredicateVerdict,
+}
+
+/// The verdict on one (subject, predicate) pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredicateVerdict {
+    /// The subject's class, or one of its subclasses, carries a slot under
+    /// this IRI. `class_iri` is the class the subject was judged by.
+    Carried { class_iri: String },
+    /// No class in the subject's family carries a slot under this IRI, so
+    /// the pattern can never match. The refusal names the slot to write
+    /// instead, when there is one.
+    NotCarried(Box<NotASlotOfClass>),
+    /// The subject's class cannot be told — no `rdf:type`, an `rdf:type` the
+    /// schema does not know, two `rdf:type`s, or no slot that reaches it —
+    /// so the predicate is neither accepted nor refused.
+    Unchecked,
+}
+
+/// Judge every fixed predicate of every subject, without refusing anything.
+///
+/// A subject's class is the one `rdf:type` the query gives it, or the one in
+/// `bound`, or the range of the slot that reached it. The class is judged
+/// together with the classes `rdf:type` gives its instances under the inference
+/// of the data graph the query reads under `dataset`
+/// ([`crate::sparql_graph_clauses::single_data_graph`], which refuses a query
+/// that reads several): `?s a C` binds instances of any of them, so a
+/// predicate any of them carries is carried. Under `ASSERTED` that is `C` alone, so a subclass-only predicate
+/// on a `C`-typed subject is not carried. A node reached through a slot is
+/// typed under the same inference, so the slot's range is judged by its family
+/// under it too. `bound` seeds variables the
+/// caller has already bound — `(name without ? or $, class IRI)` — such as
+/// SHACL's `$this`, which spargebra parses as the variable `this`.
+///
+/// The query is judged as written: no alias is resolved first, so a predicate
+/// spelled with the wrong namespace is reported, together with the spelling
+/// the data carries (`NotASlotOfClass::suggestion`). `rdf:type` and variable
+/// predicates are not slots and are not reported. Same scope rules as
+/// [`refuse_uncarried_predicates`]: `GRAPH`, `SERVICE` and property paths
+/// contribute nothing, a sub-`SELECT` is its own scope.
+pub fn check_predicates(
+    query: &Query,
+    schema_view: &SchemaView,
+    bound: &[(String, String)],
+    dataset: &crate::sparql_dataset::DatasetSpec,
+) -> Result<Vec<PredicateCheck>, crate::sparql_scoper::ScopeError> {
+    let inference = crate::sparql_graph_clauses::single_data_graph(query, dataset)?.inference;
+    Ok(judge_predicates(query, schema_view, bound, inference))
+}
+
+/// [`check_predicates`] under an inference already known.
+fn judge_predicates(
+    query: &Query,
+    schema_view: &SchemaView,
+    bound: &[(String, String)],
+    inference: TypeInference,
+) -> Vec<PredicateCheck> {
     let pattern = match query {
         Query::Select { pattern, .. }
         | Query::Construct { pattern, .. }
@@ -928,76 +1021,167 @@ pub fn refuse_uncarried_predicates(
     };
     let mut scopes: Vec<Scope> = vec![Scope::default()];
     collect_scopes(pattern, &mut scopes, 0, false);
+    for scope in &mut scopes {
+        for (variable, class_iri) in bound {
+            scope
+                .subjects
+                .entry(format!("?{variable}"))
+                .or_default()
+                .types
+                .insert(class_iri.clone());
+        }
+    }
 
     let conv = schema_view.converter();
-    // The canonical IRIs of every slot a class carries, built once per class
-    // named — most queries name one or two. For a class judged through a hop
-    // the family's slots, since the node may be any subclass.
+    // The canonical IRIs of every slot a class's family carries, built once
+    // per class named — most queries name one or two.
     let mut carried: HashMap<(String, bool), Option<Carried>> = HashMap::new();
+    let mut checks = Vec::new();
     for scope in &scopes {
-        let reached = infer_reached_classes(scope, schema_view);
+        let reached = infer_reached_classes(scope, schema_view, inference);
         for (subject, spellings) in &scope.subjects {
-            // Exactly one type, and one the schema knows — or, failing a
-            // type of its own, the range of the one slot it was reached
-            // through. Two types is an intersection the scoper judges; none,
-            // or an unknown one, is the scoper's untyped-subject refusal.
-            let (class_iri, reach) = match single_type(spellings) {
-                Some(class_iri) => (class_iri, None),
-                None => match reached.get(subject) {
-                    Some(reach) => (reach.class_iri.as_str(), Some(&reach.through)),
-                    None => continue,
-                },
+            // Exactly one type — or, failing a type of its own, the range of
+            // the one slot the subject was reached through. Two types is an
+            // intersection, none is an untyped subject: not judged here.
+            let judged = if spellings.types.is_empty() && spellings.exact_types.is_empty() {
+                reached
+                    .get(subject)
+                    .map(|reach| (reach.class_iri.as_str(), false, Some(&reach.through)))
+            } else {
+                judged_type(spellings, schema_view, inference)
+                    .map(|(class_iri, exact)| (class_iri, exact, None))
             };
-            let family = reach.is_some();
-            let entry = carried
-                .entry((class_iri.to_owned(), family))
-                .or_insert_with(|| {
-                    let class = schema_view.get_class_by_uri(class_iri).ok().flatten()?;
-                    let mut classes = vec![class.clone()];
-                    if family {
-                        classes.extend(class.get_descendants(true, false).ok()?);
-                    }
-                    let polymorphic = classes.len() > 1;
-                    let slots: BTreeSet<String> = classes
-                        .iter()
-                        .flat_map(|class| class.slots().iter())
-                        .filter_map(|slot| slot.canonical_uri().to_uri(&conv).ok().map(|u| u.0))
-                        .collect();
-                    Some((class.name().to_owned(), slots, polymorphic))
-                });
-            let Some((class_name, slots, polymorphic)) = entry else {
-                continue;
-            };
+            if let Some((class_iri, exact, _)) = judged {
+                carried
+                    .entry((class_iri.to_owned(), exact))
+                    .or_insert_with(|| {
+                        let class = schema_view.get_class_by_uri(class_iri).ok().flatten()?;
+                        let classes = judged_family(&class, exact, inference)?;
+                        let slots: BTreeSet<String> = classes
+                            .iter()
+                            .flat_map(|class| class.slots().iter())
+                            .filter_map(|slot| slot.canonical_uri().to_uri(&conv).ok().map(|u| u.0))
+                            .collect();
+                        Some((class.name().to_owned(), slots))
+                    });
+            }
             for predicate in &spellings.predicates {
-                if slots.contains(predicate) {
-                    continue;
-                }
-                return Err(Box::new(uncarried(
-                    subject,
-                    predicate,
-                    class_iri,
-                    class_name,
-                    reach.cloned(),
-                    *polymorphic,
-                    schema_view,
-                )));
+                let known = judged.and_then(|(class_iri, exact, reach)| {
+                    let (class_name, slots) =
+                        carried.get(&(class_iri.to_owned(), exact))?.as_ref()?;
+                    Some((class_iri, exact, reach, class_name, slots))
+                });
+                let verdict = match known {
+                    None => PredicateVerdict::Unchecked,
+                    Some((class_iri, _, _, _, slots)) if slots.contains(predicate) => {
+                        PredicateVerdict::Carried {
+                            class_iri: class_iri.to_owned(),
+                        }
+                    }
+                    Some((class_iri, exact, reach, class_name, _)) => {
+                        PredicateVerdict::NotCarried(Box::new(uncarried(
+                            subject,
+                            predicate,
+                            (class_iri, exact),
+                            class_name,
+                            reach.cloned(),
+                            schema_view,
+                            inference,
+                        )))
+                    }
+                };
+                checks.push(PredicateCheck {
+                    subject: subject.clone(),
+                    predicate: predicate.clone(),
+                    verdict,
+                });
             }
         }
     }
-    Ok(())
+    checks
+}
+
+/// The inference the planner's refusals judge by: the widest family, because a
+/// refusal exists for predicates that match under no reading of the query. It
+/// must never refuse a query some data graph answers (a narrower graph just
+/// answers fewer rows, which is the planner's business, not a spelling
+/// error).
+const WIDEST_INFERENCE: TypeInference = TypeInference::IS_A_AND_MIXINS;
+
+/// A class and its subclasses: what a subject typed with it may be. `None`
+/// when the schema cannot list the subclasses, so the caller reports the
+/// subject unchecked rather than judging it by the class alone.
+///
+/// The one place the family is decided, so the judgement, the reach and the
+/// suggestion cannot disagree about it.
+///
+/// The family is `type_family(class, inference)`: the planner's refusals pass
+/// [`WIDEST_INFERENCE`], the linter the inference of the graph it reads.
+fn family(class: &ClassView, inference: TypeInference) -> Option<Vec<ClassView>> {
+    linkml_runtime::schema_rdf::type_family(class, inference).ok()
+}
+
+/// The family to judge a subject by: `C` alone for an exact (`directType`)
+/// type, `C` and its subclasses otherwise. Every judgement goes through here.
+fn judged_family(
+    class: &ClassView,
+    exact: bool,
+    inference: TypeInference,
+) -> Option<Vec<ClassView>> {
+    if exact {
+        Some(vec![class.clone()])
+    } else {
+        family(class, inference)
+    }
 }
 
 /// What one class, or one class and its subclasses, can carry: the class's
-/// name, the canonical IRIs of the slots, and whether subclasses were counted.
-type Carried = (String, BTreeSet<String>, bool);
+/// name and the canonical IRIs of the slots.
+type Carried = (String, BTreeSet<String>);
 
-/// The one class the query types the subject with, when there is exactly one.
+/// The one class the query types the subject with by `rdf:type`, when there
+/// is exactly one and no `directType` is in play.
 fn single_type(spellings: &SubjectSpellings) -> Option<&str> {
+    if !spellings.exact_types.is_empty() {
+        return None;
+    }
     let mut types = spellings.types.iter();
     match (types.next(), types.next()) {
         (Some(class_iri), None) => Some(class_iri.as_str()),
         _ => None,
     }
+}
+
+/// The one class the subject is judged by, and whether it is exact.
+///
+/// A `directType` class `C` is exact. Together with `a D` it stands when
+/// `C` is a `D` under the inference (the intersection of the two readings is
+/// `C`), otherwise the subject is not judged; two different `directType`
+/// classes, or two `rdf:type`s without one, are not judged either.
+fn judged_type<'a>(
+    spellings: &'a SubjectSpellings,
+    schema_view: &SchemaView,
+    inference: TypeInference,
+) -> Option<(&'a str, bool)> {
+    let mut exact = spellings.exact_types.iter();
+    let Some(direct) = exact.next() else {
+        return single_type(spellings).map(|class_iri| (class_iri, false));
+    };
+    if exact.next().is_some() {
+        return None;
+    }
+    let class = schema_view.get_class_by_uri(direct).ok().flatten()?;
+    for other in &spellings.types {
+        if other == direct {
+            continue;
+        }
+        let other_class = schema_view.get_class_by_uri(other).ok().flatten()?;
+        let members = family(&other_class, inference)?;
+        if !members.iter().any(|member| member.name() == class.name()) {
+            return None;
+        }
+    }
+    Some((direct.as_str(), true))
 }
 
 /// The class of every node the scope reaches through a slot, for the nodes
@@ -1011,25 +1195,32 @@ fn single_type(spellings: &SubjectSpellings) -> Option<&str> {
 /// query types itself is left to its type; one reached through two slots
 /// with different ranges is left alone, since there is no one class to
 /// judge it by.
-fn infer_reached_classes(scope: &Scope, schema_view: &SchemaView) -> BTreeMap<String, Reach> {
+fn infer_reached_classes(
+    scope: &Scope,
+    schema_view: &SchemaView,
+    inference: TypeInference,
+) -> BTreeMap<String, Reach> {
     let conv = schema_view.converter();
     let mut known: BTreeMap<String, Reach> = BTreeMap::new();
     let mut conflicted: BTreeSet<String> = BTreeSet::new();
     loop {
         let mut learned = false;
         for (subject, spellings) in &scope.subjects {
-            let class_iri = match single_type(spellings) {
-                Some(class_iri) => class_iri.to_owned(),
+            let (class_iri, exact) = match judged_type(spellings, schema_view, inference) {
+                Some((class_iri, exact)) => (class_iri.to_owned(), exact),
                 None => match known.get(subject) {
-                    Some(reach) => reach.class_iri.clone(),
-                    None => continue,
+                    Some(reach) if spellings.exact_types.is_empty() => {
+                        (reach.class_iri.clone(), false)
+                    }
+                    _ => continue,
                 },
             };
             let Some(class) = schema_view.get_class_by_uri(&class_iri).ok().flatten() else {
                 continue;
             };
-            let mut family = vec![class.clone()];
-            family.extend(class.get_descendants(true, false).unwrap_or_default());
+            let Some(family) = judged_family(&class, exact, inference) else {
+                continue;
+            };
             for (predicate, nodes) in &spellings.reached {
                 let Some(range) = family.iter().find_map(|class| {
                     class
@@ -1056,7 +1247,7 @@ fn infer_reached_classes(scope: &Scope, schema_view: &SchemaView) -> BTreeMap<St
                     let typed = scope
                         .subjects
                         .get(node)
-                        .is_some_and(|node| !node.types.is_empty());
+                        .is_some_and(|node| !node.types.is_empty() || !node.exact_types.is_empty());
                     if typed || conflicted.contains(node) {
                         continue;
                     }
@@ -1094,11 +1285,12 @@ fn infer_reached_classes(scope: &Scope, schema_view: &SchemaView) -> BTreeMap<St
 fn uncarried(
     subject: &str,
     predicate: &str,
-    class_iri: &str,
+    // The class judged by, and whether it is exact (`directType`).
+    (class_iri, exact): (&str, bool),
     class_name: &str,
     reached_through: Option<ReachedThrough>,
-    polymorphic: bool,
     schema_view: &SchemaView,
+    inference: TypeInference,
 ) -> NotASlotOfClass {
     let conv = schema_view.converter();
     // The slot name the predicate resolves to anywhere in the schema, or
@@ -1110,30 +1302,29 @@ fn uncarried(
         .flatten()
         .map(|slot| slot.name.clone())
         .or_else(|| local_name(predicate).map(str::to_owned));
-    let suggestion = schema_view
-        .get_class_by_uri(class_iri)
-        .ok()
-        .flatten()
-        .and_then(|class| {
-            let wanted = wanted.as_deref()?;
-            // The class's own slot first; a reached node may be a subclass,
-            // whose slot is as good a guess.
-            let mut family = vec![class.clone()];
-            if polymorphic {
-                family.extend(class.get_descendants(true, false).ok()?);
-            }
-            let slot = family
-                .iter()
-                .find_map(|class| class.slots().iter().find(|slot| slot.name == wanted))?;
-            let canonical = slot.canonical_uri().to_uri(&conv).ok()?.0;
-            let native = schema_view
-                .get_uri(slot.schema_id(), &slot.name)
-                .to_uri(&conv)
-                .ok()
-                .map(|u| u.0)
-                .filter(|native| *native != canonical);
-            Some(SlotSpellings { canonical, native })
-        });
+    let class = schema_view.get_class_by_uri(class_iri).ok().flatten();
+    // Whether subclasses were counted: the message says so.
+    let polymorphic = class
+        .as_ref()
+        .and_then(|class| judged_family(class, exact, inference))
+        .is_some_and(|classes| classes.len() > 1);
+    let suggestion = class.and_then(|class| {
+        let wanted = wanted.as_deref()?;
+        // The class's own slot first; the subject may be a subclass,
+        // whose slot is as good a guess.
+        let classes = judged_family(&class, exact, inference)?;
+        let slot = classes
+            .iter()
+            .find_map(|class| class.slots().iter().find(|slot| slot.name == wanted))?;
+        let canonical = slot.canonical_uri().to_uri(&conv).ok()?.0;
+        let native = schema_view
+            .get_uri(slot.schema_id(), &slot.name)
+            .to_uri(&conv)
+            .ok()
+            .map(|u| u.0)
+            .filter(|native| *native != canonical);
+        Some(SlotSpellings { canonical, native })
+    });
 
     let mut curies = HashMap::new();
     let mut spelled: Vec<&str> = vec![predicate];
@@ -1187,7 +1378,7 @@ pub fn refuse_literals_against_concepts(
     let conv = schema_view.converter();
 
     for scope in &scopes {
-        let reached = infer_reached_classes(scope, schema_view);
+        let reached = infer_reached_classes(scope, schema_view, WIDEST_INFERENCE);
         for (subject, spellings) in &scope.subjects {
             // The literals to judge on this subject: written as the object
             // of a pattern, or compared in an expression with a variable one
@@ -1315,6 +1506,16 @@ fn collect_scopes(
                     continue;
                 };
                 let entry = scopes[scope].subjects.entry(subject).or_default();
+                // `sesame:directType` is the record's own class, as `rdf:type`
+                // is: no slot carries it, and so none has to.
+                // A constant class types the subject with exactly that class; a
+                // variable object seeds nothing.
+                if predicate.as_str() == linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE {
+                    if let TermPattern::NamedNode(class) = &triple.object {
+                        entry.exact_types.insert(class.as_str().to_owned());
+                    }
+                    continue;
+                }
                 if predicate.as_str() == RDF_TYPE {
                     if let TermPattern::NamedNode(class) = &triple.object {
                         entry.types.insert(class.as_str().to_owned());
@@ -1842,14 +2043,14 @@ classes:
 
     fn rewrite(query: &str) -> (Query, Vec<Rewrite>) {
         let sv = schema_view();
-        let mut parsed = crate::sparql_scoper::parse_query(query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
         let rewrites = canonicalize(&mut parsed, &sv).expect("accepted");
         (parsed, rewrites)
     }
 
     fn refuse(query: &str) -> NotASlotOfClass {
         let sv = schema_view();
-        let mut parsed = crate::sparql_scoper::parse_query(query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
         match canonicalize(&mut parsed, &sv) {
             Err(SpellingError::NotASlotOfClass(refusal)) => *refusal,
             other => panic!("{query}: expected a refusal, got {other:?}"),
@@ -1864,7 +2065,7 @@ classes:
         let query = format!(
             "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Tunnel\" }}"
         );
-        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let SpellingError::LiteralAgainstAConcept(refusal) =
             canonicalize(&mut parsed, &sv).expect_err("refused")
         else {
@@ -1889,7 +2090,7 @@ classes:
         let query = format!(
             "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Bridge\" }}"
         );
-        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let SpellingError::LiteralAgainstAConcept(refusal) =
             canonicalize(&mut parsed, &sv).expect_err("refused")
         else {
@@ -1904,7 +2105,7 @@ classes:
         let query = format!(
             "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> \"Viaduct\" }}"
         );
-        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let refusal = canonicalize(&mut parsed, &sv).expect_err("refused");
         assert!(refusal.to_string().contains("No value of"), "{refusal}");
 
@@ -1922,7 +2123,7 @@ classes:
             let query = format!(
                 "SELECT ?z WHERE {{ ?z a <{ZONE}> ; <https://data.infrabel.be/asset360/kind> ?k . {filter} }}"
             );
-            let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
             let refusal = canonicalize(&mut parsed, &sv).expect_err(&query);
             assert!(
                 matches!(refusal, SpellingError::LiteralAgainstAConcept(_)),
@@ -1935,7 +2136,7 @@ classes:
         let query = format!(
             "SELECT ?s WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <https://data.infrabel.be/asset360-rsm-subset/side> \"Left\" }}"
         );
-        let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let SpellingError::LiteralAgainstAConcept(refusal) =
             canonicalize(&mut parsed, &sv).expect_err("refused")
         else {
@@ -1962,7 +2163,7 @@ classes:
             ),
             format!("SELECT ?z WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> \"Tunnel\" }}"),
         ] {
-            let mut parsed = crate::sparql_scoper::parse_query(&accepted).expect("parses");
+            let mut parsed = crate::sparql_scoper::parse_query(&accepted, None).expect("parses");
             canonicalize(&mut parsed, &sv).expect("accepted");
         }
     }
@@ -2307,14 +2508,17 @@ classes:
         );
     }
 
-    /// A reached node may be any subclass of the slot's range, so a slot only
-    /// a subclass carries is accepted -- and a predicate no class in the
-    /// family carries is still refused, naming the range.
+    /// A subject may be any subclass of its class -- reached as the slot's
+    /// range, or typed by the query (`?s a C` binds a subclass's instances
+    /// too) -- so a slot only a subclass carries is accepted, and a predicate
+    /// no class in the family carries is still refused, naming the class.
     #[test]
     fn a_reached_node_is_judged_against_the_range_and_its_descendants() {
         let sv = schema_view();
         for accepted in [
             format!("SELECT ?c WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{CODE}> ?c }}"),
+            // The same family rule for a subject the query types itself.
+            format!("SELECT ?s ?c WHERE {{ ?s a <{LNE}> ; <{CODE}> ?c }}"),
             format!(
                 "SELECT ?n WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{NATIVE}> ?n ; <{CANONICAL}> ?m }}"
             ),
@@ -2330,8 +2534,12 @@ classes:
             ),
             // A scalar slot's object is a value, not a node.
             format!("SELECT ?n WHERE {{ ?z a <{ZONE}> ; <{ZONE_NAME}> ?v . ?v <{ZONE_NAME}> ?n }}"),
+            // `sesame:directType` is the record's own class: no slot carries it.
+            format!(
+                "SELECT ?t WHERE {{ ?z a <{ZONE}> ; <http://www.openrdf.org/schema/sesame#directType> ?t }}"
+            ),
         ] {
-            let mut parsed = crate::sparql_scoper::parse_query(&accepted).expect("parses");
+            let mut parsed = crate::sparql_scoper::parse_query(&accepted, None).expect("parses");
             canonicalize(&mut parsed, &sv).unwrap_or_else(|e| panic!("{accepted}: {e}"));
         }
 
@@ -2344,12 +2552,254 @@ classes:
             refusal.to_string().contains("nor of a subclass of it"),
             "{refusal}"
         );
+        // Typed itself, the family is judged too, and the message says so.
+        let refusal = refuse(&format!(
+            "SELECT ?x WHERE {{ ?s a <{LNE}> ; <urn:nothing> ?x }}"
+        ));
+        assert_eq!(refusal.reached_through, None);
+        assert!(refusal.polymorphic);
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "<urn:nothing> is not a slot of LocatedNetEntity (<{LNE}>), nor of a subclass of \
+                 it, so `?s <urn:nothing> …` can never match. The slots LocatedNetEntity carries \
+                 are the ?p of `GRAPH <schema> {{ ?p <https://schema.org/domainIncludes> <{LNE}> }}`."
+            )
+        );
         // A class without subclasses is judged alone and says nothing of them.
         let refusal = refuse(&format!(
             "SELECT ?x WHERE {{ ?z a <{ZONE}> ; <{ZONE_TRACK}> ?t . ?t <urn:nothing> ?x }}"
         ));
         assert!(!refusal.polymorphic);
         assert!(!refusal.to_string().contains("subclass"), "{refusal}");
+    }
+
+    // -- #306: the same judgement as a report, for the SHACL linter --------
+
+    fn check(query: &str, bound: &[(&str, &str)]) -> Vec<PredicateCheck> {
+        let parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
+        let bound: Vec<(String, String)> = bound
+            .iter()
+            .map(|(v, c)| ((*v).to_owned(), (*c).to_owned()))
+            .collect();
+        check_predicates(
+            &parsed,
+            &schema_view(),
+            &bound,
+            &crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]),
+        )
+        .expect("one data graph")
+    }
+
+    fn verdict<'a>(
+        checks: &'a [PredicateCheck],
+        subject: &str,
+        predicate: &str,
+    ) -> &'a PredicateVerdict {
+        &checks
+            .iter()
+            .find(|c| c.subject == subject && c.predicate == predicate)
+            .unwrap_or_else(|| panic!("no check for {subject} {predicate}: {checks:?}"))
+            .verdict
+    }
+
+    /// The report never refuses and says something about every fixed
+    /// predicate it saw, as written: a seeded `$this` is judged by its class,
+    /// a typed variable by its type, a reached one by the range's family, and
+    /// a subject whose class cannot be told is reported unchecked, not passed.
+    #[test]
+    fn the_report_judges_every_predicate_as_written() {
+        // `$this` pre-bound to Track; the wrong namespace is reported with
+        // the spelling the data carries, `rdf:type` is not reported.
+        let checks = check(
+            &format!(
+                "SELECT $this WHERE {{ $this a <{CANONICAL_CLASS}> ; <{ZONE_NAME}> ?n ; <{NATIVE}> ?m ; <{CANONICAL}> ?o }}"
+            ),
+            &[("this", CANONICAL_CLASS)],
+        );
+        assert_eq!(checks.len(), 3, "{checks:?}");
+        let PredicateVerdict::NotCarried(refusal) = verdict(&checks, "?this", ZONE_NAME) else {
+            panic!("{checks:?}");
+        };
+        assert_eq!(refusal.suggestion.as_ref().unwrap().canonical, CANONICAL);
+        // The alias is judged as written too: the data does not carry it.
+        let PredicateVerdict::NotCarried(refusal) = verdict(&checks, "?this", NATIVE) else {
+            panic!("{checks:?}");
+        };
+        assert_eq!(refusal.suggestion.as_ref().unwrap().canonical, CANONICAL);
+        assert_eq!(
+            verdict(&checks, "?this", CANONICAL),
+            &PredicateVerdict::Carried {
+                class_iri: CANONICAL_CLASS.to_owned()
+            }
+        );
+
+        // The seed alone types the subject; another variable by its type.
+        let checks = check(
+            &format!(
+                "SELECT ?n WHERE {{ $this <{ZONE_NAME}> ?n . ?o a <{ZONE}> ; <{CANONICAL}> ?m }}"
+            ),
+            &[("this", ZONE)],
+        );
+        assert!(matches!(
+            verdict(&checks, "?this", ZONE_NAME),
+            PredicateVerdict::Carried { .. }
+        ));
+        assert!(matches!(
+            verdict(&checks, "?o", CANONICAL),
+            PredicateVerdict::NotCarried(_)
+        ));
+
+        // Reached through a slot: judged against the range's family.
+        let checks = check(
+            &format!(
+                "SELECT ?c WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{CODE}> ?c ; <{ZONE_NAME}> ?n }}"
+            ),
+            &[],
+        );
+        assert_eq!(
+            verdict(&checks, "?e", CODE),
+            &PredicateVerdict::Carried {
+                class_iri: LNE.to_owned()
+            }
+        );
+        assert!(matches!(
+            verdict(&checks, "?e", ZONE_NAME),
+            PredicateVerdict::NotCarried(_)
+        ));
+
+        // No inferable class -- untyped, unknown class, two classes -- is
+        // unchecked; a variable predicate is not a slot and is not reported.
+        let checks = check(
+            &format!(
+                "SELECT * WHERE {{ ?u <{ZONE_NAME}> ?a . ?k a <urn:unknown> ; <{ZONE_NAME}> ?b . \
+                 ?t a <{ZONE}>, <{CANONICAL_CLASS}> ; <{ZONE_NAME}> ?c . ?z a <{ZONE}> ; ?p ?d }}"
+            ),
+            &[],
+        );
+        assert_eq!(checks.len(), 3, "{checks:?}");
+        for subject in ["?u", "?k", "?t"] {
+            assert_eq!(
+                verdict(&checks, subject, ZONE_NAME),
+                &PredicateVerdict::Unchecked
+            );
+        }
+    }
+
+    /// The family follows the inference of the graph read: a slot only a subclass
+    /// carries is carried by a parent-typed subject (or one reached through a
+    /// slot ranging over the parent) under `IS_A`, and not under `ASSERTED`.
+    #[test]
+    fn a_subclass_only_predicate_follows_the_inference() {
+        let sv = schema_view();
+        for query in [
+            format!("SELECT ?c WHERE {{ ?s a <{LNE}> ; <{CODE}> ?c }}"),
+            format!("SELECT ?c WHERE {{ ?s a <{SIGNAL}> ; <{REFERS_TO}> ?e . ?e <{CODE}> ?c }}"),
+        ] {
+            let parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
+            let verdict_under = |inference| {
+                check_predicates(
+                    &parsed,
+                    &sv,
+                    &[],
+                    &crate::sparql_dataset::dataset_with(inference, &[], &[]),
+                )
+                .expect("one data graph")
+                .into_iter()
+                .find(|c| c.predicate == CODE)
+                .expect("code is checked")
+                .verdict
+            };
+            assert!(
+                matches!(
+                    verdict_under(TypeInference::IS_A),
+                    PredicateVerdict::Carried { .. }
+                ),
+                "{query}"
+            );
+            assert!(
+                matches!(
+                    verdict_under(TypeInference::ASSERTED),
+                    PredicateVerdict::NotCarried(_)
+                ),
+                "{query}"
+            );
+        }
+    }
+
+    /// `?s sesame:directType <C>` types the subject with exactly `C`, in every
+    /// inference: what `C` carries is carried, what only a subclass carries is
+    /// not -- even where `rdf:type` would widen the family.
+    #[test]
+    fn a_direct_type_judges_the_subject_by_its_class_alone() {
+        const DIRECT: &str = "http://www.openrdf.org/schema/sesame#directType";
+        let sv = schema_view();
+        let judge = |query: &str, inference, predicate: &str| {
+            let parsed = crate::sparql_scoper::parse_query(query, None).expect("parses");
+            check_predicates(
+                &parsed,
+                &sv,
+                &[],
+                &crate::sparql_dataset::dataset_with(inference, &[], &[]),
+            )
+            .expect("one data graph")
+            .into_iter()
+            .find(|c| c.predicate == predicate)
+            .unwrap_or_else(|| panic!("{predicate} is checked in {query}"))
+            .verdict
+        };
+        for inference in [TypeInference::IS_A, TypeInference::ASSERTED] {
+            // Carried: a slot the class itself declares.
+            let query = format!("SELECT ?r WHERE {{ ?s <{DIRECT}> <{ZONE}> ; <{ZONE_NAME}> ?r }}");
+            assert!(
+                matches!(
+                    judge(&query, inference, ZONE_NAME),
+                    PredicateVerdict::Carried { .. }
+                ),
+                "{inference:?}"
+            );
+            // Not carried: a slot only a subclass of C carries, even where
+            // `a C` widens to the subclasses.
+            let query = format!("SELECT ?c WHERE {{ ?s <{DIRECT}> <{LNE}> ; <{CODE}> ?c }}");
+            assert!(
+                matches!(
+                    judge(&query, inference, CODE),
+                    PredicateVerdict::NotCarried(_)
+                ),
+                "{inference:?}"
+            );
+        }
+        let widened = format!("SELECT ?c WHERE {{ ?s a <{LNE}> ; <{CODE}> ?c }}");
+        assert!(matches!(
+            judge(&widened, TypeInference::IS_A, CODE),
+            PredicateVerdict::Carried { .. }
+        ));
+        // A variable object seeds nothing.
+        let query = format!("SELECT ?c WHERE {{ ?s <{DIRECT}> ?t ; <{CODE}> ?c }}");
+        assert_eq!(
+            judge(&query, TypeInference::IS_A, CODE),
+            PredicateVerdict::Unchecked
+        );
+        // `a D` with `directType C`, C a D: judged by C exactly; C not a D:
+        // an intersection, left alone.
+        let query =
+            format!("SELECT ?c WHERE {{ ?s a <{LNE}> ; <{DIRECT}> <{LNE}> ; <{CODE}> ?c }}");
+        assert!(matches!(
+            judge(&query, TypeInference::IS_A, CODE),
+            PredicateVerdict::NotCarried(_)
+        ));
+        let query =
+            format!("SELECT ?c WHERE {{ ?s a <{ZONE}> ; <{DIRECT}> <{LNE}> ; <{CODE}> ?c }}");
+        assert_eq!(
+            judge(&query, TypeInference::IS_A, CODE),
+            PredicateVerdict::Unchecked
+        );
+        // The planner refuses it too: no record has `directType` C and a
+        // slot only a subclass of C carries.
+        let refusal = refuse(&format!(
+            "SELECT ?c WHERE {{ ?s <{DIRECT}> <{LNE}> ; <{CODE}> ?c }}"
+        ));
+        assert_eq!(refusal.class_name, "LocatedNetEntity");
     }
 
     /// What the lookup cannot judge, it leaves to the scoper: no type, an
@@ -2378,7 +2828,7 @@ classes:
             ),
         ] {
             let sv = schema_view();
-            let mut parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let mut parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
             canonicalize(&mut parsed, &sv).unwrap_or_else(|e| panic!("{query}: {e}"));
         }
     }
@@ -2426,6 +2876,7 @@ classes:
         }
         let mut parsed = crate::sparql_scoper::parse_query(
             "SELECT ?l WHERE { ?a <https://example.org/shared/label> ?l }",
+            None,
         )
         .expect("parses");
         let error = canonicalize_predicates(&mut parsed, &sv).expect_err("ambiguous");

@@ -25,6 +25,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use linkml_runtime::schema_rdf::TypeInference;
+
 use linkml_schemaview::schemaview::SchemaView;
 
 use spargebra::algebra::{AggregateExpression, AggregateFunction};
@@ -142,6 +144,10 @@ pub enum TermOf {
         reading: SlotReading,
         presence: SlotPresence,
     },
+    /// A scanned record's *direct type*: its `asset_type` column, an IRI. The
+    /// class of the record, not of the scan -- a scan of `Asset` under
+    /// `IsA` yields records of every subclass, and this is which.
+    DirectType { star_var: String, class_uri: String },
     /// An aggregate's result.
     Measure {
         guaranteed: bool,
@@ -313,8 +319,15 @@ impl Plan {
     fn binds_here(&self, id: NodeId, var: &str) -> bool {
         match &self.nodes[id].op {
             PlanOp::Scan {
-                star_var, slots, ..
-            } => star_var == var || slots.iter().any(|slot| slot.var.as_deref() == Some(var)),
+                star_var,
+                slots,
+                direct_type,
+                ..
+            } => {
+                star_var == var
+                    || direct_type.as_deref() == Some(var)
+                    || slots.iter().any(|slot| slot.var.as_deref() == Some(var))
+            }
             PlanOp::Unnest { var: bound, .. } => bound == var,
             PlanOp::Match { .. } | PlanOp::Path { .. } | PlanOp::Values { .. } => {
                 self.variables_of(id).contains(var)
@@ -475,10 +488,16 @@ impl Plan {
                     star_var,
                     class_uri,
                     slots,
+                    direct_type,
                     ..
                 } => {
                     if star_var == var {
                         TermOf::Identity {
+                            class_uri: class_uri.clone(),
+                        }
+                    } else if direct_type.as_deref() == Some(var) {
+                        TermOf::DirectType {
+                            star_var: star_var.clone(),
                             class_uri: class_uri.clone(),
                         }
                     } else {
@@ -615,6 +634,29 @@ impl Plan {
         // An identity beside a slot binding of the same variable (a reference
         // join) is still an identity: on a join both hold the same IRI.
         Some(class)
+    }
+
+    /// The type inference the scans that make `var` the identity of `class_uri`
+    /// at `node` read under -- the one inference they all agree on, or `None`
+    /// when they disagree (or there is no such scan). A restriction derived
+    /// from that identity carries it, so it never changes which graph a star
+    /// reads.
+    pub(crate) fn identity_inference(
+        &self,
+        node: NodeId,
+        var: &str,
+        class_uri: &str,
+    ) -> Option<TypeInference> {
+        self.producers_of(node, var)
+            .into_iter()
+            .any(|producer| {
+                matches!(
+                    &self.nodes[producer].op,
+                    PlanOp::Scan { star_var, class_uri: scanned, .. }
+                        if star_var == var && scanned == class_uri
+                )
+            })
+            .then_some(self.data_inference)
     }
 
     /// The outer variables a subtree reads: empty everywhere but the right
@@ -1135,11 +1177,12 @@ pub fn is_structure(schema: &SchemaView, class_uri: &str, path: &[String]) -> bo
 /// `[parts, children]`. `None` past a reference hop (the value is in another
 /// record) or where the range is not a class.
 pub fn class_at_path_of(schema: &SchemaView, class_uri: &str, path: &[String]) -> Option<String> {
-    use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::slotview::SlotInlineMode;
     let mut class = schema.get_class_by_uri(class_uri).ok().flatten()?;
     for name in path {
-        let slot = class.slot(&Identifier::Name(name.clone()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)
+            .ok()
+            .flatten()?;
         if slot.determine_slot_inline_mode() == SlotInlineMode::Reference {
             return None;
         }
@@ -1166,7 +1209,7 @@ pub fn representable(
         return false;
     };
     match &term {
-        TermOf::Identity { .. } | TermOf::Measure { .. } => true,
+        TermOf::Identity { .. } | TermOf::Measure { .. } | TermOf::DirectType { .. } => true,
         TermOf::Slot {
             class_uri, path, ..
         } => crate::sparql_terms::resolve_column(schema, class_uri, path).is_some(),

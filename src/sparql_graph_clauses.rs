@@ -1,65 +1,69 @@
 //! What a query's `GRAPH` clauses say about routing it.
 //!
-//! Two questions, both answered by walking an already-parsed SPARQL algebra
-//! rather than by guessing at the query text. Both are about *this endpoint's
+//! Three questions, all answered by walking an already-parsed SPARQL algebra
+//! rather than by guessing at the query text. All are about *this endpoint's
 //! routes* — there is nothing generic here, which is why this sits beside the
 //! scoper and not in the upstream LinkML crates:
 //!
-//! * [`query_reads_named_graphs`] decides whether building the schema graph is
-//!   worth anything at all for this request.
+//! * [`schema_graphs_read`] decides which schema graphs are worth building for
+//!   this request (an instance query pays for none).
+//! * [`single_data_graph`] decides which one data graph the query reads, and
+//!   refuses a query that reads several.
 //! * [`reads_only_the_schema_graph`] decides whether the scoper's "unscoped"
 //!   refusal is the right answer or the wrong one.
 //!
-//! The schema graph's IRI is a parameter, never a constant: see
-//! [`crate::sparql_schema_graph`] for why. `None` means the active datamodel
-//! configures no schema graph, in which case no query can be reading it.
+//! The schema graphs' IRIs are a parameter, never a constant: they are the
+//! [`DatasetSpec`]'s, see [`crate::sparql_schema_graph`] for why. A dataset
+//! with none means the active datamodel configures no schema graph, in which
+//! case no query can be reading one.
 //!
-//! Both parse with [`crate::sparql_scoper::sparql_parser`], the parser the
-//! endpoint's other entry points use. A bare `SparqlParser::new()` here knew
+//! Queries are parsed with [`crate::sparql_scoper::parse_query`], the parser
+//! the endpoint's other entry points use. A bare `SparqlParser::new()` here knew
 //! none of the pre-registered vocabularies, so `GRAPH <…> { ?c rdfs:label ?l }`
 //! — a datamodel-discovery query, written the only way it can be written —
-//! did not parse, both functions took their "does not parse" branch, and the
-//! query came back refused as *unscoped*: a parse failure reported as a
-//! question about scope.
+//! did not parse, and the query came back refused as *unscoped*: a parse
+//! failure reported as a question about scope.
 
+use linkml_runtime::schema_rdf::TypeInference;
 use linkml_schemaview::schemaview::SchemaView;
 
-/// Whether a query could observe a named graph at all.
+use crate::sparql_dataset::DatasetSpec;
+
+/// The schema graphs a query can observe: the ones it names with a `GRAPH`
+/// constant, `FROM` or `FROM NAMED`, and every one of them for a `GRAPH ?g`.
 ///
-/// A named graph is invisible unless the query says `GRAPH`: oxigraph's default
-/// query dataset is the store's default graph, and neither `FROM NAMED` nor a
-/// `DESCRIBE` reaches a named graph on its own. So for the overwhelming
-/// majority of requests — every instance query — the schema graph would be
-/// built, inserted and never read.
-///
-/// This is a precise test, not a substring guess: the query is parsed and its
-/// algebra walked for a `GRAPH` node. A query that does not parse is treated as
-/// *possibly* reading it, so the schema graph is built and oxigraph is left to
-/// report the real parse error rather than this function inventing one.
-pub fn query_reads_named_graphs(query: &str, schema_view: &SchemaView) -> bool {
+/// What the executor builds and loads: one store entry per schema graph the
+/// query can reach, each under its own inference, so a query that reads one pays
+/// for one and an instance query pays for none (a named graph is invisible
+/// unless the query says `GRAPH`, `FROM` or `FROM NAMED`).
+pub(crate) fn schema_graphs_read(
+    parsed: &spargebra::Query,
+    dataset: &DatasetSpec,
+) -> Vec<(String, TypeInference)> {
     use spargebra::Query;
     use spargebra::algebra::GraphPattern;
+    use spargebra::term::NamedNodePattern;
 
-    fn walk(pattern: &GraphPattern) -> bool {
-        // A `GRAPH` inside an expression's `EXISTS` block is a `GRAPH` clause.
-        // Walking children only, this answered *false* for
-        // `FILTER EXISTS { GRAPH <…/schema> { ?c ?p ?o } }`, the schema graph
-        // was never built, and the query answered zero rows — while the same
-        // query with an otherwise ineffective `OPTIONAL { GRAPH … }` bolted on
-        // answered correctly, which is how the defect was found.
-        if crate::sparql_scoper::exists_patterns_in_expressions_of(pattern)
-            .into_iter()
-            .any(walk)
-        {
-            return true;
+    fn walk(pattern: &GraphPattern, out: &mut Vec<NamedNodePattern>) {
+        for block in crate::sparql_scoper::exists_patterns_in_expressions_of(pattern) {
+            walk(block, out);
         }
         match pattern {
-            GraphPattern::Graph { .. } => true,
+            GraphPattern::Graph { name, inner } => {
+                out.push(name.clone());
+                walk(inner, out);
+            }
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
             | GraphPattern::Lateral { left, right }
-            | GraphPattern::Minus { left, right } => walk(left) || walk(right),
-            GraphPattern::LeftJoin { left, right, .. } => walk(left) || walk(right),
+            | GraphPattern::Minus { left, right } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            GraphPattern::LeftJoin { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
             GraphPattern::Filter { inner, .. }
             | GraphPattern::Extend { inner, .. }
             | GraphPattern::OrderBy { inner, .. }
@@ -68,26 +72,288 @@ pub fn query_reads_named_graphs(query: &str, schema_view: &SchemaView) -> bool {
             | GraphPattern::Reduced { inner }
             | GraphPattern::Slice { inner, .. }
             | GraphPattern::Group { inner, .. }
-            | GraphPattern::Service { inner, .. } => walk(inner),
-            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
-                false
-            }
+            | GraphPattern::Service { inner, .. } => walk(inner, out),
+            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
         }
     }
 
-    let Ok(parsed) = crate::sparql_scoper::parse_query_for(query, schema_view) else {
-        return true;
+    let all = || -> Vec<(String, TypeInference)> {
+        dataset
+            .schema_graphs()
+            .map(|(iri, inference)| (iri.to_owned(), inference))
+            .collect()
     };
-    let pattern = match &parsed {
+    let pattern = match parsed {
         Query::Select { pattern, .. }
         | Query::Construct { pattern, .. }
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     };
-    walk(pattern)
+    let mut names = Vec::new();
+    walk(pattern, &mut names);
+    let mut read: std::collections::BTreeMap<String, TypeInference> = Default::default();
+    for name in names {
+        match name {
+            NamedNodePattern::NamedNode(graph) => {
+                if let Some(inference) = dataset.schema_inference(graph.as_str()) {
+                    read.insert(graph.as_str().to_owned(), inference);
+                }
+            }
+            NamedNodePattern::Variable(_) => return all(),
+        }
+    }
+    if let Some(clause) = crate::sparql_scoper::dataset_of(parsed) {
+        for graph in clause.default.iter().chain(clause.named.iter().flatten()) {
+            if let Some(inference) = dataset.schema_inference(graph.as_str()) {
+                read.insert(graph.as_str().to_owned(), inference);
+            }
+        }
+    }
+    read.into_iter().collect()
 }
 
-/// Whether every triple pattern in the query reads the schema graph.
+/// A query that reads more than one data graph: what it read, as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrossDataGraph {
+    /// The graphs the query read, each as it would be written in the query
+    /// (`<iri>`, `the default graph`, `GRAPH ?g (...)`).
+    pub(crate) graphs: Vec<String>,
+}
+
+/// Where a query reads its records: **at most one named data graph**, and the
+/// inference they are read under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DataRead {
+    /// The data graph the query reads, if it reads one by name. `None`: it
+    /// reads the default graph only (or no record at all).
+    pub(crate) graph: Option<String>,
+    /// The inference the records are read under: the graph's if there is one,
+    /// else the dataset's default.
+    pub(crate) inference: TypeInference,
+}
+
+/// **The query's one data graph**, or the refusal that it reads several.
+///
+/// A query **either** reads the dataset's default graph **or** names its one
+/// data graph `G` (through `FROM`, `FROM NAMED` or `GRAPH <G>`), never both,
+/// plus any schema graphs. The engine writes the records into `G` (or into its
+/// default graph, if the query names none) and oxigraph evaluates `GRAPH`,
+/// `FROM` and `FROM NAMED` over them as written; nothing is rewritten.
+///
+/// Reading the default graph together with a named data graph is refused even
+/// when that graph has the default inference: use either the default graph or
+/// explicit graph names, not both.
+///
+/// What the query reads, per SPARQL 1.1 13.2 (the same reads as
+/// [`QueryGraphs::default_reads`] and [`QueryGraphs::graph_reads`]):
+///
+/// * a pattern outside any `GRAPH` reads the default graph: the dataset's, or
+///   the `FROM` graphs when the query writes any;
+/// * a pattern inside `GRAPH <data graph>` reads that graph, unless the
+///   query's `FROM NAMED` leaves it out (then it reads nothing);
+/// * a pattern inside `GRAPH ?g` reads every named graph: the `FROM NAMED`
+///   list when the query writes a dataset clause (refused when that lists more
+///   than one data graph), every served graph otherwise (refused when the
+///   dataset serves more than one data graph; with exactly one, the variable
+///   ranges over it, and over the schema graphs, which read no record).
+pub(crate) fn single_data_graph(
+    query: &spargebra::Query,
+    dataset: &DatasetSpec,
+) -> Result<DataRead, CrossDataGraph> {
+    use spargebra::algebra::GraphPattern;
+    use spargebra::term::NamedNodePattern;
+
+    /// Which graph the walk is in, as far as the records go.
+    #[derive(Clone)]
+    enum Reading {
+        /// The default graph.
+        Default,
+        /// A data graph.
+        Data(String),
+        /// Anything that is no data graph, which reads no record.
+        NoData,
+    }
+
+    struct Walk<'a> {
+        dataset: &'a DatasetSpec,
+        clause: Option<&'a spargebra::algebra::QueryDataset>,
+        /// Whether a pattern read the dataset's default graph.
+        default_read: bool,
+        /// The named data graphs read, in the order they were met.
+        named: Vec<String>,
+        refusal: Option<CrossDataGraph>,
+    }
+
+    impl Walk<'_> {
+        fn record(&mut self, reading: &Reading) {
+            let graphs: Vec<String> = match reading {
+                Reading::Default => match self.clause {
+                    None => {
+                        self.default_read = true;
+                        Vec::new()
+                    }
+                    Some(clause) => clause
+                        .default
+                        .iter()
+                        .map(|graph| graph.as_str().to_owned())
+                        .filter(|iri| self.dataset.data_inference(iri).is_some())
+                        .collect(),
+                },
+                Reading::Data(iri) => vec![iri.clone()],
+                Reading::NoData => Vec::new(),
+            };
+            for iri in graphs {
+                if !self.named.contains(&iri) {
+                    self.named.push(iri);
+                }
+            }
+        }
+
+        /// What `GRAPH ?g` reads.
+        fn variable(&mut self, name: &NamedNodePattern) -> Reading {
+            let candidates: Vec<String> = match self.clause {
+                // A dataset clause names the graphs a `GRAPH` can reach.
+                Some(clause) => clause
+                    .named
+                    .iter()
+                    .flatten()
+                    .map(|graph| graph.as_str().to_owned())
+                    .filter(|iri| self.dataset.data_inference(iri).is_some())
+                    .collect(),
+                None => self
+                    .dataset
+                    .data_graphs()
+                    .map(|(iri, _)| iri.to_owned())
+                    .collect(),
+            };
+            match candidates.as_slice() {
+                [] => Reading::NoData,
+                [one] => Reading::Data(one.clone()),
+                _ => {
+                    if self.refusal.is_none() {
+                        let served: Vec<String> =
+                            candidates.iter().map(|iri| format!("<{iri}>")).collect();
+                        self.refusal = Some(CrossDataGraph {
+                            graphs: vec![format!(
+                                "GRAPH {name}, which ranges over the data graphs {}",
+                                served.join(", ")
+                            )],
+                        });
+                    }
+                    Reading::NoData
+                }
+            }
+        }
+
+        fn walk(&mut self, pattern: &GraphPattern, reading: &Reading) {
+            for block in crate::sparql_scoper::exists_patterns_in_expressions_of(pattern) {
+                self.walk(block, reading);
+            }
+            match pattern {
+                GraphPattern::Bgp { patterns } => {
+                    if !patterns.is_empty() {
+                        self.record(reading);
+                    }
+                }
+                GraphPattern::Path { .. } => self.record(reading),
+                GraphPattern::Graph { name, inner } => {
+                    let inside = match name {
+                        NamedNodePattern::NamedNode(graph) => {
+                            let iri = graph.as_str();
+                            // Under `FROM NAMED` a graph outside the list
+                            // matches nothing.
+                            let visible = self.clause.is_none_or(|clause| {
+                                clause
+                                    .named
+                                    .iter()
+                                    .flatten()
+                                    .any(|named| named.as_str() == iri)
+                            });
+                            if visible && self.dataset.data_inference(iri).is_some() {
+                                Reading::Data(iri.to_owned())
+                            } else {
+                                Reading::NoData
+                            }
+                        }
+                        NamedNodePattern::Variable(_) => self.variable(name),
+                    };
+                    self.walk(inner, &inside);
+                }
+                GraphPattern::Service { inner, .. } => self.walk(inner, &Reading::NoData),
+                GraphPattern::Join { left, right }
+                | GraphPattern::Union { left, right }
+                | GraphPattern::Lateral { left, right }
+                | GraphPattern::Minus { left, right } => {
+                    self.walk(left, reading);
+                    self.walk(right, reading);
+                }
+                GraphPattern::LeftJoin { left, right, .. } => {
+                    self.walk(left, reading);
+                    self.walk(right, reading);
+                }
+                GraphPattern::Filter { inner, .. }
+                | GraphPattern::Extend { inner, .. }
+                | GraphPattern::OrderBy { inner, .. }
+                | GraphPattern::Project { inner, .. }
+                | GraphPattern::Distinct { inner }
+                | GraphPattern::Reduced { inner }
+                | GraphPattern::Slice { inner, .. }
+                | GraphPattern::Group { inner, .. } => self.walk(inner, reading),
+                GraphPattern::Values { .. } => {}
+            }
+        }
+    }
+
+    let pattern = match query {
+        spargebra::Query::Select { pattern, .. }
+        | spargebra::Query::Construct { pattern, .. }
+        | spargebra::Query::Describe { pattern, .. }
+        | spargebra::Query::Ask { pattern, .. } => pattern,
+    };
+    let mut walk = Walk {
+        dataset,
+        clause: crate::sparql_scoper::dataset_of(query),
+        default_read: false,
+        named: Vec::new(),
+        refusal: None,
+    };
+    walk.walk(pattern, &Reading::Default);
+    if let Some(refusal) = walk.refusal {
+        return Err(refusal);
+    }
+    let labels = |walk: &Walk<'_>| -> Vec<String> {
+        let default = walk.default_read.then(|| "the default graph".to_owned());
+        default
+            .into_iter()
+            .chain(walk.named.iter().map(|iri| format!("<{iri}>")))
+            .collect()
+    };
+    match walk.named.as_slice() {
+        [] => Ok(DataRead {
+            graph: None,
+            inference: dataset.default_inference(),
+        }),
+        [graph] => {
+            let inference = dataset
+                .data_inference(graph)
+                .expect("only data graphs are recorded");
+            if walk.default_read {
+                return Err(CrossDataGraph {
+                    graphs: labels(&walk),
+                });
+            }
+            Ok(DataRead {
+                graph: Some(graph.clone()),
+                inference,
+            })
+        }
+        _ => Err(CrossDataGraph {
+            graphs: labels(&walk),
+        }),
+    }
+}
+
+/// Whether every triple pattern in the query reads a schema graph.
 ///
 /// Such a query asks about the datamodel and about no golden record, so the
 /// scoper — whose whole job is deciding which records to fetch — correctly
@@ -95,34 +361,31 @@ pub fn query_reads_named_graphs(query: &str, schema_view: &SchemaView) -> bool {
 /// no instances loaded, and this is the predicate that says when that is the
 /// right thing to do rather than a query with a genuinely missing scope.
 ///
-/// `schema_graph_iri` is the graph the active datamodel serves its schema in.
-/// `None` — no schema graph configured for this datamodel — makes this always
-/// false: there is no schema graph, so no query reads only it, and the unscoped
-/// refusal stands.
+/// `dataset` says which graphs are the schema's. With no schema graph
+/// configured for this datamodel this is always false: there is none, so no
+/// query reads only it, and the unscoped refusal stands.
+///
+/// A `GRAPH ?g` counts only while it can bind nothing but a schema graph --
+/// while the dataset serves no data graph
+/// ([`DatasetSpec::graph_variable_is_schema_only`]). Once it does, the
+/// variable ranges over records too, and a query that reads only through it
+/// is not a question about the datamodel.
 ///
 /// A query that does not parse is not schema-only: the real parse error must
 /// surface, not be turned into an empty answer.
 pub fn reads_only_the_schema_graph(
     query: &str,
-    schema_graph_iri: Option<&str>,
     schema_view: &SchemaView,
+    dataset: &DatasetSpec,
 ) -> bool {
+    use crate::sparql_dataset::{GraphReads, QueryGraphs};
     use spargebra::Query;
     use spargebra::algebra::GraphPattern;
     use spargebra::term::NamedNodePattern;
 
-    let Some(schema_graph_iri) = schema_graph_iri else {
+    if !dataset.has_schema_graph() {
         return false;
-    };
-
-    // Same rule the scoper applies: the named schema graph, or a variable that
-    // might bind to it. Any other constant graph names something the endpoint
-    // does not have, and a query reading only that has no scope and no answer
-    // here — which is what the unscoped refusal already says.
-    let reads_the_schema_graph = |name: &NamedNodePattern| match name {
-        NamedNodePattern::NamedNode(node) => node.as_str() == schema_graph_iri,
-        NamedNodePattern::Variable(_) => true,
-    };
+    }
 
     /// `(triples seen, triples seen inside the schema graph)`.
     fn walk(
@@ -158,7 +421,7 @@ pub fn reads_only_the_schema_graph(
             }
             GraphPattern::Graph { name, inner } => walk(
                 inner,
-                inside || is_schema_graph(name),
+                is_schema_graph(name),
                 total,
                 in_graph,
                 is_schema_graph,
@@ -189,7 +452,7 @@ pub fn reads_only_the_schema_graph(
         }
     }
 
-    let Ok(parsed) = crate::sparql_scoper::parse_query_for(query, schema_view) else {
+    let Ok(parsed) = crate::sparql_scoper::parse_query(query, Some(schema_view)) else {
         return false;
     };
     let pattern = match &parsed {
@@ -198,10 +461,27 @@ pub fn reads_only_the_schema_graph(
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     };
+    // The scoper's rule, from the same place: a `GRAPH` constant naming a
+    // schema graph (and visible under the query's `FROM NAMED`), or a variable
+    // that can bind nothing else. Any other constant graph names something the
+    // endpoint does not serve, and a query reading only that has no scope and
+    // no answer here -- which is what the unscoped refusal already says.
+    // A query that reads several data graphs is refused elsewhere.
+    let Ok(graphs) = QueryGraphs::new(dataset, &parsed) else {
+        return false;
+    };
+    let reads_the_schema_graph = |name: &NamedNodePattern| match name {
+        NamedNodePattern::NamedNode(node) => {
+            graphs.graph_reads(node.as_str()) == GraphReads::Schema
+        }
+        NamedNodePattern::Variable(_) => dataset.graph_variable_is_schema_only(),
+    };
     let (mut total, mut in_graph) = (0usize, 0usize);
+    // Outside any `GRAPH` a pattern reads the default graph, which a `FROM`
+    // can make a schema graph.
     walk(
         pattern,
-        false,
+        graphs.default_reads() == GraphReads::Schema,
         &mut total,
         &mut in_graph,
         &reads_the_schema_graph,
@@ -217,14 +497,14 @@ mod tests {
     /// reads it from `asset360_model/datamodels/asset360.yaml`.
     const SCHEMA_GRAPH: &str = "https://data.infrabel.be/asset360/schema";
 
-    /// The production functions over the shared test schema, so the cases
+    /// The production function over the shared test schema, so the cases
     /// below read as the questions they ask rather than as plumbing.
-    fn query_reads_named_graphs(query: &str) -> bool {
-        super::query_reads_named_graphs(query, &test_schema_view())
-    }
-
     fn reads_only_the_schema_graph(query: &str, schema_graph_iri: Option<&str>) -> bool {
-        super::reads_only_the_schema_graph(query, schema_graph_iri, &test_schema_view())
+        let dataset = match schema_graph_iri {
+            Some(iri) => crate::sparql_dataset::schema_dataset(iri),
+            None => crate::sparql_dataset::default_dataset().clone(),
+        };
+        super::reads_only_the_schema_graph(query, &test_schema_view(), &dataset)
     }
 
     #[test]
@@ -239,25 +519,6 @@ mod tests {
             ),
             Some(SCHEMA_GRAPH)
         ));
-    }
-
-    #[test]
-    fn only_a_graph_clause_can_reach_the_schema_graph() {
-        // Nothing to build for: no GRAPH clause anywhere.
-        assert!(!query_reads_named_graphs("SELECT ?s WHERE { ?s ?p ?o }"));
-        // `FROM NAMED` alone reaches no named graph without a GRAPH clause.
-        assert!(!query_reads_named_graphs(
-            "SELECT ?s FROM NAMED <urn:g> WHERE { ?s ?p ?o }"
-        ));
-        assert!(query_reads_named_graphs(
-            "SELECT ?s WHERE { GRAPH <urn:g> { ?s ?p ?o } }"
-        ));
-        assert!(query_reads_named_graphs(
-            "SELECT ?s WHERE { ?s ?p ?o OPTIONAL { GRAPH ?g { ?s ?q ?r } } }"
-        ));
-        // An unparseable query is treated as possibly reading it, so oxigraph
-        // reports the real parse error rather than this function inventing one.
-        assert!(query_reads_named_graphs("SELECT ?s WHERE {"));
     }
 
     /// Review finding 3, second manifestation.
@@ -276,7 +537,6 @@ mod tests {
         let inside_exists = format!(
             "SELECT ?s WHERE {{ ?s ?p ?o . FILTER EXISTS {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c ?q ?r }} }} }}"
         );
-        assert!(query_reads_named_graphs(&inside_exists));
         // Mixed, not schema-only: one instance pattern, one schema pattern.
         assert!(!reads_only_the_schema_graph(
             &inside_exists,
@@ -318,7 +578,6 @@ mod tests {
         let query = format!(
             "SELECT ?l WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c a owl:Class ; rdfs:label ?l }} }}"
         );
-        assert!(query_reads_named_graphs(&query));
         assert!(reads_only_the_schema_graph(&query, Some(SCHEMA_GRAPH)));
     }
 
@@ -374,6 +633,77 @@ mod tests {
             &rinf_query,
             Some(SCHEMA_GRAPH)
         ));
+    }
+
+    /// `GRAPH ?g` is a question about the datamodel only while it can bind
+    /// nothing else. Once the dataset serves a data graph the variable ranges
+    /// over records too, so a query that reads only through it is not
+    /// schema-only -- and the schema graphs a query can read are the ones it
+    /// names, every one of them for the variable.
+    #[test]
+    fn a_graph_variable_is_schema_only_until_a_data_graph_is_served() {
+        use linkml_runtime::schema_rdf::TypeInference;
+        let schema_view = test_schema_view();
+        let only_schema = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[],
+            &[(SCHEMA_GRAPH, TypeInference::ASSERTED)],
+        );
+        let with_data = crate::sparql_dataset::dataset_with(
+            TypeInference::ASSERTED,
+            &[("urn:graph:inferred", TypeInference::IS_A)],
+            &[
+                (SCHEMA_GRAPH, TypeInference::ASSERTED),
+                ("urn:graph:schema-inferred", TypeInference::IS_A),
+            ],
+        );
+        let variable = "SELECT ?c WHERE { GRAPH ?g { ?c ?p ?o } }";
+        assert!(super::reads_only_the_schema_graph(
+            variable,
+            &schema_view,
+            &only_schema
+        ));
+        assert!(!super::reads_only_the_schema_graph(
+            variable,
+            &schema_view,
+            &with_data
+        ));
+        // A data graph is no schema graph, by name.
+        assert!(!super::reads_only_the_schema_graph(
+            "SELECT ?c WHERE { GRAPH <urn:graph:inferred> { ?c ?p ?o } }",
+            &schema_view,
+            &with_data
+        ));
+        // A `FROM` makes the default graph one.
+        assert!(super::reads_only_the_schema_graph(
+            &format!("SELECT ?c FROM <{SCHEMA_GRAPH}> WHERE {{ ?c ?p ?o }}"),
+            &schema_view,
+            &with_data
+        ));
+
+        let read = |query: &str| -> Vec<String> {
+            super::schema_graphs_read(
+                &crate::sparql_scoper::parse_query(query, Some(&schema_view)).unwrap(),
+                &with_data,
+            )
+            .into_iter()
+            .map(|(iri, _)| iri)
+            .collect()
+        };
+        assert!(read("SELECT ?s WHERE { ?s ?p ?o }").is_empty());
+        assert_eq!(
+            read(&format!(
+                "SELECT ?c WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?c ?p ?o }} }}"
+            )),
+            vec![SCHEMA_GRAPH.to_owned()]
+        );
+        assert_eq!(
+            read(&format!(
+                "SELECT ?c FROM NAMED <{SCHEMA_GRAPH}> WHERE {{ ?c ?p ?o }}"
+            )),
+            vec![SCHEMA_GRAPH.to_owned()]
+        );
+        assert_eq!(read(variable).len(), 2, "a variable can bind either");
     }
 
     /// No schema graph configured: nothing reads only it, not even a query

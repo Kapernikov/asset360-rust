@@ -1376,7 +1376,7 @@ revision 5's `(holder identity, path, ordinal)` kept the last hop only
 and collapsed them.
 
 Why occurrence, and why the whole path: the engine leg materialises
-records with `TurtleOptions { skolem: false }` (`sparql_executor.rs`),
+records with `WriteOptions::flat(inference)` (`sparql_executor.rs`),
 and the turtle writer (`rust-linkml-core`, `turtle.rs`) mints one fresh
 blank node per inlined structure it *walks into* — `State::next_subject`,
 a counter, called for each element of a list or a mapping and again for

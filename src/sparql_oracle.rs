@@ -15,7 +15,8 @@
 use std::collections::BTreeMap;
 
 use linkml_runtime::LinkMLInstance;
-use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
+use linkml_runtime::schema_rdf::TypeInference;
+use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use oxigraph::io::RdfFormat;
@@ -34,6 +35,42 @@ impl Oracle {
     /// turtled the way the engine leg turtles them (`skolem: false`, so an
     /// inlined element is a blank node of its own).
     pub fn new(schema: &SchemaView, records: &[(&str, &str)]) -> Self {
+        Self::new_in(schema, records, TypeInference::ASSERTED)
+    }
+
+    /// [`Oracle::new`] with the records written under type inference `inference`:
+    /// the graph a dataset of that inference holds (`rdf:type` of every class
+    /// the inference lists, and `sesame:directType` where it writes one).
+    pub(crate) fn new_in(
+        schema: &SchemaView,
+        records: &[(&str, &str)],
+        inference: TypeInference,
+    ) -> Self {
+        Self::load(schema, records, inference, None)
+    }
+
+    /// [`Oracle::new_in`] with the records in the named graph `graph`, as the
+    /// engine writes them for a query that names that data graph, **and** in
+    /// the default graph: a plan's own translation drops the `FROM` / `GRAPH`
+    /// that named the graph (each match says its graph instead), so it reads
+    /// the default graph, and has to find the same records there.
+    pub(crate) fn new_in_graph(
+        schema: &SchemaView,
+        records: &[(&str, &str)],
+        inference: TypeInference,
+        graph: &str,
+    ) -> Self {
+        Self::load(schema, records, inference, Some(graph))
+    }
+
+    fn load(
+        schema: &SchemaView,
+        records: &[(&str, &str)],
+        inference: TypeInference,
+        graph: Option<&str>,
+    ) -> Self {
+        let records_graph =
+            graph.map(|iri| oxigraph::model::NamedNode::new(iri).expect("a graph IRI"));
         let store = Store::new().unwrap();
         let conv = schema.converter();
         let primary = schema.primary_schema().unwrap();
@@ -51,20 +88,28 @@ impl Oracle {
                 schema,
                 &primary,
                 &conv,
-                TurtleOptions { skolem: false },
+                &WriteOptions::flat(inference),
             )
             .unwrap();
-            store
-                .load_from_reader(RdfFormat::Turtle, turtle.as_bytes())
-                .unwrap_or_else(|e| panic!("{e}\n{turtle}"));
+            for quad in oxigraph::io::RdfParser::from_format(RdfFormat::Turtle)
+                .rename_blank_nodes()
+                .for_slice(turtle.as_bytes())
+            {
+                let mut quad = quad.unwrap_or_else(|e| panic!("{e}\n{turtle}"));
+                store.insert(&quad).unwrap();
+                if let Some(graph) = &records_graph {
+                    quad.graph_name = oxigraph::model::GraphName::NamedNode(graph.clone());
+                    store.insert(&quad).unwrap();
+                }
+            }
         }
         Self { store }
     }
 
     /// The answer to an already-parsed query, as a bag.
     pub fn answers(&self, query: spargebra::Query) -> Bag {
-        let results = crate::sparql_executor::geosparql_evaluator()
-            .for_query(query.clone())
+        let prepared = crate::sparql_executor::geosparql_evaluator().for_query(query.clone());
+        let results = prepared
             .on_store(&self.store)
             .execute()
             .unwrap_or_else(|e| panic!("{e}\n{query}"));
@@ -100,7 +145,7 @@ impl Oracle {
 
     /// The answer to a query string.
     pub fn answers_to(&self, query: &str) -> Bag {
-        self.answers(crate::sparql_scoper::parse_query(query).unwrap())
+        self.answers(crate::sparql_scoper::parse_query(query, None).unwrap())
     }
 }
 
@@ -140,71 +185,185 @@ pub fn ordered_answers(oracle: &Oracle, query: spargebra::Query) -> Vec<BTreeMap
 /// `parts[0].children[1]` equals `parts[1].children[1]`, and a reference hop
 /// with and without a target.
 pub fn fixture(schema: &SchemaView) -> Oracle {
-    Oracle::new(
-        schema,
-        &[
-            (
-                "Track",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/T1", "hasName": "Main"}"#,
-            ),
-            (
-                "Track",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/T2", "hasName": "Side"}"#,
-            ),
-            // Two signals identical in every read slot: duplicate mappings.
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/A", "name": "Alpha", "length": 3,
+    Oracle::new(schema, &fixture_records())
+}
+
+/// Classes to append to the test schema ([`crate::sparql_scoper::tests::test_schema_view_plus`])
+/// for [`fixture_in`]: a real mixin (`Tag`) and a class that carries it
+/// (`Trip`, an `Equipment`), so an inference that lists mixins as types has
+/// something to list. The `is_a` chain (`Equipment` > `Relay` > `LatchRelay`)
+/// is already in the base schema.
+pub(crate) const MIXIN_CLASSES: &str = r#"
+  Tag:
+    class_uri: asset360:Tag
+    mixin: true
+  Trip:
+    class_uri: asset360:Trip
+    is_a: Equipment
+    mixins: [Tag]
+  # A parent with no identifier slot whose subclasses each have one, under
+  # different names: what asset360's `BuiltElement` (no identifier) and its
+  # subclass `CivilEngineeringAsset` (`id`) are. A scan of `Structure` reads
+  # the subclasses' records, so what identifies them is the subclasses' slots.
+  Structure:
+    class_uri: asset360:Structure
+    attributes:
+      title:
+        range: string
+  Bridge:
+    is_a: Structure
+    class_uri: asset360:Bridge
+    attributes:
+      bridgeId:
+        identifier: true
+  Culvert:
+    is_a: Structure
+    class_uri: asset360:Culvert
+    attributes:
+      culvertId:
+        identifier: true
+"#;
+
+/// [`fixture`] written under type inference `inference`, plus one record of each
+/// class of the `is_a` chain and a mixin carrier, so that the inferences differ
+/// in what the store holds. `schema` has to carry [`MIXIN_CLASSES`].
+fn records_in_inferences() -> Vec<(&'static str, &'static str)> {
+    let mut records = fixture_records();
+    records.extend([
+        (
+            "Equipment",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/E1", "label": "e"}"#,
+        ),
+        (
+            "Relay",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/R1", "label": "r", "voltage": 5}"#,
+        ),
+        (
+            "LatchRelay",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/L1", "label": "l", "voltage": 5}"#,
+        ),
+        (
+            "Trip",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/T1", "label": "t"}"#,
+        ),
+        (
+            "Switch",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/S1", "label": "s"}"#,
+        ),
+        (
+            "Breaker",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/eq/B1", "label": "b"}"#,
+        ),
+        (
+            "Bridge",
+            r#"{"bridgeId": "https://data.infrabel.be/asset360/st/BR1", "title": "b1"}"#,
+        ),
+        (
+            "Culvert",
+            r#"{"culvertId": "https://data.infrabel.be/asset360/st/CU1", "title": "c1"}"#,
+        ),
+    ]);
+    records
+}
+
+/// [`fixture`] written under type inference `inference`.
+pub(crate) fn fixture_in(schema: &SchemaView, inference: TypeInference) -> Oracle {
+    Oracle::new_in(schema, &records_in_inferences(), inference)
+}
+
+/// [`fixture_in`] with the records in the data graph `graph`
+/// ([`Oracle::new_in_graph`]).
+pub(crate) fn fixture_in_graph(
+    schema: &SchemaView,
+    inference: TypeInference,
+    graph: &str,
+) -> Oracle {
+    Oracle::new_in_graph(schema, &records_in_inferences(), inference, graph)
+}
+
+impl Oracle {
+    /// The datamodel as one more graph of the store, named `iri` and
+    /// publishing the schema under `inference`: what a dataset serving a schema
+    /// graph shows a `GRAPH <iri> { ... }`.
+    pub(crate) fn with_schema_graph(
+        self,
+        schema: &SchemaView,
+        iri: &str,
+        inference: TypeInference,
+    ) -> Self {
+        let quads = crate::sparql_schema_graph::SchemaGraph::build(schema, inference)
+            .quads_in(iri)
+            .unwrap_or_else(|e| panic!("{e}"));
+        for quad in &quads {
+            self.store.insert(quad).unwrap();
+        }
+        self
+    }
+}
+
+fn fixture_records() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "Track",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/T1", "hasName": "Main"}"#,
+        ),
+        (
+            "Track",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/track/T2", "hasName": "Side"}"#,
+        ),
+        // Two signals identical in every read slot: duplicate mappings.
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/A", "name": "Alpha", "length": 3,
                     "trafficKinds": ["m", "m", "p"],
                     "documents": {"d1": {"docId": "d1", "title": "One"}, "d2": {"docId": "d2", "title": "Two"}},
                     "locatedOnTrack": "https://data.infrabel.be/asset360/track/T1"}"#,
-            ),
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/B", "name": "Alpha", "length": 3,
+        ),
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/B", "name": "Alpha", "length": 3,
                     "trafficKinds": ["m", "m", "p"],
                     "documents": {"d1": {"docId": "d1", "title": "One"}, "d2": {"docId": "d2", "title": "Two"}},
                     "locatedOnTrack": "https://data.infrabel.be/asset360/track/T1"}"#,
-            ),
-            // No array entries, no track, no name.
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/C", "length": 7}"#,
-            ),
-            // A track reference to a record that is not there.
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/D", "name": "Delta", "length": 3,
+        ),
+        // No array entries, no track, no name.
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/C", "length": 7}"#,
+        ),
+        // A track reference to a record that is not there.
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/D", "name": "Delta", "length": 3,
                     "trafficKinds": ["p"],
                     "documents": {"d9": {"docId": "d9", "title": "Nine"}},
                     "locatedOnTrack": "https://data.infrabel.be/asset360/track/T-missing"}"#,
-            ),
-            (
-                "Signal",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/E", "name": "Echo", "length": 1,
+        ),
+        (
+            "Signal",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/signal/E", "name": "Echo", "length": 1,
                     "locatedOnTrack": "https://data.infrabel.be/asset360/track/T2"}"#,
-            ),
-            (
-                "BaliseGroup",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/bg/G1", "refersToSignal": "https://data.infrabel.be/asset360/signal/A"}"#,
-            ),
-            (
-                "BaliseGroup",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/bg/G2", "refersToSignal": "https://data.infrabel.be/asset360/signal/A"}"#,
-            ),
-            // The nested occurrence: parts[0].children[1] = parts[1].children[1];
-            // and a duplicated structure, parts[2] = parts[3], which are two
-            // blank nodes (`documents` is a mapping, so it cannot hold one).
-            (
-                "Assembly",
-                r#"{"asset360_uri": "https://data.infrabel.be/asset360/assembly/X",
+        ),
+        (
+            "BaliseGroup",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/bg/G1", "refersToSignal": "https://data.infrabel.be/asset360/signal/A"}"#,
+        ),
+        (
+            "BaliseGroup",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/bg/G2", "refersToSignal": "https://data.infrabel.be/asset360/signal/A"}"#,
+        ),
+        // The nested occurrence: parts[0].children[1] = parts[1].children[1];
+        // and a duplicated structure, parts[2] = parts[3], which are two
+        // blank nodes (`documents` is a mapping, so it cannot hold one).
+        (
+            "Assembly",
+            r#"{"asset360_uri": "https://data.infrabel.be/asset360/assembly/X",
                     "parts": [{"label": "p0", "children": [{"label": "c0"}, {"label": "same"}]},
                               {"label": "p1", "children": [{"label": "c1"}, {"label": "same"}]},
                               {"label": "dup", "children": [{"label": "d"}]},
                               {"label": "dup", "children": [{"label": "d"}]}]}"#,
-            ),
-        ],
-    )
+        ),
+    ]
 }
 
 /// A design probe: `query` over a store holding exactly `turtle` (N-Triples
@@ -233,7 +392,7 @@ pub fn probe_sequence(turtle: &str, query: &str) -> Vec<BTreeMap<String, String>
     }
     ordered_answers(
         &Oracle { store },
-        crate::sparql_scoper::parse_query(query).unwrap(),
+        crate::sparql_scoper::parse_query(query, None).unwrap(),
     )
 }
 
@@ -242,8 +401,8 @@ impl Oracle {
     /// what a statement's rows look like to `sparql_finish`, and what its
     /// answer is compared against.
     pub fn json_rows(&self, query: spargebra::Query) -> (Vec<String>, Vec<serde_json::Value>) {
-        let results = crate::sparql_executor::geosparql_evaluator()
-            .for_query(query.clone())
+        let prepared = crate::sparql_executor::geosparql_evaluator().for_query(query.clone());
+        let results = prepared
             .on_store(&self.store)
             .execute()
             .unwrap_or_else(|e| panic!("{e}\n{query}"));

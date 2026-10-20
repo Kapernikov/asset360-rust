@@ -71,6 +71,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use crate::sparql_dataset::{DatasetSpec, GraphReads, QueryGraphs};
+use linkml_runtime::schema_rdf::{TypeInference, type_family};
 use linkml_schemaview::schemaview::SchemaView;
 
 use spargebra::Query;
@@ -131,8 +133,8 @@ impl fmt::Display for NodeKey {
 ///
 /// This is what [`crate::sparql_ops::Enforcement`] collapses into once the
 /// split is load-bearing. A node is `Sql` while the engine also re-applies it
-/// -- exactly today's `Narrows` -- because the engine leg re-runs the whole
-/// original query string.
+/// -- [`crate::sparql_ops::Enforcement::Narrows`] -- because the engine leg
+/// re-runs the whole original query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Executor {
     Sql,
@@ -367,9 +369,15 @@ pub enum Expr {
     /// a rule places at a scope root with the semi-join proof and what op
     /// 3b carries down to the scan, where the fold reads it as the star's
     /// type. Written back for the oracle as `EXISTS { ?var a <class> }`.
+    ///
+    /// `inference` is the type inference of the match or scan the restriction was
+    /// derived from: `?var` is a record whose `rdf:type`s *under that inference*
+    /// include `class_uri`. The fold reads it as the inference of the scan it
+    /// makes, so a restriction never changes which graph a star reads.
     InClass {
         var: String,
         class_uri: String,
+        inference: TypeInference,
     },
     /// An expression carrying a graph pattern -- `EXISTS`, `NOT EXISTS` --
     /// kept as the text the query wrote.
@@ -1416,17 +1424,19 @@ impl Expr {
             }
             // `?v` is the identity of a record of the class: exactly the
             // records with that type.
-            Self::InClass { var, class_uri } => Expression::Exists(Box::new(GraphPattern::Bgp {
-                patterns: vec![TriplePattern {
-                    subject: TermPattern::Variable(Variable::new_unchecked(var.clone())),
-                    predicate: NamedNodePattern::NamedNode(
-                        spargebra::term::NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?,
-                    ),
-                    object: TermPattern::NamedNode(
-                        spargebra::term::NamedNode::new(class_uri.clone()).ok()?,
-                    ),
-                }],
-            })),
+            Self::InClass { var, class_uri, .. } => {
+                Expression::Exists(Box::new(GraphPattern::Bgp {
+                    patterns: vec![TriplePattern {
+                        subject: TermPattern::Variable(Variable::new_unchecked(var.clone())),
+                        predicate: NamedNodePattern::NamedNode(
+                            spargebra::term::NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?,
+                        ),
+                        object: TermPattern::NamedNode(
+                            spargebra::term::NamedNode::new(class_uri.clone()).ok()?,
+                        ),
+                    }],
+                }))
+            }
             Self::Slot { .. } => return None,
             Self::Opaque(_) => return None,
         })
@@ -1707,7 +1717,20 @@ impl fmt::Display for Expr {
             Self::Or(parts) => write!(f, "({})", join_exprs(parts, " || ")),
             Self::Not(inner) => write!(f, "!{inner}"),
             Self::Function { name, args } => write!(f, "{name}({})", join_exprs(args, ", ")),
-            Self::InClass { var, class_uri } => write!(f, "?{var} ∈ {}", shorten(class_uri)),
+            Self::InClass {
+                var,
+                class_uri,
+                inference,
+            } => write!(
+                f,
+                "?{var} ∈ {}{}",
+                shorten(class_uri),
+                if *inference == TypeInference::ASSERTED {
+                    String::new()
+                } else {
+                    format!(" [{inference}]")
+                }
+            ),
             Self::Opaque(text) => f.write_str(text),
         }
     }
@@ -1875,8 +1898,8 @@ pub struct ScanSlot {
     /// `None` for a read that constrains the value without naming it: `?s
     /// :name "BX517"` asserts that the slot exists *and* what it holds, and
     /// the existence half is a slot the scan reads while the value half is a
-    /// condition above it. Today's star says the same thing by listing the
-    /// name in `required_fields` with no entry in `slot_variables`.
+    /// condition above it. The scoper's star says the same thing by listing
+    /// the name in `required_fields` with no entry in `slot_variables`.
     ///
     /// A slot with no variable binds nothing, so nothing above the scan can
     /// read it: no condition resolves through it, no join keys on it, and a
@@ -1891,10 +1914,9 @@ pub struct ScanSlot {
 
 /// Whether a scan *requires* the value it reads, or only allows it.
 ///
-/// The distinction 28d did not have, and the reason the ledger and the plan
-/// could disagree about an `OPTIONAL`. Today's star decomposition carries it
-/// as `required_fields` versus `optional_fields`, and it decides one thing in
-/// the SQL: whether an `object_data ? 'slot'` existence check is emitted.
+/// The scoper's star decomposition carries it as `required_fields` versus
+/// `optional_fields`, and it decides one thing in the SQL: whether an
+/// `object_data ? 'slot'` existence check is emitted.
 ///
 /// **Orthogonal to whether the read binds a variable**, which is
 /// [`ScanSlot::var`]. The two facts together are the whole of what a scan does
@@ -2064,6 +2086,18 @@ pub enum PlanOp {
     /// between them are nodes too.
     Match {
         pattern: Box<TriplePattern>,
+        /// The graph this triple is matched against.
+        /// [`GraphReads::Data`] for a triple read from the data graph --
+        /// outside any `GRAPH`, or under one that names the data graph --
+        /// which holds `rdf:type` triples the way the plan's one inference
+        /// ([`Plan::data_inference`]) writes them.
+        ///
+        /// Any other value is a triple under a [`PlanOp::Graph`] that stays:
+        /// the datamodel ([`GraphReads::Schema`]), `GRAPH ?g` or a graph the
+        /// endpoint does not serve ([`GraphReads::Other`]). No data rule may
+        /// fold such a triple into a [`PlanOp::Scan`] -- the records a scan
+        /// reads are the data graph's, not that graph's.
+        reads: GraphReads,
     },
     /// A property path. Engine-only, and no rule pushes one.
     Path {
@@ -2260,11 +2294,31 @@ pub enum PlanOp {
     Scan {
         star_var: String,
         class_uri: String,
+        /// Every class whose records have `class_uri` among their `rdf:type`s
+        /// under the inference of the plan's one data graph ([`Plan::data_inference`]; canonical
+        /// IRIs, sorted, deduplicated, `class_uri` included): `type_family` of
+        /// the class. Under [`TypeInference::ASSERTED`] that is `class_uri` alone.
+        /// Under that inference `?s a class_uri` holds for every record of one of
+        /// them. [`Plan::scan_classes_agree`] checks it against the schema.
+        classes: Vec<String>,
+        /// The variable bound to the record's direct type, read from the
+        /// `asset_type` column, once a rule has folded
+        /// `sesame:directType ?t` into the scan. `None` until then.
+        direct_type: Option<String>,
+        /// The classes the query fixed the record's *direct type* to
+        /// (`?s sesame:directType <C>`), canonical IRIs sorted. Empty: no
+        /// constraint. A record is read only when its `asset_type` is in
+        /// here *and* in [`classes`](PlanOp::Scan::classes), so the lowering
+        /// writes `asset_types = classes ∩ direct_type_in`
+        /// ([`crate::sparql_ops::Op::Scan`]); `classes` itself stays
+        /// `type_family` of the class, which is the invariant
+        /// [`Plan::scan_classes_agree`] checks.
+        direct_type_in: Vec<String>,
         slots: Vec<ScanSlot>,
         /// Values the query fixed the record's *identity* to.
         ///
         /// Not a slot and not a JSONB path: the identifier is the record's own
-        /// URI, which lives in an indexed column, and today's star
+        /// URI, which lives in an indexed column, and the scoper's star
         /// decomposition carries it apart from `filters` for exactly that
         /// reason. A scan with one of these reads one record; a scan without
         /// reads the class.
@@ -2519,6 +2573,9 @@ impl Node {
 pub fn scan_with_fanout(
     star_var: &str,
     class_uri: &str,
+    // The classes the scan stands for under the plan's inference
+    // (`scan_classes`): the caller has the schema, this function does not.
+    classes: Vec<String>,
     slots: Vec<ScanSlot>,
     // `identifier_values`: the record's identity, when the query named it
     // rather than a variable. A constant subject scans one row, against the
@@ -2546,6 +2603,9 @@ pub fn scan_with_fanout(
         PlanOp::Scan {
             star_var: star_var.to_owned(),
             class_uri: class_uri.to_owned(),
+            classes,
+            direct_type: None,
+            direct_type_in: Vec::new(),
             slots,
             identifier_values,
         },
@@ -2606,6 +2666,11 @@ pub struct Plan {
     /// consumer still sees the variable -- produced above the barrier
     /// instead of inside it.
     pub lifted_exports: Vec<LiftedExport>,
+    /// The one inference the query reads its records under
+    /// ([`crate::sparql_graph_clauses::single_data_graph`]): the inference every
+    /// match of a data graph and every scan is under. What
+    /// [`Plan::scan_classes_agree`] derives a scan's classes with.
+    pub data_inference: TypeInference,
 }
 
 /// An export moved out of a barrier by a lifting rule (see
@@ -2684,6 +2749,18 @@ pub enum PlanDefect {
     MisrecordedJoin {
         join: NodeId,
     },
+    /// A scan whose `classes` are not the type family of its `class_uri`
+    /// under its `inference`. See [`Plan::scan_classes_agree`].
+    MisrecordedScanClasses {
+        scan: NodeId,
+    },
+    /// A scan whose classes cannot be derived at all, so the invariant cannot
+    /// be checked: the schema's error, not a mismatch. See
+    /// [`ScanClassesError`].
+    ScanClassesUnavailable {
+        scan: NodeId,
+        error: String,
+    },
     /// A rule's edit dropped an export a consumer demanded: the one check
     /// that relates two plans rather than inspecting one. See
     /// [`Plan::check_transition`].
@@ -2726,6 +2803,11 @@ impl fmt::Display for PlanDefect {
                 "n{scan} folded the multivalued slot '{slot}' without the unnest \
                  that binds its variable, so a record with several values counts once"
             ),
+            Self::MisrecordedScanClasses { scan } => write!(
+                f,
+                "n{scan}: a scan's classes are not the type family of its class under its inference"
+            ),
+            Self::ScanClassesUnavailable { scan, error } => write!(f, "n{scan}: {error}"),
             Self::MisrecordedJoin { join } => write!(
                 f,
                 "n{join} records a reference edge the scans below it do not support"
@@ -2768,6 +2850,7 @@ impl Plan {
             transfers: Vec::new(),
             rewrites: Vec::new(),
             lifted_exports: Vec::new(),
+            data_inference: TypeInference::ASSERTED,
         };
         plan.install(nodes);
         plan.record_origins();
@@ -2905,7 +2988,38 @@ impl Plan {
     /// [`Plan::check`], plus the invariants that need the schema.
     pub fn check_with(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
         self.check()?;
+        self.scan_classes_agree(schema)?;
         self.join_keys_agree(schema).map_err(PlanDefect::Scope)
+    }
+
+    /// **Invariant 7.** A scan's `classes` are what the schema says they are.
+    ///
+    /// `classes` is a fact about the schema -- the classes whose records have
+    /// `class_uri` among their `rdf:type`s under the scan's inference -- recorded
+    /// on the scan so a renderer reads it instead of re-deriving it. What
+    /// would otherwise be a silently wrong `asset_type` filter (a subclass
+    /// dropped: rows missing; a stranger added: rows invented) is checked here
+    /// by recomputing it with [`scan_classes`], the one function that builds
+    /// it.
+    pub(crate) fn scan_classes_agree(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
+        for (id, node) in self.nodes.iter().enumerate() {
+            if let PlanOp::Scan {
+                class_uri, classes, ..
+            } = &node.op
+            {
+                let derived =
+                    scan_classes(schema, class_uri, self.data_inference).map_err(|error| {
+                        PlanDefect::ScanClassesUnavailable {
+                            scan: id,
+                            error: error.to_string(),
+                        }
+                    })?;
+                if *classes != derived {
+                    return Err(PlanDefect::MisrecordedScanClasses { scan: id });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// **Invariant 1.** Every obligation appears exactly once, in a node or in
@@ -3251,9 +3365,14 @@ impl Plan {
         let node = &self.nodes[id];
         match &node.op {
             PlanOp::Scan {
-                star_var, slots, ..
+                star_var,
+                slots,
+                direct_type,
+                ..
             } => {
                 out.insert(star_var.clone());
+                // The direct type is read from a column every record has.
+                out.extend(direct_type.clone());
                 // Every slot that *binds* a variable, whatever its presence:
                 // an absorbed optional read binds a nullable column, and a
                 // variable in scope and possibly unbound is still in scope
@@ -3262,7 +3381,7 @@ impl Plan {
                 // `match` that stayed above is what binds it.
                 out.extend(slots.iter().filter_map(|slot| slot.var.clone()));
             }
-            PlanOp::Match { pattern } => {
+            PlanOp::Match { pattern, .. } => {
                 add_term_var(&pattern.subject, &mut out);
                 if let NamedNodePattern::Variable(variable) = &pattern.predicate {
                     out.insert(variable.as_str().to_owned());
@@ -3351,9 +3470,13 @@ impl Plan {
             // `variables_of` already says, for the same reason -- a delivered
             // (`Optional`) read may come back null.
             PlanOp::Scan {
-                star_var, slots, ..
+                star_var,
+                slots,
+                direct_type,
+                ..
             } => {
                 out.insert(star_var.clone());
+                out.extend(direct_type.clone());
                 out.extend(
                     slots
                         .iter()
@@ -3363,7 +3486,7 @@ impl Plan {
             }
             // A triple pattern matches or it does not: every variable in it is
             // bound in every solution.
-            PlanOp::Match { pattern } => {
+            PlanOp::Match { pattern, .. } => {
                 add_term_var(&pattern.subject, &mut out);
                 if let NamedNodePattern::Variable(variable) = &pattern.predicate {
                     out.insert(variable.as_str().to_owned());
@@ -3554,6 +3677,22 @@ impl Plan {
 impl fmt::Display for Plan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Plan ({} → {})", self.form.as_str(), self.form.expects())?;
+        // The nodes a printed `GRAPH` is above: what explains a match that
+        // reads no data graph.
+        let mut under_graph = vec![false; self.nodes.len()];
+        for (id, node) in self.nodes.iter().enumerate() {
+            if matches!(node.op, PlanOp::Graph { .. }) {
+                let mut stack = vec![id];
+                while let Some(at) = stack.pop() {
+                    for input in self.nodes[at].op.input_ids() {
+                        if !under_graph[input] {
+                            under_graph[input] = true;
+                            stack.push(input);
+                        }
+                    }
+                }
+            }
+        }
         for (id, node) in self.nodes.iter().enumerate() {
             let claims = if node.discharges.is_empty() {
                 String::new()
@@ -3567,7 +3706,10 @@ impl fmt::Display for Plan {
                         .join(" ")
                 )
             };
-            let mut describe = node.op.describe();
+            let mut describe = node.op.describe_with(InferenceContext::Plan {
+                data: self.data_inference,
+                under_graph: under_graph[id],
+            });
             if let Some(note) = crate::sparql_constant::lowered_note(self, id) {
                 describe = format!("{describe}  {note}");
             }
@@ -3613,9 +3755,19 @@ impl PlanOp {
     /// "the same plan" has to be stated in terms of node descriptions rather
     /// than of `n3`.
     pub fn describe(&self) -> String {
+        self.describe_with(InferenceContext::Bare)
+    }
+
+    /// [`PlanOp::describe`] with the context the plan's printout has, so a
+    /// match reading no data graph and one reading the asserted graph are
+    /// told apart (see [`inference_tag`]).
+    fn describe_with(&self, context: InferenceContext) -> String {
         match self {
             PlanOp::Unit => "{}".to_owned(),
-            PlanOp::Match { pattern } => triple_text(pattern),
+            PlanOp::Match { pattern, reads } => match reads_tag(*reads, context) {
+                Some(label) => format!("{} [{label}]", triple_text(pattern)),
+                None => triple_text(pattern),
+            },
             PlanOp::Path {
                 subject,
                 path,
@@ -3765,15 +3917,50 @@ impl PlanOp {
             PlanOp::Scan {
                 star_var,
                 class_uri,
+                classes,
                 slots,
                 identifier_values,
+                direct_type,
+                direct_type_in,
+                ..
             } => format!(
-                "{} as ?{star_var}{}, requires [{}]",
+                "{}{}{} as ?{star_var}{}{}{}, requires [{}]",
                 shorten(class_uri),
+                scan_inference_tag(context)
+                    .map(|label| format!(" [{label}]"))
+                    .unwrap_or_default(),
+                {
+                    let others: Vec<String> = classes
+                        .iter()
+                        .filter(|class| *class != class_uri)
+                        .map(|class| shorten(class))
+                        .collect();
+                    if others.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (+ {})", others.join(", "))
+                    }
+                },
                 if identifier_values.is_empty() {
                     String::new()
                 } else {
                     format!(" is {}", identifier_values.join(", "))
+                },
+                if direct_type_in.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", type in {{{}}}",
+                        direct_type_in
+                            .iter()
+                            .map(|class| shorten(class))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+                match direct_type {
+                    Some(var) => format!(", type→?{var}"),
+                    None => String::new(),
                 },
                 slots
                     .iter()
@@ -3860,21 +4047,6 @@ impl From<ScopeError> for RefineError {
     }
 }
 
-/// Parse a query with the schema-less parser and build its naive plan.
-///
-/// Diagnostics and tests; a query here declares the datamodel's prefixes
-/// itself. See [`crate::sparql_scoper::sparql_parser`].
-pub fn naive_plan_of(query_str: &str) -> Result<Plan, RefineError> {
-    let parsed = crate::sparql_scoper::parse_query(query_str)?;
-    naive_plan(&parsed)
-}
-
-/// Parse a query with the schema-seeded parser and build its naive plan.
-pub fn naive_plan_for(query_str: &str, schema_view: &SchemaView) -> Result<Plan, RefineError> {
-    let parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
-    naive_plan(&parsed)
-}
-
 /// The query, faithfully, with every node engine-executed and nothing folded.
 ///
 /// The obligations are [`crate::sparql_plan::obligations_of`]'s, unchanged, so
@@ -3898,7 +4070,26 @@ pub fn naive_plan_for(query_str: &str, schema_view: &SchemaView) -> Result<Plan,
 /// obligation list is ordered the way it walks the algebra; checking turns a
 /// broken assumption into an error instead of a plan that answers a different
 /// question.
-pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
+///
+/// Each triple is matched under the type inference of the graph it reads, under
+/// `dataset`:
+///
+/// * outside any `GRAPH`: the dataset's default inference, or -- when the query
+///   writes a `FROM` -- the inference of the union of the graphs it names, and
+///   none when that union is no data (a schema graph, an unknown IRI);
+/// * inside `GRAPH <data graph>`: that graph's inference, and the `GRAPH` node is
+///   not in the plan -- it said which graph the patterns read, which each
+///   `Match` now says itself;
+/// * inside any other `GRAPH` (the schema graph, a variable, a graph the
+///   endpoint does not serve): no inference, under a [`PlanOp::Graph`] that
+///   stays, so no data rule folds what is not the data graph.
+///
+/// The caller's dataset decides all of it.
+pub(crate) fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
+    let graphs = QueryGraphs::new(dataset, query).map_err(ScopeError::from)?;
+    let default_reads = graphs.default_reads();
+
+    let data_inference = graphs.inference();
     let obligations = crate::sparql_plan::obligations_of(query)?;
     let form = QueryForm::of(query);
     let pattern = match query {
@@ -3927,6 +4118,9 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
         next_triple: 0,
         next_modifier: triple_count,
         domains_opened: 0,
+        graphs,
+        reads: default_reads,
+        inside_graph_node: false,
     };
     let mut root = builder.pattern(pattern, true);
 
@@ -3964,10 +4158,167 @@ pub fn naive_plan(query: &Query) -> Result<Plan, RefineError> {
     debug_assert_eq!(root, builder.nodes.len() - 1, "the root is the last node");
 
     let nodes = builder.nodes;
-    let plan = Plan::from_nodes(form, obligations, nodes);
+    let mut plan = Plan::from_nodes(form, obligations, nodes);
+    plan.data_inference = data_inference;
     plan.check().map_err(RefineError::Defect)?;
     Ok(plan)
 }
+
+/// How a node's inference is told in plan text. The plan's printout knows its one
+/// data inference and which nodes sit under a printed `GRAPH`; the context-free
+/// [`PlanOp::describe`] does not and keeps the short spelling.
+#[derive(Debug, Clone, Copy)]
+enum InferenceContext {
+    /// No plan around: no inference is told.
+    Bare,
+    /// Printed as part of a plan.
+    Plan {
+        /// The inference of the plan's one data graph: what its scans and its data matches
+        /// read under.
+        data: TypeInference,
+        under_graph: bool,
+    },
+}
+
+/// The tag the plan's data inference carries in plan text: its `Display`
+/// spelling, so the plan and the inference's own name never drift. Asserted is
+/// bare: a match that reads no data graph says so itself ([`reads_tag`]).
+fn inference_tag(inference: TypeInference) -> Option<String> {
+    (inference != TypeInference::ASSERTED).then(|| inference.to_string())
+}
+
+/// The tag a scan carries in plan text: the plan's data inference. A scan printed
+/// outside a plan has no inference to tell.
+fn scan_inference_tag(context: InferenceContext) -> Option<String> {
+    match context {
+        InferenceContext::Plan { data, .. } => inference_tag(data),
+        InferenceContext::Bare => None,
+    }
+}
+
+/// The tag a match carries in plan text: the plan's inference when it reads the
+/// data graph; otherwise what it reads, unless a printed `GRAPH` above it is
+/// the explanation. A match that reads no data graph and no graph a printed
+/// `GRAPH` names is told apart from one reading the asserted graph.
+fn reads_tag(reads: GraphReads, context: InferenceContext) -> Option<String> {
+    match (reads, context) {
+        (GraphReads::Data, _) => scan_inference_tag(context),
+        (
+            other,
+            InferenceContext::Plan {
+                under_graph: false, ..
+            },
+        ) => Some(
+            match other {
+                GraphReads::Schema => "schema graph",
+                GraphReads::Empty => "empty graph",
+                _ => "no data graph",
+            }
+            .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+/// `T`: `(class, type)` for every class of `classes` and every type its
+/// records carry under `inference` (canonical IRIs). `None` when a class is
+/// unknown to the schema.
+pub(crate) fn type_table(
+    schema: &SchemaView,
+    classes: &[String],
+    inference: TypeInference,
+) -> Option<Vec<(String, String)>> {
+    let mut rows = Vec::new();
+    for class in classes {
+        let view = schema.get_class_by_uri(class).ok().flatten()?;
+        for ty in linkml_runtime::schema_rdf::rdf_types(&view, inference).ok()? {
+            rows.push((class.clone(), ty.canonical_uri().to_string()));
+        }
+    }
+    Some(rows)
+}
+
+/// The classes a scan of `class_uri` stands for under `inference`: every class
+/// whose records have `class_uri` among their `rdf:type`s (canonical IRIs,
+/// sorted, deduplicated, `class_uri` included).
+///
+/// The one place this is computed, and [`Plan::scan_classes_agree`] recomputes
+/// it through here. A class the schema does not know stands for itself.
+///
+/// **An error is an error.** The schema view fails when it cannot resolve a
+/// class this walks through: `class_uri` itself, or a class below it whose
+/// `is_a` names a class that does not exist. The answer is then
+/// [`ScanClassesError`] and not a shorter list: a scan standing for fewer
+/// classes than its records belong to returns fewer rows, with nothing to say
+/// so. (A cycle in `is_a` and a mixin that does not resolve are no errors: the
+/// traversal is cycle-safe and skips an unresolved mixin.)
+pub(crate) fn scan_classes(
+    schema: &SchemaView,
+    class_uri: &str,
+    inference: TypeInference,
+) -> Result<Vec<String>, ScanClassesError> {
+    let failed = |message: String| ScanClassesError {
+        class_uri: class_uri.to_owned(),
+        inference,
+        message,
+    };
+    let mut classes: Vec<String> = match schema
+        .get_class_by_uri(class_uri)
+        .map_err(|e| failed(e.to_string()))?
+    {
+        Some(class) => type_family(&class, inference)
+            .map_err(|e| failed(e.to_string()))?
+            .iter()
+            .map(|class| class.canonical_uri().to_string())
+            .collect(),
+        // A class the schema does not know stands for itself.
+        None => Vec::new(),
+    };
+    classes.push(class_uri.to_owned());
+    classes.sort();
+    classes.dedup();
+    Ok(classes)
+}
+
+/// The schema could not say which classes a scan stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) struct ScanClassesError {
+    class_uri: String,
+    inference: TypeInference,
+    /// The schema's own error.
+    message: String,
+}
+
+#[cfg(test)]
+impl ScanClassesError {
+    /// The class the scan was of.
+    pub(crate) fn class_uri(&self) -> &str {
+        &self.class_uri
+    }
+
+    /// The inference its family was asked for under.
+    pub(crate) fn inference(&self) -> TypeInference {
+        self.inference
+    }
+
+    /// The schema's own error.
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ScanClassesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the classes a scan of <{}> stands for ({}) cannot be derived from the schema: {}",
+            self.class_uri, self.inference, self.message
+        )
+    }
+}
+
+impl std::error::Error for ScanClassesError {}
 
 /// Walks the algebra once, in the same order the obligation enumeration walks
 /// it, so a node can claim the obligation that came from the same place.
@@ -3983,6 +4334,18 @@ struct Builder<'o> {
     /// Naming domains opened so far: each off-spine sub-`SELECT` gets the
     /// next one, in walk order. The scoper counts the same way.
     domains_opened: usize,
+    /// The dataset, and the `FROM` clause the query put over it.
+    graphs: QueryGraphs<'o>,
+    /// What the graph the walk is in holds: what a triple matched here
+    /// reads. Anything but a data graph (the schema graph, a variable, a
+    /// graph the endpoint does not serve) is one no data rule may fold. The
+    /// empty graph (the default graph of a query with `FROM NAMED` and no
+    /// `FROM`) has no solution for a triple pattern, so one matched there is
+    /// planned as the empty relation, not as a match for some rule or the
+    /// engine to find out about.
+    reads: GraphReads,
+    /// Whether the walk is inside a `GRAPH` that stays in the plan as a node.
+    inside_graph_node: bool,
 }
 
 impl Builder<'_> {
@@ -4360,7 +4723,35 @@ impl Builder<'_> {
                 self.push(PlanOp::Project { input, vars }, Vec::new(), bound)
             }
             GraphPattern::Graph { name, inner } => {
+                let reads = match name {
+                    NamedNodePattern::NamedNode(graph) => self.graphs.graph_reads(graph.as_str()),
+                    // May bind a data graph or the schema graph; which one is
+                    // the engine's to say.
+                    NamedNodePattern::Variable(_) => GraphReads::Other,
+                };
+                // A data graph inside a `GRAPH` that stays is the engine's: an
+                // inner `GRAPH` switches graph, whatever encloses it, but a
+                // `Match` under a kept `Graph` node is read by the rules as
+                // that graph's.
+                let reads = match reads {
+                    GraphReads::Data if self.inside_graph_node => GraphReads::Other,
+                    other => other,
+                };
+                // A data graph holds the records every `Match` reads, so the
+                // `GRAPH` says nothing the matches do not. No node for it,
+                // hence none of the rules that treat a `Graph` as opaque has
+                // anything to decline.
+                let dissolves = matches!(reads, GraphReads::Data);
+                // A named graph is never the empty default graph.
+                let outer = std::mem::replace(&mut self.reads, reads);
+                let outer_inside = self.inside_graph_node;
+                self.inside_graph_node |= !dissolves;
                 let input = self.pattern(inner, on_spine);
+                self.reads = outer;
+                self.inside_graph_node = outer_inside;
+                if dissolves {
+                    return input;
+                }
                 let vars = self.vars[input].clone();
                 self.push(
                     PlanOp::Graph {
@@ -4480,13 +4871,21 @@ impl Builder<'_> {
                 vars.insert(variable.as_str().to_owned());
             }
             add_term_var(&pattern.object, &mut vars);
-            let node = self.push(
+            let op = if self.reads == GraphReads::Empty {
+                PlanOp::Values {
+                    variables: vars
+                        .iter()
+                        .map(|name| spargebra::term::Variable::new_unchecked(name.as_str()))
+                        .collect(),
+                    rows: Vec::new(),
+                }
+            } else {
                 PlanOp::Match {
                     pattern: Box::new(pattern.clone()),
-                },
-                claims,
-                vars,
-            );
+                    reads: self.reads,
+                }
+            };
+            let node = self.push(op, claims, vars);
             current = Some(match current {
                 Some(left) => self.join(left, node),
                 None => node,
@@ -4661,7 +5060,11 @@ mod tests {
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
 
     fn plan_of(query: &str) -> Plan {
-        naive_plan_of(&format!("{PREFIX}{query}")).expect("should build a naive plan")
+        naive_plan(
+            &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("should build a naive plan")
     }
 
     /// The shapes a naive plan has to hold, and the ledger balancing on every
@@ -4999,8 +5402,11 @@ mod tests {
             "SELECT ?s WHERE { ?s a asset360:Signal MINUS { ?s asset360:name ?nm } }",
             "SELECT ?nm WHERE { ?s asset360:locatedOnTrack+/asset360:hasName ?nm }",
         ] {
-            let error = naive_plan_of(&format!("{PREFIX}{query}"))
-                .expect_err("obligation enumeration refuses this");
+            let error = naive_plan(
+                &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect_err("obligation enumeration refuses this");
             assert!(
                 matches!(error, RefineError::Scope(_)),
                 "refused for the enumeration's reason, not a defect: {error} for {query}"
@@ -5091,6 +5497,9 @@ mod tests {
             PlanOp::Scan {
                 star_var: "s".to_owned(),
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
+                classes: vec!["https://data.infrabel.be/asset360/Signal".to_owned()],
+                direct_type: None,
+                direct_type_in: Vec::new(),
                 identifier_values: Vec::new(),
                 slots: vec![ScanSlot {
                     path: vec!["trafficKinds".to_owned()],
@@ -5135,6 +5544,7 @@ mod tests {
         let nodes = scan_with_fanout(
             "s",
             "https://data.infrabel.be/asset360/TunnelComplex",
+            vec!["https://data.infrabel.be/asset360/TunnelComplex".to_owned()],
             slots,
             Vec::new(),
             0,
@@ -5145,6 +5555,499 @@ mod tests {
         assert!(
             nodes.iter().all(|node| node.executor == Executor::Sql),
             "a folded subtree runs in SQL"
+        );
+    }
+
+    /// The dataset decides which graph each pattern reads: `FROM`, a `GRAPH`
+    /// naming a data graph (which dissolves -- each `Match` says its graph),
+    /// and the schema graph (which stays, reading no inference). A query reads
+    /// **one** data inference: a read of two is refused, by the one function both
+    /// routes use.
+    #[test]
+    fn the_dataset_decides_each_patterns_inference() {
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        const S: &str = "urn:graph:schema";
+        let sv = crate::sparql_scoper::tests::test_schema_view_plus(
+            "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
+        );
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeInference::ASSERTED,
+            &[
+                (A, TypeInference::ASSERTED),
+                (I, TypeInference::IS_A),
+                ("urn:graph:mixins", TypeInference::IS_A_AND_MIXINS),
+            ],
+            &[(S, TypeInference::IS_A)],
+        );
+        let try_plan = |query: &str| {
+            let parsed =
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
+            naive_plan(&parsed, &dataset)
+        };
+        let plan = |query: &str| try_plan(query).unwrap();
+        let refused = |query: &str| {
+            let message = try_plan(query).expect_err(query).to_string();
+            assert!(
+                message.starts_with(
+                    "cross_data_graph: a query can read one data graph; \
+                                     rewrite it per graph"
+                ),
+                "{query}: {message}"
+            );
+            message
+        };
+        // `(has a Graph node above it, inference)` per match, in node order.
+        let matches = |plan: &Plan| -> Vec<(String, Option<TypeInference>)> {
+            plan.nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    PlanOp::Match { pattern, reads } => Some((
+                        triple_text(pattern),
+                        reads.is_data().then_some(plan.data_inference),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        let inferences = |plan: &Plan| -> Vec<Option<TypeInference>> {
+            matches(plan)
+                .into_iter()
+                .map(|(_, inference)| inference)
+                .collect()
+        };
+        let graph_nodes = |plan: &Plan| {
+            plan.nodes
+                .iter()
+                .filter(|node| matches!(node.op, PlanOp::Graph { .. }))
+                .count()
+        };
+
+        // No `FROM`: the dataset's default inference. `FROM <A>` / `FROM <I>`:
+        // that graph's.
+        let body = "{ ?s a asset360:Signal ; asset360:name ?n }";
+        assert_eq!(
+            inferences(&plan(&format!("SELECT ?s WHERE {body}"))),
+            vec![Some(TypeInference::ASSERTED); 2]
+        );
+        assert_eq!(
+            inferences(&plan(&format!("SELECT ?s FROM <{A}> WHERE {body}"))),
+            vec![Some(TypeInference::ASSERTED); 2]
+        );
+        assert_eq!(
+            inferences(&plan(&format!("SELECT ?s FROM <{I}> WHERE {body}"))),
+            vec![Some(TypeInference::IS_A); 2]
+        );
+        // The same graph twice is one graph.
+        assert_eq!(
+            inferences(&plan(&format!(
+                "SELECT ?s FROM <{I}> FROM <{I}> WHERE {body}"
+            ))),
+            vec![Some(TypeInference::IS_A); 2]
+        );
+        // A `FROM` that is no data -- a schema graph, an unknown IRI -- reads
+        // no inference, and the engine answers.
+        for graph in [S, "urn:unknown"] {
+            assert_eq!(
+                inferences(&plan(&format!("SELECT ?s FROM <{graph}> WHERE {body}"))),
+                vec![None; 2],
+                "{graph}"
+            );
+        }
+
+        // `GRAPH <data graph>` dissolves; the matches carry its inference.
+        let in_inferred = plan(&format!("SELECT ?s WHERE {{ GRAPH <{I}> {body} }}"));
+        assert_eq!(inferences(&in_inferred), vec![Some(TypeInference::IS_A); 2]);
+        assert_eq!(graph_nodes(&in_inferred), 0, "{in_inferred}");
+        // A plan that reads the inference of another graph than the dataset's
+        // default says so in its text.
+        assert!(in_inferred.to_string().contains("[is_a]"), "{in_inferred}");
+        // A `FROM` alone leaves no named graph (it parses as an empty
+        // `FROM NAMED` list, SPARQL 1.1 13.2): `GRAPH <I>` reads nothing the
+        // plan can name, and is the engine's to say so.
+        let from_and_graph = plan(&format!(
+            "SELECT ?s FROM <{A}> WHERE {{ GRAPH <{I}> {body} }}"
+        ));
+        assert_eq!(inferences(&from_and_graph), vec![None; 2]);
+        assert_eq!(graph_nodes(&from_and_graph), 1);
+        // The schema graph stays, and reads no inference.
+        let kept = plan(&format!("SELECT ?s WHERE {{ GRAPH <{S}> {body} }}"));
+        assert_eq!(inferences(&kept), vec![None; 2]);
+        assert_eq!(graph_nodes(&kept), 1, "{kept}");
+        // A data graph beside the schema graph is one data inference.
+        let beside = plan(&format!(
+            "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} \
+             GRAPH <{S}> {{ ?c a asset360:Signal }} }}"
+        ));
+        assert_eq!(inferences(&beside), vec![Some(TypeInference::IS_A), None]);
+        // A data graph inside the schema graph is read as the data graph (an
+        // inner `GRAPH` switches graph), but never by the rules: it stays under
+        // both `Graph` nodes, so no rule takes it for a read of the datamodel
+        // (a schema-only region) or folds it into a scan.
+        let nested = plan(&format!(
+            "SELECT ?s WHERE {{ GRAPH <{S}> {{ GRAPH <{I}> {body} }} }}"
+        ));
+        assert_eq!(inferences(&nested), vec![None; 2]);
+        assert_eq!(graph_nodes(&nested), 2, "{nested}");
+        // Under `FROM NAMED` a graph outside the set matches nothing: kept as
+        // a `GRAPH` for the engine to say so.
+        let outside = plan(&format!(
+            "SELECT ?s FROM NAMED <{S}> WHERE {{ GRAPH <{I}> {body} }}"
+        ));
+        assert_eq!(inferences(&outside), vec![None; 2]);
+        assert_eq!(graph_nodes(&outside), 1);
+
+        // `FROM NAMED` and no `FROM`: the default graph is the empty graph
+        // (SPARQL 1.1 13.2). A pattern outside any `GRAPH` is the empty
+        // relation -- no match left for anything to find out about.
+        let empty_default = plan(&format!("SELECT ?s FROM NAMED <{S}> WHERE {body}"));
+        assert!(matches(&empty_default).is_empty(), "{empty_default}");
+        let empty_rows = empty_default
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.op, PlanOp::Values { rows, .. } if rows.is_empty()))
+            .count();
+        assert_eq!(empty_rows, 2, "{empty_default}");
+
+        // **The refusals**: every read of a second data inference, or of a graph
+        // that can be one.
+        // Data graphs of different inferences in one `FROM`.
+        let message = refused(&format!("SELECT ?s FROM <{A}> FROM <{I}> WHERE {body}"));
+        assert!(message.contains(A) && message.contains(I), "{message}");
+        // Two `GRAPH` blocks over data graphs of different inferences.
+        refused(&format!(
+            "SELECT ?s WHERE {{ GRAPH <{A}> {{ ?s a asset360:Signal }} \
+             GRAPH <{I}> {{ ?s a asset360:ShuntSignal }} }}"
+        ));
+        // A `GRAPH` over a data graph whose inference differs from the default
+        // graph's, which the query also reads.
+        let message = refused(&format!(
+            "SELECT ?s ?n WHERE {{ ?s a asset360:Signal GRAPH <{I}> {{ ?s asset360:name ?n }} }}"
+        ));
+        assert!(
+            message.contains("the default graph") && message.contains(I),
+            "{message}"
+        );
+        // `GRAPH ?g` while the dataset serves data graphs.
+        let message = refused(&format!("SELECT ?s WHERE {{ GRAPH ?g {body} }}"));
+        assert!(message.contains("GRAPH ?g"), "{message}");
+        // `FROM NAMED` of two data graphs, which `GRAPH ?g` ranges over.
+        refused(&format!(
+            "SELECT ?s FROM NAMED <{A}> FROM NAMED <{I}> WHERE {{ GRAPH ?g {body} }}"
+        ));
+        // A data graph in `FROM NAMED` is read only through a `GRAPH`: that one
+        // is the query's data graph, and a listed graph nothing reads is none.
+        let named = plan(&format!(
+            "SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {body} }}"
+        ));
+        assert_eq!(inferences(&named), vec![Some(TypeInference::IS_A); 2]);
+        let listed = plan(&format!(
+            "SELECT ?s FROM <{A}> FROM NAMED <{I}> WHERE {body}"
+        ));
+        assert_eq!(inferences(&listed), vec![Some(TypeInference::ASSERTED); 2]);
+        // The default graph beside a named data graph is refused even when
+        // that graph has the default inference (asserted): a query uses the
+        // default graph or names its data graph, never both.
+        let message = refused(&format!(
+            "SELECT ?s ?n WHERE {{ ?s a asset360:Signal GRAPH <{A}> {{ ?s asset360:name ?n }} }}"
+        ));
+        assert!(
+            message.contains("the default graph") && message.contains(A),
+            "{message}"
+        );
+    }
+
+    /// Review F9: the text tells a match that reads no data graph from one
+    /// that reads the asserted graph. Asserted is bare only when it is the
+    /// plan's own default; under another default it is said (`[asserted]`),
+    /// and a match outside a printed `GRAPH` that reads no inference says so.
+    #[test]
+    fn the_plan_text_tells_no_data_graph_from_the_asserted_one() {
+        const A: &str = "urn:graph:asserted";
+        const S: &str = "urn:graph:schema";
+        let sv = crate::sparql_scoper::tests::test_schema_view();
+        let text = |default: TypeInference, query: &str| {
+            let dataset = crate::sparql_dataset::dataset_with(
+                default,
+                &[(A, TypeInference::ASSERTED)],
+                &[(S, TypeInference::IS_A)],
+            );
+            let parsed =
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
+            naive_plan(&parsed, &dataset).unwrap().to_string()
+        };
+        let body = "?s asset360:name ?n";
+        // The default inference, asserted: as it always printed.
+        let plain = text(
+            TypeInference::ASSERTED,
+            &format!("SELECT ?s WHERE {{ {body} }}"),
+        );
+        assert!(
+            !plain.contains("[asserted]") && !plain.contains("[no data"),
+            "{plain}"
+        );
+        // A query reads one data graph, and the plan's inference is its: asserted
+        // under `A` is bare whatever the dataset's default inference is.
+        let in_a = text(
+            TypeInference::IS_A,
+            &format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"),
+        );
+        assert!(!in_a.contains("[asserted]"), "{in_a}");
+        // No data graph, outside any printed GRAPH: said, and not the same
+        // text as the asserted match.
+        let nowhere = text(
+            TypeInference::ASSERTED,
+            &format!("SELECT ?s FROM <urn:unknown> WHERE {{ {body} }}"),
+        );
+        assert!(nowhere.contains("[no data graph]"), "{nowhere}");
+        // Under a printed GRAPH the graph is the explanation: no tag.
+        let under_graph = text(
+            TypeInference::ASSERTED,
+            &format!("SELECT ?s WHERE {{ GRAPH <{S}> {{ {body} }} }}"),
+        );
+        assert!(
+            under_graph.contains("graph ") && !under_graph.contains("[no data"),
+            "{under_graph}"
+        );
+    }
+
+    /// A class whose family the schema cannot derive is an error, not a scan
+    /// that quietly stands for fewer classes (and so returns fewer rows).
+    #[test]
+    fn a_family_the_schema_cannot_derive_is_an_error_not_a_shorter_scan() {
+        let sv = crate::sparql_scoper::tests::test_schema_view_plus(
+            "  Broken:\n    class_uri: asset360:Broken\n    is_a: nosuchprefix:Thing\n",
+        );
+        let signal = "https://data.infrabel.be/asset360/Signal";
+        // Under `asserted` a family is the class alone: nothing to derive.
+        assert_eq!(
+            scan_classes(&sv, signal, TypeInference::ASSERTED).unwrap(),
+            vec![signal.to_owned()]
+        );
+        // Under `is_a` the family is read off every class, `Broken` included.
+        let error = scan_classes(&sv, signal, TypeInference::IS_A)
+            .expect_err("the schema cannot say what the family is");
+        assert_eq!(error.class_uri(), signal);
+        assert_eq!(error.inference(), TypeInference::IS_A);
+        assert!(!error.message().is_empty());
+
+        // The planner surfaces it to the caller instead of planning a scan
+        // that reads only `Signal`.
+        let dataset = crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]);
+        let query =
+            format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?n }}");
+        let planned = crate::sparql_plan::plan_of(&query, &sv, &dataset)
+            .expect_err("a planning error, not a plan");
+        assert!(
+            matches!(planned, crate::sparql_scoper::ScopeError::SchemaError(_)),
+            "{planned}"
+        );
+    }
+
+    /// A match says what graph it reads, not only whether it is a data graph:
+    /// the data graph (under its inference), the schema graph, and a graph the
+    /// endpoint does not serve or one only a variable names are four answers,
+    /// and the plan text keeps them apart.
+    #[test]
+    fn a_match_says_which_kind_of_graph_it_reads() {
+        const A: &str = "urn:graph:asserted";
+        const S: &str = "urn:graph:schema";
+        let sv = crate::sparql_scoper::tests::test_schema_view();
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeInference::ASSERTED,
+            &[(A, TypeInference::IS_A)],
+            &[(S, TypeInference::IS_A)],
+        );
+        let body = "?s asset360:name ?n";
+        let reads_of = |query: &str| -> (Vec<GraphReads>, String) {
+            let parsed =
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
+            let plan = naive_plan(&parsed, &dataset).unwrap();
+            let reads = plan
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    PlanOp::Match { reads, .. } => Some(*reads),
+                    _ => None,
+                })
+                .collect();
+            (reads, plan.to_string())
+        };
+
+        let (reads, _) = reads_of(&format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"));
+        assert_eq!(reads, vec![GraphReads::Data]);
+        let (reads, _) = reads_of(&format!("SELECT ?s WHERE {{ GRAPH <{S}> {{ {body} }} }}"));
+        assert_eq!(reads, vec![GraphReads::Schema]);
+        let (reads, _) = reads_of(&format!(
+            "SELECT ?s WHERE {{ GRAPH <urn:unknown> {{ {body} }} }}"
+        ));
+        assert_eq!(reads, vec![GraphReads::Other]);
+        // `GRAPH ?g` reads whatever graph it binds: only the engine can say
+        // which. (Over a dataset that serves a data graph it is refused: it
+        // could read several; with exactly one it is that one.)
+        let schema_only = crate::sparql_dataset::schema_dataset(S);
+        let parsed = crate::sparql_scoper::parse_query(
+            &format!("{PREFIX}SELECT ?s WHERE {{ GRAPH ?g {{ {body} }} }}"),
+            Some(&sv),
+        )
+        .unwrap();
+        let variable = naive_plan(&parsed, &schema_only).unwrap();
+        assert!(
+            variable.nodes.iter().any(|node| matches!(
+                &node.op,
+                PlanOp::Match {
+                    reads: GraphReads::Other,
+                    ..
+                }
+            )),
+            "{variable}"
+        );
+        assert!(naive_plan(&parsed, &dataset).is_ok(), "one data graph");
+        let two = crate::sparql_dataset::dataset_with(
+            TypeInference::ASSERTED,
+            &[
+                (A, TypeInference::IS_A),
+                ("urn:graph:other", TypeInference::ASSERTED),
+            ],
+            &[(S, TypeInference::IS_A)],
+        );
+        assert!(naive_plan(&parsed, &two).is_err());
+        // Outside any `GRAPH`, a `FROM` that names the schema graph reads it,
+        // and the printout says so rather than "no data graph".
+        let (reads, text) = reads_of(&format!("SELECT ?s FROM <{S}> WHERE {{ {body} }}"));
+        assert_eq!(reads, vec![GraphReads::Schema]);
+        assert!(text.contains("[schema graph]"), "{text}");
+        let (reads, text) = reads_of(&format!("SELECT ?s FROM <urn:unknown> WHERE {{ {body} }}"));
+        assert_eq!(reads, vec![GraphReads::Other]);
+        assert!(text.contains("[no data graph]"), "{text}");
+        // Only the data graph answers the one-line question the rules ask.
+        assert!(GraphReads::Data.is_data());
+        for other in [GraphReads::Schema, GraphReads::Other, GraphReads::Empty] {
+            assert!(!other.is_data());
+        }
+    }
+
+    /// An inference is on every matched triple and every scan: a triple outside
+    /// `GRAPH` carries the dataset's, one inside carries none; a scan under
+    /// `is_a` lists the subclasses it reads, in the plan text and in
+    /// `classes`; and an asserted plan prints as it always did.
+    #[test]
+    fn a_inference_reaches_every_match_and_scan() {
+        // A subclass of `Signal`, so an inference other than `asserted` has a
+        // family to list: under `is_a` a scan of `Signal` also reads these.
+        let sv = crate::sparql_scoper::tests::test_schema_view_plus(
+            "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
+        );
+        let signal = "https://data.infrabel.be/asset360/Signal".to_owned();
+        let shunt = "https://data.infrabel.be/asset360/ShuntSignal".to_owned();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?g WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+             GRAPH <https://example.org/g> {{ ?g a asset360:Signal }} }}"
+        );
+        let parsed = crate::sparql_scoper::parse_query(&query, Some(&sv)).unwrap();
+        let inferences = |plan: &Plan| -> Vec<(String, Option<TypeInference>)> {
+            plan.nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    PlanOp::Match { pattern, reads } => Some((
+                        triple_text(pattern),
+                        reads.is_data().then_some(plan.data_inference),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let asserted = naive_plan(
+            &parsed,
+            &crate::sparql_dataset::dataset_with(TypeInference::ASSERTED, &[], &[]),
+        )
+        .unwrap();
+        let in_graph = |inferences: &[(String, Option<TypeInference>)]| {
+            inferences
+                .iter()
+                .map(|(text, inference)| (text.contains("?g"), *inference))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            in_graph(&inferences(&asserted)),
+            vec![
+                (false, Some(TypeInference::ASSERTED)),
+                (false, Some(TypeInference::ASSERTED)),
+                (true, None),
+            ]
+        );
+        // Asserted plan text carries no inference label, on a match or a scan.
+        assert!(!asserted.to_string().contains("[is_a"), "{asserted}");
+
+        let is_a = naive_plan(
+            &parsed,
+            &crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            in_graph(&inferences(&is_a)),
+            vec![
+                (false, Some(TypeInference::IS_A)),
+                (false, Some(TypeInference::IS_A)),
+                (true, None),
+            ]
+        );
+        assert!(is_a.to_string().contains("[is_a]"), "{is_a}");
+
+        // Folded under `is_a`: the scan of `Signal` reads `ShuntSignal` too.
+        // The match under `GRAPH` is nobody's to fold and stays a match.
+        for (plan, expected) in [
+            (&asserted, vec![signal.clone()]),
+            (&is_a, vec![shunt.clone(), signal.clone()]),
+        ] {
+            let rules =
+                crate::sparql_rules::tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
+            let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+                rules.iter().map(|rule| rule.as_ref()).collect();
+            let mut plan = plan.clone();
+            crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
+            plan.check_with(&sv).unwrap();
+            let scans: Vec<&Vec<String>> = plan
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    PlanOp::Scan { classes, .. } => Some(classes),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(scans, vec![&expected], "{plan}");
+            assert_eq!(
+                plan.to_string().contains("(+ asset360:ShuntSignal)"),
+                expected.len() > 1,
+                "{plan}"
+            );
+            assert!(
+                plan.nodes.iter().any(
+                    |node| matches!(&node.op, PlanOp::Match { reads, .. } if !reads.is_data())
+                ),
+                "{plan}"
+            );
+        }
+
+        // The invariant: a scan that lists the wrong family is refused.
+        let mut refined = is_a.clone();
+        let rules =
+            crate::sparql_rules::tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
+        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+            rules.iter().map(|rule| rule.as_ref()).collect();
+        crate::sparql_rules::refine(&mut refined, &borrowed).unwrap();
+        let scan = refined
+            .nodes
+            .iter()
+            .position(|node| matches!(node.op, PlanOp::Scan { .. }))
+            .unwrap();
+        if let PlanOp::Scan { classes, .. } = &mut refined.nodes[scan].op {
+            classes.retain(|class| *class != shunt);
+        }
+        assert_eq!(
+            refined.scan_classes_agree(&sv),
+            Err(PlanDefect::MisrecordedScanClasses { scan })
         );
     }
 
@@ -5908,8 +6811,8 @@ mod tests {
                 _ => None,
             }
         }
-        let parsed =
-            crate::sparql_scoper::parse_query(query).unwrap_or_else(|err| panic!("{query}: {err}"));
+        let parsed = crate::sparql_scoper::parse_query(query, None)
+            .unwrap_or_else(|err| panic!("{query}: {err}"));
         let Query::Select { pattern, .. } = &parsed else {
             unreachable!("a SELECT")
         };
@@ -6004,7 +6907,7 @@ mod tests {
             .iter()
             .enumerate()
             .find(|(_, node)| match &node.op {
-                PlanOp::Match { pattern } => {
+                PlanOp::Match { pattern, .. } => {
                     predicate_iri(pattern) == Some("https://data.infrabel.be/asset360/name")
                 }
                 _ => false,
@@ -6015,7 +6918,7 @@ mod tests {
             .nodes
             .iter()
             .enumerate()
-            .find(|(_, node)| matches!(&node.op, PlanOp::Match { pattern } if is_type_pattern(pattern)))
+            .find(|(_, node)| matches!(&node.op, PlanOp::Match { pattern, .. } if is_type_pattern(pattern)))
             .map(|(id, _)| id)
             .expect("the type match is a node");
         let mandatory = matches
@@ -6032,7 +6935,8 @@ mod tests {
     /// -- kept local rather than shared because that one is private to its
     /// own module's `mod tests`.
     fn refined_plan(query: &str, sv: &SchemaView) -> Plan {
-        let rules = crate::sparql_rules::tier_one_rules(sv, None);
+        let rules =
+            crate::sparql_rules::tier_one_rules(sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         let mut plan = plan_of(query);

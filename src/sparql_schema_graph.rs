@@ -46,11 +46,11 @@
 //! there is no defensible default.
 
 #[cfg(feature = "sparql-endpoint")]
-use linkml_runtime::schema_rdf::{SchemaRdfOptions, schema_triples};
+use linkml_runtime::schema_rdf::{SchemaRdfOptions, TypeInference, schema_triples};
 #[cfg(feature = "sparql-endpoint")]
 use linkml_schemaview::schemaview::SchemaView;
 #[cfg(feature = "sparql-endpoint")]
-use oxigraph::model::{GraphName, NamedNode, Quad};
+use oxigraph::model::{GraphName, NamedNode, Quad, Triple};
 
 /// `owl:equivalentProperty`, the predicate that bridges a slot's two spellings.
 #[cfg(feature = "sparql-endpoint")]
@@ -89,13 +89,23 @@ impl std::fmt::Display for InvalidGraphIri {
 #[cfg(feature = "sparql-endpoint")]
 impl std::error::Error for InvalidGraphIri {}
 
+#[cfg(all(test, feature = "sparql-endpoint"))]
+thread_local! {
+    /// How many times [`SchemaGraph::build`] ran on this thread: building one
+    /// costs ~300 ms on the asset360 datamodel, so a test pins how many a
+    /// request pays for. Per thread, so parallel tests do not see each other.
+    pub(crate) static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The triplified datamodel, in one named graph, plus what could not be
 /// triplified.
 #[cfg(feature = "sparql-endpoint")]
 #[derive(Debug)]
 pub struct SchemaGraph {
-    /// Every quad, all of them in the graph the caller named.
-    pub quads: Vec<Quad>,
+    /// Every triple of the datamodel. A graph name is the *placement* of
+    /// these, which only a caller that loads quads needs: see
+    /// [`Self::quads_in`].
+    pub triples: Vec<Triple>,
     /// Terms dropped because their IRI would not have been absolute — an
     /// unexpandable CURIE, most likely a prefix the converter never saw. Kept
     /// rather than discarded so the endpoint can say *what* is missing instead
@@ -105,32 +115,87 @@ pub struct SchemaGraph {
 
 #[cfg(feature = "sparql-endpoint")]
 impl SchemaGraph {
-    /// Build the schema graph for one [`SchemaView`], in the named graph
-    /// `graph_iri`.
+    /// Build the schema graph for one [`SchemaView`].
     ///
     /// The triples come from [`linkml_runtime::schema_rdf`], plus what this
     /// crate adds on top: slot aliases ([`Self::alias_quads`]) and the
     /// language-tagged enum labels of [`crate::sparql_schema_labels`].
-    pub fn build(sv: &SchemaView, graph_iri: &str) -> Result<Self, InvalidGraphIri> {
+    ///
+    /// `inference` is the type inference the subclass edges are published under
+    /// (see [`linkml_runtime::schema_rdf::TypeInference`]): one schema graph per
+    /// inference the dataset serves.
+    pub fn build(sv: &SchemaView, inference: TypeInference) -> Self {
+        #[cfg(test)]
+        BUILDS.with(|builds| builds.set(builds.get() + 1));
+        let built = schema_triples(sv, &SchemaRdfOptions::default().with_inference(inference));
+        let mut triples = built.triples;
+        // The extras are written as quads in the default graph and stripped to
+        // triples: their graph is decided by the caller, in `quads_in`.
+        let unplaced = GraphName::DefaultGraph;
+        triples.extend(
+            Self::alias_quads(sv, &unplaced)
+                .into_iter()
+                .chain(crate::sparql_schema_labels::enum_label_quads(sv, &unplaced))
+                .map(|quad| Triple::new(quad.subject, quad.predicate, quad.object)),
+        );
+        SchemaGraph {
+            triples,
+            skipped: built.skipped,
+        }
+    }
+
+    /// The quads of several schema graphs, each placed in its own named graph:
+    /// what the engine leg and a materialisation load.
+    ///
+    /// A graph's triples depend on its inference and on nothing else (the IRI is
+    /// only the placement, [`Self::quads_in`]), so the datamodel is built once
+    /// per *distinct inference* and re-labelled per graph. Building is the
+    /// expensive part (~300 ms on the asset360 datamodel); two graphs
+    /// publishing the same inference must not pay twice. The one place a request
+    /// builds schema graphs, so the executor and the planner share the rule.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidGraphIri`] when a graph's IRI is not absolute.
+    pub fn quads_of_graphs<'a>(
+        sv: &SchemaView,
+        graphs: impl IntoIterator<Item = (&'a str, TypeInference)>,
+    ) -> Result<Vec<Quad>, InvalidGraphIri> {
+        let mut built: std::collections::HashMap<TypeInference, SchemaGraph> = Default::default();
+        let mut quads = Vec::new();
+        for (iri, inference) in graphs {
+            let graph = built
+                .entry(inference)
+                .or_insert_with(|| SchemaGraph::build(sv, inference));
+            quads.extend(graph.quads_in(iri)?);
+        }
+        Ok(quads)
+    }
+
+    /// Every triple placed in the named graph `graph_iri`: the quads to load
+    /// into a store.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidGraphIri`] when `graph_iri` is not an absolute IRI.
+    pub fn quads_in(&self, graph_iri: &str) -> Result<Vec<Quad>, InvalidGraphIri> {
         let graph =
             GraphName::NamedNode(NamedNode::new(graph_iri).map_err(|err| InvalidGraphIri {
                 iri: graph_iri.to_owned(),
                 reason: err.to_string(),
             })?);
-
-        let built = schema_triples(sv, &SchemaRdfOptions::default());
-        let mut quads: Vec<Quad> = built
+        Ok(self
             .triples
-            .into_iter()
-            .map(|t| Quad::new(t.subject, t.predicate, t.object, graph.clone()))
-            .collect();
-        quads.extend(Self::alias_quads(sv, &graph));
-        // The one call into the shim; see that module for why it is one.
-        quads.extend(crate::sparql_schema_labels::enum_label_quads(sv, &graph));
-        Ok(SchemaGraph {
-            quads,
-            skipped: built.skipped,
-        })
+            .iter()
+            .map(|t| {
+                Quad::new(
+                    t.subject.clone(),
+                    t.predicate.clone(),
+                    t.object.clone(),
+                    graph.clone(),
+                )
+            })
+            .collect())
     }
 
     /// The second spelling of every slot and every class that has one.
@@ -221,16 +286,16 @@ impl SchemaGraph {
 
     /// The graph as N-Triples, for tests and for a human reading it.
     ///
-    /// N-Triples and not N-Quads because the graph name is implicit — the
-    /// caller asked for *this* graph.
+    /// N-Triples and not N-Quads because the graph name is no part of what the
+    /// datamodel says.
     pub fn to_ntriples(&self) -> String {
         let mut out = String::new();
-        for quad in &self.quads {
-            out.push_str(&quad.subject.to_string());
+        for triple in &self.triples {
+            out.push_str(&triple.subject.to_string());
             out.push(' ');
-            out.push_str(&quad.predicate.to_string());
+            out.push_str(&triple.predicate.to_string());
             out.push(' ');
-            out.push_str(&quad.object.to_string());
+            out.push_str(&triple.object.to_string());
             out.push_str(" .\n");
         }
         out
@@ -283,8 +348,8 @@ mod tests {
     /// consolidator-server test suite pins that count.)
     #[test]
     fn the_fixture_quad_count_is_pinned() {
-        let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert_eq!(graph.quads.len(), 5826);
+        let graph = SchemaGraph::build(&asset360_schema_view(), TypeInference::ASSERTED);
+        assert_eq!(graph.triples.len(), 5826);
     }
 
     /// The number above is not a number to be re-pinned when it moves; it has
@@ -300,11 +365,11 @@ mod tests {
     #[test]
     fn the_quad_count_reconciles_with_the_restrictions() {
         let sv = asset360_schema_view();
-        let graph = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH).unwrap();
+        let graph = SchemaGraph::build(&sv, TypeInference::ASSERTED);
 
         let count = |predicate: &str| {
             graph
-                .quads
+                .triples
                 .iter()
                 .filter(|q| q.predicate.as_str() == predicate)
                 .count()
@@ -333,7 +398,7 @@ mod tests {
         );
 
         let typed_restrictions = graph
-            .quads
+            .triples
             .iter()
             .filter(|q| {
                 q.predicate.as_str() == RDF_TYPE
@@ -386,7 +451,7 @@ mod tests {
         let class_aliases = count(OWL_EQUIVALENT_CLASS);
         assert_eq!(class_aliases, 2 * 52, "52 aliased classes, both directions");
         assert_eq!(
-            graph.quads.len(),
+            graph.triples.len(),
             1668 + 4 * restrictions + aliases + class_aliases + labels
         );
     }
@@ -528,9 +593,9 @@ classes:
 
     /// The schema graph in an oxigraph store, ready to be queried.
     fn store_of(sv: &SchemaView) -> Store {
-        let graph = SchemaGraph::build(sv, ASSET360_SCHEMA_GRAPH).unwrap();
+        let graph = SchemaGraph::build(sv, TypeInference::ASSERTED);
         let store = Store::new().unwrap();
-        for quad in &graph.quads {
+        for quad in &graph.quads_in(ASSET360_SCHEMA_GRAPH).unwrap() {
             store.insert(quad).unwrap();
         }
         store
@@ -684,8 +749,7 @@ classes:
         assert_eq!(ask(&native), vec![format!("<{canonical}>")]);
         assert_eq!(ask(&canonical), vec![format!("<{native}>")]);
         assert!(
-            SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
-                .unwrap()
+            SchemaGraph::build(&sv, TypeInference::ASSERTED)
                 .to_ntriples()
                 .contains(&format!("<{canonical}> <{RDF_TYPE}> <{OWL_CLASS}>")),
             "the spelling handed back is the one the graph describes"
@@ -694,11 +758,13 @@ classes:
 
     #[test]
     fn every_quad_lands_in_the_graph_the_caller_named() {
-        let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        assert!(!graph.quads.is_empty(), "expected a non-empty schema graph");
+        let graph = SchemaGraph::build(&asset360_schema_view(), TypeInference::ASSERTED);
+        let quads = graph.quads_in(ASSET360_SCHEMA_GRAPH).unwrap();
+        assert_eq!(quads.len(), graph.triples.len());
+        assert!(!quads.is_empty(), "expected a non-empty schema graph");
 
         let expected = GraphName::NamedNode(NamedNode::new(ASSET360_SCHEMA_GRAPH).unwrap());
-        for quad in &graph.quads {
+        for quad in &quads {
             assert_eq!(quad.graph_name, expected, "quad escaped the schema graph");
         }
     }
@@ -708,9 +774,9 @@ classes:
     #[test]
     fn a_non_asset360_graph_iri_contains_no_infrabel_graph_name() {
         let rinf_graph = "http://data.europa.eu/949/schema";
-        let graph = SchemaGraph::build(&asset360_schema_view(), rinf_graph).unwrap();
+        let graph = SchemaGraph::build(&asset360_schema_view(), TypeInference::ASSERTED);
         let expected = GraphName::NamedNode(NamedNode::new(rinf_graph).unwrap());
-        for quad in &graph.quads {
+        for quad in &graph.quads_in(rinf_graph).unwrap() {
             assert_eq!(quad.graph_name, expected);
             assert!(
                 !quad.graph_name.to_string().contains("infrabel"),
@@ -722,18 +788,18 @@ classes:
     /// A misconfigured IRI is an error the operator sees, never a substitution.
     #[test]
     fn a_relative_graph_iri_is_refused() {
-        let err = SchemaGraph::build(&asset360_schema_view(), "not an iri")
+        let err = SchemaGraph::build(&asset360_schema_view(), TypeInference::ASSERTED)
+            .quads_in("not an iri")
             .expect_err("a relative IRI must be refused");
         assert!(err.to_string().contains("not an iri"));
     }
 
     #[test]
     fn every_emitted_iri_is_absolute() {
-        let graph = SchemaGraph::build(&asset360_schema_view(), ASSET360_SCHEMA_GRAPH).unwrap();
-        for quad in &graph.quads {
-            // `NamedNode::new` on the way in already rejected relative IRIs;
-            // re-check here so the invariant is asserted on the output, not on
-            // the code path that produced it.
+        let graph = SchemaGraph::build(&asset360_schema_view(), TypeInference::ASSERTED);
+        for quad in &graph.triples {
+            // Re-checked here so the invariant is asserted on the output, not
+            // on the code path that produced it.
             // Blank nodes are exempt: a restriction has no IRI by design.
             for iri in [
                 match &quad.subject {
@@ -765,9 +831,7 @@ classes:
     fn class_subject_matches_the_instance_rdf_type_spelling() {
         let sv = asset360_schema_view();
         let conv = sv.converter();
-        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
-            .unwrap()
-            .to_ntriples();
+        let ntriples = SchemaGraph::build(&sv, TypeInference::ASSERTED).to_ntriples();
 
         let with_distinct_class_uri: Vec<_> = sv
             .class_views()
@@ -803,9 +867,7 @@ classes:
     fn enum_values_with_a_meaning_get_their_code_as_a_label() {
         let sv = asset360_schema_view();
         let conv = sv.converter();
-        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
-            .unwrap()
-            .to_ntriples();
+        let ntriples = SchemaGraph::build(&sv, TypeInference::ASSERTED).to_ntriples();
 
         let mut checked = 0usize;
         for ev in sv.enum_views().unwrap() {
@@ -917,18 +979,16 @@ classes:
         );
 
         // The untagged code stays where it was, on both predicates.
-        let ntriples = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
-            .unwrap()
-            .to_ntriples();
+        let ntriples = SchemaGraph::build(&sv, TypeInference::ASSERTED).to_ntriples();
         let conv = sv.converter();
-        let regime = sv
+        let inference = sv
             .enum_views()
             .unwrap()
             .into_iter()
             .find(|ev| ev.name() == "SignalRegime")
             .unwrap();
-        let regime_iri = regime.canonical_uri().to_uri(&conv).unwrap().0;
-        let vns = format!("{regime_iri}#VNS");
+        let inference_iri = inference.canonical_uri().to_uri(&conv).unwrap().0;
+        let vns = format!("{inference_iri}#VNS");
         assert!(ntriples.contains(&format!("<{vns}> <{RDFS_LABEL}> \"VNS\" .")));
         assert!(ntriples.contains(&format!(
             "<{vns}> <http://www.w3.org/2004/02/skos/core#notation> \"VNS\" ."
@@ -938,12 +998,8 @@ classes:
     #[test]
     fn output_is_deterministic() {
         let sv = asset360_schema_view();
-        let first = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
-            .unwrap()
-            .to_ntriples();
-        let second = SchemaGraph::build(&sv, ASSET360_SCHEMA_GRAPH)
-            .unwrap()
-            .to_ntriples();
+        let first = SchemaGraph::build(&sv, TypeInference::ASSERTED).to_ntriples();
+        let second = SchemaGraph::build(&sv, TypeInference::ASSERTED).to_ntriples();
         assert_eq!(first, second, "schema graph must not depend on map order");
     }
 }

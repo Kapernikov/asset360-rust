@@ -72,6 +72,10 @@ pub struct BindingSpec {
     /// a column of the join's right side that is non-`NULL` on every joined
     /// row (its identity, or its key). `descriptor` is `xsd:boolean`.
     pub witness: bool,
+    /// Whether the column is the star's *direct type* rather than a slot:
+    /// the record's `asset_type` column, an IRI (`sesame:directType`).
+    /// `slot_path` is empty, as for the identity; `descriptor` is an IRI.
+    pub direct_type: bool,
 }
 
 /// How one step of a path is stored, mirroring the schema's own three-way
@@ -332,14 +336,17 @@ pub(crate) fn path_multiplies(
     class_uri: &str,
     slot_path: &[String],
 ) -> bool {
-    use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::slotview::SlotContainerMode;
 
     let Ok(Some(mut class_view)) = schema_view.get_class_by_uri(class_uri) else {
         return false;
     };
     for (i, slot_name) in slot_path.iter().enumerate() {
-        let Some(slot) = class_view.slot(&Identifier::Name(slot_name.clone())) else {
+        let Some(slot) =
+            crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, slot_name)
+                .ok()
+                .flatten()
+        else {
             return false;
         };
         if slot.determine_slot_container_mode() != SlotContainerMode::SingleValue {
@@ -381,6 +388,7 @@ pub(crate) fn binding_spec(
         relation: None,
         occurrence: false,
         witness: false,
+        direct_type: false,
     })
 }
 
@@ -396,12 +404,13 @@ pub(crate) fn occurrence_spec(
     var_name: &str,
     slot_path: Vec<String>,
 ) -> Option<BindingSpec> {
-    use linkml_schemaview::identifier::Identifier;
     use linkml_schemaview::slotview::SlotInlineMode;
     let mut class_view = schema_view.get_class_by_uri(class_uri).ok()??;
     let mut containers = Vec::with_capacity(slot_path.len());
     for name in &slot_path {
-        let slot = class_view.slot(&Identifier::Name(name.clone()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, name)
+            .ok()
+            .flatten()?;
         if slot.determine_slot_inline_mode() == SlotInlineMode::Reference {
             return None;
         }
@@ -418,7 +427,24 @@ pub(crate) fn occurrence_spec(
         relation: None,
         occurrence: true,
         witness: false,
+        direct_type: false,
     })
+}
+
+/// A binding for a star's direct type: its `asset_type`, as an IRI.
+pub(crate) fn direct_type_spec(star_var: &str, class_uri: &str, var_name: &str) -> BindingSpec {
+    BindingSpec {
+        var: var_name.to_owned(),
+        star_var: star_var.to_owned(),
+        slot_path: Vec::new(),
+        containers: Vec::new(),
+        class_uri: class_uri.to_owned(),
+        descriptor: TermDescriptor::subject_iri(),
+        relation: None,
+        occurrence: false,
+        witness: false,
+        direct_type: true,
+    }
 }
 
 /// A binding for a column of a relation, by alias and column name.
@@ -439,5 +465,6 @@ pub(crate) fn relation_spec(
         relation: Some(alias.to_owned()),
         occurrence,
         witness: false,
+        direct_type: false,
     }
 }

@@ -367,9 +367,10 @@ mod tests {
     use super::*;
 
     fn parse(query: &str) -> Query {
-        crate::sparql_scoper::parse_query(&format!(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"
-        ))
+        crate::sparql_scoper::parse_query(
+            &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+            None,
+        )
         .unwrap()
     }
 
@@ -404,7 +405,9 @@ mod tests {
             "{qualified}"
         );
 
-        let plan = crate::sparql_refine::naive_plan(&query).unwrap();
+        let plan =
+            crate::sparql_refine::naive_plan(&query, crate::sparql_dataset::default_dataset())
+                .unwrap();
         let domains: Vec<usize> = plan
             .barriers()
             .into_iter()

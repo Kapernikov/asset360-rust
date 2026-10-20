@@ -113,13 +113,14 @@
 use std::cell::OnceCell;
 
 use linkml_schemaview::schemaview::SchemaView;
-use oxigraph::model::{GraphName, NamedNode, Quad, Term as OxTerm};
+use oxigraph::model::Term as OxTerm;
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use spargebra::Query;
 use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
 use spargebra::term::{GroundTerm, NamedNodePattern, Variable};
 
+use crate::sparql_dataset::DatasetSpec;
 use crate::sparql_refine::{NodeId, Plan, PlanOp};
 
 /// A relation, as the pair a [`PlanOp::Values`] holds: its columns, and its
@@ -177,15 +178,18 @@ pub trait Materialisation {
 
 /// Whether this subplan depends on nothing outside the schema graph.
 ///
-/// `schema_graph_iri` is the graph the active datamodel serves its schema in —
-/// a parameter and never a constant, see [`crate::sparql_schema_graph`].
+/// `dataset` says which graphs are the schema's -- a parameter and never a
+/// constant, see [`crate::sparql_schema_graph`]. Data-graph `GRAPH` nodes are
+/// not in a plan at all (the naive plan dissolves them into each `Match`'s
+/// inference), so a `Graph` node here is the schema graph, a variable, or a graph
+/// the endpoint does not serve.
 ///
 /// The walk carries one bit of context, *which graph a read would read from*,
 /// because that is the only thing a `GRAPH` node changes about the nodes below
 /// it. Everything that is not a read inherits the answer from its inputs, which
 /// is why a node kind added later needs no entry here unless it reads.
-pub fn schema_only(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
-    fn walk(plan: &Plan, node: NodeId, in_schema_graph: bool, iri: &str) -> bool {
+pub(crate) fn schema_only(plan: &Plan, node: NodeId, dataset: &DatasetSpec) -> bool {
+    fn walk(plan: &Plan, node: NodeId, in_schema_graph: bool, dataset: &DatasetSpec) -> bool {
         match &plan.nodes[node].op {
             // A read: schema-only exactly when it reads the schema graph.
             PlanOp::Match { .. } | PlanOp::Path { .. } => in_schema_graph,
@@ -193,7 +197,7 @@ pub fn schema_only(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
             // the context rather than inheriting it. A nested one naming
             // something else takes its subtree back out of the schema.
             PlanOp::Graph { input, name } => {
-                walk(plan, *input, names_the_schema_graph(name, iri), iri)
+                walk(plan, *input, names_a_schema_graph(name, dataset), dataset)
             }
             // Somebody else's dataset.
             PlanOp::Service { .. } => false,
@@ -205,10 +209,10 @@ pub fn schema_only(plan: &Plan, node: NodeId, schema_graph_iri: &str) -> bool {
             other => other
                 .inputs()
                 .iter()
-                .all(|input| walk(plan, *input, in_schema_graph, iri)),
+                .all(|input| walk(plan, *input, in_schema_graph, dataset)),
         }
     }
-    walk(plan, node, false, schema_graph_iri)
+    walk(plan, node, false, dataset)
 }
 
 /// Whether every variable the subplan *uses* is one it also binds.
@@ -326,15 +330,22 @@ pub fn replace_subtree(plan: &mut Plan, root: NodeId, op: PlanOp) {
 /// The name is `NamedNodePattern::to_string()` — `<iri>` for a constant, `?g`
 /// for a variable (see the naive plan's `Graph` arm).
 ///
-/// **A variable counts**, and that rests on a dataset invariant rather than on
-/// optimism: this endpoint serves exactly one named graph, and the instances
-/// live in the default graph (see [`crate::sparql_schema_graph`]). So
-/// `GRAPH ?g { … }` can only bind `?g` to the schema graph. The probe evaluates
-/// against a store shaped the same way — the schema quads in that one named
-/// graph, the default graph empty — so `?g` binds there exactly as it would in
-/// the engine, and the invariant is executed rather than assumed.
-fn names_the_schema_graph(name: &str, schema_graph_iri: &str) -> bool {
-    name.starts_with('?') || name == format!("<{schema_graph_iri}>")
+/// **A variable counts only while the dataset serves no data graph**, and
+/// that rests on a dataset invariant rather than on optimism: with no named
+/// graph holding records, the named graphs are the schema graphs and the
+/// instances live in the default graph, which `GRAPH` never reaches (see
+/// [`crate::sparql_schema_graph`]). So `GRAPH ?g { … }` can only bind `?g` to a
+/// schema graph, and the probe's store is shaped the same way. Once a data
+/// graph is served, `?g` ranges over it too, a probe over the schema store
+/// alone would answer for a fraction of the graphs, and the variable no longer
+/// counts ([`DatasetSpec::graph_variable_is_schema_only`]).
+fn names_a_schema_graph(name: &str, dataset: &DatasetSpec) -> bool {
+    if name.starts_with('?') {
+        return dataset.has_schema_graph() && dataset.graph_variable_is_schema_only();
+    }
+    name.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|iri| dataset.schema_inference(iri).is_some())
 }
 
 /// **Whether this subplan is a region `pass` can evaluate.**
@@ -588,7 +599,7 @@ pub fn pattern_of(plan: &Plan, node: NodeId) -> Option<GraphPattern> {
         PlanOp::Unit => GraphPattern::Bgp {
             patterns: Vec::new(),
         },
-        PlanOp::Match { pattern } => GraphPattern::Bgp {
+        PlanOp::Match { pattern, .. } => GraphPattern::Bgp {
             patterns: vec![(**pattern).clone()],
         },
         PlanOp::Path {
@@ -763,15 +774,15 @@ fn graph_name(name: &str) -> Option<NamedNodePattern> {
 /// nothing; a plan that does asks once, however many subplans it has.
 pub struct SchemaGraphMaterialisation<'a> {
     schema_view: &'a SchemaView,
-    schema_graph_iri: &'a str,
+    dataset: &'a DatasetSpec,
     store: OnceCell<Option<Store>>,
 }
 
 impl<'a> SchemaGraphMaterialisation<'a> {
-    pub fn new(schema_view: &'a SchemaView, schema_graph_iri: &'a str) -> Self {
+    pub fn new(schema_view: &'a SchemaView, dataset: &'a DatasetSpec) -> Self {
         Self {
             schema_view,
-            schema_graph_iri,
+            dataset,
             store: OnceCell::new(),
         }
     }
@@ -783,28 +794,26 @@ impl Materialisation for SchemaGraphMaterialisation<'_> {
     }
 
     fn qualifies(&self, plan: &Plan, node: NodeId) -> bool {
-        schema_only(plan, node, self.schema_graph_iri)
+        schema_only(plan, node, self.dataset)
     }
 
     fn dataset(&self) -> Option<&Store> {
         self.store
             .get_or_init(|| {
-                let graph = crate::sparql_schema_graph::SchemaGraph::build(
+                // Every schema graph the dataset serves, each in its own
+                // named graph under its own inference: the shape the engine leg
+                // loads, so a probe answers what the engine would answer. The
+                // planner hands this the dataset *as the query reads it*
+                // ([`DatasetSpec::read_by`]), so that is the graphs it can
+                // reach and no others; one build per inference.
+                let store = Store::new().ok()?;
+                let quads = crate::sparql_schema_graph::SchemaGraph::quads_of_graphs(
                     self.schema_view,
-                    self.schema_graph_iri,
+                    self.dataset.schema_graphs(),
                 )
                 .ok()?;
-                let store = Store::new().ok()?;
-                let name = GraphName::NamedNode(NamedNode::new(self.schema_graph_iri).ok()?);
-                for quad in graph.quads {
-                    store
-                        .insert(&Quad::new(
-                            quad.subject,
-                            quad.predicate,
-                            quad.object,
-                            name.clone(),
-                        ))
-                        .ok()?;
+                for quad in &quads {
+                    store.insert(quad).ok()?;
                 }
                 Some(store)
             })
@@ -947,12 +956,56 @@ mod tests {
         );
     }
 
+    /// A request pays for the schema graphs it can read, once per inference. A
+    /// dataset serving four (an alias and three inferences) built all four, in
+    /// every rule that asks, for a query naming one: ~300 ms each.
+    #[test]
+    fn a_plan_builds_only_the_schema_graphs_the_query_can_read_once_per_inference() {
+        use linkml_runtime::schema_rdf::TypeInference;
+        const ALIAS: &str = "https://data.infrabel.be/asset360/schema-alias";
+        const INFERRED: &str = "https://data.infrabel.be/asset360/schema-inferred";
+        const MIXINS: &str = "https://data.infrabel.be/asset360/schema-mixins";
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeInference::ASSERTED,
+            &[],
+            &[
+                (SCHEMA_GRAPH, TypeInference::ASSERTED),
+                (ALIAS, TypeInference::ASSERTED),
+                (INFERRED, TypeInference::IS_A),
+                (MIXINS, TypeInference::IS_A_AND_MIXINS),
+            ],
+        );
+        let sv = asset360_schema_view();
+        let builds_for = |graph: &str| {
+            let text = query(&format!(
+                "SELECT ?s ?code WHERE {{ \
+                 ?s a asset360:Signal ; asset360:signalType ?t . \
+                 GRAPH {graph} {{ ?t skos:notation ?code }} \
+                 FILTER(CONTAINS(?code, \"GS\")) }}"
+            ));
+            let parsed = crate::sparql_scoper::parse_query(&text, Some(&sv)).unwrap();
+            crate::sparql_schema_graph::BUILDS.with(|builds| builds.set(0));
+            crate::sparql_plan::plan_query_refined(
+                &parsed,
+                &sv,
+                &dataset,
+                crate::sparql_plan::Finishing::Rows,
+            )
+            .expect("plans");
+            crate::sparql_schema_graph::BUILDS.with(|builds| builds.get())
+        };
+        // One graph named: one build, not four, and not one per rule.
+        assert_eq!(builds_for(&format!("<{SCHEMA_GRAPH}>")), 1);
+        // `GRAPH ?g` can read all four, which are three inferences.
+        assert_eq!(builds_for("?g"), 3);
+    }
+
     /// The same query with no schema graph configured: no rule exists, nothing
     /// is evaluated, and the fetch is what it was before any of this.
     #[test]
     fn without_a_schema_graph_nothing_is_evaluated() {
         let schema_view = asset360_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined_with_schema_graph(
+        let plan = crate::sparql_plan::plan_of(
             &query(&format!(
                 "SELECT ?s ?code WHERE {{ \
                  ?s a asset360:Signal ; asset360:signalType ?t . \
@@ -960,7 +1013,7 @@ mod tests {
                  FILTER(CONTAINS(?code, \"GS\")) }}"
             )),
             &schema_view,
-            None,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("the query scopes");
         assert!(
@@ -1164,8 +1217,13 @@ mod tests {
     /// mechanism that is general in the prose and specific in the code.
     #[test]
     fn a_second_pass_needs_no_edit_to_the_first() {
-        let mut plan = crate::sparql_refine::naive_plan_of(
-            "SELECT ?x ?y WHERE { VALUES ?x { 1 2 } VALUES ?y { 3 } }",
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(
+                "SELECT ?x ?y WHERE { VALUES ?x { 1 2 } VALUES ?y { 3 } }",
+                None,
+            )
+            .unwrap(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a naive plan");
         let rule = crate::sparql_rules::Materialise::new(ReadsNothing::default());
@@ -1294,11 +1352,13 @@ mod tests {
     /// `names_the_schema_graph` has to be narrowed with it.
     #[test]
     fn the_endpoint_serves_exactly_one_named_graph() {
-        let graph =
-            crate::sparql_schema_graph::SchemaGraph::build(&asset360_schema_view(), SCHEMA_GRAPH)
-                .unwrap();
-        let names: std::collections::BTreeSet<String> = graph
-            .quads
+        let quads = crate::sparql_schema_graph::SchemaGraph::build(
+            &asset360_schema_view(),
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+        )
+        .quads_in(SCHEMA_GRAPH)
+        .unwrap();
+        let names: std::collections::BTreeSet<String> = quads
             .iter()
             .map(|quad| quad.graph_name.to_string())
             .collect();
@@ -1341,6 +1401,27 @@ mod tests {
 
     /// An instance query pays nothing: no `GRAPH` node names the schema graph,
     /// so no subplan qualifies and the store is never built.
+    /// **A subclass question over the schema graph is a constant table joined
+    /// on the type variable** (#515): `GRAPH <schema> { ?t rdfs:subClassOf+ X }`
+    /// -- one hop or transitive -- reads nothing but the schema, so the
+    /// materialisation pass replaces the `GRAPH` subtree by the `VALUES` of its
+    /// solutions and what is left is `?s a ?t` joined on `?t`. Spelling the
+    /// table as a `VALUES` block gives the same plan shape.
+    #[test]
+    fn a_subclass_question_is_a_constant_table_joined_on_the_type() {
+        for graph_spelling in [
+            format!("GRAPH <{SCHEMA_GRAPH}> {{ ?t rdfs:subClassOf asset360:Asset }}"),
+            format!("GRAPH <{SCHEMA_GRAPH}> {{ ?t rdfs:subClassOf+ asset360:Asset }}"),
+        ] {
+            let plan = refined_for(&format!(
+                "SELECT ?s ?t WHERE {{ ?s a ?t . {graph_spelling} }}"
+            ));
+            assert!(plan.contains("values    ?t"), "{plan}");
+            assert!(plan.contains("join      n0, n1  on ?t"), "{plan}");
+            assert!(!plan.contains("graph "), "{plan}");
+        }
+    }
+
     #[test]
     fn an_instance_query_is_untouched() {
         let plan = refined_for("SELECT ?s WHERE { ?s a asset360:Signal }");
@@ -1358,10 +1439,10 @@ mod tests {
     /// The lowered execution plan, which is what the endpoint renders.
     fn plan_for(body: &str) -> String {
         let schema_view = asset360_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined_with_schema_graph(
+        let plan = crate::sparql_plan::plan_of(
             &query(body),
             &schema_view,
-            Some(SCHEMA_GRAPH),
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
         )
         .expect("the query scopes");
         format!("{plan}")
@@ -1370,11 +1451,12 @@ mod tests {
     /// The refined plan, for the cases that are about a node rather than about
     /// the statement.
     fn refined_for(body: &str) -> String {
-        crate::sparql_plan::refined_plan_text(
+        crate::sparql_plan::plan_texts_of(
             &query(body),
             &asset360_schema_view(),
-            Some(SCHEMA_GRAPH),
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
         )
+        .1
         .expect("the query refines")
     }
 
@@ -1614,7 +1696,11 @@ mod tests {
                 false,
             ),
         ] {
-            let plan = crate::sparql_refine::naive_plan_of(&query(body)).expect("the query parses");
+            let plan = crate::sparql_refine::naive_plan(
+                &crate::sparql_scoper::parse_query(&query(body), None).unwrap(),
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("the query parses");
             let root = plan.nodes.len() - 1;
             assert!(
                 plan.variables_of(root).contains(variable),
@@ -1625,6 +1711,37 @@ mod tests {
                 guaranteed,
                 "?{variable} guaranteed for `{body}`:\n{plan}"
             );
+        }
+    }
+
+    /// The materialisation reads the graphs the query can see, as the engine
+    /// does: a `FROM` alone leaves no named graph (SPARQL 1.1 13.2), so the
+    /// schema graph is not there to evaluate and nothing is materialised;
+    /// naming it in `FROM NAMED` brings the evaluation back. Same answer on
+    /// both routes, whichever rules fired.
+    #[test]
+    fn the_materialisation_honours_the_datasets_clause() {
+        const G: &str = SCHEMA_GRAPH;
+        let text = |clause: &str| {
+            refined_for(&format!(
+                "SELECT ?code {clause} WHERE {{ GRAPH <{G}> {{ ?t skos:notation ?code }} \
+                 FILTER(CONTAINS(?code, \"GS\")) }}"
+            ))
+        };
+        for hidden in ["FROM <urn:x>", "FROM <urn:x> FROM NAMED <urn:y>"] {
+            let plan = text(hidden);
+            assert!(
+                plan.contains("graph "),
+                "{hidden}: schema graph kept:\n{plan}"
+            );
+            assert!(
+                !plan.contains("values"),
+                "{hidden}: evaluated a hidden graph:\n{plan}"
+            );
+        }
+        for visible in ["", &format!("FROM <urn:x> FROM NAMED <{G}>")] {
+            let plan = text(visible);
+            assert!(plan.contains("values"), "{visible}: not evaluated:\n{plan}");
         }
     }
 }

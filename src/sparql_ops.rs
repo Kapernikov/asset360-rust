@@ -128,9 +128,21 @@ pub enum Op {
         /// The SPARQL variable this star binds, which becomes a table alias.
         star_var: String,
         class_uri: String,
+        /// Records whose `asset_type` is one of these, canonical IRIs sorted:
+        /// the classes whose records have `class_uri` among their `rdf:type`s
+        /// under the plan's data inference (`PlanOp::Scan::classes`), narrowed to
+        /// the direct types the query fixed (`PlanOp::Scan::direct_type_in`).
+        /// A renderer filters `asset_type = ANY(asset_types)`; with one element
+        /// that is `asset_type = class_uri`.
+        asset_types: Vec<String>,
         /// Values bound against the class's identifier slot, compared against
         /// the indexed `asset360_uri` column rather than the payload.
         identifier_values: Vec<String>,
+        /// The variable bound to the record's direct type, when a rule
+        /// folded `sesame:directType ?t` into the scan: render
+        /// `asset_type AS <col>` and answer it as an IRI. `asset_types` is
+        /// already narrowed by any direct type the query fixed.
+        direct_type: Option<String>,
         /// Slots that must be present: `object_data ? 'slot'`.
         required_slots: Vec<String>,
         /// Slots that may be absent, so no existence check.
@@ -508,6 +520,9 @@ pub struct ColumnRef {
     pub path: Vec<String>,
     /// The relation column's name, when `source` is a relation alias.
     pub column: Option<String>,
+    /// The star's direct type (`asset_type`) rather than its identity:
+    /// `path` is empty for both, this tells them apart.
+    pub direct_type: bool,
 }
 
 /// One export of a relation: what the outside reads of the derived table.
@@ -657,7 +672,10 @@ pub fn lower_sql_pass(
             op: Op::Scan {
                 star_var: star.variable.clone(),
                 class_uri: star.class_uri.clone(),
+                // The classes the plan's inference says its type stands for.
+                asset_types: star.classes.clone(),
                 identifier_values: star.identifier_values.clone(),
+                direct_type: None,
                 required_slots: star.required_fields.clone(),
                 optional_slots: star.optional_fields.clone(),
                 required_paths: star.required_paths.clone(),
@@ -900,6 +918,9 @@ pub enum LoweringRefusal {
     /// obligation is claimed once, and says nothing about whether the claimant
     /// does the work.
     ClaimWithoutTheWork { node: usize, claim: String },
+    /// A scan whose classes the schema cannot derive, so what the scan covers
+    /// cannot be checked against what it claims.
+    ScanClassesUnavailable { node: usize, error: String },
     /// A condition on a slot that holds several values, rendered as a
     /// comparison against the column.
     ///
@@ -973,6 +994,7 @@ impl fmt::Display for LoweringRefusal {
                 f,
                 "n{node} claims '{claim}' and renders nothing that discharges it"
             ),
+            Self::ScanClassesUnavailable { node, error } => write!(f, "n{node}: {error}"),
             Self::ConditionReadsACollection { node, slot } => write!(
                 f,
                 "n{node} compares '{slot}' as a column, and that slot holds \
@@ -1274,7 +1296,7 @@ fn lower_island(
             continue;
         };
         let unfolded = plan.nodes.iter().any(|node| {
-            let RefinedOp::Match { pattern } = &node.op else {
+            let RefinedOp::Match { pattern, .. } = &node.op else {
                 return false;
             };
             crate::sparql_refine::subject_variable(pattern) == Some(star_var.as_str())
@@ -1378,11 +1400,14 @@ fn lower_island(
             class_uri,
             identifier_values,
             slots,
+            direct_type,
+            direct_type_in,
             ..
         } = &plan.nodes[id].op
         else {
             continue;
         };
+        let inference = &plan.data_inference;
         for claim in &plan.nodes[id].discharges {
             let wrong = |claim: &crate::sparql_plan::Obligation| {
                 Err(LoweringRefusal::ClaimWithoutTheWork {
@@ -1402,7 +1427,40 @@ fn lower_island(
                             .iter()
                             .any(|value| subject.trim_matches(['<', '>']) == value),
                     };
-                    if !scopes_the_subject || class_iri != class_uri {
+                    // A scan of C discharges `?s a D` when D is C (the trivial
+                    // case) or when every record the scan reads is an instance
+                    // of D.
+                    //
+                    // Proof. The scan reads exactly the records whose
+                    // `rdf:type`s include C under its `inference`, i.e. the
+                    // records of `classes = type_family(C, inference)`. A record
+                    // of class K in that family is an instance of D under the
+                    // same inference iff K is in `type_family(D, inference)`. So if
+                    // `classes ⊆ type_family(D, inference)`, `?s a D` holds for
+                    // every row the scan returns, and rendering nothing for
+                    // the claim loses no row and admits none. The inference must
+                    // be the scan's own: families differ per inference (under
+                    // Asserted a family is the class alone, so only equality
+                    // passes). A class the schema does not know has no
+                    // family, so only equality passes.
+                    let covers = class_iri == class_uri || {
+                        // Recomputed from `class_uri` rather than read from
+                        // the scan's `classes`, which invariant 7 pins to
+                        // the same function: this check then stands alone.
+                        let classes_of = |class: &str| {
+                            crate::sparql_refine::scan_classes(schema, class, *inference).map_err(
+                                |error| LoweringRefusal::ScanClassesUnavailable {
+                                    node: id,
+                                    error: error.to_string(),
+                                },
+                            )
+                        };
+                        let read = classes_of(class_uri)?;
+                        let wanted = classes_of(class_iri)?;
+                        schema.get_class_by_uri(class_iri).ok().flatten().is_some()
+                            && read.iter().all(|class| wanted.contains(class))
+                    };
+                    if !scopes_the_subject || !covers {
                         return wrong(claim);
                     }
                 }
@@ -1417,6 +1475,31 @@ fn lower_island(
                 // longer address. The identifier is the exception the identity
                 // fold makes -- it becomes a value against the indexed column
                 // rather than a slot of the payload.
+                // **A scan claiming a `sesame:directType` read must make it**:
+                // bind the variable the pattern names to the record's
+                // `asset_type`, or hold the scan to the class the pattern
+                // names (`classes ∩ direct_type_in`, lowered).
+                Some(
+                    claim @ crate::sparql_plan::Obligation::Triple {
+                        subject,
+                        predicate,
+                        object,
+                    },
+                ) if predicate.trim_matches(['<', '>'])
+                    == linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE =>
+                {
+                    let on_this_star = subject.strip_prefix('?') == Some(star_var.as_str());
+                    let read = match object.strip_prefix('?') {
+                        Some(variable) => direct_type.as_deref() == Some(variable),
+                        None => direct_type_in.iter().any(|class| {
+                            crate::sparql_plan::shorten(class) == *object
+                                || class == object.trim_matches(['<', '>'])
+                        }),
+                    };
+                    if !on_this_star || !read {
+                        return wrong(claim);
+                    }
+                }
                 Some(claim @ crate::sparql_plan::Obligation::Triple { predicate, .. }) => {
                     // The predicate names a slot through the schema, the way
                     // every rule that folded the read resolved it -- not by
@@ -1514,6 +1597,12 @@ impl Lowering<'_> {
             TermOf::Identity { class_uri } => ColumnKind::Identity {
                 class_uri: class_uri.clone(),
             },
+            TermOf::DirectType {
+                star_var,
+                class_uri,
+            } => ColumnKind::Slot(crate::sparql_pushdown::direct_type_spec(
+                star_var, class_uri, var,
+            )),
             TermOf::Slot {
                 star_var,
                 path,
@@ -1578,11 +1667,19 @@ impl Lowering<'_> {
                 source: star_var,
                 path,
                 column: None,
+                direct_type: false,
+            },
+            Column::DirectType { star_var, .. } => ColumnRef {
+                source: star_var,
+                path: Vec::new(),
+                column: None,
+                direct_type: true,
             },
             Column::Relation { alias, column } => ColumnRef {
                 source: alias,
                 path: Vec::new(),
                 column: Some(column.var.clone()),
+                direct_type: false,
             },
             // A witness is never a key: it is a fresh name nothing else binds.
             Column::Witness { .. } => return None,
@@ -1603,6 +1700,7 @@ impl Lowering<'_> {
                         source: var.to_owned(),
                         path: Vec::new(),
                         column: None,
+                        direct_type: false,
                     });
                 }
                 crate::sparql_refine::PlanOp::Unnest {
@@ -1615,6 +1713,7 @@ impl Lowering<'_> {
                         source: star_var.clone(),
                         path: slot_path.clone(),
                         column: None,
+                        direct_type: false,
                     });
                 }
                 crate::sparql_refine::PlanOp::SubSelect { vars, .. }
@@ -1627,6 +1726,7 @@ impl Lowering<'_> {
                         source: alias.clone(),
                         path: Vec::new(),
                         column: Some(var.to_owned()),
+                        direct_type: false,
                     });
                 }
                 _ => {}
@@ -1670,6 +1770,7 @@ impl Lowering<'_> {
                     source: crate::sparql_constant::constant_alias(self.plan, facts.values),
                     path: Vec::new(),
                     column: Some(var.clone()),
+                    direct_type: false,
                 };
                 let other = self
                     .value_column_ref(facts.other, var)
@@ -1770,8 +1871,12 @@ impl Lowering<'_> {
                 RefinedOp::Scan {
                     star_var,
                     class_uri,
+                    classes: scanned_classes,
                     slots,
                     identifier_values,
+                    direct_type,
+                    direct_type_in,
+                    ..
                 } => {
                     // Only a slot of the record itself is an existence check.
                     // A value further in is reached by walking into the column,
@@ -1789,6 +1894,19 @@ impl Lowering<'_> {
                         op: Op::Scan {
                             star_var: star_var.clone(),
                             class_uri: class_uri.clone(),
+                            // The family, narrowed by the direct types the query
+                            // fixed: `asset_type = ANY(asset_types)` is then exactly
+                            // "the record's direct type is one of these".
+                            asset_types: if direct_type_in.is_empty() {
+                                scanned_classes.clone()
+                            } else {
+                                scanned_classes
+                                    .iter()
+                                    .filter(|class| direct_type_in.contains(class))
+                                    .cloned()
+                                    .collect()
+                            },
+                            direct_type: direct_type.clone(),
                             // What the query fixed the identity to, plus anything
                             // the filters below hoist here: both belong against
                             // the indexed column rather than the JSONB payload.
@@ -2863,10 +2981,9 @@ impl Lowering<'_> {
                     class_uri,
                     ..
                 } => {
-                    if bindings
-                        .iter()
-                        .any(|spec| spec.star_var == *star_var && spec.slot_path.is_empty())
-                    {
+                    if bindings.iter().any(|spec| {
+                        spec.star_var == *star_var && spec.slot_path.is_empty() && !spec.direct_type
+                    }) {
                         continue;
                     }
                     let spec = crate::sparql_pushdown::binding_spec(
@@ -2933,6 +3050,12 @@ impl Lowering<'_> {
                 class_uri,
                 path,
             } => element_spec(self.schema, &star_var, &class_uri, name, path),
+            Column::DirectType {
+                star_var,
+                class_uri,
+            } => Some(crate::sparql_pushdown::direct_type_spec(
+                &star_var, &class_uri, name,
+            )),
             Column::Relation { alias, column } => Some(crate::sparql_pushdown::relation_spec(
                 &alias,
                 name,
@@ -3008,6 +3131,7 @@ impl Lowering<'_> {
             existing.star_var == spec.star_var
                 && existing.slot_path == spec.slot_path
                 && existing.relation == spec.relation
+                && existing.direct_type == spec.direct_type
         }) {
             return Some(index);
         }
@@ -3135,6 +3259,7 @@ impl Lowering<'_> {
                     star_var,
                     class_uri,
                     slots,
+                    direct_type,
                     ..
                 } => {
                     let optional = optional_side(id);
@@ -3148,6 +3273,19 @@ impl Lowering<'_> {
                                 star_var: star_var.clone(),
                                 class_uri: class_uri.clone(),
                                 path: slot.path.clone(),
+                            },
+                        ));
+                    }
+                    // Or the record's direct type, read from `asset_type`.
+                    if slots.iter().all(|slot| slot.var.as_deref() != Some(var))
+                        && direct_type.as_deref() == Some(var)
+                    {
+                        candidates.push((
+                            optional,
+                            0,
+                            Column::DirectType {
+                                star_var: star_var.clone(),
+                                class_uri: class_uri.clone(),
                             },
                         ));
                     }
@@ -3299,6 +3437,8 @@ enum Column {
         alias: String,
         column: Box<RelationColumn>,
     },
+    /// A star's direct type: its `asset_type` column, as an IRI.
+    DirectType { star_var: String, class_uri: String },
     /// A left join's match witness, read off `anchor`: a column of the
     /// join's right side that is non-`NULL` on every row the right side
     /// joined.
@@ -3480,7 +3620,7 @@ impl OpTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparql_plan::{PassKind, plan_query_refined};
+    use crate::sparql_plan::{PassKind, plan_of};
     use crate::sparql_scoper::tests::test_schema_view;
     use linkml_schemaview::schemaview::SchemaView;
 
@@ -3489,7 +3629,12 @@ mod tests {
     /// Every SQL pass of a planned query, as (pass claims, operator tree).
     fn sql_passes(query: &str) -> Vec<(Vec<ObligationId>, OpTree)> {
         let sv = test_schema_view();
-        let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+        let plan = plan_of(
+            &format!("{PREFIX}{query}"),
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("should plan");
         plan.passes
             .iter()
             .filter_map(|pass| match &pass.kind {
@@ -3508,7 +3653,12 @@ mod tests {
     fn a_union_whose_arms_restate_different_reads_declines_the_bound() {
         let sv = test_schema_view();
         let scope = |query: &str| {
-            crate::sparql_scoper::sparql_scope(&format!("{PREFIX}{query}"), &sv).unwrap()
+            crate::sparql_scoper::sparql_scope(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap()
         };
 
         let differing = FetchBounds::of(&scope(
@@ -4062,6 +4212,7 @@ mod tests {
             crate::sparql_refine::Node::engine(
                 crate::sparql_refine::PlanOp::Match {
                     pattern: Box::new(pattern),
+                    reads: crate::sparql_dataset::GraphReads::Data,
                 },
                 Vec::new(),
             ),
@@ -4202,17 +4353,99 @@ mod tests {
 
     /// A refined plan, to fixpoint.
     fn refined_plan(query: &str, sv: &SchemaView) -> crate::sparql_refine::Plan {
-        let rules = crate::sparql_rules::tier_one_rules(sv, None);
+        let rules =
+            crate::sparql_rules::tier_one_rules(sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
-        let mut plan = crate::sparql_refine::naive_plan_of(&format!("{PREFIX}{query}"))
-            .expect("should build a naive plan");
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap(),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("should build a naive plan");
         crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
         plan
     }
 
     fn lowered(query: &str, sv: &SchemaView) -> Result<OpTree, LoweringRefusal> {
         lower_refined(&refined_plan(query, sv), sv, None, None)
+    }
+
+    /// [`lowered`] over a dataset whose data graph has type inference `inference`.
+    fn lowered_in(
+        query: &str,
+        sv: &SchemaView,
+        inference: linkml_runtime::schema_rdf::TypeInference,
+    ) -> Result<OpTree, LoweringRefusal> {
+        let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[]);
+        let rules = crate::sparql_rules::tier_one_rules(sv, &dataset);
+        let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
+            rules.iter().map(|rule| rule.as_ref()).collect();
+        let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
+            .expect("should parse");
+        let mut plan =
+            crate::sparql_refine::naive_plan(&parsed, &dataset).expect("should build a naive plan");
+        crate::sparql_rules::refine(&mut plan, &borrowed).expect("every invariant holds");
+        lower_refined(&plan, sv, None, None)
+    }
+
+    /// A parent type beside its subclass's is discharged by the subclass scan
+    /// under `is_a`: every record that scan reads is also an `Equipment`. The
+    /// fold claims both matches; lowering used to demand the scan's class be
+    /// the claimed one and refused (#511).
+    #[test]
+    fn a_scan_discharges_a_parent_type_claim_when_its_family_is_inside() {
+        use linkml_runtime::schema_rdf::TypeInference;
+        let sv = test_schema_view();
+        let query = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment }";
+        let tree = lowered_in(query, &sv, TypeInference::IS_A).expect("should lower under is_a");
+        let Op::Scan { class_uri, .. } = &tree.nodes[0].op else {
+            panic!("the first node is the scan");
+        };
+        assert!(class_uri.ends_with("/Relay"), "{class_uri}");
+        assert_eq!(tree.find("scan").len(), 1);
+        // Asserted: the two classes are different families, so the fold
+        // declines and nothing folds into one scan claiming both.
+        assert!(
+            matches!(
+                lowered_in(query, &sv, TypeInference::ASSERTED),
+                Err(LoweringRefusal::NothingPushed)
+            ),
+            "asserted: nothing folds, and lowering says so"
+        );
+        // A sibling is not covered: Relay's family is not inside Switch's.
+        let sibling = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }";
+        assert!(
+            matches!(
+                lowered_in(sibling, &sv, TypeInference::IS_A),
+                Err(LoweringRefusal::NothingPushed)
+            ),
+            "siblings do not fold, and lowering says so"
+        );
+    }
+
+    /// The same with the record named: the identifier narrowing survives.
+    #[test]
+    fn a_named_record_keeps_its_identifier_narrowing_beside_a_parent_type() {
+        use linkml_runtime::schema_rdf::TypeInference;
+        let sv = test_schema_view();
+        let iri = "https://data.infrabel.be/asset360/relay-1";
+        let query = format!(
+            "SELECT ?s WHERE {{ VALUES ?s {{ <{iri}> }} ?s a asset360:Relay , asset360:Equipment }}"
+        );
+        let tree = lowered_in(&query, &sv, TypeInference::IS_A).expect("should lower under is_a");
+        let Op::Scan {
+            class_uri,
+            identifier_values,
+            ..
+        } = &tree.nodes[0].op
+        else {
+            panic!("the first node is the scan");
+        };
+        assert!(class_uri.ends_with("/Relay"), "{class_uri}");
+        assert!(
+            identifier_values.iter().any(|v| v.contains("relay-1")),
+            "{identifier_values:?}"
+        );
     }
 
     /// A conjunct no rule pushes, to keep a query a *fetch*.
@@ -4743,12 +4976,13 @@ mod tests {
     #[test]
     fn a_branch_whose_constant_is_not_the_columns_term_is_refused() {
         let sv = test_schema_view();
-        let err = plan_query_refined(
+        let err = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?nm ; \
                  asset360:kind ?k . FILTER(?nm = \"BX517\" || ?k = \"GSA\") }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect_err("a string against a concept is refused");
         assert!(
@@ -5217,7 +5451,7 @@ pub fn observable_slots(
 ///
 /// Three things are always kept whatever the query asks:
 ///
-/// * the **identifier slot**, because the writer mints the record's subject
+/// * the **identifier slot** of every class the scan can return, because the writer mints the record's subject
 ///   IRI from it and a record with no subject joins to nothing;
 /// * the **type-designator slot** (`typeURI`), because the record's own stored
 ///   type is what several configurations read and it costs one short string;
@@ -5235,6 +5469,7 @@ pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &Sc
     for node in &mut ops.nodes {
         let Op::Scan {
             class_uri,
+            asset_types,
             required_slots,
             optional_slots,
             retrieval,
@@ -5250,8 +5485,26 @@ pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &Sc
         // them: a column it cannot see is a condition that cannot be true.
         keep.extend(required_slots.iter().cloned());
         keep.extend(optional_slots.iter().cloned());
-        if let Some(identifier) = identifier_slot_of(schema, class_uri) {
-            keep.insert(identifier);
+        // The identifier of every class the scan can return. A scan is not
+        // only of `class_uri`: it reads every record whose `asset_type` is in
+        // `asset_types`, and each of those records is identified by *its own
+        // class's* identifier slot. `BuiltElement` has none, its subclass
+        // `CivilEngineeringAsset` has `id`: keeping only the scanned class's
+        // identifier boxed every record without one, and the writer minted
+        // the same subject for all of them.
+        //
+        // Proof of completeness: a row the fetch returns has an `asset_type`
+        // in `asset_types` (the fetch filters `asset_type = ANY(asset_types)`,
+        // and `class_uri` is the scan's own class, kept for the lowering that
+        // leaves `asset_types` empty). The record's subject is minted from the
+        // identifier slot of that `asset_type`'s class, which is inserted
+        // below for every member of the set. A slot a record's class does not
+        // declare is simply absent from its payload, so the union costs
+        // nothing on a record that does not have it.
+        for class in std::iter::once(&*class_uri).chain(asset_types.iter()) {
+            if let Some(identifier) = identifier_slot_of(schema, class) {
+                keep.insert(identifier);
+            }
         }
         keep.insert("typeURI".to_owned());
 
@@ -5262,7 +5515,7 @@ pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &Sc
 #[cfg(test)]
 mod retrieval_tests {
     use super::*;
-    use crate::sparql_plan::{PassKind, plan_query_refined};
+    use crate::sparql_plan::{PassKind, plan_of};
     use crate::sparql_scoper::tests::test_schema_view;
 
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
@@ -5271,7 +5524,12 @@ mod retrieval_tests {
     /// Every scan's retrieval, in plan order.
     fn retrievals(query: &str) -> Vec<Retrieval> {
         let sv = test_schema_view();
-        let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+        let plan = plan_of(
+            &format!("{PREFIX}{query}"),
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("should plan");
         plan.passes
             .iter()
             .filter_map(|pass| match &pass.kind {
@@ -5352,7 +5610,7 @@ mod retrieval_tests {
             "!(asset360:kind)",
         ] {
             let query = format!("{PREFIX}SELECT ?x WHERE {{ ?s a asset360:Signal ; {path} ?x }}");
-            let parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+            let parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
             assert_eq!(
                 observable_slots(&parsed, &sv),
                 Err(NotEnumerable::PropertyPath),
@@ -5414,6 +5672,49 @@ mod retrieval_tests {
         assert!(slots_of(&got[0]).contains(&"location".to_owned()));
     }
 
+    /// A scan of a class with no identifier slot reads the records of its
+    /// subclasses, and what identifies those is *their* identifier slot. The
+    /// retrieval keeps the identifier of every class the scan can return.
+    #[test]
+    fn a_scan_of_an_identifierless_parent_keeps_its_subclasses_identifiers() {
+        use linkml_runtime::schema_rdf::TypeInference;
+        let sv =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let plan = plan_of(
+            &format!("{PREFIX}SELECT (COUNT(?s) AS ?n) WHERE {{ ?s a asset360:Structure }}"),
+            &sv,
+            &crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]),
+        )
+        .expect("should plan");
+        let scans: Vec<(Vec<String>, Retrieval)> = plan
+            .passes
+            .iter()
+            .filter_map(|pass| match &pass.kind {
+                PassKind::Sql(sql) => Some(sql.ops.clone()),
+                PassKind::Engine(_) => None,
+            })
+            .flat_map(|ops| ops.nodes)
+            .filter_map(|node| match node.op {
+                Op::Scan {
+                    asset_types,
+                    retrieval,
+                    ..
+                } => Some((asset_types, retrieval)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scans.len(), 1, "one scan");
+        let (asset_types, retrieval) = &scans[0];
+        assert!(
+            asset_types.iter().any(|class| class.ends_with("/Bridge")),
+            "the scan reads the subclasses' records: {asset_types:?}"
+        );
+        let slots = slots_of(retrieval);
+        for identifier in ["bridgeId", "culvertId"] {
+            assert!(slots.contains(&identifier.to_owned()), "{slots:?}");
+        }
+    }
+
     /// A join reads two classes; each scan keeps what its own side needs, and
     /// the union is a superset for both.
     #[test]
@@ -5439,7 +5740,7 @@ mod retrieval_tests {
             "{PREFIX}SELECT ?code WHERE {{ ?s a asset360:Signal ; asset360:kind ?t . \
              GRAPH <urn:schema> {{ ?t skos:notation ?code }} }}"
         );
-        let parsed = crate::sparql_scoper::parse_query(&query).expect("parses");
+        let parsed = crate::sparql_scoper::parse_query(&query, None).expect("parses");
         let slots = observable_slots(&parsed, &sv).expect("enumerable");
         assert!(slots.contains("kind"), "{slots:?}");
         assert!(
@@ -5476,8 +5777,8 @@ mod retrieval_tests {
             "SELECT ?s WHERE { ?s a asset360:Signal \
              OPTIONAL { ?s asset360:kind ?k FILTER EXISTS { ?s asset360:hasName \"Shared\" } } }",
         ] {
-            let parsed =
-                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).expect("parses");
+            let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
+                .expect("parses");
             let slots = observable_slots(&parsed, &sv).expect("enumerable");
             assert!(slots.contains("hasName"), "{query}\n{slots:?}");
         }

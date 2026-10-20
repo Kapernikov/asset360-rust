@@ -33,7 +33,6 @@
 //! and delete the module — it is deliberately one function wide so that swap
 //! stays cheap.
 
-use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::SlotContainerMode;
 
@@ -131,7 +130,9 @@ pub fn resolve_column(
 
     for (i, slot_name) in slot_path.iter().enumerate() {
         // The class's own name index, rather than a scan of its slots.
-        let slot = class_view.slot(&Identifier::Name(slot_name.clone()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class_view, slot_name)
+            .ok()
+            .flatten()?;
         containers.push(slot.determine_slot_container_mode());
 
         if i + 1 == slot_path.len() {

@@ -5,6 +5,24 @@
 use js_sys::{Array, JSON};
 use serde::Serialize;
 use serde_wasm_bindgen::to_value;
+
+/// What `toTurtle` takes.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurtleOptions {
+    #[serde(default)]
+    skolem: bool,
+    #[serde(default)]
+    inference: Option<String>,
+}
+
+#[wasm_bindgen(typescript_custom_section)]
+const TURTLE_OPTIONS_TS: &'static str = r#"
+export interface TurtleOptions {
+  skolem?: boolean;
+  inference?: string;
+}
+"#;
 use wasm_bindgen::prelude::*;
 
 #[cfg(feature = "minijinja-wasm")]
@@ -13,7 +31,8 @@ pub mod minijinja;
 pub use minijinja::*;
 
 use linkml_meta::SchemaDefinition;
-use linkml_runtime::turtle::{TurtleOptions, turtle_to_string};
+use linkml_runtime::schema_rdf::TypeInference;
+use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
 use linkml_runtime::{DiffOptions, LinkMLInstance, diff, load_json_str};
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::enumview::EnumView;
@@ -952,8 +971,33 @@ impl LinkMLInstanceHandle {
     }
 
     /// Serialize this instance as Turtle (RDF).
+    ///
+    /// `options` is `{ skolem?: boolean, inference?: string }`. `inference` is the
+    /// type inference the `rdf:type` triples are written under: `"asserted"` (the
+    /// instance's own class; the default), `"is_a"` (plus every `is_a`
+    /// ancestor and `sesame:directType`), `"is_a_and_mixins"` (plus mixins), or
+    /// any braced partition set such as `{own,is_a}` (`own`, `is_a`, `mixin`, `direct`).
+    /// `skolem` names inlined elements with IRIs instead of blank nodes.
     #[wasm_bindgen(js_name = toTurtle)]
-    pub fn to_turtle(&self, skolem: Option<bool>) -> Result<String, JsValue> {
+    pub fn to_turtle(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "TurtleOptions | undefined")] options: JsValue,
+    ) -> Result<String, JsValue> {
+        let options: TurtleOptions = if options.is_undefined() || options.is_null() {
+            TurtleOptions::default()
+        } else {
+            serde_wasm_bindgen::from_value(options)
+                .map_err(|e| JsValue::from_str(&format!("invalid toTurtle options: {e}")))?
+        };
+        let TurtleOptions { skolem, inference } = options;
+        let inference: TypeInference = inference
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|e: linkml_runtime::schema_rdf::ParseTypeInferenceError| {
+                JsValue::from_str(&e.to_string())
+            })?
+            .unwrap_or_default();
         let sv = self.inner.schema_view();
         let schema = sv
             .primary_schema()
@@ -964,9 +1008,7 @@ impl LinkMLInstanceHandle {
             sv,
             &schema,
             &conv,
-            TurtleOptions {
-                skolem: skolem.unwrap_or(false),
-            },
+            &WriteOptions::flat(inference).with_skolem(skolem),
         )
         .map_err(|e| JsValue::from_str(&e.to_string()))
     }

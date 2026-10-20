@@ -36,6 +36,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::sparql_dataset::DatasetSpec;
 use crate::sparql_refine::{
     Executor, Expr, LiftedExport, Node, NodeId, Plan, PlanOp, ScopeTransfer, SortOrigin, SortTerm,
     variables_used,
@@ -149,12 +150,14 @@ fn var_list(vars: &BTreeSet<String>) -> String {
 pub fn reads_schema_only(
     plan: &Plan,
     region: &[NodeId],
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Result<(), String> {
     let mut in_schema_graph: BTreeSet<NodeId> = BTreeSet::new();
     for &id in region {
         if let PlanOp::Graph { input, name } = &plan.nodes[id].op
-            && schema_graph_iri.is_some_and(|iri| name.trim_matches(['<', '>']) == iri)
+            && dataset
+                .schema_inference(name.trim_matches(['<', '>']))
+                .is_some()
         {
             in_schema_graph.extend(subtree(plan, *input));
         }
@@ -166,7 +169,9 @@ pub fn reads_schema_only(
                 return Err(format!("n{id} reads a triple of the default graph"));
             }
             PlanOp::Graph { name, .. }
-                if schema_graph_iri.is_none_or(|iri| name.trim_matches(['<', '>']) != iri) =>
+                if dataset
+                    .schema_inference(name.trim_matches(['<', '>']))
+                    .is_none() =>
             {
                 return Err(format!(
                     "n{id} reads the graph {name}, not the schema graph"
@@ -745,18 +750,15 @@ impl Rule for LiftOptionalExtension {
 /// obligation stays in its scope* validates.
 pub struct LiftOptionalRightSide<'a> {
     schema: &'a linkml_schemaview::schemaview::SchemaView,
-    schema_graph_iri: Option<&'a str>,
+    dataset: &'a DatasetSpec,
 }
 
 impl<'a> LiftOptionalRightSide<'a> {
     pub fn new(
         schema: &'a linkml_schemaview::schemaview::SchemaView,
-        schema_graph_iri: Option<&'a str>,
+        dataset: &'a DatasetSpec,
     ) -> Self {
-        Self {
-            schema,
-            schema_graph_iri,
-        }
+        Self { schema, dataset }
     }
 }
 
@@ -837,7 +839,7 @@ impl LiftOptionalRightSide<'_> {
             if inner_witness.is_some() {
                 return Err("the inner left join carries a witness of its own".to_owned());
             }
-            reads_schema_only(plan, &c_nodes, self.schema_graph_iri)
+            reads_schema_only(plan, &c_nodes, self.dataset)
                 .map_err(|why| format!("C (n{c}) reads more than the schema graph: {why}"))?;
             let scope_a = plan.variables_of(a);
             let bound_b = plan.definitely_bound_of(b);
@@ -1807,11 +1809,11 @@ impl Rule for PageBelowOneToOne<'_> {
 /// then the paging.
 pub fn lifting_rules<'a>(
     schema: &'a linkml_schemaview::schemaview::SchemaView,
-    schema_graph_iri: Option<&'a str>,
+    dataset: &'a DatasetSpec,
 ) -> Vec<Box<dyn Rule + 'a>> {
     vec![
         Box::new(LiftOptionalExtension),
-        Box::new(LiftOptionalRightSide::new(schema, schema_graph_iri)),
+        Box::new(LiftOptionalRightSide::new(schema, dataset)),
         Box::new(LiftExtensionOverJoin),
         Box::new(PageBelowOneToOne::new(schema)),
     ]
@@ -1821,13 +1823,13 @@ pub fn lifting_rules<'a>(
 pub fn declined(
     plan: &Plan,
     schema: &linkml_schemaview::schemaview::SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Vec<(&'static str, NodeId, String)> {
     let mut out = Vec::new();
     for (node, why) in LiftOptionalExtension::declined(plan) {
         out.push((R2, node, why));
     }
-    for (node, why) in LiftOptionalRightSide::new(schema, schema_graph_iri).declined(plan) {
+    for (node, why) in LiftOptionalRightSide::new(schema, dataset).declined(plan) {
         out.push((R1, node, why));
     }
     for (node, why) in LiftExtensionOverJoin::declined(plan) {
@@ -1885,8 +1887,16 @@ pub(crate) mod tests {
 
     /// The plan production refines a query to with the lifts on.
     pub(crate) fn lifted_plan(query: &str, schema: &SchemaView) -> Plan {
-        let mut plan = crate::sparql_refine::naive_plan_for(query, schema).unwrap();
-        let rules = crate::sparql_plan::refine_rules(schema, None, true);
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(query, Some(schema)).unwrap(),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
+        let rules = crate::sparql_plan::refine_rules(
+            schema,
+            crate::sparql_dataset::default_dataset(),
+            true,
+        );
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut plan, &borrowed)
@@ -1896,7 +1906,11 @@ pub(crate) mod tests {
 
     /// What the refined printout says, `declined` section included.
     pub(crate) fn printout(query: &str, schema: &SchemaView) -> String {
-        crate::sparql_plan::with_declined(&lifted_plan(query, schema), schema, None)
+        crate::sparql_plan::with_declined(
+            &lifted_plan(query, schema),
+            schema,
+            crate::sparql_dataset::default_dataset(),
+        )
     }
 
     /// **The rows route, end to end on the oracle.** The query is planned
@@ -1910,20 +1924,28 @@ pub(crate) mod tests {
         schema: &SchemaView,
         oracle: &Oracle,
     ) -> (ExecutionPlan, Vec<serde_json::Value>) {
-        let plan = crate::sparql_plan::plan_query_refined(query, schema).unwrap();
+        let plan =
+            crate::sparql_plan::plan_of(query, schema, crate::sparql_dataset::default_dataset())
+                .unwrap();
         assert!(
             matches!(plan.refinement, Refinement::UsedRows(_)),
             "expected the rows route:\n{plan}"
         );
         // The same placement, for the island it placed.
-        let parsed = crate::sparql_scoper::parse_query_for(query, schema).unwrap();
+        let parsed = crate::sparql_scoper::parse_query(query, Some(schema)).unwrap();
         let obligations = crate::sparql_plan::obligations_of(&parsed).unwrap();
-        let mut lifted = crate::sparql_refine::naive_plan(&parsed).unwrap();
+        let mut lifted =
+            crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
+                .unwrap();
         let lifts = plan.passes.iter().any(|pass| {
             matches!(&pass.kind, PassKind::Engine(engine)
                 if matches!(&engine.input, EngineInput::Solutions { .. }))
         });
-        let rules = crate::sparql_plan::refine_rules(schema, None, lifts);
+        let rules = crate::sparql_plan::refine_rules(
+            schema,
+            crate::sparql_dataset::default_dataset(),
+            lifts,
+        );
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut lifted, &borrowed).unwrap();
@@ -1932,7 +1954,7 @@ pub(crate) mod tests {
             &lifted,
             &parsed,
             schema,
-            None,
+            crate::sparql_dataset::default_dataset(),
             &Default::default(),
         )
         .unwrap_or_else(|why| panic!("{why}\n{lifted}"));
@@ -1954,7 +1976,6 @@ pub(crate) mod tests {
             &json,
             schema,
             crate::sparql_executor::ExecuteLimits::default(),
-            None,
         )
         .unwrap_or_else(|error| panic!("{error}\n{plan}"));
         let parsed: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
@@ -1965,7 +1986,7 @@ pub(crate) mod tests {
     /// The oracle's own answer to the original query, in its order.
     pub(crate) fn oracle_rows(query: &str, oracle: &Oracle) -> Vec<serde_json::Value> {
         oracle
-            .json_rows(crate::sparql_scoper::parse_query(query).unwrap())
+            .json_rows(crate::sparql_scoper::parse_query(query, None).unwrap())
             .1
     }
 
@@ -2076,12 +2097,13 @@ pub(crate) mod tests {
         assert_ne!(original, rows_only);
 
         let schema = test_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &format!(
                 "{PREFIX}SELECT ?s ?found WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
                  BIND(EXISTS {{ ?s asset360:length ?len }} AS ?found) }}"
             ),
             &schema,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         let Refinement::Used(Some(note)) = &plan.refinement else {
@@ -2691,7 +2713,9 @@ mod composition {
         // The lift fires on it.
         let lifted = lifted_plan(&query, &schema).to_string();
         assert!(lifted.contains("R2  "), "{lifted}");
-        let plan = crate::sparql_plan::plan_query_refined(&query, &schema).unwrap();
+        let plan =
+            crate::sparql_plan::plan_of(&query, &schema, crate::sparql_dataset::default_dataset())
+                .unwrap();
         assert!(
             !matches!(plan.refinement, Refinement::UsedRows(_)),
             "{plan}"
@@ -2730,14 +2754,22 @@ mod composition {
         // Where it stood, M1 declines it on K7 ...
         let unlifted = crate::sparql_plan::with_declined(
             &{
-                let mut plan = crate::sparql_refine::naive_plan_for(&query, &schema).unwrap();
-                let rules = crate::sparql_plan::refine_rules(&schema, None, false);
+                let mut plan = crate::sparql_refine::naive_plan(
+                    &crate::sparql_scoper::parse_query(&query, Some(&schema)).unwrap(),
+                    crate::sparql_dataset::default_dataset(),
+                )
+                .unwrap();
+                let rules = crate::sparql_plan::refine_rules(
+                    &schema,
+                    crate::sparql_dataset::default_dataset(),
+                    false,
+                );
                 let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
                 crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
                 plan
             },
             &schema,
-            None,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             unlifted.contains("K7: column ?tag is not uniform"),
@@ -2776,12 +2808,13 @@ mod composition {
     #[test]
     fn a_region_that_reads_instances_finishes_over_records() {
         let schema = test_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(
+        let plan = crate::sparql_plan::plan_of(
             &format!(
                 "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal . \
                  FILTER(EXISTS {{ ?s asset360:name ?nm }}) }}"
             ),
             &schema,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert!(matches!(plan.refinement, Refinement::Used(_)), "{plan}");
@@ -2987,7 +3020,11 @@ mod grammar_differential {
         let mut routed = 0;
         for body in crate::sparql_algebra::equivalence::grammar() {
             let query = format!("{PREFIX}{body}");
-            let Ok(plan) = crate::sparql_plan::plan_query_refined(&query, &schema) else {
+            let Ok(plan) = crate::sparql_plan::plan_of(
+                &query,
+                &schema,
+                crate::sparql_dataset::default_dataset(),
+            ) else {
                 continue;
             };
             if !matches!(plan.refinement, Refinement::UsedRows(_)) {

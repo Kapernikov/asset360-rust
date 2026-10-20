@@ -161,7 +161,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: 3.x
+          python-version: '3.13'
           architecture: ${{ matrix.platform.target }}
       - name: Set crate version from tag
         if: startsWith(github.ref, 'refs/tags/')
@@ -201,7 +201,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: 3.x
+          python-version: '3.13'
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Set crate version from tag

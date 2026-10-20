@@ -361,6 +361,13 @@ pub fn key_facts(schema: &SchemaView, plan: &Plan, join: NodeId) -> Result<KeyFa
             TermDescriptor::subject_iri(),
             "identity".to_owned(),
         ),
+        // A record's direct type: the `asset_type` column holds the class's
+        // IRI text, so the cell's own text is the key.
+        Some(TermOf::DirectType { .. }) => (
+            KeyTranslation::Identity,
+            TermDescriptor::subject_iri(),
+            "direct type".to_owned(),
+        ),
         Some(TermOf::Slot {
             class_uri,
             path,
@@ -787,16 +794,20 @@ pub(crate) mod tests {
     }
 
     fn rules(schema: &SchemaView) -> Vec<Box<dyn Rule + '_>> {
-        tier_one_rules(schema, None)
+        tier_one_rules(schema, crate::sparql_dataset::default_dataset())
     }
 
     fn refined_text(query: &str, schema: &SchemaView) -> String {
         let text = format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}");
-        let mut plan = crate::sparql_refine::naive_plan_for(&text, schema).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(&text, Some(schema)).unwrap(),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rules = rules(schema);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
-        crate::sparql_plan::with_declined(&plan, schema, None)
+        crate::sparql_plan::with_declined(&plan, schema, crate::sparql_dataset::default_dataset())
     }
 
     fn lowered_tables(plan: &Plan) -> usize {
@@ -817,7 +828,13 @@ pub(crate) mod tests {
              OPTIONAL {{ ?s asset360:signalType ?t . \
              OPTIONAL {{ GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }} }} }}"
         ));
-        let refined = crate::sparql_plan::refined_plan_text(&q, &sv, Some(SCHEMA_GRAPH)).unwrap();
+        let refined = crate::sparql_plan::plan_texts_of(
+            &q,
+            &sv,
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
+        )
+        .1
+        .unwrap();
         assert!(
             refined.contains("lowered as c1, key ?t: enum→code, 1 kept, 2 outside enum [S]"),
             "{refined}"
@@ -826,9 +843,12 @@ pub(crate) mod tests {
             refined.contains("by value ?t (signalType, enum→code)  [S]"),
             "{refined}"
         );
-        let plan =
-            crate::sparql_plan::plan_query_refined_with_schema_graph(&q, &sv, Some(SCHEMA_GRAPH))
-                .unwrap();
+        let plan = crate::sparql_plan::plan_of(
+            &q,
+            &sv,
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
+        )
+        .unwrap();
         let printed = plan.to_string();
         assert_eq!(plan.refinement.as_str(), "used_alone", "{printed}");
         assert!(
@@ -847,21 +867,30 @@ pub(crate) mod tests {
         );
     }
 
-    /// P3 of the design: the label left-joined where its key may be unbound
-    /// is declined, and the printout says which guard stopped it.
+    /// P3 of the design: the label joined where its key may be unbound is
+    /// declined, and the printout says which guard stopped it. (Joined, not
+    /// left-joined: a sibling `OPTIONAL` on a maybe-unbound key is refused by
+    /// the scoper before any plan exists -- #460 -- so there is no plan to
+    /// print for it.)
     #[test]
     fn p3_an_optional_key_declines_on_k1() {
         let sv = asset360_schema_view();
         let q = asset360_query(&format!(
             "SELECT ?s ?typeNl WHERE {{ ?s a asset360:Signal . \
              OPTIONAL {{ ?s asset360:signalType ?t }} \
-             OPTIONAL {{ GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }} }}"
+             GRAPH <{SCHEMA_GRAPH}> {{ ?t skos:prefLabel ?typeNl FILTER(lang(?typeNl) = \"nl-be\") }} }}"
         ));
-        let refined = crate::sparql_plan::refined_plan_text(&q, &sv, Some(SCHEMA_GRAPH)).unwrap();
+        let refined = crate::sparql_plan::plan_texts_of(
+            &q,
+            &sv,
+            &crate::sparql_dataset::schema_dataset(SCHEMA_GRAPH),
+        )
+        .1
+        .unwrap();
         assert!(refined.contains("  declined\n"), "{refined}");
         assert!(
             refined.contains(
-                "lower_constant_relation  n1  K1: ?t is in scope in n0 but not bound in every \
+                "lower_constant_relation  n2  K1: ?t is in scope in n1 but not bound in every \
                  solution (optional read)"
             ),
             "{refined}"
@@ -918,7 +947,9 @@ pub(crate) mod tests {
              SELECT ?s ?lat ?lbl WHERE { ?s a asset360:Signal . \
              OPTIONAL { ?s asset360:location ?loc . ?loc asset360:latitude ?lat ; asset360:detail ?d . \
              ?d asset360:value ?v . OPTIONAL { VALUES (?v ?lbl) { (\"x\" \"X\") } } } }";
-        let plan = crate::sparql_plan::plan_query_refined(query, &schema).unwrap();
+        let plan =
+            crate::sparql_plan::plan_of(query, &schema, crate::sparql_dataset::default_dataset())
+                .unwrap();
         assert_eq!(plan.refinement.as_str(), "used_alone", "{plan}");
         let printed = plan.to_string();
         assert!(
@@ -1013,7 +1044,11 @@ pub(crate) mod tests {
              SELECT ?s ?lbl WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL {{ VALUES (?k ?lbl) {{ (<{gsa}> \"gsa\") }} }} }}"
         );
-        let mut plan = crate::sparql_refine::naive_plan_for(&text, &schema).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan(
+            &crate::sparql_scoper::parse_query(&text, Some(&schema)).unwrap(),
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rules = rules(&schema);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let leftjoin = plan.find("leftjoin")[0];
@@ -1023,7 +1058,11 @@ pub(crate) mod tests {
             *condition = Some(crate::sparql_refine::Expr::Var("s".to_owned()));
         }
         crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
-        let refined = crate::sparql_plan::with_declined(&plan, &schema, None);
+        let refined = crate::sparql_plan::with_declined(
+            &plan,
+            &schema,
+            crate::sparql_dataset::default_dataset(),
+        );
         assert!(
             refined.contains("K6: the left join carries a condition"),
             "{refined}"

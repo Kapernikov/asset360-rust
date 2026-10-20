@@ -45,6 +45,7 @@ use spargebra::Query;
 
 use linkml_schemaview::schemaview::SchemaView;
 
+use crate::sparql_dataset::DatasetSpec;
 use crate::sparql_scoper::{Inexact, ScopeError};
 
 /// Bumped when a pass kind or an obligation kind is added.
@@ -52,6 +53,12 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// An executor that does not recognise the version refuses the plan. That makes
 /// a planner/executor version skew a loud failure rather than a wrong number,
 /// which is the failure this whole module is shaped around.
+///
+/// 7 added [`crate::sparql_ops::Op::Scan`]'s `direct_type`, a column the
+/// scan binds (`asset_type AS <col>`, an IRI), and the `direct_type` flag of
+/// a binding and of a join key's column: `slot_path` is empty for it as for
+/// the identity, so a consumer built against 6 reads the star's identity
+/// where the record's direct type is meant -- a wrong answer with no error.
 ///
 /// 6 added the two mechanisms of `docs/design/sparql-schema-relations-and-
 /// row-finish.md` (asset360 issue #494): [`crate::sparql_ops::Op::Constant`],
@@ -100,7 +107,7 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// conjunction into one obligation per conjunct did *not* bump it: that
 /// changes how many `Filter` obligations a query raises, not what kinds exist,
 /// and a consumer that reads the list rather than counting it is unaffected.
-pub const PLAN_CONTRACT: u32 = 6;
+pub(crate) const PLAN_CONTRACT: u32 = 7;
 
 /// Index into [`ExecutionPlan::obligations`]. Printed as `o1`, `o2`, ... so a
 /// human can check the ledger by eye.
@@ -293,9 +300,29 @@ pub struct ExecutionPlan {
     /// How this plan is to be run, and what the engine was left. See
     /// [`plan_query_refined`].
     pub refinement: Refinement,
+    /// The dataset the plan was made for. The inference of every scan and the
+    /// schema graphs a finish query may read were decided under it, so
+    /// [`crate::sparql_executor::sparql_finish`] reads it from here rather than
+    /// being handed a second one that could disagree.
+    pub(crate) dataset: DatasetSpec,
+    /// The query the plan answers, as the planner read it: parsed and with
+    /// every slot and class spelled canonically. What the engine evaluates
+    /// ([`crate::sparql_executor::sparql_execute_plan`]), so the planned query
+    /// and the evaluated one cannot be two.
+    pub(crate) query: Query,
 }
 
 impl ExecutionPlan {
+    /// The dataset the plan was made for.
+    pub fn dataset(&self) -> &DatasetSpec {
+        &self.dataset
+    }
+
+    /// The query the plan answers, parsed and canonicalised.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
     /// Whether every obligation has a pass to enforce it.
     ///
     /// False means the plan answers a *different* question than the one asked,
@@ -581,6 +608,7 @@ fn write_sql_body(f: &mut fmt::Formatter<'_>, sql: &SqlPass) -> fmt::Result {
 fn column_name(column: &crate::sparql_ops::ColumnRef) -> String {
     match (&column.column, column.path.as_slice()) {
         (Some(name), _) => name.clone(),
+        (None, []) if column.direct_type => "<direct type>".to_owned(),
         (None, []) => "<identity>".to_owned(),
         (None, path) => path.join("."),
     }
@@ -680,12 +708,17 @@ fn write_ops(
                 identifier_values,
                 required_paths,
                 is_optional,
+                direct_type,
                 ..
             } => {
                 writeln!(
                     f,
-                    "{indent}scan      {}  as ?{star_var}{}",
+                    "{indent}scan      {}  as ?{star_var}{}{}",
                     shorten(class_uri),
+                    match direct_type {
+                        Some(var) => format!("   type→?{var}"),
+                        None => String::new(),
+                    },
                     if *is_optional { "   optional" } else { "" }
                 )?;
                 if !identifier_values.is_empty() {
@@ -1125,13 +1158,8 @@ pub fn unclaimed(
 /// Carried on the artifact rather than logged in Rust, because the caller has
 /// the query text and the logger.
 ///
-/// **What this used to be, and is not.** While there were two SQL planners
-/// this said which one won and why the gate chose it, with a `NotAttempted`
-/// for a plan that never went through the pipeline and a `Used` note carrying
-/// the *ledger difference* between the two — an obligation SQL applied without
-/// claiming, reported rather than vetoed. There is one planner now, so there
-/// is no ledger to differ from: the note says what the statement left for the
-/// engine, which is the question anyone actually asks when a query is slow.
+/// The note says what the statement left for the engine, which is the question
+/// anyone asks when a query is slow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refinement {
     /// The statement narrows the rows and the engine finishes the query.
@@ -1224,6 +1252,7 @@ impl Refinement {
 ///
 /// The fourth, `FetchDeclined` -- a fetch too large to materialise -- is the
 /// runtime gate's (`planning.fallback_can_answer`) and never this crate's.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Statement,
@@ -1235,8 +1264,9 @@ pub enum Outcome {
 }
 
 /// [`Outcome`] of planning a query.
-pub fn outcome_of(query: &str, schema: &SchemaView, schema_graph_iri: Option<&str>) -> Outcome {
-    match plan_query_refined_with_schema_graph(query, schema, schema_graph_iri) {
+#[cfg(test)]
+pub(crate) fn outcome_of(query: &str, schema: &SchemaView, dataset: &DatasetSpec) -> Outcome {
+    match plan_of(query, schema, dataset) {
         Ok(plan) => match &plan.refinement {
             Refinement::UsedAlone(_) => Outcome::Statement,
             Refinement::UsedRows(_) => Outcome::Rows,
@@ -1245,6 +1275,22 @@ pub fn outcome_of(query: &str, schema: &SchemaView, schema_graph_iri: Option<&st
         },
         Err(error) => Outcome::Rejected(error.to_string()),
     }
+}
+
+/// [`refined_plan_text`] and [`naive_plan_text`] of a query as written, for
+/// tests: the production functions take the parsed query.
+#[cfg(test)]
+pub(crate) fn plan_texts_of(
+    query: &str,
+    schema: &SchemaView,
+    dataset: &DatasetSpec,
+) -> (Result<String, String>, Result<String, String>) {
+    let parse =
+        |schema| crate::sparql_scoper::parse_query(query, schema).map_err(|e| e.to_string());
+    (
+        parse(None).and_then(|parsed| naive_plan_text(&parsed, dataset)),
+        parse(Some(schema)).and_then(|parsed| refined_plan_text(&parsed, schema, dataset)),
+    )
 }
 
 /// The plan the refinement pipeline *starts* from: every node the engine's.
@@ -1258,9 +1304,11 @@ pub fn outcome_of(query: &str, schema: &SchemaView, schema_graph_iri: Option<&st
 /// Takes no schema: the naive plan is a transcription of the query's own
 /// algebra, and nothing about it depends on what the data looks like. That is
 /// the property the ledger rests on -- the obligations are read off the query,
-/// so a rule can only ever discharge them, never invent one.
-pub fn naive_plan_text(query: &str) -> Result<String, String> {
-    crate::sparql_refine::naive_plan_of(query)
+/// so a rule can only ever discharge them, never invent one. It does take the
+/// dataset, which says which graph each pattern reads and so which inference it
+/// is matched under.
+pub fn naive_plan_text(query: &Query, dataset: &DatasetSpec) -> Result<String, String> {
+    crate::sparql_refine::naive_plan(query, dataset)
         .map(|plan| plan.to_string())
         .map_err(|e| e.to_string())
 }
@@ -1268,30 +1316,58 @@ pub fn naive_plan_text(query: &str) -> Result<String, String> {
 /// The refined plan for a query, as text.
 ///
 /// For diagnostics only, and it exists because a fallback hides its own
-/// evidence: the artifact `plan_query_refined` returns carries today's
-/// operators, so the plan the gate rejected is gone by the time anyone reads
+/// evidence: the artifact `plan_query_refined` returns carries the scoper's
+/// operators, so the plan that was rejected is gone by the time anyone reads
 /// the reason. This is that plan.
 ///
-/// `schema_graph_iri` is the graph the active datamodel serves its schema in,
-/// and it is a parameter here for the same reason it is one everywhere else:
-/// it decides which rules exist, so a diagnostic that left it out would print a
-/// plan production never builds.
+/// `dataset` says which graphs the endpoint serves, and it is a parameter here
+/// for the same reason it is one everywhere else: it decides which rules exist
+/// and which inference each pattern is matched under, so a diagnostic that left it
+/// out would print a plan production never builds.
 pub fn refined_plan_text(
-    query: &str,
+    query: &Query,
     schema: &linkml_schemaview::schemaview::SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Result<String, String> {
-    let naive = crate::sparql_refine::naive_plan_for(query, schema).map_err(|e| e.to_string())?;
+    let mut parsed = query.clone();
+    // The pass production runs before it reads anything (see
+    // `plan_query_refined`): the aliases are settled and what
+    // the query's classes cannot carry is refused, so this never prints a plan
+    // production would refuse.
+    crate::sparql_alias::canonicalize(&mut parsed, schema)
+        .map_err(|e| ScopeError::from(e).to_string())?;
+    let parsed = parsed;
+    // The refusals production gives before it refines anything: the same two
+    // calls, in the same order, as `plan_query_refined`. A query refused here
+    // has no plan to show -- printing one would be printing a plan production
+    // never returns. A refusal that comes after refinement (`resolve`'s
+    // unscoped star) is deliberately not repeated: the refined plan is the
+    // evidence for it.
+    obligations_of(&parsed).map_err(|e| e.to_string())?;
+    match crate::sparql_scoper::scope_query(
+        &parsed,
+        schema,
+        dataset,
+        crate::sparql_scoper::Scoping::Record,
+    ) {
+        // Not final: a query with no instance star (a question about the
+        // datamodel alone) is read by the schema-graph route, and the refined
+        // plan is what shows what the pipeline did with it.
+        Ok(_) | Err(ScopeError::Unscoped { .. }) => {}
+        Err(refusal) => return Err(refusal.to_string()),
+    }
+    let naive = crate::sparql_refine::naive_plan(&parsed, dataset).map_err(|e| e.to_string())?;
     // The plan production builds: with the lifts when they reach the rows
     // route, without them otherwise (see `plan_query_refined`).
-    let lifts = plan_query_refined_with_schema_graph(query, schema, schema_graph_iri)
+    let lifts = plan_query_refined(&parsed, schema, dataset, Finishing::Rows)
         .is_ok_and(|plan| matches!(plan.refinement, Refinement::UsedRows(_)));
-    let rules = refine_rules(schema, schema_graph_iri, lifts);
+    let visible = dataset.read_by(&parsed);
+    let rules = refine_rules(schema, &visible, lifts);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
         rules.iter().map(|rule| rule.as_ref()).collect();
     let mut plan = naive;
     crate::sparql_rules::refine(&mut plan, &borrowed).map_err(|failure| failure.to_string())?;
-    Ok(with_declined(&plan, schema, schema_graph_iri))
+    Ok(with_declined(&plan, schema, &visible))
 }
 
 /// A refined plan's printout with its `declined` section: every rule whose
@@ -1300,10 +1376,10 @@ pub fn refined_plan_text(
 pub fn with_declined(
     plan: &crate::sparql_refine::Plan,
     schema: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> String {
     let text = plan.to_string();
-    let declined = crate::sparql_rules::declined(plan, schema, schema_graph_iri);
+    let declined = crate::sparql_rules::declined(plan, schema, dataset);
     if declined.is_empty() {
         return text;
     }
@@ -1317,42 +1393,51 @@ pub fn with_declined(
     }
 }
 
-/// Plan a query: one parse, one scope, one refinement, one artifact.
+/// Which routes may finish a planned query.
+///
+/// The records route answers every query the rows route does, more slowly, so
+/// declining the rows route is never a wrong answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Finishing {
+    /// The engine may finish over the statement's rows
+    /// (`Refinement::UsedRows`) when the plan allows it, and over fetched
+    /// records otherwise.
+    #[default]
+    Rows,
+    /// The engine finishes over fetched records only: the plan the records
+    /// route would run. What a consumer asks for when it cannot render the rows
+    /// route's statement. The lifts R1-R3 go with it, since they are kept only
+    /// for the rows route.
+    RecordsOnly,
+}
+
+/// Plan a parsed query: one scope, one refinement, one artifact.
 ///
 /// **The only planner.** A naive plan of the whole query, refined by rules to
-/// a fixpoint, lowered into the operators `sql_builder.py` renders. There used
-/// to be a second one — a single-pass analysis that decided eligibility for
-/// the grouped question as a whole — and a runtime gate that compared the two.
-/// Both are gone: two planners is two things to maintain, and the comparison's
-/// knowledge is kept as invariants on one plan rather than as a diff against
-/// another. See `doc_book/src/design/28d-plan-refinement.md`.
+/// a fixpoint, lowered into the operators `sql_builder.py` renders. What a
+/// comparison between two planners would have checked is kept as invariants on
+/// this one plan. See `doc_book/src/design/28d-plan-refinement.md`.
 ///
-/// **Admission asks one question**, the one path B always asked: does this
-/// statement answer the whole query on its own terms — every node in SQL,
-/// every obligation discharged, the residual empty, the invariants holding,
-/// and a solution it can actually emit? If so, SQL answers. If not, the
-/// statement is a *fetch* that narrows the rows and the engine finishes, which
-/// is what has always happened whenever the pushdown route declined.
+/// **Admission asks one question**: does this statement answer the whole query
+/// on its own terms — every node in SQL, every obligation discharged, the
+/// residual empty, the invariants holding, and a solution it can actually
+/// emit? If so, SQL answers. If not, the statement is a *fetch* that narrows
+/// the rows and the engine finishes.
 ///
 /// **The engine leg stays permanently.** It re-runs the whole query over the
 /// materialised instances, which makes every partial push correct and makes it
-/// the oracle every differential in this design rests on. Deleting the second
-/// SQL planner is not the same thing as removing the fallback.
+/// the oracle every differential in this design rests on.
 ///
-/// **The three inputs the deleted planner used to supply, and where each comes
-/// from now:**
+/// **The three inputs, and where each comes from:**
 ///
 /// * **the obligation list** — [`obligations_of`], which takes the parsed
-///   query and nothing else. It was already the single derivation: the naive
-///   plan builder calls it too, so the refined plan's ledger and this list are
-///   the same list rather than two lists that agree. Nothing moved, and that
-///   is the point — a second derivation that agrees today is the failure mode
-///   worth avoiding.
+///   query and nothing else. The naive plan builder calls it too, so the
+///   refined plan's ledger and this list are the same list rather than two
+///   lists that agree.
 /// * **the fetch bound** — `QueryPlan::sql_limit`, straight from the scoper.
 ///   Whether a `LIMIT` may reach the fetch is an analysis with a subtlety in
 ///   it (a dropped filter makes it unsafe), so it stays where that analysis
-///   lives. Reading it here rather than recovering it from another planner's
-///   operators removes a dependency without adding a derivation.
+///   lives.
 /// * **the pass structure** — built below. Two shapes and no third: one SQL
 ///   pass when the statement answers the whole query, or an SQL fetch plus an
 ///   engine pass that finishes it.
@@ -1360,45 +1445,21 @@ pub fn with_declined(
 /// The scoper is still called, and not only for the bound: it is what refuses
 /// `UNION`, `MINUS` and an unscoped subject, which the endpoint turns into a
 /// 422 rather than a wrong answer. Those refusals are the user's, not the
-/// planner's, and they predate all of this.
+/// planner's.
 ///
-/// `schema_graph_iri` is the named graph the active datamodel serves its schema
-/// in, or `None` when it configures none. The scoper needs it to tell a pattern
-/// about the datamodel apart from a pattern about a golden record; it is a
-/// parameter and not a constant because the deployment's datamodel decides it
-/// (see [`crate::sparql_schema_graph`]).
+/// `dataset` says which graphs the endpoint serves and what the default graph
+/// means. The scoper needs it to tell a pattern about the datamodel apart from
+/// a pattern about a golden record, and the plan to say which type inference each
+/// pattern is matched under; it is a parameter and not a constant because the
+/// deployment decides it (see [`crate::sparql_dataset`] and
+/// [`crate::sparql_schema_graph`]).
 pub fn plan_query_refined(
-    query_str: &str,
+    query: &Query,
     schema_view: &SchemaView,
+    dataset: &DatasetSpec,
+    finishing: Finishing,
 ) -> Result<ExecutionPlan, ScopeError> {
-    plan_query_refined_with_schema_graph(query_str, schema_view, None)
-}
-
-/// [`plan_query_refined`], for a deployment that serves a schema graph.
-///
-/// See [`crate::sparql_scoper::sparql_scope_with_schema_graph`] for what
-/// `schema_graph_iri` is and why it is not a constant.
-pub fn plan_query_refined_with_schema_graph(
-    query_str: &str,
-    schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
-) -> Result<ExecutionPlan, ScopeError> {
-    plan_query_refined_with_options(query_str, schema_view, schema_graph_iri, true)
-}
-
-/// [`plan_query_refined_with_schema_graph`], with the rows route
-/// (`Refinement::UsedRows`) switched off when `rows_route` is `false`: the
-/// plan the records route would run. What a consumer asks for when it cannot
-/// render the rows route's statement -- the records route answers every
-/// query the rows route does, more slowly, so declining one is never a wrong
-/// answer. The lifts R1–R3 go with it, since they are kept only for it.
-pub fn plan_query_refined_with_options(
-    query_str: &str,
-    schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
-    rows_route: bool,
-) -> Result<ExecutionPlan, ScopeError> {
-    let mut parsed = crate::sparql_scoper::parse_query_for(query_str, schema_view)?;
+    let rows_route = finishing == Finishing::Rows;
     // Before anything reads a predicate or a type: one slot has two
     // legitimate IRIs when it declares a `slot_uri`, one class when it declares
     // a `class_uri`, and both routes have to be looking at the same one.
@@ -1406,6 +1467,7 @@ pub fn plan_query_refined_with_options(
     // client sent -- and a predicate the subject's class cannot carry is
     // refused here, before the scoper could resolve it by local name onto a
     // slot it does not name. See [`crate::sparql_alias`].
+    let mut parsed = query.clone();
     crate::sparql_alias::canonicalize(&mut parsed, schema_view)?;
     let parsed = parsed;
     let obligations = obligations_of(&parsed)?;
@@ -1417,14 +1479,19 @@ pub fn plan_query_refined_with_options(
     // type -- the only place an unscoped refusal is final. The refusals for
     // what the fetch cannot represent (`UnsupportedConstruct`) stay
     // immediate.
-    let recorded = crate::sparql_scoper::scope_parsed_as(
+    let recorded = crate::sparql_scoper::scope_query(
         &parsed,
         schema_view,
-        schema_graph_iri,
+        dataset,
         crate::sparql_scoper::Scoping::Record,
     )?;
 
-    let naive = match crate::sparql_refine::naive_plan(&parsed) {
+    // The graphs the query can see: under a `FROM NAMED` a graph outside the
+    // set is not there to be read, for the rules that read a schema graph as
+    // much as for the engine.
+    let visible = dataset.read_by(&parsed);
+    let dataset_in_force = &visible;
+    let naive = match crate::sparql_refine::naive_plan(&parsed, dataset) {
         Ok(plan) => plan,
         // A naive plan the builder cannot make is a query this pipeline does
         // not represent. The scoper has already accepted it, so there are rows
@@ -1433,8 +1500,15 @@ pub fn plan_query_refined_with_options(
         // No refined plan exists, so there is nothing to keep: a
         // partial refusal is partial in what the *rules* proved.
         Err(error) => {
-            let scoped = resolve(&parsed, schema_view, schema_graph_iri, &recorded, None)?;
-            return Ok(fetch_only(obligations, &scoped, error.to_string(), None));
+            let scoped = resolve(&parsed, schema_view, dataset, &recorded, None)?;
+            return Ok(fetch_only(
+                obligations,
+                &scoped,
+                error.to_string(),
+                None,
+                dataset,
+                &parsed,
+            ));
         }
     };
     // **M2's lifts are kept only when they reach `UsedRows`.** They exist to
@@ -1456,7 +1530,7 @@ pub fn plan_query_refined_with_options(
     let _ = rows_route;
     #[cfg(feature = "sparql-endpoint")]
     if rows_route {
-        let rules = refine_rules(schema_view, schema_graph_iri, true);
+        let rules = refine_rules(schema_view, dataset_in_force, true);
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         let mut lifted = naive.clone();
@@ -1464,19 +1538,13 @@ pub fn plan_query_refined_with_options(
             if lifted.rewrites.is_empty() {
                 settled = Some(lifted);
             } else {
-                let scoped = resolve(
-                    &parsed,
-                    schema_view,
-                    schema_graph_iri,
-                    &recorded,
-                    Some(&lifted),
-                )?;
+                let scoped = resolve(&parsed, schema_view, dataset, &recorded, Some(&lifted))?;
                 if let Ok(plan) = self::rows_route(
                     &obligations,
                     &lifted,
                     &parsed,
                     schema_view,
-                    schema_graph_iri,
+                    dataset_in_force,
                     &scoped,
                 ) {
                     return Ok(plan);
@@ -1484,7 +1552,7 @@ pub fn plan_query_refined_with_options(
             }
         }
     }
-    let rules = refine_rules(schema_view, schema_graph_iri, false);
+    let rules = refine_rules(schema_view, dataset_in_force, false);
     let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
         rules.iter().map(|rule| rule.as_ref()).collect();
     let mut refined = naive;
@@ -1499,23 +1567,19 @@ pub fn plan_query_refined_with_options(
         // A plan a rule broke is a plan whose narrowings nothing vouches
         // for -- the invariant that would have vouched for them is the one
         // that failed. Refuse them all.
-        let scoped = resolve(&parsed, schema_view, schema_graph_iri, &recorded, None)?;
+        let scoped = resolve(&parsed, schema_view, dataset, &recorded, None)?;
         return Ok(fetch_only(
             obligations,
             &scoped,
             format!("a rule broke the plan: {failure}"),
             None,
+            dataset,
+            &parsed,
         ));
     }
     // `resolve`: every recorded star is typed from the refined plan's scan
     // for it in its own domain, or refused.
-    let scoped = resolve(
-        &parsed,
-        schema_view,
-        schema_graph_iri,
-        &recorded,
-        Some(&refined),
-    )?;
+    let scoped = resolve(&parsed, schema_view, dataset, &recorded, Some(&refined))?;
 
     let mut ops = match crate::sparql_ops::lower_refined_with(
         &refined,
@@ -1537,6 +1601,8 @@ pub fn plan_query_refined_with_options(
                 &scoped,
                 format!("not lowerable: {refusal}"),
                 Some((&refined, schema_view)),
+                dataset,
+                &parsed,
             ));
         }
     };
@@ -1555,6 +1621,8 @@ pub fn plan_query_refined_with_options(
         obligations,
         // Decided by `answers_alone` below; both arms overwrite it.
         refinement: Refinement::Used(None),
+        dataset: dataset.clone(),
+        query: parsed.clone(),
     };
 
     match answers_alone(&plan, &ops) {
@@ -1580,7 +1648,7 @@ pub fn plan_query_refined_with_options(
                     &refined,
                     &parsed,
                     schema_view,
-                    schema_graph_iri,
+                    dataset_in_force,
                     &scoped,
                 ) {
                     Ok(rows) => return Ok(rows),
@@ -1627,15 +1695,12 @@ pub fn plan_query_refined_with_options(
 /// -- M2's lifting rules R1–R3 after it.
 pub(crate) fn refine_rules<'a>(
     schema_view: &'a SchemaView,
-    schema_graph_iri: Option<&'a str>,
+    dataset: &'a DatasetSpec,
     lifts: bool,
 ) -> Vec<Box<dyn crate::sparql_rules::Rule + 'a>> {
-    let mut rules = crate::sparql_rules::tier_one_rules(schema_view, schema_graph_iri);
+    let mut rules = crate::sparql_rules::tier_one_rules(schema_view, dataset);
     if lifts {
-        rules.extend(crate::sparql_lift::lifting_rules(
-            schema_view,
-            schema_graph_iri,
-        ));
+        rules.extend(crate::sparql_lift::lifting_rules(schema_view, dataset));
     }
     rules
 }
@@ -1670,7 +1735,7 @@ pub(crate) fn rows_route(
     refined: &crate::sparql_refine::Plan,
     parsed: &Query,
     schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
     scoped: &crate::sparql_scoper::QueryPlan,
 ) -> Result<ExecutionPlan, String> {
     let mut placement = rows_placement(
@@ -1678,7 +1743,7 @@ pub(crate) fn rows_route(
         refined,
         parsed,
         schema_view,
-        schema_graph_iri,
+        dataset,
         &crate::sparql_ops::FetchBounds::of(scoped),
     )?;
     // Why the engine is needed, as the records route would say it.
@@ -1707,23 +1772,19 @@ pub(crate) fn rows_placement(
     refined: &crate::sparql_refine::Plan,
     parsed: &Query,
     schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
     bounds: &crate::sparql_ops::FetchBounds,
 ) -> Result<RowsPlacement, String> {
     use crate::sparql_refine::{Executor, Node, PlanOp};
 
     let Query::Select {
-        dataset, base_iri, ..
+        dataset: clause,
+        base_iri,
+        ..
     } = parsed
     else {
         return Err("only a SELECT finishes over rows".to_owned());
     };
-    if dataset.is_some() {
-        return Err(
-            "the query names a dataset (FROM / FROM NAMED), which the finish query cannot carry"
-                .to_owned(),
-        );
-    }
     let count = refined.nodes.len();
     let sql: Vec<usize> = (0..count)
         .filter(|id| refined.nodes[*id].executor == Executor::Sql)
@@ -1799,7 +1860,7 @@ pub(crate) fn rows_placement(
     let region: Vec<usize> = (0..working.nodes.len())
         .filter(|id| working.nodes[*id].executor == Executor::Engine && *id != boundary)
         .collect();
-    crate::sparql_lift::reads_schema_only(&working, &region, schema_graph_iri)?;
+    crate::sparql_lift::reads_schema_only(&working, &region, dataset)?;
 
     // Check 5: nothing volatile in the statement.
     let statement: Vec<usize> = (0..working.nodes.len())
@@ -1873,12 +1934,12 @@ pub(crate) fn rows_placement(
     )
     .ok_or_else(|| "the engine region has no SPARQL write-back".to_owned())?;
     let finish = Query::Select {
-        dataset: None,
+        dataset: clause.clone(),
         pattern,
         base_iri: base_iri.clone(),
     }
     .to_string();
-    let reparsed = crate::sparql_scoper::parse_query(&finish)
+    let reparsed = crate::sparql_scoper::parse_query(&finish, None)
         .map_err(|error| format!("the finish query does not parse back: {error}"))?;
     if crate::sparql_executor::placeholders_in(&reparsed, &placeholder) != 1 {
         return Err("the finish query's placeholder is not one VALUES block".to_owned());
@@ -1931,6 +1992,8 @@ pub(crate) fn rows_placement(
         residual: Vec::new(),
         obligations: obligations.to_vec(),
         refinement: Refinement::UsedRows(note),
+        dataset: dataset.clone(),
+        query: parsed.clone(),
     };
     Ok(RowsPlacement {
         plan,
@@ -1963,7 +2026,7 @@ pub(crate) fn rows_placement(
 fn resolve(
     parsed: &Query,
     schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
     recorded: &crate::sparql_scoper::QueryPlan,
     refined: Option<&crate::sparql_refine::Plan>,
 ) -> Result<crate::sparql_scoper::QueryPlan, ScopeError> {
@@ -1978,10 +2041,10 @@ fn resolve(
             }
         }
     }
-    crate::sparql_scoper::scope_parsed_as(
+    crate::sparql_scoper::scope_query(
         parsed,
         schema_view,
-        schema_graph_iri,
+        dataset,
         crate::sparql_scoper::Scoping::Resolve(&hints),
     )
 }
@@ -2407,6 +2470,8 @@ fn fetch_only(
     scoped: &crate::sparql_scoper::QueryPlan,
     why: String,
     refined: Option<(&crate::sparql_refine::Plan, &SchemaView)>,
+    dataset: &DatasetSpec,
+    query: &Query,
 ) -> ExecutionPlan {
     let triple_count = obligations
         .iter()
@@ -2465,6 +2530,8 @@ fn fetch_only(
             why,
             narrowings: Box::new(narrowings),
         },
+        dataset: dataset.clone(),
+        query: query.clone(),
     }
 }
 
@@ -2552,6 +2619,19 @@ fn emitted_from(ops: &crate::sparql_ops::OpTree) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A string query planned as the endpoint does it, rows route allowed: test
+/// convenience over [`crate::sparql_scoper::parse_query`] and
+/// [`plan_query_refined`], which is the operation.
+#[cfg(test)]
+pub(crate) fn plan_of(
+    query_str: &str,
+    schema_view: &SchemaView,
+    dataset: &DatasetSpec,
+) -> Result<ExecutionPlan, ScopeError> {
+    let query = crate::sparql_scoper::parse_query(query_str, Some(schema_view))?;
+    plan_query_refined(&query, schema_view, dataset, Finishing::Rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2570,12 +2650,13 @@ mod tests {
     #[test]
     fn a_union_plans_as_one_union_all_statement() {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s WHERE {{ {{ ?s a asset360:Signal }} \
                  UNION {{ ?s a asset360:BaliseGroup }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION plans");
 
@@ -2678,7 +2759,8 @@ classes:
         }
         let query = format!("{PREFIX}SELECT * WHERE {{ {body} }} ORDER BY ?name");
         let started = std::time::Instant::now();
-        let plan = plan_query_refined(&query, &sv).expect("the wide query plans");
+        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset())
+            .expect("the wide query plans");
         let elapsed = started.elapsed();
         assert!(plan.is_accounted(), "{plan}");
         assert!(
@@ -2728,9 +2810,10 @@ classes:
             // stacked statement has nowhere to put that. See above.
             (optional_join_arms, "LIMIT 10", None),
         ] {
-            let plan = plan_query_refined(
+            let plan = plan_of(
                 &format!("{PREFIX}SELECT ?s ?n WHERE {{ {arms} }} {modifiers}"),
                 &sv,
+                crate::sparql_dataset::default_dataset(),
             )
             .expect("a UNION plans");
             let Some(crate::sparql_plan::PassKind::Sql(sql)) =
@@ -2760,13 +2843,14 @@ classes:
     #[test]
     fn a_condition_in_a_union_arm_resolves_against_its_own_arms_class() {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s WHERE {{ \
                  {{ ?s a asset360:Signal ; asset360:length ?l . FILTER(?l > 10) }} \
                  UNION {{ ?s a asset360:BaliseGroup }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION plans");
 
@@ -2812,13 +2896,14 @@ classes:
                 false,
             ),
         ] {
-            let plan = plan_query_refined(
+            let plan = plan_of(
                 &format!(
                     "{PREFIX}SELECT ?s WHERE {{ \
                      {{ ?s a {first} ; asset360:spanCount ?n . {condition} }} \
                      UNION {{ ?s a {second} }} }}"
                 ),
                 &sv,
+                crate::sparql_dataset::default_dataset(),
             )
             .expect("a UNION plans");
 
@@ -2850,13 +2935,14 @@ classes:
     #[test]
     fn a_union_with_an_engine_arm_keeps_the_per_arm_fetch() {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s WHERE {{ {{ ?s a asset360:Signal }} UNION \
                  {{ ?s a asset360:BaliseGroup ; asset360:name ?nm . \
                  FILTER(STRLEN(?nm) > 3) }} }} LIMIT 1"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION plans");
 
@@ -2889,17 +2975,19 @@ classes:
     #[test]
     fn both_spellings_of_a_mapped_slot_plan_to_the_same_statement() {
         let sv = test_schema_view();
-        let native = plan_query_refined(
+        let native = plan_of(
             &format!("{PREFIX}SELECT ?n WHERE {{ ?t a asset360:Track ; asset360:rsmName ?n }}"),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("the readable spelling plans");
-        let canonical = plan_query_refined(
+        let canonical = plan_of(
             &format!(
                 "{PREFIX}SELECT ?n WHERE \
                  {{ ?t a asset360:Track ; <http://ontorail.org/src/Eulynx/EAID_NAME> ?n }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("the declared spelling plans");
 
@@ -2920,12 +3008,13 @@ classes:
     #[test]
     fn an_aggregate_no_rule_takes_is_named_on_the_artifact() {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT (GROUP_CONCAT(?name) AS ?names) \
                  WHERE {{ ?s a asset360:Signal ; asset360:name ?name }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("an aggregate no rule takes still plans -- the engine answers it");
 
@@ -2955,18 +3044,24 @@ classes:
     #[test]
     fn a_conjunction_is_one_obligation_per_conjunct() {
         let separate = obligations_of(
-            &parse_query(&format!(
-                "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+            &parse_query(
+                &format!(
+                    "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(?nm > \"A\") FILTER(REGEX(?nm, \"^A\")) }}"
-            ))
+                ),
+                None,
+            )
             .unwrap(),
         )
         .unwrap();
         let conjoined = obligations_of(
-            &parse_query(&format!(
-                "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+            &parse_query(
+                &format!(
+                    "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(?nm > \"A\" && REGEX(?nm, \"^A\")) }}"
-            ))
+                ),
+                None,
+            )
             .unwrap(),
         )
         .unwrap();
@@ -2982,10 +3077,13 @@ classes:
 
         // A three-way conjunction flattens, however the parser nested it.
         let nested = obligations_of(
-            &parse_query(&format!(
-                "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+            &parse_query(
+                &format!(
+                    "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER((?nm > \"A\" && ?nm < \"B\") && REGEX(?nm, \"^A\")) }}"
-            ))
+                ),
+                None,
+            )
             .unwrap(),
         )
         .unwrap();
@@ -3002,10 +3100,13 @@ classes:
         // anything on its own, so there is nothing a pass could discharge
         // separately.
         let disjunction = obligations_of(
-            &parse_query(&format!(
-                "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
+            &parse_query(
+                &format!(
+                    "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(?nm > \"A\" || ?nm < \"B\") }}"
-            ))
+                ),
+                None,
+            )
             .unwrap(),
         )
         .unwrap();
@@ -3027,12 +3128,13 @@ classes:
     fn an_optional_condition_and_a_values_block_are_accounted() {
         let sv = test_schema_view();
 
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal . \
                  OPTIONAL {{ ?s asset360:name ?nm . FILTER(?nm > \"A\") }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         plan.ledger_balances().unwrap();
@@ -3049,12 +3151,13 @@ classes:
 
         // A VALUES block the scoper cannot represent: its own obligation,
         // claimed by the engine.
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
                  VALUES ?k {{ \"KSS\" }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         plan.ledger_balances().unwrap();
@@ -3073,12 +3176,13 @@ classes:
 
         // And one the scoper *does* represent: SQL claims it, and the claim is
         // honest because the pass renders it as the IN it hoisted.
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
                  asset360:name ?nm . VALUES ?nm {{ \"BX1\" \"BX2\" }} }} GROUP BY ?nm"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         plan.ledger_balances().unwrap();
@@ -3104,7 +3208,8 @@ classes:
              asset360:name ?nm ; asset360:trafficKinds ?k }} GROUP BY ?nm"
         );
 
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan =
+            plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("should plan");
         assert!(
             matches!(plan.refinement, Refinement::UsedAlone(_)),
             "expected the statement to answer alone, got {:?}",
@@ -3194,7 +3299,12 @@ classes:
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm } GROUP BY ?nm HAVING (COUNT(*) > 1)",
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let plan = plan_of(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("should plan");
             assert!(
                 matches!(
                     plan.refinement,
@@ -3250,7 +3360,12 @@ classes:
                 "an equality filter",
             ),
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let plan = plan_of(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("should plan");
             let reason = plan.refinement.reason().unwrap_or_else(|| {
                 panic!("{spelling} answered an aggregate: {:?}", plan.refinement)
             });
@@ -3277,12 +3392,13 @@ classes:
         let sv = test_schema_view();
 
         // Answers alone: everything the query asks for is in the statement.
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
                  asset360:name ?nm }} GROUP BY ?nm"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3296,12 +3412,13 @@ classes:
         // rows are the solutions, so the statement is the answer and not a
         // fetch (it was a fetch before `PushProjection`, and the engine
         // applied the projection over the same rows).
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; \
                  asset360:name ?nm . FILTER(?nm > \"A\") }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3314,13 +3431,14 @@ classes:
         // Rows: one conjunct the statement cannot take keeps the engine, and
         // what the engine is left reads nothing but the statement's rows, so
         // it finishes over them (M2).
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; \
                  asset360:name ?nm . FILTER(?nm > \"A\") \
                  FILTER(REGEX(STR(?s), \"^x\")) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3333,13 +3451,14 @@ classes:
         // A fetch: what the engine is left reads instance data -- an
         // `EXISTS` -- so the statement narrows and the engine re-runs the
         // query over records.
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; \
                  asset360:name ?nm . FILTER(?nm > \"A\") \
                  FILTER(EXISTS {{ ?s asset360:length ?len }}) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3352,12 +3471,13 @@ classes:
         // And a plan with an engine node in it is *not* admitted alone, which
         // is the failure this rehearsal exists to catch: with no comparator,
         // nothing else stands between such a plan and an answer.
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
                  asset360:name ?nm . FILTER(REGEX(?nm, \"^A\")) }} GROUP BY ?nm"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(
@@ -3365,6 +3485,182 @@ classes:
             "a regex the statement cannot apply must not be answered from \
              it:\n{plan}"
         );
+    }
+
+    /// The dataset is a field of the plan: the finish query carries the
+    /// query's own `FROM` / `FROM NAMED` (the engine evaluates the clause
+    /// itself, where it used to be refused outright), and a pattern under a
+    /// data graph's inference is answered by a statement that scans the classes
+    /// of *that* inference.
+    #[test]
+    fn the_finish_query_keeps_the_dataset() {
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        let sv = crate::sparql_scoper::tests::test_schema_view_plus(
+            "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
+        );
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[
+                (A, linkml_runtime::schema_rdf::TypeInference::ASSERTED),
+                (I, linkml_runtime::schema_rdf::TypeInference::IS_A),
+            ],
+            &[],
+        );
+        let body = "?s a asset360:Signal ; asset360:name ?nm . FILTER(?nm > \"A\") \
+                    FILTER(REGEX(STR(?s), \"^x\"))";
+        let finish_of = |query: String| {
+            let plan = plan_of(&query, &sv, &dataset).expect("should plan");
+            assert!(
+                matches!(plan.refinement, Refinement::UsedRows(_)),
+                "{:?}",
+                plan.refinement
+            );
+            let classes: Vec<Vec<String>> = plan
+                .passes
+                .iter()
+                .filter_map(|pass| match &pass.kind {
+                    PassKind::Sql(sql) => Some(sql.ops.nodes.iter()),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|node| match &node.op {
+                    crate::sparql_ops::Op::Scan { asset_types, .. } => Some(asset_types.clone()),
+                    _ => None,
+                })
+                .collect();
+            let finish = plan
+                .passes
+                .iter()
+                .find_map(|pass| match &pass.kind {
+                    PassKind::Engine(EnginePass {
+                        input: EngineInput::Solutions { finish, .. },
+                        ..
+                    }) => Some(finish.clone()),
+                    _ => None,
+                })
+                .expect("a finish query");
+            (finish, classes)
+        };
+
+        // The clause rides along into the finish, and the scan reads the
+        // inference of the graph the clause names.
+        let (finish, classes) = finish_of(format!(
+            "{PREFIX}SELECT ?s ?nm FROM <{I}> WHERE {{ {body} }}"
+        ));
+        assert!(finish.contains(&format!("FROM <{I}>")), "{finish}");
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].len(), 2, "Signal and ShuntSignal: {classes:?}");
+        let (finish, classes) = finish_of(format!(
+            "{PREFIX}SELECT ?s ?nm FROM <{A}> WHERE {{ {body} }}"
+        ));
+        assert!(finish.contains(&format!("FROM <{A}>")), "{finish}");
+        assert_eq!(
+            classes,
+            vec![vec!["https://data.infrabel.be/asset360/Signal".to_owned()]]
+        );
+
+        // A `GRAPH` naming a data graph dissolves: the inference is the
+        // matches', and there is no graph left to write into the finish.
+        let (finish, classes) = finish_of(format!(
+            "{PREFIX}SELECT ?s ?nm WHERE {{ GRAPH <{I}> {{ {body} }} }}"
+        ));
+        assert!(!finish.contains("GRAPH"), "{finish}");
+        assert_eq!(classes[0].len(), 2, "{classes:?}");
+    }
+
+    /// Review F10a: the diagnostic runs the alias/refusal pass production
+    /// runs, so it never prints a plan production refuses; it prints the
+    /// refusal instead.
+    #[test]
+    fn the_refined_plan_text_prints_the_refusal_production_gives() {
+        let sv = test_schema_view();
+        let dataset = crate::sparql_dataset::default_dataset().clone();
+        let query =
+            format!("{PREFIX}SELECT ?lo WHERE {{ ?c a asset360:Track ; asset360:longitude ?lo }}");
+        let production = plan_of(&query, &sv, &dataset).expect_err("refused");
+        let text = plan_texts_of(&query, &sv, &dataset)
+            .1
+            .expect_err("a refusal, not a plan");
+        assert_eq!(text, production.to_string());
+        assert!(text.contains("not a slot of Track"), "{text}");
+    }
+
+    /// The diagnostic ran `plan_query_refined` only inside `.is_ok_and(..)`,
+    /// so a refusal of the scoper (here #460: an `OPTIONAL` joined on a
+    /// variable the optional before it may leave unbound) was discarded and the
+    /// printout showed a plan production refuses. It prints production's
+    /// refusal, in production's words. (A refusal that only the *refined* plan
+    /// can decide -- an unscoped star -- is still printed as the plan: that is
+    /// the evidence the diagnostic exists for.)
+    #[test]
+    fn the_refined_plan_text_prints_a_scoper_refusal_production_gives() {
+        let sv = test_schema_view();
+        const SCHEMA: &str = "urn:graph:schema";
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[],
+            &[(SCHEMA, linkml_runtime::schema_rdf::TypeInference::ASSERTED)],
+        );
+        let query = format!(
+            "{PREFIX}PREFIX skos: <http://www.w3.org/2004/02/skos/core#> \
+             SELECT * WHERE {{ ?a a asset360:Signal . \
+             OPTIONAL {{ ?a asset360:locatedOnTrack ?f }} \
+             OPTIONAL {{ GRAPH <{SCHEMA}> {{ ?f skos:prefLabel ?l }} }} }}"
+        );
+        let production = plan_of(&query, &sv, &dataset).expect_err("production refuses it");
+        let text = plan_texts_of(&query, &sv, &dataset)
+            .1
+            .expect_err("a refusal, not a plan");
+        assert_eq!(text, production.to_string());
+        assert!(text.contains("Nest it under the OPTIONAL"), "{text}");
+    }
+
+    /// `FROM NAMED` and no `FROM` leaves the default graph empty (SPARQL 1.1
+    /// 13.2): the refined plan says so (an empty relation where each default
+    /// graph pattern was), no pass answers from the table, and the engine --
+    /// which is handed the clause -- is what answers.
+    #[test]
+    fn from_named_alone_plans_an_empty_default_graph() {
+        let sv = test_schema_view();
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[(
+                "urn:g:a",
+                linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            )],
+            &[],
+        );
+        let query = format!(
+            "{PREFIX}SELECT ?s ?nm FROM NAMED <urn:g:other> WHERE {{ ?s a asset360:Signal ; \
+             asset360:name ?nm }}"
+        );
+        let text = plan_texts_of(&query, &sv, &dataset).1.expect("should plan");
+        assert!(!text.contains("scan"), "{text}");
+        assert!(text.contains("values"), "{text}");
+        let plan = plan_of(&query, &sv, &dataset).expect("should plan");
+        assert!(!plan.sql_only(), "the table cannot answer for it:\n{plan}");
+        assert!(
+            plan.passes
+                .iter()
+                .any(|pass| matches!(pass.kind, PassKind::Engine(_))),
+            "{plan}"
+        );
+        // The same query with the clause dropped is answered from the table.
+        let plain = plan_of(
+            &query.replace("FROM NAMED <urn:g:other> ", ""),
+            &sv,
+            &dataset,
+        )
+        .expect("should plan");
+        assert!(plain.sql_only(), "{plain}");
+        // A data graph in `FROM NAMED` that nothing reads is no data read.
+        plan_of(
+            &format!("{PREFIX}SELECT ?s FROM NAMED <urn:g:a> WHERE {{ ?s a asset360:Signal }}"),
+            &sv,
+            &dataset,
+        )
+        .expect("should plan");
     }
 
     /// A statement that does not answer alone hands the engine its rows when
@@ -3380,7 +3676,8 @@ classes:
             "{PREFIX}SELECT (GROUP_CONCAT(?nm) AS ?names) WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan =
+            plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("should plan");
         let note = match &plan.refinement {
             Refinement::UsedRows(note) => note.clone(),
             other => panic!("expected the rows route, got {other:?}"),
@@ -3397,7 +3694,8 @@ classes:
             "{PREFIX}SELECT (GROUP_CONCAT(?nm) AS ?names) WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm FILTER(EXISTS {{ ?s asset360:length ?len }}) }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan =
+            plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("should plan");
         let note = match &plan.refinement {
             Refinement::Used(Some(note)) => note.clone(),
             other => panic!("expected a fetch with a reason, got {other:?}"),
@@ -3420,7 +3718,8 @@ classes:
             "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ ?s a asset360:Signal ; \
              asset360:name ?nm }} GROUP BY ?nm"
         );
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan =
+            plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("should plan");
 
         assert!(
             matches!(plan.refinement, Refinement::UsedAlone(_)),
@@ -3486,7 +3785,8 @@ classes:
             "{PREFIX}SELECT ?s ?nm WHERE {{ ?s a asset360:Signal ; asset360:kind ?k . \
              OPTIONAL {{ ?s asset360:name ?nm }} FILTER(REGEX(STR(?s), \"^x\")) }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("should plan");
+        let plan =
+            plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("should plan");
 
         assert!(
             matches!(
@@ -3551,7 +3851,12 @@ classes:
                 "identifier restriction",
             ),
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let plan = plan_of(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("should plan");
             assert!(
                 !matches!(plan.refinement, Refinement::UsedAlone(_)),
                 "{query} answered alone: {:?}",
@@ -3588,7 +3893,8 @@ classes:
             "{PREFIX}SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:name ?nm . \
              FILTER(?nm > \"A\") FILTER(REGEX(?nm, \"^A\")) }}"
         );
-        let refined = plan_query_refined(&query, &sv).expect("should plan");
+        let refined =
+            plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("should plan");
         assert!(
             matches!(refined.refinement, Refinement::UsedRows(_)),
             "the regex reads only the rows, so the engine finishes over them: {:?}",
@@ -3651,7 +3957,8 @@ classes:
                 .and_then(crate::sparql_ops::fetch_bound_of)
         };
 
-        let refined = plan_query_refined(&query, &sv).expect("should plan");
+        let refined =
+            plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("should plan");
         assert!(
             matches!(refined.refinement, Refinement::Used(_)),
             "{refined}"
@@ -3677,7 +3984,8 @@ classes:
         // read the claimed slice as one would drop its offset (issue 457,
         // consolidator-server).
         let query = format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal }} LIMIT 1");
-        let answered = plan_query_refined(&query, &sv).expect("should plan");
+        let answered =
+            plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("should plan");
         assert!(answered.sql_only(), "{answered}");
         assert_eq!(bound_of(&answered), None, "{answered}");
         let claimed: Vec<&Pass> = answered.passes.iter().collect();
@@ -3731,12 +4039,13 @@ classes:
             (limit, paths)
         };
 
-        let restated = plan_query_refined(
+        let restated = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s ?v WHERE {{ ?s a asset360:Signal ; asset360:location ?c . \
                  ?c asset360:longitude ?v }} LIMIT 50"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert_eq!(
@@ -3758,12 +4067,13 @@ classes:
         // *fetch* bound, and now the read is the statement's own -- folded
         // through the unnested element -- so the projection answers alone
         // and the `LIMIT` is the query's, carried with no premise to state.
-        let answered = plan_query_refined(
+        let answered = plan_of(
             &format!(
                 "{PREFIX}SELECT ?s ?k WHERE {{ ?s a asset360:Signal ; asset360:documents ?d . \
                  ?d asset360:docId ?k }} LIMIT 50"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("should plan");
         assert!(answered.sql_only(), "{answered}");
@@ -3809,7 +4119,12 @@ classes:
             "SELECT ?s ?t WHERE { ?s a asset360:Signal ; \
              asset360:location ?c . ?c asset360:onTrack ?t }",
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).expect("should plan");
+            let plan = plan_of(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("should plan");
             assert!(plan.sql_only(), "{plan}");
             assert_eq!(paths_of(&plan), on_track, "{plan}");
         }
@@ -3819,9 +4134,10 @@ classes:
     #[test]
     fn an_ordinary_query_names_no_unpushed_aggregate() {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal }}"),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -3834,11 +4150,14 @@ classes:
     /// prints the same ids every time.
     #[test]
     fn a_query_enumerates_its_obligations() {
-        let query = parse_query(&format!(
-            "{PREFIX}SELECT ?kind (COUNT(*) AS ?n) WHERE {{ \
+        let query = parse_query(
+            &format!(
+                "{PREFIX}SELECT ?kind (COUNT(*) AS ?n) WHERE {{ \
              ?s a asset360:Signal ; asset360:kind ?kind ; asset360:length ?len . \
              FILTER(?len >= 10) }} GROUP BY ?kind ORDER BY DESC(?n) LIMIT 5"
-        ))
+            ),
+            None,
+        )
         .unwrap();
 
         let obligations = obligations_of(&query).unwrap();
@@ -3870,12 +4189,13 @@ classes:
     #[test]
     fn a_pushable_question_plans_as_one_sql_pass() {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?kind (COUNT(*) AS ?n) WHERE {{ \
                  ?s a asset360:Signal ; asset360:kind ?kind }} GROUP BY ?kind"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -3895,13 +4215,14 @@ classes:
     #[test]
     fn an_unpushable_filter_plans_as_a_scan_plus_an_engine_pass() {
         let sv = test_schema_view();
-        let plan = plan_query_refined(
+        let plan = plan_of(
             &format!(
                 "{PREFIX}SELECT ?nm (COUNT(*) AS ?n) WHERE {{ \
                  ?s a asset360:Signal ; asset360:name ?nm . \
                  FILTER(REGEX(?nm, \"^BX\")) }} GROUP BY ?nm"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -3956,7 +4277,12 @@ classes:
             "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
              ?t a asset360:Track ; asset360:hasName ?tn }",
         ] {
-            let plan = plan_query_refined(&format!("{PREFIX}{query}"), &sv).unwrap();
+            let plan = plan_of(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             plan.ledger_balances()
                 .unwrap_or_else(|err| panic!("{err} for {query}\n{plan}"));
         }
@@ -3988,6 +4314,8 @@ classes:
             }],
             residual: vec![1],
             refinement: Refinement::Used(None),
+            dataset: crate::sparql_dataset::default_dataset().clone(),
+            query: parse_query("SELECT * WHERE { ?s ?p ?o }", None).unwrap(),
         };
         assert!(balanced.ledger_balances().is_ok());
         assert!(
@@ -4013,6 +4341,25 @@ classes:
         assert_eq!(doubled.ledger_balances().unwrap_err().duplicated, vec![0]);
     }
 
+    /// A leaf reached through slots declared only on subclasses of the hop
+    /// ranges is read by SQL as a nested path, not left to the engine.
+    #[test]
+    fn a_leaf_behind_subclass_only_slots_is_read_by_sql() {
+        let sv = test_schema_view();
+        let query = format!(
+            "{PREFIX}SELECT ?s ?lat WHERE {{ ?s a asset360:Site ; asset360:place ?p . \
+             ?p asset360:coords ?c . ?c asset360:lat ?lat }}"
+        );
+        let refined = plan_texts_of(&query, &sv, crate::sparql_dataset::default_dataset())
+            .1
+            .expect("this shape refines");
+        assert!(refined.contains("[S]"), "no SQL in:\n{refined}");
+        assert!(
+            refined.contains("place.coords.lat→?lat"),
+            "the nested read is not in the plan:\n{refined}"
+        );
+    }
+
     /// The naive text and the refined text must *differ* for a query the
     /// pipeline actually improves, and both must carry the same obligations.
     ///
@@ -4028,8 +4375,12 @@ classes:
              ?s a asset360:Signal ; asset360:kind ?kind }} GROUP BY ?kind"
         );
 
-        let naive = naive_plan_text(&query).expect("the naive plan is a transcription");
-        let refined = refined_plan_text(&query, &sv, None).expect("this shape refines");
+        let naive = plan_texts_of(&query, &sv, crate::sparql_dataset::default_dataset())
+            .0
+            .expect("the naive plan is a transcription");
+        let refined = plan_texts_of(&query, &sv, crate::sparql_dataset::default_dataset())
+            .1
+            .expect("this shape refines");
 
         assert_ne!(naive, refined, "refinement moved nothing");
         // The naive plan is the engine's throughout; the refined one is not.
@@ -4062,7 +4413,7 @@ classes:
              FILTER NOT EXISTS {{ ?component a asset360:CivilEngineeringAsset ; \
              asset360:belongsToTunnelComplex ?complex }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).unwrap();
+        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).unwrap();
         let printed = plan.to_string();
 
         assert!(
@@ -4104,7 +4455,7 @@ classes:
              FILTER NOT EXISTS {{ ?g a asset360:LineGroup ; \
              asset360:groupsLines ?l }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).unwrap();
+        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).unwrap();
         let printed = plan.to_string();
 
         // The class the filter asks about is fetched, and fetched optionally:
@@ -4131,9 +4482,15 @@ classes:
             "{PREFIX}SELECT ?kind (COUNT(*) AS ?n) WHERE {{ \
              ?s a asset360:Signal ; asset360:kind ?kind }} GROUP BY ?kind"
         );
-        let parsed = parse_query(&query).unwrap();
+        let parsed = parse_query(&query, None).unwrap();
         let obligations = obligations_of(&parsed).unwrap();
-        let scoped = crate::sparql_scoper::scope_parsed(&parsed, &sv).unwrap();
+        let scoped = crate::sparql_scoper::scope_query(
+            &parsed,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+            crate::sparql_scoper::Scoping::Refuse,
+        )
+        .unwrap();
 
         let plan = ExecutionPlan {
             contract: PLAN_CONTRACT,
@@ -4149,6 +4506,8 @@ classes:
             }],
             residual: Vec::new(),
             refinement: Refinement::UsedAlone("hand-built".to_owned()),
+            dataset: crate::sparql_dataset::default_dataset().clone(),
+            query: parsed.clone(),
         };
         plan.ledger_balances().unwrap();
 
@@ -4194,7 +4553,7 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?nm . \
              VALUES (?nm ?tag) {{ (\"a\" \"x\") (\"b\" \"y\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
 
         let Refinement::Fallback {
             ref why,
@@ -4215,9 +4574,14 @@ classes:
 
         // The control. The decomposition on its own derives nothing here, so
         // the condition above is the refined plan's and not the scoper's.
-        let parsed = parse_query(&query).expect("parses");
-        let scoped = crate::sparql_scoper::scope_parsed_with_schema_graph(&parsed, &sv, None)
-            .expect("scopes");
+        let parsed = parse_query(&query, None).expect("parses");
+        let scoped = crate::sparql_scoper::scope_query(
+            &parsed,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+            crate::sparql_scoper::Scoping::Refuse,
+        )
+        .expect("scopes");
         let bare = crate::sparql_ops::lower_sql_pass(&scoped, &[]);
         assert!(
             !bare
@@ -4240,7 +4604,7 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?h . \
              VALUES (?lo ?tag) {{ (1 \"x\") (2 \"y\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
         let printed = plan.to_string();
         assert!(
             printed.contains("location.longitude IN ('1', '2')") && printed.contains("numeric"),
@@ -4262,7 +4626,7 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?h . \
              VALUES (?k ?tag) {{ (\"m\" \"x\") (\"f\" \"y\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
         let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
             panic!("{plan}");
         };
@@ -4324,8 +4688,12 @@ classes:
                      OPTIONAL {{ ?s asset360:typeURI ?nm . BIND({bind} AS ?inv) }} }}"
                 )
             };
-            let lifted =
-                plan_query_refined(&query_with("STRAFTER(STR(?nm), \"x\")"), &sv).expect("plans");
+            let lifted = plan_of(
+                &query_with("STRAFTER(STR(?nm), \"x\")"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("plans");
             assert!(
                 matches!(lifted.refinement, Refinement::UsedRows(_)),
                 "typed={typed}: {lifted}"
@@ -4348,7 +4716,8 @@ classes:
                 "typed={typed}: the answering statement reads the element it bound: {lifted}"
             );
             let query = query_with("CONCAT(STR(?nm), STRUUID())");
-            let plan = plan_query_refined(&query, &sv).expect("plans");
+            let plan =
+                plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
             let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
                 panic!("{plan}");
             };
@@ -4419,9 +4788,12 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?nm . \
              VALUES (?nm ?tag) {{ (\"a\" \"x\") (\"b\" \"y\") }} }}"
         );
-        let parsed = parse_query(&query).expect("parses");
-        let mut refined = crate::sparql_refine::naive_plan(&parsed).expect("a naive plan");
-        let rules = crate::sparql_rules::tier_one_rules(&sv, None);
+        let parsed = parse_query(&query, None).expect("parses");
+        let mut refined =
+            crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
+                .expect("a naive plan");
+        let rules =
+            crate::sparql_rules::tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut refined, &borrowed).expect("refines");
@@ -4441,8 +4813,13 @@ classes:
             Vec::new(),
         ));
 
-        let mut scoped = crate::sparql_scoper::scope_parsed_with_schema_graph(&parsed, &sv, None)
-            .expect("scopes");
+        let mut scoped = crate::sparql_scoper::scope_query(
+            &parsed,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+            crate::sparql_scoper::Scoping::Refuse,
+        )
+        .expect("scopes");
         let narrowings = keep_what_the_rules_proved(&mut scoped, &refined, &sv);
 
         assert!(narrowings.kept.is_empty(), "{narrowings:?}");
@@ -4480,7 +4857,7 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?h . \
              VALUES (?id ?tag) {{ (\"one\" \"x\") (\"two\" \"y\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
         let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
             panic!("{plan}");
         };
@@ -4527,7 +4904,8 @@ classes:
              FILTER NOT EXISTS { ?s asset360:kind ?k } }",
         ] {
             let query = format!("{PREFIX}{query}");
-            let plan = plan_query_refined(&query, &sv).expect("plans");
+            let plan =
+                plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
             assert!(
                 matches!(plan.refinement, Refinement::Fallback { .. }),
                 "this test only says anything about the fallback: {plan}"
@@ -4576,7 +4954,7 @@ classes:
              ?t a asset360:Track ; asset360:hasName ?nm . \
              VALUES (?nm ?tag) {{ (\"a\" \"x\") }} }}"
         );
-        let plan = plan_query_refined(&query, &sv).expect("plans");
+        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
         let Some(PassKind::Sql(sql)) = plan.passes.first().map(|pass| &pass.kind) else {
             panic!("{plan}");
         };
@@ -4613,7 +4991,13 @@ classes:
     #[test]
     fn the_pipeline_decides_the_designs_outcomes() {
         let sv = test_schema_view();
-        let outcome = |query: &str| outcome_of(&format!("{PREFIX}{query}"), &sv, None);
+        let outcome = |query: &str| {
+            outcome_of(
+                &format!("{PREFIX}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+        };
         let rejected_naming = |query: &str, star: &str| {
             let Outcome::Rejected(message) = outcome(query) else {
                 panic!("{query}\nexpected a rejection, got {:?}", outcome(query));
@@ -4689,8 +5073,11 @@ classes:
             "SELECT ?x WHERE { { SELECT ?x WHERE { { SELECT ?x WHERE { ?s a asset360:Signal ; \
              asset360:name ?x } } } } }",
         ] {
-            let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
-            let plan = crate::sparql_refine::naive_plan(&parsed).unwrap();
+            let parsed =
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap();
+            let plan =
+                crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
+                    .unwrap();
             let barrier_domains: std::collections::BTreeSet<usize> = plan
                 .barriers()
                 .into_iter()
@@ -4712,5 +5099,79 @@ classes:
                 "{query}\n{plan}\n{qualified}"
             );
         }
+    }
+
+    /// #515, spelling 1: `?s a/rdfs:subClassOf* C` walks a hierarchy no data
+    /// graph holds, so it is its zero-length step -- the class scan. It plans
+    /// as that scan: same plan, on the SQL route, no engine pass, where it
+    /// used to be refused as a property path. A path over a slot predicate,
+    /// and one inside a `GRAPH` that is not the schema graph, are still
+    /// refused with the same message; one inside the schema graph is the
+    /// engine's.
+    #[test]
+    fn a_class_hierarchy_path_plans_as_the_class_scan() {
+        let sv = test_schema_view();
+        let prefix = format!("{PREFIX}PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ");
+        let schema_graph = "https://data.infrabel.be/asset360/schema";
+        for (path, scan) in [
+            (
+                "SELECT (COUNT(?s) AS ?n) WHERE { ?s a/rdfs:subClassOf* asset360:Signal }",
+                "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Signal }",
+            ),
+            (
+                "SELECT ?s ?n WHERE { ?s a/rdfs:subClassOf* asset360:Signal . ?s asset360:name ?n }",
+                "SELECT ?s ?n WHERE { ?s a asset360:Signal . ?s asset360:name ?n }",
+            ),
+        ] {
+            let got = plan_of(
+                &format!("{prefix}{path}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+            let want = plan_of(
+                &format!("{prefix}{scan}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("the scan plans");
+            assert_eq!(got.to_string(), want.to_string(), "{path}");
+            assert_eq!(got.sql_only(), want.sql_only(), "{path}");
+            assert!(got.is_accounted(), "{got}");
+        }
+
+        for refused in [
+            "SELECT ?s WHERE { ?s asset360:documents* asset360:X }",
+            "SELECT ?s WHERE { GRAPH ?g { ?s rdfs:subClassOf* asset360:Signal } }",
+            "SELECT ?s ?t WHERE { ?s rdfs:subClassOf* ?t }",
+        ] {
+            let error = plan_of(
+                &format!("{prefix}{refused}"),
+                &sv,
+                &crate::sparql_dataset::schema_dataset(schema_graph),
+            )
+            .expect_err(refused);
+            assert!(
+                error
+                    .to_string()
+                    .contains("property paths are not supported"),
+                "{refused}: {error}"
+            );
+        }
+
+        // Mixed: a record read beside a path over the schema graph.
+        let mixed = plan_of(
+            &format!(
+                "{prefix}SELECT ?s ?c WHERE {{ ?s a asset360:Signal . \
+                 GRAPH <{schema_graph}> {{ ?c rdfs:subClassOf+ asset360:Signal }} }}"
+            ),
+            &sv,
+            &crate::sparql_dataset::schema_dataset(schema_graph),
+        )
+        .expect("a path over the schema graph is not refused");
+        assert!(
+            !mixed.sql_only(),
+            "the engine answers the schema part: {mixed}"
+        );
     }
 }

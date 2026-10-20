@@ -1,0 +1,570 @@
+//! The dataset a SPARQL endpoint serves: which named graphs exist, what each
+//! one holds, and what the default graph means.
+//!
+//! One value, passed to every entry point that plans or evaluates a query, so
+//! no call can forget it. The endpoint serves
+//!
+//! * **data graphs** -- named graphs over the golden records, each under a
+//!   [`TypeInference`] (which `rdf:type` triples its records carry),
+//! * a **default graph**, the records under an inference, and
+//! * **schema graphs** -- the datamodel itself, one per inference its subclass
+//!   edges are published under.
+//!
+//! The planner reads it to decide which inference a triple pattern is matched
+//! under (and so which classes a scan stands for); the executor reads it to
+//! decide which schema graphs a query can observe. Nothing here knows SPARQL.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use linkml_runtime::schema_rdf::{TypeInference, TypePartition};
+
+/// Which named graphs the endpoint serves and what the default graph means.
+///
+/// Always valid: the only way to make one is [`DatasetSpec::builder`], which
+/// refuses a dataset that contradicts itself, so an entry point that takes a
+/// `DatasetSpec` has nothing to check. There is deliberately no [`Default`]: a
+/// dataset is something a deployment decides, and one that is defaulted by
+/// accident plans a different endpoint's query.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DatasetSpec {
+    default: TypeInference,
+    data_graphs: BTreeMap<String, TypeInference>,
+    schema_graphs: BTreeMap<String, TypeInference>,
+}
+
+/// One way a dataset contradicts itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DatasetConflict {
+    /// One IRI is both a data graph and a schema graph.
+    GraphIsDataAndSchema { iri: String },
+    /// A data graph's inference lacks the [`TypePartition::Own`] partition, which
+    /// holds every non-type triple of a record: such a graph holds no record's
+    /// slot values, and a scan over it would claim records the writer never
+    /// typed that way.
+    DataGraphWithoutOwn {
+        iri: String,
+        inference: TypeInference,
+    },
+    /// The default inference lacks [`TypePartition::Own`]: the records loaded
+    /// under it would carry no slot values (see [`Self::DataGraphWithoutOwn`]).
+    DefaultInferenceWithoutOwn { inference: TypeInference },
+}
+
+impl fmt::Display for DatasetConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GraphIsDataAndSchema { iri } => write!(
+                f,
+                "<{iri}> is both a data graph and a schema graph; a graph has one meaning"
+            ),
+            Self::DataGraphWithoutOwn { iri, inference } => write!(
+                f,
+                "the data graph <{iri}> has inference {inference}, which lacks the own partition; \
+                 a graph of records holds their slot values in it"
+            ),
+            Self::DefaultInferenceWithoutOwn { inference } => write!(
+                f,
+                "the default inference {inference} lacks the own partition; \
+                 records are written with their slot values in it"
+            ),
+        }
+    }
+}
+
+/// A dataset that does not describe one coherent endpoint: **every** conflict
+/// found, in the order they were met, never fewer than one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DatasetSpecError {
+    conflicts: Vec<DatasetConflict>,
+}
+
+impl DatasetSpecError {
+    /// Every conflict, in the order they were met. Never empty.
+    pub fn conflicts(&self) -> &[DatasetConflict] {
+        &self.conflicts
+    }
+}
+
+impl fmt::Display for DatasetSpecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (n, conflict) in self.conflicts.iter().enumerate() {
+            if n > 0 {
+                write!(f, "; ")?;
+            }
+            write!(f, "{conflict}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DatasetSpecError {}
+
+impl DatasetSpec {
+    /// Start a dataset whose default graph holds the records under
+    /// `default_inference`; add the named data graphs (each under its own inference)
+    /// and the schema graphs (each publishing its subclass edges under its
+    /// inference) on the builder. The one place a dataset is stated; conflicts
+    /// are reported by [`DatasetSpecBuilder::build`].
+    pub fn builder(default_inference: TypeInference) -> DatasetSpecBuilder {
+        DatasetSpecBuilder {
+            default_inference,
+            data_graphs: BTreeMap::new(),
+            schema_graphs: BTreeMap::new(),
+        }
+    }
+
+    /// The inference a triple pattern outside any `GRAPH` is matched under when
+    /// the query names no `FROM`: the default graph's.
+    pub fn default_inference(&self) -> TypeInference {
+        self.default
+    }
+
+    /// The inference of the data graph `iri`, if it is one.
+    pub fn data_inference(&self, iri: &str) -> Option<TypeInference> {
+        self.data_graphs.get(iri).copied()
+    }
+
+    /// The inference the schema graph `iri` publishes its subclass edges under,
+    /// if it is one.
+    pub fn schema_inference(&self, iri: &str) -> Option<TypeInference> {
+        self.schema_graphs.get(iri).copied()
+    }
+
+    /// Every data graph, IRI order.
+    pub fn data_graphs(&self) -> impl Iterator<Item = (&str, TypeInference)> {
+        self.data_graphs
+            .iter()
+            .map(|(iri, inference)| (iri.as_str(), *inference))
+    }
+
+    /// Every schema graph, IRI order.
+    pub fn schema_graphs(&self) -> impl Iterator<Item = (&str, TypeInference)> {
+        self.schema_graphs
+            .iter()
+            .map(|(iri, inference)| (iri.as_str(), *inference))
+    }
+
+    /// Whether `iri` is a schema graph.
+    pub(crate) fn is_schema_graph(&self, iri: &str) -> bool {
+        self.schema_graphs.contains_key(iri)
+    }
+
+    /// Whether `GRAPH ?g` can bind nothing but a schema graph.
+    ///
+    /// True while no named graph holds records: the records are in the default
+    /// graph, which a `GRAPH` clause never reaches, so the named graphs are the
+    /// schema graphs and only them. Once the dataset serves a data graph a
+    /// graph variable ranges over it too, and it is no longer a question about
+    /// the datamodel.
+    pub(crate) fn graph_variable_is_schema_only(&self) -> bool {
+        self.data_graphs.is_empty()
+    }
+
+    /// The dataset as one query's `FROM NAMED` leaves it: under such a clause
+    /// the named graphs are exactly the ones it lists, so a schema graph
+    /// outside the list is not there for the query to read. What a rule that
+    /// evaluates schema-only subplans consults, so it never answers from a
+    /// graph the engine would not show the query.
+    pub(crate) fn seen_through(&self, clause: Option<&spargebra::algebra::QueryDataset>) -> Self {
+        let mut seen = self.clone();
+        // A `FROM` alone parses as an empty `FROM NAMED` list, and that is the
+        // truth of it: no named graph is visible (SPARQL 1.1 13.2).
+        if let Some(named) = clause.and_then(|clause| clause.named.as_ref()) {
+            seen.schema_graphs
+                .retain(|iri, _| named.iter().any(|graph| graph.as_str() == iri));
+        }
+        seen
+    }
+
+    /// The dataset as one query can observe it: [`Self::seen_through`] its
+    /// `FROM NAMED`, and only the schema graphs it can read
+    /// ([`crate::sparql_graph_clauses::schema_graphs_read`]: the ones it names,
+    /// all of them for a `GRAPH ?g`).
+    ///
+    /// What the planner's rules are built over. A schema graph the query cannot
+    /// reach changes no answer -- every rule that consults one does so for a
+    /// `GRAPH` the query wrote -- and building one is ~300 ms, so a dataset
+    /// serving four must not build four for a query that names one.
+    pub(crate) fn read_by(&self, query: &spargebra::Query) -> Self {
+        let mut seen = self.seen_through(crate::sparql_scoper::dataset_of(query));
+        let read: std::collections::BTreeSet<String> =
+            crate::sparql_graph_clauses::schema_graphs_read(query, &seen)
+                .into_iter()
+                .map(|(iri, _)| iri)
+                .collect();
+        seen.schema_graphs.retain(|iri, _| read.contains(iri));
+        seen
+    }
+
+    /// Whether the dataset serves any schema graph at all.
+    pub(crate) fn has_schema_graph(&self) -> bool {
+        !self.schema_graphs.is_empty()
+    }
+}
+
+/// What one graph holds, as far as the planner can tell.
+///
+/// What a [`crate::sparql_refine::PlanOp::Match`] says it reads, so the cases
+/// a rule must tell apart stay apart: the records (under an inference), the
+/// datamodel, nothing at all, and a graph only the engine can speak for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GraphReads {
+    /// The golden records, under the plan's one inference
+    /// ([`crate::sparql_refine::Plan::data_inference`]). The SQL route reads them.
+    Data,
+    /// The datamodel. Only the engine, or a schema-only region, reads it.
+    Schema,
+    /// Nothing: the empty graph. The default graph of a query that writes
+    /// `FROM NAMED` and no `FROM` (SPARQL 1.1 13.2), which no triple pattern
+    /// matches in.
+    Empty,
+    /// Anything else: a graph the endpoint does not serve, a `GRAPH ?g`, or a
+    /// default graph that mixes data and schema graphs. Only the engine can say
+    /// what it holds.
+    Other,
+}
+
+impl GraphReads {
+    /// Whether this is the data graph, the only one that holds records a scan
+    /// could read: what a rule about type triples asks.
+    pub fn is_data(&self) -> bool {
+        matches!(self, Self::Data)
+    }
+}
+
+/// A query's view of the dataset: [`DatasetSpec`] and the `FROM` / `FROM
+/// NAMED` clause the query put over it.
+///
+/// The one place that decides which graph a triple pattern reads, so the
+/// planner's naive plan and the scoper's star decomposition cannot disagree
+/// about it.
+#[derive(Debug, Clone)]
+pub(crate) struct QueryGraphs<'a> {
+    dataset: &'a DatasetSpec,
+    /// The one inference the query reads its records under
+    /// ([`crate::sparql_graph_clauses::single_data_graph`]).
+    inference: TypeInference,
+    from: Vec<String>,
+    /// Whether the query wrote a `FROM` / `FROM NAMED` clause at all.
+    clause_written: bool,
+    /// The graphs a `GRAPH` clause can reach, when the query wrote a dataset
+    /// clause: exactly its `FROM NAMED` list, empty for a `FROM` alone.
+    from_named: Option<Vec<String>>,
+}
+
+impl<'a> QueryGraphs<'a> {
+    /// The view of `query` over `dataset`, or the refusal that it reads more
+    /// than one data graph (see
+    /// [`crate::sparql_graph_clauses::single_data_graph`]).
+    pub(crate) fn new(
+        dataset: &'a DatasetSpec,
+        query: &spargebra::Query,
+    ) -> Result<Self, crate::sparql_graph_clauses::CrossDataGraph> {
+        let inference = crate::sparql_graph_clauses::single_data_graph(query, dataset)?.inference;
+        let clause = crate::sparql_scoper::dataset_of(query);
+        Ok(Self {
+            inference,
+            dataset,
+            clause_written: clause.is_some(),
+            from: clause
+                .map(|clause| {
+                    clause
+                        .default
+                        .iter()
+                        .map(|g| g.as_str().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // `FROM` alone parses as an empty `FROM NAMED` list: no named graph
+            // at all, as the engine evaluates it.
+            from_named: clause.and_then(|clause| {
+                clause
+                    .named
+                    .as_ref()
+                    .map(|named| named.iter().map(|g| g.as_str().to_owned()).collect())
+            }),
+        })
+    }
+
+    pub(crate) fn dataset(&self) -> &'a DatasetSpec {
+        self.dataset
+    }
+
+    /// What a triple pattern outside any `GRAPH` reads, per SPARQL 1.1 13.2:
+    /// the dataset's default graph when the query writes no dataset clause,
+    /// the union of the `FROM` graphs when it writes any, and the empty graph
+    /// for `FROM NAMED` alone.
+    pub(crate) fn default_reads(&self) -> GraphReads {
+        if self.from.is_empty() && self.clause_written {
+            return GraphReads::Empty;
+        }
+        if self.from.is_empty() {
+            return GraphReads::Data;
+        }
+        // The query reads one data graph, so a `FROM` over data graphs is one
+        // inference: the plan's.
+        if self
+            .from
+            .iter()
+            .all(|iri| self.dataset.data_inference(iri).is_some())
+        {
+            GraphReads::Data
+        } else if self
+            .from
+            .iter()
+            .all(|iri| self.dataset.is_schema_graph(iri))
+        {
+            GraphReads::Schema
+        } else {
+            GraphReads::Other
+        }
+    }
+
+    /// What a triple pattern inside `GRAPH <iri>` reads.
+    pub(crate) fn graph_reads(&self, iri: &str) -> GraphReads {
+        // Under `FROM NAMED` a graph outside the set matches nothing. Left to
+        // the engine, which says so, rather than read as the graph it names.
+        if let Some(named) = &self.from_named
+            && !named.iter().any(|graph| graph == iri)
+        {
+            return GraphReads::Other;
+        }
+        if self.dataset.data_inference(iri).is_some() {
+            GraphReads::Data
+        } else if self.dataset.is_schema_graph(iri) {
+            GraphReads::Schema
+        } else {
+            GraphReads::Other
+        }
+    }
+
+    /// The one inference the query reads its records under.
+    pub(crate) fn inference(&self) -> TypeInference {
+        self.inference
+    }
+}
+
+/// Builds a [`DatasetSpec`]; every conflict is reported at [`Self::build`].
+/// New kinds of input are added as further `with_*` methods.
+#[derive(Debug, Clone)]
+#[must_use = "a builder does nothing until `build` is called"]
+pub struct DatasetSpecBuilder {
+    default_inference: TypeInference,
+    data_graphs: BTreeMap<String, TypeInference>,
+    schema_graphs: BTreeMap<String, TypeInference>,
+}
+
+impl DatasetSpecBuilder {
+    /// Serve `iri` as a data graph holding its records under `inference`.
+    pub fn with_data_graph(mut self, iri: impl Into<String>, inference: TypeInference) -> Self {
+        self.data_graphs.insert(iri.into(), inference);
+        self
+    }
+
+    /// Serve `iri` as a schema graph publishing the schema under `inference`.
+    pub fn with_schema_graph(mut self, iri: impl Into<String>, inference: TypeInference) -> Self {
+        self.schema_graphs.insert(iri.into(), inference);
+        self
+    }
+
+    /// Refused, with **every** conflict found: an IRI in both maps, and a
+    /// inference without [`TypePartition::Own`] (for the default and for a data
+    /// graph).
+    pub fn build(self) -> Result<DatasetSpec, DatasetSpecError> {
+        let Self {
+            default_inference,
+            data_graphs,
+            schema_graphs,
+        } = self;
+        let mut conflicts = Vec::new();
+        if !default_inference.contains(TypePartition::Own) {
+            conflicts.push(DatasetConflict::DefaultInferenceWithoutOwn {
+                inference: default_inference,
+            });
+        }
+        for (iri, inference) in &data_graphs {
+            if schema_graphs.contains_key(iri) {
+                conflicts.push(DatasetConflict::GraphIsDataAndSchema { iri: iri.clone() });
+            }
+            if !inference.contains(TypePartition::Own) {
+                conflicts.push(DatasetConflict::DataGraphWithoutOwn {
+                    iri: iri.clone(),
+                    inference: *inference,
+                });
+            }
+        }
+        if conflicts.is_empty() {
+            Ok(DatasetSpec {
+                default: default_inference,
+                data_graphs,
+                schema_graphs,
+            })
+        } else {
+            Err(DatasetSpecError { conflicts })
+        }
+    }
+}
+
+#[cfg(test)]
+fn build(
+    default_inference: TypeInference,
+    data_graphs: &[(&str, TypeInference)],
+    schema_graphs: &[(&str, TypeInference)],
+) -> Result<DatasetSpec, DatasetSpecError> {
+    let mut builder = DatasetSpec::builder(default_inference);
+    for (iri, inference) in data_graphs {
+        builder = builder.with_data_graph(*iri, *inference);
+    }
+    for (iri, inference) in schema_graphs {
+        builder = builder.with_schema_graph(*iri, *inference);
+    }
+    builder.build()
+}
+
+/// A dataset for a test, from slices instead of maps.
+#[cfg(test)]
+pub(crate) fn dataset_with(
+    default_inference: TypeInference,
+    data_graphs: &[(&str, TypeInference)],
+    schema_graphs: &[(&str, TypeInference)],
+) -> DatasetSpec {
+    build(default_inference, data_graphs, schema_graphs).expect("a valid dataset")
+}
+
+/// The dataset a test that is not about datasets plans under, stated
+/// explicitly rather than defaulted: an asserted default graph and no named
+/// graph. Borrowed for as long as a test's rules need it.
+#[cfg(test)]
+pub(crate) fn default_dataset() -> &'static DatasetSpec {
+    static DEFAULT: std::sync::OnceLock<DatasetSpec> = std::sync::OnceLock::new();
+    DEFAULT.get_or_init(|| dataset_with(TypeInference::ASSERTED, &[], &[]))
+}
+
+/// An asserted dataset that serves one schema graph, `iri`.
+#[cfg(test)]
+pub(crate) fn schema_dataset(iri: &str) -> DatasetSpec {
+    dataset_with(
+        TypeInference::ASSERTED,
+        &[],
+        &[(iri, TypeInference::ASSERTED)],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "urn:graph:asserted";
+    const I: &str = "urn:graph:inferred";
+    const M: &str = "urn:graph:mixins";
+    const S: &str = "urn:graph:schema";
+
+    fn served() -> DatasetSpec {
+        dataset_with(
+            TypeInference::IS_A,
+            &[
+                (A, TypeInference::ASSERTED),
+                (I, TypeInference::IS_A),
+                (M, TypeInference::IS_A_AND_MIXINS),
+            ],
+            &[(S, TypeInference::IS_A)],
+        )
+    }
+
+    fn conflicts_of(
+        default: TypeInference,
+        data: &[(&str, TypeInference)],
+        schema: &[(&str, TypeInference)],
+    ) -> Vec<DatasetConflict> {
+        build(default, data, schema)
+            .expect_err("the dataset contradicts itself")
+            .conflicts()
+            .to_vec()
+    }
+
+    #[test]
+    fn a_dataset_answers_for_each_graph_it_serves() {
+        let dataset = served();
+        assert_eq!(dataset.default_inference(), TypeInference::IS_A);
+        assert_eq!(
+            dataset.data_inference(M),
+            Some(TypeInference::IS_A_AND_MIXINS)
+        );
+        assert_eq!(dataset.schema_inference(S), Some(TypeInference::IS_A));
+        assert_eq!(dataset.data_inference(S), None);
+        assert_eq!(dataset.schema_inference(A), None);
+        assert!(dataset.has_schema_graph());
+        assert!(!default_dataset().has_schema_graph());
+    }
+
+    #[test]
+    fn a_graph_is_a_data_graph_or_a_schema_graph() {
+        assert_eq!(
+            conflicts_of(
+                TypeInference::ASSERTED,
+                &[(A, TypeInference::ASSERTED)],
+                &[(A, TypeInference::IS_A)]
+            ),
+            vec![DatasetConflict::GraphIsDataAndSchema { iri: A.into() }]
+        );
+    }
+
+    /// `Own` holds every non-type triple of a record, so a graph of records
+    /// without it holds no slot values: refused, for a data graph and for the
+    /// default inference, and the empty set is one of them.
+    #[test]
+    fn a_inference_without_own_is_no_graph_of_records() {
+        let is_a_only = TypeInference::from(TypePartition::IsA);
+        assert!(!is_a_only.contains(TypePartition::Own));
+        assert!(TypeInference::IS_A_AND_MIXINS.contains(TypePartition::Own));
+        for inference in [is_a_only, TypeInference::empty()] {
+            assert_eq!(
+                conflicts_of(
+                    TypeInference::ASSERTED,
+                    &[("urn:graph:odd", inference)],
+                    &[]
+                ),
+                vec![DatasetConflict::DataGraphWithoutOwn {
+                    iri: "urn:graph:odd".into(),
+                    inference
+                }]
+            );
+            assert_eq!(
+                conflicts_of(inference, &[], &[]),
+                vec![DatasetConflict::DefaultInferenceWithoutOwn { inference }]
+            );
+        }
+        let text = DatasetConflict::DataGraphWithoutOwn {
+            iri: "urn:graph:odd".into(),
+            inference: is_a_only,
+        }
+        .to_string();
+        assert!(
+            text.contains("urn:graph:odd") && text.contains("own"),
+            "{text}"
+        );
+    }
+
+    /// Every conflict is reported, not the first one met: a deployment fixing
+    /// its configuration should not have to rebuild once per mistake.
+    #[test]
+    fn every_conflict_is_reported_at_once() {
+        let conflicts = conflicts_of(
+            TypeInference::empty(),
+            &[(A, TypeInference::ASSERTED), (S, TypeInference::empty())],
+            &[(S, TypeInference::IS_A)],
+        );
+        assert_eq!(conflicts.len(), 3, "{conflicts:?}");
+        let text = conflicts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(text.contains("default inference"), "{text}");
+        assert!(text.contains("urn:graph:schema"), "{text}");
+    }
+}

@@ -34,7 +34,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 
 use spargebra::Query;
@@ -103,9 +102,29 @@ impl Translation<'_> {
         format!("_{}_{}", hint, self.fresh)
     }
 
-    fn predicate(&self, class_uri: &str, slot: &str) -> Option<NamedNode> {
+    fn predicate(
+        &self,
+        class_uri: &str,
+        slot: &str,
+        designator_as_type: bool,
+    ) -> Option<NamedNode> {
         let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
-        let slot = class.slot(&Identifier::Name(slot.to_owned()))?;
+        // By name: `slot` is a segment of a stored JSON path, a key, and the
+        // predicate is what this derives from it -- the opposite direction of
+        // a triple's predicate, which is resolved by IRI.
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, slot)
+            .ok()
+            .flatten()?;
+        // A type designator is not a triple: the writer states the element's
+        // class as `rdf:type` and skips the slot. Its value (a `uri` range
+        // stores the very IRI the writer types the element with) is what that
+        // `rdf:type` object is, so a *condition* on it reads the type -- exact
+        // for a test of the value, and there is no row where the element names
+        // no designator, which a test of the value never asked about. A scan's
+        // own read of the slot is left as the query wrote it.
+        if designator_as_type && slot.definition().designates_type == Some(true) {
+            return NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok();
+        }
         let conv = self.schema.converter();
         let iri = slot.canonical_uri().to_uri(&conv).ok()?;
         NamedNode::new(iri.0).ok()
@@ -127,11 +146,37 @@ impl Translation<'_> {
         object: TermPattern,
         counter: &mut usize,
     ) -> Option<Vec<TriplePattern>> {
+        self.read_as(class_uri, star, path, object, counter, false)
+    }
+
+    /// [`Self::read`] for the address of a condition, where a designator is
+    /// read as the type it stands for.
+    fn read_condition(
+        &self,
+        class_uri: &str,
+        star: &str,
+        path: &[String],
+        object: TermPattern,
+        counter: &mut usize,
+    ) -> Option<Vec<TriplePattern>> {
+        self.read_as(class_uri, star, path, object, counter, true)
+    }
+
+    fn read_as(
+        &self,
+        class_uri: &str,
+        star: &str,
+        path: &[String],
+        object: TermPattern,
+        counter: &mut usize,
+        designator_as_type: bool,
+    ) -> Option<Vec<TriplePattern>> {
         let mut triples = Vec::new();
         let mut subject = TermPattern::Variable(Variable::new_unchecked(star.to_owned()));
         let mut class = class_uri.to_owned();
         for (index, hop) in path.iter().enumerate() {
-            let predicate = self.predicate(&class, hop)?;
+            let predicate =
+                self.predicate(&class, hop, designator_as_type && index + 1 == path.len())?;
             let last = index + 1 == path.len();
             let next = if last {
                 object.clone()
@@ -158,7 +203,7 @@ impl Translation<'_> {
             PlanOp::Unit => GraphPattern::Bgp {
                 patterns: Vec::new(),
             },
-            PlanOp::Match { pattern } => GraphPattern::Bgp {
+            PlanOp::Match { pattern, .. } => GraphPattern::Bgp {
                 patterns: vec![(**pattern).clone()],
             },
             PlanOp::Path {
@@ -336,13 +381,128 @@ impl Translation<'_> {
                 class_uri,
                 slots,
                 identifier_values,
+                direct_type,
+                direct_type_in,
+                ..
             } => {
+                let inference = plan.data_inference;
                 let type_iri = NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?;
                 let mut required: Vec<TriplePattern> = vec![TriplePattern {
                     subject: TermPattern::Variable(Variable::new_unchecked(star_var.clone())),
                     predicate: NamedNodePattern::NamedNode(type_iri),
                     object: TermPattern::NamedNode(NamedNode::new(class_uri.clone()).ok()?),
                 }];
+                // The direct type the scan binds, and the ones it is held to:
+                // the record's one `sesame:directType` triple where the
+                // inference writes it. Where it does not (asserted), the
+                // record's only `rdf:type` triple is its own class, which is
+                // the same thing.
+                //
+                // An inference that writes neither the direct type nor only the
+                // own class (`{own,is_a}`, `{own,mixin}`) has no triple that
+                // says it: `rdf:type` then holds the ancestors too. The
+                // record's own class `d` is the one whose types are all the
+                // types the record has, which the table of the scan's classes
+                // states (`own_by_table` below).
+                let own_by_triple = inference
+                    .contains(linkml_runtime::schema_rdf::TypePartition::Direct)
+                    || inference.is_subset(linkml_runtime::schema_rdf::TypeInference::ASSERTED);
+                let direct_predicate =
+                    if inference.contains(linkml_runtime::schema_rdf::TypePartition::Direct) {
+                        linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE
+                    } else {
+                        crate::sparql_scoper::RDF_TYPE
+                    };
+                let direct = |object: TermPattern| -> Option<TriplePattern> {
+                    Some(TriplePattern {
+                        subject: TermPattern::Variable(Variable::new_unchecked(star_var.clone())),
+                        predicate: NamedNodePattern::NamedNode(
+                            NamedNode::new(direct_predicate).ok()?,
+                        ),
+                        object,
+                    })
+                };
+                // The classes the record's own class is held to, as variables:
+                // the one the scan binds, and a fresh one per class the query
+                // fixed (bound to it below).
+                let mut own_by_table: Vec<(String, Option<&String>)> = Vec::new();
+                if own_by_triple {
+                    if let Some(var) = direct_type {
+                        required.push(direct(TermPattern::Variable(Variable::new_unchecked(
+                            var.clone(),
+                        )))?);
+                    }
+                    for class in direct_type_in {
+                        required.push(direct(TermPattern::NamedNode(
+                            NamedNode::new(class.clone()).ok()?,
+                        ))?);
+                    }
+                } else {
+                    if let Some(var) = direct_type {
+                        own_by_table.push((var.clone(), None));
+                    }
+                    for class in direct_type_in {
+                        own_by_table.push((self.fresh_var("own"), Some(class)));
+                    }
+                }
+                let mut own_values: Vec<(String, String)> = Vec::new();
+                let mut own_guards: Vec<Expression> = Vec::new();
+                if !own_by_table.is_empty() {
+                    let family =
+                        crate::sparql_refine::scan_classes(self.schema, class_uri, inference)
+                            .ok()?;
+                    let table = crate::sparql_refine::type_table(self.schema, &family, inference)?;
+                    for (own, fixed) in own_by_table {
+                        let any = |name: &str| TermPattern::Variable(Variable::new_unchecked(name));
+                        let type_of =
+                            |subject: &str, object: TermPattern| -> Option<TriplePattern> {
+                                Some(TriplePattern {
+                                    subject: any(subject),
+                                    predicate: NamedNodePattern::NamedNode(
+                                        NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok()?,
+                                    ),
+                                    object,
+                                })
+                            };
+                        required.push(type_of(star_var, any(&own))?);
+                        if let Some(class) = fixed {
+                            own_values.push((own.clone(), class.clone()));
+                        }
+                        // No type of the record lies outside what `own` is
+                        // typed with: `NOT EXISTS { ?s a ?t FILTER NOT EXISTS
+                        // { VALUES (?own ?t) { T } } }`.
+                        let other = self.fresh_var("own_type");
+                        let rows = table
+                            .iter()
+                            .map(|(class, ty)| {
+                                vec![
+                                    Some(GroundTerm::NamedNode(NamedNode::new_unchecked(
+                                        class.clone(),
+                                    ))),
+                                    Some(GroundTerm::NamedNode(NamedNode::new_unchecked(
+                                        ty.clone(),
+                                    ))),
+                                ]
+                            })
+                            .collect();
+                        let known = GraphPattern::Values {
+                            variables: vec![
+                                Variable::new_unchecked(own.clone()),
+                                Variable::new_unchecked(other.clone()),
+                            ],
+                            bindings: rows,
+                        };
+                        let unknown = GraphPattern::Filter {
+                            expr: Expression::Not(Box::new(Expression::Exists(Box::new(known)))),
+                            inner: Box::new(GraphPattern::Bgp {
+                                patterns: vec![type_of(star_var, any(&other))?],
+                            }),
+                        };
+                        own_guards.push(Expression::Not(Box::new(Expression::Exists(Box::new(
+                            unknown,
+                        )))));
+                    }
+                }
                 let mut optional: Vec<Vec<TriplePattern>> = Vec::new();
                 let mut exists: Vec<Vec<TriplePattern>> = Vec::new();
                 let mut counter = 0usize;
@@ -452,6 +612,23 @@ impl Translation<'_> {
                             variables: vec![variable],
                             bindings,
                         }),
+                    };
+                }
+                for (own, class) in own_values {
+                    pattern = GraphPattern::Join {
+                        left: Box::new(pattern),
+                        right: Box::new(GraphPattern::Values {
+                            variables: vec![Variable::new_unchecked(own)],
+                            bindings: vec![vec![Some(GroundTerm::NamedNode(
+                                NamedNode::new_unchecked(class),
+                            ))]],
+                        }),
+                    };
+                }
+                for guard in own_guards {
+                    pattern = GraphPattern::Filter {
+                        expr: guard,
+                        inner: Box::new(pattern),
                     };
                 }
                 pattern
@@ -596,7 +773,7 @@ impl Translation<'_> {
                     })?;
             (element, self.class_at(&class_uri, &edge.path)?)
         };
-        let predicate = self.predicate(&class_uri, &edge.slot)?;
+        let predicate = self.predicate(&class_uri, &edge.slot, false)?;
         let triple = TriplePattern {
             subject: TermPattern::Variable(Variable::new_unchecked(subject)),
             predicate: NamedNodePattern::NamedNode(predicate),
@@ -787,7 +964,7 @@ impl Translation<'_> {
             SlotReading::Column => {
                 let var = self.fresh_var(&format!("{star}_{}", path.join("_")));
                 let mut counter = 200 + self.fresh;
-                reads.extend(self.read(
+                reads.extend(self.read_condition(
                     &class_uri,
                     star,
                     path,
@@ -808,7 +985,7 @@ impl Translation<'_> {
                 let element_class = self.class_at(&class_uri, &path[..prefix])?;
                 let var = self.fresh_var(&format!("{element}_{}", path[prefix..].join("_")));
                 let mut counter = 300 + self.fresh;
-                reads.extend(self.read(
+                reads.extend(self.read_condition(
                     &element_class,
                     &element,
                     &path[prefix..],
@@ -952,8 +1129,11 @@ mod tests {
              GROUP BY ?s HAVING (COUNT(*) > 1) ORDER BY DESC(?n)",
             "SELECT ?s ?d WHERE { ?s a asset360:Signal . BIND(?s AS ?d) }",
         ] {
-            let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}")).unwrap();
-            let plan = crate::sparql_refine::naive_plan(&parsed).unwrap();
+            let parsed =
+                crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap();
+            let plan =
+                crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
+                    .unwrap();
             let translated =
                 plan_to_query(&plan, &schema).unwrap_or_else(|| panic!("{query}\n{plan}"));
             // Structurally the same up to how a basic graph pattern is
@@ -1079,11 +1259,14 @@ mod tests {
 #[cfg(all(test, feature = "sparql-endpoint"))]
 pub(crate) mod equivalence {
     use super::*;
+    use crate::sparql_dataset::DatasetSpec;
     use crate::sparql_oracle::{Oracle, fixture};
     use crate::sparql_rules::{Rule, tier_one_rules};
     use crate::sparql_scoper::tests::test_schema_view;
+    use linkml_runtime::schema_rdf::TypeInference;
 
-    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+    const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+         PREFIX sesame: <http://www.openrdf.org/schema/sesame#> ";
 
     /// Bags compared with a blank node standing for "some blank node" -- the
     /// oracle already spells one so -- and the rows of the query's own
@@ -1101,11 +1284,30 @@ pub(crate) mod equivalence {
         oracle: &Oracle,
         rules: &[&dyn Rule],
     ) -> Plan {
+        each_rewrite_preserves_answers_in(
+            query,
+            schema,
+            oracle,
+            rules,
+            &crate::sparql_dataset::default_dataset().clone(),
+        )
+    }
+
+    /// [`each_rewrite_preserves_answers`] over a dataset: the plan reads the
+    /// type inference the dataset says, and `oracle` has to hold records written
+    /// under that inference ([`Oracle::new_in`]).
+    pub(crate) fn each_rewrite_preserves_answers_in(
+        query: &str,
+        schema: &SchemaView,
+        oracle: &Oracle,
+        rules: &[&dyn Rule],
+        dataset: &crate::sparql_dataset::DatasetSpec,
+    ) -> Plan {
         let text = format!("{PREFIX}{query}");
-        let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
+        let parsed = crate::sparql_scoper::parse_query(&text, None).unwrap();
         let expected = answers(oracle, &parsed);
-        let mut plan =
-            crate::sparql_refine::naive_plan(&parsed).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let mut plan = crate::sparql_refine::naive_plan(&parsed, dataset)
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
         let naive = plan_to_query(&plan, schema).unwrap_or_else(|| panic!("{query}\n{plan}"));
         assert_eq!(answers(oracle, &naive), expected, "naive: {query}\n{plan}");
 
@@ -1329,29 +1531,303 @@ pub(crate) mod equivalence {
         out
     }
 
+    /// The named inferences, and two that name no direct type and write more than
+    /// the own class: `rdf:type` alone cannot say which class a record is,
+    /// which the translation of a scan's direct type must not assume.
+    fn inferences_under_test() -> Vec<TypeInference> {
+        use linkml_runtime::schema_rdf::TypePartition;
+        let mut inferences = TypeInference::NAMED.to_vec();
+        inferences.push(TypeInference::ASSERTED.with(TypePartition::IsA));
+        inferences.push(TypeInference::ASSERTED.with(TypePartition::Mixin));
+        inferences
+    }
+
+    /// The test schema with an `is_a` chain and a real mixin, and the oracle
+    /// holding the fixture written under `inference`: what each corpus test below
+    /// runs against once per inference, with the dataset whose default graph is
+    /// that inference. A rule that is only sound under the asserted inference is
+    /// caught here and not by the asserted-only oracle.
+    fn in_each_inference(mut each: impl FnMut(TypeInference, &SchemaView, &Oracle, &DatasetSpec)) {
+        let schema =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        for inference in inferences_under_test() {
+            let oracle = crate::sparql_oracle::fixture_in(&schema, inference);
+            each(
+                inference,
+                &schema,
+                &oracle,
+                &crate::sparql_dataset::dataset_with(inference, &[], &[]),
+            );
+        }
+    }
+
     /// (a) a fixpoint with every invariant holding, (b) lowers or names the
     /// node that stopped it, (d) each rewrite alone answer-preserving --
     /// over the whole grammar, exhaustively.
     #[test]
     fn every_rewrite_of_every_grammar_query_preserves_the_answer() {
-        let schema = test_schema_view();
-        let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, None);
-        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let grammar = grammar();
         assert!(grammar.len() > 100, "{}", grammar.len());
         let mut lowered = 0;
-        for query in &grammar {
-            let plan = each_rewrite_preserves_answers(query, &schema, &oracle, &borrowed);
-            match crate::sparql_ops::lower_refined(&plan, &schema, None, None) {
-                Ok(_) => lowered += 1,
-                Err(refusal) => {
-                    // Names the node, or the shape: never a panic.
-                    let _ = refusal.to_string();
+        in_each_inference(|inference, schema, oracle, dataset| {
+            let rules = tier_one_rules(schema, dataset);
+            let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            for query in &grammar {
+                let plan =
+                    each_rewrite_preserves_answers_in(query, schema, oracle, &borrowed, dataset);
+                match crate::sparql_ops::lower_refined(&plan, schema, None, None) {
+                    Ok(_) => lowered += 1,
+                    Err(refusal) => {
+                        // Names the node, or the shape: never a panic.
+                        let _ = format!("{inference:?}: {refusal}");
+                    }
+                }
+            }
+        });
+        assert!(lowered > 0);
+    }
+
+    /// The type queries -- `?s a ?t`, `sesame:directType`, and the spelling
+    /// of "the most specific type" over the schema graph -- under every data
+    /// inference and every inference the schema graph can publish. The grammar
+    /// above never types a subject by a variable, so the rules about types
+    /// (the type table, the direct type, the parent-type fold) are held to the
+    /// oracle here, over an `is_a` chain and a mixin.
+    #[test]
+    fn every_rewrite_of_the_type_queries_preserves_the_answer_in_every_inference() {
+        const G: &str = "https://data.infrabel.be/asset360/schema";
+        let queries = [
+            // An identifier-less parent whose subclasses carry the identity:
+            // the count is the number of records, not 1.
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Structure }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Structure ; a ?t }",
+            "SELECT ?s ?l WHERE { ?s a asset360:Structure ; asset360:title ?l }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
+            // The scan's direct type, in an inference with no `directType` triple
+            // that writes more than the own class (review N2).
+            "SELECT ?s ?t WHERE { ?s a asset360:Tag ; a ?t }",
+            "SELECT ?s ?d WHERE { ?s a asset360:Tag ; sesame:directType ?d }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:LatchRelay ; a asset360:Relay }",
+            "SELECT ?s ?d WHERE { ?s a asset360:Equipment ; sesame:directType ?d }",
+            "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; asset360:label ?l ; a ?t }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Tag }",
+            "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; a ?t } GROUP BY ?t",
+            // #511 chain fold: both orders, VALUES-narrowed, a three-class
+            // chain, a mixin, and siblings (no fold) as the control. Under
+            // the asserted inference parent + sub is empty.
+            "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment , asset360:Relay }",
+            "SELECT ?s WHERE { VALUES ?s { <https://data.infrabel.be/asset360/eq/L1> } \
+             ?s a asset360:Equipment , asset360:LatchRelay }",
+            "SELECT ?s WHERE { VALUES ?s { <https://data.infrabel.be/asset360/eq/L1> } \
+             ?s a asset360:LatchRelay , asset360:Equipment }",
+            "SELECT ?s WHERE { ?s a asset360:LatchRelay , asset360:Relay , asset360:Equipment }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment , asset360:LatchRelay , asset360:Relay }",
+            "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment , asset360:LatchRelay }",
+            "SELECT ?s WHERE { ?s a asset360:Trip , asset360:Equipment , asset360:Tag }",
+            "SELECT ?s WHERE { ?s a asset360:Tag , asset360:Trip }",
+            "SELECT ?s WHERE { ?s a asset360:Switch , asset360:Breaker }",
+            "SELECT ?s WHERE { ?s a asset360:Switch , asset360:Relay }",
+            // The lowering discharge check: a subclass scan discharges the
+            // parent's type claim.
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment . ?s a asset360:Relay }",
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Relay . ?s a asset360:Equipment }",
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment . ?s a asset360:Tag }",
+            // #512: a slot only the subclass declares, on a parent-typed subject.
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment ; asset360:voltage ?v }",
+            "SELECT ?s ?v WHERE { ?s a asset360:Equipment . OPTIONAL { ?s asset360:voltage ?v } }",
+            "SELECT ?s ?l ?v WHERE { ?s a asset360:Equipment ; asset360:label ?l . \
+             OPTIONAL { ?s asset360:voltage ?v } }",
+            // The most specific type, spelt over the schema graph.
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t WHERE { ?s a ?t FILTER NOT EXISTS { ?s a ?sub . \
+             GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t FILTER NOT EXISTS { ?s a ?sub . \
+             GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
+            // Review F2: `?sub` is bound outside the NOT EXISTS, so this is
+            // not the most-specific-type spelling and must not be rewritten.
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t WHERE { VALUES ?sub { asset360:Equipment } ?s a ?t FILTER NOT EXISTS { \
+             ?s a ?sub . GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
+        ];
+        let schema =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        for inference in inferences_under_test() {
+            for &graph in TypeInference::NAMED {
+                let oracle = crate::sparql_oracle::fixture_in(&schema, inference)
+                    .with_schema_graph(&schema, G, graph);
+                let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[(G, graph)]);
+                let rules = tier_one_rules(&schema, &dataset);
+                let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+                // #515 spelling 1: the path is reduced to the class scan
+                // before planning (`sparql_paths`), so the engine's answer
+                // to the query as written is the bar for the reduced query
+                // and for the plan built from it.
+                for query in [
+                    "SELECT ?s WHERE { ?s a/rdfs:subClassOf* asset360:Equipment }",
+                    "SELECT ?s WHERE { ?s a/rdfs:subClassOf* asset360:Relay }",
+                    "SELECT ?s WHERE { ?s a/rdfs:subClassOf* asset360:Tag }",
+                    "SELECT (COUNT(?s) AS ?n) WHERE { ?s a/rdfs:subClassOf* asset360:Equipment }",
+                    "SELECT ?s ?l WHERE { ?s a/rdfs:subClassOf* asset360:Equipment ; asset360:label ?l }",
+                ] {
+                    let text = format!(
+                        "{PREFIX}PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {query}"
+                    );
+                    let original = crate::sparql_scoper::parse_query(&text, None).unwrap();
+                    let mut reduced = original.clone();
+                    crate::sparql_paths::reduce_paths(&mut reduced, &schema);
+                    assert_eq!(
+                        answers(&oracle, &reduced),
+                        answers(&oracle, &original),
+                        "{inference:?}/{graph:?} reduction vs engine: {query}\n{reduced}"
+                    );
+                    each_rewrite_preserves_answers_in(
+                        &reduced.to_string(),
+                        &schema,
+                        &oracle,
+                        &borrowed,
+                        &dataset,
+                    );
+                }
+                if !inference.contains(linkml_runtime::schema_rdf::TypePartition::IsA) {
+                    // Not vacuous: parent + subclass is empty when the data
+                    // writes no ancestor, and not otherwise.
+                    let both = crate::sparql_scoper::parse_query(
+                        &format!(
+                            "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
+                        ),
+                        None,
+                    )
+                    .unwrap();
+                    assert!(answers(&oracle, &both).is_empty());
+                } else {
+                    let both = crate::sparql_scoper::parse_query(
+                        &format!(
+                            "{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
+                        ),
+                        None,
+                    )
+                    .unwrap();
+                    assert!(!answers(&oracle, &both).is_empty());
+                }
+                for query in queries {
+                    let plan = each_rewrite_preserves_answers_in(
+                        query, &schema, &oracle, &borrowed, &dataset,
+                    );
+                    // Not vacuous: where the data says its types and the
+                    // schema graph agrees with it, the NOT EXISTS is the
+                    // direct type: no anti-join left.
+                    if query.contains("NOT EXISTS")
+                        && !query.contains("VALUES ?sub")
+                        && inference != TypeInference::ASSERTED
+                        && graph == inference
+                    {
+                        assert!(!plan.to_string().contains("antijoin"), "{query}\n{plan}");
+                    }
                 }
             }
         }
-        assert!(lowered > 0);
+    }
+
+    /// **A query reads one data graph**, and every rewrite of the plan it makes
+    /// is held to the oracle holding the records *in that graph*, as the engine
+    /// loads them: `FROM <data>`, `FROM NAMED <data>`, `GRAPH <data>`, and a
+    /// data graph nested in the schema graph (which the plan leaves to the
+    /// engine). The plan reads the data graph's inference, so each graph of a
+    /// different inference is its own run.
+    #[test]
+    fn every_rewrite_of_a_data_graph_query_preserves_the_answer() {
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        const M: &str = "urn:graph:mixins";
+        const G: &str = "https://data.infrabel.be/asset360/schema";
+        let schema =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let dataset = crate::sparql_dataset::dataset_with(
+            TypeInference::ASSERTED,
+            &[
+                (A, TypeInference::ASSERTED),
+                (I, TypeInference::IS_A),
+                (M, TypeInference::IS_A_AND_MIXINS),
+            ],
+            &[(G, TypeInference::IS_A)],
+        );
+        let rules = tier_one_rules(&schema, &dataset);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        for (graph, inference) in [
+            (A, TypeInference::ASSERTED),
+            (I, TypeInference::IS_A),
+            (M, TypeInference::IS_A_AND_MIXINS),
+        ] {
+            let oracle = crate::sparql_oracle::fixture_in_graph(&schema, inference, graph)
+                .with_schema_graph(&schema, G, TypeInference::IS_A);
+            // Not vacuous: the records are in the graph, and which types they
+            // carry is the graph's inference.
+            let both = crate::sparql_scoper::parse_query(
+                &format!(
+                    "{PREFIX}SELECT ?s FROM <{graph}> WHERE {{ ?s a asset360:Relay , asset360:Equipment }}"
+                ),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                answers(&oracle, &both).is_empty(),
+                inference == TypeInference::ASSERTED
+            );
+            for body in [
+                "?s a asset360:Equipment ; a ?t",
+                "?s a asset360:Tag ; a ?t",
+                "?s a asset360:Tag ; sesame:directType ?d",
+                "?s a asset360:Equipment ; asset360:label ?l . OPTIONAL { ?s asset360:voltage ?v }",
+                "?s a asset360:Relay , asset360:Equipment",
+            ] {
+                for query in [
+                    format!("SELECT * FROM <{graph}> WHERE {{ {body} }}"),
+                    format!(
+                        "SELECT * FROM NAMED <{graph}> WHERE {{ GRAPH <{graph}> {{ {body} }} }}"
+                    ),
+                    format!("SELECT * WHERE {{ GRAPH <{graph}> {{ {body} }} }}"),
+                    // Nested in the schema graph: the inner `GRAPH` switches
+                    // back to the data graph.
+                    format!("SELECT * WHERE {{ GRAPH <{G}> {{ GRAPH <{graph}> {{ {body} }} }} }}"),
+                ] {
+                    let plan = each_rewrite_preserves_answers_in(
+                        &query, &schema, &oracle, &borrowed, &dataset,
+                    );
+                    assert_eq!(plan.data_inference, inference, "{query}");
+                }
+            }
+        }
+    }
+
+    /// Review F2, as the oracle sees it: `?sub` is bound outside the NOT
+    /// EXISTS, so the filter does not depend on `?s` and `?t` alone and the
+    /// most-specific-type rewrite (R1, `sparql_typed_subjects`) changes the
+    /// answer. The rule declines when the NOT EXISTS reads a variable bound
+    /// outside it, which this holds to the oracle.
+    #[test]
+    fn a_variable_bound_outside_the_not_exists_keeps_the_most_specific_type_rewrite_honest() {
+        const G: &str = "https://data.infrabel.be/asset360/schema";
+        let schema =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let inference = TypeInference::IS_A;
+        let oracle = crate::sparql_oracle::fixture_in(&schema, inference)
+            .with_schema_graph(&schema, G, inference);
+        let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[(G, inference)]);
+        let rules = tier_one_rules(&schema, &dataset);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        each_rewrite_preserves_answers_in(
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+             SELECT ?s ?t WHERE { VALUES ?sub { asset360:Equipment } ?s a ?t FILTER NOT EXISTS { \
+             ?s a ?sub . GRAPH <https://data.infrabel.be/asset360/schema> { ?sub rdfs:subClassOf+ ?t } } }",
+            &schema,
+            &oracle,
+            &borrowed,
+            &dataset,
+        );
     }
 
     /// The same, under the three legal schedules: the list, the list
@@ -1359,20 +1835,20 @@ pub(crate) mod equivalence {
     /// plans; both must answer the query.
     #[test]
     fn every_schedule_answers_the_same() {
-        let schema = test_schema_view();
-        let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, None);
-        let forwards: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
-        let backwards: Vec<&dyn Rule> = rules.iter().rev().map(|rule| rule.as_ref()).collect();
-        let mut permuted: Vec<&dyn Rule> = forwards.clone();
-        // A fixed permutation: rotate by a third.
-        let third = permuted.len() / 3;
-        permuted.rotate_left(third);
-        for query in grammar().iter().step_by(3) {
-            for schedule in [&forwards, &backwards, &permuted] {
-                each_rewrite_preserves_answers(query, &schema, &oracle, schedule);
+        in_each_inference(|_, schema, oracle, dataset| {
+            let rules = tier_one_rules(schema, dataset);
+            let forwards: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            let backwards: Vec<&dyn Rule> = rules.iter().rev().map(|rule| rule.as_ref()).collect();
+            let mut permuted: Vec<&dyn Rule> = forwards.clone();
+            // A fixed permutation: rotate by a third.
+            let third = permuted.len() / 3;
+            permuted.rotate_left(third);
+            for query in grammar().iter().step_by(3) {
+                for schedule in [&forwards, &backwards, &permuted] {
+                    each_rewrite_preserves_answers_in(query, schema, oracle, schedule, dataset);
+                }
             }
-        }
+        });
     }
 
     /// `MAX_ROUNDS = 1` over the grammar: every plan passes every invariant,
@@ -1380,24 +1856,24 @@ pub(crate) mod equivalence {
     /// leaves a correct, less refined plan (design test 11(v)).
     #[test]
     fn one_round_leaves_a_correct_plan() {
-        let schema = test_schema_view();
-        let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, None);
-        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
-        for query in grammar().iter().step_by(5) {
-            let text = format!("{PREFIX}{query}");
-            let parsed = crate::sparql_scoper::parse_query(&text).unwrap();
-            let expected = answers(&oracle, &parsed);
-            let mut plan = crate::sparql_refine::naive_plan(&parsed).unwrap();
-            for rule in &borrowed {
-                rule.apply(&mut plan);
+        in_each_inference(|_, schema, oracle, dataset| {
+            let rules = tier_one_rules(schema, dataset);
+            let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+            for query in grammar().iter().step_by(5) {
+                let text = format!("{PREFIX}{query}");
+                let parsed = crate::sparql_scoper::parse_query(&text, None).unwrap();
+                let expected = answers(oracle, &parsed);
+                let mut plan = crate::sparql_refine::naive_plan(&parsed, dataset).unwrap();
+                for rule in &borrowed {
+                    rule.apply(&mut plan);
+                }
+                plan.check_with(schema)
+                    .unwrap_or_else(|d| panic!("{d}\n{query}\n{plan}"));
+                let translated = plan_to_query(&plan, schema).unwrap();
+                assert_eq!(answers(oracle, &translated), expected, "{query}\n{plan}");
+                let _ = crate::sparql_ops::lower_refined(&plan, schema, None, None);
             }
-            plan.check_with(&schema)
-                .unwrap_or_else(|d| panic!("{d}\n{query}\n{plan}"));
-            let translated = plan_to_query(&plan, &schema).unwrap();
-            assert_eq!(answers(&oracle, &translated), expected, "{query}\n{plan}");
-            let _ = crate::sparql_ops::lower_refined(&plan, &schema, None, None);
-        }
+        });
     }
 
     /// **Direct tests for the nodes the round trip never exercises**: a
@@ -1411,7 +1887,7 @@ pub(crate) mod equivalence {
     fn the_scan_and_unnest_translations_are_the_matches_they_replaced() {
         let schema = test_schema_view();
         let oracle = fixture(&schema);
-        let rules = tier_one_rules(&schema, None);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         for (query, expected_rows) in [
             // A required read: the record without a name is not a row.

@@ -8,8 +8,16 @@ shape against the actual PyO3 surface, not against what a docstring claims.
 
 from __future__ import annotations
 
-from asset360_rust import FilterCondition, PlanOp, SchemaView
-from asset360_rust import plan_query_refined as _plan_query_refined
+from asset360_rust import DatasetSpec, FilterCondition, PlanOp, SchemaView, TypeInference
+from asset360_rust import plan_query_refined as _plan_with_dataset
+
+# `dataset` is required by the binding (no call can forget it); these tests plan
+# against the endpoint every dataset was before graphs had inferences.
+_DATASET = DatasetSpec(TypeInference.ASSERTED)
+
+
+def _plan_query_refined(query, schema_view, **options):
+    return _plan_with_dataset(query, schema_view, _DATASET, **options)
 
 lr = __import__("asset360_rust")
 
@@ -248,3 +256,80 @@ def test_plan_op_broken_out_column_is_none_for_an_ordinary_slot():
     ops = _sql_filter_ops(plan)
     assert len(ops) == 1
     assert ops[0].broken_out_column is None
+
+
+def test_the_dataset_is_required_and_validated():
+    """No call can forget the dataset, and one that contradicts itself is refused."""
+    import pytest
+
+    query = PREFIX + "SELECT ?s WHERE { ?s a asset360:Signal }"
+    with pytest.raises(TypeError):
+        _plan_with_dataset(query, schema())
+    with pytest.raises(TypeError):
+        DatasetSpec("urn:graph:nowhere")
+    with pytest.raises(ValueError, match="both a data graph and a schema graph"):
+        DatasetSpec(
+            TypeInference.ASSERTED,
+            data_graphs={"urn:g": TypeInference.IS_A},
+            schema_graphs={"urn:g": TypeInference.IS_A},
+        )
+    served = DatasetSpec(
+        TypeInference.ASSERTED,
+        data_graphs={"urn:graph:inferred": TypeInference.IS_A},
+    )
+    plan = _plan_with_dataset(
+        PREFIX
+        + "SELECT ?s WHERE { GRAPH <urn:graph:inferred> { ?s a asset360:Signal } }",
+        schema(),
+        served,
+    )
+    assert plan.is_accounted
+
+
+_PARENT_YAML = _SCHEMA_YAML.replace(
+    "classes:\n  Signal:\n    class_uri: asset360:Signal\n",
+    "classes:\n  Asset:\n    class_uri: asset360:Asset\n    attributes:\n      asset360_uri:\n"
+    "        identifier: true\n  Signal:\n    is_a: Asset\n    class_uri: asset360:Signal\n",
+)
+_SESAME = "PREFIX sesame: <http://www.openrdf.org/schema/sesame#> "
+
+
+def _is_a_scan(query):
+    sv = SchemaView()
+    sv.add_schema_str(_PARENT_YAML)
+    plan = _plan_with_dataset(PREFIX + _SESAME + query, sv, DatasetSpec(TypeInference.IS_A))
+    scans = [
+        op for p in plan.passes if p.kind == "sql" for op in p.ops if op.kind == "scan"
+    ]
+    assert len(scans) == 1
+    return plan, scans[0]
+
+
+def test_a_direct_type_is_a_column_of_the_scan():
+    """`sesame:directType ?t` is the scan's `asset_type`, bound as `?t`; a constant
+    one narrows `asset_types` (what the renderer filters `asset_type` by)."""
+    _, scan = _is_a_scan(
+        "SELECT ?s ?t WHERE { ?s a asset360:Asset ; sesame:directType ?t }"
+    )
+    assert scan.direct_type == "t"
+    assert len(scan.asset_types) == 2
+
+    _, scan = _is_a_scan(
+        "SELECT ?s WHERE { ?s a asset360:Asset ; sesame:directType asset360:Signal }"
+    )
+    assert scan.direct_type is None
+    assert [c.rsplit("/", 1)[1] for c in scan.asset_types] == ["Signal"]
+
+    plan, scan = _is_a_scan(
+        "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Signal ; a ?t } GROUP BY ?t"
+    )
+    assert scan.direct_type is not None
+    joins = [
+        op for p in plan.passes if p.kind == "sql" for op in p.ops if op.kind == "join"
+    ]
+    assert any(
+        column.direct_type
+        for join in joins
+        for column in (join.join_key_left, join.join_key_right)
+        if column is not None
+    )

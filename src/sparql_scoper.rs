@@ -13,12 +13,14 @@
 //! The full SPARQL query is always executed in Oxigraph against the loaded
 //! data. The plan only determines *what* to load efficiently.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use spargebra::{Query, SparqlParser};
 
+use crate::sparql_dataset::{DatasetSpec, GraphReads, QueryGraphs};
+use linkml_runtime::schema_rdf::TypeInference;
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 
@@ -176,6 +178,12 @@ pub struct QueryPlan {
     /// refusal is final (design, *The pipeline*). Their triples are among
     /// `unconsumed` and the plan is inexact.
     pub untyped: Vec<String>,
+
+    /// The one inference the query reads its records under
+    /// ([`crate::sparql_graph_clauses::single_data_graph`]): the engine loads
+    /// the records flat under it, and every star above reads its type under
+    /// it. A query that reads no records has its dataset's default.
+    pub data_inference: TypeInference,
 }
 
 /// What a scoping does with a star its domain leaves untyped.
@@ -780,6 +788,12 @@ pub struct Star {
     /// `asset_type` column with `=`, not `LIKE`.
     pub class_uri: String,
 
+    /// Every class the star reads, canonical IRIs sorted: `class_uri` and the
+    /// classes whose records have it among their `rdf:type`s under the plan's
+    /// the inference of the one data graph ([`QueryPlan::data_inference`]). One element, `class_uri`,
+    /// under the asserted inference.
+    pub classes: Vec<String>,
+
     /// Values bound to this class's LinkML identifier slot (the slot
     /// marked `identifier: true`) — schema-resolved, never assumed to
     /// be named `"id"`. Collected from inline literals, inline IRIs,
@@ -1255,6 +1269,37 @@ pub enum ScopeError {
     /// `OPTIONAL`, `NOT EXISTS`, …). Reject with a clear message rather
     /// than silently returning wrong results.
     UnsupportedConstruct(String),
+    /// The schema could not answer a question the plan rests on (which classes
+    /// a scan stands for). The query is not at fault, and a plan built on a
+    /// guess would return fewer rows than it should.
+    SchemaError(String),
+    /// The query reads more than one data graph: several named ones (whatever
+    /// their inferences), the default graph beside any named data graph (use either
+    /// the default graph or explicit graph names, not both), or
+    /// a graph variable that can range over several. Refused by both routes,
+    /// because the engine loads the records into **one** graph, flat under its
+    /// inference (`WriteOptions::flat(inference)`), and the SQL route must not answer a
+    /// question the engine cannot. `graphs` names what the query read.
+    CrossDataGraph { graphs: Vec<String> },
+}
+
+impl From<crate::sparql_graph_clauses::CrossDataGraph> for ScopeError {
+    fn from(error: crate::sparql_graph_clauses::CrossDataGraph) -> Self {
+        ScopeError::CrossDataGraph {
+            graphs: error.graphs,
+        }
+    }
+}
+
+/// The stable code a refusal for reading several data graphs opens with. The
+/// text after it is prose and may be reworded; this token is what a caller
+/// maps (the same contract as `unsupported_construct`).
+pub(crate) const CROSS_DATA_GRAPH: &str = "cross_data_graph";
+
+impl From<crate::sparql_refine::ScanClassesError> for ScopeError {
+    fn from(error: crate::sparql_refine::ScanClassesError) -> Self {
+        ScopeError::SchemaError(error.to_string())
+    }
 }
 
 /// What an unscoped refusal that names its own rewrite opens with.
@@ -1288,6 +1333,13 @@ impl std::fmt::Display for ScopeError {
             ScopeError::UnsupportedConstruct(msg) => {
                 write!(f, "unsupported_construct: {msg}")
             }
+            ScopeError::SchemaError(msg) => write!(f, "schema error: {msg}"),
+            ScopeError::CrossDataGraph { graphs } => write!(
+                f,
+                "{CROSS_DATA_GRAPH}: a query can read one data graph; rewrite it per graph \
+                 (this one read {})",
+                graphs.join(", ")
+            ),
         }
     }
 }
@@ -1298,48 +1350,28 @@ impl std::fmt::Display for ScopeError {
 
 pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-/// Analyse a SPARQL query and produce a [`QueryPlan`].
-///
-/// Parses the query via `spargebra`, decomposes the BGP into stars,
-/// detects join edges between stars, and collects filter conditions.
-///
-/// # Errors
-///
-/// - [`ScopeError::ParseError`] — invalid SPARQL syntax.
-/// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
-/// - [`ScopeError::UpdateRejected`] — input is a SPARQL Update.
-pub fn sparql_scope(query_str: &str, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
-    sparql_scope_with_schema_graph(query_str, schema_view, None)
-}
-
-/// [`sparql_scope`], for a deployment that serves a schema graph.
-///
-/// `schema_graph_iri` is the named graph the active datamodel serves its
-/// datamodel in, which the endpoint reads from that datamodel's configuration.
-/// It is a parameter and not a constant because `DATAMODEL` decides it — see
-/// [`crate::sparql_schema_graph`]. `None`, which is what plain
-/// [`sparql_scope`] passes, means no schema graph exists, so no pattern is in
-/// one and every triple is scoped as an instance pattern.
-pub fn sparql_scope_with_schema_graph(
+/// A string query scoped as the endpoint does: parsed with the datamodel's
+/// parser, spelled canonically, refused on anything it refuses. Test
+/// convenience over [`parse_query`], [`crate::sparql_alias::canonicalize`] and
+/// [`scope_query`], which are the operations.
+#[cfg(test)]
+pub(crate) fn sparql_scope(
     query_str: &str,
     schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> Result<QueryPlan, ScopeError> {
-    let mut query = parse_query_for(query_str, schema_view)?;
-    // The same spelling pass every other entry point runs, so a caller that
-    // only scopes -- the config linter, through the `sparql_scope` binding --
-    // accepts and refuses exactly what the planner and the engine leg do. See
-    // [`crate::sparql_alias`].
+    let mut query = parse_query(query_str, Some(schema_view))?;
     crate::sparql_alias::canonicalize(&mut query, schema_view)?;
-    scope_parsed_with_schema_graph(&query, schema_view, schema_graph_iri)
+    scope_query(&query, schema_view, dataset, Scoping::Refuse)
 }
 
 /// The vocabularies the parser seeds whatever the datamodel says.
 ///
-/// The four W3C vocabularies every SPARQL engine pre-registers plus the two
-/// the datamodel's own schema graph is written in — `skos` for enum values
-/// (`skos:notation`, `skos:inScheme`) and `schema` for slot domains
-/// (`schema:domainIncludes`). Without those, the only way to write a discovery
+/// The four W3C vocabularies every SPARQL engine pre-registers plus the three
+/// the endpoint's own graphs are written in — `skos` for enum values
+/// (`skos:notation`, `skos:inScheme`), `schema` for slot domains
+/// (`schema:domainIncludes`), and `sesame` for the inferring inference'
+/// `sesame:directType` / `sesame:directSubClassOf`. Without those, the only way to write a discovery
 /// query is with declarations that the query it is discovering *for* does not
 /// need, which is a difference no caller can be expected to guess.
 ///
@@ -1348,13 +1380,14 @@ pub fn sparql_scope_with_schema_graph(
 /// ([`crate::sparql_schema_graph`]) writes `https://schema.org/domainIncludes`.
 /// A parser that took the schema's spelling would parse a discovery query
 /// into IRIs the graph never carries — a silent empty answer.
-pub const ENDPOINT_PREFIXES: [(&str, &str); 6] = [
+pub(crate) const ENDPOINT_PREFIXES: &[(&str, &str)] = &[
     ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
     ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
     ("owl", "http://www.w3.org/2002/07/owl#"),
     ("xsd", "http://www.w3.org/2001/XMLSchema#"),
     ("skos", "http://www.w3.org/2004/02/skos/core#"),
     ("schema", "https://schema.org/"),
+    ("sesame", "http://www.openrdf.org/schema/sesame#"),
 ];
 
 /// The datamodel's own `prefixes:`, label to namespace, over every schema in
@@ -1399,7 +1432,7 @@ pub fn predeclared_prefixes(
     schema_view: &SchemaView,
 ) -> std::collections::BTreeMap<String, String> {
     let mut out = schema_prefixes(schema_view);
-    for (label, namespace) in ENDPOINT_PREFIXES {
+    for &(label, namespace) in ENDPOINT_PREFIXES {
         out.insert(label.to_owned(), namespace.to_owned());
     }
     out
@@ -1421,14 +1454,13 @@ pub fn predeclared_prefixes(
 /// ([`schema_prefixes`]) — read off the schema rather than hardcoded, so a
 /// refusal's "did you mean `irsm:longname`" can be pasted as written, and a
 /// second datamodel (`DATAMODEL=rinf`) describes itself instead of being
-/// handed asset360's namespace. `asset360:` used to be the one hardcoded
-/// datamodel prefix here; it is now seeded like any other because the schema
-/// declares it.
+/// handed asset360's namespace. `asset360:` is seeded like any other
+/// datamodel prefix, because the schema declares it.
 ///
 /// These are defaults, not overrides: a query that declares a label itself wins
 /// (the parser's in-query declaration overwrites the seeded one), so a caller
 /// who binds `rdf:` to something else gets the query they wrote.
-pub fn sparql_parser_for(schema_view: &SchemaView) -> SparqlParser {
+fn sparql_parser_for(schema_view: &SchemaView) -> SparqlParser {
     let mut parser = SparqlParser::new();
     for (label, namespace) in predeclared_prefixes(schema_view) {
         // A namespace that is not an IRI cannot be a prefix of any IRI in
@@ -1449,9 +1481,9 @@ pub fn sparql_parser_for(schema_view: &SchemaView) -> SparqlParser {
 /// leaves the datamodel's own prefix undeclared does not parse here, which is
 /// the difference between the two and why every entry point that serves a
 /// client takes the other one.
-pub fn sparql_parser() -> SparqlParser {
+fn sparql_parser() -> SparqlParser {
     let mut parser = SparqlParser::new();
-    for (label, namespace) in ENDPOINT_PREFIXES {
+    for &(label, namespace) in ENDPOINT_PREFIXES {
         parser = parser
             .with_prefix(label, namespace)
             .expect("hardcoded prefix");
@@ -1459,14 +1491,17 @@ pub fn sparql_parser() -> SparqlParser {
     parser
 }
 
-/// Parse a query with [`sparql_parser_for`], rejecting SPARQL Update.
-pub fn parse_query_for(query_str: &str, schema_view: &SchemaView) -> Result<Query, ScopeError> {
-    parse_with(&sparql_parser_for(schema_view), query_str)
-}
-
-/// Parse a query with [`sparql_parser`], rejecting SPARQL Update.
-pub fn parse_query(query_str: &str) -> Result<Query, ScopeError> {
-    parse_with(&sparql_parser(), query_str)
+/// Parse a query, rejecting SPARQL Update: **the** parse function.
+///
+/// With a schema, the parser is [`sparql_parser_for`] -- seeded from the
+/// datamodel, which every entry point that serves a client uses. Without one
+/// it is [`sparql_parser`], the endpoint's vocabularies only: for diagnostics
+/// and tests, where a query declares the datamodel's prefixes itself.
+pub fn parse_query(query_str: &str, schema_view: Option<&SchemaView>) -> Result<Query, ScopeError> {
+    match schema_view {
+        Some(schema_view) => parse_with(&sparql_parser_for(schema_view), query_str),
+        None => parse_with(&sparql_parser(), query_str),
+    }
 }
 
 fn parse_with(parser: &SparqlParser, query_str: &str) -> Result<Query, ScopeError> {
@@ -1483,30 +1518,33 @@ fn parse_with(parser: &SparqlParser, query_str: &str) -> Result<Query, ScopeErro
         .map_err(|e| ScopeError::ParseError(e.to_string()))
 }
 
-/// Plan an already-parsed query.
+/// Analyse a parsed query and produce a [`QueryPlan`], for a deployment whose
+/// dataset is `dataset`: the one scoping operation.
 ///
-/// Separate from [`sparql_scope`] so a caller that needs the parsed algebra for
-/// its own analysis — the aggregate pushdown does — can parse once and share
-/// the result, instead of parsing the same string again with a parser that
-/// might not match.
-pub fn scope_parsed(query: &Query, schema_view: &SchemaView) -> Result<QueryPlan, ScopeError> {
-    scope_parsed_with_schema_graph(query, schema_view, None)
-}
-
-/// [`scope_parsed`], for a deployment that serves a schema graph.
+/// Decomposes the BGP into stars, detects join edges between stars, and
+/// collects filter conditions. The caller parses ([`parse_query`]) and spells
+/// the query canonically ([`crate::sparql_alias::canonicalize`]) first, so a
+/// caller that needs the parsed algebra for its own analysis parses once and
+/// shares the result, instead of parsing the same string again with a parser
+/// that might not match.
 ///
-/// See [`sparql_scope_with_schema_graph`] for what `schema_graph_iri` is and
-/// why it is not a constant.
-pub fn scope_parsed_with_schema_graph(
-    query: &Query,
-    schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
-) -> Result<QueryPlan, ScopeError> {
-    scope_parsed_as(query, schema_view, schema_graph_iri, Scoping::Refuse)
-}
-
-/// [`scope_parsed_with_schema_graph`] with a choice of what to do with an
-/// untyped star. The pipeline's entry point.
+/// `scoping` says what to do with an untyped star: refuse it
+/// ([`Scoping::Refuse`]), record it for the refined plan to type
+/// ([`Scoping::Record`]), or type it from classes the refined plan derived
+/// ([`Scoping::Resolve`]).
+///
+/// # Errors
+///
+/// - [`ScopeError::Unscoped`] — no `rdf:type` or URI constraints.
+/// - [`ScopeError::CrossDataGraph`] — the query reads more than one data graph.
+/// - [`ScopeError::UnsupportedConstruct`] — a construct this does not support.
+///
+/// `dataset` says which named graphs the endpoint serves: the schema graphs
+/// the datamodel is published in, the data graphs the records are served as,
+/// and what the default graph means. It is a parameter and not a constant
+/// because the deployment decides it — see [`crate::sparql_dataset`] and
+/// [`crate::sparql_schema_graph`]. A dataset with no schema graph has no
+/// pattern in one, so every triple is scoped as an instance pattern.
 ///
 /// **A star is a `(naming domain, variable)`.** The query is first read with
 /// every variable inside a sub-select qualified by its domain
@@ -1514,14 +1552,25 @@ pub fn scope_parsed_with_schema_graph(
 /// which keys by variable name and is otherwise unchanged -- is per domain
 /// by construction: a private inner `?s` is `?s__d1`, a star of its own,
 /// typed from its own domain's triples or not at all.
-pub fn scope_parsed_as(
+pub fn scope_query(
     query: &Query,
     schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
     scoping: Scoping<'_>,
 ) -> Result<QueryPlan, ScopeError> {
+    // An `OPTIONAL` joined to what precedes it only through a variable that
+    // may be unbound there is a cartesian product per the algebra, and never
+    // what the author meant. Refused for both routes, with the nested
+    // spelling; see `crate::sparql_optional_binding`. Checked on the query as
+    // written: qualifying renames a sub-select's variables (`?m` becomes
+    // `?m__d1`), which cuts the join the rule reasons about.
+    if let Some(shape) = crate::sparql_optional_binding::optional_on_a_maybe_unbound_variable(query)
+    {
+        return Err(ScopeError::UnsupportedConstruct(shape.to_string()));
+    }
+
     let qualified = crate::sparql_domains::qualify(query);
-    scope_qualified(&qualified, schema_view, schema_graph_iri, scoping)
+    scope_qualified(&qualified, schema_view, dataset, scoping)
 }
 
 /// The scoping proper, over a query whose variables are already qualified
@@ -1531,46 +1580,18 @@ pub fn scope_parsed_as(
 fn scope_qualified(
     query: &Query,
     schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
     scoping: Scoping<'_>,
 ) -> Result<QueryPlan, ScopeError> {
     // A `FROM` / `FROM NAMED` clause redefines the dataset the query is asked
-    // against, and nothing downstream of here carries it: every arm below
-    // discards it with `..`, the plan has no field for it, and
-    // `sparql_materialise` rebuilds a query with `dataset: None`. So
-    //
-    //     SELECT (COUNT(*) AS ?n) FROM <urn:empty> WHERE { ?s a :TunnelComplex }
-    //
-    // was planned as *all in SQL*, admitted, and answered `2` from the table
-    // — against a dataset holding no triples, where the answer is `0`. The
-    // engine gets the original query text and honours the clause, so the two
-    // routes answered different questions and which one you got depended on
-    // whether a rule happened to lift the pattern.
-    //
-    // Refused by name, and refused for *both* routes rather than merely kept
-    // out of SQL. Routing it to the engine would answer this query correctly
-    // today, and it would rest on "no analysis's conclusion changes under a
-    // dataset clause" — an invariant that is true by inspection and recorded
-    // nowhere, which is the arrangement that produced this defect. When the
-    // dataset is a field of the plan it can be honoured; until then the
-    // refusal is the only answer that is checkable. See doc 28h.
-    if dataset_of(query).is_some() {
-        return Err(ScopeError::UnsupportedConstruct(
-            "a FROM / FROM NAMED dataset clause is not supported; the endpoint serves one \
-             dataset and the query plan does not carry a dataset restriction, so honouring \
-             the clause on one route and not the other would answer a different question"
-                .into(),
-        ));
-    }
-
-    // An `OPTIONAL` joined to what precedes it only through a variable that
-    // may be unbound there is a cartesian product per the algebra, and never
-    // what the author meant. Refused for both routes, with the nested
-    // spelling; see `crate::sparql_optional_binding`.
-    if let Some(shape) = crate::sparql_optional_binding::optional_on_a_maybe_unbound_variable(query)
-    {
-        return Err(ScopeError::UnsupportedConstruct(shape.to_string()));
-    }
+    // against, and the plan carries it: which graph each triple pattern
+    // reads is decided here and in the naive plan by the same
+    // [`QueryGraphs`], the finish query is written with the clause (the
+    // engine evaluates it itself), and the executor refuses what it cannot
+    // yet evaluate by name. It used to be refused outright, because nothing
+    // downstream carried it and one route answered the clause while the other
+    // ignored it -- see doc 28h.
+    let graphs = QueryGraphs::new(dataset, query)?;
 
     let pattern = match query {
         Query::Select { pattern, .. } => pattern,
@@ -1584,39 +1605,49 @@ fn scope_qualified(
     // cannot share one. See `union_branches` for why distributing is sound
     // for a *fetch* even though it is not a rewrite of the query.
     if let Some(branches) = union_branches(pattern)? {
-        return scope_union(query, &branches, schema_view, schema_graph_iri, scoping);
+        return scope_union(query, &branches, schema_view, dataset, scoping);
     }
 
     // Phase 0: Depth-tag every BGP triple, rejecting unsupported
     // constructs along the way (UNION, MINUS, property paths).
     let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
     tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
+    refuse_paths_outside_the_schema_graph(pattern, dataset)?;
 
-    // Phase 0b: forget what a `GRAPH` clause asked of the *schema* graph.
+    // Phase 0b: forget what a `GRAPH` clause asked of a *schema* graph, and
+    // stamp every other triple with the graph it reads.
     //
-    // Scoping decides which golden records to fetch. The endpoint serves one
-    // named graph and it holds the datamodel, so a pattern inside it names
-    // schema terms and no record at all. Feeding those into star building asks
-    // the wrong question and gets a wrong answer: a schema pattern with a
-    // constant IRI subject — which is how every enum-value lookup is written —
-    // was rejected as an unscopable instance subject.
+    // Scoping decides which golden records to fetch. A schema graph holds the
+    // datamodel, so a pattern inside it names schema terms and no record at
+    // all. Feeding those into star building asks the wrong question and gets a
+    // wrong answer: a schema pattern with a constant IRI subject — which is
+    // how every enum-value lookup is written — was rejected as an unscopable
+    // instance subject.
     //
-    // Any *other* named graph keeps the behaviour it had. The endpoint holds no
-    // such graph, so the triples inside are still walked into the fetch and the
-    // plan is still marked `Inexact::NamedGraph`, leaving the engine to answer
-    // from a graph that is empty. Over-fetching for a graph nobody has is
-    // wasteful, not wrong, and narrowing it is a separate change.
+    // A triple in a *data* graph (a `GRAPH` naming one, a `FROM`, the default
+    // graph) reads the same records as the default graph and is walked into
+    // the fetch, stamped with the graph's inference. A `GRAPH ?g` ranges over
+    // data graphs too once the dataset serves any, so it is walked as well,
+    // under the widest inference so no graph's records are missed; what it binds
+    // is the engine's (`Inexact::NamedGraph`). Any other graph keeps the
+    // behaviour it had: walked into the fetch, the plan marked inexact.
     //
     // Filtered here rather than inside `tag_triples_by_depth`, because that
     // enumeration is also the obligation list the plan refiner consumes
     // positionally: dropping triples there would leave the refiner's algebra
     // walk claiming obligations that no longer exist.
-    let schema_triples = triples_in_the_schema_graph(pattern, schema_graph_iri);
-    if !schema_triples.is_empty() {
-        triples_with_depth
-            .retain(|(triple, _)| !schema_triples.contains(&std::ptr::from_ref(*triple)));
+    let graph_of = graphs_of_triples(pattern, &graphs);
+    let in_the_schema_graph = |triple: &TriplePattern| {
+        graph_of
+            .get(&std::ptr::from_ref(triple))
+            .is_some_and(|graph| graph.reads == GraphReads::Schema)
+    };
+    if graph_of
+        .values()
+        .any(|graph| graph.reads == GraphReads::Schema)
+    {
+        triples_with_depth.retain(|(triple, _)| !in_the_schema_graph(triple));
     }
-
     // Anything dropped along the way is recorded here, at the point it is
     // dropped. The first cause wins: one actionable reason beats a list.
     let mut inexact: Option<Inexact> = None;
@@ -1660,7 +1691,11 @@ fn scope_qualified(
     // stand for golden records, and the only ones the untyped-subject refusal
     // below is about. A subject seen only inside a `GRAPH` or `SERVICE` block
     // is somebody else's, and the block's own inexactness accounts for it.
-    let foreign_triples = triples_outside_the_default_graph(pattern);
+    let foreign_triples: HashSet<*const TriplePattern> = graph_of
+        .iter()
+        .filter(|(_, graph)| graph.foreign)
+        .map(|(triple, _)| *triple)
+        .collect();
     let mut default_graph_subjects: HashSet<String> = HashSet::new();
 
     for (index, (tp, depth)) in triples_with_depth.iter().enumerate() {
@@ -1709,7 +1744,9 @@ fn scope_qualified(
                 type_iri: None,
                 type_depth: usize::MAX,
                 slot_depth: HashMap::new(),
-                object_variables: HashMap::new(),
+                object_variables: BTreeMap::new(),
+                slot_predicates: HashMap::new(),
+                variable_depth: HashMap::new(),
                 inline_filters: HashMap::new(),
                 claimed: Vec::new(),
             });
@@ -1723,6 +1760,25 @@ fn scope_qualified(
                     builder.claimed.push(index);
                 } else if builder.type_iri.as_deref() == Some(nn.as_str()) {
                     // The same type stated twice says nothing new.
+                    unconsumed.remove(&index);
+                    builder.claimed.push(index);
+                } else if *depth == builder.type_depth
+                    && let Some(specific) = crate::sparql_rules::most_specific(
+                        schema_view,
+                        &std::collections::BTreeSet::from([
+                            builder.type_iri.clone().unwrap_or_default(),
+                            nn.as_str().to_owned(),
+                        ]),
+                        // Judged under the inference of the query's one data graph.
+                        graphs.inference(),
+                    )
+                {
+                    // A parent type beside its subclass (#511): the family of
+                    // the more specific class is inside the other's, so the
+                    // intersection is that family and the star's class is the
+                    // specific one. Either triple is satisfied by it, whatever
+                    // order the query wrote them in.
+                    builder.type_iri = Some(specific);
                     unconsumed.remove(&index);
                     builder.claimed.push(index);
                 } else if *depth < builder.type_depth {
@@ -1739,6 +1795,16 @@ fn scope_qualified(
             // Handled below. The `else` after this branch is the drop site for
             // a predicate the schema does not know.
             let slot_name = slot_view.name.clone();
+            // One name under two predicates cannot be walked by either: the
+            // star is keyed by name, so the two reads would be merged. Honestly
+            // inexact, and the engine finishes the query.
+            if builder
+                .slot_predicates
+                .insert(slot_name.clone(), pred_iri.to_owned())
+                .is_some_and(|known| known != pred_iri)
+            {
+                record_loss(Inexact::DuplicateSlotBinding);
+            }
             let multivalued = slot_view.determine_slot_container_mode()
                 != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
             // How this column's values render, so an inline constant is judged
@@ -1765,30 +1831,41 @@ fn scope_qualified(
                 .insert(slot_name.clone(), current.min(*depth));
             match &tp.object {
                 TermPattern::Variable(v) => {
-                    // One slot bound to two variables — `:kinds ?x ; :kinds ?y`
-                    // — is a self-join over the slot's values, and the map holds
-                    // one variable per slot. Keep the first and leave this
-                    // triple unconsumed: overwriting silently described a
-                    // single read where the query has two. The mirror of the
-                    // one-variable-on-two-slots case, which is caught.
-                    match builder.object_variables.get(&slot_name) {
-                        Some(existing) if existing != v.as_str() => {}
-                        // A constant already read this slot. On a multivalued
-                        // slot that is the same self-join in the other
-                        // direction: `:kinds "p" ; :kinds ?x` pairs the values
-                        // with each other, while the plan describes one
-                        // filtered read. Single-valued is different — the
-                        // constant just fixes what the variable binds.
-                        _ if multivalued && builder.inline_filters.contains_key(&slot_name) => {
-                            record_loss(Inexact::ConstantAndVariableOnSlot);
+                    // A constant already read this slot. On a multivalued slot
+                    // that is a self-join: `:kinds "p" ; :kinds ?x` pairs the
+                    // values with each other, while the plan describes one
+                    // filtered read. Single-valued is different — the constant
+                    // just fixes what the variable binds.
+                    if multivalued && builder.inline_filters.contains_key(&slot_name) {
+                        record_loss(Inexact::ConstantAndVariableOnSlot);
+                    } else {
+                        // One slot bound to two variables — `:kinds ?x ; :kinds
+                        // ?y`, or `:sections ?s1` here and `:sections ?s2` in a
+                        // sibling OPTIONAL — is a self-join over the slot's
+                        // values. Every variable is kept, so the path walk
+                        // reaches what each one introduces (a variable dropped
+                        // here was never walked, and its own triples were then
+                        // refused as untyped), but the plan cannot say it:
+                        // `slot_variables` holds one variable per slot and a
+                        // path binding does not name the element it reads, so
+                        // two reads of one array look like one. Honestly
+                        // inexact, and the engine finishes the query.
+                        let variables = builder.object_variables.entry(slot_name).or_default();
+                        if !variables.iter().any(|known| known == v.as_str()) {
+                            variables.push(v.as_str().to_owned());
+                            if variables.len() > 1 {
+                                record_loss(Inexact::DuplicateSlotBinding);
+                            }
                         }
-                        _ => {
-                            builder
-                                .object_variables
-                                .insert(slot_name, v.as_str().to_owned());
-                            unconsumed.remove(&index);
-                            builder.claimed.push(index);
-                        }
+                        // Each variable is as optional as its own read: the
+                        // slot's depth is the shallowest of all of them.
+                        let own = builder
+                            .variable_depth
+                            .entry(v.as_str().to_owned())
+                            .or_insert(usize::MAX);
+                        *own = (*own).min(*depth);
+                        unconsumed.remove(&index);
+                        builder.claimed.push(index);
                     }
                 }
                 // Inline NamedNode constant: `?s :foo <uri>` →
@@ -2076,6 +2153,11 @@ fn scope_qualified(
 
         stars.push(Star {
             variable: builder.variable.clone(),
+            classes: crate::sparql_refine::scan_classes(
+                schema_view,
+                &class_uri,
+                graphs.inference(),
+            )?,
             class_uri,
             multivalued_fields,
             numeric_fields,
@@ -2091,7 +2173,13 @@ fn scope_qualified(
             // above. FILTER(...)/VALUES filters from Phase 3 are merged
             // in below.
             filters: inline_filters,
-            slot_variables: builder.object_variables.clone(),
+            // One variable per slot: the first. A second is a self-join the
+            // plan records as inexact (`DuplicateSlotBinding`).
+            slot_variables: builder
+                .object_variables
+                .iter()
+                .filter_map(|(slot, vars)| vars.first().map(|var| (slot.clone(), var.clone())))
+                .collect(),
         });
     }
 
@@ -2129,9 +2217,7 @@ fn scope_qualified(
         if !var_to_class.contains_key(&builder.variable) {
             continue;
         }
-        let mut sorted_slots: Vec<(&String, &String)> = builder.object_variables.iter().collect();
-        sorted_slots.sort_by(|a, b| a.0.cmp(b.0));
-        for (slot_name, obj_var) in sorted_slots {
+        for (slot_name, obj_var) in builder.object_pairs() {
             if var_to_class.contains_key(obj_var) {
                 // A join edge says "this slot holds the other class's URI".
                 // That is only true of a *reference*: an inlined slot holds the
@@ -2280,9 +2366,8 @@ fn scope_qualified(
                     .chain(discarded_claims.iter().copied())
                     .flat_map(|builder| {
                         builder
-                            .object_variables
-                            .values()
-                            .map(move |object| (builder.variable.as_str(), object.as_str()))
+                            .object_pairs()
+                            .map(move |(_, object)| (builder.variable.as_str(), object.as_str()))
                     }),
             )
             .collect();
@@ -2311,7 +2396,7 @@ fn scope_qualified(
         if !var_to_class.contains_key(&builder.variable) {
             continue;
         }
-        for (slot_name, obj_var) in &builder.object_variables {
+        for (slot_name, obj_var) in builder.object_pairs() {
             if !var_to_class.contains_key(obj_var) {
                 // obj_var is a value variable (not another star's subject)
                 var_to_field.insert(
@@ -2620,7 +2705,7 @@ fn scope_qualified(
                     &references,
                     &path_bindings,
                     schema_view,
-                    schema_graph_iri,
+                    dataset,
                 ));
             }
             // Recorded, not refused: the refined plan gets its one chance to
@@ -2641,7 +2726,7 @@ fn scope_qualified(
         let represented = (discarded.inline_filters.is_empty()
             || carried_constants.contains(&discarded.variable))
             && discarded.type_iri.is_none()
-            && discarded.object_variables.values().all(|var| {
+            && discarded.object_pairs().all(|(_, var)| {
                 // A leaf comes back as a path binding. An *intermediate* node
                 // deliberately does not — it serialises as a blank node, so the
                 // walk records it as a step and keeps going — and the paths that
@@ -2679,7 +2764,7 @@ fn scope_qualified(
     let mut bound_once: HashSet<&String> = HashSet::new();
     let mut bound_twice = false;
     for builder in star_map.values() {
-        for object_var in builder.object_variables.values() {
+        for (_, object_var) in builder.object_pairs() {
             if var_to_class.contains_key(object_var) {
                 // A typed object variable is a join edge, which the plan does
                 // carry.
@@ -2697,8 +2782,14 @@ fn scope_qualified(
     if contains_subquery(pattern) {
         record_loss(Inexact::Subquery);
     }
-    if let Some(cause) = contains_foreign_scope(pattern) {
+    if let Some(cause) = contains_foreign_scope(pattern, &graphs) {
         record_loss(cause);
+    }
+    // A `FROM` that makes the default graph something other than the records
+    // (a schema graph, a graph the endpoint does not serve) leaves every
+    // pattern outside a `GRAPH` reading it: the table cannot answer for it.
+    if !matches!(graphs.default_reads(), GraphReads::Data) {
+        record_loss(Inexact::NamedGraph);
     }
 
     // Phase 7: the SQL LIMIT.
@@ -2754,6 +2845,7 @@ fn scope_qualified(
         path_bindings,
         inexact,
         untyped,
+        data_inference: graphs.inference(),
     })
 }
 
@@ -2775,7 +2867,18 @@ struct StarBuilder {
     /// referenced on this subject.
     slot_depth: HashMap<String, usize>,
     /// Map: slot_name → object variable name (for join detection + filters).
-    object_variables: HashMap<String, String>,
+    ///
+    /// Several variables on one slot is a self-join over its values; they are
+    /// kept in the order the query wrote them, slots in name order.
+    object_variables: BTreeMap<String, Vec<String>>,
+    /// Map: slot name → the predicate the query wrote for it. A path walk
+    /// asks the schema for the slot *by that predicate*, not by the name: two
+    /// slots of one name may be written under different IRIs.
+    slot_predicates: HashMap<String, String>,
+    /// Variable → the shallowest OPTIONAL depth at which a triple of this star
+    /// binds it as an object. Needed because `slot_depth` is per slot, and two
+    /// variables on one slot can sit in different blocks.
+    variable_depth: HashMap<String, usize>,
     /// Filters extracted from triples whose object is an inline literal
     /// or NamedNode (e.g. `?s :hasName "X"` or `?s :foo <some/uri>`).
     /// Only collected at OPTIONAL depth 0 — inside an OPTIONAL block
@@ -2788,6 +2891,15 @@ struct StarBuilder {
     /// still be discarded, and its triples are then represented by nothing
     /// unless the path walk picks them up. Kept so they can be handed back.
     claimed: Vec<usize>,
+}
+
+impl StarBuilder {
+    /// Every `(slot, object variable)` pair, slots in name order.
+    fn object_pairs(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.object_variables
+            .iter()
+            .flat_map(|(slot, vars)| vars.iter().map(move |var| (slot, var)))
+    }
 }
 
 /// Resolve the LinkML class (and identifier slot name) for one star.
@@ -3168,12 +3280,13 @@ fn scope_union(
     query: &Query,
     branches: &[GraphPattern],
     schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
     scoping: Scoping<'_>,
 ) -> Result<QueryPlan, ScopeError> {
     let pattern = query_pattern(query);
     let mut triples_with_depth: Vec<(&TriplePattern, usize)> = Vec::new();
     tag_triples_by_depth(pattern, 0, &mut triples_with_depth)?;
+    refuse_paths_outside_the_schema_graph(pattern, dataset)?;
 
     let mut stars: Vec<Star> = Vec::new();
     let mut joins: Vec<JoinEdge> = Vec::new();
@@ -3225,7 +3338,7 @@ fn scope_union(
         // rewrite it names -- `?m a <Municipality>` -- may be one the author
         // already wrote, in the other arm, and being told to add it again is
         // worse than not being told which arm is short.
-        let plan = scope_qualified(&branch_query, schema_view, schema_graph_iri, scoping).map_err(
+        let plan = scope_qualified(&branch_query, schema_view, dataset, scoping).map_err(
             |err| match err {
                 ScopeError::Unscoped { message, rewrite } => ScopeError::Unscoped {
                     message: format!(
@@ -3347,6 +3460,7 @@ fn scope_union(
         // a fact about a pattern this plan no longer has a node for.
         inexact: Some(Inexact::UnionBranch),
         untyped,
+        data_inference: crate::sparql_graph_clauses::single_data_graph(query, dataset)?.inference,
     })
 }
 
@@ -3386,6 +3500,22 @@ pub(crate) fn tag_triples_by_depth<'a>(
     depth: usize,
     out: &mut Vec<(&'a TriplePattern, usize)>,
 ) -> Result<(), ScopeError> {
+    tag_triples_walk(pattern, depth, out, false)
+}
+
+/// [`tag_triples_by_depth`] with the one thing a `GRAPH` block changes:
+/// `in_graph` says the walk is inside a `GRAPH` clause, where a property path
+/// is not refused here. A path over the schema graph is the engine's — the
+/// schema graph subtree already goes there, and a path contributes no triple
+/// pattern to tag. Whether the graph *is* the schema graph is not knowable
+/// from here (no schema IRI); [`refuse_paths_outside_the_schema_graph`] asks
+/// that, where the IRI is known.
+fn tag_triples_walk<'a>(
+    pattern: &'a GraphPattern,
+    depth: usize,
+    out: &mut Vec<(&'a TriplePattern, usize)>,
+    in_graph: bool,
+) -> Result<(), ScopeError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             for tp in patterns {
@@ -3394,8 +3524,8 @@ pub(crate) fn tag_triples_by_depth<'a>(
             Ok(())
         }
         GraphPattern::Join { left, right } => {
-            tag_triples_by_depth(left, depth, out)?;
-            tag_triples_by_depth(right, depth, out)
+            tag_triples_walk(left, depth, out, in_graph)?;
+            tag_triples_walk(right, depth, out, in_graph)
         }
         GraphPattern::LeftJoin {
             left,
@@ -3404,15 +3534,15 @@ pub(crate) fn tag_triples_by_depth<'a>(
         } => {
             // Left side stays at the current depth — it's the mandatory
             // pattern from the point of view of this OPTIONAL.
-            tag_triples_by_depth(left, depth, out)?;
+            tag_triples_walk(left, depth, out, in_graph)?;
             // Right side is one level deeper — it's inside the OPTIONAL.
-            tag_triples_by_depth(right, depth + 1, out)?;
+            tag_triples_walk(right, depth + 1, out, in_graph)?;
             // The condition spargebra lifted out of `OPTIONAL { ... FILTER }`,
             // which may hold an `EXISTS` like any other filter. Read last, so
             // the order is the one the obligation enumeration and the plan
             // builder both walk: left, right, then the condition.
             match expression {
-                Some(expression) => read_exists_patterns(expression, depth, out),
+                Some(expression) => read_exists_patterns(expression, depth, out, in_graph),
                 None => Ok(()),
             }
         }
@@ -3425,14 +3555,14 @@ pub(crate) fn tag_triples_by_depth<'a>(
         // all, so the filter held for every row and the endpoint answered a
         // different question without saying so.
         GraphPattern::Filter { expr, inner } => {
-            tag_triples_by_depth(inner, depth, out)?;
-            read_exists_patterns(expr, depth, out)
+            tag_triples_walk(inner, depth, out, in_graph)?;
+            read_exists_patterns(expr, depth, out, in_graph)
         }
         GraphPattern::Extend {
             inner, expression, ..
         } => {
-            tag_triples_by_depth(inner, depth, out)?;
-            read_exists_patterns(expression, depth, out)
+            tag_triples_walk(inner, depth, out, in_graph)?;
+            read_exists_patterns(expression, depth, out, in_graph)
         }
         // `ORDER BY EXISTS { ... }` and `SUM(?x + EXISTS { ... })` are read by
         // nothing here: the ordering and the aggregate are computed over rows
@@ -3444,7 +3574,7 @@ pub(crate) fn tag_triples_by_depth<'a>(
                 let (OrderExpression::Asc(expr) | OrderExpression::Desc(expr)) = term;
                 refuse_exists_patterns(expr, "an ORDER BY expression")?;
             }
-            tag_triples_by_depth(inner, depth, out)
+            tag_triples_walk(inner, depth, out, in_graph)
         }
         GraphPattern::Group {
             inner, aggregates, ..
@@ -3454,14 +3584,14 @@ pub(crate) fn tag_triples_by_depth<'a>(
                     refuse_exists_patterns(expr, "an aggregate's argument")?;
                 }
             }
-            tag_triples_by_depth(inner, depth, out)
+            tag_triples_walk(inner, depth, out, in_graph)
         }
         GraphPattern::Project { inner, .. }
         | GraphPattern::Distinct { inner }
         | GraphPattern::Reduced { inner }
         | GraphPattern::Slice { inner, .. }
-        | GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. } => tag_triples_by_depth(inner, depth, out),
+        | GraphPattern::Service { inner, .. } => tag_triples_walk(inner, depth, out, in_graph),
+        GraphPattern::Graph { inner, .. } => tag_triples_walk(inner, depth, out, true),
         GraphPattern::Values { .. } => Ok(()),
         // Both arms, left then right — the order
         // `sparql_refine::Builder::pattern` walks them in, because the
@@ -3480,8 +3610,8 @@ pub(crate) fn tag_triples_by_depth<'a>(
         // so two arms typing the same variable differently cannot collapse
         // into one class.
         GraphPattern::Union { left, right } => {
-            tag_triples_by_depth(left, depth + 1, out)?;
-            tag_triples_by_depth(right, depth + 1, out)
+            tag_triples_walk(left, depth + 1, out, in_graph)?;
+            tag_triples_walk(right, depth + 1, out, in_graph)
         }
         GraphPattern::Lateral { .. } => Err(ScopeError::UnsupportedConstruct(
             "LATERAL is not supported; it is a SPARQL extension this endpoint does not serve"
@@ -3490,11 +3620,74 @@ pub(crate) fn tag_triples_by_depth<'a>(
         GraphPattern::Minus { .. } => Err(ScopeError::UnsupportedConstruct(
             "MINUS is not supported yet".into(),
         )),
-        GraphPattern::Path { .. } => Err(ScopeError::UnsupportedConstruct(
-            "SPARQL property paths are not supported; use explicit triple patterns".into(),
-        )),
+        GraphPattern::Path { .. } if in_graph => Ok(()),
+        GraphPattern::Path { .. } => Err(ScopeError::UnsupportedConstruct(PATH_REFUSAL.into())),
     }
 }
+
+/// Refuse a property path inside a `GRAPH` that is not the schema graph.
+///
+/// [`tag_triples_walk`] lets a path through inside any `GRAPH`, because it has
+/// no schema IRI to ask. This is the question, asked where the IRI is known:
+/// a path whose innermost enclosing `GRAPH` is the named schema graph is the
+/// engine's to answer (the schema graph is the one graph that holds the
+/// triples such a path walks, and its subtree already goes to the engine). A
+/// path in any other graph -- another constant IRI, a `GRAPH ?g` that may
+/// range over data graphs, or any graph at all when no schema graph is
+/// configured -- is refused with the refusal a path outside a `GRAPH` gets.
+fn refuse_paths_outside_the_schema_graph(
+    pattern: &GraphPattern,
+    dataset: &DatasetSpec,
+) -> Result<(), ScopeError> {
+    use spargebra::term::NamedNodePattern;
+
+    /// `inside`: `None` outside every `GRAPH`; otherwise whether the innermost
+    /// one is the schema graph.
+    fn walk(
+        pattern: &GraphPattern,
+        inside: Option<bool>,
+        dataset: &DatasetSpec,
+    ) -> Result<(), ScopeError> {
+        for block in exists_patterns_in_expressions_of(pattern) {
+            walk(block, inside, dataset)?;
+        }
+        match pattern {
+            GraphPattern::Path { .. } => match inside {
+                Some(false) => Err(ScopeError::UnsupportedConstruct(PATH_REFUSAL.into())),
+                _ => Ok(()),
+            },
+            GraphPattern::Graph { name, inner } => {
+                let is_schema = match name {
+                    NamedNodePattern::NamedNode(node) => dataset.is_schema_graph(node.as_str()),
+                    _ => false,
+                };
+                walk(inner, Some(is_schema), dataset)
+            }
+            GraphPattern::Join { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Lateral { left, right }
+            | GraphPattern::Minus { left, right }
+            | GraphPattern::LeftJoin { left, right, .. } => {
+                walk(left, inside, dataset)?;
+                walk(right, inside, dataset)
+            }
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => walk(inner, inside, dataset),
+            GraphPattern::Bgp { .. } | GraphPattern::Values { .. } => Ok(()),
+        }
+    }
+    walk(pattern, None, dataset)
+}
+
+/// The refusal for a property path nothing here can answer.
+const PATH_REFUSAL: &str = "SPARQL property paths are not supported; use explicit triple patterns";
 
 /// Read every `EXISTS` block this expression holds into the fetch.
 ///
@@ -3509,11 +3702,12 @@ fn read_exists_patterns<'a>(
     expr: &'a Expression,
     depth: usize,
     out: &mut Vec<(&'a TriplePattern, usize)>,
+    in_graph: bool,
 ) -> Result<(), ScopeError> {
     let mut patterns = Vec::new();
     exists_patterns_of(expr, &mut patterns);
     for pattern in patterns {
-        tag_triples_by_depth(pattern, depth + 1, out)?;
+        tag_triples_walk(pattern, depth + 1, out, in_graph)?;
     }
     Ok(())
 }
@@ -3588,7 +3782,7 @@ pub(crate) fn exists_patterns_of<'a>(expr: &'a Expression, out: &mut Vec<&'a Gra
 ///
 /// Exhaustive over [`Query`]: every form can carry a dataset clause, and a
 /// form that carried one unnoticed is the defect this exists to refuse.
-fn dataset_of(query: &Query) -> Option<&spargebra::algebra::QueryDataset> {
+pub(crate) fn dataset_of(query: &Query) -> Option<&spargebra::algebra::QueryDataset> {
     match query {
         Query::Select { dataset, .. }
         | Query::Construct { dataset, .. }
@@ -3658,91 +3852,97 @@ pub(crate) fn exists_patterns_in_expressions_of(pattern: &GraphPattern) -> Vec<&
     out
 }
 
-/// Every triple pattern that reads the schema graph, by identity.
-///
-/// Identity and not value: two textually identical patterns, one inside the
-/// `GRAPH` and one outside, are different obligations and only the first is a
-/// schema pattern.
-///
-/// A `GRAPH` naming a *variable* counts too. It may bind to the schema graph,
-/// and a pattern that might be about the datamodel cannot be scoped as if it
-/// were certainly about golden records. A `GRAPH` naming some other constant
-/// IRI does not: the endpoint has no such graph, and its long-standing
-/// behaviour — walk the triples into the fetch, mark the plan inexact, let the
-/// engine answer from an empty graph — is left exactly as it was.
-fn triples_in_the_schema_graph(
-    pattern: &GraphPattern,
-    schema_graph_iri: Option<&str>,
-) -> HashSet<*const TriplePattern> {
-    // No schema graph configured for the active datamodel: there is no such
-    // graph, so no pattern is in it and every triple is scoped as before.
-    let Some(schema_graph_iri) = schema_graph_iri else {
-        return HashSet::new();
-    };
-    let reads_the_schema_graph = |name: &spargebra::term::NamedNodePattern| match name {
-        spargebra::term::NamedNodePattern::NamedNode(node) => node.as_str() == schema_graph_iri,
-        spargebra::term::NamedNodePattern::Variable(_) => true,
-    };
-    triples_in_blocks(pattern, &reads_the_schema_graph, false)
+/// The graph one triple pattern reads, as the scoper needs it.
+#[derive(Debug, Clone, Copy)]
+struct TripleGraph {
+    /// What the graph holds: records under an inference, the datamodel, or
+    /// something else.
+    reads: GraphReads,
+    /// Whether the triple is somebody else's rather than the default
+    /// graph's: inside a `SERVICE`, a `GRAPH ?g`, or a graph that is no data
+    /// graph. A subject seen only in such blocks is not a golden record, so
+    /// "give it an rdf:type" is the wrong thing to tell its author; the
+    /// plan's inexactness for the block (`Inexact::NamedGraph`,
+    /// `Inexact::RemoteService`) is what accounts for it.
+    foreign: bool,
 }
 
-/// The triples the endpoint's own store does not hold: inside any `GRAPH`
-/// block, or inside a `SERVICE` block.
+/// The graph every triple pattern reads, by identity.
 ///
-/// A subject that appears only there is not a golden record, so "give it an
-/// rdf:type" is the wrong thing to tell its author; the plan's inexactness for
-/// the block (`Inexact::NamedGraph`, `Inexact::RemoteService`) is what
-/// accounts for it.
-fn triples_outside_the_default_graph(pattern: &GraphPattern) -> HashSet<*const TriplePattern> {
-    triples_in_blocks(pattern, &|_| true, true)
-}
-
-/// The triples inside the `GRAPH` blocks `is_the_graph` accepts -- and inside
-/// `SERVICE` blocks too when `and_services` is set.
-fn triples_in_blocks(
+/// Identity and not value: two textually identical patterns, one inside a
+/// `GRAPH` and one outside, are different obligations and read different
+/// graphs. Outside any `GRAPH` a pattern reads the query's default graph
+/// ([`QueryGraphs::default_reads`]); inside `GRAPH <iri>` the graph that IRI
+/// names ([`QueryGraphs::graph_reads`]); inside `GRAPH ?g` -- which may bind
+/// a schema graph, so a pattern that might be about the datamodel cannot be
+/// scoped as if it were certainly about golden records -- the schema graph
+/// while the dataset serves no data graph (the variable can bind nothing
+/// else), otherwise a read of data under the widest inference, left to the engine
+/// to say which graph it bound. A graph that does not exist reads as `Other`:
+/// the long-standing behaviour, walk the triples into the fetch, mark the plan
+/// inexact, let the engine answer from an empty graph.
+fn graphs_of_triples(
     pattern: &GraphPattern,
-    is_the_graph: &dyn Fn(&spargebra::term::NamedNodePattern) -> bool,
-    and_services: bool,
-) -> HashSet<*const TriplePattern> {
+    graphs: &QueryGraphs<'_>,
+) -> HashMap<*const TriplePattern, TripleGraph> {
     fn walk(
         pattern: &GraphPattern,
-        inside: bool,
-        out: &mut HashSet<*const TriplePattern>,
-        is_the_graph: &dyn Fn(&spargebra::term::NamedNodePattern) -> bool,
-        and_services: bool,
+        context: TripleGraph,
+        graphs: &QueryGraphs<'_>,
+        out: &mut HashMap<*const TriplePattern, TripleGraph>,
     ) {
+        // An `EXISTS` block reads the graph its expression is in.
+        for block in exists_patterns_in_expressions_of(pattern) {
+            walk(block, context, graphs, out);
+        }
         match pattern {
             GraphPattern::Bgp { patterns } => {
-                if inside {
-                    for triple in patterns {
-                        out.insert(std::ptr::from_ref(triple));
-                    }
+                for triple in patterns {
+                    out.insert(std::ptr::from_ref(triple), context);
                 }
             }
-            GraphPattern::Graph { name, inner } => walk(
-                inner,
-                inside || is_the_graph(name),
-                out,
-                is_the_graph,
-                and_services,
-            ),
+            GraphPattern::Graph { name, inner } => {
+                let dataset = graphs.dataset();
+                let inside = match name {
+                    NamedNodePattern::NamedNode(graph) => {
+                        let reads = graphs.graph_reads(graph.as_str());
+                        TripleGraph {
+                            reads,
+                            foreign: !matches!(reads, GraphReads::Data),
+                        }
+                    }
+                    NamedNodePattern::Variable(_) => TripleGraph {
+                        reads: if dataset.has_schema_graph()
+                            && dataset.graph_variable_is_schema_only()
+                        {
+                            GraphReads::Schema
+                        } else {
+                            GraphReads::Data
+                        },
+                        foreign: true,
+                    },
+                };
+                walk(inner, inside, graphs, out);
+            }
             GraphPattern::Service { inner, .. } => walk(
                 inner,
-                inside || and_services,
+                TripleGraph {
+                    foreign: true,
+                    ..context
+                },
+                graphs,
                 out,
-                is_the_graph,
-                and_services,
             ),
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
             | GraphPattern::Lateral { left, right }
             | GraphPattern::Minus { left, right } => {
-                walk(left, inside, out, is_the_graph, and_services);
-                walk(right, inside, out, is_the_graph, and_services);
+                walk(left, context, graphs, out);
+                walk(right, context, graphs, out);
             }
             GraphPattern::LeftJoin { left, right, .. } => {
-                walk(left, inside, out, is_the_graph, and_services);
-                walk(right, inside, out, is_the_graph, and_services);
+                walk(left, context, graphs, out);
+                walk(right, context, graphs, out);
             }
             GraphPattern::Filter { inner, .. }
             | GraphPattern::Extend { inner, .. }
@@ -3751,15 +3951,22 @@ fn triples_in_blocks(
             | GraphPattern::Distinct { inner }
             | GraphPattern::Reduced { inner }
             | GraphPattern::Slice { inner, .. }
-            | GraphPattern::Group { inner, .. } => {
-                walk(inner, inside, out, is_the_graph, and_services)
-            }
+            | GraphPattern::Group { inner, .. } => walk(inner, context, graphs, out),
             GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
         }
     }
 
-    let mut out = HashSet::new();
-    walk(pattern, false, &mut out, is_the_graph, and_services);
+    let reads = graphs.default_reads();
+    let mut out = HashMap::new();
+    walk(
+        pattern,
+        TripleGraph {
+            reads,
+            foreign: matches!(reads, GraphReads::Other),
+        },
+        graphs,
+        &mut out,
+    );
     out
 }
 
@@ -4324,7 +4531,9 @@ pub(crate) fn nested_presence_of(
     let mut class = schema_view.get_class_by_uri(class_uri).ok().flatten()?;
     let mut containers = Vec::with_capacity(slot_path.len());
     for (index, name) in slot_path.iter().enumerate() {
-        let slot = class.slot(&Identifier::Name(name.clone()))?;
+        let slot = crate::sparql_slot_family::slot_on_class_or_descendant(&class, name)
+            .ok()
+            .flatten()?;
         let mode = slot.determine_slot_container_mode();
         containers.push(mode);
         if index + 1 == slot_path.len() {
@@ -4939,6 +5148,7 @@ fn collect_path_bindings(
             continue;
         };
         walk_paths(
+            schema_view,
             star_var,
             star_var,
             &class_view,
@@ -4964,6 +5174,7 @@ fn collect_path_bindings(
 
 #[allow(clippy::too_many_arguments)]
 fn walk_paths(
+    schema_view: &SchemaView,
     star_var: &str,
     current_var: &str,
     current_class: &linkml_schemaview::classview::ClassView,
@@ -5004,23 +5215,34 @@ fn walk_paths(
         }
     }
 
-    let mut slots: Vec<(&String, &String)> = builder.object_variables.iter().collect();
-    slots.sort_by(|a, b| a.0.cmp(b.0));
-
-    for (slot_name, object_var) in slots {
+    for (slot_name, object_var) in builder.object_pairs() {
         // The class's own O(1) name index rather than a scan. It hands back an
         // owned SlotView, which this did not need before — worth it for a wide
         // class (TunnelComplex has 95 slots), a wash for a narrow one.
-        let Some(slot) = current_class.slot(&Identifier::Name(slot_name.clone())) else {
+        // Asked by the predicate the query wrote, not by the name it resolved
+        // to: a same-named slot under another IRI is not what was read.
+        let Some(predicate) = builder.slot_predicates.get(slot_name) else {
+            continue;
+        };
+        let Some(slot) = crate::sparql_slot_family::slot_for_predicate_on_class_or_descendant(
+            schema_view,
+            current_class,
+            predicate,
+        )
+        .ok()
+        .flatten() else {
             continue;
         };
 
         let mut path = path_so_far.to_vec();
         path.push(slot_name.clone());
-        let hop_optional = builder
-            .slot_depth
-            .get(slot_name)
-            .is_some_and(|depth| *depth > 0);
+        // The slot's shallowest read, unless several variables share it: then
+        // each is as optional as its own read.
+        let hop_depth = match builder.object_variables.get(slot_name) {
+            Some(vars) if vars.len() > 1 => builder.variable_depth.get(object_var),
+            _ => builder.slot_depth.get(slot_name),
+        };
+        let hop_optional = hop_depth.is_some_and(|depth| *depth > 0);
         let hop_multivalued = slot.determine_slot_container_mode()
             != linkml_schemaview::slotview::SlotContainerMode::SingleValue;
 
@@ -5065,6 +5287,7 @@ fn walk_paths(
                 ) {
                     traversed.insert(object_var.clone());
                     walk_paths(
+                        schema_view,
                         star_var,
                         object_var,
                         &range_class,
@@ -5148,7 +5371,7 @@ fn untyped_subject_refusal(
     references: &HashMap<String, ReferenceReach>,
     path_bindings: &HashMap<String, PathBinding>,
     schema_view: &SchemaView,
-    schema_graph_iri: Option<&str>,
+    dataset: &DatasetSpec,
 ) -> ScopeError {
     // The name as the query wrote it, with the sub-select it is private to:
     // `?s__d1` is the `?s` of sub-select 1, and the author wrote `?s`.
@@ -5197,8 +5420,7 @@ fn untyped_subject_refusal(
         let class_uri = var_to_class.get(&builder.variable)?;
         let class = schema_view.get_class_by_uri(class_uri).ok().flatten()?;
         builder
-            .object_variables
-            .iter()
+            .object_pairs()
             .find(|(_, object_var)| object_var.as_str() == var)
             .and_then(|(slot_name, _)| {
                 let slot = class.slot(&Identifier::Name(slot_name.clone()))?;
@@ -5211,8 +5433,8 @@ fn untyped_subject_refusal(
             })
     });
     if let Some((holder, slot_name, enum_iri)) = concept_slot {
-        let graph = match schema_graph_iri {
-            Some(iri) => format!("<{iri}>"),
+        let graph = match dataset.schema_graphs().next() {
+            Some((iri, _)) => format!("<{iri}>"),
             None => "<schema-graph>".to_owned(),
         };
         return ScopeError::Unscoped {
@@ -5233,18 +5455,15 @@ fn untyped_subject_refusal(
             let Some(class_uri) = var_to_class.get(&builder.variable) else {
                 return false;
             };
-            builder
-                .object_variables
-                .iter()
-                .any(|(slot_name, object_var)| {
-                    object_var == var
-                        && schema_view
-                            .get_class_by_uri(class_uri)
-                            .ok()
-                            .flatten()
-                            .and_then(|cv| cv.slot(&Identifier::Name(slot_name.clone())))
-                            .is_some_and(|slot| slot.get_range_class().is_none())
-                })
+            builder.object_pairs().any(|(slot_name, object_var)| {
+                object_var == var
+                    && schema_view
+                        .get_class_by_uri(class_uri)
+                        .ok()
+                        .flatten()
+                        .and_then(|cv| cv.slot(&Identifier::Name(slot_name.clone())))
+                        .is_some_and(|slot| slot.get_range_class().is_none())
+            })
         });
     if is_value {
         return ScopeError::Unscoped {
@@ -5325,8 +5544,7 @@ fn holder_candidates(
         return Vec::new();
     };
     let mut typed_slots: Vec<(&String, &String)> = builder
-        .object_variables
-        .iter()
+        .object_pairs()
         .filter_map(|(slot, object_var)| var_to_class.get(object_var).map(|class| (slot, class)))
         .collect();
     typed_slots.sort();
@@ -5391,8 +5609,18 @@ fn cause_for_unconsumed(tp: &TriplePattern, depth: usize, schema_view: &SchemaVi
 /// datamodel, so its patterns name schema terms rather than golden records.
 /// `triples_inside_named_graphs` drops them before star building, and this
 /// inexactness is what still routes the query to the engine.
-fn contains_foreign_scope(pattern: &GraphPattern) -> Option<Inexact> {
+fn contains_foreign_scope(pattern: &GraphPattern, graphs: &QueryGraphs<'_>) -> Option<Inexact> {
     match pattern {
+        // A data graph holds the records every star reads, so a `GRAPH`
+        // naming one is the same read as the default graph's, under the
+        // graph's inference (which the star decomposition stamps). Any other
+        // graph is read from the wrong place.
+        GraphPattern::Graph {
+            name: NamedNodePattern::NamedNode(graph),
+            inner,
+        } if matches!(graphs.graph_reads(graph.as_str()), GraphReads::Data) => {
+            contains_foreign_scope(inner, graphs)
+        }
         GraphPattern::Graph { .. } => Some(Inexact::NamedGraph),
         GraphPattern::Service { .. } => Some(Inexact::RemoteService),
         GraphPattern::Filter { inner, .. }
@@ -5402,13 +5630,13 @@ fn contains_foreign_scope(pattern: &GraphPattern) -> Option<Inexact> {
         | GraphPattern::Distinct { inner }
         | GraphPattern::Reduced { inner }
         | GraphPattern::Slice { inner, .. }
-        | GraphPattern::Group { inner, .. } => contains_foreign_scope(inner),
+        | GraphPattern::Group { inner, .. } => contains_foreign_scope(inner, graphs),
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
         | GraphPattern::Lateral { left, right }
         | GraphPattern::Minus { left, right } => {
-            contains_foreign_scope(left).or(contains_foreign_scope(right))
+            contains_foreign_scope(left, graphs).or(contains_foreign_scope(right, graphs))
         }
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => None,
     }
@@ -5465,11 +5693,18 @@ pub(crate) mod tests {
 
     /// Small hand-written schema shared with the pushdown analyser's tests.
     pub(crate) fn test_schema_view() -> SchemaView {
+        test_schema_view_plus("")
+    }
+
+    /// [`test_schema_view`] with `extra` classes appended: for a test that
+    /// needs a shape most tests must not see (a subclass hands its slots to a
+    /// class whose queries then read as ambiguous).
+    pub(crate) fn test_schema_view_plus(extra: &str) -> SchemaView {
         use linkml_meta::SchemaDefinition;
         use serde_path_to_error as p2e;
         use serde_yml as yml;
 
-        let schema_yaml = r#"
+        let base = r#"
 id: https://data.infrabel.be/asset360
 name: asset360
 prefixes:
@@ -5496,6 +5731,9 @@ types:
   integer:
     uri: xsd:integer
     base: int
+  uri:
+    uri: xsd:anyURI
+    base: URI
 
 # Partially mapped, as the real `signalType` is: `GSA` carries a `meaning` and
 # renders as that IRI, while `KSS` has none and renders as the IRI minted for
@@ -5696,9 +5934,127 @@ classes:
     attributes:
       label:
         range: string
+  # Subclass-only slots, two levels deep, for the slot-on-the-family walk: a
+  # `Site` stores a `Place`, but the slot `coords` exists only on
+  # `SpotPlace`, whose range `Fix` again has the slot `lat` only on
+  # `GeoFix`. `tag` is declared on two sibling subclasses with different
+  # ranges, so no one definition can be chosen for it.
+  Site:
+    class_uri: asset360:Site
+    attributes:
+      asset360_uri:
+        identifier: true
+      place:
+        range: Place
+        inlined: true
+      places:
+        range: Place
+        multivalued: true
+        inlined: true
+      # A single-valued nested object holding the collection: the hop to
+      # `places` is a fan-out off a chain, not off the record.
+      holder:
+        range: Holder
+        inlined: true
+  Holder:
+    class_uri: asset360:Holder
+    attributes:
+      places:
+        range: Place
+        multivalued: true
+        inlined: true
+      # A single-valued nested object holding the collection: the hop to
+      # `places` is a fan-out off a chain, not off the record.
+      holder:
+        range: Holder
+        inlined: true
+  Holder:
+    class_uri: asset360:Holder
+    attributes:
+      places:
+        range: Place
+        multivalued: true
+        inlined: true
+  Place:
+    class_uri: asset360:Place
+    attributes:
+      label:
+        range: string
+      # The class an element is, as `BaseLocation.typeURI` is in the real
+      # datamodel: a full IRI, written by the instance writer, and absent on
+      # an element that is a plain `Place`.
+      typeURI:
+        range: uri
+        designates_type: true
+  SpotPlace:
+    is_a: Place
+    class_uri: asset360:SpotPlace
+    attributes:
+      coords:
+        range: Fix
+        inlined: true
+  RoadPlace:
+    is_a: Place
+    class_uri: asset360:RoadPlace
+    attributes:
+      tag:
+        range: string
+  RailPlace:
+    is_a: Place
+    class_uri: asset360:RailPlace
+    attributes:
+      tag:
+        range: integer
+  Fix:
+    class_uri: asset360:Fix
+    attributes:
+      source:
+        range: string
+      typeURI:
+        range: uri
+        designates_type: true
+  GeoFix:
+    is_a: Fix
+    class_uri: asset360:GeoFix
+    attributes:
+      lat:
+        range: integer
+  # An `is_a` chain, additive: `Equipment` > `Relay` > `LatchRelay`, with
+  # `Switch` and `Breaker` as siblings that declare `inference` differently
+  # (multivalued vs single), so a family can agree on a slot or disagree.
+  Equipment:
+    class_uri: asset360:Equipment
+    attributes:
+      asset360_uri:
+        identifier: true
+      label:
+        range: string
+  Relay:
+    is_a: Equipment
+    class_uri: asset360:Relay
+    attributes:
+      voltage:
+        range: integer
+  LatchRelay:
+    is_a: Relay
+    class_uri: asset360:LatchRelay
+  Switch:
+    is_a: Equipment
+    class_uri: asset360:Switch
+    attributes:
+      inference:
+        range: string
+        multivalued: true
+  Breaker:
+    is_a: Equipment
+    class_uri: asset360:Breaker
+    attributes:
+      inference:
+        range: string
 "#;
+        let schema_yaml = format!("{base}{extra}");
         let schema: SchemaDefinition =
-            p2e::deserialize(yml::Deserializer::from_str(schema_yaml)).unwrap();
+            p2e::deserialize(yml::Deserializer::from_str(&schema_yaml)).unwrap();
         let mut sv = SchemaView::new();
         sv.add_schema(schema).unwrap();
         sv
@@ -5728,6 +6084,7 @@ classes:
         let plan = sparql_scope(
             "SELECT ?s ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -5750,7 +6107,7 @@ classes:
         let plan = sparql_scope(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?name . FILTER(?name = \"BX517\") }",
-            &sv,
+            &sv, crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -5763,7 +6120,12 @@ classes:
     #[test]
     fn test_single_type_with_limit() {
         let sv = test_schema_view();
-        let plan = sparql_scope("SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10", &sv).unwrap();
+        let plan = sparql_scope(
+            "SELECT ?s WHERE { ?s a asset360:Signal } LIMIT 10",
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
 
         assert_eq!(plan.sql_limit, Some(10));
     }
@@ -5778,6 +6140,7 @@ classes:
              SELECT ?lon WHERE { ?s a asset360:Signal ; asset360:location ?loc . \
              ?loc asset360:longitude ?lon }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -5800,6 +6163,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?name WHERE { ?s a asset360:Signal ; asset360:name ?name }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -5827,6 +6191,7 @@ classes:
              SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
              ?t asset360:hasName ?tn }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap_err();
 
@@ -5918,10 +6283,10 @@ classes:
                  OPTIONAL { ?k <http://www.w3.org/2004/02/skos/core#prefLabel> ?l } }",
             ),
         ] {
-            let err = sparql_scope_with_schema_graph(
+            let err = sparql_scope(
                 &format!("{prefix}{query}"),
                 &sv,
-                Some("urn:schema"),
+                &crate::sparql_dataset::schema_dataset("urn:schema"),
             )
             .unwrap_err();
             let ScopeError::Unscoped { .. } = &err else {
@@ -5944,8 +6309,12 @@ classes:
              GRAPH <urn:other> { ?k <urn:label> ?l } }",
             "SELECT ?s WHERE { ?s a asset360:Signal . SERVICE <urn:remote> { ?x <urn:p> ?o } }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv)
-                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
             assert!(
                 plan.inexact.is_some(),
                 "{query}: the block must still route to the engine"
@@ -5964,6 +6333,7 @@ classes:
                  FILTER(?len > 10) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -5988,6 +6358,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . FILTER(10 < ?len) }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6008,6 +6379,7 @@ classes:
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:length ?len . \
              FILTER(?len >= 10 && ?len <= 20) }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -6026,8 +6398,12 @@ classes:
     #[test]
     fn substring_filters_lift_with_their_case_folding() {
         let lifted = |query: &str| -> Vec<FilterCondition> {
-            let scope =
-                sparql_scope(&format!("{PREFIX}{query}"), &test_schema_view()).expect("scopes");
+            let scope = sparql_scope(
+                &format!("{PREFIX}{query}"),
+                &test_schema_view(),
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("scopes");
             all_stars(&scope)
                 .iter()
                 .flat_map(|star| star.filters.values())
@@ -6097,6 +6473,7 @@ classes:
                  FILTER(CONTAINS(?nm, LCASE(\"X5\"))) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6123,6 +6500,7 @@ classes:
                  FILTER(CONTAINS(?k, \"GS\")) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6145,6 +6523,7 @@ classes:
                  FILTER(?nm != \"BX517\") }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         let conditions: Vec<_> = all_stars(&scope)
@@ -6172,6 +6551,7 @@ classes:
                  FILTER(?k != <http://ontorail.org/src/Eulynx/Amb>) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6198,6 +6578,7 @@ classes:
                  FILTER(?nm != \"BX517\") }} LIMIT 10"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert_eq!(plan.sql_limit, Some(10));
@@ -6215,6 +6596,7 @@ classes:
                  OPTIONAL {{ ?s asset360:name ?nm }} FILTER(!bound(?nm)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         let conditions: Vec<_> = all_stars(&plan)
@@ -6241,6 +6623,7 @@ classes:
                  FILTER(!bound(?nm)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(all_stars(&plan).iter().all(|star| star.filters.is_empty()));
@@ -6266,6 +6649,7 @@ classes:
                  ?loc asset360:longitude ?lon . FILTER(!bound(?lon)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         let conditions: Vec<_> = all_stars(&plan)
@@ -6287,8 +6671,12 @@ classes:
         const GEOF: &str = "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
                             PREFIX geo: <http://www.opengis.net/ont/geosparql#> ";
         let path_conditions = |query: &str| -> Vec<FilterCondition> {
-            let scope = sparql_scope(&format!("{PREFIX}{GEOF}{query}"), &test_schema_view())
-                .expect("scopes");
+            let scope = sparql_scope(
+                &format!("{PREFIX}{GEOF}{query}"),
+                &test_schema_view(),
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("scopes");
             scope
                 .root
                 .all_stars()
@@ -6364,7 +6752,7 @@ classes:
                  FILTER(geof:sfIntersects(?w, \
                  \"{{\\\"type\\\":\\\"Point\\\",\\\"coordinates\\\":[1,2]}}\"^^geo:geoJSONLiteral)) }}"
             ),
-            &test_schema_view(),
+            &test_schema_view(), crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6394,6 +6782,7 @@ classes:
                  FILTER(geof:sfIntersects(?w, \"POINT(1 2)\"^^geo:wktLiteral)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6417,6 +6806,7 @@ classes:
                  FILTER(geof:sfWithin(?w, \"POINT(1 2)\"^^geo:wktLiteral)) }}"
             ),
             &test_schema_view(),
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("scopes");
         assert!(
@@ -6551,7 +6941,12 @@ classes:
                 "SELECT ?s WHERE { ?s a asset360:Signal . ?s ?p \"x\" } LIMIT 10",
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.sql_limit, None, "sql_limit must be None for: {label}");
         }
     }
@@ -6616,7 +7011,12 @@ classes:
                 "SELECT ?c WHERE { ?c a asset360:CivilEngineeringAsset } LIMIT 50".to_owned(),
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.sql_limit, expected, "for: {label}");
             assert_eq!(plan.sql_limit_scope, scope, "scope, for: {label}");
         }
@@ -6693,7 +7093,12 @@ classes:
                 None,
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.inexact, None, "a walked path is not a loss: {label}");
             let star = &plan.root.all_stars()[0];
             assert_eq!(star.required_paths, expected, "restated, for: {label}");
@@ -6729,6 +7134,7 @@ classes:
                  asset360:location ?c . ?c asset360:onTrack ?t }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(
@@ -6744,6 +7150,7 @@ classes:
                  asset360:location ?c . ?c asset360:onTrack ?t ; asset360:longitude ?lo }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(
@@ -6761,6 +7168,7 @@ classes:
                  OPTIONAL {{ ?s asset360:location ?c . ?c asset360:onTrack ?t }} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert!(
@@ -6776,6 +7184,7 @@ classes:
                  asset360:location ?c . ?c asset360:onTrack ?t . ?t a asset360:Track }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert!(
@@ -6799,6 +7208,7 @@ classes:
              OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track ; \
              asset360:documents ?d . ?d asset360:title ?n } } LIMIT 50",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None);
@@ -7001,13 +7411,45 @@ classes:
                  asset360:location [ asset360:longitude ?v ] }",
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv)
-                .unwrap_or_else(|e| panic!("scope failed for {query}: {e:?}"));
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap_or_else(|e| panic!("scope failed for {query}: {e:?}"));
             assert_eq!(
                 plan.inexact,
                 Some(expected),
                 "wrong cause recorded for: {query}"
             );
+        }
+    }
+
+    /// A parent type beside its subclass is judged in the inference the scoper
+    /// reads under (#511). Asserted, the two are an empty intersection and the
+    /// repeated type is recorded, as for siblings.
+    #[test]
+    fn a_parent_type_beside_its_subclass_is_one_star() {
+        let sv = test_schema_view();
+        let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+        // The scoper reads under the default (asserted) inference, where a
+        // class's family is the class alone: a parent beside its subclass is
+        // an intersection of two classes with nothing in it, so the second
+        // type is not absorbed. (Under `is_a` the star would collapse to the
+        // subclass; the scoper has no dataset to say so yet, and the plan
+        // rule `FoldMatchesIntoScan` does it where the inference is known.)
+        for query in [
+            "SELECT ?s WHERE { ?s a asset360:Relay ; a asset360:Equipment }",
+            "SELECT ?s WHERE { ?s a asset360:Equipment ; a asset360:Relay }",
+            "SELECT ?s WHERE { ?s a asset360:Relay ; a asset360:Switch }",
+        ] {
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect("scopes");
+            assert_eq!(plan.inexact, Some(Inexact::RepeatedType), "{query}");
         }
     }
 
@@ -7028,12 +7470,12 @@ classes:
         // it is configuration and not a constant -- see
         // `crate::sparql_schema_graph`.
         let schema_graph = "https://data.infrabel.be/asset360/schema";
-        let plan = sparql_scope_with_schema_graph(
+        let plan = sparql_scope(
             &format!(
                 "{prefix}SELECT ?s ?l WHERE {{ ?s a asset360:Signal .                  GRAPH <{schema_graph}> {{                  <https://example.org/term> rdfs:label ?l }} }}"
             ),
             &sv,
-            Some(schema_graph),
+            &crate::sparql_dataset::schema_dataset(schema_graph),
         )
         .expect("a schema pattern must not make the query unscopable");
 
@@ -7059,6 +7501,7 @@ classes:
         let result = sparql_scope(
             "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>              SELECT ?c ?l WHERE { GRAPH <https://data.infrabel.be/asset360/schema>              { ?c rdfs:label ?l } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::Unscoped { .. })),
@@ -7138,7 +7581,12 @@ classes:
                 true,
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(
                 plan.inexact.is_none(),
                 pushed,
@@ -7160,6 +7608,7 @@ classes:
              SELECT ?nm WHERE { <https://data.infrabel.be/asset360/signal/A> \
              asset360:name ?nm }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("an ordinary constant-subject query is not a disconnected OPTIONAL");
 
@@ -7191,6 +7640,7 @@ classes:
                  ?c a asset360:Coordinates ; asset360:longitude ?lo }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, Some(Inexact::TypedNestedStructure));
@@ -7213,6 +7663,7 @@ classes:
                  ?c a asset360:Track ; asset360:longitude ?lo }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap_err();
         assert!(
@@ -7227,6 +7678,7 @@ classes:
                  ?c asset360:longitude ?lo }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None);
@@ -7247,7 +7699,8 @@ classes:
                  OPTIONAL {{ ?s asset360:location ?c . ?c asset360:hasName ?x }} }}"
             ),
         ] {
-            let err = sparql_scope(&query, &sv).unwrap_err();
+            let err =
+                sparql_scope(&query, &sv, crate::sparql_dataset::default_dataset()).unwrap_err();
             assert!(
                 matches!(&err, ScopeError::UnsupportedConstruct(msg)
                     if msg.contains("not a slot of Coordinates")
@@ -7263,6 +7716,7 @@ classes:
                  asset360:locatedOnTrack ?t . ?t a asset360:Track ; asset360:hasName ?tn }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None);
@@ -7281,6 +7735,7 @@ classes:
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:trafficKinds \"m\" ; \
              asset360:name \"BX\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7307,6 +7762,7 @@ classes:
                  asset360:location ?c . ?c asset360:longitude ?lo . FILTER(?lo = 4) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "a nested FILTER is pushable");
@@ -7327,6 +7783,46 @@ classes:
         );
     }
 
+    /// A hop's range names a family: a slot declared only on a subclass of the
+    /// range is still a hop of the path, two levels deep here (`coords` is on
+    /// `SpotPlace` only, `lat` on `GeoFix` only). A slot two siblings declare
+    /// differently has no one meaning and is refused as before.
+    #[test]
+    fn a_nested_path_walks_through_subclass_only_slots() {
+        let sv = test_schema_view();
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?lat WHERE {{ ?s a asset360:Site ; asset360:place ?p .                  ?p asset360:coords ?c . ?c asset360:lat ?lat }}"
+            ),
+            &sv, crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
+        assert_eq!(plan.inexact, None, "{:?}", plan.inexact);
+
+        assert_eq!(
+            plan.path_bindings.get("lat").map(|b| b.slot_path.clone()),
+            Some(vec![
+                "place".to_owned(),
+                "coords".to_owned(),
+                "lat".to_owned()
+            ]),
+            "the leaf is a nested path of the scanned record"
+        );
+
+        // Two descendants, two definitions of `tag`: not a path.
+        let plan = sparql_scope(
+            &format!(
+                "{PREFIX}SELECT ?t WHERE {{ ?s a asset360:Site ; asset360:place ?p .                  ?p asset360:tag ?t }}"
+            ),
+            &sv, crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
+        assert!(
+            !plan.path_bindings.contains_key("t"),
+            "an ambiguous subclass slot must not become a path"
+        );
+    }
+
     /// The same value written as a constant on the nested step rather than
     /// through a FILTER. One question, so one answer.
     #[test]
@@ -7337,6 +7833,7 @@ classes:
              SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:location ?c . ?c asset360:longitude 4 }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "a nested constant is pushable");
@@ -7366,6 +7863,7 @@ classes:
                  asset360:kind <http://ontorail.org/src/Eulynx/GSA> }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "an IRI constant on an enum is pushable");
@@ -7382,6 +7880,7 @@ classes:
                  asset360:kind <https://data.infrabel.be/asset360/SignalKind#KSS> }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.inexact, None, "a minted IRI is pushable too");
@@ -7402,6 +7901,7 @@ classes:
                     "{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:kind \"{code}\" }}"
                 ),
                 &sv,
+                crate::sparql_dataset::default_dataset(),
             )
             .unwrap_err();
             let ScopeError::UnsupportedConstruct(msg) = &err else {
@@ -7445,7 +7945,7 @@ classes:
                 FilterCondition::In(vec!["GSA".to_owned(), "KSS".to_owned()]),
             ),
         ] {
-            let plan = sparql_scope(&query, &sv).unwrap();
+            let plan = sparql_scope(&query, &sv, crate::sparql_dataset::default_dataset()).unwrap();
             assert_eq!(plan.inexact, None, "not pushed: {query}");
             assert_eq!(
                 plan.root.all_stars()[0].filters["kind"],
@@ -7467,6 +7967,7 @@ classes:
              SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:length ?len ; \
              asset360:name ?nm . FILTER(?len >= 10) }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7492,7 +7993,12 @@ classes:
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:locatedOnTrack ?t . \
              FILTER(?t IN (<https://data.infrabel.be/asset360/track/T1>)) }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.inexact, None, "should push: {query}");
         }
 
@@ -7504,7 +8010,12 @@ classes:
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
              FILTER(?nm = <https://data.infrabel.be/asset360/track/T1>) }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert!(plan.inexact.is_some(), "should refuse: {query}");
         }
     }
@@ -7519,7 +8030,7 @@ classes:
                      SELECT ?v WHERE { ?s a asset360:Signal ; asset360:location ?c . \
                      ?c asset360:detail ?d . ?d asset360:value ?v }";
 
-        let plan = sparql_scope(query, &sv).unwrap();
+        let plan = sparql_scope(query, &sv, crate::sparql_dataset::default_dataset()).unwrap();
         assert_eq!(plan.inexact, None, "a walked path is not a loss");
         let binding = plan.path_bindings.get("v").expect("?v is a path binding");
         assert_eq!(binding.slot_path, ["location", "detail", "value"]);
@@ -7561,7 +8072,12 @@ classes:
                 None,
             ),
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.sql_limit, expected, "for: {query}");
         }
     }
@@ -7580,6 +8096,7 @@ classes:
                  FILTER(?nm IN (\"a\", \"b\")) }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7618,7 +8135,12 @@ classes:
             "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
              asset360:length ?l . VALUES (?nm ?l) { (\"BX1\" 4) } }",
         ] {
-            let plan = sparql_scope(&format!("{prefix}{query}"), &sv).unwrap();
+            let plan = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
             assert_eq!(plan.inexact, None, "should be exact: {query}");
         }
 
@@ -7626,6 +8148,7 @@ classes:
         let plan = sparql_scope(
             &format!("{prefix}SELECT ?s WHERE {{ ?s a asset360:Signal }} LIMIT 10"),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
         assert_eq!(plan.sql_limit, Some(10));
@@ -7643,6 +8166,7 @@ classes:
              FILTER NOT EXISTS { ?component a asset360:CivilEngineeringAsset ; \
              asset360:belongsToTunnelComplex ?complex } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7675,8 +8199,12 @@ classes:
             "SELECT (SUM(IF(EXISTS { ?s asset360:belongsToLine ?l }, 1, 0)) AS ?n) \
              WHERE { ?s a asset360:Signal }",
         ] {
-            let error = sparql_scope(&format!("{prefix}{query}"), &sv)
-                .expect_err("should refuse rather than answer: {query}");
+            let error = sparql_scope(
+                &format!("{prefix}{query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect_err("should refuse rather than answer: {query}");
             let ScopeError::UnsupportedConstruct(message) = &error else {
                 panic!("expected an unsupported-construct refusal, got {error:?}");
             };
@@ -7701,6 +8229,7 @@ classes:
                           asset360:hasName ?componentName . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7760,6 +8289,7 @@ classes:
                ?l a asset360:Line ; asset360:hasName ?ln . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7784,6 +8314,7 @@ classes:
                ?sig a asset360:Signal ; asset360:name ?name . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7810,6 +8341,7 @@ classes:
                ?sig a asset360:Signal ; asset360:locatedOnTrack ?track ; asset360:name ?sn . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7850,6 +8382,7 @@ classes:
                ?tc a asset360:TunnelComplex . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7885,6 +8418,7 @@ classes:
                                                             asset360:hasName ?n . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7910,6 +8444,7 @@ classes:
                <https://data.infrabel.be/asset360/thing/Y> asset360:hasName ?n . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(matches!(result, Err(ScopeError::UnsupportedConstruct(_))));
     }
@@ -7919,7 +8454,11 @@ classes:
     #[test]
     fn test_unscoped_query_rejected() {
         let sv = test_schema_view();
-        let result = sparql_scope("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", &sv);
+        let result = sparql_scope(
+            "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        );
         assert!(matches!(result, Err(ScopeError::Unscoped { .. })));
     }
 
@@ -7929,6 +8468,7 @@ classes:
         let result = sparql_scope(
             "INSERT DATA { <http://example.org/s> <http://example.org/p> \"value\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(matches!(result, Err(ScopeError::UpdateRejected)));
     }
@@ -7936,7 +8476,11 @@ classes:
     #[test]
     fn test_parse_error() {
         let sv = test_schema_view();
-        let result = sparql_scope("NOT VALID {{{", &sv);
+        let result = sparql_scope(
+            "NOT VALID {{{",
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        );
         assert!(matches!(result, Err(ScopeError::ParseError(_))));
     }
 
@@ -7952,6 +8496,7 @@ classes:
                VALUES ?name { \"BX517\" \"BX518\" } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7974,6 +8519,7 @@ classes:
         let plan = sparql_scope(
             "ASK { ?s a asset360:Signal ; asset360:name \"BX517\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -7991,6 +8537,7 @@ classes:
             "CONSTRUCT { ?s a asset360:Signal ; asset360:name ?n } \
              WHERE { ?s a asset360:Signal ; asset360:name ?n }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8019,6 +8566,7 @@ classes:
                } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8084,6 +8632,7 @@ classes:
                } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8115,6 +8664,7 @@ classes:
                OPTIONAL { ?s asset360:name ?n } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8136,6 +8686,7 @@ classes:
                OPTIONAL { ?s asset360:locatedOnTrack ?t } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8157,6 +8708,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION is scopable");
         let mut classes: Vec<&str> = plan
@@ -8189,6 +8741,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { { ?s a asset360:Signal } UNION { ?s a asset360:BaliseGroup } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION is scopable");
         let names: HashSet<&str> = plan
@@ -8226,6 +8779,7 @@ classes:
                  ?t a asset360:TunnelComplex ; asset360:hasName ?tn } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION is scopable");
 
@@ -8265,6 +8819,7 @@ classes:
              SELECT * WHERE { ?s a asset360:Signal . \
              { ?s asset360:name ?n } UNION { ?s asset360:length ?t } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .expect("a UNION is scopable");
         for star in plan.root.all_stars() {
@@ -8285,6 +8840,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { { ?s a asset360:Signal } UNION { ?x ?p ?o } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::Unscoped { .. })),
@@ -8306,6 +8862,7 @@ classes:
                 "PREFIX asset360: <https://data.infrabel.be/asset360/> SELECT * WHERE {{ {arms} }}"
             ),
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("branches")),
@@ -8320,6 +8877,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { ?s a asset360:Signal . MINUS { ?s asset360:name \"X\" } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("MINUS")),
@@ -8327,39 +8885,168 @@ classes:
         );
     }
 
-    /// Review finding 4. A dataset clause used to be discarded by the `..` in
-    /// every arm of [`scope_parsed_with_schema_graph`], so
+    /// Review finding 4, and what replaced its refusal. A dataset clause used
+    /// to be discarded by the `..` in every arm of [`scope_query`], so
     /// `FROM <urn:empty>` was planned as all-in-SQL, admitted, and answered
-    /// from the table — `2` for a dataset in which the answer is `0`. Refused
-    /// by name now, for both routes: see doc 28h on why routing it to the
-    /// engine would be correct today and still the wrong default.
+    /// from the table — `2` for a dataset in which the answer is `0`. It was
+    /// refused by name, because nothing downstream carried it. The plan carries
+    /// it now: a clause that names graphs of the dataset reads them under their
+    /// inferences, and one that names anything else makes the plan inexact, so the
+    /// engine -- which evaluates the clause itself -- answers.
     #[test]
-    fn a_dataset_clause_is_refused_by_name() {
+    fn a_dataset_clause_decides_which_graph_each_pattern_reads() {
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
-        for query in [
-            "SELECT (COUNT(*) AS ?n) FROM <urn:empty> WHERE { ?s a asset360:Signal }",
-            "SELECT ?s FROM NAMED <urn:empty> WHERE { ?s a asset360:Signal }",
-            "ASK FROM <urn:empty> WHERE { ?s a asset360:Signal }",
-        ] {
-            let result = sparql_scope(
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[(A, TypeInference::ASSERTED), (I, TypeInference::IS_A)],
+            &[],
+        );
+        let scoped = |query: &str| {
+            sparql_scope(
                 &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
                 &sv,
-            );
-            assert!(
-                matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("FROM")),
-                "expected a FROM refusal for `{query}`, got {result:?}"
+                &dataset,
+            )
+            .unwrap_or_else(|e| panic!("`{query}`: {e}"))
+        };
+        let inference_of = |plan: &QueryPlan| {
+            let stars = plan.root.all_stars();
+            assert_eq!(stars.len(), 1, "{stars:?}");
+            plan.data_inference
+        };
+
+        // No clause: the dataset's default inference, and the one class.
+        let plain = scoped("SELECT ?s WHERE { ?s a asset360:Signal }");
+        assert_eq!(inference_of(&plain), TypeInference::ASSERTED);
+        assert_eq!(plain.inexact, None);
+
+        // A clause naming data graphs: the inference they share.
+        let from_asserted = scoped(&format!(
+            "SELECT ?s FROM <{A}> WHERE {{ ?s a asset360:Signal }}"
+        ));
+        assert_eq!(inference_of(&from_asserted), TypeInference::ASSERTED);
+        let from_inferred = scoped(&format!(
+            "SELECT ?s FROM <{I}> WHERE {{ ?s a asset360:Signal }}"
+        ));
+        assert_eq!(inference_of(&from_inferred), TypeInference::IS_A);
+        assert_eq!(from_inferred.inexact, None);
+        // Data graphs of different inferences are two data graphs: refused.
+        let refused = sparql_scope(
+            &format!(
+                "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                 ASK FROM <{A}> FROM <{I}> WHERE {{ ?s a asset360:Signal }}"
+            ),
+            &sv,
+            &dataset,
+        )
+        .expect_err("two inferences");
+        assert!(
+            matches!(refused, ScopeError::CrossDataGraph { ref graphs } if graphs.len() == 2),
+            "{refused:?}"
+        );
+
+        // A graph of the dataset inside the pattern: the same read, per
+        // pattern, with no inexactness for a data graph.
+        let in_graph = scoped(&format!(
+            "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
+        ));
+        assert_eq!(inference_of(&in_graph), TypeInference::IS_A);
+        assert_eq!(in_graph.inexact, None);
+
+        // A clause naming something the dataset does not serve is the
+        // engine's: the table cannot answer for `urn:empty`.
+        for query in [
+            "SELECT (COUNT(*) AS ?n) FROM <urn:empty> WHERE { ?s a asset360:Signal }",
+            "ASK FROM <urn:empty> WHERE { ?s a asset360:Signal }",
+            "SELECT ?s FROM NAMED <urn:empty> WHERE { ?s a asset360:Signal }",
+        ] {
+            assert_eq!(
+                scoped(query).inexact,
+                Some(Inexact::NamedGraph),
+                "`{query}` reads a graph the table does not hold"
             );
         }
-        // And no dataset clause is still scoped, which is every query the
-        // application sends.
-        assert!(
-            sparql_scope(
-                "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-                 SELECT ?s WHERE { ?s a asset360:Signal }",
-                &sv,
-            )
-            .is_ok()
+        // `FROM NAMED` narrows the named graphs: one outside the set matches
+        // nothing, which only the engine can say.
+        let outside = scoped(&format!(
+            "SELECT ?s FROM NAMED <urn:empty> WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
+        ));
+        assert_eq!(outside.inexact, Some(Inexact::NamedGraph));
+        // `FROM NAMED` alone leaves the default graph empty (SPARQL 1.1
+        // 13.2), so a pattern outside a `GRAPH` is not the records either.
+        let empty_default =
+            scoped("SELECT ?s FROM NAMED <urn:empty> WHERE { ?s a asset360:Signal }");
+        assert_eq!(empty_default.inexact, Some(Inexact::NamedGraph));
+    }
+
+    /// A star reads its records under the inference of the query's one data graph, and so
+    /// stands for the classes that inference says. A mix of inferences across graphs
+    /// is not a star typed once by its type triple: it is refused.
+    #[test]
+    fn a_star_reads_its_type_under_its_own_graphs_inference() {
+        const A: &str = "urn:graph:asserted";
+        const I: &str = "urn:graph:inferred";
+        let sv = test_schema_view_plus(
+            "
+  Beacon:
+    is_a: Signal
+",
         );
+        let dataset = crate::sparql_dataset::dataset_with(
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[(A, TypeInference::ASSERTED), (I, TypeInference::IS_A)],
+            &[],
+        );
+        let scope = |query: &str| {
+            sparql_scope(
+                &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+                &sv,
+                &dataset,
+            )
+            .unwrap_or_else(|e| panic!("`{query}`: {e}"))
+        };
+        let classes = |plan: &QueryPlan| plan.root.all_stars()[0].classes.clone();
+        let signal = "https://data.infrabel.be/asset360/Signal".to_owned();
+        let beacon = "https://data.infrabel.be/asset360/Beacon".to_owned();
+
+        assert_eq!(
+            classes(&scope(&format!(
+                "SELECT ?s WHERE {{ GRAPH <{A}> {{ ?s a asset360:Signal }} }}"
+            ))),
+            vec![signal.clone()]
+        );
+        assert_eq!(
+            classes(&scope(&format!(
+                "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
+            ))),
+            vec![beacon.clone(), signal.clone()]
+        );
+        // The type in one graph, a slot in a graph of another inference: refused.
+        let mixed = sparql_scope(
+            &format!(
+                "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                 SELECT ?s ?n WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} \
+                 GRAPH <{A}> {{ ?s asset360:name ?n }} }}"
+            ),
+            &sv,
+            &dataset,
+        )
+        .expect_err("two inferences");
+        assert!(
+            mixed.to_string().starts_with(
+                "cross_data_graph: a query can read one data graph; rewrite it per graph"
+            ),
+            "{mixed}"
+        );
+        // Both in the inferred graph: one star, one inference.
+        let both = scope(&format!(
+            "SELECT ?s ?n WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal ; asset360:name ?n }} }}"
+        ));
+        assert_eq!(both.root.all_stars().len(), 1);
+        assert_eq!(classes(&both), vec![beacon, signal]);
+        assert_eq!(both.data_inference, TypeInference::IS_A);
     }
 
     #[test]
@@ -8369,6 +9056,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT * WHERE { ?s a asset360:Signal . LATERAL { ?s asset360:name ?n } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("LATERAL")),
@@ -8390,7 +9078,7 @@ classes:
                ?comp a asset360:CivilEngineeringAsset ; \
                      asset360:belongsToTunnelComplex <https://data.infrabel.be/data/TunnelComplexes/abc> . \
              }",
-            &sv,
+            &sv, crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8422,6 +9110,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8446,6 +9135,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"abc\" }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8478,6 +9168,7 @@ classes:
                   asset360:asset360_uri <https://data.infrabel.be/data/Signals/abc> . \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8501,6 +9192,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s ?id WHERE { ?s a asset360:Signal ; asset360:asset360_uri ?id }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8530,6 +9222,7 @@ classes:
                VALUES ?id { \"abc\" \"def\" \"ghi\" } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8556,6 +9249,7 @@ classes:
                FILTER(?id = \"abc\") \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8577,6 +9271,7 @@ classes:
                OPTIONAL { ?s asset360:name \"BX517\" } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8605,9 +9300,9 @@ classes:
                    ?t a asset360:Track ; asset360:hasName ?tn . \
                  }";
         // Run several times — sort order must be stable.
-        let plan1 = sparql_scope(q, &sv).unwrap();
-        let plan2 = sparql_scope(q, &sv).unwrap();
-        let plan3 = sparql_scope(q, &sv).unwrap();
+        let plan1 = sparql_scope(q, &sv, crate::sparql_dataset::default_dataset()).unwrap();
+        let plan2 = sparql_scope(q, &sv, crate::sparql_dataset::default_dataset()).unwrap();
+        let plan3 = sparql_scope(q, &sv, crate::sparql_dataset::default_dataset()).unwrap();
 
         let stars1: Vec<&str> = all_stars(&plan1)
             .iter()
@@ -8654,6 +9349,7 @@ classes:
                OPTIONAL { ?b a asset360:BaliseGroup } \
              }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("disconnected")),
@@ -8681,9 +9377,12 @@ classes:
             "{ ?s asset360:hasAccessibleTracks",
             "{ ?s a asset360:TunnelComplex ; asset360:hasAccessibleTracks",
         );
-        let untyped_plan = crate::sparql_plan::plan_query_refined(untyped, &sv)
-            .unwrap_or_else(|error| panic!("refused: {error}"));
-        let typed_plan = crate::sparql_plan::plan_query_refined(&typed, &sv).unwrap();
+        let untyped_plan =
+            crate::sparql_plan::plan_of(untyped, &sv, crate::sparql_dataset::default_dataset())
+                .unwrap_or_else(|error| panic!("refused: {error}"));
+        let typed_plan =
+            crate::sparql_plan::plan_of(&typed, &sv, crate::sparql_dataset::default_dataset())
+                .unwrap();
         // The passes, not the ledger: the typed body owes one more type
         // obligation, and that is the only difference there may be.
         let passes = |plan: &crate::sparql_plan::ExecutionPlan| {
@@ -8740,6 +9439,7 @@ classes:
                ?cs asset360:belongsToTrack ?t . \
                ?t a asset360:Track ; asset360:typeURI ?tn }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         )
         .unwrap();
 
@@ -8767,7 +9467,12 @@ classes:
     #[test]
     fn an_optional_through_an_inline_list_is_connected() {
         let sv = asset360_fixture_schema_view();
-        let plan = sparql_scope(TUNNEL_TRACK_OPTIONAL, &sv).unwrap();
+        let plan = sparql_scope(
+            TUNNEL_TRACK_OPTIONAL,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
 
         let joins = all_joins(&plan);
         assert_eq!(joins.len(), 1, "{joins:?}");
@@ -8789,6 +9494,7 @@ classes:
                ?cs asset360:belongsToTrack ?t . ?t a asset360:Track . \
                OPTIONAL { ?u a asset360:Line ; asset360:typeURI ?tn } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         assert!(
             matches!(result, Err(ScopeError::UnsupportedConstruct(ref m)) if m.contains("?u") && m.contains("disconnected")),
@@ -8807,7 +9513,12 @@ classes:
     #[test]
     fn the_execution_plan_carries_the_path_edge_into_the_fetch() {
         let sv = asset360_fixture_schema_view();
-        let plan = crate::sparql_plan::plan_query_refined(TUNNEL_TRACK_OPTIONAL, &sv).unwrap();
+        let plan = crate::sparql_plan::plan_of(
+            TUNNEL_TRACK_OPTIONAL,
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
         let rendered = format!("{plan}");
         assert!(
             rendered.contains("join      ?s.hasCoveredSection.belongsToTrack[each] = ?t"),
@@ -8834,6 +9545,7 @@ classes:
                           ?cs asset360:belongsToTrack ?t . \
                           ?t asset360:typeURI ?tn } }",
             &sv,
+            crate::sparql_dataset::default_dataset(),
         );
         let Err(ScopeError::Unscoped { .. }) = &result else {
             panic!("expected an unscoped refusal, got {result:?}");
@@ -8844,6 +9556,199 @@ classes:
                 && msg.contains("Add `?t a <https://data.infrabel.be/asset360/Track>`"),
             "{msg}"
         );
+    }
+
+    /// The #460 refusal is a property of the query as written, so one
+    /// OPTIONAL and two identical sibling OPTIONALs keyed on a variable a
+    /// sub-select leaves maybe-unbound are refused alike, both naming the
+    /// first. It used to run on the sub-select-qualified query, where the
+    /// sub-select's `?m` is `?m__d1`: the first sibling then shared nothing
+    /// with its left side (accepted, "a product by construction") and only
+    /// the second, whose left side now held the first's `?m`, was refused.
+    #[test]
+    fn a_label_optional_on_a_subselect_variable_is_refused_one_or_two_alike() {
+        let sv = asset360_fixture_schema_view();
+        let nl = "OPTIONAL { GRAPH <https://x/schema> { ?m skos:prefLabel ?nl } }";
+        let fr = "OPTIONAL { GRAPH <https://x/schema> { ?m skos:prefLabel ?fr } }";
+        for siblings in [nl.to_string(), format!("{nl} {fr}")] {
+            let err = sparql_scope(
+                &format!(
+                    "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+                     PREFIX skos: <http://www.w3.org/2004/02/skos/core#> \
+                     SELECT * WHERE {{ ?s a asset360:TunnelComplex . OPTIONAL {{ \
+                       {{ SELECT ?s ?m WHERE {{ ?s a asset360:TunnelComplex ; \
+                            asset360:hasCoveredSection ?e . \
+                            ?e a asset360:CoveredSection . \
+                            OPTIONAL {{ ?e asset360:hasSequenceNumber ?m }} }} }} \
+                       {siblings} }} }}"
+                ),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .expect_err("refused");
+            let ScopeError::UnsupportedConstruct(message) = err else {
+                panic!("not the #460 refusal: {err:?}");
+            };
+            assert!(
+                message.starts_with("OPTIONAL { GRAPH <https://x/schema> { ?m <http://www.w3.org/2004/02/skos/core#prefLabel> ?nl"),
+                "{message}"
+            );
+        }
+    }
+
+    /// Two sibling OPTIONALs through the same inline list (#553): each
+    /// variable on the slot is walked, so the values below it are paths and the
+    /// query is no longer refused as untyped. The two reads pair the list with
+    /// itself, which a path binding (it names a slot path, not an element)
+    /// cannot say: the plan stays inexact and the engine finishes. And each
+    /// variable is as optional as *its own* block -- a mandatory first read
+    /// must not make the second one required.
+    #[test]
+    fn two_reads_of_one_inline_list_are_walked_and_inexact() {
+        let sv = asset360_fixture_schema_view();
+        let both_optional = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex . \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a } \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }",
+            &sv, crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
+        assert_eq!(
+            both_optional.inexact,
+            Some(Inexact::DuplicateSlotBinding),
+            "{:?}",
+            both_optional.unconsumed
+        );
+        assert!(
+            both_optional.untyped.is_empty(),
+            "{:?}",
+            both_optional.untyped
+        );
+        for (var, slot) in [("a", "hasSequenceNumber"), ("b", "hasSequenceNumber")] {
+            let binding = &both_optional.path_bindings[var];
+            assert_eq!(
+                binding.slot_path,
+                vec!["hasCoveredSection".to_owned(), slot.to_owned()]
+            );
+            assert!(binding.optional, "{var}");
+        }
+
+        let first_mandatory = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex ; \
+                 asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a . \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }",
+            &sv, crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
+        assert!(!first_mandatory.path_bindings["a"].optional);
+        assert!(first_mandatory.path_bindings["b"].optional);
+        assert_eq!(first_mandatory.inexact, Some(Inexact::DuplicateSlotBinding));
+    }
+
+    /// Nothing is lost on the way: the refined plan is accepted and every
+    /// rewrite the rules make still answers what the oracle does -- over a
+    /// complex with two sections, one with none, and one with a single one.
+    #[test]
+    fn two_reads_of_one_inline_list_agree_with_the_oracle() {
+        use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+        use crate::sparql_oracle::Oracle;
+        use crate::sparql_rules::{Rule, tier_one_rules};
+
+        let sv = asset360_fixture_schema_view();
+        let oracle = Oracle::new(
+            &sv,
+            &[
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/1", "typeURI": "https://example.org/TC",
+                        "hasCoveredSection": [
+                          {"hasSequenceNumber": 1}, {"hasSequenceNumber": 2}]}"#,
+                ),
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/2", "typeURI": "https://example.org/TC"}"#,
+                ),
+                (
+                    "TunnelComplex",
+                    r#"{"id": "https://data.infrabel.be/asset360/tc/3", "typeURI": "https://example.org/TC",
+                        "hasCoveredSection": [{"hasSequenceNumber": 7}]}"#,
+                ),
+            ],
+        );
+        let rules = tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let query = "SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex . \
+             OPTIONAL { ?s asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a } \
+             OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 asset360:hasSequenceNumber ?b } }";
+        each_rewrite_preserves_answers(query, &sv, &oracle, &borrowed);
+
+        let plan = crate::sparql_plan::plan_of(
+            &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
+        // The refined plan reads each block as a scope of its own, one unnest
+        // per block, left-joined on the identity: independent reads of the
+        // list, which *is* the cross product the query asks for. SQL answers
+        // alone, with no engine step to pair them.
+        assert!(plan.sql_only(), "{plan}");
+        assert_eq!(
+            plan.to_string()
+                .matches("unnest    hasCoveredSection")
+                .count(),
+            2
+        );
+    }
+
+    /// The advice for an untyped second read must not lead to another refusal
+    /// (#553): the typed spelling is no longer "disconnected", because the
+    /// triple that introduces the variable counts as sharing it.
+    #[test]
+    fn a_typed_second_read_is_not_refused_as_disconnected() {
+        let sv = asset360_fixture_schema_view();
+        let result = sparql_scope(
+            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
+             SELECT ?s ?a ?b WHERE { ?s a asset360:TunnelComplex . \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s1 . ?s1 asset360:hasSequenceNumber ?a } \
+               OPTIONAL { ?s asset360:hasCoveredSection ?s2 . ?s2 a asset360:CoveredSection ; \
+                          asset360:hasSequenceNumber ?b } }",
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// The same shape through a keyed-map inline slot (`documents`): two
+    /// sibling OPTIONALs, and a mandatory read beside an optional one.
+    #[test]
+    fn two_reads_of_one_keyed_map_agree_with_the_oracle() {
+        use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+        use crate::sparql_rules::{Rule, tier_one_rules};
+
+        let sv = test_schema_view();
+        let oracle = crate::sparql_oracle::fixture(&sv);
+        let rules = tier_one_rules(&sv, crate::sparql_dataset::default_dataset());
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        for query in [
+            "SELECT ?s ?t1 ?t2 WHERE { ?s a asset360:Signal . \
+               OPTIONAL { ?s asset360:documents ?d1 . ?d1 asset360:title ?t1 } \
+               OPTIONAL { ?s asset360:documents ?d2 . ?d2 asset360:title ?t2 } }",
+            "SELECT ?s ?t1 ?t2 WHERE { ?s a asset360:Signal ; asset360:documents ?d1 . \
+               ?d1 asset360:title ?t1 . \
+               OPTIONAL { ?s asset360:documents ?d2 . ?d2 asset360:title ?t2 } }",
+        ] {
+            each_rewrite_preserves_answers(query, &sv, &oracle, &borrowed);
+            let plan = sparql_scope(
+                &format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}"),
+                &sv,
+                crate::sparql_dataset::default_dataset(),
+            )
+            .unwrap();
+            assert_eq!(plan.inexact, Some(Inexact::DuplicateSlotBinding), "{query}");
+        }
     }
 
     /// Two schemas, two datamodel prefixes — the shape `irsm:` has in
@@ -8920,7 +9825,7 @@ classes:
         // as written (#478, pepibru GitLab issue).
         let sv = two_schema_view();
         let query = "SELECT ?n WHERE { ?t a irsm:Track ; irsm:name ?n . ?s a asset360:Signal }";
-        let parsed = parse_query_for(query, &sv).expect("both datamodel prefixes are seeded");
+        let parsed = parse_query(query, Some(&sv)).expect("both datamodel prefixes are seeded");
         assert_eq!(
             first_type_iri(&parsed),
             "https://data.infrabel.be/asset360-rsm-subset/Track"
@@ -8929,7 +9834,10 @@ classes:
         // datamodel: the same text is a parse error there, which is the
         // difference between the two parsers and why every entry point that
         // serves a client takes the seeded one.
-        assert!(matches!(parse_query(query), Err(ScopeError::ParseError(_))));
+        assert!(matches!(
+            parse_query(query, None),
+            Err(ScopeError::ParseError(_))
+        ));
     }
 
     #[test]
@@ -8951,11 +9859,11 @@ classes:
         // The metamodel's own prefixes name nothing a query could bind.
         assert!(!predeclared.contains_key("linkml"));
         assert!(!predeclared.contains_key("shex"));
-        for (label, _) in ENDPOINT_PREFIXES {
+        for &(label, _) in ENDPOINT_PREFIXES {
             assert!(predeclared.contains_key(label), "{label}");
         }
         let parsed =
-            parse_query_for("SELECT ?c WHERE { ?p schema:domainIncludes ?c }", &sv).unwrap();
+            parse_query("SELECT ?c WHERE { ?p schema:domainIncludes ?c }", Some(&sv)).unwrap();
         let Query::Select { pattern, .. } = &parsed else {
             panic!()
         };
@@ -8968,9 +9876,9 @@ classes:
     #[test]
     fn an_in_query_declaration_still_wins_over_the_seed() {
         let sv = two_schema_view();
-        let parsed = parse_query_for(
+        let parsed = parse_query(
             "PREFIX asset360: <urn:elsewhere/> SELECT ?s WHERE { ?s a asset360:Signal }",
-            &sv,
+            Some(&sv),
         )
         .unwrap();
         assert_eq!(first_type_iri(&parsed), "urn:elsewhere/Signal");
