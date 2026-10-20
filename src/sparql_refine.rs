@@ -3001,7 +3001,7 @@ impl Plan {
     /// dropped: rows missing; a stranger added: rows invented) is checked here
     /// by recomputing it with [`scan_classes`], the one function that builds
     /// it.
-    pub fn scan_classes_agree(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
+    pub(crate) fn scan_classes_agree(&self, schema: &SchemaView) -> Result<(), PlanDefect> {
         for (id, node) in self.nodes.iter().enumerate() {
             if let PlanOp::Scan {
                 class_uri, classes, ..
@@ -4085,7 +4085,7 @@ impl From<ScopeError> for RefineError {
 ///   stays, so no data rule folds what is not the data graph.
 ///
 /// The caller's dataset decides all of it.
-pub fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
+pub(crate) fn naive_plan(query: &Query, dataset: &DatasetSpec) -> Result<Plan, RefineError> {
     let graphs = QueryGraphs::new(dataset, query).map_err(ScopeError::from)?;
     let default_reads = graphs.default_reads();
 
@@ -4283,26 +4283,27 @@ pub(crate) fn scan_classes(
 /// The schema could not say which classes a scan stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ScanClassesError {
+pub(crate) struct ScanClassesError {
     class_uri: String,
     regime: TypeRegime,
     /// The schema's own error.
     message: String,
 }
 
+#[cfg(test)]
 impl ScanClassesError {
     /// The class the scan was of.
-    pub fn class_uri(&self) -> &str {
+    pub(crate) fn class_uri(&self) -> &str {
         &self.class_uri
     }
 
     /// The regime its family was asked for under.
-    pub fn regime(&self) -> TypeRegime {
+    pub(crate) fn regime(&self) -> TypeRegime {
         self.regime
     }
 
     /// The schema's own error.
-    pub fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         &self.message
     }
 }

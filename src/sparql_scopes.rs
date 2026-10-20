@@ -641,7 +641,12 @@ impl Plan {
     /// when they disagree (or there is no such scan). A restriction derived
     /// from that identity carries it, so it never changes which graph a star
     /// reads.
-    pub fn identity_regime(&self, node: NodeId, var: &str, class_uri: &str) -> Option<TypeRegime> {
+    pub(crate) fn identity_regime(
+        &self,
+        node: NodeId,
+        var: &str,
+        class_uri: &str,
+    ) -> Option<TypeRegime> {
         self.producers_of(node, var)
             .into_iter()
             .any(|producer| {

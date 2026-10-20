@@ -21,7 +21,7 @@ use linkml_runtime::schema_rdf::{TypePartition, TypeRegime};
 
 /// Which named graphs the endpoint serves and what the default graph means.
 ///
-/// Always valid: the only way to make one is [`DatasetSpec::new`], which
+/// Always valid: the only way to make one is [`DatasetSpec::builder`], which
 /// refuses a dataset that contradicts itself, so an entry point that takes a
 /// `DatasetSpec` has nothing to check. There is deliberately no [`Default`]: a
 /// dataset is something a deployment decides, and one that is defaulted by
@@ -100,44 +100,16 @@ impl fmt::Display for DatasetSpecError {
 impl std::error::Error for DatasetSpecError {}
 
 impl DatasetSpec {
-    /// The dataset whose default graph holds the records under `default_regime`,
-    /// that serves the records as the named `data_graphs` (each under its own
-    /// regime) and the datamodel as the `schema_graphs` (each publishing its
-    /// subclass edges under its regime). The one place a dataset is stated.
-    ///
-    /// Refused, with **every** conflict found: an IRI in both maps, and a
-    /// regime without [`TypePartition::Own`] (for the default and for a data
-    /// graph).
-    pub fn new(
-        default_regime: TypeRegime,
-        data_graphs: BTreeMap<String, TypeRegime>,
-        schema_graphs: BTreeMap<String, TypeRegime>,
-    ) -> Result<Self, DatasetSpecError> {
-        let mut conflicts = Vec::new();
-        if !default_regime.contains(TypePartition::Own) {
-            conflicts.push(DatasetConflict::DefaultRegimeWithoutOwn {
-                regime: default_regime,
-            });
-        }
-        for (iri, regime) in &data_graphs {
-            if schema_graphs.contains_key(iri) {
-                conflicts.push(DatasetConflict::GraphIsDataAndSchema { iri: iri.clone() });
-            }
-            if !regime.contains(TypePartition::Own) {
-                conflicts.push(DatasetConflict::DataGraphWithoutOwn {
-                    iri: iri.clone(),
-                    regime: *regime,
-                });
-            }
-        }
-        if conflicts.is_empty() {
-            Ok(Self {
-                default: default_regime,
-                data_graphs,
-                schema_graphs,
-            })
-        } else {
-            Err(DatasetSpecError { conflicts })
+    /// Start a dataset whose default graph holds the records under
+    /// `default_regime`; add the named data graphs (each under its own regime)
+    /// and the schema graphs (each publishing its subclass edges under its
+    /// regime) on the builder. The one place a dataset is stated; conflicts
+    /// are reported by [`DatasetSpecBuilder::build`].
+    pub fn builder(default_regime: TypeRegime) -> DatasetSpecBuilder {
+        DatasetSpecBuilder {
+            default_regime,
+            data_graphs: BTreeMap::new(),
+            schema_graphs: BTreeMap::new(),
         }
     }
 
@@ -373,6 +345,83 @@ impl<'a> QueryGraphs<'a> {
     }
 }
 
+/// Builds a [`DatasetSpec`]; every conflict is reported at [`Self::build`].
+/// New kinds of input are added as further `with_*` methods.
+#[derive(Debug, Clone)]
+#[must_use = "a builder does nothing until `build` is called"]
+pub struct DatasetSpecBuilder {
+    default_regime: TypeRegime,
+    data_graphs: BTreeMap<String, TypeRegime>,
+    schema_graphs: BTreeMap<String, TypeRegime>,
+}
+
+impl DatasetSpecBuilder {
+    /// Serve `iri` as a data graph holding its records under `regime`.
+    pub fn with_data_graph(mut self, iri: impl Into<String>, regime: TypeRegime) -> Self {
+        self.data_graphs.insert(iri.into(), regime);
+        self
+    }
+
+    /// Serve `iri` as a schema graph publishing the schema under `regime`.
+    pub fn with_schema_graph(mut self, iri: impl Into<String>, regime: TypeRegime) -> Self {
+        self.schema_graphs.insert(iri.into(), regime);
+        self
+    }
+
+    /// Refused, with **every** conflict found: an IRI in both maps, and a
+    /// regime without [`TypePartition::Own`] (for the default and for a data
+    /// graph).
+    pub fn build(self) -> Result<DatasetSpec, DatasetSpecError> {
+        let Self {
+            default_regime,
+            data_graphs,
+            schema_graphs,
+        } = self;
+        let mut conflicts = Vec::new();
+        if !default_regime.contains(TypePartition::Own) {
+            conflicts.push(DatasetConflict::DefaultRegimeWithoutOwn {
+                regime: default_regime,
+            });
+        }
+        for (iri, regime) in &data_graphs {
+            if schema_graphs.contains_key(iri) {
+                conflicts.push(DatasetConflict::GraphIsDataAndSchema { iri: iri.clone() });
+            }
+            if !regime.contains(TypePartition::Own) {
+                conflicts.push(DatasetConflict::DataGraphWithoutOwn {
+                    iri: iri.clone(),
+                    regime: *regime,
+                });
+            }
+        }
+        if conflicts.is_empty() {
+            Ok(DatasetSpec {
+                default: default_regime,
+                data_graphs,
+                schema_graphs,
+            })
+        } else {
+            Err(DatasetSpecError { conflicts })
+        }
+    }
+}
+
+#[cfg(test)]
+fn build(
+    default_regime: TypeRegime,
+    data_graphs: &[(&str, TypeRegime)],
+    schema_graphs: &[(&str, TypeRegime)],
+) -> Result<DatasetSpec, DatasetSpecError> {
+    let mut builder = DatasetSpec::builder(default_regime);
+    for (iri, regime) in data_graphs {
+        builder = builder.with_data_graph(*iri, *regime);
+    }
+    for (iri, regime) in schema_graphs {
+        builder = builder.with_schema_graph(*iri, *regime);
+    }
+    builder.build()
+}
+
 /// A dataset for a test, from slices instead of maps.
 #[cfg(test)]
 pub(crate) fn dataset_with(
@@ -380,14 +429,7 @@ pub(crate) fn dataset_with(
     data_graphs: &[(&str, TypeRegime)],
     schema_graphs: &[(&str, TypeRegime)],
 ) -> DatasetSpec {
-    let owned = |graphs: &[(&str, TypeRegime)]| {
-        graphs
-            .iter()
-            .map(|(iri, regime)| ((*iri).to_owned(), *regime))
-            .collect()
-    };
-    DatasetSpec::new(default_regime, owned(data_graphs), owned(schema_graphs))
-        .expect("a valid dataset")
+    build(default_regime, data_graphs, schema_graphs).expect("a valid dataset")
 }
 
 /// The dataset a test that is not about datasets plans under, stated
@@ -431,13 +473,7 @@ mod tests {
         data: &[(&str, TypeRegime)],
         schema: &[(&str, TypeRegime)],
     ) -> Vec<DatasetConflict> {
-        let owned = |graphs: &[(&str, TypeRegime)]| {
-            graphs
-                .iter()
-                .map(|(iri, regime)| ((*iri).to_owned(), *regime))
-                .collect()
-        };
-        DatasetSpec::new(default, owned(data), owned(schema))
+        build(default, data, schema)
             .expect_err("the dataset contradicts itself")
             .conflicts()
             .to_vec()

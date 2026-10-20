@@ -107,7 +107,7 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// conjunction into one obligation per conjunct did *not* bump it: that
 /// changes how many `Filter` obligations a query raises, not what kinds exist,
 /// and a consumer that reads the list rather than counting it is unaffected.
-pub const PLAN_CONTRACT: u32 = 7;
+pub(crate) const PLAN_CONTRACT: u32 = 7;
 
 /// Index into [`ExecutionPlan::obligations`]. Printed as `o1`, `o2`, ... so a
 /// human can check the ledger by eye.

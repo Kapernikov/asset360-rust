@@ -190,13 +190,13 @@ fn most_specific_is_direct(
 /// `?s a ?t FILTER NOT EXISTS { ?s a ?sub . GRAPH <G> { ?sub rdfs:subClassOf+ ?t } }`
 /// is `?s sesame:directType ?t`. See the module documentation for the proof and
 /// the conditions.
-pub struct MostSpecificTypeIsTheDirectType<'s> {
+pub(crate) struct MostSpecificTypeIsTheDirectType<'s> {
     schema: &'s SchemaView,
     dataset: &'s DatasetSpec,
 }
 
 impl<'s> MostSpecificTypeIsTheDirectType<'s> {
-    pub fn new(schema: &'s SchemaView, dataset: &'s DatasetSpec) -> Self {
+    pub(crate) fn new(schema: &'s SchemaView, dataset: &'s DatasetSpec) -> Self {
         Self { schema, dataset }
     }
 }

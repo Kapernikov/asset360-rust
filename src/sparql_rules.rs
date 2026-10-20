@@ -795,7 +795,7 @@ fn replace_match_with_empty_relation(plan: &mut Plan, id: NodeId) {
 ///
 /// An untyped subject (`?s sesame:directType ?t` with no class on `?s`) has no
 /// scan to read the column from and stays with the engine.
-pub struct FoldDirectTypeIntoScan;
+pub(crate) struct FoldDirectTypeIntoScan;
 
 impl Rule for FoldDirectTypeIntoScan {
     fn name(&self) -> &'static str {
@@ -917,7 +917,7 @@ impl Rule for FoldDirectTypeIntoScan {
 /// [`FoldDirectTypeIntoScan`] to bind its column or narrow its classes:
 /// without that the fixpoint (the table's rows, the column's name) would
 /// depend on which of the two ran first.
-pub struct TypeVariableBecomesTypeTable<'s> {
+pub(crate) struct TypeVariableBecomesTypeTable<'s> {
     schema: &'s SchemaView,
 }
 
@@ -2519,7 +2519,7 @@ fn is_inline_element(plan: &Plan, schema: &SchemaView, var: &str) -> bool {
 ///   none). A path condition cannot say "absent" two hops down (`!bound`
 ///   holds one hop only), so that case is left to the engine rather than
 ///   narrowed to the elements that do carry the value.
-pub struct InlineTypeMatchBecomesFilter<'s> {
+pub(crate) struct InlineTypeMatchBecomesFilter<'s> {
     schema: &'s SchemaView,
 }
 

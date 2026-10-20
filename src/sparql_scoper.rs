@@ -1294,7 +1294,7 @@ impl From<crate::sparql_graph_clauses::CrossDataGraph> for ScopeError {
 /// The stable code a refusal for reading several data graphs opens with. The
 /// text after it is prose and may be reworded; this token is what a caller
 /// maps (the same contract as `unsupported_construct`).
-pub const CROSS_DATA_GRAPH: &str = "cross_data_graph";
+pub(crate) const CROSS_DATA_GRAPH: &str = "cross_data_graph";
 
 impl From<crate::sparql_refine::ScanClassesError> for ScopeError {
     fn from(error: crate::sparql_refine::ScanClassesError) -> Self {
@@ -1380,7 +1380,7 @@ pub(crate) fn sparql_scope(
 /// ([`crate::sparql_schema_graph`]) writes `https://schema.org/domainIncludes`.
 /// A parser that took the schema's spelling would parse a discovery query
 /// into IRIs the graph never carries — a silent empty answer.
-pub const ENDPOINT_PREFIXES: &[(&str, &str)] = &[
+pub(crate) const ENDPOINT_PREFIXES: &[(&str, &str)] = &[
     ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
     ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
     ("owl", "http://www.w3.org/2002/07/owl#"),

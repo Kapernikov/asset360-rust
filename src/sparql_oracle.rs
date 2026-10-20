@@ -41,7 +41,11 @@ impl Oracle {
     /// [`Oracle::new`] with the records written under type regime `regime`:
     /// the graph a dataset of that regime holds (`rdf:type` of every class
     /// the regime lists, and `sesame:directType` where it writes one).
-    pub fn new_in(schema: &SchemaView, records: &[(&str, &str)], regime: TypeRegime) -> Self {
+    pub(crate) fn new_in(
+        schema: &SchemaView,
+        records: &[(&str, &str)],
+        regime: TypeRegime,
+    ) -> Self {
         Self::load(schema, records, regime, None)
     }
 
@@ -50,7 +54,7 @@ impl Oracle {
     /// the default graph: a plan's own translation drops the `FROM` / `GRAPH`
     /// that named the graph (each match says its graph instead), so it reads
     /// the default graph, and has to find the same records there.
-    pub fn new_in_graph(
+    pub(crate) fn new_in_graph(
         schema: &SchemaView,
         records: &[(&str, &str)],
         regime: TypeRegime,
@@ -189,7 +193,7 @@ pub fn fixture(schema: &SchemaView) -> Oracle {
 /// (`Trip`, an `Equipment`), so a regime that lists mixins as types has
 /// something to list. The `is_a` chain (`Equipment` > `Relay` > `LatchRelay`)
 /// is already in the base schema.
-pub const MIXIN_CLASSES: &str = r#"
+pub(crate) const MIXIN_CLASSES: &str = r#"
   Tag:
     class_uri: asset360:Tag
     mixin: true
@@ -263,13 +267,13 @@ fn records_in_regimes() -> Vec<(&'static str, &'static str)> {
 }
 
 /// [`fixture`] written under type regime `regime`.
-pub fn fixture_in(schema: &SchemaView, regime: TypeRegime) -> Oracle {
+pub(crate) fn fixture_in(schema: &SchemaView, regime: TypeRegime) -> Oracle {
     Oracle::new_in(schema, &records_in_regimes(), regime)
 }
 
 /// [`fixture_in`] with the records in the data graph `graph`
 /// ([`Oracle::new_in_graph`]).
-pub fn fixture_in_graph(schema: &SchemaView, regime: TypeRegime, graph: &str) -> Oracle {
+pub(crate) fn fixture_in_graph(schema: &SchemaView, regime: TypeRegime, graph: &str) -> Oracle {
     Oracle::new_in_graph(schema, &records_in_regimes(), regime, graph)
 }
 
@@ -277,7 +281,12 @@ impl Oracle {
     /// The datamodel as one more graph of the store, named `iri` and
     /// publishing the schema under `regime`: what a dataset serving a schema
     /// graph shows a `GRAPH <iri> { ... }`.
-    pub fn with_schema_graph(self, schema: &SchemaView, iri: &str, regime: TypeRegime) -> Self {
+    pub(crate) fn with_schema_graph(
+        self,
+        schema: &SchemaView,
+        iri: &str,
+        regime: TypeRegime,
+    ) -> Self {
         let quads = crate::sparql_schema_graph::SchemaGraph::build(schema, regime)
             .quads_in(iri)
             .unwrap_or_else(|e| panic!("{e}"));

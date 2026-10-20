@@ -8,7 +8,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = Path::new(&args[1]);
     let query = std::fs::read_to_string(&args[2]).unwrap();
-    let schema_graphs = args
+    let schema_graphs: Vec<_> = args
         .get(3)
         .map(|iri| {
             (
@@ -18,12 +18,13 @@ fn main() {
         })
         .into_iter()
         .collect();
-    let dataset = asset360_rust::sparql_dataset::DatasetSpec::new(
+    let mut dataset = asset360_rust::sparql_dataset::DatasetSpec::builder(
         linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-        Default::default(),
-        schema_graphs,
-    )
-    .expect("a valid dataset");
+    );
+    for (iri, regime) in schema_graphs {
+        dataset = dataset.with_schema_graph(iri, regime);
+    }
+    let dataset = dataset.build().expect("a valid dataset");
     let mut sv = SchemaView::new();
     for name in [
         "types.yaml",

@@ -54,7 +54,7 @@ pub mod sparql_materialise;
 pub mod sparql_ops;
 pub mod sparql_optional_binding;
 pub mod sparql_oracle;
-pub mod sparql_paths;
+pub(crate) mod sparql_paths;
 pub mod sparql_plan;
 pub mod sparql_pushdown;
 pub mod sparql_refine;
@@ -67,7 +67,7 @@ pub mod sparql_scoper;
 pub mod sparql_scopes;
 pub(crate) mod sparql_slot_family;
 pub mod sparql_terms;
-pub mod sparql_typed_subjects;
+pub(crate) mod sparql_typed_subjects;
 
 #[cfg(feature = "shacl-parser")]
 pub mod shacl_parser;
@@ -3947,22 +3947,17 @@ impl PyDatasetSpec {
             std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>,
         >,
     ) -> PyResult<Self> {
-        let regimes = |graphs: Option<
-            std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>,
-        >| {
-            graphs
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(iri, regime)| (iri, regime.into()))
-                .collect()
-        };
         // Every conflict at once, so the message is the whole list.
-        let inner = crate::sparql_dataset::DatasetSpec::new(
-            default_regime.into(),
-            regimes(data_graphs),
-            regimes(schema_graphs),
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let mut builder = crate::sparql_dataset::DatasetSpec::builder(default_regime.into());
+        for (iri, regime) in data_graphs.unwrap_or_default() {
+            builder = builder.with_data_graph(iri, regime.into());
+        }
+        for (iri, regime) in schema_graphs.unwrap_or_default() {
+            builder = builder.with_schema_graph(iri, regime.into());
+        }
+        let inner = builder
+            .build()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner })
     }
 

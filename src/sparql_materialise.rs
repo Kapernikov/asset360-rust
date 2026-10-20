@@ -188,7 +188,7 @@ pub trait Materialisation {
 /// because that is the only thing a `GRAPH` node changes about the nodes below
 /// it. Everything that is not a read inherits the answer from its inputs, which
 /// is why a node kind added later needs no entry here unless it reads.
-pub fn schema_only(plan: &Plan, node: NodeId, dataset: &DatasetSpec) -> bool {
+pub(crate) fn schema_only(plan: &Plan, node: NodeId, dataset: &DatasetSpec) -> bool {
     fn walk(plan: &Plan, node: NodeId, in_schema_graph: bool, dataset: &DatasetSpec) -> bool {
         match &plan.nodes[node].op {
             // A read: schema-only exactly when it reads the schema graph.

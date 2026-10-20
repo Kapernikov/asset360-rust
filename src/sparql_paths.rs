@@ -92,7 +92,7 @@ use spargebra::term::{NamedNode, TermPattern, TriplePattern};
 use linkml_schemaview::schemaview::SchemaView;
 
 /// Reduce every path the data graph cannot walk. See the module docs.
-pub fn reduce_paths(query: &mut Query, schema_view: &SchemaView) {
+pub(crate) fn reduce_paths(query: &mut Query, schema_view: &SchemaView) {
     let (Query::Select { dataset, .. }
     | Query::Construct { dataset, .. }
     | Query::Describe { dataset, .. }
