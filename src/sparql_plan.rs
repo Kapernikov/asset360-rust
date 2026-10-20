@@ -3500,10 +3500,10 @@ classes:
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
         let dataset = crate::sparql_dataset::dataset_with(
-            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
             &[
-                (A, linkml_runtime::schema_rdf::TypeRegime::ASSERTED),
-                (I, linkml_runtime::schema_rdf::TypeRegime::IS_A),
+                (A, linkml_runtime::schema_rdf::TypeInference::ASSERTED),
+                (I, linkml_runtime::schema_rdf::TypeInference::IS_A),
             ],
             &[],
         );
@@ -3598,9 +3598,9 @@ classes:
         let sv = test_schema_view();
         const SCHEMA: &str = "urn:graph:schema";
         let dataset = crate::sparql_dataset::dataset_with(
-            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
             &[],
-            &[(SCHEMA, linkml_runtime::schema_rdf::TypeRegime::ASSERTED)],
+            &[(SCHEMA, linkml_runtime::schema_rdf::TypeInference::ASSERTED)],
         );
         let query = format!(
             "{PREFIX}PREFIX skos: <http://www.w3.org/2004/02/skos/core#> \
@@ -3624,8 +3624,11 @@ classes:
     fn from_named_alone_plans_an_empty_default_graph() {
         let sv = test_schema_view();
         let dataset = crate::sparql_dataset::dataset_with(
-            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-            &[("urn:g:a", linkml_runtime::schema_rdf::TypeRegime::ASSERTED)],
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[(
+                "urn:g:a",
+                linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            )],
             &[],
         );
         let query = format!(

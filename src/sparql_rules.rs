@@ -54,7 +54,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use linkml_runtime::schema_rdf::{SESAME_DIRECT_TYPE, TypePartition, TypeRegime, type_family};
+use linkml_runtime::schema_rdf::{SESAME_DIRECT_TYPE, TypeInference, TypePartition, type_family};
 use linkml_schemaview::schemaview::SchemaView;
 use linkml_schemaview::slotview::{SlotContainerMode, SlotInlineMode};
 
@@ -450,7 +450,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
                 Vec<String>,
                 String,
                 String,
-                TypeRegime,
+                TypeInference,
             ) = match &node.op {
                 // A type match under a `GRAPH` is not about the data graph
                 // and folds into nothing: only the data graph's match arm
@@ -680,7 +680,7 @@ impl Rule for FoldMatchesIntoScan<'_> {
 ///   `t ∈ rdf_types(direct_type(s), r)`, and emits `(s sesame:directType d)`
 ///   iff [`TypePartition::Direct`] is in `r` and
 ///   `d = direct_type(s)` -- exactly one such triple per record.
-fn writes_direct_type(inference: TypeRegime) -> bool {
+fn writes_direct_type(inference: TypeInference) -> bool {
     inference.contains(TypePartition::Direct)
 }
 
@@ -6430,7 +6430,7 @@ impl<M: crate::sparql_materialise::Materialisation> Rule for Materialise<M> {
 fn family_iris(
     schema: &SchemaView,
     class_iri: &str,
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> Option<BTreeSet<String>> {
     let class = schema.get_class_by_uri(class_iri).ok().flatten()?;
     let converter = schema.converter();
@@ -6451,7 +6451,7 @@ fn family_iris(
 pub(crate) fn most_specific(
     schema: &SchemaView,
     classes: &BTreeSet<String>,
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> Option<String> {
     let families: Vec<(&String, BTreeSet<String>)> = classes
         .iter()
@@ -6490,7 +6490,7 @@ mod tests {
     /// [`plan_of`] over a dataset whose data graph has type inference `inference`:
     /// what a class's family is, and so whether a parent type beside its
     /// subclass is one class, depends on it.
-    fn plan_in(query: &str, inference: TypeRegime) -> Plan {
+    fn plan_in(query: &str, inference: TypeInference) -> Plan {
         let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
             .expect("should parse");
         crate::sparql_refine::naive_plan(
@@ -6876,7 +6876,7 @@ mod tests {
             "SELECT ?s ?v WHERE { ?s a asset360:Equipment , asset360:LatchRelay , asset360:Relay ; \
              asset360:voltage ?v }",
         ] {
-            let mut plan = plan_in(query, TypeRegime::IS_A);
+            let mut plan = plan_in(query, TypeInference::IS_A);
             let before = plan.obligations.len();
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert_eq!(log.applied.len(), 1, "{query}\n{plan}");
@@ -6911,14 +6911,14 @@ mod tests {
             "SELECT ?s ?v WHERE { ?s a asset360:Relay , asset360:Equipment ; asset360:voltage ?v }",
             "SELECT ?s ?v WHERE { ?s a asset360:Equipment , asset360:Relay ; asset360:voltage ?v }",
         ] {
-            let mut plan = plan_in(query, TypeRegime::ASSERTED);
+            let mut plan = plan_in(query, TypeInference::ASSERTED);
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert!(log.applied.is_empty(), "{query}\n{plan}");
             assert!(plan.find("scan").is_empty(), "{query}\n{plan}");
         }
 
         // Siblings: neither family is inside the other, in any inference.
-        for inference in [TypeRegime::ASSERTED, TypeRegime::IS_A] {
+        for inference in [TypeInference::ASSERTED, TypeInference::IS_A] {
             let mut plan = plan_in(
                 "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }",
                 inference,
@@ -6932,7 +6932,7 @@ mod tests {
     /// Wrap the voltage read of `plan` in an `InClass` restriction of
     /// `class_uri` in `inference`, as one pushed down by an earlier rule sits: on
     /// one side of the join, inside the star's group.
-    fn with_restriction(plan: &mut Plan, class_uri: &str, inference: TypeRegime) {
+    fn with_restriction(plan: &mut Plan, class_uri: &str, inference: TypeInference) {
         let join = plan.find("match")[1];
         let mut nodes = plan.nodes.clone();
         nodes.insert(
@@ -6970,8 +6970,11 @@ mod tests {
         let rule = FoldMatchesIntoScan::new(&schema);
         let query = "SELECT ?s ?v WHERE { ?s a asset360:Relay ; asset360:voltage ?v }";
         let equipment = "https://data.infrabel.be/asset360/Equipment";
-        for (inference, absorbed) in [(TypeRegime::IS_A, true), (TypeRegime::ASSERTED, false)] {
-            let mut plan = plan_in(query, TypeRegime::IS_A);
+        for (inference, absorbed) in [
+            (TypeInference::IS_A, true),
+            (TypeInference::ASSERTED, false),
+        ] {
+            let mut plan = plan_in(query, TypeInference::IS_A);
             with_restriction(&mut plan, equipment, inference);
             let log = refine(&mut plan, &[&rule]).expect("the fold preserves every invariant");
             assert_eq!(log.applied.len(), 1, "{inference:?}\n{plan}");
@@ -9073,7 +9076,7 @@ mod tests {
     }
 
     /// [`refined`] over a dataset whose data graph has type inference `inference`.
-    fn refined_in(query: &str, schema: &SchemaView, inference: TypeRegime) -> Plan {
+    fn refined_in(query: &str, schema: &SchemaView, inference: TypeInference) -> Plan {
         refine_naive(&plan_in(query, inference), schema, false)
     }
 
@@ -9378,7 +9381,7 @@ mod tests {
             "SELECT ?s ?l WHERE { ?s a asset360:Equipment , asset360:Relay ; asset360:label ?l . \
              VALUES ?l { \"a\" \"b\" } }",
         ] {
-            let plan = refined_in(query, &schema, TypeRegime::IS_A);
+            let plan = refined_in(query, &schema, TypeInference::IS_A);
             let scans = plan.find("scan");
             assert_eq!(scans.len(), 1, "{plan}");
             assert!(plan.find("values").is_empty(), "narrowing folded:\n{plan}");
@@ -11061,13 +11064,13 @@ mod inline_type_match {
     /// under the inferred one (every element is a place).
     #[test]
     fn an_inline_type_triple_is_judged_in_its_own_graph() {
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
         let dataset = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
-            &[(A, TypeRegime::ASSERTED), (I, TypeRegime::IS_A)],
+            TypeInference::ASSERTED,
+            &[(A, TypeInference::ASSERTED), (I, TypeInference::IS_A)],
             &[],
         );
         let refined = |site_graph: &str, type_graph: &str| {
@@ -11346,7 +11349,7 @@ mod direct_type {
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
          PREFIX sesame: <http://www.openrdf.org/schema/sesame#> ";
 
-    fn refined_in(query: &str, schema: &SchemaView, inference: TypeRegime) -> Plan {
+    fn refined_in(query: &str, schema: &SchemaView, inference: TypeInference) -> Plan {
         let parsed = crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None)
             .expect("should parse");
         let mut plan = naive_plan(
@@ -11409,7 +11412,7 @@ mod direct_type {
         rows.len()
     }
 
-    /// `?s sesame:directType ?t` under a inference that writes it is a column of
+    /// `?s sesame:directType ?t` under an inference that writes it is a column of
     /// the scan: no match, no join, the whole plan in SQL.
     #[test]
     fn a_direct_type_variable_folds_into_the_scan() {
@@ -11417,7 +11420,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t }",
             &schema,
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
         );
         println!("{plan}");
         let (direct, narrowed, classes) = scan_of(&plan);
@@ -11444,7 +11447,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:Relay }",
             &schema,
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
         );
         println!("{plan}");
         let (direct, narrowed, classes) = scan_of(&plan);
@@ -11472,7 +11475,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s WHERE { ?s a asset360:Relay ; sesame:directType asset360:Switch }",
             &schema,
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
         );
         println!("{plan}");
         assert!(plan.find("match").is_empty(), "{plan}");
@@ -11488,7 +11491,7 @@ mod direct_type {
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; sesame:directType ?t }",
             "SELECT ?s WHERE { ?s a asset360:Equipment ; sesame:directType asset360:Equipment }",
         ] {
-            let plan = refined_in(query, &schema, TypeRegime::ASSERTED);
+            let plan = refined_in(query, &schema, TypeInference::ASSERTED);
             println!("{plan}");
             assert!(plan.find("match").is_empty(), "{plan}");
             assert_eq!(row_count(&plan), 0, "{plan}");
@@ -11506,7 +11509,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
             &schema,
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
         );
         println!("{plan}");
         let (direct, _, classes) = scan_of(&plan);
@@ -11536,7 +11539,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
             &schema,
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
         );
         println!("{plan}");
         assert_eq!(
@@ -11550,7 +11553,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; sesame:directType ?t ; a ?t }",
             &schema,
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
         );
         println!("{plan}");
         assert_eq!(scan_of(&plan).0.as_deref(), Some("t"), "{plan}");
@@ -11568,7 +11571,7 @@ mod direct_type {
             "SELECT ?d (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; \
              sesame:directType ?d } GROUP BY ?d",
             &schema,
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
         );
         println!("{plan}");
         let tree = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
@@ -11588,7 +11591,7 @@ mod direct_type {
         let plan = refined_in(
             "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a asset360:Equipment ; a ?t } GROUP BY ?t",
             &schema,
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
         );
         println!("{plan}");
         let tree = crate::sparql_ops::lower_refined(&plan, &schema, None, None)
@@ -11618,7 +11621,7 @@ mod direct_type {
             "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s sesame:directType ?t } GROUP BY ?t",
             "SELECT ?t (COUNT(?s) AS ?n) WHERE { ?s a ?t } GROUP BY ?t",
         ] {
-            let plan = refined_in(query, &schema, TypeRegime::IS_A);
+            let plan = refined_in(query, &schema, TypeInference::IS_A);
             assert!(plan.find("scan").is_empty(), "{query}\n{plan}");
             assert_eq!(plan.find("match").len(), 1, "{query}\n{plan}");
         }
@@ -11636,7 +11639,7 @@ mod direct_type {
                 crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), None).unwrap();
             let naive = naive_plan(
                 &parsed,
-                &crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]),
+                &crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]),
             )
             .unwrap();
             let mut texts = Vec::new();
@@ -11700,7 +11703,7 @@ mod direct_type {
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; asset360:label ?l ; a ?t . \
              OPTIONAL { ?s sesame:directType ?d } }",
         ];
-        for &inference in TypeRegime::NAMED {
+        for &inference in TypeInference::NAMED {
             let oracle = crate::sparql_oracle::Oracle::new_in(&schema, &records, inference);
             let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[]);
             let rules = tier_one_rules(&schema, &dataset);

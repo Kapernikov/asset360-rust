@@ -8,12 +8,12 @@ shape against the actual PyO3 surface, not against what a docstring claims.
 
 from __future__ import annotations
 
-from asset360_rust import DatasetSpec, FilterCondition, PlanOp, SchemaView, TypeRegime
+from asset360_rust import DatasetSpec, FilterCondition, PlanOp, SchemaView, TypeInference
 from asset360_rust import plan_query_refined as _plan_with_dataset
 
 # `dataset` is required by the binding (no call can forget it); these tests plan
 # against the endpoint every dataset was before graphs had inferences.
-_DATASET = DatasetSpec(TypeRegime.ASSERTED)
+_DATASET = DatasetSpec(TypeInference.ASSERTED)
 
 
 def _plan_query_refined(query, schema_view, **options):
@@ -269,13 +269,13 @@ def test_the_dataset_is_required_and_validated():
         DatasetSpec("urn:graph:nowhere")
     with pytest.raises(ValueError, match="both a data graph and a schema graph"):
         DatasetSpec(
-            TypeRegime.ASSERTED,
-            data_graphs={"urn:g": TypeRegime.IS_A},
-            schema_graphs={"urn:g": TypeRegime.IS_A},
+            TypeInference.ASSERTED,
+            data_graphs={"urn:g": TypeInference.IS_A},
+            schema_graphs={"urn:g": TypeInference.IS_A},
         )
     served = DatasetSpec(
-        TypeRegime.ASSERTED,
-        data_graphs={"urn:graph:inferred": TypeRegime.IS_A},
+        TypeInference.ASSERTED,
+        data_graphs={"urn:graph:inferred": TypeInference.IS_A},
     )
     plan = _plan_with_dataset(
         PREFIX
@@ -297,7 +297,7 @@ _SESAME = "PREFIX sesame: <http://www.openrdf.org/schema/sesame#> "
 def _is_a_scan(query):
     sv = SchemaView()
     sv.add_schema_str(_PARENT_YAML)
-    plan = _plan_with_dataset(PREFIX + _SESAME + query, sv, DatasetSpec(TypeRegime.IS_A))
+    plan = _plan_with_dataset(PREFIX + _SESAME + query, sv, DatasetSpec(TypeInference.IS_A))
     scans = [
         op for p in plan.passes if p.kind == "sql" for op in p.ops if op.kind == "scan"
     ]

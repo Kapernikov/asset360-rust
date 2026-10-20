@@ -5,8 +5,8 @@
 //! no call can forget it. The endpoint serves
 //!
 //! * **data graphs** -- named graphs over the golden records, each under a
-//!   [`TypeRegime`] (which `rdf:type` triples its records carry),
-//! * a **default graph**, the records under a inference, and
+//!   [`TypeInference`] (which `rdf:type` triples its records carry),
+//! * a **default graph**, the records under an inference, and
 //! * **schema graphs** -- the datamodel itself, one per inference its subclass
 //!   edges are published under.
 //!
@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use linkml_runtime::schema_rdf::{TypePartition, TypeRegime};
+use linkml_runtime::schema_rdf::{TypeInference, TypePartition};
 
 /// Which named graphs the endpoint serves and what the default graph means.
 ///
@@ -28,9 +28,9 @@ use linkml_runtime::schema_rdf::{TypePartition, TypeRegime};
 /// accident plans a different endpoint's query.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DatasetSpec {
-    default: TypeRegime,
-    data_graphs: BTreeMap<String, TypeRegime>,
-    schema_graphs: BTreeMap<String, TypeRegime>,
+    default: TypeInference,
+    data_graphs: BTreeMap<String, TypeInference>,
+    schema_graphs: BTreeMap<String, TypeInference>,
 }
 
 /// One way a dataset contradicts itself.
@@ -43,10 +43,13 @@ pub enum DatasetConflict {
     /// holds every non-type triple of a record: such a graph holds no record's
     /// slot values, and a scan over it would claim records the writer never
     /// typed that way.
-    DataGraphWithoutOwn { iri: String, inference: TypeRegime },
+    DataGraphWithoutOwn {
+        iri: String,
+        inference: TypeInference,
+    },
     /// The default inference lacks [`TypePartition::Own`]: the records loaded
     /// under it would carry no slot values (see [`Self::DataGraphWithoutOwn`]).
-    DefaultInferenceWithoutOwn { inference: TypeRegime },
+    DefaultInferenceWithoutOwn { inference: TypeInference },
 }
 
 impl fmt::Display for DatasetConflict {
@@ -105,7 +108,7 @@ impl DatasetSpec {
     /// and the schema graphs (each publishing its subclass edges under its
     /// inference) on the builder. The one place a dataset is stated; conflicts
     /// are reported by [`DatasetSpecBuilder::build`].
-    pub fn builder(default_inference: TypeRegime) -> DatasetSpecBuilder {
+    pub fn builder(default_inference: TypeInference) -> DatasetSpecBuilder {
         DatasetSpecBuilder {
             default_inference,
             data_graphs: BTreeMap::new(),
@@ -115,30 +118,30 @@ impl DatasetSpec {
 
     /// The inference a triple pattern outside any `GRAPH` is matched under when
     /// the query names no `FROM`: the default graph's.
-    pub fn default_inference(&self) -> TypeRegime {
+    pub fn default_inference(&self) -> TypeInference {
         self.default
     }
 
     /// The inference of the data graph `iri`, if it is one.
-    pub fn data_inference(&self, iri: &str) -> Option<TypeRegime> {
+    pub fn data_inference(&self, iri: &str) -> Option<TypeInference> {
         self.data_graphs.get(iri).copied()
     }
 
     /// The inference the schema graph `iri` publishes its subclass edges under,
     /// if it is one.
-    pub fn schema_inference(&self, iri: &str) -> Option<TypeRegime> {
+    pub fn schema_inference(&self, iri: &str) -> Option<TypeInference> {
         self.schema_graphs.get(iri).copied()
     }
 
     /// Every data graph, IRI order.
-    pub fn data_graphs(&self) -> impl Iterator<Item = (&str, TypeRegime)> {
+    pub fn data_graphs(&self) -> impl Iterator<Item = (&str, TypeInference)> {
         self.data_graphs
             .iter()
             .map(|(iri, inference)| (iri.as_str(), *inference))
     }
 
     /// Every schema graph, IRI order.
-    pub fn schema_graphs(&self) -> impl Iterator<Item = (&str, TypeRegime)> {
+    pub fn schema_graphs(&self) -> impl Iterator<Item = (&str, TypeInference)> {
         self.schema_graphs
             .iter()
             .map(|(iri, inference)| (iri.as_str(), *inference))
@@ -205,7 +208,7 @@ impl DatasetSpec {
 /// What one graph holds, as far as the planner can tell.
 ///
 /// What a [`crate::sparql_refine::PlanOp::Match`] says it reads, so the cases
-/// a rule must tell apart stay apart: the records (under a inference), the
+/// a rule must tell apart stay apart: the records (under an inference), the
 /// datamodel, nothing at all, and a graph only the engine can speak for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -244,7 +247,7 @@ pub(crate) struct QueryGraphs<'a> {
     dataset: &'a DatasetSpec,
     /// The one inference the query reads its records under
     /// ([`crate::sparql_graph_clauses::single_data_graph`]).
-    inference: TypeRegime,
+    inference: TypeInference,
     from: Vec<String>,
     /// Whether the query wrote a `FROM` / `FROM NAMED` clause at all.
     clause_written: bool,
@@ -340,7 +343,7 @@ impl<'a> QueryGraphs<'a> {
     }
 
     /// The one inference the query reads its records under.
-    pub(crate) fn inference(&self) -> TypeRegime {
+    pub(crate) fn inference(&self) -> TypeInference {
         self.inference
     }
 }
@@ -350,20 +353,20 @@ impl<'a> QueryGraphs<'a> {
 #[derive(Debug, Clone)]
 #[must_use = "a builder does nothing until `build` is called"]
 pub struct DatasetSpecBuilder {
-    default_inference: TypeRegime,
-    data_graphs: BTreeMap<String, TypeRegime>,
-    schema_graphs: BTreeMap<String, TypeRegime>,
+    default_inference: TypeInference,
+    data_graphs: BTreeMap<String, TypeInference>,
+    schema_graphs: BTreeMap<String, TypeInference>,
 }
 
 impl DatasetSpecBuilder {
     /// Serve `iri` as a data graph holding its records under `inference`.
-    pub fn with_data_graph(mut self, iri: impl Into<String>, inference: TypeRegime) -> Self {
+    pub fn with_data_graph(mut self, iri: impl Into<String>, inference: TypeInference) -> Self {
         self.data_graphs.insert(iri.into(), inference);
         self
     }
 
     /// Serve `iri` as a schema graph publishing the schema under `inference`.
-    pub fn with_schema_graph(mut self, iri: impl Into<String>, inference: TypeRegime) -> Self {
+    pub fn with_schema_graph(mut self, iri: impl Into<String>, inference: TypeInference) -> Self {
         self.schema_graphs.insert(iri.into(), inference);
         self
     }
@@ -408,9 +411,9 @@ impl DatasetSpecBuilder {
 
 #[cfg(test)]
 fn build(
-    default_inference: TypeRegime,
-    data_graphs: &[(&str, TypeRegime)],
-    schema_graphs: &[(&str, TypeRegime)],
+    default_inference: TypeInference,
+    data_graphs: &[(&str, TypeInference)],
+    schema_graphs: &[(&str, TypeInference)],
 ) -> Result<DatasetSpec, DatasetSpecError> {
     let mut builder = DatasetSpec::builder(default_inference);
     for (iri, inference) in data_graphs {
@@ -425,9 +428,9 @@ fn build(
 /// A dataset for a test, from slices instead of maps.
 #[cfg(test)]
 pub(crate) fn dataset_with(
-    default_inference: TypeRegime,
-    data_graphs: &[(&str, TypeRegime)],
-    schema_graphs: &[(&str, TypeRegime)],
+    default_inference: TypeInference,
+    data_graphs: &[(&str, TypeInference)],
+    schema_graphs: &[(&str, TypeInference)],
 ) -> DatasetSpec {
     build(default_inference, data_graphs, schema_graphs).expect("a valid dataset")
 }
@@ -438,13 +441,17 @@ pub(crate) fn dataset_with(
 #[cfg(test)]
 pub(crate) fn default_dataset() -> &'static DatasetSpec {
     static DEFAULT: std::sync::OnceLock<DatasetSpec> = std::sync::OnceLock::new();
-    DEFAULT.get_or_init(|| dataset_with(TypeRegime::ASSERTED, &[], &[]))
+    DEFAULT.get_or_init(|| dataset_with(TypeInference::ASSERTED, &[], &[]))
 }
 
 /// An asserted dataset that serves one schema graph, `iri`.
 #[cfg(test)]
 pub(crate) fn schema_dataset(iri: &str) -> DatasetSpec {
-    dataset_with(TypeRegime::ASSERTED, &[], &[(iri, TypeRegime::ASSERTED)])
+    dataset_with(
+        TypeInference::ASSERTED,
+        &[],
+        &[(iri, TypeInference::ASSERTED)],
+    )
 }
 
 #[cfg(test)]
@@ -458,20 +465,20 @@ mod tests {
 
     fn served() -> DatasetSpec {
         dataset_with(
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
             &[
-                (A, TypeRegime::ASSERTED),
-                (I, TypeRegime::IS_A),
-                (M, TypeRegime::IS_A_AND_MIXINS),
+                (A, TypeInference::ASSERTED),
+                (I, TypeInference::IS_A),
+                (M, TypeInference::IS_A_AND_MIXINS),
             ],
-            &[(S, TypeRegime::IS_A)],
+            &[(S, TypeInference::IS_A)],
         )
     }
 
     fn conflicts_of(
-        default: TypeRegime,
-        data: &[(&str, TypeRegime)],
-        schema: &[(&str, TypeRegime)],
+        default: TypeInference,
+        data: &[(&str, TypeInference)],
+        schema: &[(&str, TypeInference)],
     ) -> Vec<DatasetConflict> {
         build(default, data, schema)
             .expect_err("the dataset contradicts itself")
@@ -482,9 +489,12 @@ mod tests {
     #[test]
     fn a_dataset_answers_for_each_graph_it_serves() {
         let dataset = served();
-        assert_eq!(dataset.default_inference(), TypeRegime::IS_A);
-        assert_eq!(dataset.data_inference(M), Some(TypeRegime::IS_A_AND_MIXINS));
-        assert_eq!(dataset.schema_inference(S), Some(TypeRegime::IS_A));
+        assert_eq!(dataset.default_inference(), TypeInference::IS_A);
+        assert_eq!(
+            dataset.data_inference(M),
+            Some(TypeInference::IS_A_AND_MIXINS)
+        );
+        assert_eq!(dataset.schema_inference(S), Some(TypeInference::IS_A));
         assert_eq!(dataset.data_inference(S), None);
         assert_eq!(dataset.schema_inference(A), None);
         assert!(dataset.has_schema_graph());
@@ -495,9 +505,9 @@ mod tests {
     fn a_graph_is_a_data_graph_or_a_schema_graph() {
         assert_eq!(
             conflicts_of(
-                TypeRegime::ASSERTED,
-                &[(A, TypeRegime::ASSERTED)],
-                &[(A, TypeRegime::IS_A)]
+                TypeInference::ASSERTED,
+                &[(A, TypeInference::ASSERTED)],
+                &[(A, TypeInference::IS_A)]
             ),
             vec![DatasetConflict::GraphIsDataAndSchema { iri: A.into() }]
         );
@@ -508,12 +518,16 @@ mod tests {
     /// default inference, and the empty set is one of them.
     #[test]
     fn a_inference_without_own_is_no_graph_of_records() {
-        let is_a_only = TypeRegime::from(TypePartition::IsA);
+        let is_a_only = TypeInference::from(TypePartition::IsA);
         assert!(!is_a_only.contains(TypePartition::Own));
-        assert!(TypeRegime::IS_A_AND_MIXINS.contains(TypePartition::Own));
-        for inference in [is_a_only, TypeRegime::empty()] {
+        assert!(TypeInference::IS_A_AND_MIXINS.contains(TypePartition::Own));
+        for inference in [is_a_only, TypeInference::empty()] {
             assert_eq!(
-                conflicts_of(TypeRegime::ASSERTED, &[("urn:graph:odd", inference)], &[]),
+                conflicts_of(
+                    TypeInference::ASSERTED,
+                    &[("urn:graph:odd", inference)],
+                    &[]
+                ),
                 vec![DatasetConflict::DataGraphWithoutOwn {
                     iri: "urn:graph:odd".into(),
                     inference
@@ -540,9 +554,9 @@ mod tests {
     #[test]
     fn every_conflict_is_reported_at_once() {
         let conflicts = conflicts_of(
-            TypeRegime::empty(),
-            &[(A, TypeRegime::ASSERTED), (S, TypeRegime::empty())],
-            &[(S, TypeRegime::IS_A)],
+            TypeInference::empty(),
+            &[(A, TypeInference::ASSERTED), (S, TypeInference::empty())],
+            &[(S, TypeInference::IS_A)],
         );
         assert_eq!(conflicts.len(), 3, "{conflicts:?}");
         let text = conflicts

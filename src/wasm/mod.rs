@@ -31,7 +31,7 @@ pub mod minijinja;
 pub use minijinja::*;
 
 use linkml_meta::SchemaDefinition;
-use linkml_runtime::schema_rdf::TypeRegime;
+use linkml_runtime::schema_rdf::TypeInference;
 use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
 use linkml_runtime::{DiffOptions, LinkMLInstance, diff, load_json_str};
 use linkml_schemaview::classview::ClassView;
@@ -990,11 +990,11 @@ impl LinkMLInstanceHandle {
                 .map_err(|e| JsValue::from_str(&format!("invalid toTurtle options: {e}")))?
         };
         let TurtleOptions { skolem, inference } = options;
-        let inference: TypeRegime = inference
+        let inference: TypeInference = inference
             .as_deref()
             .map(str::parse)
             .transpose()
-            .map_err(|e: linkml_runtime::schema_rdf::ParseTypeRegimeError| {
+            .map_err(|e: linkml_runtime::schema_rdf::ParseTypeInferenceError| {
                 JsValue::from_str(&e.to_string())
             })?
             .unwrap_or_default();

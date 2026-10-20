@@ -93,7 +93,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use linkml_runtime::schema_rdf::{
-    RDFS_SUBCLASS_OF, TypePartition, TypeRegime, rdf_types, subclass_edges,
+    RDFS_SUBCLASS_OF, TypeInference, TypePartition, rdf_types, subclass_edges,
 };
 use linkml_schemaview::schemaview::SchemaView;
 use spargebra::algebra::PropertyPathExpression;
@@ -116,7 +116,10 @@ fn class_key(class: &linkml_schemaview::classview::ClassView) -> String {
 /// `E+`: the transitive closure of the `rdfs:subClassOf` edges a schema graph
 /// of inference `inference` publishes, as `(sub, super)` pairs of canonical class
 /// IRIs. `None` when the schema cannot enumerate its edges.
-fn subclass_closure(sv: &SchemaView, inference: TypeRegime) -> Option<HashSet<(String, String)>> {
+fn subclass_closure(
+    sv: &SchemaView,
+    inference: TypeInference,
+) -> Option<HashSet<(String, String)>> {
     let mut above: HashMap<String, Vec<String>> = HashMap::new();
     for (sub, sup) in subclass_edges(sv, inference).ok()? {
         above
@@ -144,8 +147,8 @@ fn subclass_closure(sv: &SchemaView, inference: TypeRegime) -> Option<HashSet<(S
 /// `s`'s direct type" for data of inference `data_inference`.
 fn most_specific_is_direct(
     sv: &SchemaView,
-    graph_inference: TypeRegime,
-    data_inference: TypeRegime,
+    graph_inference: TypeInference,
+    data_inference: TypeInference,
 ) -> bool {
     let Some(closure) = subclass_closure(sv, graph_inference) else {
         return false;
@@ -160,7 +163,7 @@ fn most_specific_is_direct(
     if !data_inference.contains(TypePartition::Own) {
         return false;
     }
-    if data_inference.is_subset(TypeRegime::ASSERTED) {
+    if data_inference.is_subset(TypeInference::ASSERTED) {
         return true;
     }
     if !data_inference.contains(TypePartition::Direct) {
@@ -202,7 +205,7 @@ impl<'s> MostSpecificTypeIsTheDirectType<'s> {
 }
 
 /// A match `?subject a ?object`, both variables, in a data graph.
-fn typed_pair(plan: &Plan, id: NodeId) -> Option<(String, String, TypeRegime)> {
+fn typed_pair(plan: &Plan, id: NodeId) -> Option<(String, String, TypeInference)> {
     let PlanOp::Match { pattern, reads } = &plan.nodes[id].op else {
         return None;
     };
@@ -270,7 +273,7 @@ struct Found {
     matched: NodeId,
     /// The NOT EXISTS body, which goes.
     body: BTreeSet<NodeId>,
-    inference: TypeRegime,
+    inference: TypeInference,
     graph_iri: String,
 }
 
@@ -529,7 +532,7 @@ classes:
 
     /// A dataset whose default graph is data of inference `data` and which serves
     /// `G` as a schema graph publishing `graph`.
-    fn serving(data: TypeRegime, graph: TypeRegime) -> DatasetSpec {
+    fn serving(data: TypeInference, graph: TypeInference) -> DatasetSpec {
         crate::sparql_dataset::dataset_with(data, &[], &[(G, graph)])
     }
 
@@ -537,17 +540,17 @@ classes:
     fn the_canonical_spelling_under_is_a_data_is_the_direct_type() {
         let sv = schema_view();
         for graph in [
-            TypeRegime::IS_A,
-            TypeRegime::IS_A_AND_MIXINS,
-            TypeRegime::ASSERTED,
+            TypeInference::IS_A,
+            TypeInference::IS_A_AND_MIXINS,
+            TypeInference::ASSERTED,
         ] {
-            let (fired, plan) = refined(&sv, &serving(TypeRegime::IS_A, graph), &canonical(G));
+            let (fired, plan) = refined(&sv, &serving(TypeInference::IS_A, graph), &canonical(G));
             assert!(fired, "{graph:?}:\n{plan}");
             assert!(plan.contains("directType"), "{graph:?}:\n{plan}");
         }
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::IS_A, TypeRegime::IS_A),
+            &serving(TypeInference::IS_A, TypeInference::IS_A),
             &canonical(G),
         );
         assert!(fired, "{plan}");
@@ -568,9 +571,9 @@ classes:
         const A: &str = "urn:graph:a";
         let sv = schema_view();
         let dataset = crate::sparql_dataset::dataset_with(
-            TypeRegime::IS_A,
-            &[(A, TypeRegime::IS_A)],
-            &[(G, TypeRegime::IS_A)],
+            TypeInference::IS_A,
+            &[(A, TypeInference::IS_A)],
+            &[(G, TypeInference::IS_A)],
         );
         let with_clause = |clause: &str| {
             canonical(G).replace(
@@ -602,7 +605,7 @@ classes:
         let sv = schema_view();
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::ASSERTED, TypeRegime::ASSERTED),
+            &serving(TypeInference::ASSERTED, TypeInference::ASSERTED),
             &canonical(G),
         );
         assert!(fired, "{plan}");
@@ -621,7 +624,7 @@ classes:
         let sv = schema_view();
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::IS_A_AND_MIXINS, TypeRegime::IS_A),
+            &serving(TypeInference::IS_A_AND_MIXINS, TypeInference::IS_A),
             &canonical(G),
         );
         assert!(!fired, "{plan}");
@@ -635,7 +638,7 @@ classes:
         let sv = schema_view();
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::IS_A, TypeRegime::IS_A),
+            &serving(TypeInference::IS_A, TypeInference::IS_A),
             &format!(
                 "SELECT ?s ?t ?n WHERE {{ ?s a ?t . ?s <https://example.org/typed/name> ?n \
                  FILTER NOT EXISTS {{ ?s a ?sub . GRAPH <{G}> {{ ?sub rdfs:subClassOf+ ?t }} }} }}"
@@ -656,7 +659,7 @@ classes:
     #[test]
     fn a_body_variable_bound_on_the_left_leaves_the_plan_alone() {
         let sv = schema_view();
-        let dataset = serving(TypeRegime::IS_A, TypeRegime::IS_A);
+        let dataset = serving(TypeInference::IS_A, TypeInference::IS_A);
         let not_exists = format!(
             "FILTER NOT EXISTS {{ ?s a ?sub . GRAPH <{G}> {{ ?sub rdfs:subClassOf+ ?t }} }}"
         );
@@ -680,7 +683,7 @@ classes:
         let sv = schema_view();
         let (fired, plan) = refined(
             &sv,
-            &serving(TypeRegime::IS_A, TypeRegime::IS_A),
+            &serving(TypeInference::IS_A, TypeInference::IS_A),
             &canonical("https://other/g"),
         );
         assert!(!fired, "{plan}");
@@ -693,46 +696,46 @@ classes:
         // Mixin data needs mixin edges; the is-a graph has none for `Tag`.
         assert!(!most_specific_is_direct(
             &sv,
-            TypeRegime::IS_A,
-            TypeRegime::IS_A_AND_MIXINS
+            TypeInference::IS_A,
+            TypeInference::IS_A_AND_MIXINS
         ));
         // The asserted graph's direct edges close to the is-a ancestry.
         assert!(most_specific_is_direct(
             &sv,
-            TypeRegime::ASSERTED,
-            TypeRegime::IS_A
+            TypeInference::ASSERTED,
+            TypeInference::IS_A
         ));
         assert!(most_specific_is_direct(
             &sv,
-            TypeRegime::IS_A_AND_MIXINS,
-            TypeRegime::IS_A_AND_MIXINS
+            TypeInference::IS_A_AND_MIXINS,
+            TypeInference::IS_A_AND_MIXINS
         ));
         assert!(!most_specific_is_direct(
             &sv,
-            TypeRegime::ASSERTED,
-            TypeRegime::IS_A_AND_MIXINS
+            TypeInference::ASSERTED,
+            TypeInference::IS_A_AND_MIXINS
         ));
     }
 
     /// Every branch of the data-inference judgement. Asserted data is accepted
-    /// (the own class is the direct type); a inference without `Own` is declined
+    /// (the own class is the direct type); an inference without `Own` is declined
     /// (`?s a ?t` would not read the own class); inferred types without
     /// `Direct` are declined (nothing to rewrite to); `Own + Direct` is accepted.
     #[test]
     fn the_data_inference_judgement_covers_every_branch() {
         let sv = schema_view();
-        let graph = TypeRegime::IS_A_AND_MIXINS;
-        let own_direct = TypeRegime::ASSERTED.with(TypePartition::Direct);
-        let own_is_a = TypeRegime::ASSERTED.with(TypePartition::IsA);
-        let direct_only = TypeRegime::empty().with(TypePartition::Direct);
-        let no_own_is_a = TypeRegime::empty().with(TypePartition::IsA);
-        assert!(most_specific_is_direct(&sv, graph, TypeRegime::ASSERTED));
+        let graph = TypeInference::IS_A_AND_MIXINS;
+        let own_direct = TypeInference::ASSERTED.with(TypePartition::Direct);
+        let own_is_a = TypeInference::ASSERTED.with(TypePartition::IsA);
+        let direct_only = TypeInference::empty().with(TypePartition::Direct);
+        let no_own_is_a = TypeInference::empty().with(TypePartition::IsA);
+        assert!(most_specific_is_direct(&sv, graph, TypeInference::ASSERTED));
         assert!(most_specific_is_direct(&sv, graph, own_direct));
-        assert!(most_specific_is_direct(&sv, graph, TypeRegime::IS_A));
+        assert!(most_specific_is_direct(&sv, graph, TypeInference::IS_A));
         assert!(!most_specific_is_direct(&sv, graph, own_is_a));
         assert!(!most_specific_is_direct(&sv, graph, direct_only));
         assert!(!most_specific_is_direct(&sv, graph, no_own_is_a));
-        assert!(!most_specific_is_direct(&sv, graph, TypeRegime::empty()));
+        assert!(!most_specific_is_direct(&sv, graph, TypeInference::empty()));
     }
 
     /// The dataset names its schema graphs by inference; the rule reads the one the
@@ -750,22 +753,22 @@ classes:
                 data,
                 &[],
                 &[
-                    (INFERRED_MIXINS, TypeRegime::IS_A_AND_MIXINS),
-                    (ASSERTED, TypeRegime::ASSERTED),
+                    (INFERRED_MIXINS, TypeInference::IS_A_AND_MIXINS),
+                    (ASSERTED, TypeInference::ASSERTED),
                 ],
             )
         };
-        let (fired, plan) = refined(&sv, &both(TypeRegime::IS_A), &canonical(INFERRED_MIXINS));
+        let (fired, plan) = refined(&sv, &both(TypeInference::IS_A), &canonical(INFERRED_MIXINS));
         assert!(fired && plan.contains("directType"), "{plan}");
         let (fired, plan) = refined(
             &sv,
-            &both(TypeRegime::IS_A_AND_MIXINS),
+            &both(TypeInference::IS_A_AND_MIXINS),
             &canonical(INFERRED_MIXINS),
         );
         assert!(fired && plan.contains("directType"), "{plan}");
         let (fired, plan) = refined(
             &sv,
-            &both(TypeRegime::IS_A_AND_MIXINS),
+            &both(TypeInference::IS_A_AND_MIXINS),
             &canonical(ASSERTED),
         );
         assert!(!fired, "{plan}");
@@ -779,7 +782,7 @@ classes:
     #[test]
     fn subclass_edges_are_irreflexive_in_every_inference() {
         let sv = schema_view();
-        for &inference in TypeRegime::NAMED {
+        for &inference in TypeInference::NAMED {
             for (sub, sup) in subclass_edges(&sv, inference).unwrap() {
                 assert_ne!(class_key(&sub), class_key(&sup), "{inference:?}");
             }

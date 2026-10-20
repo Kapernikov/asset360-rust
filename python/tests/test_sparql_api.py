@@ -11,7 +11,7 @@ from asset360_rust import (
     Finishing,
     SchemaView,
     TypePartition,
-    TypeRegime,
+    TypeInference,
     plan_query_refined,
     sparql_execute,
     sparql_execute_plan,
@@ -28,9 +28,9 @@ S = "urn:graph:schema"
 def test_a_dataset_that_contradicts_itself_raises_with_every_conflict():
     with pytest.raises(ValueError) as raised:
         DatasetSpec(
-            TypeRegime.parse("{}"),
-            data_graphs={A: TypeRegime.ASSERTED},
-            schema_graphs={A: TypeRegime.IS_A, S: TypeRegime.IS_A},
+            TypeInference.parse("{}"),
+            data_graphs={A: TypeInference.ASSERTED},
+            schema_graphs={A: TypeInference.IS_A, S: TypeInference.IS_A},
         )
     message = str(raised.value)
     # Both mistakes are named, not the first one met.
@@ -40,18 +40,18 @@ def test_a_dataset_that_contradicts_itself_raises_with_every_conflict():
 
 def test_a_coherent_dataset_builds():
     DatasetSpec(
-        TypeRegime.ASSERTED,
-        data_graphs={A: TypeRegime.ASSERTED},
-        schema_graphs={S: TypeRegime.IS_A},
+        TypeInference.ASSERTED,
+        data_graphs={A: TypeInference.ASSERTED},
+        schema_graphs={S: TypeInference.IS_A},
     )
 
 
 def test_a_graph_of_records_needs_the_own_partition():
-    only_is_a = TypeRegime([TypePartition.IS_A])
+    only_is_a = TypeInference([TypePartition.IS_A])
     with pytest.raises(ValueError, match="lacks the own partition"):
-        DatasetSpec(TypeRegime.ASSERTED, data_graphs={A: only_is_a})
+        DatasetSpec(TypeInference.ASSERTED, data_graphs={A: only_is_a})
     with pytest.raises(ValueError, match="lacks the own partition"):
-        DatasetSpec(TypeRegime.parse("{}"))
+        DatasetSpec(TypeInference.parse("{}"))
 
 
 def test_limits_are_keyword_only_with_their_defaults():
@@ -86,60 +86,60 @@ def test_the_schema_graph_is_asked_for_by_inference_alone():
     sv = SchemaView()
     sv.add_schema_str(_SCHEMA_YAML)
     subclass_of = "<http://www.w3.org/2000/01/rdf-schema#subClassOf>"
-    asserted = sparql_schema_graph_ntriples(sv, TypeRegime.ASSERTED)
+    asserted = sparql_schema_graph_ntriples(sv, TypeInference.ASSERTED)
     assert "<https://example.org/s/Tunnel> " + subclass_of + " <https://example.org/s/Asset>" in asserted
-    assert asserted != sparql_schema_graph_ntriples(sv, TypeRegime.IS_A)
-    assert sparql_schema_graph_skipped(sv, TypeRegime.ASSERTED) == []
+    assert asserted != sparql_schema_graph_ntriples(sv, TypeInference.IS_A)
+    assert sparql_schema_graph_skipped(sv, TypeInference.ASSERTED) == []
 
 
 def test_a_dataset_can_be_read_back():
     dataset = DatasetSpec(
-        TypeRegime.IS_A,
-        data_graphs={A: TypeRegime.IS_A},
-        schema_graphs={S: TypeRegime.IS_A_AND_MIXINS},
+        TypeInference.IS_A,
+        data_graphs={A: TypeInference.IS_A},
+        schema_graphs={S: TypeInference.IS_A_AND_MIXINS},
     )
-    assert dataset.default_inference == TypeRegime.IS_A
-    assert dataset.data_graphs == {A: TypeRegime.IS_A}
-    assert dataset.schema_graphs == {S: TypeRegime.IS_A_AND_MIXINS}
+    assert dataset.default_inference == TypeInference.IS_A
+    assert dataset.data_graphs == {A: TypeInference.IS_A}
+    assert dataset.schema_graphs == {S: TypeInference.IS_A_AND_MIXINS}
     assert repr(dataset) == (
-        "DatasetSpec(TypeRegime.IS_A, data_graphs={'urn:graph:asserted': TypeRegime.IS_A}"
-        ", schema_graphs={'urn:graph:schema': TypeRegime.IS_A_AND_MIXINS})"
+        "DatasetSpec(TypeInference.IS_A, data_graphs={'urn:graph:asserted': TypeInference.IS_A}"
+        ", schema_graphs={'urn:graph:schema': TypeInference.IS_A_AND_MIXINS})"
     )
 
 
 def test_a_dataset_repr_round_trips_and_hashes_with_equality():
-    own_and_isa = TypeRegime([TypePartition.OWN, TypePartition.IS_A])
+    own_and_isa = TypeInference([TypePartition.OWN, TypePartition.IS_A])
     for dataset in (
-        DatasetSpec(TypeRegime.ASSERTED),
-        DatasetSpec(TypeRegime.IS_A, data_graphs={A: own_and_isa}),
-        DatasetSpec(TypeRegime.IS_A, data_graphs={A: own_and_isa}, schema_graphs={S: TypeRegime.IS_A}),
-        DatasetSpec(TypeRegime.ASSERTED, data_graphs={"urn:it's": TypeRegime.ASSERTED}),
+        DatasetSpec(TypeInference.ASSERTED),
+        DatasetSpec(TypeInference.IS_A, data_graphs={A: own_and_isa}),
+        DatasetSpec(TypeInference.IS_A, data_graphs={A: own_and_isa}, schema_graphs={S: TypeInference.IS_A}),
+        DatasetSpec(TypeInference.ASSERTED, data_graphs={"urn:it's": TypeInference.ASSERTED}),
     ):
         again = eval(repr(dataset))  # noqa: S307 -- the repr is the thing under test
         assert again == dataset
         assert hash(again) == hash(dataset)
-    assert hash(DatasetSpec(TypeRegime.ASSERTED)) != hash(DatasetSpec(TypeRegime.IS_A))
+    assert hash(DatasetSpec(TypeInference.ASSERTED)) != hash(DatasetSpec(TypeInference.IS_A))
     # A served graph is part of the dataset's identity.
-    assert DatasetSpec(TypeRegime.ASSERTED) != DatasetSpec(
-        TypeRegime.ASSERTED, data_graphs={A: TypeRegime.ASSERTED}
+    assert DatasetSpec(TypeInference.ASSERTED) != DatasetSpec(
+        TypeInference.ASSERTED, data_graphs={A: TypeInference.ASSERTED}
     )
 
 
 def test_a_inference_that_is_no_named_one_reads_back_as_itself():
-    own_and_isa = TypeRegime([TypePartition.OWN, TypePartition.IS_A])
-    dataset = DatasetSpec(TypeRegime.ASSERTED, data_graphs={A: own_and_isa})
+    own_and_isa = TypeInference([TypePartition.OWN, TypePartition.IS_A])
+    dataset = DatasetSpec(TypeInference.ASSERTED, data_graphs={A: own_and_isa})
     assert dataset.data_graphs == {A: own_and_isa}
     assert repr(dataset) == (
-        "DatasetSpec(TypeRegime.ASSERTED, "
-        "data_graphs={'urn:graph:asserted': TypeRegime.parse('{own,is_a}')})"
+        "DatasetSpec(TypeInference.ASSERTED, "
+        "data_graphs={'urn:graph:asserted': TypeInference.parse('{own,is_a}')})"
     )
 
 
 def test_a_bare_dataset_reads_back_empty():
-    dataset = DatasetSpec(TypeRegime.ASSERTED)
-    assert dataset.default_inference == TypeRegime.ASSERTED
+    dataset = DatasetSpec(TypeInference.ASSERTED)
+    assert dataset.default_inference == TypeInference.ASSERTED
     assert dataset.data_graphs == {} and dataset.schema_graphs == {}
-    assert repr(dataset) == "DatasetSpec(TypeRegime.ASSERTED)"
+    assert repr(dataset) == "DatasetSpec(TypeInference.ASSERTED)"
 
 
 def test_a_query_reading_two_data_graphs_is_refused_by_name_on_every_route():
@@ -147,8 +147,8 @@ def test_a_query_reading_two_data_graphs_is_refused_by_name_on_every_route():
     sv.add_schema_str(_SCHEMA_YAML)
     inferred = "urn:graph:inferred"
     dataset = DatasetSpec(
-        TypeRegime.ASSERTED,
-        data_graphs={A: TypeRegime.ASSERTED, inferred: TypeRegime.IS_A},
+        TypeInference.ASSERTED,
+        data_graphs={A: TypeInference.ASSERTED, inferred: TypeInference.IS_A},
     )
     query = f"SELECT ?s FROM <{A}> FROM <{inferred}> WHERE {{ ?s a <https://example.org/s/Asset> }}"
     refusal = "cross_data_graph: a query can read one data graph; rewrite it per graph"
@@ -181,8 +181,8 @@ def test_the_records_route_takes_the_plan_and_its_dataset():
     sv.add_schema_str(_SCHEMA_YAML)
     inferred = "urn:graph:inferred"
     dataset = DatasetSpec(
-        TypeRegime.ASSERTED,
-        data_graphs={A: TypeRegime.ASSERTED, inferred: TypeRegime.IS_A},
+        TypeInference.ASSERTED,
+        data_graphs={A: TypeInference.ASSERTED, inferred: TypeInference.IS_A},
     )
     query = f"SELECT ?s FROM <{inferred}> WHERE {{ ?s a <https://example.org/s/Asset> }}"
     plan = plan_query_refined(query, sv, dataset)

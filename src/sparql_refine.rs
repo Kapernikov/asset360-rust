@@ -72,7 +72,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use crate::sparql_dataset::{DatasetSpec, GraphReads, QueryGraphs};
-use linkml_runtime::schema_rdf::{TypeRegime, type_family};
+use linkml_runtime::schema_rdf::{TypeInference, type_family};
 use linkml_schemaview::schemaview::SchemaView;
 
 use spargebra::Query;
@@ -377,7 +377,7 @@ pub enum Expr {
     InClass {
         var: String,
         class_uri: String,
-        inference: TypeRegime,
+        inference: TypeInference,
     },
     /// An expression carrying a graph pattern -- `EXISTS`, `NOT EXISTS` --
     /// kept as the text the query wrote.
@@ -1725,7 +1725,7 @@ impl fmt::Display for Expr {
                 f,
                 "?{var} ∈ {}{}",
                 shorten(class_uri),
-                if *inference == TypeRegime::ASSERTED {
+                if *inference == TypeInference::ASSERTED {
                     String::new()
                 } else {
                     format!(" [{inference}]")
@@ -2297,7 +2297,7 @@ pub enum PlanOp {
         /// Every class whose records have `class_uri` among their `rdf:type`s
         /// under the inference of the plan's one data graph ([`Plan::data_inference`]; canonical
         /// IRIs, sorted, deduplicated, `class_uri` included): `type_family` of
-        /// the class. Under [`TypeRegime::ASSERTED`] that is `class_uri` alone.
+        /// the class. Under [`TypeInference::ASSERTED`] that is `class_uri` alone.
         /// Under that inference `?s a class_uri` holds for every record of one of
         /// them. [`Plan::scan_classes_agree`] checks it against the schema.
         classes: Vec<String>,
@@ -2670,7 +2670,7 @@ pub struct Plan {
     /// ([`crate::sparql_graph_clauses::single_data_graph`]): the inference every
     /// match of a data graph and every scan is under. What
     /// [`Plan::scan_classes_agree`] derives a scan's classes with.
-    pub data_inference: TypeRegime,
+    pub data_inference: TypeInference,
 }
 
 /// An export moved out of a barrier by a lifting rule (see
@@ -2850,7 +2850,7 @@ impl Plan {
             transfers: Vec::new(),
             rewrites: Vec::new(),
             lifted_exports: Vec::new(),
-            data_inference: TypeRegime::ASSERTED,
+            data_inference: TypeInference::ASSERTED,
         };
         plan.install(nodes);
         plan.record_origins();
@@ -4175,7 +4175,7 @@ enum InferenceContext {
     Plan {
         /// The inference of the plan's one data graph: what its scans and its data matches
         /// read under.
-        data: TypeRegime,
+        data: TypeInference,
         under_graph: bool,
     },
 }
@@ -4183,8 +4183,8 @@ enum InferenceContext {
 /// The tag the plan's data inference carries in plan text: its `Display`
 /// spelling, so the plan and the inference's own name never drift. Asserted is
 /// bare: a match that reads no data graph says so itself ([`reads_tag`]).
-fn inference_tag(inference: TypeRegime) -> Option<String> {
-    (inference != TypeRegime::ASSERTED).then(|| inference.to_string())
+fn inference_tag(inference: TypeInference) -> Option<String> {
+    (inference != TypeInference::ASSERTED).then(|| inference.to_string())
 }
 
 /// The tag a scan carries in plan text: the plan's data inference. A scan printed
@@ -4226,7 +4226,7 @@ fn reads_tag(reads: GraphReads, context: InferenceContext) -> Option<String> {
 pub(crate) fn type_table(
     schema: &SchemaView,
     classes: &[String],
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> Option<Vec<(String, String)>> {
     let mut rows = Vec::new();
     for class in classes {
@@ -4255,7 +4255,7 @@ pub(crate) fn type_table(
 pub(crate) fn scan_classes(
     schema: &SchemaView,
     class_uri: &str,
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> Result<Vec<String>, ScanClassesError> {
     let failed = |message: String| ScanClassesError {
         class_uri: class_uri.to_owned(),
@@ -4285,7 +4285,7 @@ pub(crate) fn scan_classes(
 #[non_exhaustive]
 pub(crate) struct ScanClassesError {
     class_uri: String,
-    inference: TypeRegime,
+    inference: TypeInference,
     /// The schema's own error.
     message: String,
 }
@@ -4298,7 +4298,7 @@ impl ScanClassesError {
     }
 
     /// The inference its family was asked for under.
-    pub(crate) fn inference(&self) -> TypeRegime {
+    pub(crate) fn inference(&self) -> TypeInference {
         self.inference
     }
 
@@ -5572,13 +5572,13 @@ mod tests {
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
         );
         let dataset = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
             &[
-                (A, TypeRegime::ASSERTED),
-                (I, TypeRegime::IS_A),
-                ("urn:graph:mixins", TypeRegime::IS_A_AND_MIXINS),
+                (A, TypeInference::ASSERTED),
+                (I, TypeInference::IS_A),
+                ("urn:graph:mixins", TypeInference::IS_A_AND_MIXINS),
             ],
-            &[(S, TypeRegime::IS_A)],
+            &[(S, TypeInference::IS_A)],
         );
         let try_plan = |query: &str| {
             let parsed =
@@ -5598,7 +5598,7 @@ mod tests {
             message
         };
         // `(has a Graph node above it, inference)` per match, in node order.
-        let matches = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
+        let matches = |plan: &Plan| -> Vec<(String, Option<TypeInference>)> {
             plan.nodes
                 .iter()
                 .filter_map(|node| match &node.op {
@@ -5610,7 +5610,7 @@ mod tests {
                 })
                 .collect()
         };
-        let inferences = |plan: &Plan| -> Vec<Option<TypeRegime>> {
+        let inferences = |plan: &Plan| -> Vec<Option<TypeInference>> {
             matches(plan)
                 .into_iter()
                 .map(|(_, inference)| inference)
@@ -5628,22 +5628,22 @@ mod tests {
         let body = "{ ?s a asset360:Signal ; asset360:name ?n }";
         assert_eq!(
             inferences(&plan(&format!("SELECT ?s WHERE {body}"))),
-            vec![Some(TypeRegime::ASSERTED); 2]
+            vec![Some(TypeInference::ASSERTED); 2]
         );
         assert_eq!(
             inferences(&plan(&format!("SELECT ?s FROM <{A}> WHERE {body}"))),
-            vec![Some(TypeRegime::ASSERTED); 2]
+            vec![Some(TypeInference::ASSERTED); 2]
         );
         assert_eq!(
             inferences(&plan(&format!("SELECT ?s FROM <{I}> WHERE {body}"))),
-            vec![Some(TypeRegime::IS_A); 2]
+            vec![Some(TypeInference::IS_A); 2]
         );
         // The same graph twice is one graph.
         assert_eq!(
             inferences(&plan(&format!(
                 "SELECT ?s FROM <{I}> FROM <{I}> WHERE {body}"
             ))),
-            vec![Some(TypeRegime::IS_A); 2]
+            vec![Some(TypeInference::IS_A); 2]
         );
         // A `FROM` that is no data -- a schema graph, an unknown IRI -- reads
         // no inference, and the engine answers.
@@ -5657,7 +5657,7 @@ mod tests {
 
         // `GRAPH <data graph>` dissolves; the matches carry its inference.
         let in_inferred = plan(&format!("SELECT ?s WHERE {{ GRAPH <{I}> {body} }}"));
-        assert_eq!(inferences(&in_inferred), vec![Some(TypeRegime::IS_A); 2]);
+        assert_eq!(inferences(&in_inferred), vec![Some(TypeInference::IS_A); 2]);
         assert_eq!(graph_nodes(&in_inferred), 0, "{in_inferred}");
         // A plan that reads the inference of another graph than the dataset's
         // default says so in its text.
@@ -5679,7 +5679,7 @@ mod tests {
             "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} \
              GRAPH <{S}> {{ ?c a asset360:Signal }} }}"
         ));
-        assert_eq!(inferences(&beside), vec![Some(TypeRegime::IS_A), None]);
+        assert_eq!(inferences(&beside), vec![Some(TypeInference::IS_A), None]);
         // A data graph inside the schema graph is read as the data graph (an
         // inner `GRAPH` switches graph), but never by the rules: it stays under
         // both `Graph` nodes, so no rule takes it for a read of the datamodel
@@ -5740,11 +5740,11 @@ mod tests {
         let named = plan(&format!(
             "SELECT ?s FROM NAMED <{I}> WHERE {{ GRAPH <{I}> {body} }}"
         ));
-        assert_eq!(inferences(&named), vec![Some(TypeRegime::IS_A); 2]);
+        assert_eq!(inferences(&named), vec![Some(TypeInference::IS_A); 2]);
         let listed = plan(&format!(
             "SELECT ?s FROM <{A}> FROM NAMED <{I}> WHERE {body}"
         ));
-        assert_eq!(inferences(&listed), vec![Some(TypeRegime::ASSERTED); 2]);
+        assert_eq!(inferences(&listed), vec![Some(TypeInference::ASSERTED); 2]);
         // The default graph beside a named data graph is refused even when
         // that graph has the default inference (asserted): a query uses the
         // default graph or names its data graph, never both.
@@ -5766,11 +5766,11 @@ mod tests {
         const A: &str = "urn:graph:asserted";
         const S: &str = "urn:graph:schema";
         let sv = crate::sparql_scoper::tests::test_schema_view();
-        let text = |default: TypeRegime, query: &str| {
+        let text = |default: TypeInference, query: &str| {
             let dataset = crate::sparql_dataset::dataset_with(
                 default,
-                &[(A, TypeRegime::ASSERTED)],
-                &[(S, TypeRegime::IS_A)],
+                &[(A, TypeInference::ASSERTED)],
+                &[(S, TypeInference::IS_A)],
             );
             let parsed =
                 crate::sparql_scoper::parse_query(&format!("{PREFIX}{query}"), Some(&sv)).unwrap();
@@ -5779,7 +5779,7 @@ mod tests {
         let body = "?s asset360:name ?n";
         // The default inference, asserted: as it always printed.
         let plain = text(
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
             &format!("SELECT ?s WHERE {{ {body} }}"),
         );
         assert!(
@@ -5789,20 +5789,20 @@ mod tests {
         // A query reads one data graph, and the plan's inference is its: asserted
         // under `A` is bare whatever the dataset's default inference is.
         let in_a = text(
-            TypeRegime::IS_A,
+            TypeInference::IS_A,
             &format!("SELECT ?s WHERE {{ GRAPH <{A}> {{ {body} }} }}"),
         );
         assert!(!in_a.contains("[asserted]"), "{in_a}");
         // No data graph, outside any printed GRAPH: said, and not the same
         // text as the asserted match.
         let nowhere = text(
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
             &format!("SELECT ?s FROM <urn:unknown> WHERE {{ {body} }}"),
         );
         assert!(nowhere.contains("[no data graph]"), "{nowhere}");
         // Under a printed GRAPH the graph is the explanation: no tag.
         let under_graph = text(
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
             &format!("SELECT ?s WHERE {{ GRAPH <{S}> {{ {body} }} }}"),
         );
         assert!(
@@ -5821,19 +5821,19 @@ mod tests {
         let signal = "https://data.infrabel.be/asset360/Signal";
         // Under `asserted` a family is the class alone: nothing to derive.
         assert_eq!(
-            scan_classes(&sv, signal, TypeRegime::ASSERTED).unwrap(),
+            scan_classes(&sv, signal, TypeInference::ASSERTED).unwrap(),
             vec![signal.to_owned()]
         );
         // Under `is_a` the family is read off every class, `Broken` included.
-        let error = scan_classes(&sv, signal, TypeRegime::IS_A)
+        let error = scan_classes(&sv, signal, TypeInference::IS_A)
             .expect_err("the schema cannot say what the family is");
         assert_eq!(error.class_uri(), signal);
-        assert_eq!(error.inference(), TypeRegime::IS_A);
+        assert_eq!(error.inference(), TypeInference::IS_A);
         assert!(!error.message().is_empty());
 
         // The planner surfaces it to the caller instead of planning a scan
         // that reads only `Signal`.
-        let dataset = crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]);
+        let dataset = crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]);
         let query =
             format!("{PREFIX}SELECT ?s WHERE {{ ?s a asset360:Signal ; asset360:name ?n }}");
         let planned = crate::sparql_plan::plan_of(&query, &sv, &dataset)
@@ -5854,9 +5854,9 @@ mod tests {
         const S: &str = "urn:graph:schema";
         let sv = crate::sparql_scoper::tests::test_schema_view();
         let dataset = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
-            &[(A, TypeRegime::IS_A)],
-            &[(S, TypeRegime::IS_A)],
+            TypeInference::ASSERTED,
+            &[(A, TypeInference::IS_A)],
+            &[(S, TypeInference::IS_A)],
         );
         let body = "?s asset360:name ?n";
         let reads_of = |query: &str| -> (Vec<GraphReads>, String) {
@@ -5904,12 +5904,12 @@ mod tests {
         );
         assert!(naive_plan(&parsed, &dataset).is_ok(), "one data graph");
         let two = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
             &[
-                (A, TypeRegime::IS_A),
-                ("urn:graph:other", TypeRegime::ASSERTED),
+                (A, TypeInference::IS_A),
+                ("urn:graph:other", TypeInference::ASSERTED),
             ],
-            &[(S, TypeRegime::IS_A)],
+            &[(S, TypeInference::IS_A)],
         );
         assert!(naive_plan(&parsed, &two).is_err());
         // Outside any `GRAPH`, a `FROM` that names the schema graph reads it,
@@ -5927,13 +5927,13 @@ mod tests {
         }
     }
 
-    /// A inference is on every matched triple and every scan: a triple outside
+    /// An inference is on every matched triple and every scan: a triple outside
     /// `GRAPH` carries the dataset's, one inside carries none; a scan under
     /// `is_a` lists the subclasses it reads, in the plan text and in
     /// `classes`; and an asserted plan prints as it always did.
     #[test]
     fn a_inference_reaches_every_match_and_scan() {
-        // A subclass of `Signal`, so a inference other than `asserted` has a
+        // A subclass of `Signal`, so an inference other than `asserted` has a
         // family to list: under `is_a` a scan of `Signal` also reads these.
         let sv = crate::sparql_scoper::tests::test_schema_view_plus(
             "  ShuntSignal:\n    class_uri: asset360:ShuntSignal\n    is_a: Signal\n",
@@ -5945,7 +5945,7 @@ mod tests {
              GRAPH <https://example.org/g> {{ ?g a asset360:Signal }} }}"
         );
         let parsed = crate::sparql_scoper::parse_query(&query, Some(&sv)).unwrap();
-        let inferences = |plan: &Plan| -> Vec<(String, Option<TypeRegime>)> {
+        let inferences = |plan: &Plan| -> Vec<(String, Option<TypeInference>)> {
             plan.nodes
                 .iter()
                 .filter_map(|node| match &node.op {
@@ -5960,10 +5960,10 @@ mod tests {
 
         let asserted = naive_plan(
             &parsed,
-            &crate::sparql_dataset::dataset_with(TypeRegime::ASSERTED, &[], &[]),
+            &crate::sparql_dataset::dataset_with(TypeInference::ASSERTED, &[], &[]),
         )
         .unwrap();
-        let in_graph = |inferences: &[(String, Option<TypeRegime>)]| {
+        let in_graph = |inferences: &[(String, Option<TypeInference>)]| {
             inferences
                 .iter()
                 .map(|(text, inference)| (text.contains("?g"), *inference))
@@ -5972,8 +5972,8 @@ mod tests {
         assert_eq!(
             in_graph(&inferences(&asserted)),
             vec![
-                (false, Some(TypeRegime::ASSERTED)),
-                (false, Some(TypeRegime::ASSERTED)),
+                (false, Some(TypeInference::ASSERTED)),
+                (false, Some(TypeInference::ASSERTED)),
                 (true, None),
             ]
         );
@@ -5982,14 +5982,14 @@ mod tests {
 
         let is_a = naive_plan(
             &parsed,
-            &crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]),
+            &crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]),
         )
         .unwrap();
         assert_eq!(
             in_graph(&inferences(&is_a)),
             vec![
-                (false, Some(TypeRegime::IS_A)),
-                (false, Some(TypeRegime::IS_A)),
+                (false, Some(TypeInference::IS_A)),
+                (false, Some(TypeInference::IS_A)),
                 (true, None),
             ]
         );

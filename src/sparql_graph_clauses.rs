@@ -24,7 +24,7 @@
 //! did not parse, and the query came back refused as *unscoped*: a parse
 //! failure reported as a question about scope.
 
-use linkml_runtime::schema_rdf::TypeRegime;
+use linkml_runtime::schema_rdf::TypeInference;
 use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_dataset::DatasetSpec;
@@ -39,7 +39,7 @@ use crate::sparql_dataset::DatasetSpec;
 pub(crate) fn schema_graphs_read(
     parsed: &spargebra::Query,
     dataset: &DatasetSpec,
-) -> Vec<(String, TypeRegime)> {
+) -> Vec<(String, TypeInference)> {
     use spargebra::Query;
     use spargebra::algebra::GraphPattern;
     use spargebra::term::NamedNodePattern;
@@ -77,7 +77,7 @@ pub(crate) fn schema_graphs_read(
         }
     }
 
-    let all = || -> Vec<(String, TypeRegime)> {
+    let all = || -> Vec<(String, TypeInference)> {
         dataset
             .schema_graphs()
             .map(|(iri, inference)| (iri.to_owned(), inference))
@@ -91,7 +91,7 @@ pub(crate) fn schema_graphs_read(
     };
     let mut names = Vec::new();
     walk(pattern, &mut names);
-    let mut read: std::collections::BTreeMap<String, TypeRegime> = Default::default();
+    let mut read: std::collections::BTreeMap<String, TypeInference> = Default::default();
     for name in names {
         match name {
             NamedNodePattern::NamedNode(graph) => {
@@ -129,7 +129,7 @@ pub(crate) struct DataRead {
     pub(crate) graph: Option<String>,
     /// The inference the records are read under: the graph's if there is one,
     /// else the dataset's default.
-    pub(crate) inference: TypeRegime,
+    pub(crate) inference: TypeInference,
 }
 
 /// **The query's one data graph**, or the refusal that it reads several.
@@ -642,19 +642,19 @@ mod tests {
     /// names, every one of them for the variable.
     #[test]
     fn a_graph_variable_is_schema_only_until_a_data_graph_is_served() {
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         let schema_view = test_schema_view();
         let only_schema = crate::sparql_dataset::dataset_with(
-            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
             &[],
-            &[(SCHEMA_GRAPH, TypeRegime::ASSERTED)],
+            &[(SCHEMA_GRAPH, TypeInference::ASSERTED)],
         );
         let with_data = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
-            &[("urn:graph:inferred", TypeRegime::IS_A)],
+            TypeInference::ASSERTED,
+            &[("urn:graph:inferred", TypeInference::IS_A)],
             &[
-                (SCHEMA_GRAPH, TypeRegime::ASSERTED),
-                ("urn:graph:schema-inferred", TypeRegime::IS_A),
+                (SCHEMA_GRAPH, TypeInference::ASSERTED),
+                ("urn:graph:schema-inferred", TypeInference::IS_A),
             ],
         );
         let variable = "SELECT ?c WHERE { GRAPH ?g { ?c ?p ?o } }";

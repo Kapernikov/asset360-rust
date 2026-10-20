@@ -1166,7 +1166,7 @@ classes:
     /// refused, with the planner's own text.
     #[test]
     fn a_query_reads_one_data_graph_and_the_engine_answers_where_the_records_are() {
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         const A: &str = "urn:graph:asserted";
         const I: &str = "urn:graph:inferred";
         const M: &str = "urn:graph:mixins";
@@ -1195,13 +1195,13 @@ classes:
         };
         let refs: Vec<&LinkMLInstance> = vec![&beacon];
         let dataset = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
             &[
-                (A, TypeRegime::ASSERTED),
-                (I, TypeRegime::IS_A),
-                (M, TypeRegime::IS_A_AND_MIXINS),
+                (A, TypeInference::ASSERTED),
+                (I, TypeInference::IS_A),
+                (M, TypeInference::IS_A_AND_MIXINS),
             ],
-            &[(S, TypeRegime::IS_A)],
+            &[(S, TypeInference::IS_A)],
         );
         let prefixed =
             |query: &str| format!("PREFIX asset360: <https://data.infrabel.be/asset360/> {query}");
@@ -1344,9 +1344,9 @@ classes:
         // into that graph and the schema graph into its own, and the plan
         // agrees.
         let lone = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
-            &[(I, TypeRegime::IS_A)],
-            &[(S, TypeRegime::IS_A)],
+            TypeInference::ASSERTED,
+            &[(I, TypeInference::IS_A)],
+            &[(S, TypeInference::IS_A)],
         );
         let bound_graphs = |query: &str| -> Vec<String> {
             let answer = sparql_execute(
@@ -1431,10 +1431,10 @@ classes:
     fn an_identifierless_parent_counts_its_subclass_records_after_the_fetch_projection() {
         use crate::sparql_ops::{Op, Retrieval};
         use crate::sparql_plan::PassKind;
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         let sv =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        let dataset = crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]);
+        let dataset = crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]);
         let plan = crate::sparql_plan::plan_of(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT (COUNT(?s) AS ?n) WHERE { ?s a asset360:Structure }",
@@ -2582,7 +2582,7 @@ classes:
                     &sv,
                     &primary,
                     &conv,
-                    &WriteOptions::flat(linkml_runtime::schema_rdf::TypeRegime::ASSERTED),
+                    &WriteOptions::flat(linkml_runtime::schema_rdf::TypeInference::ASSERTED),
                 )
                 .unwrap();
                 store
@@ -2803,7 +2803,7 @@ classes:
             &sv,
             &primary,
             &conv,
-            &WriteOptions::flat(linkml_runtime::schema_rdf::TypeRegime::ASSERTED),
+            &WriteOptions::flat(linkml_runtime::schema_rdf::TypeInference::ASSERTED),
         )
         .unwrap();
 

@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use linkml_runtime::LinkMLInstance;
-use linkml_runtime::schema_rdf::TypeRegime;
+use linkml_runtime::schema_rdf::TypeInference;
 use linkml_runtime::turtle::{WriteOptions, turtle_to_string};
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
@@ -35,7 +35,7 @@ impl Oracle {
     /// turtled the way the engine leg turtles them (`skolem: false`, so an
     /// inlined element is a blank node of its own).
     pub fn new(schema: &SchemaView, records: &[(&str, &str)]) -> Self {
-        Self::new_in(schema, records, TypeRegime::ASSERTED)
+        Self::new_in(schema, records, TypeInference::ASSERTED)
     }
 
     /// [`Oracle::new`] with the records written under type inference `inference`:
@@ -44,7 +44,7 @@ impl Oracle {
     pub(crate) fn new_in(
         schema: &SchemaView,
         records: &[(&str, &str)],
-        inference: TypeRegime,
+        inference: TypeInference,
     ) -> Self {
         Self::load(schema, records, inference, None)
     }
@@ -57,7 +57,7 @@ impl Oracle {
     pub(crate) fn new_in_graph(
         schema: &SchemaView,
         records: &[(&str, &str)],
-        inference: TypeRegime,
+        inference: TypeInference,
         graph: &str,
     ) -> Self {
         Self::load(schema, records, inference, Some(graph))
@@ -66,7 +66,7 @@ impl Oracle {
     fn load(
         schema: &SchemaView,
         records: &[(&str, &str)],
-        inference: TypeRegime,
+        inference: TypeInference,
         graph: Option<&str>,
     ) -> Self {
         let records_graph =
@@ -190,7 +190,7 @@ pub fn fixture(schema: &SchemaView) -> Oracle {
 
 /// Classes to append to the test schema ([`crate::sparql_scoper::tests::test_schema_view_plus`])
 /// for [`fixture_in`]: a real mixin (`Tag`) and a class that carries it
-/// (`Trip`, an `Equipment`), so a inference that lists mixins as types has
+/// (`Trip`, an `Equipment`), so an inference that lists mixins as types has
 /// something to list. The `is_a` chain (`Equipment` > `Relay` > `LatchRelay`)
 /// is already in the base schema.
 pub(crate) const MIXIN_CLASSES: &str = r#"
@@ -267,13 +267,17 @@ fn records_in_inferences() -> Vec<(&'static str, &'static str)> {
 }
 
 /// [`fixture`] written under type inference `inference`.
-pub(crate) fn fixture_in(schema: &SchemaView, inference: TypeRegime) -> Oracle {
+pub(crate) fn fixture_in(schema: &SchemaView, inference: TypeInference) -> Oracle {
     Oracle::new_in(schema, &records_in_inferences(), inference)
 }
 
 /// [`fixture_in`] with the records in the data graph `graph`
 /// ([`Oracle::new_in_graph`]).
-pub(crate) fn fixture_in_graph(schema: &SchemaView, inference: TypeRegime, graph: &str) -> Oracle {
+pub(crate) fn fixture_in_graph(
+    schema: &SchemaView,
+    inference: TypeInference,
+    graph: &str,
+) -> Oracle {
     Oracle::new_in_graph(schema, &records_in_inferences(), inference, graph)
 }
 
@@ -285,7 +289,7 @@ impl Oracle {
         self,
         schema: &SchemaView,
         iri: &str,
-        inference: TypeRegime,
+        inference: TypeInference,
     ) -> Self {
         let quads = crate::sparql_schema_graph::SchemaGraph::build(schema, inference)
             .quads_in(iri)

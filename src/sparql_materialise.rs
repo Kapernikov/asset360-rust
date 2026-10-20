@@ -961,18 +961,18 @@ mod tests {
     /// every rule that asks, for a query naming one: ~300 ms each.
     #[test]
     fn a_plan_builds_only_the_schema_graphs_the_query_can_read_once_per_inference() {
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         const ALIAS: &str = "https://data.infrabel.be/asset360/schema-alias";
         const INFERRED: &str = "https://data.infrabel.be/asset360/schema-inferred";
         const MIXINS: &str = "https://data.infrabel.be/asset360/schema-mixins";
         let dataset = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
             &[],
             &[
-                (SCHEMA_GRAPH, TypeRegime::ASSERTED),
-                (ALIAS, TypeRegime::ASSERTED),
-                (INFERRED, TypeRegime::IS_A),
-                (MIXINS, TypeRegime::IS_A_AND_MIXINS),
+                (SCHEMA_GRAPH, TypeInference::ASSERTED),
+                (ALIAS, TypeInference::ASSERTED),
+                (INFERRED, TypeInference::IS_A),
+                (MIXINS, TypeInference::IS_A_AND_MIXINS),
             ],
         );
         let sv = asset360_schema_view();
@@ -1354,7 +1354,7 @@ mod tests {
     fn the_endpoint_serves_exactly_one_named_graph() {
         let quads = crate::sparql_schema_graph::SchemaGraph::build(
             &asset360_schema_view(),
-            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
         )
         .quads_in(SCHEMA_GRAPH)
         .unwrap();

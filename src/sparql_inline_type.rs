@@ -8,7 +8,7 @@
 //! module is that decision as a pure function of the schema; the rule that
 //! rewrites a plan with it is `sparql_rules::InlineTypeMatchBecomesFilter`.
 
-use linkml_runtime::schema_rdf::{TypeRegime, type_family};
+use linkml_runtime::schema_rdf::{TypeInference, type_family};
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
@@ -57,10 +57,10 @@ pub(crate) fn inline_type_test(
     schema: &SchemaView,
     range: &ClassView,
     c: &ClassView,
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> Option<InlineTypeTest> {
     let key = |class: &ClassView| class.canonical_uri().to_string();
-    let universe = type_family(range, TypeRegime::IS_A_AND_MIXINS).ok()?;
+    let universe = type_family(range, TypeInference::IS_A_AND_MIXINS).ok()?;
     let wanted: std::collections::HashSet<String> =
         type_family(c, inference).ok()?.iter().map(key).collect();
     let matching: Vec<&ClassView> = universe
@@ -123,7 +123,7 @@ mod tests {
             .unwrap()
     }
 
-    fn test(range: &str, c: &str, inference: TypeRegime) -> InlineTypeTest {
+    fn test(range: &str, c: &str, inference: TypeInference) -> InlineTypeTest {
         let sv = test_schema_view();
         inline_type_test(&sv, &class(&sv, range), &class(&sv, c), inference).unwrap()
     }
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn the_verdict_follows_the_inference() {
         use InlineTypeTest::*;
-        for &inference in TypeRegime::NAMED {
+        for &inference in TypeInference::NAMED {
             // A subclass of the range: the elements designated by it.
             assert_eq!(
                 test("Place", "SpotPlace", inference),
@@ -157,25 +157,25 @@ mod tests {
         // The range itself: asserted, only the elements that are plain
         // `Place`s (designator absent, or naming `Place`); inferred, all.
         assert_eq!(
-            test("Place", "Place", TypeRegime::ASSERTED),
+            test("Place", "Place", TypeInference::ASSERTED),
             designator(&["Place"], true)
         );
-        assert_eq!(test("Place", "Place", TypeRegime::IS_A), Discharged);
+        assert_eq!(test("Place", "Place", TypeInference::IS_A), Discharged);
         assert_eq!(
-            test("Place", "Place", TypeRegime::IS_A_AND_MIXINS),
+            test("Place", "Place", TypeInference::IS_A_AND_MIXINS),
             Discharged
         );
         // A leaf range is its own whole family.
         assert_eq!(
-            test("SpotPlace", "SpotPlace", TypeRegime::ASSERTED),
+            test("SpotPlace", "SpotPlace", TypeInference::ASSERTED),
             Discharged
         );
         // A superclass of the range: asserted, an element is only its own
         // class; inferred, it is the superclass too, always.
-        assert_eq!(test("GeoFix", "Fix", TypeRegime::ASSERTED), NeverMatches);
-        assert_eq!(test("GeoFix", "Fix", TypeRegime::IS_A), Discharged);
+        assert_eq!(test("GeoFix", "Fix", TypeInference::ASSERTED), NeverMatches);
+        assert_eq!(test("GeoFix", "Fix", TypeInference::IS_A), Discharged);
         assert_eq!(
-            test("GeoFix", "Fix", TypeRegime::IS_A_AND_MIXINS),
+            test("GeoFix", "Fix", TypeInference::IS_A_AND_MIXINS),
             Discharged
         );
     }
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn a_range_without_a_designator_is_all_one_class() {
         use InlineTypeTest::*;
-        for &inference in TypeRegime::NAMED {
+        for &inference in TypeInference::NAMED {
             assert_eq!(
                 test("Detail", "Coordinates", inference),
                 NeverMatches,
@@ -197,7 +197,10 @@ mod tests {
                 "{inference:?}"
             );
         }
-        assert_eq!(test("Detail", "Detail", TypeRegime::ASSERTED), Discharged);
-        assert_eq!(test("Detail", "Detail", TypeRegime::IS_A), Discharged);
+        assert_eq!(
+            test("Detail", "Detail", TypeInference::ASSERTED),
+            Discharged
+        );
+        assert_eq!(test("Detail", "Detail", TypeInference::IS_A), Discharged);
     }
 }

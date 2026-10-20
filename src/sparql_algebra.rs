@@ -398,7 +398,7 @@ impl Translation<'_> {
                 // record's only `rdf:type` triple is its own class, which is
                 // the same thing.
                 //
-                // A inference that writes neither the direct type nor only the
+                // An inference that writes neither the direct type nor only the
                 // own class (`{own,is_a}`, `{own,mixin}`) has no triple that
                 // says it: `rdf:type` then holds the ancestors too. The
                 // record's own class `d` is the one whose types are all the
@@ -406,7 +406,7 @@ impl Translation<'_> {
                 // states (`own_by_table` below).
                 let own_by_triple = inference
                     .contains(linkml_runtime::schema_rdf::TypePartition::Direct)
-                    || inference.is_subset(linkml_runtime::schema_rdf::TypeRegime::ASSERTED);
+                    || inference.is_subset(linkml_runtime::schema_rdf::TypeInference::ASSERTED);
                 let direct_predicate =
                     if inference.contains(linkml_runtime::schema_rdf::TypePartition::Direct) {
                         linkml_runtime::schema_rdf::SESAME_DIRECT_TYPE
@@ -1263,7 +1263,7 @@ pub(crate) mod equivalence {
     use crate::sparql_oracle::{Oracle, fixture};
     use crate::sparql_rules::{Rule, tier_one_rules};
     use crate::sparql_scoper::tests::test_schema_view;
-    use linkml_runtime::schema_rdf::TypeRegime;
+    use linkml_runtime::schema_rdf::TypeInference;
 
     const PREFIX: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
          PREFIX sesame: <http://www.openrdf.org/schema/sesame#> ";
@@ -1534,11 +1534,11 @@ pub(crate) mod equivalence {
     /// The named inferences, and two that name no direct type and write more than
     /// the own class: `rdf:type` alone cannot say which class a record is,
     /// which the translation of a scan's direct type must not assume.
-    fn inferences_under_test() -> Vec<TypeRegime> {
+    fn inferences_under_test() -> Vec<TypeInference> {
         use linkml_runtime::schema_rdf::TypePartition;
-        let mut inferences = TypeRegime::NAMED.to_vec();
-        inferences.push(TypeRegime::ASSERTED.with(TypePartition::IsA));
-        inferences.push(TypeRegime::ASSERTED.with(TypePartition::Mixin));
+        let mut inferences = TypeInference::NAMED.to_vec();
+        inferences.push(TypeInference::ASSERTED.with(TypePartition::IsA));
+        inferences.push(TypeInference::ASSERTED.with(TypePartition::Mixin));
         inferences
     }
 
@@ -1547,7 +1547,7 @@ pub(crate) mod equivalence {
     /// runs against once per inference, with the dataset whose default graph is
     /// that inference. A rule that is only sound under the asserted inference is
     /// caught here and not by the asserted-only oracle.
-    fn in_each_inference(mut each: impl FnMut(TypeRegime, &SchemaView, &Oracle, &DatasetSpec)) {
+    fn in_each_inference(mut each: impl FnMut(TypeInference, &SchemaView, &Oracle, &DatasetSpec)) {
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
         for inference in inferences_under_test() {
@@ -1604,7 +1604,7 @@ pub(crate) mod equivalence {
             "SELECT ?s ?l WHERE { ?s a asset360:Structure ; asset360:title ?l }",
             "SELECT ?s ?t WHERE { ?s a asset360:Equipment ; a ?t }",
             "SELECT ?s ?t WHERE { ?s a asset360:Relay ; a ?t }",
-            // The scan's direct type, in a inference with no `directType` triple
+            // The scan's direct type, in an inference with no `directType` triple
             // that writes more than the own class (review N2).
             "SELECT ?s ?t WHERE { ?s a asset360:Tag ; a ?t }",
             "SELECT ?s ?d WHERE { ?s a asset360:Tag ; sesame:directType ?d }",
@@ -1656,7 +1656,7 @@ pub(crate) mod equivalence {
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
         for inference in inferences_under_test() {
-            for &graph in TypeRegime::NAMED {
+            for &graph in TypeInference::NAMED {
                 let oracle = crate::sparql_oracle::fixture_in(&schema, inference)
                     .with_schema_graph(&schema, G, graph);
                 let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[(G, graph)]);
@@ -1722,7 +1722,7 @@ pub(crate) mod equivalence {
                     // direct type: no anti-join left.
                     if query.contains("NOT EXISTS")
                         && !query.contains("VALUES ?sub")
-                        && inference != TypeRegime::ASSERTED
+                        && inference != TypeInference::ASSERTED
                         && graph == inference
                     {
                         assert!(!plan.to_string().contains("antijoin"), "{query}\n{plan}");
@@ -1747,23 +1747,23 @@ pub(crate) mod equivalence {
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
         let dataset = crate::sparql_dataset::dataset_with(
-            TypeRegime::ASSERTED,
+            TypeInference::ASSERTED,
             &[
-                (A, TypeRegime::ASSERTED),
-                (I, TypeRegime::IS_A),
-                (M, TypeRegime::IS_A_AND_MIXINS),
+                (A, TypeInference::ASSERTED),
+                (I, TypeInference::IS_A),
+                (M, TypeInference::IS_A_AND_MIXINS),
             ],
-            &[(G, TypeRegime::IS_A)],
+            &[(G, TypeInference::IS_A)],
         );
         let rules = tier_one_rules(&schema, &dataset);
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         for (graph, inference) in [
-            (A, TypeRegime::ASSERTED),
-            (I, TypeRegime::IS_A),
-            (M, TypeRegime::IS_A_AND_MIXINS),
+            (A, TypeInference::ASSERTED),
+            (I, TypeInference::IS_A),
+            (M, TypeInference::IS_A_AND_MIXINS),
         ] {
             let oracle = crate::sparql_oracle::fixture_in_graph(&schema, inference, graph)
-                .with_schema_graph(&schema, G, TypeRegime::IS_A);
+                .with_schema_graph(&schema, G, TypeInference::IS_A);
             // Not vacuous: the records are in the graph, and which types they
             // carry is the graph's inference.
             let both = crate::sparql_scoper::parse_query(
@@ -1775,7 +1775,7 @@ pub(crate) mod equivalence {
             .unwrap();
             assert_eq!(
                 answers(&oracle, &both).is_empty(),
-                inference == TypeRegime::ASSERTED
+                inference == TypeInference::ASSERTED
             );
             for body in [
                 "?s a asset360:Equipment ; a ?t",
@@ -1813,7 +1813,7 @@ pub(crate) mod equivalence {
         const G: &str = "https://data.infrabel.be/asset360/schema";
         let schema =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        let inference = TypeRegime::IS_A;
+        let inference = TypeInference::IS_A;
         let oracle = crate::sparql_oracle::fixture_in(&schema, inference)
             .with_schema_graph(&schema, G, inference);
         let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[(G, inference)]);

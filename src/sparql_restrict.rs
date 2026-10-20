@@ -34,7 +34,7 @@
 
 use std::collections::BTreeSet;
 
-use linkml_runtime::schema_rdf::TypeRegime;
+use linkml_runtime::schema_rdf::TypeInference;
 use linkml_schemaview::schemaview::SchemaView;
 
 use crate::sparql_dataset::GraphReads;
@@ -79,7 +79,7 @@ pub enum Predicate {
     /// the star's type when 3b carries it to the matches.
     Class {
         class_uri: String,
-        inference: TypeRegime,
+        inference: TypeInference,
     },
     /// A condition over slots of `?v`'s record -- `?v.kind = 'GSA'` -- that
     /// the other side's every row satisfies. It lands as a filter above
@@ -1438,12 +1438,12 @@ mod tests {
     /// restriction to be confused with.)
     #[test]
     fn a_restriction_carries_the_inference_of_the_scan_it_came_from() {
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         const I: &str = "urn:graph:inferred";
         let schema = test_schema_view();
         let dataset = crate::sparql_dataset::dataset_with(
-            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-            &[(I, TypeRegime::IS_A)],
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[(I, TypeInference::IS_A)],
             &[],
         );
         let query = format!(
@@ -1467,7 +1467,7 @@ mod tests {
             restriction.predicate,
             Predicate::Class {
                 class_uri: "https://data.infrabel.be/asset360/Signal".to_owned(),
-                inference: TypeRegime::IS_A
+                inference: TypeInference::IS_A
             },
             "{plan}"
         );

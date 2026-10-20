@@ -462,7 +462,7 @@ fn format_blame_map_py(
 
 #[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass(name = "Asset360ChangeMeta")]
+#[pyclass(name = "Asset360ChangeMeta", from_py_object)]
 #[derive(Clone)]
 struct PyAsset360ChangeMeta {
     inner: Asset360ChangeMeta,
@@ -1013,7 +1013,7 @@ fn get_blame_info_py(
 
 #[cfg(feature = "python-bindings")]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass(name = "ForeignReference")]
+#[pyclass(name = "ForeignReference", from_py_object)]
 #[derive(Clone)]
 struct PyForeignReference {
     inner: crate::foreign_references::ForeignReference,
@@ -1328,7 +1328,7 @@ impl PyConstraintSet {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// A filter condition extracted from the SPARQL query, pushable to SQL.
 ///
@@ -1519,7 +1519,7 @@ impl FilterCondition {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// A star in the query plan — one LinkML class with its constraints.
 ///
@@ -1704,7 +1704,7 @@ impl Star {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// A join between two stars, pushable to a SQL JOIN.
 ///
@@ -1784,7 +1784,7 @@ impl JoinEdge {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One node in the query plan algebra tree.
 ///
@@ -1869,7 +1869,7 @@ impl PlanNode {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// Structured plan for fetching data from PostgreSQL.
 ///
@@ -2026,7 +2026,7 @@ impl QueryPlan {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One projected value in a pushdown solution: which slot of which star it
 /// reads, and where that sits in the schema.
@@ -2189,7 +2189,7 @@ impl PushdownBinding {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One aggregate in the SELECT list.
 pub struct PushdownMeasure {
@@ -2263,7 +2263,7 @@ impl PushdownMeasure {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One ``HAVING`` comparison: a column of the grouped result against a
 /// constant.
@@ -2331,7 +2331,7 @@ impl PushdownHaving {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One ``ORDER BY`` term.
 ///
@@ -2427,7 +2427,7 @@ fn py_broken_out_column(class_uri: &str, slot_path: Vec<String>) -> Option<&'sta
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One node of a [`PlanOp::filter_tree`]'s condition tree: a within-star
 /// disjunction or conjunction, or the leaf condition at its bottom.
@@ -2575,7 +2575,7 @@ impl FilterNode {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One column a join key names: a star's identity or slot, or a column of a
 /// relation by alias.
@@ -2626,7 +2626,7 @@ impl JoinColumn {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One column of a ``"constant"``: an inline table the statement joins.
 pub struct ConstantColumn {
@@ -2688,7 +2688,7 @@ impl ConstantColumn {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One export of a ``"relation"``: what the outside reads of the derived
 /// table, under the variable's name as the column's.
@@ -2821,7 +2821,7 @@ impl RelationColumn {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One operator of a database pass: a scan, a filter, a filter tree, a join,
 /// an unnest, a grouping, a sort, a distinct, a slice, a projection, or a
@@ -3570,7 +3570,7 @@ impl PlanOp {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// One step of an execution plan.
 pub struct PlanPass {
@@ -3738,7 +3738,7 @@ impl PlanPass {
 
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 /// What answering a query takes: the obligations it imposes, the passes that
 /// discharge them, and anything left over.
@@ -3909,18 +3909,18 @@ impl ExecutionPlan {
 /// call can forget it.
 ///
 /// * ``default_inference`` -- the default graph: the records, written under this
-///   :class:`TypeRegime`, with no graph name.
+///   :class:`TypeInference`, with no graph name.
 /// * ``data_graphs`` -- named graphs over the golden records, each under a
 ///   inference: ``GRAPH <iri> { ... }`` reads the records under that inference. A
 ///   inference must contain ``TypePartition.OWN``, which holds every non-type
 ///   triple of a record.
 /// * ``schema_graphs`` -- the datamodel as named graphs, each publishing its
-///   subclass edges under a inference.
+///   subclass edges under an inference.
 ///
 /// A query reads **one** data graph (see ``plan_query_refined``), so the
 /// engine loads the records flat under that graph's inference.
 ///
-/// ``DatasetSpec(TypeRegime.ASSERTED)`` is an asserted default graph and no
+/// ``DatasetSpec(TypeInference.ASSERTED)`` is an asserted default graph and no
 /// named graph. ``repr`` round-trips: ``eval(repr(x)) == x``.
 ///
 /// Raises:
@@ -3928,7 +3928,7 @@ impl ExecutionPlan {
 ///         inference lacks ``Own``.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass(name = "DatasetSpec", frozen, eq, hash)]
+#[pyclass(name = "DatasetSpec", frozen, eq, hash, from_py_object)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PyDatasetSpec {
     inner: crate::sparql_dataset::DatasetSpec,
@@ -3941,10 +3941,12 @@ impl PyDatasetSpec {
     #[new]
     #[pyo3(signature = (default_inference, *, data_graphs=None, schema_graphs=None))]
     fn new(
-        default_inference: linkml_runtime_python::PyTypeRegime,
-        data_graphs: Option<std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>>,
+        default_inference: linkml_runtime_python::PyTypeInference,
+        data_graphs: Option<
+            std::collections::HashMap<String, linkml_runtime_python::PyTypeInference>,
+        >,
         schema_graphs: Option<
-            std::collections::HashMap<String, linkml_runtime_python::PyTypeRegime>,
+            std::collections::HashMap<String, linkml_runtime_python::PyTypeInference>,
         >,
     ) -> PyResult<Self> {
         // Every conflict at once, so the message is the whole list.
@@ -3967,7 +3969,7 @@ impl PyDatasetSpec {
     fn default_inference(
         &self,
         py: Python<'_>,
-    ) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
+    ) -> PyResult<Py<linkml_runtime_python::PyTypeInference>> {
         py_inference(py, self.inner.default_inference())
     }
 
@@ -3976,7 +3978,8 @@ impl PyDatasetSpec {
     fn data_graphs(
         &self,
         py: Python<'_>,
-    ) -> PyResult<std::collections::BTreeMap<String, Py<linkml_runtime_python::PyTypeRegime>>> {
+    ) -> PyResult<std::collections::BTreeMap<String, Py<linkml_runtime_python::PyTypeInference>>>
+    {
         self.inner
             .data_graphs()
             .map(|(iri, inference)| Ok((iri.to_owned(), py_inference(py, inference)?)))
@@ -3989,7 +3992,8 @@ impl PyDatasetSpec {
     fn schema_graphs(
         &self,
         py: Python<'_>,
-    ) -> PyResult<std::collections::BTreeMap<String, Py<linkml_runtime_python::PyTypeRegime>>> {
+    ) -> PyResult<std::collections::BTreeMap<String, Py<linkml_runtime_python::PyTypeInference>>>
+    {
         self.inner
             .schema_graphs()
             .map(|(iri, inference)| Ok((iri.to_owned(), py_inference(py, inference)?)))
@@ -3999,7 +4003,7 @@ impl PyDatasetSpec {
     fn __repr__(&self) -> String {
         let inference = inference_repr;
         let mut parts = vec![inference(self.inner.default_inference())];
-        let graphs = |graphs: Vec<(&str, linkml_runtime::schema_rdf::TypeRegime)>| {
+        let graphs = |graphs: Vec<(&str, linkml_runtime::schema_rdf::TypeInference)>| {
             let entries: Vec<String> = graphs
                 .into_iter()
                 .map(|(iri, r)| format!("{}: {}", py_str_repr(iri), inference(r)))
@@ -4024,35 +4028,35 @@ fn py_str_repr(text: &str) -> String {
     format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// The Python object for a inference.
+/// The Python object for an inference.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 fn py_inference(
     py: Python<'_>,
-    inference: linkml_runtime::schema_rdf::TypeRegime,
-) -> PyResult<Py<linkml_runtime_python::PyTypeRegime>> {
-    Py::new(py, linkml_runtime_python::PyTypeRegime::from(inference))
+    inference: linkml_runtime::schema_rdf::TypeInference,
+) -> PyResult<Py<linkml_runtime_python::PyTypeInference>> {
+    Py::new(py, linkml_runtime_python::PyTypeInference::from(inference))
 }
 
-/// How Python spells a inference in a `repr`: the named ones as attributes, any
-/// other set as `TypeRegime.parse('{own,is_a}')`.
+/// How Python spells an inference in a `repr`: the named ones as attributes, any
+/// other set as `TypeInference.parse('{own,is_a}')`.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
-fn inference_repr(inference: linkml_runtime::schema_rdf::TypeRegime) -> String {
-    use linkml_runtime::schema_rdf::TypeRegime;
-    if inference == TypeRegime::ASSERTED {
-        "TypeRegime.ASSERTED".to_owned()
-    } else if inference == TypeRegime::IS_A {
-        "TypeRegime.IS_A".to_owned()
-    } else if inference == TypeRegime::IS_A_AND_MIXINS {
-        "TypeRegime.IS_A_AND_MIXINS".to_owned()
+fn inference_repr(inference: linkml_runtime::schema_rdf::TypeInference) -> String {
+    use linkml_runtime::schema_rdf::TypeInference;
+    if inference == TypeInference::ASSERTED {
+        "TypeInference.ASSERTED".to_owned()
+    } else if inference == TypeInference::IS_A {
+        "TypeInference.IS_A".to_owned()
+    } else if inference == TypeInference::IS_A_AND_MIXINS {
+        "TypeInference.IS_A_AND_MIXINS".to_owned()
     } else {
-        format!("TypeRegime.parse('{inference}')")
+        format!("TypeInference.parse('{inference}')")
     }
 }
 
 /// Which routes may finish a planned query; see :func:`plan_query_refined`.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass_enum)]
-#[pyclass(name = "Finishing", eq, eq_int, hash, frozen)]
+#[pyclass(name = "Finishing", eq, eq_int, hash, frozen, from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PyFinishing {
     /// The engine may finish over the statement's rows when the plan allows
@@ -4614,12 +4618,12 @@ fn sparql_finish(
 ///
 /// Args:
 ///     schema_view: The LinkML schema.
-///     inference: The :class:`TypeRegime` the subclass edges are published
+///     inference: The :class:`TypeInference` the subclass edges are published
 ///         under (a schema graph of a dataset publishes under its own).
 fn sparql_schema_graph_ntriples(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
-    inference: linkml_runtime_python::PyTypeRegime,
+    inference: linkml_runtime_python::PyTypeInference,
 ) -> String {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
@@ -4637,11 +4641,11 @@ fn sparql_schema_graph_ntriples(
 ///
 /// Args:
 ///     schema_view: The LinkML schema.
-///     inference: The :class:`TypeRegime` the graph is published under.
+///     inference: The :class:`TypeInference` the graph is published under.
 fn sparql_schema_graph_skipped(
     py: Python<'_>,
     schema_view: Py<PySchemaView>,
-    inference: linkml_runtime_python::PyTypeRegime,
+    inference: linkml_runtime_python::PyTypeInference,
 ) -> Vec<String> {
     let bound = schema_view.bind(py);
     let sv_ref = bound.borrow();
@@ -4711,7 +4715,7 @@ fn sparql_predeclared_prefixes(
 /// The verdict on one fixed predicate of one subject; see :func:`check_predicates`.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass_enum)]
-#[pyclass(name = "PredicateVerdict", eq, eq_int, hash, frozen)]
+#[pyclass(name = "PredicateVerdict", eq, eq_int, hash, frozen, from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PyPredicateVerdict {
     /// The subject's class family carries a slot under this IRI.
@@ -4725,7 +4729,7 @@ pub enum PyPredicateVerdict {
 /// What :func:`check_predicates` found for one fixed predicate of one subject.
 #[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass(name = "PredicateCheck", frozen, get_all)]
+#[pyclass(name = "PredicateCheck", frozen, get_all, from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyPredicateCheck {
     /// The subject as the query wrote it: ``?t``, ``<iri>`` or ``_:b``.

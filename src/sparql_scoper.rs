@@ -20,7 +20,7 @@ use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use spargebra::{Query, SparqlParser};
 
 use crate::sparql_dataset::{DatasetSpec, GraphReads, QueryGraphs};
-use linkml_runtime::schema_rdf::TypeRegime;
+use linkml_runtime::schema_rdf::TypeInference;
 use linkml_schemaview::identifier::Identifier;
 use linkml_schemaview::schemaview::SchemaView;
 
@@ -183,7 +183,7 @@ pub struct QueryPlan {
     /// ([`crate::sparql_graph_clauses::single_data_graph`]): the engine loads
     /// the records flat under it, and every star above reads its type under
     /// it. A query that reads no records has its dataset's default.
-    pub data_inference: TypeRegime,
+    pub data_inference: TypeInference,
 }
 
 /// What a scoping does with a star its domain leaves untyped.
@@ -3855,7 +3855,7 @@ pub(crate) fn exists_patterns_in_expressions_of(pattern: &GraphPattern) -> Vec<&
 /// The graph one triple pattern reads, as the scoper needs it.
 #[derive(Debug, Clone, Copy)]
 struct TripleGraph {
-    /// What the graph holds: records under a inference, the datamodel, or
+    /// What the graph holds: records under an inference, the datamodel, or
     /// something else.
     reads: GraphReads,
     /// Whether the triple is somebody else's rather than the default
@@ -8899,8 +8899,8 @@ classes:
         const I: &str = "urn:graph:inferred";
         let sv = test_schema_view();
         let dataset = crate::sparql_dataset::dataset_with(
-            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-            &[(A, TypeRegime::ASSERTED), (I, TypeRegime::IS_A)],
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[(A, TypeInference::ASSERTED), (I, TypeInference::IS_A)],
             &[],
         );
         let scoped = |query: &str| {
@@ -8919,18 +8919,18 @@ classes:
 
         // No clause: the dataset's default inference, and the one class.
         let plain = scoped("SELECT ?s WHERE { ?s a asset360:Signal }");
-        assert_eq!(inference_of(&plain), TypeRegime::ASSERTED);
+        assert_eq!(inference_of(&plain), TypeInference::ASSERTED);
         assert_eq!(plain.inexact, None);
 
         // A clause naming data graphs: the inference they share.
         let from_asserted = scoped(&format!(
             "SELECT ?s FROM <{A}> WHERE {{ ?s a asset360:Signal }}"
         ));
-        assert_eq!(inference_of(&from_asserted), TypeRegime::ASSERTED);
+        assert_eq!(inference_of(&from_asserted), TypeInference::ASSERTED);
         let from_inferred = scoped(&format!(
             "SELECT ?s FROM <{I}> WHERE {{ ?s a asset360:Signal }}"
         ));
-        assert_eq!(inference_of(&from_inferred), TypeRegime::IS_A);
+        assert_eq!(inference_of(&from_inferred), TypeInference::IS_A);
         assert_eq!(from_inferred.inexact, None);
         // Data graphs of different inferences are two data graphs: refused.
         let refused = sparql_scope(
@@ -8952,7 +8952,7 @@ classes:
         let in_graph = scoped(&format!(
             "SELECT ?s WHERE {{ GRAPH <{I}> {{ ?s a asset360:Signal }} }}"
         ));
-        assert_eq!(inference_of(&in_graph), TypeRegime::IS_A);
+        assert_eq!(inference_of(&in_graph), TypeInference::IS_A);
         assert_eq!(in_graph.inexact, None);
 
         // A clause naming something the dataset does not serve is the
@@ -8995,8 +8995,8 @@ classes:
 ",
         );
         let dataset = crate::sparql_dataset::dataset_with(
-            linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
-            &[(A, TypeRegime::ASSERTED), (I, TypeRegime::IS_A)],
+            linkml_runtime::schema_rdf::TypeInference::ASSERTED,
+            &[(A, TypeInference::ASSERTED), (I, TypeInference::IS_A)],
             &[],
         );
         let scope = |query: &str| {
@@ -9046,7 +9046,7 @@ classes:
         ));
         assert_eq!(both.root.all_stars().len(), 1);
         assert_eq!(classes(&both), vec![beacon, signal]);
-        assert_eq!(both.data_inference, TypeRegime::IS_A);
+        assert_eq!(both.data_inference, TypeInference::IS_A);
     }
 
     #[test]

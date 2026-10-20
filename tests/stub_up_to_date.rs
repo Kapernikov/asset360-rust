@@ -1,6 +1,6 @@
 //! Guard the committed Python type stubs against silent drift.
 //!
-//! `python/asset360_rust/_native2.pyi` is generated from the PyO3 bindings and
+//! `python/asset360_rust/_native2/__init__.pyi` is generated from the PyO3 bindings and
 //! shipped inside the wheel, but nothing regenerated it: it fell three commits
 //! behind the v0.8.4 release it shipped with (missing `load_json_batch` and
 //! `PlanOp.retrieval`) because `stub_gen --check` existed and was never run.
@@ -46,7 +46,7 @@ fn committed_python_stubs_match_the_bindings() {
 fn committed_python_stubs_are_parseable_python() {
     let stub = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/python/asset360_rust/_native2.pyi"
+        "/python/asset360_rust/_native2/__init__.pyi"
     );
 
     let output = Command::new("python3")
@@ -147,7 +147,7 @@ fn gen_stub_attributes_precede_the_pyo3_attributes() {
 fn committed_python_stubs_attach_every_setter_to_its_property() {
     let stub = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/python/asset360_rust/_native2.pyi"
+        "/python/asset360_rust/_native2/__init__.pyi"
     );
 
     let audit = r#"

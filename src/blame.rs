@@ -151,13 +151,15 @@ mod py_conversions {
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
 
-    impl<'py> FromPyObject<'py> for Asset360ChangeMeta {
-        fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+    impl<'a, 'py> FromPyObject<'a, 'py> for Asset360ChangeMeta {
+        type Error = PyErr;
+
+        fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
             if let Ok(meta_obj) = ob.extract::<PyRef<PyAsset360ChangeMeta>>() {
                 return Ok(meta_obj.clone_inner());
             }
 
-            let dict = ob.downcast::<PyDict>()?;
+            let dict = ob.cast::<PyDict>()?;
             let require = |key: &str| {
                 dict.get_item(key)?
                     .ok_or_else(|| PyValueError::new_err(format!("missing '{key}' in metadata")))

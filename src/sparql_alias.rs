@@ -109,7 +109,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use linkml_runtime::schema_rdf::TypeRegime;
+use linkml_runtime::schema_rdf::TypeInference;
 use linkml_schemaview::classview::ClassView;
 use linkml_schemaview::schemaview::SchemaView;
 use spargebra::Query;
@@ -1006,12 +1006,12 @@ pub fn check_predicates(
     Ok(judge_predicates(query, schema_view, bound, inference))
 }
 
-/// [`check_predicates`] under a inference already known.
+/// [`check_predicates`] under an inference already known.
 fn judge_predicates(
     query: &Query,
     schema_view: &SchemaView,
     bound: &[(String, String)],
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> Vec<PredicateCheck> {
     let pattern = match query {
         Query::Select { pattern, .. }
@@ -1106,7 +1106,7 @@ fn judge_predicates(
 /// must never refuse a query some data graph answers (a narrower graph just
 /// answers fewer rows, which is the planner's business, not a spelling
 /// error).
-const WIDEST_INFERENCE: TypeRegime = TypeRegime::IS_A_AND_MIXINS;
+const WIDEST_INFERENCE: TypeInference = TypeInference::IS_A_AND_MIXINS;
 
 /// A class and its subclasses: what a subject typed with it may be. `None`
 /// when the schema cannot list the subclasses, so the caller reports the
@@ -1117,13 +1117,17 @@ const WIDEST_INFERENCE: TypeRegime = TypeRegime::IS_A_AND_MIXINS;
 ///
 /// The family is `type_family(class, inference)`: the planner's refusals pass
 /// [`WIDEST_INFERENCE`], the linter the inference of the graph it reads.
-fn family(class: &ClassView, inference: TypeRegime) -> Option<Vec<ClassView>> {
+fn family(class: &ClassView, inference: TypeInference) -> Option<Vec<ClassView>> {
     linkml_runtime::schema_rdf::type_family(class, inference).ok()
 }
 
 /// The family to judge a subject by: `C` alone for an exact (`directType`)
 /// type, `C` and its subclasses otherwise. Every judgement goes through here.
-fn judged_family(class: &ClassView, exact: bool, inference: TypeRegime) -> Option<Vec<ClassView>> {
+fn judged_family(
+    class: &ClassView,
+    exact: bool,
+    inference: TypeInference,
+) -> Option<Vec<ClassView>> {
     if exact {
         Some(vec![class.clone()])
     } else {
@@ -1157,7 +1161,7 @@ fn single_type(spellings: &SubjectSpellings) -> Option<&str> {
 fn judged_type<'a>(
     spellings: &'a SubjectSpellings,
     schema_view: &SchemaView,
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> Option<(&'a str, bool)> {
     let mut exact = spellings.exact_types.iter();
     let Some(direct) = exact.next() else {
@@ -1194,7 +1198,7 @@ fn judged_type<'a>(
 fn infer_reached_classes(
     scope: &Scope,
     schema_view: &SchemaView,
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> BTreeMap<String, Reach> {
     let conv = schema_view.converter();
     let mut known: BTreeMap<String, Reach> = BTreeMap::new();
@@ -1286,7 +1290,7 @@ fn uncarried(
     class_name: &str,
     reached_through: Option<ReachedThrough>,
     schema_view: &SchemaView,
-    inference: TypeRegime,
+    inference: TypeInference,
 ) -> NotASlotOfClass {
     let conv = schema_view.converter();
     // The slot name the predicate resolves to anywhere in the schema, or
@@ -2582,7 +2586,7 @@ classes:
             &parsed,
             &schema_view(),
             &bound,
-            &crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]),
+            &crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]),
         )
         .expect("one data graph")
     }
@@ -2708,14 +2712,14 @@ classes:
             };
             assert!(
                 matches!(
-                    verdict_under(TypeRegime::IS_A),
+                    verdict_under(TypeInference::IS_A),
                     PredicateVerdict::Carried { .. }
                 ),
                 "{query}"
             );
             assert!(
                 matches!(
-                    verdict_under(TypeRegime::ASSERTED),
+                    verdict_under(TypeInference::ASSERTED),
                     PredicateVerdict::NotCarried(_)
                 ),
                 "{query}"
@@ -2744,7 +2748,7 @@ classes:
             .unwrap_or_else(|| panic!("{predicate} is checked in {query}"))
             .verdict
         };
-        for inference in [TypeRegime::IS_A, TypeRegime::ASSERTED] {
+        for inference in [TypeInference::IS_A, TypeInference::ASSERTED] {
             // Carried: a slot the class itself declares.
             let query = format!("SELECT ?r WHERE {{ ?s <{DIRECT}> <{ZONE}> ; <{ZONE_NAME}> ?r }}");
             assert!(
@@ -2767,13 +2771,13 @@ classes:
         }
         let widened = format!("SELECT ?c WHERE {{ ?s a <{LNE}> ; <{CODE}> ?c }}");
         assert!(matches!(
-            judge(&widened, TypeRegime::IS_A, CODE),
+            judge(&widened, TypeInference::IS_A, CODE),
             PredicateVerdict::Carried { .. }
         ));
         // A variable object seeds nothing.
         let query = format!("SELECT ?c WHERE {{ ?s <{DIRECT}> ?t ; <{CODE}> ?c }}");
         assert_eq!(
-            judge(&query, TypeRegime::IS_A, CODE),
+            judge(&query, TypeInference::IS_A, CODE),
             PredicateVerdict::Unchecked
         );
         // `a D` with `directType C`, C a D: judged by C exactly; C not a D:
@@ -2781,13 +2785,13 @@ classes:
         let query =
             format!("SELECT ?c WHERE {{ ?s a <{LNE}> ; <{DIRECT}> <{LNE}> ; <{CODE}> ?c }}");
         assert!(matches!(
-            judge(&query, TypeRegime::IS_A, CODE),
+            judge(&query, TypeInference::IS_A, CODE),
             PredicateVerdict::NotCarried(_)
         ));
         let query =
             format!("SELECT ?c WHERE {{ ?s a <{ZONE}> ; <{DIRECT}> <{LNE}> ; <{CODE}> ?c }}");
         assert_eq!(
-            judge(&query, TypeRegime::IS_A, CODE),
+            judge(&query, TypeInference::IS_A, CODE),
             PredicateVerdict::Unchecked
         );
         // The planner refuses it too: no record has `directType` C and a

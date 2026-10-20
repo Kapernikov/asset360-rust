@@ -4374,7 +4374,7 @@ mod tests {
     fn lowered_in(
         query: &str,
         sv: &SchemaView,
-        inference: linkml_runtime::schema_rdf::TypeRegime,
+        inference: linkml_runtime::schema_rdf::TypeInference,
     ) -> Result<OpTree, LoweringRefusal> {
         let dataset = crate::sparql_dataset::dataset_with(inference, &[], &[]);
         let rules = crate::sparql_rules::tier_one_rules(sv, &dataset);
@@ -4394,10 +4394,10 @@ mod tests {
     /// the claimed one and refused (#511).
     #[test]
     fn a_scan_discharges_a_parent_type_claim_when_its_family_is_inside() {
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         let sv = test_schema_view();
         let query = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment }";
-        let tree = lowered_in(query, &sv, TypeRegime::IS_A).expect("should lower under is_a");
+        let tree = lowered_in(query, &sv, TypeInference::IS_A).expect("should lower under is_a");
         let Op::Scan { class_uri, .. } = &tree.nodes[0].op else {
             panic!("the first node is the scan");
         };
@@ -4407,7 +4407,7 @@ mod tests {
         // declines and nothing folds into one scan claiming both.
         assert!(
             matches!(
-                lowered_in(query, &sv, TypeRegime::ASSERTED),
+                lowered_in(query, &sv, TypeInference::ASSERTED),
                 Err(LoweringRefusal::NothingPushed)
             ),
             "asserted: nothing folds, and lowering says so"
@@ -4416,7 +4416,7 @@ mod tests {
         let sibling = "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Switch }";
         assert!(
             matches!(
-                lowered_in(sibling, &sv, TypeRegime::IS_A),
+                lowered_in(sibling, &sv, TypeInference::IS_A),
                 Err(LoweringRefusal::NothingPushed)
             ),
             "siblings do not fold, and lowering says so"
@@ -4426,13 +4426,13 @@ mod tests {
     /// The same with the record named: the identifier narrowing survives.
     #[test]
     fn a_named_record_keeps_its_identifier_narrowing_beside_a_parent_type() {
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         let sv = test_schema_view();
         let iri = "https://data.infrabel.be/asset360/relay-1";
         let query = format!(
             "SELECT ?s WHERE {{ VALUES ?s {{ <{iri}> }} ?s a asset360:Relay , asset360:Equipment }}"
         );
-        let tree = lowered_in(&query, &sv, TypeRegime::IS_A).expect("should lower under is_a");
+        let tree = lowered_in(&query, &sv, TypeInference::IS_A).expect("should lower under is_a");
         let Op::Scan {
             class_uri,
             identifier_values,
@@ -5677,13 +5677,13 @@ mod retrieval_tests {
     /// retrieval keeps the identifier of every class the scan can return.
     #[test]
     fn a_scan_of_an_identifierless_parent_keeps_its_subclasses_identifiers() {
-        use linkml_runtime::schema_rdf::TypeRegime;
+        use linkml_runtime::schema_rdf::TypeInference;
         let sv =
             crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
         let plan = plan_of(
             &format!("{PREFIX}SELECT (COUNT(?s) AS ?n) WHERE {{ ?s a asset360:Structure }}"),
             &sv,
-            &crate::sparql_dataset::dataset_with(TypeRegime::IS_A, &[], &[]),
+            &crate::sparql_dataset::dataset_with(TypeInference::IS_A, &[], &[]),
         )
         .expect("should plan");
         let scans: Vec<(Vec<String>, Retrieval)> = plan

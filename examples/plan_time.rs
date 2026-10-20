@@ -13,13 +13,13 @@ fn main() {
         .map(|iri| {
             (
                 iri.clone(),
-                linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+                linkml_runtime::schema_rdf::TypeInference::ASSERTED,
             )
         })
         .into_iter()
         .collect();
     let mut dataset = asset360_rust::sparql_dataset::DatasetSpec::builder(
-        linkml_runtime::schema_rdf::TypeRegime::ASSERTED,
+        linkml_runtime::schema_rdf::TypeInference::ASSERTED,
     );
     for (iri, inference) in schema_graphs {
         dataset = dataset.with_schema_graph(iri, inference);

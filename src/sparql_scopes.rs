@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use linkml_runtime::schema_rdf::TypeRegime;
+use linkml_runtime::schema_rdf::TypeInference;
 
 use linkml_schemaview::schemaview::SchemaView;
 
@@ -646,7 +646,7 @@ impl Plan {
         node: NodeId,
         var: &str,
         class_uri: &str,
-    ) -> Option<TypeRegime> {
+    ) -> Option<TypeInference> {
         self.producers_of(node, var)
             .into_iter()
             .any(|producer| {
