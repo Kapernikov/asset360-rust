@@ -817,10 +817,10 @@ mod tests {
         use crate::sparql_scoper::tests::asset360_fixture_schema_view;
         let fixture = asset360_fixture_schema_view();
         let prefix = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
-        let body = "?a a asset360:TunnelComplex ; asset360:typeURI ?name . \
+        let body = "?a a asset360:TunnelComplex ; asset360:controllerTechnology ?name . \
              OPTIONAL { ?a asset360:hasCoveredSection ?cs . \
              ?cs asset360:belongsToTrack ?track ; asset360:hasSequenceNumber ?seq . \
-             ?track a asset360:Track ; asset360:typeURI ?trackName }";
+             ?track a asset360:Track ; asset360:refersToLine ?trackName }";
         // Scalar projection: statement, `?cs` pruned.
         let scalar = format!("{prefix}SELECT ?name ?seq ?track ?trackName WHERE {{ {body} }}");
         assert_eq!(

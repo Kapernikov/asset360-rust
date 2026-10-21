@@ -1406,9 +1406,7 @@ impl Visible {
             // That is a capability gap against today's planner, which pushes
             // such a constraint as `Star::identifier_values`. Closing it needs
             // an *address* for a record's identity, which no `Expr::Slot` has
-            // -- a representation change rather than a rule. A constraint
-            // written on the identifier slot itself
-            // (`?s :asset360_uri "u"`) does push, through the slot.
+            // -- a representation change rather than a rule.
             slots.insert(star_var.clone(), None);
             // A slot that binds no variable is invisible here without a
             // special case: there is no name to resolve. That covers the read
@@ -2736,22 +2734,6 @@ impl<'s> ConstantObjectBecomesFilter<'s> {
         let on_class = slot_for_predicate_on_class_or_descendant(self.schema, &class, predicate)
             .ok()
             .flatten()?;
-        // Identity is [`FoldIdentityConstant`]'s, and the two rules have to be
-        // disjoint or the plan depends on which fired first -- which it did:
-        // reversed, this rule turned `?s :id "u"` into a JSONB path condition
-        // plus an existence check on a column that is structurally always
-        // there, and the identity fold then had nothing left to fold.
-        //
-        // Declining is also the right answer on its own terms. The identifier
-        // is the record's URI in an indexed column, not a value in the
-        // payload, and a condition naming it as a path is a different (and
-        // slower) question.
-        if class
-            .identifier_slot()
-            .is_some_and(|identifier| identifier.name == on_class.name)
-        {
-            return None;
-        }
         // A constant object on a multivalued slot is a containment test, and
         // *not* a fan-out: `?s :trafficKinds "m"` binds nothing, so a record
         // whose array carries the value answers the query once however many
@@ -2952,80 +2934,32 @@ fn replace_match_with_filter(
 }
 
 // ---------------------------------------------------------------------------
-// Fold a constant on the identifier slot
+// Fold a constraint on the subject's identity
 // ---------------------------------------------------------------------------
 
-/// `?ce asset360:id "X"` becomes the scan's identity, not a condition on a
-/// column.
+/// `VALUES ?s { <iri> }` and `FILTER(?s = <iri>)` become the scan's identity,
+/// not a condition on a column.
 ///
 /// Without it the refined planner is *blind to identity*: its scan reads every
-/// record of the class and leaves the restriction to the engine, on the query
-/// every named source in the product runs. The comparator caught it as
-/// "?ce disagrees about identifier values: [] against [X]", which is also why
-/// the two-star form fell back with "2 islands" -- with identity unfolded,
-/// nothing joined the two stars in SQL.
+/// record of the class and leaves the restriction to the engine.
 ///
 /// **Identity is not a slot value.** The identifier is the record's own URI,
-/// which lives in an indexed column, and the writer emits no triple for it --
-/// so this is neither [`ConstantObjectBecomesFilter`]'s JSONB path condition
-/// nor a claim that can answer anything on its own. Two consequences, both
-/// load-bearing:
+/// which lives in an indexed column, and the writer emits no triple for it:
+/// the identifier slot is not a predicate (a query naming it is refused), the
+/// identity is the subject IRI. So the only identity a query can state is on
+/// the subject itself, and the term rule does not apply: the comparison is
+/// against the identity, not against stored text.
 ///
-/// * **The term rule does not apply.** A condition on a column compares stored
-///   text, and [`Expr::to_sql`] refuses a constant the column's values never
-///   spell. Here there is no column and no stored text: the comparison is
-///   against the identity, and the query may write it as a literal or as an
-///   IRI -- the product does both, in the same set of form configs -- with the
-///   same string either way. Today's star decomposition bypasses the term rule
-///   here for the same reason, in the same words.
-/// * **It narrows, and never answers.** The engine's answer to `?ce :id "X"`
-///   is *empty*, because the graph has no such triple.
-///   `LoweringRefusal::IdentityIsNotATriple` refuses a statement that would
-///   answer alone while resting on one, which is the wrong answer today's
-///   aggregate route gives: one record where the engine reports none.
-///
-/// Preconditions, each with the wrong answer it prevents:
-///
-/// * **The predicate is the class's `identifier` slot**, from the class view
-///   rather than by name, so this works for any managed class. A `key`-only
-///   slot is *not* folded: a key is a local name rather than the record's URI,
-///   so comparing it against the identity column would narrow to nothing and
-///   answer empty. (Today's decomposition folds those too; no managed class
-///   has one, so the divergence is unreachable -- see the report.)
-/// * **One identity per scan.** `?s :id "a" ; :id "b"` asks for a record whose
-///   identity is both, which is no record; folding both into a set would ask
-///   for *either* and answer two. The second constant declines and the engine
-///   answers it -- correctly, with nothing.
-/// * **The match's one consumer is a plain join whose other side takes every
-///   row from the scan**, as for any constant object: identity inside an
-///   `OPTIONAL` is not a restriction on the preserved side.
-pub struct FoldIdentityConstant<'s> {
-    schema: &'s SchemaView,
-}
-
-impl<'s> FoldIdentityConstant<'s> {
-    pub fn new(schema: &'s SchemaView) -> Self {
-        Self { schema }
-    }
-
-    /// The name of the class's identifier slot, when it has one.
-    ///
-    /// `identifier_slot` and not `key_or_identifier_slot`: see the
-    /// precondition above.
-    fn identifier_of(&self, class_uri: &str) -> Option<String> {
-        let class = self.schema.get_class_by_uri(class_uri).ok().flatten()?;
-        class.identifier_slot().map(|slot| slot.name.clone())
-    }
-}
+/// **It narrows, and never answers.** `LoweringRefusal::IdentityIsNotATriple`
+/// refuses a statement that would answer alone while resting on one.
+pub struct FoldIdentityConstant;
 
 /// The identity constraint a node states on a *star variable*, when it states
 /// one this rule can fold: the IRIs a record's own name is allowed to be.
 ///
-/// Three spellings of one question reach here, and the point of resolving them
+/// Two spellings of one question reach here, and the point of resolving them
 /// in one place is that they are the same question:
 ///
-/// * `?s asset360:id "<uri>"` -- a triple on the identifier slot, handled by
-///   the other arm because it has a slot address.
 /// * `VALUES ?s { <uri> }`
 /// * `FILTER(?s = <uri>)`
 ///
@@ -3225,97 +3159,12 @@ fn remove_nodes(plan: &mut Plan, removed: &[NodeId]) {
     plan.rebuild(nodes, &remap);
 }
 
-impl Rule for FoldIdentityConstant<'_> {
+impl Rule for FoldIdentityConstant {
     fn name(&self) -> &'static str {
         "fold_identity_constant"
     }
 
     fn apply(&self, plan: &mut Plan) -> bool {
-        for id in 0..plan.nodes.len() {
-            if plan.nodes[id].executor != Executor::Engine {
-                continue;
-            }
-            let PlanOp::Match { pattern, .. } = &plan.nodes[id].op else {
-                continue;
-            };
-            if is_type_pattern(pattern) {
-                continue;
-            }
-            let (Some(star), Some(predicate), Some(term)) = (
-                subject_variable(pattern),
-                predicate_iri(pattern),
-                constant_object(pattern),
-            ) else {
-                continue;
-            };
-            let (star, predicate) = (star.to_owned(), predicate.to_owned());
-
-            let above = consumers(plan, id);
-            let [consumer] = above.as_slice() else {
-                continue;
-            };
-            let PlanOp::Join {
-                left, right, on, ..
-            } = &plan.nodes[*consumer].op
-            else {
-                continue;
-            };
-            if on.as_slice() != [star.clone()] {
-                continue;
-            }
-            let (consumer, other) = (*consumer, if *left == id { *right } else { *left });
-
-            // The scan this identity belongs to, and its class's identifier.
-            let Some(site) = subject_site(plan, other, &star) else {
-                continue;
-            };
-            if !reads_the_records(plan, id) {
-                continue;
-            }
-            if !site.prefix.is_empty() {
-                // A nested structure has no identity of its own to fix.
-                continue;
-            }
-            let Some(identifier) = self.identifier_of(&site.class_uri) else {
-                continue;
-            };
-            let Some(slot) = self.schema.get_slot_by_uri(&predicate).ok().flatten() else {
-                continue;
-            };
-            if slot.name != identifier {
-                continue;
-            }
-            if let PlanOp::Scan {
-                identifier_values, ..
-            } = &plan.nodes[site.scan].op
-                && !identifier_values.is_empty()
-            {
-                continue;
-            }
-
-            // The value as the identity column stores it: a literal's lexical
-            // form and an IRI's string are the same URI, which is what makes
-            // both spellings the same question here.
-            let value = crate::sparql_refine::lexical_of(&term);
-            if let PlanOp::Scan {
-                identifier_values, ..
-            } = &mut plan.nodes[site.scan].op
-            {
-                identifier_values.push(value);
-            }
-            let mut claims = plan.nodes[id].discharges.clone();
-            claims.extend(plan.nodes[consumer].discharges.iter().copied());
-            plan.nodes[site.scan].discharges.extend(claims);
-            plan.nodes[site.scan].discharges.sort_unstable();
-
-            collapse_leaf_into(plan, id, consumer, other);
-            return true;
-        }
-
-        // The same fold, from a constraint written on the star variable
-        // itself. Separate loop rather than a second shape in the one above,
-        // because what it collapses differs -- a `VALUES` takes its join with
-        // it, a `FILTER` is unary -- while what it *decides* is shared.
         for id in 0..plan.nodes.len() {
             if plan.nodes[id].executor != Executor::Engine {
                 continue;
@@ -5433,18 +5282,6 @@ impl Rule for NarrowByAKeptHop<'_> {
             {
                 continue;
             }
-            // The identifier's existence check is structurally always true --
-            // every row has an identity -- so it narrows nothing. The
-            // lowering drops it for that reason, and adding it here would
-            // make the plan depend on whether this rule ran before the
-            // identity fold: `the_rule_order_does_not_decide_the_fixpoint`
-            // caught exactly that.
-            if class
-                .identifier_slot()
-                .is_some_and(|identifier| identifier.name == on_class.name)
-            {
-                continue;
-            }
             let multivalued =
                 on_class.determine_slot_container_mode() != SlotContainerMode::SingleValue;
             if let PlanOp::Scan { slots, .. } = &mut plan.nodes[scan].op {
@@ -5761,12 +5598,10 @@ impl PushProjection<'_> {
         }) {
             return false;
         }
-        // An identifier restriction narrows a fetch and cannot answer: the
-        // writer emits no triple for a record's identifier, so the engine's
-        // answer to `?s :id "X"` is empty and a statement that answered it
-        // would report a record the query has no solution for. The lowering
-        // refuses such a statement (`IdentityIsNotATriple`); declining here
-        // keeps the plan the fetch it was, with the identity on the scan.
+        // An identity restriction narrows a fetch and does not answer: the
+        // lowering refuses such a statement (`IdentityIsNotATriple`);
+        // declining here keeps the plan the fetch it was, with the identity
+        // on the scan.
         if plan.nodes.iter().any(|node| {
             matches!(&node.op, PlanOp::Scan { identifier_values, .. }
                 if node.executor == Executor::Sql && !identifier_values.is_empty())
@@ -5852,7 +5687,7 @@ pub fn tier_one_rules<'a>(
         Box::new(DeliverOptionalRead::new(schema)),
         Box::new(AbsorbOptionalRead::new(schema)),
         Box::new(AbsorbOptionalReference::new(schema)),
-        Box::new(FoldIdentityConstant::new(schema)),
+        Box::new(FoldIdentityConstant),
         Box::new(ConstantObjectBecomesFilter::new(schema)),
         Box::new(ValuesBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
@@ -8089,61 +7924,6 @@ mod tests {
         println!("{plan}");
     }
 
-    /// The rule the application needed: identity folds onto the scan, so the
-    /// statement reads one record instead of a class.
-    ///
-    /// Both spellings, because the product's own form configs use both -- a
-    /// literal in the civil-engineering form, an IRI in the locality one --
-    /// and they carry the same URI.
-    #[test]
-    fn an_identifier_constant_folds_onto_the_scan() {
-        let schema = test_schema_view();
-        for object in ["\"u-1\"", "<https://data.infrabel.be/data/Signals/u-1>"] {
-            let plan = refined(
-                &format!(
-                    "SELECT ?nm WHERE {{ ?s a asset360:Signal ; asset360:asset360_uri {object} ; \
-                     asset360:name ?nm }}"
-                ),
-                &schema,
-                false,
-            );
-
-            assert!(plan.find("match").is_empty(), "{object}\n{plan}");
-            assert!(plan.find("join").is_empty(), "{object}\n{plan}");
-            assert!(
-                plan.find("filter").is_empty(),
-                "identity is not a condition on a column:\n{plan}"
-            );
-            let PlanOp::Scan {
-                identifier_values,
-                slots,
-                ..
-            } = &plan.nodes[plan.find("scan")[0]].op
-            else {
-                panic!("{plan}");
-            };
-            assert_eq!(identifier_values.len(), 1, "{object}\n{plan}");
-            assert!(
-                identifier_values[0].ends_with("u-1"),
-                "the same URI either way: {identifier_values:?}"
-            );
-            // And no existence check for it: every record has an identity.
-            assert!(
-                !slots.iter().any(|slot| slot.path == ["asset360_uri"]),
-                "{plan}"
-            );
-            // The scan claims the triple, since it is what restricts the rows.
-            assert_eq!(
-                plan.nodes[plan.find("scan")[0]].discharges.len(),
-                3,
-                "{plan}"
-            );
-            plan.check()
-                .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
-            println!("{plan}");
-        }
-    }
-
     /// The two-star form the product actually sends: with identity folded, the
     /// reference join has something to join *on*, and the plan is one
     /// statement rather than two islands.
@@ -8151,7 +7931,7 @@ mod tests {
     fn identity_folded_lets_the_reference_join_push() {
         let schema = test_schema_view();
         let plan = refined(
-            "SELECT ?tn WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
+            "SELECT ?tn WHERE { <https://data.infrabel.be/data/Signals/u-1> a asset360:Signal ; \
              asset360:locatedOnTrack ?t . ?t a asset360:Track ; asset360:hasName ?tn }",
             &schema,
             false,
@@ -8165,53 +7945,6 @@ mod tests {
         );
         assert!(plan.find("match").is_empty(), "{plan}");
         println!("{plan}");
-    }
-
-    /// What the identity fold declines, and the answer each would break.
-    #[test]
-    fn what_the_identity_fold_declines() {
-        let schema = test_schema_view();
-        let identity_of = |query: &str| -> Vec<String> {
-            let plan = refined(query, &schema, false);
-            plan.nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    PlanOp::Scan {
-                        identifier_values, ..
-                    } => Some(identifier_values.clone()),
-                    _ => None,
-                })
-                .flatten()
-                .collect()
-        };
-
-        // Two identities is no record, and folding both as a set would ask for
-        // either and answer two. The second declines and the engine answers
-        // it -- correctly, with nothing.
-        assert_eq!(
-            identity_of(
-                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"a\" ; \
-                 asset360:asset360_uri \"b\" }"
-            )
-            .len(),
-            1,
-            "one identity per scan"
-        );
-
-        // A constant on an ordinary slot is not identity.
-        assert!(
-            identity_of("SELECT ?s WHERE { ?s a asset360:Signal ; asset360:name \"BX517\" }")
-                .is_empty()
-        );
-
-        // Identity inside an `OPTIONAL` does not restrict the preserved side.
-        assert!(
-            identity_of(
-                "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:kind ?k . \
-                 OPTIONAL { ?s asset360:asset360_uri \"a\" } }"
-            )
-            .is_empty()
-        );
     }
 
     /// What the rule is for: a constant object is a value constraint, so it
@@ -8944,7 +8677,8 @@ mod tests {
         "SELECT ?s WHERE { { SELECT ?s WHERE { ?s a asset360:Signal ; \
          asset360:name ?nm } LIMIT 3 } }",
         "SELECT ?s WHERE { VALUES ?s { \"a\" \"b\" } }",
-        "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u\" }",
+        "SELECT ?nm WHERE { <https://data.infrabel.be/asset360/sig-1> a asset360:Signal ; \
+         asset360:name ?nm }",
         "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm . \
          VALUES ?nm { \"a\" \"b\" } }",
         "SELECT ?kind (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
@@ -9480,9 +9214,9 @@ mod tests {
         );
     }
 
-    /// Four spellings of "this one asset, by identifier", and one plan.
+    /// Three spellings of "this one asset, by identifier", and one plan.
     ///
-    /// The four are what the form configurations actually contain or are being
+    /// The three are what the form configurations actually contain or are being
     /// asked to move to, so the planner has to read all of them as one row
     /// against the indexed identifier column rather than as a class scan the
     /// engine narrows afterwards. The second is the *canonical* one and was
@@ -9496,11 +9230,6 @@ mod tests {
         let schema = test_schema_view();
         let uri = "https://data.infrabel.be/asset360/sig-1";
         for (query, spelling) in [
-            (
-                "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm ; \
-                 asset360:asset360_uri \"https://data.infrabel.be/asset360/sig-1\" }",
-                "the identifier slot, which is what the configurations send today",
-            ),
             (
                 "SELECT ?nm WHERE { <https://data.infrabel.be/asset360/sig-1> \
                  a asset360:Signal ; asset360:name ?nm }",
@@ -9643,9 +9372,8 @@ mod tests {
              OPTIONAL { ?t a asset360:Track ; asset360:hasName ?tn } }",
             // ...and on the optional side, which is the same edge read the
             // other way round.
-            "SELECT ?s ?bn WHERE { ?s a asset360:Signal . \
-             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s ; \
-             asset360:asset360_uri ?bn } }",
+            "SELECT ?s ?bg WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s } }",
         ] {
             let plan = refined(query, &schema, false);
             let leftjoin = plan.find("leftjoin")[0];
@@ -9907,12 +9635,10 @@ mod tests {
             "SELECT DISTINCT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
              ORDER BY ?s LIMIT 10"
         ));
-        // An identifier restriction: the writer emits no triple for it, so the
-        // engine's answer is empty and a statement that answered would report
-        // a record the query has no solution for.
+        // An identity restriction narrows a fetch and does not answer alone.
         assert!(!answers(
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
-             asset360:name ?nm }"
+            "SELECT ?nm WHERE { <https://data.infrabel.be/asset360/sig-1> \
+             a asset360:Signal ; asset360:name ?nm }"
         ));
         // A projected structure: an inlined range serialises as a blank node
         // nothing can reproduce, so the column has no term shape.
@@ -10844,7 +10570,7 @@ mod element_held_optional_reference {
             &[
                 (
                     "Track",
-                    r#"{"id": "https://data.infrabel.be/asset360/track/T1", "typeURI": "https://example.org/Main"}"#,
+                    r#"{"id": "https://data.infrabel.be/asset360/track/T1", "refersToLine": "https://data.infrabel.be/asset360/line/L1"}"#,
                 ),
                 (
                     "Line",
@@ -10872,7 +10598,7 @@ mod element_held_optional_reference {
         let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
         let query = "SELECT ?s ?t ?tn ?l WHERE { ?s a asset360:TunnelComplex . \
              OPTIONAL { ?s asset360:hasCoveredSection ?cs . ?cs asset360:belongsToTrack ?t . \
-             ?t a asset360:Track ; asset360:typeURI ?tn . \
+             ?t a asset360:Track ; asset360:refersToLine ?tn . \
              OPTIONAL { ?cs asset360:belongsToLine ?l . ?l a asset360:Line } } }";
         let plan = each_rewrite_preserves_answers(query, &schema, &oracle, &borrowed);
         let edge = plan.nodes.iter().find_map(|node| match &node.op {

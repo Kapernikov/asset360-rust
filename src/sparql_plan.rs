@@ -2167,12 +2167,7 @@ pub struct KeptNarrowings {
 ///    refined plan says it holds several values, because the list's contract is
 ///    "every slot mentioned on this star"; a disagreement in the other
 ///    direction refuses.
-/// 5. **It is not the identifier slot.** An identifier restriction is
-///    `Star::identifier_values`, rendered against the indexed `asset360_uri`
-///    column, and the scoper already derives its own. Appending to a list that
-///    renders as a conjunctive `IN` from a second source is an intersection
-///    nobody asked for (`IdentityUnfolded` is the same fact one level up).
-/// 6. **`to_sql` can state it at all.** The same call `lower_refined` makes, so
+/// 5. **`to_sql` can state it at all.** The same call `lower_refined` makes, so
 ///    a condition that does not render is refused here exactly as it would be
 ///    there.
 ///
@@ -2277,19 +2272,6 @@ fn keep_what_the_rules_proved(
             };
             // The scoper's name for this scan's star.
             condition.star_var = crate::sparql_domains::qualified(&condition.star_var, domain);
-            let identifier = crate::sparql_ops::identifier_slot_of(schema, &class_uri);
-            // Precondition 5.
-            if identifier
-                .as_deref()
-                .is_some_and(|slot| condition.slot_path.as_slice() == [slot.to_owned()])
-            {
-                out.refused.push(format!(
-                    "n{id}: a restriction on the identifier slot belongs against \
-                     the indexed column as identifier_values, which the \
-                     decomposition derives itself"
-                ));
-                continue;
-            }
             // Precondition 3.
             let Some(star) = scoped
                 .root
@@ -2796,8 +2778,7 @@ classes:
         // by a reference, which is the shape whose `LEFT JOIN` the rules push
         // -- so the union is all-SQL and stacks, and the leak would be live.
         let optional_join_arms = "{ ?s a asset360:Signal . \
-             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s ; \
-             asset360:asset360_uri ?n } } \
+             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s } } \
              UNION { ?s a asset360:Track . \
              OPTIONAL { ?x a asset360:Signal ; asset360:locatedOnTrack ?s ; \
              asset360:name ?n } }";
@@ -4682,10 +4663,10 @@ classes:
             let type_triple = if typed { "?t a asset360:Track . " } else { "" };
             let query_with = |bind: &str| {
                 format!(
-                    "{PREFIX}SELECT ?s ?n ?t ?inv WHERE {{ ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+                    "{PREFIX}SELECT ?s ?n ?t ?inv WHERE {{ ?s a asset360:TunnelComplex ; asset360:controllerTechnology ?n . \
                      {{ SELECT ?s ?t WHERE {{ ?s a asset360:TunnelComplex ; asset360:hasAccessibleTracks ?cs . \
                      ?cs asset360:isDirect true ; asset360:belongsToTrack ?t . {type_triple}}} }} \
-                     OPTIONAL {{ ?s asset360:typeURI ?nm . BIND({bind} AS ?inv) }} }}"
+                     OPTIONAL {{ ?s asset360:controllerTechnology ?nm . BIND({bind} AS ?inv) }} }}"
                 )
             };
             let lifted = plan_of(
@@ -4836,36 +4817,6 @@ classes:
                 .all(|star| star.filters.is_empty()),
             "nothing may reach the fetch: {:?}",
             scoped.root.all_stars()
-        );
-    }
-
-    /// A narrowing on the identifier slot is refused rather than merged.
-    ///
-    /// Not because it is unsound as a *fetch* restriction — it is the one
-    /// narrowing `LoweringRefusal::IdentityIsNotATriple` says is fine for a
-    /// fetch and wrong for an answer — but because it belongs in
-    /// `Star::identifier_values`, against the indexed column, and the
-    /// decomposition derives its own. Appending to a list that renders as a
-    /// conjunctive `IN` from a second source is an intersection nobody asked
-    /// for.
-    #[test]
-    fn a_narrowing_on_the_identifier_slot_is_left_to_the_decomposition() {
-        let sv = test_schema_view();
-        let query = format!(
-            "{PREFIX}SELECT ?id ?tag WHERE {{ \
-             ?s a asset360:Signal ; asset360:asset360_uri ?id . \
-             ?t a asset360:Track ; asset360:hasName ?h . \
-             VALUES (?id ?tag) {{ (\"one\" \"x\") (\"two\" \"y\") }} }}"
-        );
-        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
-        let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
-            panic!("{plan}");
-        };
-        // Either nothing was derived, or it was derived and refused. What must
-        // not happen is a second `identifier_values` source.
-        assert!(
-            narrowings.kept.is_empty(),
-            "an identifier restriction is not a column filter: {plan}"
         );
     }
 

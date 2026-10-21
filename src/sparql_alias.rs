@@ -189,9 +189,23 @@ pub struct NotASlotOfClass {
     /// typed or reached, so the judgement covered the whole family and the
     /// message says so.
     pub polymorphic: bool,
+    /// Set when the predicate IS a slot of the class, but one the data does not
+    /// write as a triple: the identifier or the type designator. Then
+    /// `suggestion` is `None` and the message says what to write instead.
+    pub not_a_triple: Option<NotATriple>,
     /// The predicate and the suggestion as CURIEs, where the schema's prefixes
     /// can compress them. For the message only.
     pub curies: HashMap<String, String>,
+}
+
+/// A slot of a class that is not a triple in the RDF: the writer turns the
+/// identifier into the subject IRI and the type designator into `rdf:type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotATriple {
+    /// `identifier: true` — the subject IRI.
+    Identifier,
+    /// `designates_type: true` — the `rdf:type`.
+    Designator,
 }
 
 /// The hop that tells a node's class: `?s :refersToLocatedNetEntity ?e` makes
@@ -234,6 +248,29 @@ impl NotASlotOfClass {
 
 impl std::fmt::Display for NotASlotOfClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.not_a_triple {
+            Some(NotATriple::Identifier) => {
+                return write!(
+                    f,
+                    "{} is the identifier of {}; it is not a triple: the identifier is the \
+                     subject IRI — match it with a constant subject `<iri>`, \
+                     `VALUES ?s {{ <iri> }}` or `FILTER(?s = <iri>)`",
+                    self.full(&self.predicate),
+                    self.class_name,
+                );
+            }
+            Some(NotATriple::Designator) => {
+                return write!(
+                    f,
+                    "{} designates the type of {}; it is not a triple: use `?s a <{}>` \
+                     (rdf:type) or `?s sesame:directType ?t`",
+                    self.full(&self.predicate),
+                    self.class_name,
+                    self.class_iri,
+                );
+            }
+            None => {}
+        }
         write!(
             f,
             "{} is not a slot of {} (<{}>)",
@@ -1057,11 +1094,23 @@ fn judge_predicates(
                     .or_insert_with(|| {
                         let class = schema_view.get_class_by_uri(class_iri).ok().flatten()?;
                         let classes = judged_family(&class, exact, inference)?;
-                        let slots: BTreeSet<String> = classes
-                            .iter()
-                            .flat_map(|class| class.slots().iter())
-                            .filter_map(|slot| slot.canonical_uri().to_uri(&conv).ok().map(|u| u.0))
-                            .collect();
+                        let mut slots: BTreeMap<String, Option<NotATriple>> = BTreeMap::new();
+                        for slot in classes.iter().flat_map(|class| class.slots().iter()) {
+                            let Some(iri) = slot.canonical_uri().to_uri(&conv).ok().map(|u| u.0)
+                            else {
+                                continue;
+                            };
+                            let definition = slot.definition();
+                            let kind = if definition.identifier == Some(true) {
+                                Some(NotATriple::Identifier)
+                            } else if definition.designates_type == Some(true) {
+                                Some(NotATriple::Designator)
+                            } else {
+                                None
+                            };
+                            let entry = slots.entry(iri).or_insert(kind);
+                            *entry = entry.or(kind);
+                        }
                         Some((class.name().to_owned(), slots))
                     });
             }
@@ -1073,13 +1122,13 @@ fn judge_predicates(
                 });
                 let verdict = match known {
                     None => PredicateVerdict::Unchecked,
-                    Some((class_iri, _, _, _, slots)) if slots.contains(predicate) => {
+                    Some((class_iri, _, _, _, slots)) if slots.get(predicate) == Some(&None) => {
                         PredicateVerdict::Carried {
                             class_iri: class_iri.to_owned(),
                         }
                     }
-                    Some((class_iri, exact, reach, class_name, _)) => {
-                        PredicateVerdict::NotCarried(Box::new(uncarried(
+                    Some((class_iri, exact, reach, class_name, slots)) => {
+                        let mut refusal = uncarried(
                             subject,
                             predicate,
                             (class_iri, exact),
@@ -1087,7 +1136,13 @@ fn judge_predicates(
                             reach.cloned(),
                             schema_view,
                             inference,
-                        )))
+                        );
+                        // A slot of the class that is no triple: nothing to suggest.
+                        refusal.not_a_triple = slots.get(predicate).copied().flatten();
+                        if refusal.not_a_triple.is_some() {
+                            refusal.suggestion = None;
+                        }
+                        PredicateVerdict::NotCarried(Box::new(refusal))
                     }
                 };
                 checks.push(PredicateCheck {
@@ -1137,7 +1192,7 @@ fn judged_family(
 
 /// What one class, or one class and its subclasses, can carry: the class's
 /// name and the canonical IRIs of the slots.
-type Carried = (String, BTreeSet<String>);
+type Carried = (String, BTreeMap<String, Option<NotATriple>>);
 
 /// The one class the query types the subject with by `rdf:type`, when there
 /// is exactly one and no `directType` is in play.
@@ -1353,6 +1408,7 @@ fn uncarried(
         suggestion,
         reached_through,
         polymorphic,
+        not_a_triple: None,
         curies,
     }
 }
@@ -2013,6 +2069,9 @@ classes:
     attributes:
       asset360_uri:
         identifier: true
+      typeURI:
+        range: uri
+        designates_type: true
       refersToLocatedNetEntity:
         range: LocatedNetEntity
         inlined: true
@@ -2888,5 +2947,52 @@ classes:
                 "https://example.org/ext/labelB".to_owned(),
             ]
         );
+    }
+
+    /// The identifier and the type designator are slots of their class but not
+    /// triples: the writer turns the first into the subject IRI and the second
+    /// into `rdf:type`. Both routes refuse a pattern naming them, saying what to
+    /// write instead, and the report says the same through `NotCarried`.
+    #[test]
+    fn the_identifier_and_the_designator_are_not_triples() {
+        let identifier = "https://data.infrabel.be/asset360/asset360_uri";
+        let designator = "https://data.infrabel.be/asset360/typeURI";
+        let refusal = refuse(&format!(
+            "SELECT ?s WHERE {{ ?s a <{SIGNAL}> ; <{identifier}> \"x\" }}"
+        ));
+        assert_eq!(refusal.not_a_triple, Some(NotATriple::Identifier));
+        assert_eq!(refusal.suggestion, None);
+        let message = refusal.to_string();
+        assert!(
+            message.contains("is the identifier of Signal; it is not a triple")
+                && message.contains("constant subject"),
+            "{message}"
+        );
+        let refusal = refuse(&format!(
+            "SELECT ?t WHERE {{ ?s a <{SIGNAL}> ; <{designator}> ?t }}"
+        ));
+        assert_eq!(refusal.not_a_triple, Some(NotATriple::Designator));
+        let message = refusal.to_string();
+        assert!(
+            message.contains("designates the type of Signal; it is not a triple")
+                && message.contains(&format!("`?s a <{SIGNAL}>`")),
+            "{message}"
+        );
+
+        let checks = check(
+            &format!("SELECT ?s WHERE {{ ?s a <{SIGNAL}> ; <{identifier}> \"x\" }}"),
+            &[],
+        );
+        let PredicateVerdict::NotCarried(refusal) = verdict(&checks, "?s", identifier) else {
+            panic!("{checks:?}");
+        };
+        assert_eq!(refusal.not_a_triple, Some(NotATriple::Identifier));
+
+        // The identity as a subject is the way, and still plans.
+        let (_, rewrites) = rewrite(&format!(
+            "SELECT ?v WHERE {{ <https://data.infrabel.be/asset360/s-1> a <{SIGNAL}> ; \
+             <{REFERS_TO}> ?v }}"
+        ));
+        assert!(rewrites.is_empty());
     }
 }
