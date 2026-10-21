@@ -5699,7 +5699,9 @@ pub fn tier_one_rules<'a>(
         // An OPTIONAL body made only of reads of an element of its preserved
         // side gets that collection's occurrences to join on; the rules above
         // take it from there.
-        Box::new(crate::sparql_scope_rules::SeedElementScope::new(schema)),
+        Box::new(crate::sparql_scope_rules::SeedElementScope::new(
+            schema, dataset,
+        )),
         // Op 3: a restriction at a join side with the semi-join proof, then
         // pushed down one operator at a time; the fold reads it as the
         // star's type when it reaches the matches.

@@ -368,11 +368,12 @@ impl Rule for PushJoinOnIdentity<'_> {
 /// unchanged either way.
 pub struct SeedElementScope<'s> {
     schema: &'s SchemaView,
+    dataset: &'s crate::sparql_dataset::DatasetSpec,
 }
 
 impl<'s> SeedElementScope<'s> {
-    pub fn new(schema: &'s SchemaView) -> Self {
-        Self { schema }
+    pub fn new(schema: &'s SchemaView, dataset: &'s crate::sparql_dataset::DatasetSpec) -> Self {
+        Self { schema, dataset }
     }
 
     /// The `[S]` scan of the records `var` is an element of at `a`, and the
@@ -455,7 +456,7 @@ impl SeedElementScope<'_> {
                 continue;
             };
             let (a, vars) = (*a, vars.clone());
-            if plan.nodes[a].executor != Executor::Sql {
+            if !crate::sparql_lift::sql_under_lifts(plan, a, self.dataset) {
                 continue;
             }
             let mut core = *input;
@@ -1386,7 +1387,13 @@ mod seed_element_scope {
                 el("c", "REP_H_D", r#", "year": 2001"#),
             ],
         );
-        let b2 = bridge(2, &[el("d", "KSS", "")]);
+        let b2 = bridge(
+            2,
+            &[
+                el("d", "KSS", ""),
+                el("f", "GSA", r#", "year": 1999, "material": "GSA""#),
+            ],
+        );
         let b3 = bridge(3, &[el("e", "REP_H_D", r#", "material": "KSS""#)]);
         let b4 = bridge(4, &[]);
         let track = format!(r#"{{"asset360_uri": "{NS}/track/T1", "hasName": "Main"}}"#);
@@ -1588,13 +1595,9 @@ mod seed_element_scope {
     }
 
     /// Two sibling element OPTIONALs that each carry label lookups: R1 lifts
-    /// the first one's labels above its join, which leaves the second one's
-    /// left side an engine join, so it can neither be lifted from nor
-    /// pushed. Before the seed this query took the records route; with it
-    /// the plan is a fallback. Needs a rule that commutes a lifted
-    /// `X ⟕ C` above the next left join.
+    /// the first one's labels above its join, and the commuting rule moves
+    /// that lifted join above the second, so both are lifted from.
     #[test]
-    #[ignore = "needs a rule commuting a lifted left join above a following one"]
     fn review_two_sibling_element_optionals_with_labels_are_not_a_fallback() {
         let schema = schema();
         let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
@@ -1614,7 +1617,7 @@ mod seed_element_scope {
         );
         let production = plan_of(&query, &schema, &dataset).unwrap();
         assert!(
-            !matches!(production.refinement, Refinement::Fallback { .. }),
+            matches!(production.refinement, Refinement::UsedRows(_)),
             "{:?}",
             production.refinement
         );
@@ -1641,6 +1644,44 @@ mod seed_element_scope {
                     "?{star_var} reads every Bridge\n{plan}"
                 );
             }
+        }
+    }
+
+    /// The shape of the real query: two blocks at the record level, each in
+    /// its own `OPTIONAL`, each over the same collection with a constant on
+    /// the element's type. One statement, the labels finished over its rows.
+    #[test]
+    fn two_blocks_over_the_same_collection_are_one_statement() {
+        let schema = schema();
+        let oracle = oracle(&schema);
+        let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
+        for path in ["elements", "parts"] {
+            let block = |n: u32, kind: &str| {
+                format!(
+                    "OPTIONAL {{ ?b asset360:{path} ?e{n} . ?e{n} asset360:elType k:{kind} . \
+                     OPTIONAL {{ ?e{n} asset360:year ?y{n} }} \
+                     OPTIONAL {{ ?e{n} asset360:material ?m{n} . \
+                       OPTIONAL {{ GRAPH <urn:graph:schema> {{ ?m{n} skos:prefLabel ?nl{n} \
+                         FILTER(lang(?nl{n}) = \"nl-be\") }} }} \
+                       OPTIONAL {{ GRAPH <urn:graph:schema> {{ ?m{n} skos:prefLabel ?fr{n} \
+                         FILTER(lang(?fr{n}) = \"fr-be\") }} }} }} }} "
+                )
+            };
+            let query = format!(
+                "{PREFIX}SELECT ?b ?y1 ?m1 ?nl1 ?fr1 ?y2 ?m2 ?nl2 ?fr2 WHERE {{ \
+                 ?b a asset360:Bridge . {}{} }}",
+                block(1, "KSS"),
+                block(2, "REP_H_D")
+            );
+            refined_and_checked(&query, &schema, &oracle);
+            let query = format!("{ASSET360}{query}");
+            let (plan, rows) = rows_route_answer_in(&query, &schema, &oracle, &dataset);
+            assert!(matches!(plan.refinement, Refinement::UsedRows(_)), "{plan}");
+            if path == "parts" {
+                println!("{plan}");
+            }
+            let expected = oracle_rows(&query, &oracle);
+            assert_eq!(as_bag(&rows), as_bag(&expected), "{query}\n{plan}");
         }
     }
 }

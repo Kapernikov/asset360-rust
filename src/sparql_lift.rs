@@ -48,6 +48,7 @@ pub const R1: &str = "lift_optional_right_side";
 pub const R2: &str = "lift_optional_extension";
 pub const R3: &str = "page_below_one_to_one";
 pub const R4: &str = "lift_extension_over_join";
+pub const R5: &str = "commute_lifted_left_join";
 
 // ---------------------------------------------------------------------------
 // Facts shared by the rules
@@ -192,6 +193,43 @@ pub fn reads_schema_only(
         }
     }
     Ok(())
+}
+
+/// Whether `node` is SQL, or SQL under what the lifts leave above it: left
+/// joins whose right sides are engine-only, read the schema graph alone and
+/// carry no witness or effectful condition, and the projections that drop a
+/// witness. Such a node is what R1 and R5 go on working from, one sibling
+/// `OPTIONAL` at a time.
+pub fn sql_under_lifts(plan: &Plan, mut node: NodeId, dataset: &DatasetSpec) -> bool {
+    while plan.nodes[node].executor != Executor::Sql {
+        match &plan.nodes[node].op {
+            PlanOp::Project { input, .. } if plan.nodes[node].executor == Executor::Engine => {
+                node = *input;
+            }
+            PlanOp::LeftJoin {
+                left,
+                right,
+                condition,
+                witness: None,
+                ..
+            } => {
+                let side = subtree(plan, *right);
+                if side
+                    .iter()
+                    .any(|id| plan.nodes[*id].executor != Executor::Engine)
+                    || reads_schema_only(plan, &side, dataset).is_err()
+                    || condition.as_ref().is_some_and(|f| {
+                        f.contains_an_opaque_subquery() || !f.evaluates_the_same_out_of_context()
+                    })
+                {
+                    return false;
+                }
+                node = *left;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn contains_in_class(expr: &Expr) -> bool {
@@ -733,10 +771,11 @@ impl Rule for LiftOptionalExtension {
 /// has no condition; the inner join has no witness of its own; **G1b**
 /// `vars(C) ∩ scope(A) ⊆ bound(B)`; **G1c** `f` holds no `EXISTS` and
 /// `vars(f) ∩ scope(A) ⊆ bound(B) ∪ bound(C)`; **G1d** `f` and every
-/// expression in `C` are effect-free; **G1e** `A` is SQL, and so is `B` --
-/// or `B` is a chain of left joins over SQL whose right sides are
-/// engine-only, read nothing but the schema graph, carry no witness and no
-/// effectful condition: what R1 goes on lifting from, one sibling at a time.
+/// expression in `C` are effect-free; **G1e** `A` and `B` are SQL, or SQL
+/// under what earlier lifts left ([`sql_under_lifts`]): left joins whose
+/// right sides are engine-only and read nothing but the schema graph, and
+/// witness-dropping projections -- what R1 goes on lifting from, one
+/// sibling at a time.
 ///
 /// **Equivalence** (the design's, in brief). For a left row `a` and a pair
 /// `(b, c)`: `a ~ b ⊕ c` iff `a ~ b` and `a ~ c` on what they share, and by
@@ -897,10 +936,10 @@ impl LiftOptionalRightSide<'_> {
                     "G1d: an expression inside C (n{c}) is not effect-free"
                 ));
             }
-            if plan.nodes[a].executor != Executor::Sql {
+            if !sql_under_lifts(plan, a, self.dataset) {
                 return Err(format!("G1e: A (n{a}) is not SQL"));
             }
-            if !self.sql_under_schema_left_joins(plan, b) {
+            if !sql_under_lifts(plan, b, self.dataset) {
                 return Err(format!("G1e: B (n{b}) is not SQL"));
             }
             Ok(R1Match {
@@ -913,37 +952,6 @@ impl LiftOptionalRightSide<'_> {
                 condition: condition.clone(),
             })
         })())
-    }
-
-    /// G1e: `b` is SQL, or left joins over SQL whose right sides are
-    /// engine-only, read the schema graph alone, and carry no witness or
-    /// effectful condition -- the sides R1 lifts in turn.
-    fn sql_under_schema_left_joins(&self, plan: &Plan, mut b: NodeId) -> bool {
-        while plan.nodes[b].executor != Executor::Sql {
-            let PlanOp::LeftJoin {
-                left,
-                right,
-                condition,
-                witness: None,
-                ..
-            } = &plan.nodes[b].op
-            else {
-                return false;
-            };
-            let side = subtree(plan, *right);
-            if side
-                .iter()
-                .any(|id| plan.nodes[*id].executor != Executor::Engine)
-                || reads_schema_only(plan, &side, self.dataset).is_err()
-                || condition.as_ref().is_some_and(|f| {
-                    f.contains_an_opaque_subquery() || !f.evaluates_the_same_out_of_context()
-                })
-            {
-                return false;
-            }
-            b = *left;
-        }
-        true
     }
 
     pub fn declined(&self, plan: &Plan) -> Vec<(NodeId, String)> {
@@ -1015,6 +1023,8 @@ impl Rule for LiftOptionalRightSide<'_> {
         let scope_b = plan.variables_of(b);
         // What the outer join exposed before the lift (see R2's edit).
         let exposed = plan.variables_of(outer);
+        // What is observed above it, likewise before the barrier is edited.
+        let observed = plan.demand_above(outer);
         // What the lifted join compares `C` with, and its condition reads:
         // the barrier must export those of them `B` binds, whether or not a
         // prune took them away while nothing above demanded them.
@@ -1073,7 +1083,9 @@ impl Rule for LiftOptionalRightSide<'_> {
                     if vars.iter().all(|var| exposed.contains(var)))
         );
         if !reused && !hidden_above && !scope.is_subset(&exposed) {
-            scope.retain(|kept| exposed.contains(kept));
+            // What the projection keeps is what was exposed and is observed
+            // above: a column nobody observes need not reach the engine.
+            scope.retain(|kept| exposed.contains(kept) && observed.contains(kept));
             inserted.push(Node::engine(
                 PlanOp::Project {
                     input: PREVIOUS,
@@ -1413,6 +1425,229 @@ impl Rule for LiftExtensionOverJoin {
              bound below; effect-free",
             lifted_key.reference(),
             join_key.reference(),
+        ));
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R5: a lifted left join moves above the next one
+// ---------------------------------------------------------------------------
+
+/// **R5.** `π_V(A ⟕_f C) ⟕ S` → `π_{V ∪ vars(S)}((A ⟕ S) ⟕_f C)` -- the
+/// projection `π_V`, which R1 puts above the join it lifts from, being
+/// optional.
+///
+/// **Why it exists.** R1 lifts a body's label lookups `C` to directly above
+/// their `OPTIONAL`'s join, where they leave `A ⟕ C` an engine node. The next
+/// sibling `OPTIONAL` then has an engine left side: its join cannot be
+/// pushed and the SQL part stays two islands. Moving `C` up one more join
+/// leaves the sibling's join over `A`.
+///
+/// **Match.** An engine `LeftJoin` with no condition (it may carry a witness,
+/// which stays on it) whose right
+/// input is a barrier `S` of an `OPTIONAL` body (no naming domain), and
+/// whose left input is an engine `LeftJoin` `A ⟕_f C` with no witness --
+/// possibly under an engine `Project` -- read by nothing else.
+///
+/// **Guards.** **K1** `A` is SQL under lifts ([`sql_under_lifts`]), the body
+/// of `S` is SQL, `C` is engine-only and reads the schema graph alone: the
+/// move lets `A ⟕ S` be pushed. **K2** `vars(C) ∩ vars(S) ⊆ bound(A)`: a
+/// variable both bind and `A` does not would be compared by the original and
+/// not by the new order. **K3** `f` holds no `EXISTS` and `vars(f) ∩ vars(S)
+/// ⊆ bound(A)`: `f` would otherwise see a binding of `S` the original did
+/// not. **K4** `C` and `f` are effect-free: they run on the rows of `A ⟕ S`.
+/// **K5** `vars(S)` meets nothing the projection drops: the original did not
+/// compare it.
+///
+/// **Equivalence.** Fix a row `a` of `A`. An `s` of `S` is compatible with
+/// `a ⊕ c` iff with `a`, since by K2 `s` and `c` share only variables `a`
+/// binds (K5 for the ones the projection hid); likewise `c` with `a ⊕ s`, and
+/// by K3 `f` takes the same value on `a ⊕ c` and `a ⊕ s ⊕ c`. So both orders
+/// give, for each compatible `s` (or `a` alone if none) and each qualifying
+/// `c` (or none), one row `a ⊕ s ⊕ c` -- the same bag; the new projection
+/// keeps what the old output had. `S`'s join has no condition, so it reads
+/// neither side.
+///
+/// **Progress.** `J` drops by the number of evaluating nodes of `C`: `C` has
+/// one left join above it instead of two, and `S` holds none (its body is
+/// SQL), so nothing is added elsewhere. `I` and `D` are unchanged.
+pub struct CommuteLiftedLeftJoin<'a> {
+    dataset: &'a DatasetSpec,
+}
+
+struct R5Match {
+    outer: NodeId,
+    inner: NodeId,
+    /// The projection over `inner` and the variables it keeps.
+    project: Option<(NodeId, Vec<String>)>,
+    a: NodeId,
+    c: NodeId,
+}
+
+impl<'a> CommuteLiftedLeftJoin<'a> {
+    pub fn new(dataset: &'a DatasetSpec) -> Self {
+        Self { dataset }
+    }
+
+    fn candidate(&self, plan: &Plan) -> Option<R5Match> {
+        (0..plan.nodes.len()).find_map(|outer| {
+            let PlanOp::LeftJoin {
+                left,
+                right: s,
+                condition: None,
+                reference: None,
+                key: None,
+                ..
+            } = &plan.nodes[outer].op
+            else {
+                return None;
+            };
+            let PlanOp::SubSelect {
+                input: body,
+                domain: None,
+                ..
+            } = &plan.nodes[*s].op
+            else {
+                return None;
+            };
+            let (project, inner) = match &plan.nodes[*left].op {
+                PlanOp::Project { input, vars }
+                    if plan.nodes[*left].executor == Executor::Engine =>
+                {
+                    (Some((*left, vars.clone())), *input)
+                }
+                _ => (None, *left),
+            };
+            let PlanOp::LeftJoin {
+                left: a,
+                right: c,
+                condition,
+                witness: None,
+                reference: None,
+                key: None,
+            } = &plan.nodes[inner].op
+            else {
+                return None;
+            };
+            let (s, a, c) = (*s, *a, *c);
+            let c_nodes = subtree(plan, c);
+            if plan.nodes[outer].executor != Executor::Engine
+                || plan.nodes[inner].executor != Executor::Engine
+                || consumers(plan, project.as_ref().map_or(inner, |(p, _)| *p)) != [outer]
+                || (project.is_some() && consumers(plan, inner).len() != 1)
+                || !sql_under_lifts(plan, a, self.dataset)
+                || plan.nodes[*body].executor != Executor::Sql
+                || c_nodes
+                    .iter()
+                    .any(|id| plan.nodes[*id].executor != Executor::Engine)
+                || reads_schema_only(plan, &c_nodes, self.dataset).is_err()
+                || !effect_free(plan, &c_nodes)
+            {
+                return None;
+            }
+            let bound_a = plan.definitely_bound_of(a);
+            let vars_s = plan.variables_of(s);
+            let shared_with_s = |vars: BTreeSet<String>| {
+                vars.intersection(&vars_s).all(|var| bound_a.contains(var))
+            };
+            if !shared_with_s(plan.variables_of(c)) {
+                return None;
+            }
+            if let Some(f) = condition
+                && (f.contains_an_opaque_subquery()
+                    || !f.evaluates_the_same_out_of_context()
+                    || !shared_with_s(variables_used(f).into_iter().collect()))
+            {
+                return None;
+            }
+            if let Some((_, kept)) = &project
+                && plan
+                    .variables_of(inner)
+                    .iter()
+                    .any(|var| !kept.contains(var) && vars_s.contains(var))
+            {
+                return None;
+            }
+            Some(R5Match {
+                outer,
+                inner,
+                project,
+                a,
+                c,
+            })
+        })
+    }
+}
+
+impl Rule for CommuteLiftedLeftJoin<'_> {
+    fn name(&self) -> &'static str {
+        R5
+    }
+
+    fn measured(&self) -> bool {
+        true
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        let Some(R5Match {
+            outer,
+            inner,
+            project,
+            a,
+            c,
+            ..
+        }) = self.candidate(plan)
+        else {
+            return false;
+        };
+        let PlanOp::LeftJoin { condition, .. } = &plan.nodes[inner].op else {
+            unreachable!("matched a left join");
+        };
+        let condition = condition.clone();
+        let inner_key = plan.key_of(inner);
+        let claims = plan.nodes[inner].discharges.clone();
+        let mut removed = vec![(inner, a)];
+        let mut inserted = vec![Node::engine(
+            PlanOp::LeftJoin {
+                left: PREVIOUS,
+                right: c,
+                reference: None,
+                key: None,
+                condition,
+                witness: None,
+            },
+            claims,
+        )];
+        if let Some((project, _)) = &project {
+            removed.push((*project, a));
+            // What the join exposed -- the projection's columns, `S`'s and
+            // the join's own witness -- less what nothing above observes.
+            let observed = plan.demand_above(outer);
+            let mut vars = plan.variables_of(outer);
+            vars.retain(|var| observed.contains(var));
+            inserted.push(Node::engine(
+                PlanOp::Project {
+                    input: PREVIOUS,
+                    vars: vars.into_iter().collect(),
+                },
+                Vec::new(),
+            ));
+        }
+        let at = apply_edit(
+            plan,
+            Edit {
+                removed,
+                after: outer,
+                inserted,
+            },
+        );
+        let moved = plan.key_of(at[0]);
+        plan.retire(inner_key, Some(moved));
+        plan.rewrites.push(format!(
+            "R5  {}  the lifted left join moved above the next OPTIONAL; they share only what \
+             the left side binds; effect-free",
+            moved.reference()
         ));
         true
     }
@@ -1895,6 +2130,7 @@ pub fn lifting_rules<'a>(
         Box::new(LiftOptionalExtension),
         Box::new(LiftOptionalRightSide::new(schema, dataset)),
         Box::new(LiftExtensionOverJoin),
+        Box::new(CommuteLiftedLeftJoin::new(dataset)),
         Box::new(PageBelowOneToOne::new(schema)),
     ]
 }
