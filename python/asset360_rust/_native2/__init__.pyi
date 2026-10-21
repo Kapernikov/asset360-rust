@@ -6245,13 +6245,12 @@ class Star:
     @property
     def identifier_values(self) -> builtins.list[builtins.str]:
         r"""
-        Values bound to the LinkML identifier slot of this class.
-        Schema-resolved (``identifier: true``), never assumed to be
-        named ``"id"``. Empty when the query has no identifier predicate.
+        The IRIs the query fixed the record's subject to: a constant
+        subject, ``VALUES ?s`` or ``FILTER(?s = <iri>)``. The identifier is
+        the subject IRI, never a triple, so a query that names the identifier
+        slot as a predicate is refused. Empty when the query names no subject.
         Python should translate to ``WHERE asset360_uri IN (...)``
-        against the indexed column — NOT JSONB extraction. The
-        identifier slot is also absent from ``filters`` and
-        ``required_fields``.
+        against the indexed column — NOT JSONB extraction.
         """
     @property
     def required_fields(self) -> builtins.list[builtins.str]:

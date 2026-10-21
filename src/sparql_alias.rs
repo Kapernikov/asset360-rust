@@ -250,11 +250,21 @@ impl std::fmt::Display for NotASlotOfClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.not_a_triple {
             Some(NotATriple::Identifier) => {
+                // The subject as the author wrote it: a variable is bound to
+                // the IRI, a constant already is one.
+                let how = if self.subject.starts_with('?') || self.subject.starts_with('$') {
+                    format!(
+                        "match it with a constant subject `<iri>`, `VALUES {0} {{ <iri> }}` or \
+                         `FILTER({0} = <iri>)`",
+                        self.subject
+                    )
+                } else {
+                    format!("the subject {} already is the identifier", self.subject)
+                };
                 return write!(
                     f,
                     "{} is the identifier of {}; it is not a triple: the identifier is the \
-                     subject IRI — match it with a constant subject `<iri>`, \
-                     `VALUES ?s {{ <iri> }}` or `FILTER(?s = <iri>)`",
+                     subject IRI — {how}",
                     self.full(&self.predicate),
                     self.class_name,
                 );
@@ -262,11 +272,12 @@ impl std::fmt::Display for NotASlotOfClass {
             Some(NotATriple::Designator) => {
                 return write!(
                     f,
-                    "{} designates the type of {}; it is not a triple: use `?s a <{}>` \
-                     (rdf:type) or `?s sesame:directType ?t`",
+                    "{} designates the type of {}; it is not a triple: the type is the \
+                     rdf:type of {2} — read it with `{2} a ?t` or `{2} \
+                     sesame:directType ?t`",
                     self.full(&self.predicate),
                     self.class_name,
-                    self.class_iri,
+                    self.subject,
                 );
             }
             None => {}
@@ -1073,6 +1084,9 @@ fn judge_predicates(
     // The canonical IRIs of every slot a class's family carries, built once
     // per class named — most queries name one or two.
     let mut carried: HashMap<(String, bool), Option<Carried>> = HashMap::new();
+    // Built once, on the first subject no class can be told for.
+    let mut not_triples_of_the_schema: Option<BTreeMap<String, (NotATriple, String, String)>> =
+        None;
     let mut checks = Vec::new();
     for scope in &scopes {
         let reached = infer_reached_classes(scope, schema_view, inference);
@@ -1121,7 +1135,32 @@ fn judge_predicates(
                     Some((class_iri, exact, reach, class_name, slots))
                 });
                 let verdict = match known {
-                    None => PredicateVerdict::Unchecked,
+                    // A subject of no one class: the identifier and the
+                    // designator are no triples on ANY class, so a predicate
+                    // that is one anywhere in the schema is refused here,
+                    // whatever the subject is. Without this a statement reads
+                    // the payload key and answers alone with a value the RDF
+                    // does not have.
+                    None => match not_triples_of_the_schema
+                        .get_or_insert_with(|| not_triples_of_the_schema_of(schema_view))
+                        .get(predicate)
+                    {
+                        Some((kind, class_iri, class_name)) => {
+                            let mut refusal = uncarried(
+                                subject,
+                                predicate,
+                                (class_iri, false),
+                                class_name,
+                                None,
+                                schema_view,
+                                inference,
+                            );
+                            refusal.not_a_triple = Some(*kind);
+                            refusal.suggestion = None;
+                            PredicateVerdict::NotCarried(Box::new(refusal))
+                        }
+                        None => PredicateVerdict::Unchecked,
+                    },
                     Some((class_iri, _, _, _, slots)) if slots.get(predicate) == Some(&None) => {
                         PredicateVerdict::Carried {
                             class_iri: class_iri.to_owned(),
@@ -1154,6 +1193,41 @@ fn judge_predicates(
         }
     }
     checks
+}
+
+/// Every slot the schema declares an identifier or a type designator, by
+/// canonical IRI, with the first class declaring it (its IRI and name). The
+/// writer emits no triple for either, whatever the class, so a subject whose
+/// class cannot be pinned is judged by this.
+fn not_triples_of_the_schema_of(
+    schema_view: &SchemaView,
+) -> BTreeMap<String, (NotATriple, String, String)> {
+    let conv = schema_view.converter();
+    let mut found = BTreeMap::new();
+    for class in schema_view.class_views().unwrap_or_default() {
+        for slot in class.slots() {
+            let definition = slot.definition();
+            let kind = if definition.identifier == Some(true) {
+                NotATriple::Identifier
+            } else if definition.designates_type == Some(true) {
+                NotATriple::Designator
+            } else {
+                continue;
+            };
+            let Some(iri) = slot.canonical_uri().to_uri(&conv).ok().map(|u| u.0) else {
+                continue;
+            };
+            let class_iri = class
+                .canonical_uri()
+                .to_uri(&conv)
+                .map(|u| u.0)
+                .unwrap_or_else(|_| class.canonical_uri().to_string());
+            found
+                .entry(iri)
+                .or_insert((kind, class_iri, class.name().to_owned()));
+        }
+    }
+    found
 }
 
 /// The inference the planner's refusals judge by: the widest family, because a
@@ -2975,7 +3049,8 @@ classes:
         let message = refusal.to_string();
         assert!(
             message.contains("designates the type of Signal; it is not a triple")
-                && message.contains(&format!("`?s a <{SIGNAL}>`")),
+                && message.contains("`?s a ?t`")
+                && !message.contains(&format!("`?s a <{SIGNAL}>`")),
             "{message}"
         );
 

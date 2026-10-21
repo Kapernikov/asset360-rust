@@ -125,6 +125,15 @@ impl Translation<'_> {
         if designator_as_type && slot.definition().designates_type == Some(true) {
             return NamedNode::new(crate::sparql_scoper::RDF_TYPE).ok();
         }
+        // The writer emits no triple for the identifier (it is the subject IRI)
+        // nor for a designator read as a value (it is the `rdf:type`): there is
+        // no pattern to state, so the statement is not translated, rather than
+        // modelled as a triple the oracle does not have.
+        if slot.definition().identifier == Some(true)
+            || slot.definition().designates_type == Some(true)
+        {
+            return None;
+        }
         let conv = self.schema.converter();
         let iri = slot.canonical_uri().to_uri(&conv).ok()?;
         NamedNode::new(iri.0).ok()

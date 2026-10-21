@@ -2905,6 +2905,92 @@ classes:
         }
     }
 
+    /// The identifier and the type designator are no triples, whatever the
+    /// query says about the subject's type. A subject the judge cannot pin to
+    /// one class (two types, none, `UNION`-typed, `VALUES`-bound) was passed
+    /// on, and the statement then read the payload key and answered alone
+    /// with a value the RDF does not have (SQL 1, engine 0 under `IS_A`).
+    /// One rule, no typing precondition: such a predicate is refused wherever
+    /// the schema declares it an identifier or a designator.
+    #[test]
+    fn an_identifier_or_designator_is_refused_on_a_subject_of_no_one_class() {
+        use linkml_runtime::schema_rdf::TypeInference;
+        let sv =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let eq = "<https://data.infrabel.be/asset360/eq/L1>";
+        for (query, subject, what) in [
+            (
+                "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment ; \
+                 asset360:asset360_uri \"https://data.infrabel.be/asset360/eq/L1\" }"
+                    .to_owned(),
+                "?s",
+                "is the identifier of",
+            ),
+            (
+                format!("SELECT ?id WHERE {{ {eq} asset360:asset360_uri ?id }}"),
+                eq,
+                "is the identifier of",
+            ),
+            (
+                "SELECT ?id WHERE { { ?s a asset360:Relay } UNION { ?s a asset360:Switch } \
+                 ?s asset360:asset360_uri ?id }"
+                    .to_owned(),
+                "?s",
+                "is the identifier of",
+            ),
+            (
+                format!("SELECT ?id WHERE {{ VALUES ?s {{ {eq} }} ?s asset360:asset360_uri ?id }}"),
+                "?s",
+                "is the identifier of",
+            ),
+            (
+                "SELECT ?t WHERE { ?s asset360:typeURI ?t }".to_owned(),
+                "?s",
+                "designates the type of",
+            ),
+        ] {
+            for inference in [TypeInference::ASSERTED, TypeInference::IS_A] {
+                let error = plan_of(
+                    &format!("{PREFIX}{query}"),
+                    &sv,
+                    &crate::sparql_dataset::dataset_with(inference, &[], &[]),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{query} under {inference:?} was planned"))
+                .to_string();
+                assert!(
+                    error.contains(what) && error.contains("it is not a triple"),
+                    "{query}: {error}"
+                );
+                assert!(error.contains(subject), "{query} names {subject}: {error}");
+            }
+        }
+    }
+
+    /// A named subject answers alone only when the writer mints the subject
+    /// from the identifier slot, i.e. when the scanned classes have one. A
+    /// class without (`Structure`) is written under `<base>root`, so SQL's
+    /// `asset360_uri = <iri>` would find a record the engine does not: the
+    /// engine finishes.
+    #[test]
+    fn a_named_subject_of_a_class_without_an_identifier_does_not_answer_alone() {
+        let sv =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let plan = plan_of(
+            &format!(
+                "{PREFIX}SELECT ?l WHERE {{ <https://data.infrabel.be/asset360/st/s1> \
+                 a asset360:Structure ; asset360:title ?l }}"
+            ),
+            &sv,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .expect("plans");
+        assert!(
+            !matches!(plan.refinement, Refinement::UsedAlone(_)) && !plan.sql_only(),
+            "{plan}"
+        );
+    }
+
     /// A union with one arm the rules could not push keeps the per-arm fetch
     /// it has always had.
     ///

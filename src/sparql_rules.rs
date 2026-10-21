@@ -1403,10 +1403,8 @@ impl Visible {
             // ambiguous: a rule then declines `FILTER(?s = <iri>)` rather than
             // resolving `?s` through some other star's slot of the same name.
             //
-            // That is a capability gap against today's planner, which pushes
-            // such a constraint as `Star::identifier_values`. Closing it needs
-            // an *address* for a record's identity, which no `Expr::Slot` has
-            // -- a representation change rather than a rule.
+            // Identity is folded into the scan by `FoldIdentityConstant`
+            // (`identifier_values`), so a rule never needs an *address* for it.
             slots.insert(star_var.clone(), None);
             // A slot that binds no variable is invisible here without a
             // special case: there is no name to resolve. That covers the read

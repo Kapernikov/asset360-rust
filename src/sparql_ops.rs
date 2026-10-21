@@ -135,8 +135,10 @@ pub enum Op {
         /// A renderer filters `asset_type = ANY(asset_types)`; with one element
         /// that is `asset_type = class_uri`.
         asset_types: Vec<String>,
-        /// Values bound against the class's identifier slot, compared against
-        /// the indexed `asset360_uri` column rather than the payload.
+        /// The IRIs the query fixed the record's subject to (a constant
+        /// subject, `VALUES ?s`, `FILTER(?s = <iri>)`): the identifier is the
+        /// subject IRI, never a triple. Compared against the indexed
+        /// `asset360_uri` column rather than the payload.
         identifier_values: Vec<String>,
         /// The variable bound to the record's direct type, when a rule
         /// folded `sesame:directType ?t` into the scan: render
@@ -928,6 +930,14 @@ pub enum LoweringRefusal {
     /// compared against the constant and nothing matches, so the query answers
     /// empty while every ledger balances.
     ConditionReadsACollection { node: usize, slot: String },
+    /// A statement that would answer *alone* from an identifier restriction on
+    /// a scan of a class that has no identifier slot.
+    ///
+    /// The writer mints such a record's subject as `<base>root`, not from the
+    /// `asset360_uri` column the restriction compares, so the statement and
+    /// the engine disagree; the statement narrows a fetch and the engine
+    /// finishes.
+    IdentityIsNotTheSubject { node: usize },
 }
 
 impl fmt::Display for LoweringRefusal {
@@ -951,6 +961,12 @@ impl fmt::Display for LoweringRefusal {
                 f,
                 "n{node} pushes a left join whose lifted condition would have to \
                  be a conditional binding rather than a row test"
+            ),
+            Self::IdentityIsNotTheSubject { node } => write!(
+                f,
+                "n{node} rests on an identifier restriction over a class with no \
+                 identifier slot, whose records the writer gives a fixed subject: \
+                 the statement narrows a fetch but cannot answer alone"
             ),
             Self::FetchBoundTooTight { bound, demanded } => write!(
                 f,
@@ -1253,10 +1269,26 @@ fn lower_island(
 
     // A scan's `identifier_values = {x}` restricts the star's subject to the
     // IRI x -- exactly what a constant subject, `VALUES ?s {<x>}` and
-    // `FILTER(?s = <x>)` mean in the RDF, and the SQL column `asset360_uri` is
-    // that subject IRI by construction. The restriction is on the subject
-    // term, which the engine sees too, so a statement carrying one answers
-    // alone like any other.
+    // `FILTER(?s = <x>)` mean in the RDF -- and the SQL column `asset360_uri`
+    // is that subject IRI, *provided the writer mints the subject from the
+    // record's identifier slot*. A class without one is written under a fixed
+    // `<base>root` subject, so the column holds an IRI no triple has and the
+    // statement would answer 1 where the engine answers 0: such a scan narrows
+    // a fetch and the engine finishes.
+    if enforcement == Enforcement::Enforces
+        && let Some(id) = sql.iter().copied().find(|id| {
+            matches!(&plan.nodes[*id].op,
+                RefinedOp::Scan { class_uri, classes, direct_type_in, identifier_values, .. }
+                    if !identifier_values.is_empty()
+                        && std::iter::once(class_uri)
+                            .chain(classes.iter().filter(|class| {
+                                direct_type_in.is_empty() || direct_type_in.contains(class)
+                            }))
+                            .any(|class| identifier_slot_of(schema, class).is_none()))
+        })
+    {
+        return Err(LoweringRefusal::IdentityIsNotTheSubject { node: id });
+    }
 
     let mut lowering = Lowering {
         plan,
@@ -3381,6 +3413,20 @@ pub(crate) fn identifier_slot_of(
     class.identifier_slot().map(|slot| slot.name.clone())
 }
 
+/// The name of a class's type-designator slot (`designates_type: true`), when
+/// it has one.
+pub(crate) fn designator_slot_of(
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    class_uri: &str,
+) -> Option<String> {
+    let class = schema.get_class_by_uri(class_uri).ok().flatten()?;
+    class
+        .slots()
+        .iter()
+        .find(|slot| slot.definition().designates_type == Some(true))
+        .map(|slot| slot.name.clone())
+}
+
 impl OpTree {
     pub fn root(&self) -> Option<&OpNode> {
         self.nodes.last()
@@ -5164,7 +5210,7 @@ pub fn observable_slots(
 ///
 /// * the **identifier slot** of every class the scan can return, because the writer mints the record's subject
 ///   IRI from it and a record with no subject joins to nothing;
-/// * the **type-designator slot** (`typeURI`), because the record's own stored
+/// * the **type-designator slot** (`designates_type`) of each, because the record's own stored
 ///   type is what several configurations read and it costs one short string;
 /// * every slot the scan itself narrows on, so a condition the statement
 ///   pushed and the engine re-applies still sees its column.
@@ -5217,7 +5263,13 @@ pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &Sc
                 keep.insert(identifier);
             }
         }
-        keep.insert("typeURI".to_owned());
+        // The designator of every class the scan can return, for the same
+        // reason: the writer states a record's type from it.
+        for class in std::iter::once(&*class_uri).chain(asset_types.iter()) {
+            if let Some(designator) = designator_slot_of(schema, class) {
+                keep.insert(designator);
+            }
+        }
 
         *retrieval = Retrieval::Slots(keep.into_iter().collect());
     }
@@ -5274,11 +5326,16 @@ mod retrieval_tests {
         assert_eq!(got.len(), 1, "one scan");
         let slots = slots_of(&got[0]);
         assert!(slots.contains(&"kind".to_owned()), "{slots:?}");
-        assert!(slots.contains(&"typeURI".to_owned()), "{slots:?}");
+        assert!(slots.contains(&"asset360_uri".to_owned()), "{slots:?}");
         assert!(
             !slots.contains(&"name".to_owned()),
             "a slot the query never mentions must not be fetched: {slots:?}"
         );
+        // The designator is the class's own `designates_type` slot, by schema
+        // and not by name.
+        let got = retrievals("SELECT ?l WHERE { ?s a asset360:Place ; asset360:label ?l }");
+        let slots = slots_of(&got[0]);
+        assert!(slots.contains(&"typeURI".to_owned()), "{slots:?}");
     }
 
     /// The trap, stated as a test. A variable predicate reaches every slot, so
