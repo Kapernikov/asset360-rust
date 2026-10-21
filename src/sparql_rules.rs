@@ -1887,7 +1887,9 @@ impl Rule for AbsorbOptionalRead<'_> {
 /// Whether `var` is bound or mentioned anywhere under `node`: a variable of
 /// its scope, or one an expression reads. An expression that holds a pattern
 /// (`EXISTS`) is taken to mention everything, since it reads the row's
-/// bindings by name.
+/// bindings by name. It reads expressions only, not the patterns under an
+/// `AntiJoin` or a `Minus`: safe while `MINUS` is refused and `NOT EXISTS`
+/// is opaque, and the first thing to revisit when `MINUS` lands.
 fn mentioned_below(plan: &Plan, node: NodeId, var: &str) -> bool {
     plan.variables_of(node).contains(var)
         || crate::sparql_lift::subtree(plan, node)
@@ -10594,7 +10596,9 @@ mod optional_read_after_an_optional_binding_it {
             "SELECT ?s ?len ?lbl WHERE { ?s a asset360:Signal . \
              OPTIONAL { ?s asset360:length ?len . OPTIONAL { VALUES (?len ?lbl) { (3 \"three\") (7 \"seven\") } } } \
              OPTIONAL { ?s asset360:trafficKinds ?lbl } }",
-            // The same hole for an optional reference.
+            // An optional reference: `AbsorbOptionalReference` keeps the left
+            // join and its shared-variable check, so this was never a hole;
+            // kept as a regression check.
             "SELECT ?s ?len ?t WHERE { ?s a asset360:Signal . \
              OPTIONAL { ?s asset360:length ?len . OPTIONAL { VALUES (?len ?t) \
              { (3 <https://data.infrabel.be/asset360/track/T2>) } } } \
