@@ -325,6 +325,198 @@ impl Rule for PushJoinOnIdentity<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Seed an element's scope
+// ---------------------------------------------------------------------------
+
+/// The body of an `OPTIONAL` that reads an element its preserved side
+/// unnests gets the element's occurrences to join on, so that it can be SQL.
+///
+/// Nothing scans an element: a `match ?e :p ?v` on an inlined element has no
+/// star of its own, and a body made only of such matches is an island nobody
+/// can fold. Written by hand, `OPTIONAL { ?h a :Bridge ; :elements ?e . ?e :p
+/// ?v }` is a relation of `(?e, ?v)` that op 5 joins to the element on its
+/// occurrence. This rule writes the `?h … :elements ?e` half.
+///
+/// **Match.** `A ⟕ SubSelect∅(B)` where a variable `?e` the barrier exports
+/// is, at `A`, one collection hop `P` off the records of class `H`
+/// ([`TermOf::Structure`], produced by an `Unnest` straight over an `[S]`
+/// `Scan` -- an element of an element is refused) and bound in every row of
+/// `A`. Walk down `B`'s left spine through `LeftJoin`s to its first other
+/// node `X`, the mandatory core of the body.
+///
+/// **Guards.** `?e` is bound in every row of `X`, and `X` binds `?e` as no
+/// structure yet -- which is what ends the rule's own repetition. It is a
+/// [`Rule::last_resort`]: it adds work for the other rules and must not
+/// preempt one that takes the body as it stands.
+///
+/// **Edit.** `X := E ⋈_{?e} X`, with `E = Unnest(Scan(H as ?__h, [P → ?e]))`
+/// over the classes `A`'s scan reads, `?__h` fresh and exported by no
+/// barrier. `E` claims no obligation.
+///
+/// **Equivalence.** A left row `a` is compatible with a body row `b` only if
+/// `b.e = a.e`, both bound, and `a.e` is an occurrence of `(H, P)`. `E` holds
+/// exactly one row per occurrence of `(H, P)` in every record `A` can read,
+/// and its other column is fresh and projected away, so a `b` whose `e` is an
+/// occurrence matches exactly one row of `E` (its multiplicity is kept) and a
+/// `b` with any other `e` was compatible with no `a`. The join sits under the
+/// spine's left joins: `(E ⋈ X) ⟕ C = E ⋈ (X ⟕ C)`, because `E` shares only
+/// `?e` with each `C` and `?e` is bound in `X`. Unmatched left rows are kept
+/// unchanged either way.
+pub struct SeedElementScope<'s> {
+    schema: &'s SchemaView,
+}
+
+impl<'s> SeedElementScope<'s> {
+    pub fn new(schema: &'s SchemaView) -> Self {
+        Self { schema }
+    }
+
+    /// The `[S]` scan of the records `var` is an element of at `a`, and the
+    /// one hop to it, when `var` is exactly that.
+    fn holder_scan(&self, plan: &Plan, a: NodeId, var: &str) -> Option<(NodeId, String)> {
+        let terms = plan.term_of(self.schema, a, var);
+        let [TermOf::Structure { path, .. }] = terms.as_slice() else {
+            return None;
+        };
+        let [hop] = path.as_slice() else {
+            return None;
+        };
+        let producers = plan.producers_of(a, var);
+        let [unnest] = producers.as_slice() else {
+            return None;
+        };
+        let PlanOp::Unnest {
+            input, star_var, ..
+        } = &plan.nodes[*unnest].op
+        else {
+            return None;
+        };
+        let scan = (plan.nodes[*unnest].executor == Executor::Sql
+            && plan.nodes[*input].executor == Executor::Sql
+            && matches!(&plan.nodes[*input].op, PlanOp::Scan { star_var: s, .. } if s == star_var))
+        .then_some(*input)?;
+        Some((scan, hop.clone()))
+    }
+}
+
+impl Rule for SeedElementScope<'_> {
+    fn name(&self) -> &'static str {
+        "seed_element_scope"
+    }
+
+    /// Only once nothing else applies: the seed makes work for the other
+    /// rules, and must not preempt one that takes the body as it stands (an
+    /// element-held reference, an absorbed read).
+    fn last_resort(&self) -> bool {
+        true
+    }
+
+    fn apply(&self, plan: &mut Plan) -> bool {
+        use crate::sparql_refine::{Node, ScanSlot, SlotPresence};
+        for id in 0..plan.nodes.len() {
+            let PlanOp::LeftJoin { left: a, right, .. } = &plan.nodes[id].op else {
+                continue;
+            };
+            let PlanOp::SubSelect {
+                input,
+                vars,
+                domain: None,
+            } = &plan.nodes[*right].op
+            else {
+                continue;
+            };
+            let (a, vars) = (*a, vars.clone());
+            let mut core = *input;
+            while let PlanOp::LeftJoin { left, .. } = &plan.nodes[core].op {
+                core = *left;
+            }
+            let guaranteed = plan.guaranteed(core);
+            let Some((var, scan, hop)) = vars.iter().find_map(|var| {
+                if !plan.guaranteed(a).contains(var) || !guaranteed.contains(var) {
+                    return None;
+                }
+                let seeded = plan
+                    .term_of(self.schema, core, var)
+                    .iter()
+                    .any(|term| matches!(term, TermOf::Structure { .. }));
+                if seeded {
+                    return None;
+                }
+                let (scan, hop) = self.holder_scan(plan, a, var)?;
+                Some((var.clone(), scan, hop))
+            }) else {
+                continue;
+            };
+            let PlanOp::Scan {
+                class_uri, classes, ..
+            } = &plan.nodes[scan].op
+            else {
+                unreachable!("holder_scan returned a scan");
+            };
+            let (class_uri, classes) = (class_uri.clone(), classes.clone());
+            let holder_class = crate::sparql_plan::shorten(&class_uri);
+            let holder = crate::sparql_lift::fresh(plan, "__h", true);
+            let seed = vec![
+                Node::sql(
+                    PlanOp::Scan {
+                        star_var: holder.clone(),
+                        class_uri,
+                        classes,
+                        direct_type: None,
+                        direct_type_in: Vec::new(),
+                        slots: vec![ScanSlot {
+                            path: vec![hop.clone()],
+                            var: Some(var.clone()),
+                            multivalued: true,
+                            presence: SlotPresence::Required,
+                        }],
+                        identifier_values: Vec::new(),
+                    },
+                    Vec::new(),
+                ),
+                Node::sql(
+                    PlanOp::Unnest {
+                        input: crate::sparql_lift::PREVIOUS,
+                        star_var: holder.clone(),
+                        slot_path: vec![hop.clone()],
+                        var: var.clone(),
+                        presence: SlotPresence::Required,
+                    },
+                    Vec::new(),
+                ),
+                Node::engine(
+                    PlanOp::Join {
+                        left: crate::sparql_lift::PREVIOUS,
+                        right: core,
+                        on: vec![var.clone()],
+                        reference: None,
+                        key: None,
+                    },
+                    Vec::new(),
+                ),
+            ];
+            let at = crate::sparql_lift::apply_edit(
+                plan,
+                crate::sparql_lift::Edit {
+                    removed: Vec::new(),
+                    after: core,
+                    inserted: seed,
+                },
+            );
+            let joined = plan.key_of(at[2]).reference();
+            plan.rewrites.push(format!(
+                "seed_element_scope  {joined}  ?{var} is an element of {hop} (records of {}), \
+                 bound in the OPTIONAL's core: joined to the occurrences of that collection \
+                 (?{holder}.{hop} → ?{var})",
+                holder_class
+            ));
+            return true;
+        }
+        false
+    }
+}
+
 /// Whether a subtree yields at most one row: a keyless `Group` or a `LIMIT
 /// 1` slice, reached through nodes that never add rows.
 fn at_most_one_row(plan: &Plan, node: NodeId) -> bool {
@@ -1050,5 +1242,269 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+}
+
+/// A nested `OPTIONAL` whose body reads an element of an inlined collection
+/// is one statement (`SeedElementScope`, then the rules that were already
+/// there), and every step of it is held to the oracle.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod seed_element_scope {
+    use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers_in;
+    use crate::sparql_lift::tests::{as_bag, oracle_rows, rows_route_answer_in};
+    use crate::sparql_oracle::Oracle;
+    use crate::sparql_plan::{Refinement, plan_of};
+    use crate::sparql_refine::{Executor, Plan};
+    use crate::sparql_rules::Rule;
+    use crate::sparql_scoper::tests::test_schema_view_plus;
+    use linkml_runtime::schema_rdf::TypeInference;
+    use linkml_schemaview::schemaview::SchemaView;
+
+    const SCHEMA: &str = "urn:graph:schema";
+    const NS: &str = "https://data.infrabel.be/asset360";
+    /// What the equivalence harness does not declare itself.
+    const PREFIX: &str = "PREFIX skos: <http://www.w3.org/2004/02/skos/core#> \
+         PREFIX k: <https://data.infrabel.be/asset360/SignalKind#> ";
+    const ASSET360: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> ";
+
+    /// A bridge holds its elements twice over: keyed (`elements`) and as a
+    /// list (`parts`); an element reads a record (`track`).
+    const EXTRA: &str = r#"
+  Bridge:
+    class_uri: asset360:Bridge
+    attributes:
+      asset360_uri:
+        identifier: true
+      elements:
+        range: Element
+        multivalued: true
+        inlined: true
+      parts:
+        range: Element
+        multivalued: true
+        inlined: true
+        inlined_as_list: true
+  Element:
+    class_uri: asset360:Element
+    attributes:
+      elId:
+        key: true
+      elType:
+        range: SignalKind
+      material:
+        range: SignalKind
+      year:
+        range: integer
+      track:
+        range: Track
+"#;
+
+    fn schema() -> SchemaView {
+        test_schema_view_plus(EXTRA)
+    }
+
+    /// Four bridges: two KSS elements (one a plain duplicate in everything
+    /// the queries read but its id), a non-KSS one beside them; a KSS element
+    /// with neither year, material nor track; only a non-KSS element; none.
+    /// Materials with a label (KSS), without one (GSA), and a track that is
+    /// not a record. Every bridge repeats its elements as `parts`.
+    fn oracle(schema: &SchemaView) -> Oracle {
+        let el =
+            |id: &str, t: &str, rest: &str| format!(r#"{{"elId": "{id}", "elType": "{t}"{rest}}}"#);
+        let t1 = format!(r#", "track": "{NS}/track/T1""#);
+        let lost = format!(r#", "track": "{NS}/track/T-missing""#);
+        let bridge = |n: u32, elements: &[String]| {
+            let keyed: Vec<String> = elements
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!(r#""e{i}": {e}"#))
+                .collect();
+            let body = if elements.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#", "elements": {{{}}}, "parts": [{}]"#,
+                    keyed.join(", "),
+                    elements.join(", ")
+                )
+            };
+            format!(r#"{{"asset360_uri": "{NS}/bridge/{n}"{body}}}"#)
+        };
+        let b1 = bridge(
+            1,
+            &[
+                el(
+                    "a",
+                    "KSS",
+                    &format!(r#", "year": 1950, "material": "KSS"{t1}"#),
+                ),
+                el(
+                    "b",
+                    "KSS",
+                    &format!(r#", "year": 1950, "material": "GSA"{lost}"#),
+                ),
+                el("c", "REP_H_D", r#", "year": 2001"#),
+            ],
+        );
+        let b2 = bridge(2, &[el("d", "KSS", "")]);
+        let b3 = bridge(3, &[el("e", "REP_H_D", r#", "material": "KSS""#)]);
+        let b4 = bridge(4, &[]);
+        let track = format!(r#"{{"asset360_uri": "{NS}/track/T1", "hasName": "Main"}}"#);
+        Oracle::new(
+            schema,
+            &[
+                ("Bridge", &b1),
+                ("Bridge", &b2),
+                ("Bridge", &b3),
+                ("Bridge", &b4),
+                ("Track", &track),
+            ],
+        )
+        .with_schema_graph(schema, SCHEMA, TypeInference::ASSERTED)
+    }
+
+    fn holder(path: &str, select: &str, tail: &str) -> String {
+        format!(
+            "{PREFIX}SELECT {select} WHERE {{ ?b a asset360:Bridge . OPTIONAL {{ ?b asset360:{path} ?e . \
+             ?e asset360:elType k:KSS . {tail} }} }}"
+        )
+    }
+
+    const LABELS: &str = "OPTIONAL { GRAPH <urn:graph:schema> { ?m skos:prefLabel ?nl \
+         FILTER(lang(?nl) = \"nl-be\") } } \
+         OPTIONAL { GRAPH <urn:graph:schema> { ?m skos:prefLabel ?fr \
+         FILTER(lang(?fr) = \"fr-be\") } }";
+
+    /// Every rule application of the refinement holds to the oracle, with
+    /// the lifting rules too.
+    fn refined_and_checked(query: &str, schema: &SchemaView, oracle: &Oracle) -> Plan {
+        let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
+        let rules = crate::sparql_plan::refine_rules(schema, &dataset, true);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        each_rewrite_preserves_answers_in(query, schema, oracle, &borrowed, &dataset)
+    }
+
+    /// The element is read in its own scope: the nested `OPTIONAL` is one
+    /// statement, whether the collection is keyed or a list, and a nested
+    /// reference held by the element (`track`) is too.
+    #[test]
+    fn a_nested_optional_over_an_element_is_one_statement() {
+        let schema = schema();
+        let oracle = oracle(&schema);
+        let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
+        for path in ["elements", "parts"] {
+            // The last one is an element-held reference, SQL without a seed.
+            for (select, tail, seeded) in [
+                ("?b ?y", "OPTIONAL { ?e asset360:year ?y }", true),
+                (
+                    "?b ?y ?m",
+                    "OPTIONAL { ?e asset360:year ?y } OPTIONAL { ?e asset360:material ?m }",
+                    true,
+                ),
+                (
+                    "?b ?t ?n",
+                    "OPTIONAL { ?e asset360:track ?t . ?t a asset360:Track ; asset360:hasName ?n }",
+                    false,
+                ),
+            ] {
+                let query = holder(path, select, tail);
+                let plan = refined_and_checked(&query, &schema, &oracle);
+                assert!(
+                    plan.nodes.iter().all(|node| node.executor == Executor::Sql),
+                    "{query}\n{plan}"
+                );
+                assert_eq!(
+                    plan.rewrites
+                        .iter()
+                        .any(|line| line.contains("seed_element_scope")),
+                    seeded,
+                    "{query}\n{plan}"
+                );
+                // The order the rules run in does not decide the plan. (Not for the
+                // last query, whose scan lists its reads in a different order: not
+                // this rule's.)
+                let parsed =
+                    crate::sparql_scoper::parse_query(&format!("{ASSET360}{query}"), None).unwrap();
+                let mut texts = Vec::new();
+                for reverse in [false, true]
+                    .into_iter()
+                    .filter(|reverse| seeded || !reverse)
+                {
+                    let mut rules = crate::sparql_rules::tier_one_rules(&schema, &dataset);
+                    if reverse {
+                        rules.reverse();
+                    }
+                    let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+                    let mut again = crate::sparql_refine::naive_plan(&parsed, &dataset).unwrap();
+                    crate::sparql_rules::refine(&mut again, &borrowed)
+                        .unwrap_or_else(|failure| panic!("{failure}"));
+                    texts.push(again.to_string());
+                }
+                assert!(
+                    texts.len() == 1 || texts[0] == texts[1],
+                    "{query}\n{texts:?}"
+                );
+                let production = plan_of(&format!("{ASSET360}{query}"), &schema, &dataset).unwrap();
+                assert!(production.sql_only(), "{query}\n{production}");
+            }
+        }
+    }
+
+    /// The material's labels are the engine's, over the statement's rows:
+    /// SQL answers, engine finishes. The answer is the oracle's, with a label
+    /// where the material has one and none where it does not.
+    #[test]
+    fn labels_under_an_element_are_finished_over_the_rows() {
+        let schema = schema();
+        let oracle = oracle(&schema);
+        let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
+        for path in ["elements", "parts"] {
+            let query = holder(
+                path,
+                "?b ?y ?m ?nl ?fr",
+                &format!(
+                    "OPTIONAL {{ ?e asset360:year ?y }} \
+                     OPTIONAL {{ ?e asset360:material ?m . {LABELS} }}"
+                ),
+            );
+            refined_and_checked(&query, &schema, &oracle);
+            let query = format!("{ASSET360}{query}");
+            let (plan, rows) = rows_route_answer_in(&query, &schema, &oracle, &dataset);
+            assert!(matches!(plan.refinement, Refinement::UsedRows(_)), "{plan}");
+            let expected = oracle_rows(&query, &oracle);
+            assert_eq!(as_bag(&rows), as_bag(&expected), "{query}\n{plan}");
+            // Not vacuous: a label found, a material without one, no element.
+            let text = as_bag(&expected).join("\n");
+            assert!(
+                text.contains("Kunstwerk") && text.contains("Ouvrage"),
+                "{text}"
+            );
+            assert!(expected.len() > 4, "{text}");
+        }
+    }
+
+    /// An element of an element is not seeded: there is no one-hop
+    /// occurrence of a record to enumerate. Still correct.
+    #[test]
+    fn an_element_of_an_element_is_not_seeded() {
+        let schema = schema();
+        let assembly = format!(
+            r#"{{"asset360_uri": "{NS}/assembly/1", "parts": [
+                 {{"label": "p1", "children": [{{"label": "c1"}}, {{"label": "c2"}}]}},
+                 {{"label": "p2", "children": [{{"label": "c1"}}]}}]}}"#
+        );
+        let oracle = Oracle::new(&schema, &[("Assembly", &assembly)]);
+        let query = format!(
+            "{PREFIX}SELECT * WHERE {{ ?a a asset360:Assembly . OPTIONAL {{ ?a asset360:parts ?p . \
+             ?p asset360:children ?c . OPTIONAL {{ ?c asset360:label ?l }} }} }}"
+        );
+        let plan = refined_and_checked(&query, &schema, &oracle);
+        assert!(
+            !plan
+                .rewrites
+                .iter()
+                .any(|line| line.contains("seed_element_scope")),
+            "{plan}"
+        );
     }
 }

@@ -5595,7 +5595,10 @@ enums:
     permissible_values:
       GSA:
         meaning: eul:GSA
-      KSS: {}
+      KSS:
+        annotations:
+          data.infrabel.be/linkml/label/nl-be: Kunstwerk
+          data.infrabel.be/linkml/label/fr-be: Ouvrage
       REP_H_D: {}
   # A second, additive enum — not a change to `SignalKind` — purely so a
   # `!=` FILTER can be given a constant that selects more than one code.

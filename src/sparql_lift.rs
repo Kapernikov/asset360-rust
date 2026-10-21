@@ -368,16 +368,16 @@ pub fn ordinal_reaches_its_sort(plan: &Plan) -> Result<(), crate::sparql_scopes:
 /// `Insert::Previous` the node inserted just before it), and every old
 /// consumer of `after` other than the inserted ones reading the last
 /// inserted node instead. Returns the new positions of the inserted nodes.
-struct Edit {
-    removed: Vec<(NodeId, NodeId)>,
-    after: NodeId,
-    inserted: Vec<Node>,
+pub(crate) struct Edit {
+    pub(crate) removed: Vec<(NodeId, NodeId)>,
+    pub(crate) after: NodeId,
+    pub(crate) inserted: Vec<Node>,
 }
 
 /// The input of an inserted node, before the rebuild.
-const PREVIOUS: NodeId = usize::MAX;
+pub(crate) const PREVIOUS: NodeId = usize::MAX;
 
-fn apply_edit(plan: &mut Plan, edit: Edit) -> Vec<NodeId> {
+pub(crate) fn apply_edit(plan: &mut Plan, edit: Edit) -> Vec<NodeId> {
     let old_len = plan.nodes.len();
     let mut nodes: Vec<Node> = Vec::with_capacity(old_len + edit.inserted.len());
     let mut remap: Vec<Option<NodeId>> = vec![None; old_len];
@@ -733,7 +733,10 @@ impl Rule for LiftOptionalExtension {
 /// has no condition; the inner join has no witness of its own; **G1b**
 /// `vars(C) ∩ scope(A) ⊆ bound(B)`; **G1c** `f` holds no `EXISTS` and
 /// `vars(f) ∩ scope(A) ⊆ bound(B) ∪ bound(C)`; **G1d** `f` and every
-/// expression in `C` are effect-free; **G1e** `A` and `B` are SQL.
+/// expression in `C` are effect-free; **G1e** `A` is SQL, and so is `B` --
+/// or `B` is a chain of left joins over SQL whose right sides are
+/// engine-only, read nothing but the schema graph, carry no witness and no
+/// effectful condition: what R1 goes on lifting from, one sibling at a time.
 ///
 /// **Equivalence** (the design's, in brief). For a left row `a` and a pair
 /// `(b, c)`: `a ~ b ⊕ c` iff `a ~ b` and `a ~ c` on what they share, and by
@@ -744,6 +747,19 @@ impl Rule for LiftOptionalExtension {
 /// stays `a` -- where testing a shared variable would fail, because `C` can
 /// bind it. Multiplicity: each `(a, b)` contributes its qualifying `c`s, or
 /// one row, on both sides.
+///
+/// **A witness borrowed from `B`.** When the outer join has no witness yet
+/// and `B` guarantees a variable `?v` that is a record's identity, outside
+/// `scope(A)`, unbound by `C` and unread by `f`, `?v` is the witness: it is
+/// bound in a row iff `B` matched, which is what a witness states, and `C`
+/// cannot bind it. The join gets no witness slot, the barrier exports `?v`,
+/// and the lifted condition is `BOUND(?v)`. A fresh witness is a computed
+/// column, which a relation cannot export; an identity is representable.
+///
+/// **No projection** drops the witness when the lift exposes nothing the
+/// outer join did not expose before, or when the join's only consumer is a
+/// barrier whose exports it already exposed: a projection between a barrier
+/// and the left join it wraps blocks the next R1 on the enclosing `OPTIONAL`.
 ///
 /// **Obligations.** The inner join's own claims (its condition) move one
 /// scope up, to the new join: recorded as a [`ScopeTransfer`], which *an
@@ -881,10 +897,11 @@ impl LiftOptionalRightSide<'_> {
                     "G1d: an expression inside C (n{c}) is not effect-free"
                 ));
             }
-            for (side, name) in [(a, "A"), (b, "B")] {
-                if plan.nodes[side].executor != Executor::Sql {
-                    return Err(format!("G1e: {name} (n{side}) is not SQL"));
-                }
+            if plan.nodes[a].executor != Executor::Sql {
+                return Err(format!("G1e: A (n{a}) is not SQL"));
+            }
+            if !self.sql_under_schema_left_joins(plan, b) {
+                return Err(format!("G1e: B (n{b}) is not SQL"));
             }
             Ok(R1Match {
                 outer,
@@ -896,6 +913,37 @@ impl LiftOptionalRightSide<'_> {
                 condition: condition.clone(),
             })
         })())
+    }
+
+    /// G1e: `b` is SQL, or left joins over SQL whose right sides are
+    /// engine-only, read the schema graph alone, and carry no witness or
+    /// effectful condition -- the sides R1 lifts in turn.
+    fn sql_under_schema_left_joins(&self, plan: &Plan, mut b: NodeId) -> bool {
+        while plan.nodes[b].executor != Executor::Sql {
+            let PlanOp::LeftJoin {
+                left,
+                right,
+                condition,
+                witness: None,
+                ..
+            } = &plan.nodes[b].op
+            else {
+                return false;
+            };
+            let side = subtree(plan, *right);
+            if side
+                .iter()
+                .any(|id| plan.nodes[*id].executor != Executor::Engine)
+                || reads_schema_only(plan, &side, self.dataset).is_err()
+                || condition.as_ref().is_some_and(|f| {
+                    f.contains_an_opaque_subquery() || !f.evaluates_the_same_out_of_context()
+                })
+            {
+                return false;
+            }
+            b = *left;
+        }
+        true
     }
 
     pub fn declined(&self, plan: &Plan) -> Vec<(NodeId, String)> {
@@ -937,7 +985,24 @@ impl Rule for LiftOptionalRightSide<'_> {
             _ => unreachable!("matched a left join"),
         };
         let reused = existing.is_some();
-        let witness = existing.unwrap_or_else(|| fresh(plan, "__m", true));
+        let scope_a = plan.variables_of(a);
+        let vars_c = plan.variables_of(c);
+        let borrowed: Option<String> = if reused {
+            None
+        } else {
+            plan.guaranteed(b).into_iter().find(|var| {
+                !scope_a.contains(var)
+                    && !vars_c.contains(var)
+                    && !condition
+                        .iter()
+                        .flat_map(variables_used)
+                        .any(|used| &used == var)
+                    && plan.identity_class(self.schema, b, var).is_some()
+            })
+        };
+        let witness = existing
+            .or_else(|| borrowed.clone())
+            .unwrap_or_else(|| fresh(plan, "__m", true));
         let inner_key = plan.key_of(inner);
         let barrier_key = plan.key_of(barrier);
         let inner_claims = plan.nodes[inner].discharges.clone();
@@ -957,6 +1022,7 @@ impl Rule for LiftOptionalRightSide<'_> {
             .variables_of(c)
             .into_iter()
             .chain(condition.iter().flat_map(variables_used))
+            .chain(borrowed.clone())
             .filter(|var| scope_b.contains(var))
             .collect();
         let mut dropped: Vec<String> = Vec::new();
@@ -974,7 +1040,9 @@ impl Rule for LiftOptionalRightSide<'_> {
                 }
             }
         }
-        if let PlanOp::LeftJoin { witness: slot, .. } = &mut plan.nodes[outer].op {
+        if borrowed.is_none()
+            && let PlanOp::LeftJoin { witness: slot, .. } = &mut plan.nodes[outer].op
+        {
             *slot = Some(witness.clone());
         }
         let lifted_condition = match condition {
@@ -992,13 +1060,19 @@ impl Rule for LiftOptionalRightSide<'_> {
             },
             inner_claims.clone(),
         )];
-        if !reused {
-            let mut scope: BTreeSet<String> = plan.variables_of(a);
-            if let PlanOp::SubSelect { vars, .. } = &plan.nodes[barrier].op {
-                scope.extend(vars.iter().cloned());
-            }
-            scope.extend(plan.variables_of(c));
-            scope.remove(&witness);
+        let mut scope: BTreeSet<String> = plan.variables_of(a);
+        if let PlanOp::SubSelect { vars, .. } = &plan.nodes[barrier].op {
+            scope.extend(vars.iter().cloned());
+        }
+        scope.extend(plan.variables_of(c));
+        scope.insert(witness.clone());
+        let hidden_above = matches!(
+            consumers(plan, outer).as_slice(),
+            [above] if matches!(&plan.nodes[*above].op,
+                PlanOp::SubSelect { domain: None, vars, .. }
+                    if vars.iter().all(|var| exposed.contains(var)))
+        );
+        if !reused && !hidden_above && !scope.is_subset(&exposed) {
             scope.retain(|kept| exposed.contains(kept));
             inserted.push(Node::engine(
                 PlanOp::Project {
@@ -1041,7 +1115,13 @@ impl Rule for LiftOptionalRightSide<'_> {
             "R1  {}  {c_ref} lifted out of its OPTIONAL; C's variables shared with A are bound \
              by B; condition and C effect-free; witness ?{witness}{}",
             lifted_key.reference(),
-            if reused { " (reused)" } else { "" }
+            if reused {
+                " (reused)"
+            } else if borrowed.is_some() {
+                " (borrowed from B: an identity it binds)"
+            } else {
+                ""
+            }
         ));
         true
     }
@@ -1924,9 +2004,22 @@ pub(crate) mod tests {
         schema: &SchemaView,
         oracle: &Oracle,
     ) -> (ExecutionPlan, Vec<serde_json::Value>) {
-        let plan =
-            crate::sparql_plan::plan_of(query, schema, crate::sparql_dataset::default_dataset())
-                .unwrap();
+        rows_route_answer_in(
+            query,
+            schema,
+            oracle,
+            crate::sparql_dataset::default_dataset(),
+        )
+    }
+
+    /// [`rows_route_answer`] over a dataset (one serving a schema graph, say).
+    pub(crate) fn rows_route_answer_in(
+        query: &str,
+        schema: &SchemaView,
+        oracle: &Oracle,
+        dataset: &crate::sparql_dataset::DatasetSpec,
+    ) -> (ExecutionPlan, Vec<serde_json::Value>) {
+        let plan = crate::sparql_plan::plan_of(query, schema, dataset).unwrap();
         assert!(
             matches!(plan.refinement, Refinement::UsedRows(_)),
             "expected the rows route:\n{plan}"
@@ -1934,18 +2027,12 @@ pub(crate) mod tests {
         // The same placement, for the island it placed.
         let parsed = crate::sparql_scoper::parse_query(query, Some(schema)).unwrap();
         let obligations = crate::sparql_plan::obligations_of(&parsed).unwrap();
-        let mut lifted =
-            crate::sparql_refine::naive_plan(&parsed, crate::sparql_dataset::default_dataset())
-                .unwrap();
+        let mut lifted = crate::sparql_refine::naive_plan(&parsed, dataset).unwrap();
         let lifts = plan.passes.iter().any(|pass| {
             matches!(&pass.kind, PassKind::Engine(engine)
                 if matches!(&engine.input, EngineInput::Solutions { .. }))
         });
-        let rules = crate::sparql_plan::refine_rules(
-            schema,
-            crate::sparql_dataset::default_dataset(),
-            lifts,
-        );
+        let rules = crate::sparql_plan::refine_rules(schema, dataset, lifts);
         let borrowed: Vec<&dyn crate::sparql_rules::Rule> =
             rules.iter().map(|rule| rule.as_ref()).collect();
         crate::sparql_rules::refine(&mut lifted, &borrowed).unwrap();
@@ -1954,7 +2041,7 @@ pub(crate) mod tests {
             &lifted,
             &parsed,
             schema,
-            crate::sparql_dataset::default_dataset(),
+            dataset,
             &Default::default(),
         )
         .unwrap_or_else(|why| panic!("{why}\n{lifted}"));

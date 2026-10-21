@@ -89,6 +89,13 @@ pub trait Rule {
     fn measured(&self) -> bool {
         false
     }
+    /// Whether the rule only makes work for the others -- it adds a node they
+    /// then fold or push -- and so must not preempt one that takes the plan
+    /// as it stands. The driver tries it only in a round where no other rule
+    /// applied, wherever it sits in the list.
+    fn last_resort(&self) -> bool {
+        false
+    }
 }
 
 /// How many passes over the rule list the driver will make.
@@ -146,6 +153,8 @@ pub struct RefineLog {
 ///   cost is not a reason to skip it.
 pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFailure> {
     let mut log = RefineLog::default();
+    let mut ordered = rules.to_vec();
+    ordered.sort_by_key(|rule| rule.last_resort());
     for _ in 0..MAX_ROUNDS {
         log.rounds += 1;
         let mut changed = false;
@@ -164,7 +173,10 @@ pub fn refine(plan: &mut Plan, rules: &[&dyn Rule]) -> Result<RefineLog, RuleFai
         // Φ of the plan as it stands, computed only when a measured rule
         // asks and forgotten whenever any rule edits the plan.
         let mut phi: Option<(usize, usize, usize, usize)> = None;
-        for rule in rules {
+        for rule in &ordered {
+            if rule.last_resort() && changed {
+                continue;
+            }
             let before = if rule.measured() {
                 Some(*phi.get_or_insert_with(|| crate::sparql_lift::progress(plan)))
             } else {
@@ -5696,6 +5708,10 @@ pub fn tier_one_rules<'a>(
         Box::new(crate::sparql_scope_rules::PruneUnusedExports),
         Box::new(crate::sparql_scope_rules::PushBarrier::new(schema)),
         Box::new(crate::sparql_scope_rules::PushJoinOnIdentity::new(schema)),
+        // An OPTIONAL body that reads an element of its preserved side gets
+        // that collection's occurrences to join on, once nothing else
+        // applies; the rules above take it from there.
+        Box::new(crate::sparql_scope_rules::SeedElementScope::new(schema)),
         // Op 3: a restriction at a join side with the semi-join proof, then
         // pushed down one operator at a time; the fold reads it as the
         // star's type when it reaches the matches.
