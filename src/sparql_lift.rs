@@ -55,7 +55,7 @@ pub const R5: &str = "commute_lifted_left_join";
 // ---------------------------------------------------------------------------
 
 /// Every expression a node evaluates.
-fn expressions(op: &PlanOp) -> Vec<&Expr> {
+pub(crate) fn expressions(op: &PlanOp) -> Vec<&Expr> {
     match op {
         PlanOp::Filter { condition, .. } => vec![condition],
         PlanOp::Bind { expr, .. } => vec![expr],

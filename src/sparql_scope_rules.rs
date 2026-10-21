@@ -347,8 +347,9 @@ impl Rule for PushJoinOnIdentity<'_> {
 ///
 /// **Guards.** The left join has no condition, and every right side on the
 /// body's spine reads the schema graph only (the label lookups R1 lifts):
-/// anything else there is left to the engine, and seeding would strand the
-/// holder scan as an island of its own. `?e` is bound in every row of `X`, and `X` binds `?e` as no
+/// anything else there is left to the engine (a nested data `OPTIONAL` under
+/// an element body stays unlowered, a refused rare shape), and seeding would
+/// strand the holder scan as an island of its own. `?e` is bound in every row of `X`, and `X` binds `?e` as no
 /// structure yet -- which is what ends the rule's own repetition; **the
 /// core is made only of reads of the element**: data-graph `Match`es whose
 /// subject is `?e`, joined by plain joins. A body that also reaches a record
