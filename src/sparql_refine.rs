@@ -3286,13 +3286,15 @@ impl Plan {
                                 // what binds the referenced star: the
                                 // variable is that star's identity, and the
                                 // column stays unbound on purpose
-                                // (`AbsorbOptionalReference`).
+                                // (`AbsorbOptionalReference`). Optional or
+                                // required: a required read (the query also
+                                // reads the reference outside the `OPTIONAL`,
+                                // say as a constant) delivers the same column,
+                                // and the `ON` compares it the same way
+                                // (#440 gap 2, pepibru GitLab).
                                 && ((slot.var.as_deref() == Some(edge.referenced.as_str())
                                     && slot.presence == SlotPresence::Required)
-                                    || (preserved
-                                        && side == *left
-                                        && slot.var.is_none()
-                                        && slot.presence == SlotPresence::Optional))
+                                    || (preserved && side == *left && slot.var.is_none()))
                                 // A *collection* of identifiers is not a
                                 // foreign key an equality can compare: the
                                 // renderer would emit

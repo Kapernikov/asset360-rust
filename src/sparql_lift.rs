@@ -54,7 +54,7 @@ pub const R4: &str = "lift_extension_over_join";
 // ---------------------------------------------------------------------------
 
 /// Every expression a node evaluates.
-fn expressions(op: &PlanOp) -> Vec<&Expr> {
+pub(crate) fn expressions(op: &PlanOp) -> Vec<&Expr> {
     match op {
         PlanOp::Filter { condition, .. } => vec![condition],
         PlanOp::Bind { expr, .. } => vec![expr],
@@ -124,7 +124,7 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
 }
 
 /// The nodes of the subtree rooted at `root`.
-fn subtree(plan: &Plan, root: NodeId) -> Vec<NodeId> {
+pub(crate) fn subtree(plan: &Plan, root: NodeId) -> Vec<NodeId> {
     plan.reaching(root)
         .into_iter()
         .enumerate()
