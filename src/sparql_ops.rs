@@ -930,14 +930,6 @@ pub enum LoweringRefusal {
     /// compared against the constant and nothing matches, so the query answers
     /// empty while every ledger balances.
     ConditionReadsACollection { node: usize, slot: String },
-    /// A statement that would answer *alone* from an identifier restriction on
-    /// a scan of a class that has no identifier slot.
-    ///
-    /// The writer mints such a record's subject as `<base>root`, not from the
-    /// `asset360_uri` column the restriction compares, so the statement and
-    /// the engine disagree; the statement narrows a fetch and the engine
-    /// finishes.
-    IdentityIsNotTheSubject { node: usize },
 }
 
 impl fmt::Display for LoweringRefusal {
@@ -961,12 +953,6 @@ impl fmt::Display for LoweringRefusal {
                 f,
                 "n{node} pushes a left join whose lifted condition would have to \
                  be a conditional binding rather than a row test"
-            ),
-            Self::IdentityIsNotTheSubject { node } => write!(
-                f,
-                "n{node} rests on an identifier restriction over a class with no \
-                 identifier slot, whose records the writer gives a fixed subject: \
-                 the statement narrows a fetch but cannot answer alone"
             ),
             Self::FetchBoundTooTight { bound, demanded } => write!(
                 f,
@@ -1270,25 +1256,9 @@ fn lower_island(
     // A scan's `identifier_values = {x}` restricts the star's subject to the
     // IRI x -- exactly what a constant subject, `VALUES ?s {<x>}` and
     // `FILTER(?s = <x>)` mean in the RDF -- and the SQL column `asset360_uri`
-    // is that subject IRI, *provided the writer mints the subject from the
-    // record's identifier slot*. A class without one is written under a fixed
-    // `<base>root` subject, so the column holds an IRI no triple has and the
-    // statement would answer 1 where the engine answers 0: such a scan narrows
-    // a fetch and the engine finishes.
-    if enforcement == Enforcement::Enforces
-        && let Some(id) = sql.iter().copied().find(|id| {
-            matches!(&plan.nodes[*id].op,
-                RefinedOp::Scan { class_uri, classes, direct_type_in, identifier_values, .. }
-                    if !identifier_values.is_empty()
-                        && std::iter::once(class_uri)
-                            .chain(classes.iter().filter(|class| {
-                                direct_type_in.is_empty() || direct_type_in.contains(class)
-                            }))
-                            .any(|class| identifier_slot_of(schema, class).is_none()))
-        })
-    {
-        return Err(LoweringRefusal::IdentityIsNotTheSubject { node: id });
-    }
+    // is that subject IRI. That holds by the precondition in
+    // QUERY-PLANNER-RULES.md ("Preconditions"): every stored class has an
+    // identifier slot, from which the writer mints the subject.
 
     let mut lowering = Lowering {
         plan,

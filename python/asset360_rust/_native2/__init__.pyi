@@ -6245,10 +6245,12 @@ class Star:
     @property
     def identifier_values(self) -> builtins.list[builtins.str]:
         r"""
-        The IRIs the query fixed the record's subject to: a constant
-        subject, ``VALUES ?s`` or ``FILTER(?s = <iri>)``. The identifier is
-        the subject IRI, never a triple, so a query that names the identifier
-        slot as a predicate is refused. Empty when the query names no subject.
+        The IRI the query fixed the record's subject to, when it wrote a
+        constant subject. Only that fills this: ``VALUES ?s`` and
+        ``FILTER(?s = <iri>)`` are folded into the plan's scan later, not
+        into this field. The identifier is the subject IRI, never a triple, so
+        a query that names the identifier slot as a predicate is refused.
+        Empty otherwise.
         Python should translate to ``WHERE asset360_uri IN (...)``
         against the indexed column — NOT JSONB extraction.
         """

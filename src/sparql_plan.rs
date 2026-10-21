@@ -2924,29 +2924,35 @@ classes:
                  asset360:asset360_uri \"https://data.infrabel.be/asset360/eq/L1\" }"
                     .to_owned(),
                 "?s",
-                "is the identifier of",
+                "is an identifier in this schema",
             ),
             (
                 format!("SELECT ?id WHERE {{ {eq} asset360:asset360_uri ?id }}"),
                 eq,
-                "is the identifier of",
+                "is an identifier in this schema",
             ),
             (
                 "SELECT ?id WHERE { { ?s a asset360:Relay } UNION { ?s a asset360:Switch } \
                  ?s asset360:asset360_uri ?id }"
                     .to_owned(),
                 "?s",
-                "is the identifier of",
+                "is an identifier in this schema",
             ),
             (
                 format!("SELECT ?id WHERE {{ VALUES ?s {{ {eq} }} ?s asset360:asset360_uri ?id }}"),
                 "?s",
-                "is the identifier of",
+                "is an identifier in this schema",
+            ),
+            (
+                // A blank node is worded like a variable, never printed.
+                "SELECT ?id WHERE { [] asset360:asset360_uri ?id }".to_owned(),
+                "give the node a variable",
+                "is an identifier in this schema",
             ),
             (
                 "SELECT ?t WHERE { ?s asset360:typeURI ?t }".to_owned(),
                 "?s",
-                "designates the type of",
+                "designates a type in this schema",
             ),
         ] {
             for inference in [TypeInference::ASSERTED, TypeInference::IS_A] {
@@ -2963,32 +2969,12 @@ classes:
                     "{query}: {error}"
                 );
                 assert!(error.contains(subject), "{query} names {subject}: {error}");
+                assert!(
+                    !error.contains("_:") && !error.contains(" of Signal"),
+                    "{query} names no blank node and no class: {error}"
+                );
             }
         }
-    }
-
-    /// A named subject answers alone only when the writer mints the subject
-    /// from the identifier slot, i.e. when the scanned classes have one. A
-    /// class without (`Structure`) is written under `<base>root`, so SQL's
-    /// `asset360_uri = <iri>` would find a record the engine does not: the
-    /// engine finishes.
-    #[test]
-    fn a_named_subject_of_a_class_without_an_identifier_does_not_answer_alone() {
-        let sv =
-            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
-        let plan = plan_of(
-            &format!(
-                "{PREFIX}SELECT ?l WHERE {{ <https://data.infrabel.be/asset360/st/s1> \
-                 a asset360:Structure ; asset360:title ?l }}"
-            ),
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .expect("plans");
-        assert!(
-            !matches!(plan.refinement, Refinement::UsedAlone(_)) && !plan.sql_only(),
-            "{plan}"
-        );
     }
 
     /// A union with one arm the rules could not push keeps the per-arm fetch

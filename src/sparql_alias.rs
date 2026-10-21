@@ -174,7 +174,9 @@ pub struct NotASlotOfClass {
     pub predicate: String,
     /// The class the subject is typed with, as its declared IRI.
     pub class_iri: String,
-    /// The class's name in the schema.
+    /// The class's name in the schema. Empty when the subject is of no one
+    /// class and the predicate is an identifier or designator somewhere in the
+    /// schema ([`NotATriple`]): then no class is named.
     pub class_name: String,
     /// The slot of that class the author most likely meant: the one with the
     /// same slot name as the predicate resolves to, or failing that the same
@@ -248,36 +250,60 @@ impl NotASlotOfClass {
 
 impl std::fmt::Display for NotASlotOfClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The subject as the author wrote it: a variable names itself, a
+        // constant is an IRI already, a blank node (a property path's
+        // intermediate, `[ … ]`) has no name worth printing.
+        let is_variable = self.subject.starts_with('?') || self.subject.starts_with('$');
+        let is_blank = self.subject.starts_with("_:");
+        let (node, variable) = if is_blank {
+            ("this node".to_owned(), "?s".to_owned())
+        } else {
+            (self.subject.clone(), self.subject.clone())
+        };
+        let of = if self.class_name.is_empty() {
+            String::new()
+        } else {
+            format!(" of {}", self.class_name)
+        };
+        let bind = if is_blank {
+            "give the node a variable and "
+        } else {
+            ""
+        };
         match self.not_a_triple {
             Some(NotATriple::Identifier) => {
-                // The subject as the author wrote it: a variable is bound to
-                // the IRI, a constant already is one.
-                let how = if self.subject.starts_with('?') || self.subject.starts_with('$') {
+                let how = if is_variable || is_blank {
                     format!(
-                        "match it with a constant subject `<iri>`, `VALUES {0} {{ <iri> }}` or \
-                         `FILTER({0} = <iri>)`",
-                        self.subject
+                        "{bind}match it with a constant subject `<iri>`, \
+                         `VALUES {variable} {{ <iri> }}` or `FILTER({variable} = <iri>)`"
                     )
                 } else {
-                    format!("the subject {} already is the identifier", self.subject)
+                    format!("the subject {node} already is the identifier")
+                };
+                let what = if self.class_name.is_empty() {
+                    "an identifier in this schema".to_owned()
+                } else {
+                    format!("the identifier{of}")
                 };
                 return write!(
                     f,
-                    "{} is the identifier of {}; it is not a triple: the identifier is the \
+                    "{} is {what}; it is not a triple: the identifier is the \
                      subject IRI — {how}",
                     self.full(&self.predicate),
-                    self.class_name,
                 );
             }
             Some(NotATriple::Designator) => {
+                let what = if self.class_name.is_empty() {
+                    "designates a type in this schema".to_owned()
+                } else {
+                    format!("designates the type{of}")
+                };
                 return write!(
                     f,
-                    "{} designates the type of {}; it is not a triple: the type is the \
-                     rdf:type of {2} — read it with `{2} a ?t` or `{2} \
-                     sesame:directType ?t`",
+                    "{} {what}; it is not a triple: the type is the \
+                     rdf:type of {node} — {bind}read it with `{variable} a ?t` or \
+                     `{variable} sesame:directType ?t`",
                     self.full(&self.predicate),
-                    self.class_name,
-                    self.subject,
                 );
             }
             None => {}
@@ -1085,8 +1111,7 @@ fn judge_predicates(
     // per class named — most queries name one or two.
     let mut carried: HashMap<(String, bool), Option<Carried>> = HashMap::new();
     // Built once, on the first subject no class can be told for.
-    let mut not_triples_of_the_schema: Option<BTreeMap<String, (NotATriple, String, String)>> =
-        None;
+    let mut not_triples_of_the_schema: Option<BTreeMap<String, NotATriple>> = None;
     let mut checks = Vec::new();
     for scope in &scopes {
         let reached = infer_reached_classes(scope, schema_view, inference);
@@ -1145,19 +1170,24 @@ fn judge_predicates(
                         .get_or_insert_with(|| not_triples_of_the_schema_of(schema_view))
                         .get(predicate)
                     {
-                        Some((kind, class_iri, class_name)) => {
-                            let mut refusal = uncarried(
-                                subject,
-                                predicate,
-                                (class_iri, false),
-                                class_name,
-                                None,
-                                schema_view,
-                                inference,
-                            );
-                            refusal.not_a_triple = Some(*kind);
-                            refusal.suggestion = None;
-                            PredicateVerdict::NotCarried(Box::new(refusal))
+                        Some(kind) => {
+                            let mut curies = HashMap::new();
+                            if let Ok(curie) = conv.compress(predicate)
+                                && curie != *predicate
+                            {
+                                curies.insert(predicate.clone(), curie);
+                            }
+                            PredicateVerdict::NotCarried(Box::new(NotASlotOfClass {
+                                subject: subject.clone(),
+                                predicate: predicate.clone(),
+                                class_iri: String::new(),
+                                class_name: String::new(),
+                                suggestion: None,
+                                reached_through: None,
+                                polymorphic: false,
+                                not_a_triple: Some(*kind),
+                                curies,
+                            }))
                         }
                         None => PredicateVerdict::Unchecked,
                     },
@@ -1196,12 +1226,9 @@ fn judge_predicates(
 }
 
 /// Every slot the schema declares an identifier or a type designator, by
-/// canonical IRI, with the first class declaring it (its IRI and name). The
-/// writer emits no triple for either, whatever the class, so a subject whose
-/// class cannot be pinned is judged by this.
-fn not_triples_of_the_schema_of(
-    schema_view: &SchemaView,
-) -> BTreeMap<String, (NotATriple, String, String)> {
+/// canonical IRI. The writer emits no triple for either, whatever the class,
+/// so a subject whose class cannot be pinned is judged by this.
+fn not_triples_of_the_schema_of(schema_view: &SchemaView) -> BTreeMap<String, NotATriple> {
     let conv = schema_view.converter();
     let mut found = BTreeMap::new();
     for class in schema_view.class_views().unwrap_or_default() {
@@ -1217,14 +1244,7 @@ fn not_triples_of_the_schema_of(
             let Some(iri) = slot.canonical_uri().to_uri(&conv).ok().map(|u| u.0) else {
                 continue;
             };
-            let class_iri = class
-                .canonical_uri()
-                .to_uri(&conv)
-                .map(|u| u.0)
-                .unwrap_or_else(|_| class.canonical_uri().to_string());
-            found
-                .entry(iri)
-                .or_insert((kind, class_iri, class.name().to_owned()));
+            found.entry(iri).or_insert(kind);
         }
     }
     found
