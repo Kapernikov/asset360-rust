@@ -1640,6 +1640,16 @@ pub(crate) mod equivalence {
             "SELECT ?s ?v WHERE { ?s a asset360:Equipment . OPTIONAL { ?s asset360:voltage ?v } }",
             "SELECT ?s ?l ?v WHERE { ?s a asset360:Equipment ; asset360:label ?l . \
              OPTIONAL { ?s asset360:voltage ?v } }",
+            // The identifier is the subject IRI, not a triple: an aggregate over
+            // a named subject answers alone in SQL, so the plan is held to the
+            // engine for each spelling (constant subject, VALUES, FILTER).
+            "SELECT (COUNT(*) AS ?n) WHERE { <https://data.infrabel.be/asset360/eq/L1> \
+             a asset360:Equipment ; asset360:label ?l }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Equipment ; asset360:label ?l . \
+             VALUES ?s { <https://data.infrabel.be/asset360/eq/L1> \
+             <https://data.infrabel.be/asset360/eq/R1> } }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a asset360:Equipment ; asset360:label ?l . \
+             FILTER(?s = <https://data.infrabel.be/asset360/eq/L1>) }",
             // The most specific type, spelt over the schema graph.
             "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
              SELECT ?s ?t WHERE { ?s a ?t FILTER NOT EXISTS { ?s a ?sub . \

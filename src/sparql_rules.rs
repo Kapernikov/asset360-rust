@@ -2950,8 +2950,10 @@ fn replace_match_with_filter(
 /// the subject itself, and the term rule does not apply: the comparison is
 /// against the identity, not against stored text.
 ///
-/// **It narrows, and never answers.** `LoweringRefusal::IdentityIsNotATriple`
-/// refuses a statement that would answer alone while resting on one.
+/// **The restriction is the subject's, so the statement may answer alone.**
+/// `identifier_values = {x}` restricts the star's subject to the IRI x, which
+/// is what a constant subject, `VALUES ?s {<x>}` and `FILTER(?s = <x>)` mean
+/// in the RDF; `asset360_uri` is that subject IRI by construction.
 pub struct FoldIdentityConstant;
 
 /// The identity constraint a node states on a *star variable*, when it states
@@ -5595,16 +5597,6 @@ impl PushProjection<'_> {
                 plan.nodes[*id].op,
                 PlanOp::Group { .. } | PlanOp::Union { .. }
             )
-        }) {
-            return false;
-        }
-        // An identity restriction narrows a fetch and does not answer: the
-        // lowering refuses such a statement (`IdentityIsNotATriple`);
-        // declining here keeps the plan the fetch it was, with the identity
-        // on the scan.
-        if plan.nodes.iter().any(|node| {
-            matches!(&node.op, PlanOp::Scan { identifier_values, .. }
-                if node.executor == Executor::Sql && !identifier_values.is_empty())
         }) {
             return false;
         }
@@ -9635,8 +9627,9 @@ mod tests {
             "SELECT DISTINCT ?nm WHERE { ?s a asset360:Signal ; asset360:name ?nm } \
              ORDER BY ?s LIMIT 10"
         ));
-        // An identity restriction narrows a fetch and does not answer alone.
-        assert!(!answers(
+        // A named subject: the restriction is on the subject term, which the
+        // engine reads the same way, so the statement answers.
+        assert!(answers(
             "SELECT ?nm WHERE { <https://data.infrabel.be/asset360/sig-1> \
              a asset360:Signal ; asset360:name ?nm }"
         ));

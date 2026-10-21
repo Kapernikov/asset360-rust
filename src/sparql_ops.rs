@@ -928,14 +928,6 @@ pub enum LoweringRefusal {
     /// compared against the constant and nothing matches, so the query answers
     /// empty while every ledger balances.
     ConditionReadsACollection { node: usize, slot: String },
-    /// A statement that would answer *alone* while resting on an identifier
-    /// restriction.
-    ///
-    /// The identifier is the subject IRI, never a triple, so a restriction on
-    /// the identity column (a constant subject, `VALUES ?s`, `FILTER(?s =
-    /// <iri>)`) is a narrowing of a fetch; the statement answering alone from
-    /// it is declined, and the engine finishes.
-    IdentityIsNotATriple { node: usize },
 }
 
 impl fmt::Display for LoweringRefusal {
@@ -959,12 +951,6 @@ impl fmt::Display for LoweringRefusal {
                 f,
                 "n{node} pushes a left join whose lifted condition would have to \
                  be a conditional binding rather than a row test"
-            ),
-            Self::IdentityIsNotATriple { node } => write!(
-                f,
-                "n{node} rests on an identifier restriction, which narrows a fetch \
-                 but cannot answer alone: the writer emits no triple for an \
-                 identifier, so the engine's answer to such a query is empty"
             ),
             Self::FetchBoundTooTight { bound, demanded } => write!(
                 f,
@@ -1265,16 +1251,12 @@ fn lower_island(
         Enforcement::Narrows
     };
 
-    // An identity restriction narrows a fetch and does not answer alone: the
-    // refined planner leaves the answer to the engine.
-    if enforcement == Enforcement::Enforces
-        && let Some(id) = sql.iter().copied().find(|id| {
-            matches!(&plan.nodes[*id].op,
-                RefinedOp::Scan { identifier_values, .. } if !identifier_values.is_empty())
-        })
-    {
-        return Err(LoweringRefusal::IdentityIsNotATriple { node: id });
-    }
+    // A scan's `identifier_values = {x}` restricts the star's subject to the
+    // IRI x -- exactly what a constant subject, `VALUES ?s {<x>}` and
+    // `FILTER(?s = <x>)` mean in the RDF, and the SQL column `asset360_uri` is
+    // that subject IRI by construction. The restriction is on the subject
+    // term, which the engine sees too, so a statement carrying one answers
+    // alone like any other.
 
     let mut lowering = Lowering {
         plan,
@@ -3814,9 +3796,9 @@ mod tests {
     }
 
     /// A statement that restricts the identity (a constant subject) narrows a
-    /// fetch, and does not answer a grouping alone: the grouping falls back.
+    /// fetch, and answers a grouping alone too.
     #[test]
-    fn an_identity_restriction_cannot_answer_alone() {
+    fn an_identity_restriction_can_answer_alone() {
         let sv = test_schema_view();
         // A fetch: identity narrows, the engine decides, and this is the whole
         // point of the fold.
@@ -3837,19 +3819,15 @@ mod tests {
             &vec!["https://data.infrabel.be/data/Signals/u-1".to_owned()]
         );
 
-        // A grouping over the same restriction would answer alone, so it does
-        // not lower.
-        let refusal = lowered(
+        // A grouping over the same restriction answers alone: the restriction
+        // is on the subject, which the engine reads the same way.
+        lowered(
             "SELECT ?nm (COUNT(*) AS ?n) WHERE { \
              <https://data.infrabel.be/data/Signals/u-1> a asset360:Signal ; \
              asset360:name ?nm } GROUP BY ?nm",
             &sv,
         )
-        .expect_err("an identity restriction must not answer alone");
-        assert!(
-            matches!(refusal, LoweringRefusal::IdentityIsNotATriple { .. }),
-            "{refusal}"
-        );
+        .expect("a named subject answers alone");
     }
 
     /// **The promoted clause: claims backed by rendered work.**
