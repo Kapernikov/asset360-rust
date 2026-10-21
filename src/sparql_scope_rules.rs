@@ -345,7 +345,10 @@ impl Rule for PushJoinOnIdentity<'_> {
 /// `A`. Walk down `B`'s left spine through `LeftJoin`s to its first other
 /// node `X`, the mandatory core of the body.
 ///
-/// **Guards.** `?e` is bound in every row of `X`, and `X` binds `?e` as no
+/// **Guards.** The left join has no condition, and every right side on the
+/// body's spine reads the schema graph only (the label lookups R1 lifts):
+/// anything else there is left to the engine, and seeding would strand the
+/// holder scan as an island of its own. `?e` is bound in every row of `X`, and `X` binds `?e` as no
 /// structure yet -- which is what ends the rule's own repetition; **the
 /// core is made only of reads of the element**: data-graph `Match`es whose
 /// subject is `?e`, joined by plain joins. A body that also reaches a record
@@ -444,7 +447,13 @@ impl SeedElementScope<'_> {
     fn seed_one(&self, plan: &mut Plan) -> bool {
         use crate::sparql_refine::{Node, ScanSlot, SlotPresence};
         for id in 0..plan.nodes.len() {
-            let PlanOp::LeftJoin { left: a, right, .. } = &plan.nodes[id].op else {
+            let PlanOp::LeftJoin {
+                left: a,
+                right,
+                condition: None,
+                ..
+            } = &plan.nodes[id].op
+            else {
                 continue;
             };
             let PlanOp::SubSelect {
@@ -460,8 +469,15 @@ impl SeedElementScope<'_> {
                 continue;
             }
             let mut core = *input;
-            while let PlanOp::LeftJoin { left, .. } = &plan.nodes[core].op {
+            let mut only_labels = true;
+            while let PlanOp::LeftJoin { left, right, .. } = &plan.nodes[core].op {
+                let side = crate::sparql_lift::subtree(plan, *right);
+                only_labels &=
+                    crate::sparql_lift::reads_schema_only(plan, &side, self.dataset).is_ok();
                 core = *left;
+            }
+            if !only_labels {
+                continue;
             }
             let guaranteed = plan.guaranteed(core);
             let Some((var, scan, hop)) = vars.iter().find_map(|var| {
@@ -1677,11 +1693,58 @@ mod seed_element_scope {
             let query = format!("{ASSET360}{query}");
             let (plan, rows) = rows_route_answer_in(&query, &schema, &oracle, &dataset);
             assert!(matches!(plan.refinement, Refinement::UsedRows(_)), "{plan}");
-            if path == "parts" {
-                println!("{plan}");
-            }
             let expected = oracle_rows(&query, &oracle);
             assert_eq!(as_bag(&rows), as_bag(&expected), "{query}\n{plan}");
         }
+    }
+
+    #[test]
+    fn review_seed_strands_an_island_under_a_filter_or_an_unfoldable_nested_optional() {
+        let schema = schema();
+        let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
+        for tail in [
+            "OPTIONAL { ?e asset360:year ?y . FILTER(?y > 1960) . ?e asset360:material ?m }",
+            "OPTIONAL { ?e asset360:year ?y . OPTIONAL { ?b asset360:parts ?e2 . ?e2 asset360:year ?y } }",
+        ] {
+            let query = format!(
+                "{ASSET360}SELECT * WHERE {{ ?b a asset360:Bridge ; asset360:parts ?e . {tail} }}"
+            );
+            let production = plan_of(&query, &schema, &dataset).unwrap();
+            assert!(
+                !matches!(production.refinement, Refinement::Fallback { .. }),
+                "{tail}\n{production}"
+            );
+        }
+    }
+
+    /// R5's guards, each with the query that would answer wrongly without
+    /// it: the rule must not fire, and every step still holds to the oracle.
+    /// Two sibling element `OPTIONAL`s, the first with a label lookup `C`.
+    fn r5_refused(second: &str, label_filter: &str) {
+        let schema = schema();
+        let oracle = oracle(&schema);
+        let query = format!(
+            "{PREFIX}SELECT * WHERE {{ ?b a asset360:Bridge ; asset360:parts ?e . \
+             OPTIONAL {{ ?e asset360:material ?m . OPTIONAL {{ GRAPH <urn:graph:schema> {{ \
+             ?m skos:prefLabel ?nl }} FILTER(lang(?nl) = \"nl-be\"{label_filter}) }} }} \
+             {second} }}"
+        );
+        let plan = refined_and_checked(&query, &schema, &oracle);
+        assert!(
+            !plan.rewrites.iter().any(|line| line.starts_with("R5 ")),
+            "{plan}"
+        );
+    }
+
+    /// K2: the second `OPTIONAL` binds `C`'s variable, which `A` does not.
+    #[test]
+    fn r5_the_next_optional_binds_the_labels_variable() {
+        r5_refused("OPTIONAL { ?e asset360:year ?nl }", "");
+    }
+
+    /// K3: `C`'s condition reads what the second `OPTIONAL` binds.
+    #[test]
+    fn r5_the_labels_condition_reads_the_next_optional() {
+        r5_refused("OPTIONAL { ?e asset360:elType ?k }", " && BOUND(?k)");
     }
 }

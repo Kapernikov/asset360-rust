@@ -125,7 +125,7 @@ fn consumers(plan: &Plan, id: NodeId) -> Vec<NodeId> {
 }
 
 /// The nodes of the subtree rooted at `root`.
-fn subtree(plan: &Plan, root: NodeId) -> Vec<NodeId> {
+pub(crate) fn subtree(plan: &Plan, root: NodeId) -> Vec<NodeId> {
     plan.reaching(root)
         .into_iter()
         .enumerate()
@@ -1468,6 +1468,8 @@ impl Rule for LiftExtensionOverJoin {
 /// `c` (or none), one row `a ⊕ s ⊕ c` -- the same bag; the new projection
 /// keeps what the old output had. `S`'s join has no condition, so it reads
 /// neither side.
+///
+/// R5 only fires once the body of `S` is already SQL (its own lifts done).
 ///
 /// **Progress.** `J` drops by the number of evaluating nodes of `C`: `C` has
 /// one left join above it instead of two, and `S` holds none (its body is

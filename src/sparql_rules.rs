@@ -1745,6 +1745,11 @@ impl Rule for DeliverOptionalRead<'_> {
 ///   than above the scan, and the fifth invariant refuses the shape this rule
 ///   would otherwise build.
 /// * **The scan runs in SQL and takes every row of the preserved side.**
+/// * **The read's variable is not in the preserved side's scope.** A column
+///   the scan binds is there from the first row; an earlier `OPTIONAL` of the
+///   preserved side that also binds `?lbl` would be joined *after* it, and
+///   its value, which the original gave the row first, would be compared with
+///   the column instead of binding.
 pub struct AbsorbOptionalRead<'s> {
     schema: &'s SchemaView,
 }
@@ -1809,6 +1814,10 @@ impl Rule for AbsorbOptionalRead<'_> {
                 continue;
             };
             let path = vec![slot.name.clone()];
+            // The variable is new to the preserved side.
+            if plan.variables_of(left).contains(&var) {
+                continue;
+            }
 
             // The preserved side: a scan of that same star, in SQL, whose rows
             // all reach the join.
@@ -10543,6 +10552,40 @@ mod tests {
         assert!(log.reached_fixpoint);
         assert!(log.applied.is_empty());
         assert_eq!(before, plan.to_string());
+    }
+}
+
+/// An `OPTIONAL` read is absorbed into the scan only where no earlier
+/// `OPTIONAL` of the preserved side binds the same variable: the read would
+/// move ahead of it and bind first.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod optional_read_after_an_optional_binding_it {
+    use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+    use crate::sparql_oracle::fixture;
+    use crate::sparql_rules::{Rule, tier_one_rules};
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    #[test]
+    fn absorb_optional_read_and_an_earlier_optional_bind_the_same_variable() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|r| r.as_ref()).collect();
+        for query in [
+            "SELECT ?s ?len ?lbl WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:length ?len . OPTIONAL { VALUES (?len ?lbl) { (3 \"three\") (7 \"seven\") } } } \
+             OPTIONAL { ?s asset360:name ?lbl } }",
+            "SELECT ?s ?len ?lbl WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:length ?len . OPTIONAL { VALUES (?len ?lbl) { (3 \"three\") (7 \"seven\") } } } \
+             OPTIONAL { ?s asset360:trafficKinds ?lbl } }",
+            // The same hole for an optional reference.
+            "SELECT ?s ?len ?t WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:length ?len . OPTIONAL { VALUES (?len ?t) \
+             { (3 <https://data.infrabel.be/asset360/track/T2>) } } } \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track } }",
+        ] {
+            each_rewrite_preserves_answers(query, &schema, &oracle, &borrowed);
+        }
     }
 }
 
