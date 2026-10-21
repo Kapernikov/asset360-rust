@@ -1745,6 +1745,12 @@ impl Rule for DeliverOptionalRead<'_> {
 ///   than above the scan, and the fifth invariant refuses the shape this rule
 ///   would otherwise build.
 /// * **The scan runs in SQL and takes every row of the preserved side.**
+/// * **The read's variable is not mentioned under the preserved side** --
+///   not bound there, and not read by a filter, a condition or an `EXISTS`
+///   body. A column the scan binds is there from the first row; an earlier
+///   `OPTIONAL` that also binds `?lbl` would be joined *after* it and compare
+///   instead of binding, and a filter such as `!BOUND(?lbl)` would see the
+///   column where the original left the variable unbound.
 pub struct AbsorbOptionalRead<'s> {
     schema: &'s SchemaView,
 }
@@ -1809,6 +1815,11 @@ impl Rule for AbsorbOptionalRead<'_> {
                 continue;
             };
             let path = vec![slot.name.clone()];
+            // The variable is new to the preserved side: not bound there, not
+            // read there.
+            if mentioned_below(plan, left, &var) {
+                continue;
+            }
 
             // The preserved side: a scan of that same star, in SQL, whose rows
             // all reach the join.
@@ -1871,6 +1882,26 @@ impl Rule for AbsorbOptionalRead<'_> {
         }
         false
     }
+}
+
+/// Whether `var` is bound or mentioned anywhere under `node`: a variable of
+/// its scope, or one an expression reads. An expression that holds a pattern
+/// (`EXISTS`) is taken to mention everything, since it reads the row's
+/// bindings by name.
+fn mentioned_below(plan: &Plan, node: NodeId, var: &str) -> bool {
+    plan.variables_of(node).contains(var)
+        || crate::sparql_lift::subtree(plan, node)
+            .into_iter()
+            .any(|id| {
+                crate::sparql_lift::expressions(&plan.nodes[id].op)
+                    .into_iter()
+                    .any(|expr| {
+                        expr.contains_an_opaque_subquery()
+                            || crate::sparql_refine::variables_used(expr)
+                                .iter()
+                                .any(|used| used == var)
+                    })
+            })
 }
 
 /// Remove the left join, the barrier and the match it made optional, leaving
@@ -10537,6 +10568,62 @@ mod tests {
         assert!(log.reached_fixpoint);
         assert!(log.applied.is_empty());
         assert_eq!(before, plan.to_string());
+    }
+}
+
+/// An `OPTIONAL` read is absorbed into the scan only where no earlier
+/// `OPTIONAL` of the preserved side binds the same variable: the read would
+/// move ahead of it and bind first.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod optional_read_after_an_optional_binding_it {
+    use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+    use crate::sparql_oracle::fixture;
+    use crate::sparql_rules::{Rule, tier_one_rules};
+    use crate::sparql_scoper::tests::test_schema_view;
+
+    #[test]
+    fn absorb_optional_read_and_an_earlier_optional_bind_the_same_variable() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|r| r.as_ref()).collect();
+        for query in [
+            "SELECT ?s ?len ?lbl WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:length ?len . OPTIONAL { VALUES (?len ?lbl) { (3 \"three\") (7 \"seven\") } } } \
+             OPTIONAL { ?s asset360:name ?lbl } }",
+            "SELECT ?s ?len ?lbl WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:length ?len . OPTIONAL { VALUES (?len ?lbl) { (3 \"three\") (7 \"seven\") } } } \
+             OPTIONAL { ?s asset360:trafficKinds ?lbl } }",
+            // The same hole for an optional reference.
+            "SELECT ?s ?len ?t WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:length ?len . OPTIONAL { VALUES (?len ?t) \
+             { (3 <https://data.infrabel.be/asset360/track/T2>) } } } \
+             OPTIONAL { ?s asset360:locatedOnTrack ?t . ?t a asset360:Track } }",
+        ] {
+            each_rewrite_preserves_answers(query, &schema, &oracle, &borrowed);
+        }
+    }
+
+    /// The variable is *read* on the preserved side (a filter, a condition),
+    /// where it is unbound: the read must not move ahead and bind it.
+    #[test]
+    fn absorb_optional_read_and_the_preserved_side_reads_the_variable() {
+        let schema = test_schema_view();
+        let oracle = fixture(&schema);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|r| r.as_ref()).collect();
+        for query in [
+            "SELECT ?s ?lbl WHERE { { ?s a asset360:Signal FILTER(!BOUND(?lbl)) } \
+             OPTIONAL { ?s asset360:name ?lbl } }",
+            "SELECT ?s ?len ?lbl WHERE { ?s a asset360:Signal . \
+             OPTIONAL { ?s asset360:length ?len FILTER(!BOUND(?lbl)) } \
+             OPTIONAL { ?s asset360:name ?lbl } }",
+            "SELECT ?s ?lbl WHERE { { ?s a asset360:Signal \
+             FILTER(COALESCE(?lbl, \"none\") = \"none\") } \
+             OPTIONAL { ?s asset360:name ?lbl } }",
+        ] {
+            each_rewrite_preserves_answers(query, &schema, &oracle, &borrowed);
+        }
     }
 }
 
