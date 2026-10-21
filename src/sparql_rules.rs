@@ -10626,6 +10626,95 @@ mod element_held_optional_reference {
     }
 }
 
+/// A reference the preserved star reads mandatorily -- here as a constant --
+/// and re-reads inside an `OPTIONAL` (#440 gap 2, pepibru GitLab: the
+/// 42-Verviers sub-zone export). The scan already holds the column as a
+/// *required* read, so [`AbsorbOptionalReference`] records its edge on that
+/// read; the invariant used to accept only an *optional* delivered read on
+/// the preserved side and called the plan broken, and the query fell back
+/// to the engine and timed out.
+#[cfg(all(test, feature = "sparql-endpoint"))]
+mod reference_read_mandatorily_and_optionally {
+    use crate::sparql_algebra::equivalence::each_rewrite_preserves_answers;
+    use crate::sparql_oracle::Oracle;
+    use crate::sparql_rules::{Rule, tier_one_rules};
+    use crate::sparql_scoper::tests::test_schema_view_plus;
+
+    const NS: &str = "https://data.infrabel.be/asset360";
+
+    #[test]
+    fn a_required_read_of_the_key_is_the_left_join_s_edge() {
+        let schema = test_schema_view_plus(
+            r#"
+  Asset:
+    class_uri: asset360:Asset
+    attributes:
+      asset360_uri:
+        identifier: true
+      inSector:
+        range: Track
+      inZone:
+        range: Line
+"#,
+        );
+        let records: Vec<(&str, String)> = vec![
+            (
+                "Line",
+                format!(r#"{{"asset360_uri": "{NS}/line/L1", "hasName": "l1"}}"#),
+            ),
+            (
+                "Track",
+                format!(r#"{{"asset360_uri": "{NS}/track/T1", "hasName": "t1"}}"#),
+            ),
+            // In the zone with a sector; in the zone with a sector that is
+            // not a record; in the zone with none; in another zone.
+            (
+                "Asset",
+                format!(
+                    r#"{{"asset360_uri": "{NS}/a/1", "inZone": "{NS}/line/L1", "inSector": "{NS}/track/T1"}}"#
+                ),
+            ),
+            (
+                "Asset",
+                format!(
+                    r#"{{"asset360_uri": "{NS}/a/2", "inZone": "{NS}/line/L1", "inSector": "{NS}/track/T-missing"}}"#
+                ),
+            ),
+            (
+                "Asset",
+                format!(r#"{{"asset360_uri": "{NS}/a/3", "inZone": "{NS}/line/L1"}}"#),
+            ),
+            (
+                "Asset",
+                format!(r#"{{"asset360_uri": "{NS}/a/4", "inZone": "{NS}/line/L2"}}"#),
+            ),
+        ];
+        let borrowed_records: Vec<(&str, &str)> = records
+            .iter()
+            .map(|(class, json)| (*class, json.as_str()))
+            .collect();
+        let oracle = Oracle::new(&schema, &borrowed_records);
+        let rules = tier_one_rules(&schema, crate::sparql_dataset::default_dataset());
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let query = format!(
+            "SELECT * WHERE {{ ?a a asset360:Asset ; asset360:inZone <{NS}/line/L1> . \
+             OPTIONAL {{ ?a asset360:inSector ?t . ?t a asset360:Track . \
+               OPTIONAL {{ ?t asset360:hasName ?n }} OPTIONAL {{ ?t asset360:rsmName ?r }} }} \
+             OPTIONAL {{ ?a asset360:inZone ?z . ?z a asset360:Line }} }}"
+        );
+        let plan = each_rewrite_preserves_answers(&query, &schema, &oracle, &borrowed);
+        plan.check()
+            .unwrap_or_else(|defect| panic!("{defect}\n{plan}"));
+        let production = crate::sparql_plan::plan_of(
+            &format!("PREFIX asset360: <{NS}/> {query}"),
+            &schema,
+            crate::sparql_dataset::default_dataset(),
+        )
+        .unwrap();
+        assert!(production.sql_only(), "{production}");
+    }
+}
+
 /// `?x` reached through an *inline* slot and typed (`?x a :C`) is a test on
 /// the element's designator, not a record scan (#514): the element is a
 /// structure inside a record, so there is no table of `C` to scan.
