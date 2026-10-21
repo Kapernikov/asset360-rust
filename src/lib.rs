@@ -66,6 +66,7 @@ pub mod sparql_scope_rules;
 pub mod sparql_scoper;
 pub mod sparql_scopes;
 pub(crate) mod sparql_slot_family;
+pub(crate) mod sparql_string_bind;
 pub mod sparql_terms;
 pub(crate) mod sparql_typed_subjects;
 
@@ -142,6 +143,7 @@ pub fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PlanPass>()?;
         m.add_class::<PlanOp>()?;
         m.add_class::<PushdownBinding>()?;
+        m.add_class::<PushdownComputed>()?;
         m.add_class::<JoinColumn>()?;
         m.add_class::<RelationColumn>()?;
         m.add_class::<ConstantColumn>()?;
@@ -2128,6 +2130,24 @@ impl PushdownBinding {
         self.inner.direct_type
     }
 
+    /// The expression a **computed** column evaluates, or ``None`` for every
+    /// column that is read.
+    ///
+    /// A ``BIND`` of ``STR``/``STRAFTER``/``STRBEFORE`` over a plain string
+    /// column or a subject IRI that the plan runs in SQL. When set, the
+    /// binding's own ``star_var``, ``slot_path`` and ``class_uri`` are empty
+    /// placeholders -- a renderer must test this *before* it resolves
+    /// ``star_var`` to a table alias, and render the leaves of the tree through
+    /// their own bindings. ``term_kind`` is ``"literal"`` with no datatype and
+    /// no language: a simple literal, on a match and on a miss alike.
+    #[getter]
+    fn computed(&self) -> Option<PushdownComputed> {
+        self.inner
+            .computed
+            .clone()
+            .map(|inner| PushdownComputed { inner })
+    }
+
     /// ``True`` when the slot's values are numbers.
     ///
     /// The renderer needs this twice over: a numeric column is cast before
@@ -2185,6 +2205,80 @@ impl PushdownBinding {
             self.inner.slot_path,
             self.term_kind()
         )
+    }
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+/// A string expression a statement computes over columns it reads: a tree of
+/// ``function`` nodes whose leaves are ``"column"`` nodes.
+///
+/// ``"column"`` is a leaf: ``column`` is an ordinary binding (a plain string
+/// slot, or -- ``slot_path`` empty -- a star's subject IRI), rendered exactly
+/// as any binding of that star would be. ``"STRAFTER"`` and ``"STRBEFORE"``
+/// have one argument in ``args`` and the constant needle in ``text``. ``STR``
+/// is erased: both leaf kinds are text already.
+///
+/// Semantics, with ``x`` the argument and ``n`` the needle (spareval's):
+/// ``STRAFTER`` is ``''`` when ``n`` does not occur in ``x`` and otherwise the
+/// text after its first occurrence; ``STRBEFORE`` is ``''`` and the text
+/// before it. An empty ``n`` occurs at the start. A ``NULL`` ``x`` (unbound)
+/// gives ``NULL`` (unbound), never ``''``. Positions are code points. ``text``
+/// is a constant of the query and must be bound as a parameter. An unknown
+/// ``function`` must be refused, not guessed.
+pub struct PushdownComputed {
+    inner: crate::sparql_pushdown::Computed,
+}
+
+#[cfg(all(feature = "python-bindings", feature = "sparql-endpoint"))]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PushdownComputed {
+    /// ``"column"``, ``"STRAFTER"`` or ``"STRBEFORE"``.
+    #[getter]
+    fn function(&self) -> &'static str {
+        self.inner.function()
+    }
+
+    /// The argument of a function (one entry); empty for a ``"column"``.
+    #[getter]
+    fn args(&self) -> Vec<PushdownComputed> {
+        use crate::sparql_pushdown::Computed;
+        match &self.inner {
+            Computed::Column(_) => Vec::new(),
+            Computed::StrAfter(arg, _) | Computed::StrBefore(arg, _) => vec![PushdownComputed {
+                inner: arg.as_ref().clone(),
+            }],
+        }
+    }
+
+    /// For ``"column"``: the binding the leaf reads.
+    #[getter]
+    fn column(&self) -> Option<PushdownBinding> {
+        use crate::sparql_pushdown::Computed;
+        match &self.inner {
+            Computed::Column(spec) => Some(PushdownBinding {
+                inner: spec.as_ref().clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// For ``"STRAFTER"`` and ``"STRBEFORE"``: the needle, a simple string
+    /// constant containing no NUL.
+    #[getter]
+    fn text(&self) -> Option<String> {
+        use crate::sparql_pushdown::Computed;
+        match &self.inner {
+            Computed::StrAfter(_, needle) | Computed::StrBefore(_, needle) => Some(needle.clone()),
+            Computed::Column(_) => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        self.inner.render()
     }
 }
 
@@ -2729,7 +2823,9 @@ impl RelationColumn {
     /// ``"constant"`` (a column of an inline table in the body, read by the
     /// body's ``binding``, whose ``relation`` is the table's alias),
     /// ``"measure"`` (an aggregate under its own name in the body's
-    /// grouping) or ``"structure"`` (an inlined element's occurrence
+    /// grouping), ``"derived"`` (a string the body computes -- its
+    /// projection carries a binding whose ``computed`` is set -- read by the
+    /// outside as the derived table's column of that name) or ``"structure"`` (an inlined element's occurrence
     /// identifier, composed in the body from ``binding``'s hops).
     #[getter]
     fn kind(&self) -> &'static str {

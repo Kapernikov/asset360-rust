@@ -495,7 +495,15 @@ fn bound_witness(witness: &str) -> Expr {
 /// `Bind` sits directly above the join; a projection dropping the witness
 /// sits above it, built as scope minus the witness. An existing witness is
 /// reused, and so is the projection above its last consumer.
-pub struct LiftOptionalExtension;
+///
+/// **G2f: a body that runs in SQL is not lifted.** A string cut the statement
+/// computes ([`crate::sparql_string_bind::PushStringBind`]) is one SQL
+/// column; lifting it would put the engine back between two SQL nodes. The
+/// decline also fires while the bind's input is still waiting for a rule to
+/// make it SQL, so the schedule does not decide which of the two wins.
+pub struct LiftOptionalExtension<'s> {
+    schema: &'s linkml_schemaview::schemaview::SchemaView,
+}
 
 struct R2Match {
     join: NodeId,
@@ -507,8 +515,12 @@ struct R2Match {
     expr: Expr,
 }
 
-impl LiftOptionalExtension {
-    fn candidate(plan: &Plan, join: NodeId) -> Option<Result<R2Match, String>> {
+impl<'s> LiftOptionalExtension<'s> {
+    pub fn new(schema: &'s linkml_schemaview::schemaview::SchemaView) -> Self {
+        Self { schema }
+    }
+
+    fn candidate(&self, plan: &Plan, join: NodeId) -> Option<Result<R2Match, String>> {
         let node = &plan.nodes[join];
         let PlanOp::LeftJoin {
             left,
@@ -569,6 +581,11 @@ impl LiftOptionalExtension {
             if !expr.evaluates_the_same_out_of_context() {
                 return Err("G2c: the expression is not effect-free".to_owned());
             }
+            if plan.nodes[*input].executor == Executor::Sql
+                || crate::sparql_string_bind::is_pushable(self.schema, plan, *input)
+            {
+                return Err("G2f: the extension runs in SQL".to_owned());
+            }
             for (side, name) in [(a, "A"), (b, "B")] {
                 if plan.nodes[side].executor != Executor::Sql {
                     return Err(format!("G2e: {name} (n{side}) is not SQL"));
@@ -586,9 +603,9 @@ impl LiftOptionalExtension {
         })())
     }
 
-    pub fn declined(plan: &Plan) -> Vec<(NodeId, String)> {
+    pub fn declined(&self, plan: &Plan) -> Vec<(NodeId, String)> {
         (0..plan.nodes.len())
-            .filter_map(|join| match Self::candidate(plan, join)? {
+            .filter_map(|join| match self.candidate(plan, join)? {
                 Err(why) => Some((join, why)),
                 Ok(_) => None,
             })
@@ -596,7 +613,7 @@ impl LiftOptionalExtension {
     }
 }
 
-impl Rule for LiftOptionalExtension {
+impl Rule for LiftOptionalExtension<'_> {
     fn name(&self) -> &'static str {
         R2
     }
@@ -607,7 +624,7 @@ impl Rule for LiftOptionalExtension {
 
     fn apply(&self, plan: &mut Plan) -> bool {
         let Some(found) =
-            (0..plan.nodes.len()).find_map(|join| Self::candidate(plan, join).and_then(Result::ok))
+            (0..plan.nodes.len()).find_map(|join| self.candidate(plan, join).and_then(Result::ok))
         else {
             return false;
         };
@@ -1086,20 +1103,20 @@ impl Rule for LiftOptionalRightSide<'_> {
 /// The projection commutes by H5: what it drops is not compared by the join.
 pub struct LiftExtensionOverJoin;
 
-struct R4Match {
+pub(crate) struct R4Match {
     join: NodeId,
     /// The join's input the extension is: the `Bind`, or the projection over
     /// it.
     side: NodeId,
     projection: Option<NodeId>,
-    bind: NodeId,
+    pub(crate) bind: NodeId,
     x: NodeId,
     var: String,
     expr: Expr,
 }
 
 impl LiftExtensionOverJoin {
-    fn candidate(plan: &Plan, join: NodeId) -> Option<Result<R4Match, String>> {
+    pub(crate) fn candidate(plan: &Plan, join: NodeId) -> Option<Result<R4Match, String>> {
         let node = &plan.nodes[join];
         if node.executor != Executor::Engine {
             return None;
@@ -1812,7 +1829,7 @@ pub fn lifting_rules<'a>(
     dataset: &'a DatasetSpec,
 ) -> Vec<Box<dyn Rule + 'a>> {
     vec![
-        Box::new(LiftOptionalExtension),
+        Box::new(LiftOptionalExtension::new(schema)),
         Box::new(LiftOptionalRightSide::new(schema, dataset)),
         Box::new(LiftExtensionOverJoin),
         Box::new(PageBelowOneToOne::new(schema)),
@@ -1826,7 +1843,7 @@ pub fn declined(
     dataset: &DatasetSpec,
 ) -> Vec<(&'static str, NodeId, String)> {
     let mut out = Vec::new();
-    for (node, why) in LiftOptionalExtension::declined(plan) {
+    for (node, why) in LiftOptionalExtension::new(schema).declined(plan) {
         out.push((R2, node, why));
     }
     for (node, why) in LiftOptionalRightSide::new(schema, dataset).declined(plan) {
@@ -2546,7 +2563,7 @@ mod regressions {
     fn r3_a_page_with_no_order() {
         let schema = test_schema_view();
         let query = format!(
-            "{PREFIX}SELECT ?s ?x WHERE {{ ?s a asset360:Signal . BIND(STR(?s) AS ?x) }} LIMIT 2"
+            "{PREFIX}SELECT ?s ?x WHERE {{ ?s a asset360:Signal . BIND(STRLEN(STR(?s)) AS ?x) }} LIMIT 2"
         );
         let plan = lifted_plan(&query, &schema);
         let printed = plan.to_string();

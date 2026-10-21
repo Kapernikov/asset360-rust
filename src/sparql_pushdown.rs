@@ -76,6 +76,66 @@ pub struct BindingSpec {
     /// the record's `asset_type` column, an IRI (`sesame:directType`).
     /// `slot_path` is empty, as for the identity; `descriptor` is an IRI.
     pub direct_type: bool,
+    /// Set when the column is *computed* from other columns of the same
+    /// statement rather than read from one: a `BIND` of `STR`, `STRAFTER` or
+    /// `STRBEFORE` the plan runs in SQL. Everything else on the spec is then a
+    /// placeholder (`star_var` and `class_uri` empty, `slot_path` empty,
+    /// `descriptor` a simple literal), and a renderer must read this first.
+    pub computed: Option<Computed>,
+}
+
+/// A string expression a statement computes, over columns it already reads.
+///
+/// Closed on purpose: the smallest vocabulary the exports need. `STR` is
+/// erased (a plain string column and a subject IRI are already text), so what
+/// remains is a column, or one cut of a computed string at a constant needle.
+/// The needle is a constant of the query and a renderer binds it as a
+/// parameter, never as SQL text.
+#[derive(Debug, Clone)]
+pub enum Computed {
+    /// A column the statement reads: a plain string slot, or a star's
+    /// identity (`slot_path` empty, the subject IRI). The spec is an ordinary
+    /// one and its `var` is its own name, not a result column.
+    Column(Box<BindingSpec>),
+    /// `STRAFTER(arg, needle)`: what follows the first occurrence; `''` when
+    /// there is none.
+    StrAfter(Box<Computed>, String),
+    /// `STRBEFORE(arg, needle)`: what precedes the first occurrence; `''`
+    /// when there is none.
+    StrBefore(Box<Computed>, String),
+}
+
+impl BindingSpec {
+    /// Where the value comes from, for a plan printout: the slot path, the
+    /// identity, or the expression a computed column evaluates.
+    pub fn source(&self) -> String {
+        match (&self.computed, self.slot_path.as_slice()) {
+            (Some(computed), _) => computed.render(),
+            (None, []) => "<identity>".to_owned(),
+            (None, path) => path.join("."),
+        }
+    }
+}
+
+impl Computed {
+    /// `STRAFTER(?s.name, "x")`, for a plan printout.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Column(spec) if spec.slot_path.is_empty() => format!("?{}", spec.star_var),
+            Self::Column(spec) => format!("?{}.{}", spec.star_var, spec.slot_path.join(".")),
+            Self::StrAfter(arg, needle) => format!("STRAFTER({}, {needle:?})", arg.render()),
+            Self::StrBefore(arg, needle) => format!("STRBEFORE({}, {needle:?})", arg.render()),
+        }
+    }
+
+    /// The function's SPARQL name, or `"column"`.
+    pub fn function(&self) -> &'static str {
+        match self {
+            Self::Column(_) => "column",
+            Self::StrAfter(..) => "STRAFTER",
+            Self::StrBefore(..) => "STRBEFORE",
+        }
+    }
 }
 
 /// How one step of a path is stored, mirroring the schema's own three-way
@@ -389,6 +449,7 @@ pub(crate) fn binding_spec(
         occurrence: false,
         witness: false,
         direct_type: false,
+        computed: None,
     })
 }
 
@@ -428,6 +489,7 @@ pub(crate) fn occurrence_spec(
         occurrence: true,
         witness: false,
         direct_type: false,
+        computed: None,
     })
 }
 
@@ -444,6 +506,29 @@ pub(crate) fn direct_type_spec(star_var: &str, class_uri: &str, var_name: &str) 
         occurrence: false,
         witness: false,
         direct_type: true,
+        computed: None,
+    }
+}
+
+/// A binding for a computed string: a result column named `var_name` whose
+/// value the statement derives from other columns.
+pub(crate) fn computed_spec(
+    var_name: &str,
+    computed: Computed,
+    descriptor: TermDescriptor,
+) -> BindingSpec {
+    BindingSpec {
+        var: var_name.to_owned(),
+        star_var: String::new(),
+        slot_path: Vec::new(),
+        containers: Vec::new(),
+        class_uri: String::new(),
+        descriptor,
+        relation: None,
+        occurrence: false,
+        witness: false,
+        direct_type: false,
+        computed: Some(computed),
     }
 }
 
@@ -466,5 +551,6 @@ pub(crate) fn relation_spec(
         occurrence,
         witness: false,
         direct_type: false,
+        computed: None,
     }
 }

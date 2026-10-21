@@ -573,6 +573,12 @@ pub enum ColumnKind {
     /// A column of a constant table inside the body, read by the body's
     /// binding (`relation` is the table's alias).
     Constant(BindingSpec),
+    /// A string the body computes (`BIND(STRAFTER(..) AS ?v)` run in SQL),
+    /// under its own name in the body's projection: the outside reads the
+    /// derived table's column and the term is `descriptor`'s.
+    Derived {
+        descriptor: crate::sparql_terms::TermDescriptor,
+    },
 }
 
 impl ColumnKind {
@@ -583,6 +589,7 @@ impl ColumnKind {
             Self::Measure { .. } => "measure",
             Self::Structure { .. } => "structure",
             Self::Constant(_) => "constant",
+            Self::Derived { .. } => "derived",
         }
     }
 }
@@ -1580,6 +1587,9 @@ impl Lowering<'_> {
                     false,
                 ))
             }
+            TermOf::Derived { descriptor } => ColumnKind::Derived {
+                descriptor: descriptor.clone(),
+            },
             TermOf::Collection { .. } | TermOf::Computed => return None,
         })
     }
@@ -1634,7 +1644,8 @@ impl Lowering<'_> {
                 containers: Vec::new(),
             },
             // A witness is never a key: it is a fresh name nothing else binds.
-            Column::Witness { .. } => return None,
+            // Nor is a computed string: nothing keys on it.
+            Column::Witness { .. } | Column::Computed(_) => return None,
         })
     }
 
@@ -2474,6 +2485,7 @@ impl Lowering<'_> {
                             ColumnKind::Measure { descriptor } => Some(descriptor.clone()),
                             ColumnKind::Structure { .. } => None,
                             ColumnKind::Constant(binding) => Some(binding.descriptor.clone()),
+                            ColumnKind::Derived { descriptor } => Some(descriptor.clone()),
                         };
                         columns.push(RelationColumn {
                             var: var.clone(),
@@ -2526,6 +2538,13 @@ impl Lowering<'_> {
                         },
                         discharges: node.discharges.clone(),
                     });
+                }
+                // A string cut the statement computes (`crate::sparql_string_bind`):
+                // no operator of its own. It adds a column, read by whatever
+                // projects it, so the node is the input it extends.
+                RefinedOp::Bind { input, .. } => {
+                    remap.insert(id, remap[input]);
+                    continue;
                 }
                 other => {
                     return Err(LoweringRefusal::UnknownOperator { kind: other.kind() });
@@ -2928,6 +2947,11 @@ impl Lowering<'_> {
                     .unwrap_or_else(crate::sparql_terms::TermDescriptor::subject_iri),
                 column.descriptor.is_none(),
             )),
+            Column::Computed(computed) => Some(crate::sparql_pushdown::computed_spec(
+                name,
+                computed,
+                crate::sparql_string_bind::result_descriptor(),
+            )),
             Column::Witness { anchor } => {
                 let mut binding = self.binding_of_column(*anchor, name)?;
                 binding.witness = true;
@@ -2994,6 +3018,8 @@ impl Lowering<'_> {
                 && existing.slot_path == spec.slot_path
                 && existing.relation == spec.relation
                 && existing.direct_type == spec.direct_type
+                && existing.computed.is_none()
+                && spec.computed.is_none()
         }) {
             return Some(index);
         }
@@ -3165,6 +3191,33 @@ impl Lowering<'_> {
                         ));
                     }
                 }
+                RefinedOp::Bind {
+                    input,
+                    var: bound,
+                    expr,
+                } if bound == var => {
+                    // The leaves are read the way any consumer above the
+                    // input would read them, so a join variable takes the
+                    // preserved side's column.
+                    let shape =
+                        crate::sparql_string_bind::shape_of(self.schema, plan, *input, expr)?;
+                    let computed =
+                        shape.computed(&|leaf| match self.scanned_column(*input, leaf)? {
+                            Column::Star {
+                                star_var,
+                                class_uri,
+                                path,
+                            } => crate::sparql_pushdown::binding_spec(
+                                self.schema,
+                                &star_var,
+                                &class_uri,
+                                "",
+                                path,
+                            ),
+                            _ => None,
+                        })?;
+                    candidates.push((optional_side(id), 0, Column::Computed(computed)));
+                }
                 RefinedOp::SubSelect { vars, .. }
                     if !plan.transparent(id) && vars.iter().any(|v| v == var) =>
                 {
@@ -3305,6 +3358,8 @@ enum Column {
     /// join's right side that is non-`NULL` on every row the right side
     /// joined.
     Witness { anchor: Box<Column> },
+    /// A string the statement computes from columns it reads.
+    Computed(crate::sparql_pushdown::Computed),
 }
 
 /// A binding for a value at a path: a term, or -- when the path ends in an
