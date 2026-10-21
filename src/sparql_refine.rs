@@ -2324,9 +2324,10 @@ pub enum PlanOp {
         /// reads the class.
         ///
         /// The writer emits *no triple* for the identifier -- it is the
-        /// subject IRI -- so a constant here narrows the fetch and is never an
-        /// answer on its own. `LoweringRefusal::IdentityIsNotATriple` is what
-        /// keeps that true.
+        /// subject IRI -- and a constant here restricts the star's subject to
+        /// that IRI, which is what the query's subject constant, `VALUES ?s`
+        /// or `FILTER(?s = <iri>)` mean, so it does not stop a statement
+        /// answering alone.
         identifier_values: Vec<String>,
     },
     /// One row per element of a multivalued slot, so row count matches

@@ -1874,9 +1874,9 @@ mod tests {
         use crate::sparql_scoper::tests::asset360_fixture_schema_view;
         let schema = asset360_fixture_schema_view();
         let query = format!(
-            "{PREFIX}SELECT ?s ?tn WHERE {{ ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+            "{PREFIX}SELECT ?s ?l2 WHERE {{ ?s a asset360:TunnelComplex ; asset360:controllerTechnology ?n . \
              OPTIONAL {{ ?s asset360:hasCoveredSection ?cs . ?cs asset360:hasSequenceNumber 1 ; asset360:belongsToTrack ?t ; \
-             asset360:belongsToLine ?line . ?t a asset360:Track ; asset360:typeURI ?tn . \
+             asset360:belongsToLine ?line . ?t a asset360:Track . \
              OPTIONAL {{ ?t asset360:refersToLine ?l2 }} }} }}"
         );
         assert_eq!(

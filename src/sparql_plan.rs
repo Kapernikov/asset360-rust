@@ -2167,12 +2167,7 @@ pub struct KeptNarrowings {
 ///    refined plan says it holds several values, because the list's contract is
 ///    "every slot mentioned on this star"; a disagreement in the other
 ///    direction refuses.
-/// 5. **It is not the identifier slot.** An identifier restriction is
-///    `Star::identifier_values`, rendered against the indexed `asset360_uri`
-///    column, and the scoper already derives its own. Appending to a list that
-///    renders as a conjunctive `IN` from a second source is an intersection
-///    nobody asked for (`IdentityUnfolded` is the same fact one level up).
-/// 6. **`to_sql` can state it at all.** The same call `lower_refined` makes, so
+/// 5. **`to_sql` can state it at all.** The same call `lower_refined` makes, so
 ///    a condition that does not render is refused here exactly as it would be
 ///    there.
 ///
@@ -2277,19 +2272,6 @@ fn keep_what_the_rules_proved(
             };
             // The scoper's name for this scan's star.
             condition.star_var = crate::sparql_domains::qualified(&condition.star_var, domain);
-            let identifier = crate::sparql_ops::identifier_slot_of(schema, &class_uri);
-            // Precondition 5.
-            if identifier
-                .as_deref()
-                .is_some_and(|slot| condition.slot_path.as_slice() == [slot.to_owned()])
-            {
-                out.refused.push(format!(
-                    "n{id}: a restriction on the identifier slot belongs against \
-                     the indexed column as identifier_values, which the \
-                     decomposition derives itself"
-                ));
-                continue;
-            }
             // Precondition 3.
             let Some(star) = scoped
                 .root
@@ -2796,8 +2778,7 @@ classes:
         // by a reference, which is the shape whose `LEFT JOIN` the rules push
         // -- so the union is all-SQL and stacks, and the leak would be live.
         let optional_join_arms = "{ ?s a asset360:Signal . \
-             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s ; \
-             asset360:asset360_uri ?n } } \
+             OPTIONAL { ?bg a asset360:BaliseGroup ; asset360:refersToSignal ?s } } \
              UNION { ?s a asset360:Track . \
              OPTIONAL { ?x a asset360:Signal ; asset360:locatedOnTrack ?s ; \
              asset360:name ?n } }";
@@ -2921,6 +2902,78 @@ classes:
                 numeric,
                 "the condition is rendered against {first}'s column: {printed}"
             );
+        }
+    }
+
+    /// The identifier and the type designator are no triples, whatever the
+    /// query says about the subject's type. A subject the judge cannot pin to
+    /// one class (two types, none, `UNION`-typed, `VALUES`-bound) was passed
+    /// on, and the statement then read the payload key and answered alone
+    /// with a value the RDF does not have (SQL 1, engine 0 under `IS_A`).
+    /// One rule, no typing precondition: such a predicate is refused wherever
+    /// the schema declares it an identifier or a designator.
+    #[test]
+    fn an_identifier_or_designator_is_refused_on_a_subject_of_no_one_class() {
+        use linkml_runtime::schema_rdf::TypeInference;
+        let sv =
+            crate::sparql_scoper::tests::test_schema_view_plus(crate::sparql_oracle::MIXIN_CLASSES);
+        let eq = "<https://data.infrabel.be/asset360/eq/L1>";
+        for (query, subject, what) in [
+            (
+                "SELECT ?s WHERE { ?s a asset360:Relay , asset360:Equipment ; \
+                 asset360:asset360_uri \"https://data.infrabel.be/asset360/eq/L1\" }"
+                    .to_owned(),
+                "?s",
+                "is an identifier in this schema",
+            ),
+            (
+                format!("SELECT ?id WHERE {{ {eq} asset360:asset360_uri ?id }}"),
+                eq,
+                "is an identifier in this schema",
+            ),
+            (
+                "SELECT ?id WHERE { { ?s a asset360:Relay } UNION { ?s a asset360:Switch } \
+                 ?s asset360:asset360_uri ?id }"
+                    .to_owned(),
+                "?s",
+                "is an identifier in this schema",
+            ),
+            (
+                format!("SELECT ?id WHERE {{ VALUES ?s {{ {eq} }} ?s asset360:asset360_uri ?id }}"),
+                "?s",
+                "is an identifier in this schema",
+            ),
+            (
+                // A blank node is worded like a variable, never printed.
+                "SELECT ?id WHERE { [] asset360:asset360_uri ?id }".to_owned(),
+                "give the node a variable",
+                "is an identifier in this schema",
+            ),
+            (
+                "SELECT ?t WHERE { ?s asset360:typeURI ?t }".to_owned(),
+                "?s",
+                "designates a type in this schema",
+            ),
+        ] {
+            for inference in [TypeInference::ASSERTED, TypeInference::IS_A] {
+                let error = plan_of(
+                    &format!("{PREFIX}{query}"),
+                    &sv,
+                    &crate::sparql_dataset::dataset_with(inference, &[], &[]),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{query} under {inference:?} was planned"))
+                .to_string();
+                assert!(
+                    error.contains(what) && error.contains("it is not a triple"),
+                    "{query}: {error}"
+                );
+                assert!(error.contains(subject), "{query} names {subject}: {error}");
+                assert!(
+                    !error.contains("_:") && !error.contains(" of Signal"),
+                    "{query} names no blank node and no class: {error}"
+                );
+            }
         }
     }
 
@@ -3327,17 +3380,16 @@ classes:
         }
     }
 
-    /// Every spelling of an identity restriction still declines to answer an
-    /// aggregate alone, including the several-identifier one.
+    /// Every spelling of a named subject answers an aggregate alone in SQL,
+    /// including the several-identifier one.
     ///
-    /// The standing constraint as the identity surface widened, and the reason
-    /// it is a constraint rather than a preference: the writer emits no triple
-    /// for an identifier, so the engine's answer to such a query is empty --
-    /// and an aggregate is the one case where the engine's answer is the
-    /// answer. Falling back leaves these queries with today's planner, which
-    /// serves them, so the refusal costs nothing and prevents an empty result.
+    /// The identifier is the subject IRI, not a triple, and the restriction is
+    /// on the subject term itself, which the engine sees too:
+    /// `identifier_values = {x}` is exactly what a constant subject,
+    /// `VALUES ?s {<x>}` and `FILTER(?s = <x>)` mean in the RDF. So the
+    /// statement's answer cannot differ from the engine's and need not defer.
     #[test]
-    fn no_spelling_of_an_identity_answers_an_aggregate_alone() {
+    fn every_spelling_of_a_named_subject_answers_an_aggregate_alone() {
         let sv = test_schema_view();
         for (query, spelling) in [
             (
@@ -3366,13 +3418,12 @@ classes:
                 crate::sparql_dataset::default_dataset(),
             )
             .expect("should plan");
-            let reason = plan.refinement.reason().unwrap_or_else(|| {
-                panic!("{spelling} answered an aggregate: {:?}", plan.refinement)
-            });
             assert!(
-                reason.contains("identifier restriction"),
-                "{spelling}: {reason}"
+                matches!(plan.refinement, Refinement::UsedAlone(_)),
+                "{spelling}: {:?}",
+                plan.refinement
             );
+            assert!(plan.sql_only(), "{spelling}:\n{plan}");
         }
     }
 
@@ -3825,32 +3876,17 @@ classes:
     #[test]
     fn a_shape_the_rules_cannot_serve_is_left_to_the_engine() {
         let sv = test_schema_view();
-        for (query, expected) in [
-            (
-                // An aggregate the grouping rule declines: `COUNT(DISTINCT *)`
-                // counts distinct solutions, which `count(*)` does not, so the
-                // refined statement would hand the grouping back -- the
-                // regression the rule refuses to reproduce. The deleted
-                // planner answered it by rendering the distinct away.
-                "SELECT (COUNT(DISTINCT *) AS ?n) WHERE { ?s a asset360:Signal ; \
+        // An aggregate the grouping rule declines: `COUNT(DISTINCT *)`
+        // counts distinct solutions, which `count(*)` does not, so the
+        // refined statement would hand the grouping back -- the
+        // regression the rule refuses to reproduce. The deleted
+        // planner answered it by rendering the distinct away.
+        let (query, expected) = (
+            "SELECT (COUNT(DISTINCT *) AS ?n) WHERE { ?s a asset360:Signal ; \
              asset360:name ?nm }",
-                "COUNT(DISTINCT *)",
-            ),
-            (
-                // An aggregate over a record the query named. The deleted
-                // planner answered it from the statement, which is the one
-                // answer this deletion changes -- from an invented 1 to the
-                // RDF-correct 0. The rules refuse it because the writer
-                // emits no triple for an identifier and the engine's answer to
-                // such a query is empty -- so a statement that answered alone
-                // would be inventing one. Deliberately left as a fallback: the
-                // spelling is the user's decision to make, not the planner's.
-                "SELECT (COUNT(*) AS ?n) WHERE { \
-             <https://data.infrabel.be/asset360/sig-1> a asset360:Signal ; \
-             asset360:name ?nm }",
-                "identifier restriction",
-            ),
-        ] {
+            "COUNT(DISTINCT *)",
+        );
+        {
             let plan = plan_of(
                 &format!("{PREFIX}{query}"),
                 &sv,
@@ -4682,10 +4718,10 @@ classes:
             let type_triple = if typed { "?t a asset360:Track . " } else { "" };
             let query_with = |bind: &str| {
                 format!(
-                    "{PREFIX}SELECT ?s ?n ?t ?inv WHERE {{ ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+                    "{PREFIX}SELECT ?s ?n ?t ?inv WHERE {{ ?s a asset360:TunnelComplex ; asset360:controllerTechnology ?n . \
                      {{ SELECT ?s ?t WHERE {{ ?s a asset360:TunnelComplex ; asset360:hasAccessibleTracks ?cs . \
                      ?cs asset360:isDirect true ; asset360:belongsToTrack ?t . {type_triple}}} }} \
-                     OPTIONAL {{ ?s asset360:typeURI ?nm . BIND({bind} AS ?inv) }} }}"
+                     OPTIONAL {{ ?s asset360:controllerTechnology ?nm . BIND({bind} AS ?inv) }} }}"
                 )
             };
             let lifted = plan_of(
@@ -4836,36 +4872,6 @@ classes:
                 .all(|star| star.filters.is_empty()),
             "nothing may reach the fetch: {:?}",
             scoped.root.all_stars()
-        );
-    }
-
-    /// A narrowing on the identifier slot is refused rather than merged.
-    ///
-    /// Not because it is unsound as a *fetch* restriction — it is the one
-    /// narrowing `LoweringRefusal::IdentityIsNotATriple` says is fine for a
-    /// fetch and wrong for an answer — but because it belongs in
-    /// `Star::identifier_values`, against the indexed column, and the
-    /// decomposition derives its own. Appending to a list that renders as a
-    /// conjunctive `IN` from a second source is an intersection nobody asked
-    /// for.
-    #[test]
-    fn a_narrowing_on_the_identifier_slot_is_left_to_the_decomposition() {
-        let sv = test_schema_view();
-        let query = format!(
-            "{PREFIX}SELECT ?id ?tag WHERE {{ \
-             ?s a asset360:Signal ; asset360:asset360_uri ?id . \
-             ?t a asset360:Track ; asset360:hasName ?h . \
-             VALUES (?id ?tag) {{ (\"one\" \"x\") (\"two\" \"y\") }} }}"
-        );
-        let plan = plan_of(&query, &sv, crate::sparql_dataset::default_dataset()).expect("plans");
-        let Refinement::Fallback { ref narrowings, .. } = plan.refinement else {
-            panic!("{plan}");
-        };
-        // Either nothing was derived, or it was derived and refused. What must
-        // not happen is a second `identifier_values` source.
-        assert!(
-            narrowings.kept.is_empty(),
-            "an identifier restriction is not a column filter: {plan}"
         );
     }
 

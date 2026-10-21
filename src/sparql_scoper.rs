@@ -794,17 +794,10 @@ pub struct Star {
     /// under the asserted inference.
     pub classes: Vec<String>,
 
-    /// Values bound to this class's LinkML identifier slot (the slot
-    /// marked `identifier: true`) — schema-resolved, never assumed to
-    /// be named `"id"`. Collected from inline literals, inline IRIs,
-    /// `FILTER(?id = "v")`, `FILTER(?id IN (...))`, and `VALUES ?id { ... }`.
-    /// Empty when the query has no identifier predicate bound.
-    ///
-    /// The identifier slot does NOT appear in `filters` or
-    /// `required_fields` — the existence check is structurally always
-    /// true (every row has an identifier by construction), and value
-    /// pushdown happens against the indexed `asset360_uri` column
-    /// rather than the JSONB payload.
+    /// The subject IRIs this star is fixed to: a constant subject. The
+    /// identifier is the subject IRI, never a triple, so no predicate
+    /// contributes here. Pushdown is against the indexed `asset360_uri`
+    /// column rather than the JSONB payload.
     pub identifier_values: Vec<String>,
 
     /// Slots that MUST be present on the object. Python emits
@@ -827,8 +820,6 @@ pub struct Star {
     /// Value-level filter conditions per slot, pushable to SQL.
     /// From `FILTER(?var = "literal")` and `VALUES ?var { ... }`
     /// where `?var` is bound to a known slot in this star.
-    ///
-    /// Does NOT include the identifier slot — see `identifier_values`.
     ///
     /// A field listed in [`Self::multivalued_fields`] holds an array, and a
     /// condition on it is a test that the array *contains* the value. Rendering
@@ -1813,14 +1804,6 @@ fn scope_qualified(
             // `:length "3"` on a column storing `3` and refuses the `3` that
             // matches — the inversion the FILTER route was fixed for.
             let form = push_form_of_slot(schema_view, &slot_view);
-            // An identity slot is the object's identity rather than a stored
-            // value: the writer emits no triple for it, and a constant here is
-            // hoisted into `identifier_values` for an indexed `asset360_uri`
-            // lookup instead of a JSONB text compare. The term rule is about
-            // that compare, so it does not apply — and the identity may be
-            // written either as a literal or as an IRI.
-            let identity_slot = slot_view.definition().identifier.unwrap_or(false)
-                || slot_view.definition().key.unwrap_or(false);
             let current = builder
                 .slot_depth
                 .get(&slot_name)
@@ -1877,7 +1860,7 @@ fn scope_qualified(
                         // See the variable arm above: two reads of one
                         // multivalued slot, found in the other order.
                         record_loss(Inexact::ConstantAndVariableOnSlot);
-                    } else if identity_slot || form == PushForm::Iri {
+                    } else if form == PushForm::Iri {
                         builder
                             .inline_filters
                             .entry(slot_name)
@@ -1912,9 +1895,7 @@ fn scope_qualified(
                 // values render as — the same rule the FILTER and VALUES routes
                 // apply, from the same function.
                 TermPattern::Literal(lit) if *depth == 0 => {
-                    if let PushForm::Enum { meanings } = &form
-                        && !identity_slot
-                    {
+                    if let PushForm::Enum { meanings } = &form {
                         // Same rule as the IRI arm above: a literal selects the
                         // codes that render as it, which is the code itself
                         // only when it carries no `meaning`.
@@ -1935,7 +1916,7 @@ fn scope_qualified(
                             }
                             None => record_loss(Inexact::EnumConstantUnmatched),
                         }
-                    } else if identity_slot || literal_pushable(lit, &form) {
+                    } else if literal_pushable(lit, &form) {
                         if multivalued && builder.object_variables.contains_key(&slot_name) {
                             // See the variable arm above.
                             record_loss(Inexact::ConstantAndVariableOnSlot);
@@ -1975,13 +1956,9 @@ fn scope_qualified(
     let mut var_to_class: HashMap<String, String> = HashMap::new();
     // Track the min OPTIONAL depth at which each star first appears.
     let mut star_depths: HashMap<String, usize> = HashMap::new();
-    // Track the identifier slot name (schema-resolved, `identifier: true`)
-    // per star variable — consumed by the Phase 3 filter merge below
-    // so identifier-slot values land in `identifier_values`, not `filters`.
-    let mut var_to_identifier_slot: HashMap<String, String> = HashMap::new();
 
     for builder in star_map.values() {
-        // Resolve the class (and its identifier slot). A variable subject we
+        // Resolve the class. A variable subject we
         // can't scope yields `None` and is set aside for the path walk. A
         // constant-IRI subject we can't scope yields `Err` and rejects the
         // whole query — never a silent drop that returns wrong data.
@@ -1989,28 +1966,27 @@ fn scope_qualified(
             Scoping::Resolve(hints) => hints,
             _ => &HashMap::new(),
         };
-        let (class_uri, identifier_slot_name) =
-            match resolve_star_class(builder, schema_view, hints)? {
-                Some(resolved) => resolved,
-                None => {
-                    // A variable subject whose class cannot be resolved. Two very
-                    // different things look like this, and only the path walk can
-                    // tell them apart: a step inside another star's nested
-                    // structure (`?s :location ?loc . ?loc :longitude ?v`), which
-                    // the plan *does* represent as a path, and a subject nothing
-                    // accounts for (`?sig :locatedOnTrack ?t` with ?sig untyped),
-                    // whose records no star fetches -- refused after the walk,
-                    // with the class to add where the schema knows it.
-                    //
-                    // So record the name rather than the verdict, and let the path
-                    // walk clear the ones it explains — and hand the triples this
-                    // builder claimed back to the working set unless the walk turns
-                    // out to represent every one of them.
-                    unresolved_subjects.insert(builder.variable.clone());
-                    discarded_claims.push(builder);
-                    continue;
-                }
-            };
+        let class_uri = match resolve_star_class(builder, schema_view, hints)? {
+            Some(resolved) => resolved,
+            None => {
+                // A variable subject whose class cannot be resolved. Two very
+                // different things look like this, and only the path walk can
+                // tell them apart: a step inside another star's nested
+                // structure (`?s :location ?loc . ?loc :longitude ?v`), which
+                // the plan *does* represent as a path, and a subject nothing
+                // accounts for (`?sig :locatedOnTrack ?t` with ?sig untyped),
+                // whose records no star fetches -- refused after the walk,
+                // with the class to add where the schema knows it.
+                //
+                // So record the name rather than the verdict, and let the path
+                // walk clear the ones it explains — and hand the triples this
+                // builder claimed back to the working set unless the walk turns
+                // out to represent every one of them.
+                unresolved_subjects.insert(builder.variable.clone());
+                discarded_claims.push(builder);
+                continue;
+            }
+        };
         // `type_depth` is the OPTIONAL depth of the `rdf:type` triple, and it
         // starts at `usize::MAX` for a subject that has none. A constant-IRI
         // subject usually has none — `<.../signal/A> :name ?nm` names the
@@ -2038,75 +2014,16 @@ fn scope_qualified(
         optional_fields.sort();
         optional_fields.dedup();
 
-        // Hoist inline-constant values on the identifier slot into
-        // identifier_values (Phase 1 source). FILTER/VALUES sources
-        // are hoisted in the Phase 3 merge below. The identifier slot
-        // itself is stripped from required_fields / optional_fields:
-        // every row has an identifier by construction, so a JSONB
-        // existence check would be pointless (and value pushdown
-        // happens against the indexed `asset360_uri` column, not the
-        // JSONB payload).
         let mut identifier_values: Vec<String> = Vec::new();
         // A constant-IRI subject is identified by its own URI, regardless of
         // whether the class declares a named identifier slot.
         if let Some(iri) = &builder.const_iri {
             identifier_values.push(iri.clone());
         }
-        let mut inline_filters = builder.inline_filters.clone();
-        if let Some(id_name) = identifier_slot_name.as_deref() {
-            if let Some(conds) = inline_filters.remove(id_name) {
-                // Equality and set membership become an `asset360_uri` lookup
-                // against the indexed column. An ordering comparison cannot —
-                // there is no finite value list — so it stays a filter and the
-                // renderer targets the same column with the operator.
-                let mut kept: Vec<FilterCondition> = Vec::new();
-                for cond in conds {
-                    match cond {
-                        FilterCondition::Eq(v) => identifier_values.push(v),
-                        FilterCondition::In(vs) => identifier_values.extend(vs),
-                        cmp @ FilterCondition::Cmp { .. } => kept.push(cmp),
-                        // A substring match is not a finite value list either
-                        // — same reasoning as `Cmp` — so it stays a filter
-                        // and the renderer targets `asset360_uri` with LIKE.
-                        like @ FilterCondition::Like { .. } => kept.push(like),
-                        // Nor is `!=`: "not this one value" has no list to
-                        // hoist, so it stays a filter and the renderer's null
-                        // test runs against `asset360_uri` itself.
-                        ne @ FilterCondition::Ne(_) => kept.push(ne),
-                        // `inline_filters` here holds constants seeded from
-                        // triple patterns (Phase 1), never a `!bound` --
-                        // that only ever comes from `FILTER` and lands in
-                        // `star_filters`, handled separately below. Kept
-                        // rather than dropped anyway, on the same "no value
-                        // list to hoist" reasoning as `Ne`, so the match
-                        // stays exhaustive without asserting unreachability
-                        // it cannot prove.
-                        nb @ FilterCondition::NotBound => kept.push(nb),
-                        // Same reasoning again, and doubly unreachable: a
-                        // geometry predicate has no value list to hoist
-                        // either, and `inline_filters` never carries one
-                        // regardless -- `lift_intersects` only ever writes
-                        // into `star_filters` (see its own doc comment),
-                        // and the identifier slot this branch is keyed on is
-                        // never geometry-typed. Kept for the same "match
-                        // stays exhaustive without asserting unreachability
-                        // it cannot prove" reason as `NotBound`.
-                        geo @ FilterCondition::Intersects { .. } => kept.push(geo),
-                    }
-                }
-                if !kept.is_empty() {
-                    inline_filters.insert(id_name.to_owned(), kept);
-                }
-            }
-            required_fields.retain(|s| s != id_name);
-            optional_fields.retain(|s| s != id_name);
-        }
+        let inline_filters = builder.inline_filters.clone();
 
         var_to_class.insert(builder.variable.clone(), class_uri.clone());
         star_depths.insert(builder.variable.clone(), builder.type_depth);
-        if let Some(id_name) = identifier_slot_name.clone() {
-            var_to_identifier_slot.insert(builder.variable.clone(), id_name);
-        }
 
         // Which of this star's slots hold arrays. Asked of the schema once here,
         // because a consumer cannot tell from `filters` alone and getting it
@@ -2168,10 +2085,8 @@ fn scope_qualified(
             required_fields,
             optional_fields,
             is_optional: star_is_optional,
-            // Inline-constant filters from Phase 1 (e.g. `?s :foo <uri>`),
-            // minus any entries on the identifier slot that were hoisted
-            // above. FILTER(...)/VALUES filters from Phase 3 are merged
-            // in below.
+            // Inline-constant filters from Phase 1 (e.g. `?s :foo <uri>`).
+            // FILTER(...)/VALUES filters from Phase 3 are merged in below.
             filters: inline_filters,
             // One variable per slot: the first. A second is a self-join the
             // plan records as inexact (`DuplicateSlotBinding`).
@@ -2484,11 +2399,7 @@ fn scope_qualified(
 
     for star in &mut stars {
         if let Some(extra) = star_filters.remove(&star.variable) {
-            let id_slot = var_to_identifier_slot.get(&star.variable).cloned();
             // Merge into any inline-constant filters seeded in Phase 1.
-            // Identifier-slot filters get hoisted into identifier_values
-            // instead of star.filters — they pushdown against the indexed
-            // `asset360_uri` column, not JSONB.
             for (path, conds) in extra {
                 // A path of several slots reads inside the JSON, which no
                 // column key can name.
@@ -2509,54 +2420,7 @@ fn scope_qualified(
                         continue;
                     }
                 };
-                if Some(&slot) == id_slot.as_ref() {
-                    for cond in conds {
-                        match cond {
-                            FilterCondition::Eq(v) => star.identifier_values.push(v),
-                            FilterCondition::In(vs) => star.identifier_values.extend(vs),
-                            // See the Phase-1 note: an ordering comparison has
-                            // no value list to hoist, so it stays a filter.
-                            cmp @ FilterCondition::Cmp { .. } => {
-                                star.filters.entry(slot.clone()).or_default().push(cmp);
-                            }
-                            // Same reasoning: a substring match has no value
-                            // list to hoist onto `identifier_values`, so it
-                            // stays a filter against `asset360_uri`.
-                            like @ FilterCondition::Like { .. } => {
-                                star.filters.entry(slot.clone()).or_default().push(like);
-                            }
-                            // Same reasoning again: `!=` has no value list
-                            // either, so it stays a filter and the renderer's
-                            // null test runs against `asset360_uri`.
-                            ne @ FilterCondition::Ne(_) => {
-                                star.filters.entry(slot.clone()).or_default().push(ne);
-                            }
-                            // `!bound` cannot actually reach here either:
-                            // its gate requires the slot to be in
-                            // `optional_fields`, and the identifier slot is
-                            // never optional. Handled the same way as `Ne`
-                            // regardless, for the same "no value list"
-                            // reasoning.
-                            nb @ FilterCondition::NotBound => {
-                                star.filters.entry(slot.clone()).or_default().push(nb);
-                            }
-                            // Unreachable in truth, and not just by the
-                            // "no value list" reasoning the other arms give:
-                            // this branch only ever sees a *single*-slot
-                            // path (`<[String; 1]>::try_from(path)`, above),
-                            // and the registry never claims one -- its tail
-                            // is two segments (`sparql_columns.rs`). Handled
-                            // the same way anyway, so the match stays
-                            // exhaustive without asserting a stronger
-                            // unreachability claim than the code proves.
-                            geo @ FilterCondition::Intersects { .. } => {
-                                star.filters.entry(slot.clone()).or_default().push(geo);
-                            }
-                        }
-                    }
-                } else {
-                    star.filters.entry(slot).or_default().extend(conds);
-                }
+                star.filters.entry(slot).or_default().extend(conds);
             }
         }
     }
@@ -2902,10 +2766,10 @@ impl StarBuilder {
     }
 }
 
-/// Resolve the LinkML class (and identifier slot name) for one star.
+/// Resolve the LinkML class for one star.
 ///
 /// Returns:
-/// - `Ok(Some((class_uri, identifier_slot_name)))` — the star is scopable.
+/// - `Ok(Some(class_uri))` — the star is scopable.
 /// - `Ok(None)` — a *variable* subject we can't scope (no/unknown `rdf:type`).
 ///   The caller skips it and lets oxigraph evaluate it against the (superset)
 ///   prefetch, exactly as before.
@@ -2922,7 +2786,7 @@ fn resolve_star_class(
     builder: &StarBuilder,
     schema_view: &SchemaView,
     hints: &HashMap<String, String>,
-) -> Result<Option<(String, Option<String>)>, ScopeError> {
+) -> Result<Option<String>, ScopeError> {
     // A class the refined plan derived for a star its own domain left
     // untyped -- read back at the pipeline's `resolve` step, never inferred
     // here a second way. Consulted before the type triple so the two are
@@ -2937,24 +2801,13 @@ fn resolve_star_class(
                 builder.variable
             )));
         }
-        return Ok(Some((
-            class_uri.clone(),
-            schema_view
-                .get_class_by_uri(class_uri)
-                .ok()
-                .flatten()
-                .and_then(|cv| cv.identifier_slot().map(|s| s.name.clone())),
-        )));
+        return Ok(Some(class_uri.clone()));
     }
     if let Some(iri) = &builder.type_iri {
         return match schema_view.get_class_by_uri(iri) {
             // Schema knows this class — keep the full IRI as the canonical
-            // identifier crossing the Rust↔Python boundary. The identifier
-            // slot may be None if the class declares none.
-            Ok(Some(cv)) => Ok(Some((
-                iri.clone(),
-                cv.identifier_slot().map(|s| s.name.clone()),
-            ))),
+            // identifier crossing the Rust↔Python boundary.
+            Ok(Some(_)) => Ok(Some(iri.clone())),
             _ => match &builder.const_iri {
                 Some(subj) => Err(ScopeError::UnsupportedConstruct(format!(
                     "constant subject <{subj}> has rdf:type <{iri}>, which is not a known class"
@@ -2992,10 +2845,7 @@ fn resolve_star_class(
     }
 
     match candidates.as_slice() {
-        [cv] => Ok(Some((
-            cv.canonical_uri().to_string(),
-            cv.identifier_slot().map(|s| s.name.clone()),
-        ))),
+        [cv] => Ok(Some(cv.canonical_uri().to_string())),
         [] => Err(ScopeError::UnsupportedConstruct(format!(
             "constant subject <{subj}> has no rdf:type and its class cannot be inferred from \
              the slots it uses; add an explicit `<{subj}> a asset360:<Class>`"
@@ -9122,142 +8972,6 @@ classes:
         assert!(matches!(&f[0], FilterCondition::Eq(v) if v == "BX517"));
     }
 
-    // ---- Identifier-slot hoist (schema-resolved, never bare "id") ----
-
-    /// Inline literal on the IDENTIFIER slot must be hoisted to
-    /// `identifier_values` — not stored in `filters` (which goes to
-    /// JSONB) and not added to `required_fields` (every row has an
-    /// identifier by construction).
-    #[test]
-    fn test_inline_literal_on_identifier_slot_is_hoisted() {
-        let sv = test_schema_view();
-        let plan = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"abc\" }",
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
-
-        let star = find_star(&plan, "s");
-        assert_eq!(
-            star.identifier_values,
-            vec!["abc".to_owned()],
-            "inline literal on identifier slot must populate identifier_values"
-        );
-        assert!(
-            !star.filters.contains_key("asset360_uri"),
-            "identifier slot must NOT appear in filters (saw {:?})",
-            star.filters
-        );
-        assert!(
-            !star.required_fields.contains(&"asset360_uri".to_owned()),
-            "identifier slot must NOT appear in required_fields (saw {:?})",
-            star.required_fields
-        );
-    }
-
-    /// Same hoist as the literal case, but with an inline IRI object.
-    #[test]
-    fn test_inline_iri_on_identifier_slot_is_hoisted() {
-        let sv = test_schema_view();
-        let plan = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { \
-               ?s a asset360:Signal ; \
-                  asset360:asset360_uri <https://data.infrabel.be/data/Signals/abc> . \
-             }",
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
-
-        let star = find_star(&plan, "s");
-        assert_eq!(
-            star.identifier_values,
-            vec!["https://data.infrabel.be/data/Signals/abc".to_owned()],
-        );
-        assert!(!star.filters.contains_key("asset360_uri"));
-        assert!(!star.required_fields.contains(&"asset360_uri".to_owned()));
-    }
-
-    /// `?s :asset360_uri ?id` (variable object, no filter) must not
-    /// add the identifier slot to required_fields: every row has an
-    /// identifier by construction, so the JSONB existence check is
-    /// structurally always true.
-    #[test]
-    fn test_variable_identifier_not_in_required_fields() {
-        let sv = test_schema_view();
-        let plan = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s ?id WHERE { ?s a asset360:Signal ; asset360:asset360_uri ?id }",
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
-
-        let star = find_star(&plan, "s");
-        assert!(
-            star.identifier_values.is_empty(),
-            "no values bound, identifier_values must stay empty"
-        );
-        assert!(
-            !star.required_fields.contains(&"asset360_uri".to_owned()),
-            "identifier slot must not appear in required_fields (saw {:?})",
-            star.required_fields
-        );
-        assert!(!star.filters.contains_key("asset360_uri"));
-    }
-
-    /// VALUES on the identifier slot's bound variable must hoist into
-    /// identifier_values, not filters. Indexed `asset360_uri IN (...)`
-    /// is the right SQL shape — JSONB extraction would defeat the index.
-    #[test]
-    fn test_values_on_identifier_slot_is_hoisted() {
-        let sv = test_schema_view();
-        let plan = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { \
-               ?s a asset360:Signal ; asset360:asset360_uri ?id . \
-               VALUES ?id { \"abc\" \"def\" \"ghi\" } \
-             }",
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
-
-        let star = find_star(&plan, "s");
-        let mut got = star.identifier_values.clone();
-        got.sort();
-        assert_eq!(
-            got,
-            vec!["abc".to_owned(), "def".to_owned(), "ghi".to_owned()]
-        );
-        assert!(!star.filters.contains_key("asset360_uri"));
-        assert!(!star.required_fields.contains(&"asset360_uri".to_owned()));
-    }
-
-    /// FILTER(?id = "abc") on identifier-bound variable hoists into
-    /// identifier_values via the Phase 3 merge path.
-    #[test]
-    fn test_filter_equality_on_identifier_slot_is_hoisted() {
-        let sv = test_schema_view();
-        let plan = sparql_scope(
-            "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s WHERE { \
-               ?s a asset360:Signal ; asset360:asset360_uri ?id . \
-               FILTER(?id = \"abc\") \
-             }",
-            &sv,
-            crate::sparql_dataset::default_dataset(),
-        )
-        .unwrap();
-
-        let star = find_star(&plan, "s");
-        assert_eq!(star.identifier_values, vec!["abc".to_owned()]);
-        assert!(!star.filters.contains_key("asset360_uri"));
-    }
-
     /// Inline filters inside an OPTIONAL block must NOT be pushed to
     /// SQL — they would break LEFT JOIN row preservation. Oxigraph will
     /// apply them after the prefetch.
@@ -9370,7 +9084,7 @@ classes:
     fn an_optional_sub_select_reached_through_an_untyped_subject_is_connected() {
         let sv = asset360_fixture_schema_view();
         let untyped = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
-             SELECT ?s ?n ?t WHERE { ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+             SELECT ?s ?n ?t WHERE { ?s a asset360:TunnelComplex ; asset360:controllerTechnology ?n . \
              OPTIONAL { { SELECT ?s ?t WHERE { ?s asset360:hasAccessibleTracks ?cs . \
              ?cs asset360:belongsToTrack ?t . ?t a asset360:Track } } } }";
         let typed = untyped.replace(
@@ -9419,10 +9133,10 @@ classes:
 
     const TUNNEL_TRACK_OPTIONAL: &str = "PREFIX asset360: <https://data.infrabel.be/asset360/> \
         SELECT ?s ?tn WHERE { \
-          ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+          ?s a asset360:TunnelComplex ; asset360:controllerTechnology ?n . \
           OPTIONAL { ?s asset360:hasCoveredSection ?cs . \
                      ?cs asset360:belongsToTrack ?t . \
-                     ?t a asset360:Track ; asset360:typeURI ?tn } }";
+                     ?t a asset360:Track ; asset360:refersToLine ?tn } }";
 
     /// `?t` is reached from `?s` through `?cs`, an element of an inline list.
     /// That is a join -- ?t's identifier is in ?s's record, two slots down --
@@ -9434,10 +9148,10 @@ classes:
         let plan = sparql_scope(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s ?tn WHERE { \
-               ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+               ?s a asset360:TunnelComplex ; asset360:controllerTechnology ?n . \
                ?s asset360:hasCoveredSection ?cs . \
                ?cs asset360:belongsToTrack ?t . \
-               ?t a asset360:Track ; asset360:typeURI ?tn }",
+               ?t a asset360:Track ; asset360:refersToLine ?tn }",
             &sv,
             crate::sparql_dataset::default_dataset(),
         )
@@ -9492,7 +9206,7 @@ classes:
              SELECT ?s ?tn WHERE { \
                ?s a asset360:TunnelComplex ; asset360:hasCoveredSection ?cs . \
                ?cs asset360:belongsToTrack ?t . ?t a asset360:Track . \
-               OPTIONAL { ?u a asset360:Line ; asset360:typeURI ?tn } }",
+               OPTIONAL { ?u a asset360:Line } }",
             &sv,
             crate::sparql_dataset::default_dataset(),
         );
@@ -9540,10 +9254,10 @@ classes:
         let result = sparql_scope(
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              SELECT ?s ?tn WHERE { \
-               ?s a asset360:TunnelComplex ; asset360:typeURI ?n . \
+               ?s a asset360:TunnelComplex ; asset360:controllerTechnology ?n . \
                OPTIONAL { ?s asset360:hasCoveredSection ?cs . \
                           ?cs asset360:belongsToTrack ?t . \
-                          ?t asset360:typeURI ?tn } }",
+                          ?t asset360:refersToLine ?tn } }",
             &sv,
             crate::sparql_dataset::default_dataset(),
         );

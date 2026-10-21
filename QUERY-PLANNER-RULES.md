@@ -17,3 +17,12 @@ the query planner for sparql has some standing rules for all modifications:
 * The query plan datastructure must remain nest friendly
 
 
+
+## Preconditions
+
+* Every class whose records are stored (the managed classes, annotation
+  `https://data.infrabel.be/asset360/managed`) has an identifier slot. The
+  planner relies on it: the writer mints a record's subject IRI from that slot,
+  so the SQL column `asset360_uri` *is* the subject IRI, and a constant
+  subject, `VALUES ?s {<x>}` or `FILTER(?s = <x>)` can answer from SQL alone.
+  (Checked against the real asset360 schema: all 29 managed classes have one.)

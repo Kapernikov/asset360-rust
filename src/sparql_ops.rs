@@ -135,8 +135,10 @@ pub enum Op {
         /// A renderer filters `asset_type = ANY(asset_types)`; with one element
         /// that is `asset_type = class_uri`.
         asset_types: Vec<String>,
-        /// Values bound against the class's identifier slot, compared against
-        /// the indexed `asset360_uri` column rather than the payload.
+        /// The IRIs the query fixed the record's subject to (a constant
+        /// subject, `VALUES ?s`, `FILTER(?s = <iri>)`): the identifier is the
+        /// subject IRI, never a triple. Compared against the indexed
+        /// `asset360_uri` column rather than the payload.
         identifier_values: Vec<String>,
         /// The variable bound to the record's direct type, when a rule
         /// folded `sesame:directType ?t` into the scan: render
@@ -928,27 +930,6 @@ pub enum LoweringRefusal {
     /// compared against the constant and nothing matches, so the query answers
     /// empty while every ledger balances.
     ConditionReadsACollection { node: usize, slot: String },
-    /// A statement that reads a whole class while the query fixes the
-    /// record's identity.
-    ///
-    /// **A comparator clause, promoted.** It was found by comparing against
-    /// the single-pass planner -- "?ce disagrees about identifier values: []
-    /// against [X]" -- on the query every form field in the product runs. It
-    /// needs no second plan to state: a `match` on the identifier slot with a
-    /// constant object, still unfolded above a scan of the same star, *is* the
-    /// difference between reading one record and reading the class.
-    IdentityUnfolded { node: usize },
-    /// A statement that would answer *alone* while resting on an identifier
-    /// restriction.
-    ///
-    /// The identifier is the subject IRI and the writer emits no triple for
-    /// it, so `?ce :id "X"` matches nothing in the graph: the engine's answer
-    /// to such a query is *empty*. A restriction on the identity column is
-    /// therefore a narrowing of a fetch and never an answer -- today's
-    /// aggregate route counts the record and reports one where the engine
-    /// reports none, which is the wrong answer this refusal exists to avoid
-    /// repeating.
-    IdentityIsNotATriple { node: usize },
 }
 
 impl fmt::Display for LoweringRefusal {
@@ -972,17 +953,6 @@ impl fmt::Display for LoweringRefusal {
                 f,
                 "n{node} pushes a left join whose lifted condition would have to \
                  be a conditional binding rather than a row test"
-            ),
-            Self::IdentityUnfolded { node } => write!(
-                f,
-                "n{node} reads a whole class while the query fixes the record's \
-                 identity, so the statement is wider than the question"
-            ),
-            Self::IdentityIsNotATriple { node } => write!(
-                f,
-                "n{node} rests on an identifier restriction, which narrows a fetch \
-                 but cannot answer alone: the writer emits no triple for an \
-                 identifier, so the engine's answer to such a query is empty"
             ),
             Self::FetchBoundTooTight { bound, demanded } => write!(
                 f,
@@ -1274,42 +1244,6 @@ fn lower_island(
         .flat_map(|right| (0..plan.nodes.len()).filter(move |id| plan.feeds_visibly(*id, right)))
         .collect();
 
-    // A statement must not read a whole class while the query names one
-    // record. This is the comparator clause that caught the identity blindness,
-    // stated on one plan: an unfolded identifier constant above a scan of the
-    // same star is the difference, and it is visible without anything to
-    // compare against.
-    for &id in &sql {
-        let RefinedOp::Scan {
-            star_var,
-            class_uri,
-            identifier_values,
-            ..
-        } = &plan.nodes[id].op
-        else {
-            continue;
-        };
-        if !identifier_values.is_empty() {
-            continue;
-        }
-        let Some(identifier) = identifier_slot_of(schema, class_uri) else {
-            continue;
-        };
-        let unfolded = plan.nodes.iter().any(|node| {
-            let RefinedOp::Match { pattern, .. } = &node.op else {
-                return false;
-            };
-            crate::sparql_refine::subject_variable(pattern) == Some(star_var.as_str())
-                && crate::sparql_refine::predicate_iri(pattern)
-                    .and_then(|iri| schema.get_slot_by_uri(iri).ok().flatten())
-                    .is_some_and(|slot| slot.name == identifier)
-                && !matches!(pattern.object, spargebra::term::TermPattern::Variable(_))
-        });
-        if unfolded {
-            return Err(LoweringRefusal::IdentityUnfolded { node: id });
-        }
-    }
-
     // A pass that answers the query enforces its filters; one that feeds the
     // engine only narrows. The refined plan says which by whether anything
     // above the frontier is left.
@@ -1319,21 +1253,12 @@ fn lower_island(
         Enforcement::Narrows
     };
 
-    // An identifier restriction narrows a fetch and cannot answer alone. The
-    // engine's answer to `?ce :id "X"` is *empty* -- the writer emits no
-    // triple for an identifier, because it is the subject IRI -- so a
-    // statement that both restricts the identity and answers on its own
-    // reports a record the query has no solution for. Today's aggregate route
-    // does exactly that (one where the engine says none); this is where the
-    // refined planner declines to.
-    if enforcement == Enforcement::Enforces
-        && let Some(id) = sql.iter().copied().find(|id| {
-            matches!(&plan.nodes[*id].op,
-                RefinedOp::Scan { identifier_values, .. } if !identifier_values.is_empty())
-        })
-    {
-        return Err(LoweringRefusal::IdentityIsNotATriple { node: id });
-    }
+    // A scan's `identifier_values = {x}` restricts the star's subject to the
+    // IRI x -- exactly what a constant subject, `VALUES ?s {<x>}` and
+    // `FILTER(?s = <x>)` mean in the RDF -- and the SQL column `asset360_uri`
+    // is that subject IRI. That holds by the precondition in
+    // QUERY-PLANNER-RULES.md ("Preconditions"): every stored class has an
+    // identifier slot, from which the writer mints the subject.
 
     let mut lowering = Lowering {
         plan,
@@ -1518,10 +1443,7 @@ fn lower_island(
                             iri.rsplit(['/', '#']).next().unwrap_or_default().to_owned()
                         });
                     let read = slots.iter().any(|scanned| scanned.path.contains(&slot));
-                    let is_the_identity = identifier_slot_of(schema, class_uri)
-                        .is_some_and(|identifier| identifier == slot)
-                        && !identifier_values.is_empty();
-                    if !read && !is_the_identity {
+                    if !read {
                         return wrong(claim);
                     }
                 }
@@ -1889,7 +1811,6 @@ impl Lowering<'_> {
                             .map(|slot| slot.path[0].clone())
                             .collect()
                     };
-                    let identifier = identifier_slot_of(schema, class_uri);
                     nodes.push(OpNode {
                         op: Op::Scan {
                             star_var: star_var.clone(),
@@ -1911,13 +1832,7 @@ impl Lowering<'_> {
                             // the filters below hoist here: both belong against
                             // the indexed column rather than the JSONB payload.
                             identifier_values: identifier_values.clone(),
-                            required_slots: column_slots(SlotPresence::Required)
-                                .into_iter()
-                                // The identifier's existence check is structurally
-                                // always true, and today's star leaves it out for
-                                // the same reason.
-                                .filter(|slot| Some(slot.as_str()) != identifier.as_deref())
-                                .collect(),
+                            required_slots: column_slots(SlotPresence::Required),
                             optional_slots: column_slots(SlotPresence::Optional),
                             // The scoper's, not the refined plan's: the refined
                             // scan lists the nested reads a rule folded into it,
@@ -2054,15 +1969,6 @@ impl Lowering<'_> {
                             let Some(star_var) = tree.star().map(str::to_owned) else {
                                 return Err(LoweringRefusal::Unrenderable { node: id });
                             };
-                            // A leaf on the identifier slot is **not** hoisted onto
-                            // the scan the way a single `Eq` is. `identifier_values`
-                            // is a list of values the row must be one of, which is a
-                            // conjunct of the statement: hoisting one branch of a
-                            // disjunction there would apply it to every row and
-                            // answer a narrower question than the query asked. It
-                            // stays a leaf, rendered against the indexed column by
-                            // its path -- the same thing already happens to a `Cmp`
-                            // or a `Like` on an identifier.
                             nodes.push(OpNode {
                                 op: Op::FilterTree {
                                     input,
@@ -2090,84 +1996,6 @@ impl Lowering<'_> {
                             Vec::new()
                         };
                         let class_uri = classes.get(&condition.star_var);
-                        // A constraint on the identifier slot is hoisted onto the
-                        // scan, against the indexed column. Rendering it as a
-                        // JSONB comparison would miss the B-tree, and today's star
-                        // hoists it for the same reason.
-                        let identifier = class_uri
-                            .and_then(|class_uri| identifier_slot_of(schema, class_uri))
-                            .is_some_and(|slot| condition.slot_path.as_slice() == [slot]);
-                        if identifier {
-                            let scan = scan_of_star(&mut nodes, &condition.star_var);
-                            if let Some(Op::Scan {
-                                identifier_values, ..
-                            }) = scan.map(|scan| &mut nodes[scan].op)
-                            {
-                                match &condition.condition {
-                                    FilterCondition::Eq(value) => {
-                                        identifier_values.push(value.clone());
-                                    }
-                                    FilterCondition::In(values) => {
-                                        identifier_values.extend(values.iter().cloned());
-                                    }
-                                    // An ordering comparison on an identifier is
-                                    // not a set of values, so it stays a filter --
-                                    // the renderer collates the column itself.
-                                    FilterCondition::Cmp { .. }
-                                    // Same reasoning: a substring match has no
-                                    // finite value list to hoist onto
-                                    // `identifier_values`, so it stays a filter
-                                    // against the indexed column too.
-                                    | FilterCondition::Like { .. }
-                                    // `!=` is the same shape again: "not this one
-                                    // value" is not a value list either, and the
-                                    // renderer's null test has to run against the
-                                    // indexed column itself.
-                                    | FilterCondition::Ne(_)
-                                    // `!bound` never actually reaches here: the
-                                    // gate that lifts it requires the slot to be
-                                    // in `optional_fields`, and the identifier
-                                    // slot is never optional (see `Star`'s doc
-                                    // comment -- its existence is structural).
-                                    // Handled the same way as the others anyway,
-                                    // since "no value list to hoist" is just as
-                                    // true of absence as of any other condition.
-                                    | FilterCondition::NotBound
-                                    // A geometry predicate never reaches here
-                                    // either, and not only for the "no value
-                                    // list" reason the others give: this branch
-                                    // only fires when `condition.slot_path` is
-                                    // exactly the identifier slot (checked
-                                    // above), and the geometry registry's tail
-                                    // is two segments, so it never equals a
-                                    // single identifier slot. Handled the same
-                                    // way regardless, so the match stays
-                                    // exhaustive without asserting a stronger
-                                    // unreachability claim than the code proves.
-                                    | FilterCondition::Intersects { .. } => {
-                                        push_filter(
-                                            &mut nodes,
-                                            input,
-                                            &condition,
-                                            FilterFacts {
-                                                schema,
-                                                class_uri,
-                                                enforcement,
-                                                optional_side: optional_nodes.contains(&id),
-                                            },
-                                            discharges,
-                                        );
-                                        input = nodes.len() - 1;
-                                        continue;
-                                    }
-                                }
-                                if !discharges.is_empty() {
-                                    nodes[scan.unwrap()].discharges.extend(discharges);
-                                    nodes[scan.unwrap()].discharges.sort_unstable();
-                                }
-                                continue;
-                            }
-                        }
                         push_filter(
                             &mut nodes,
                             input,
@@ -3461,13 +3289,6 @@ fn element_spec(
     }
 }
 
-/// The scan node for a star, in a tree being built.
-fn scan_of_star(nodes: &mut [OpNode], star_var: &str) -> Option<OpId> {
-    nodes.iter().position(
-        |node| matches!(&node.op, Op::Scan { star_var: scanned, .. } if scanned == star_var),
-    )
-}
-
 /// Append one filter operator, resolving the physical facts the condition does
 /// not carry.
 /// What a lowered filter needs beyond its condition: the two physical facts
@@ -3560,6 +3381,20 @@ pub(crate) fn identifier_slot_of(
 ) -> Option<String> {
     let class = schema.get_class_by_uri(class_uri).ok().flatten()?;
     class.identifier_slot().map(|slot| slot.name.clone())
+}
+
+/// The name of a class's type-designator slot (`designates_type: true`), when
+/// it has one.
+pub(crate) fn designator_slot_of(
+    schema: &linkml_schemaview::schemaview::SchemaView,
+    class_uri: &str,
+) -> Option<String> {
+    let class = schema.get_class_by_uri(class_uri).ok().flatten()?;
+    class
+        .slots()
+        .iter()
+        .find(|slot| slot.definition().designates_type == Some(true))
+        .map(|slot| slot.name.clone())
 }
 
 impl OpTree {
@@ -3976,23 +3811,15 @@ mod tests {
         );
     }
 
-    /// **The wrong answer this refusal exists to prevent.** A statement that
-    /// restricts the identity and answers *alone* reports a record the query
-    /// has no solution for.
-    ///
-    /// The writer emits no triple for an identifier -- it is the subject IRI
-    /// -- so `?s :id "u"` matches nothing in the graph and the engine's answer
-    /// is empty. Today's aggregate route counts the record and reports one;
-    /// the refined planner declines to render such a statement at all, which
-    /// is why the grouping falls back to that route rather than repeating its
-    /// number from a second place.
+    /// A statement that restricts the identity (a constant subject) narrows a
+    /// fetch, and answers a grouping alone too.
     #[test]
-    fn an_identity_restriction_cannot_answer_alone() {
+    fn an_identity_restriction_can_answer_alone() {
         let sv = test_schema_view();
         // A fetch: identity narrows, the engine decides, and this is the whole
         // point of the fold.
         let fetch = lowered(
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
+            "SELECT ?nm WHERE { <https://data.infrabel.be/data/Signals/u-1> a asset360:Signal ; \
              asset360:name ?nm }",
             &sv,
         )
@@ -4003,20 +3830,20 @@ mod tests {
         else {
             panic!("the first node is the scan");
         };
-        assert_eq!(identifier_values, &vec!["u-1".to_owned()]);
+        assert_eq!(
+            identifier_values,
+            &vec!["https://data.infrabel.be/data/Signals/u-1".to_owned()]
+        );
 
-        // A grouping over the same restriction would answer alone, so it does
-        // not lower.
-        let refusal = lowered(
-            "SELECT ?nm (COUNT(*) AS ?n) WHERE { ?s a asset360:Signal ; \
-             asset360:asset360_uri \"u-1\" ; asset360:name ?nm } GROUP BY ?nm",
+        // A grouping over the same restriction answers alone: the restriction
+        // is on the subject, which the engine reads the same way.
+        lowered(
+            "SELECT ?nm (COUNT(*) AS ?n) WHERE { \
+             <https://data.infrabel.be/data/Signals/u-1> a asset360:Signal ; \
+             asset360:name ?nm } GROUP BY ?nm",
             &sv,
         )
-        .expect_err("an identity restriction must not answer alone");
-        assert!(
-            matches!(refusal, LoweringRefusal::IdentityIsNotATriple { .. }),
-            "{refusal}"
-        );
+        .expect("a named subject answers alone");
     }
 
     /// **The promoted clause: claims backed by rendered work.**
@@ -4166,70 +3993,6 @@ mod tests {
         );
     }
 
-    /// **A comparator clause, promoted to a check on one plan.** A statement
-    /// that reads a whole class while the query fixes the identity is refused,
-    /// whether or not there is a second planner to compare against.
-    ///
-    /// This is the shape the comparator caught -- "?ce disagrees about
-    /// identifier values: [] against [X]" -- on the query every named source
-    /// in the product runs. Stating it here is what keeps the knowledge after
-    /// the comparator goes.
-    #[test]
-    fn a_statement_may_not_read_a_class_the_query_narrows_to_one_record() {
-        let sv = test_schema_view();
-        let mut plan = refined_plan(
-            "SELECT ?nm WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u-1\" ; \
-             asset360:name ?nm }",
-            &sv,
-        );
-        // As the rules leave it, identity is folded and it lowers.
-        lower_refined(&plan, &sv, None, None).expect("folded identity lowers");
-
-        // Unfold it, as a planner blind to identity would leave it: the
-        // constant back as a `match`, the scan reading the class.
-        let scan = plan.find("scan")[0];
-        if let crate::sparql_refine::PlanOp::Scan {
-            identifier_values, ..
-        } = &mut plan.nodes[scan].op
-        {
-            identifier_values.clear();
-        }
-        let pattern = spargebra::term::TriplePattern {
-            subject: spargebra::term::TermPattern::Variable(
-                spargebra::term::Variable::new_unchecked("s"),
-            ),
-            predicate: spargebra::term::NamedNodePattern::NamedNode(
-                spargebra::term::NamedNode::new_unchecked(
-                    "https://data.infrabel.be/asset360/asset360_uri",
-                ),
-            ),
-            object: spargebra::term::TermPattern::Literal(
-                spargebra::term::Literal::new_simple_literal("u-1"),
-            ),
-        };
-        plan.nodes.insert(
-            scan + 1,
-            crate::sparql_refine::Node::engine(
-                crate::sparql_refine::PlanOp::Match {
-                    pattern: Box::new(pattern),
-                    reads: crate::sparql_dataset::GraphReads::Data,
-                },
-                Vec::new(),
-            ),
-        );
-        for node in plan.nodes.iter_mut().skip(scan + 2) {
-            node.op
-                .map_inputs(|input| if input > scan { input + 1 } else { input });
-        }
-
-        let refusal = lower_refined(&plan, &sv, None, None)
-            .expect_err("a class scan where the query names one record must not render");
-        assert!(
-            matches!(refusal, LoweringRefusal::IdentityUnfolded { .. }),
-            "{refusal}"
-        );
-    }
-
     /// A left join with a lifted condition does not lower, even pushed.
     ///
     /// The condition decides whether the optional side *matched*: a signal
@@ -4292,14 +4055,14 @@ mod tests {
         assert_eq!(refusal, LoweringRefusal::NothingPushed);
     }
 
-    /// The identifier slot's values are hoisted onto the scan, against the
-    /// indexed column, exactly as today's star hoists them -- a JSONB
-    /// comparison would miss the B-tree.
+    /// A constant subject is the scan's identity, against the indexed column
+    /// -- a JSONB comparison would miss the B-tree.
     #[test]
-    fn an_identifier_constraint_is_hoisted_onto_the_scan() {
+    fn a_constant_subject_is_hoisted_onto_the_scan() {
         let sv = test_schema_view();
         let tree = lowered(
-            "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri \"u\" }",
+            "SELECT ?nm WHERE { <https://data.infrabel.be/data/Signals/u> a asset360:Signal ; \
+             asset360:name ?nm }",
             &sv,
         )
         .expect("should lower");
@@ -4311,18 +4074,21 @@ mod tests {
         else {
             panic!("the first node is the scan");
         };
-        assert_eq!(identifier_values, &vec!["u".to_owned()]);
-        assert!(
-            required_slots.is_empty(),
-            "every row has an identifier, so the existence check is structurally true"
+        assert_eq!(
+            identifier_values,
+            &vec!["https://data.infrabel.be/data/Signals/u".to_owned()]
+        );
+        assert_eq!(
+            required_slots,
+            &vec!["name".to_owned()],
+            "the identity is the subject, not a slot to check for"
         );
         assert!(
             tree.find("filter").is_empty(),
             "hoisted, not rendered twice"
         );
-        // The claim moves with it: the triple is discharged by the scan, so
-        // the ledger still accounts for it.
-        assert_eq!(tree.claims().len(), 2, "the type and the identifier value");
+        // The scan discharges the type and the name read.
+        assert_eq!(tree.claims().len(), 2);
     }
 
     /// Refinement moves claims, never invents them: what the lowered tree
@@ -4991,45 +4757,6 @@ mod tests {
         );
     }
 
-    /// A leaf on the identifier slot stays in the tree instead of being
-    /// hoisted onto the scan.
-    ///
-    /// `Op::Scan::identifier_values` is a list of values the row must be one
-    /// of, which is a *conjunct* of the statement: hoisting one branch of a
-    /// disjunction there would apply it to every row and answer a narrower
-    /// question than the query asked. So the leaf stays, rendered against the
-    /// indexed column by its path -- the same thing already happens to a
-    /// `Cmp` or a `Like` on an identifier.
-    #[test]
-    fn an_identifier_leaf_is_not_hoisted_out_of_a_tree() {
-        let query = "SELECT ?s WHERE { ?s a asset360:Signal ; asset360:asset360_uri ?u ; \
-                     asset360:name ?nm . FILTER(?u = \"u-1\" || ?nm = \"BX517\") }";
-        let trees = filter_trees(query);
-        assert_eq!(trees.len(), 1);
-        assert_eq!(
-            trees[0]
-                .1
-                .leaves()
-                .into_iter()
-                .map(|leaf| leaf.condition.slot_path.join("."))
-                .collect::<Vec<_>>(),
-            vec!["asset360_uri".to_owned(), "name".to_owned()],
-        );
-        for (_, tree) in sql_passes(query) {
-            for node in &tree.nodes {
-                if let Op::Scan {
-                    identifier_values, ..
-                } = &node.op
-                {
-                    assert!(
-                        identifier_values.is_empty(),
-                        "one branch of a disjunction is not a value the row must have"
-                    );
-                }
-            }
-        }
-    }
-
     /// A disjunction is all-or-nothing: one branch nothing renders declines
     /// the whole tree.
     ///
@@ -5453,7 +5180,7 @@ pub fn observable_slots(
 ///
 /// * the **identifier slot** of every class the scan can return, because the writer mints the record's subject
 ///   IRI from it and a record with no subject joins to nothing;
-/// * the **type-designator slot** (`typeURI`), because the record's own stored
+/// * the **type-designator slot** (`designates_type`) of each, because the record's own stored
 ///   type is what several configurations read and it costs one short string;
 /// * every slot the scan itself narrows on, so a condition the statement
 ///   pushed and the engine re-applies still sees its column.
@@ -5506,7 +5233,13 @@ pub fn declare_retrieval(ops: &mut OpTree, query: &spargebra::Query, schema: &Sc
                 keep.insert(identifier);
             }
         }
-        keep.insert("typeURI".to_owned());
+        // The designator of every class the scan can return, for the same
+        // reason: the writer states a record's type from it.
+        for class in std::iter::once(&*class_uri).chain(asset_types.iter()) {
+            if let Some(designator) = designator_slot_of(schema, class) {
+                keep.insert(designator);
+            }
+        }
 
         *retrieval = Retrieval::Slots(keep.into_iter().collect());
     }
@@ -5563,11 +5296,16 @@ mod retrieval_tests {
         assert_eq!(got.len(), 1, "one scan");
         let slots = slots_of(&got[0]);
         assert!(slots.contains(&"kind".to_owned()), "{slots:?}");
-        assert!(slots.contains(&"typeURI".to_owned()), "{slots:?}");
+        assert!(slots.contains(&"asset360_uri".to_owned()), "{slots:?}");
         assert!(
             !slots.contains(&"name".to_owned()),
             "a slot the query never mentions must not be fetched: {slots:?}"
         );
+        // The designator is the class's own `designates_type` slot, by schema
+        // and not by name.
+        let got = retrievals("SELECT ?l WHERE { ?s a asset360:Place ; asset360:label ?l }");
+        let slots = slots_of(&got[0]);
+        assert!(slots.contains(&"typeURI".to_owned()), "{slots:?}");
     }
 
     /// The trap, stated as a test. A variable predicate reaches every slot, so
