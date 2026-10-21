@@ -867,7 +867,9 @@ pub fn lower_sql_pass(
 /// nobody can see is a fallback that becomes permanent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoweringRefusal {
-    /// No node runs in SQL, so there is nothing to render.
+    /// No node runs in SQL, so there is nothing to render -- or every node
+    /// that does sits inside a barrier the engine runs (a sub-select whose
+    /// projection stayed with it), where there is no statement to render.
     NothingPushed,
     /// The plan contains a `UNION`.
     ///
@@ -1280,6 +1282,12 @@ fn lower_island(
         next_alias: 0,
     };
     let mut nodes = lowering.lower_scope(None, enforcement)?;
+    // The `Sql` nodes can all sit inside a barrier the engine runs: the
+    // island is then not part of the outermost scope, and a statement with no
+    // operators is not a statement the fetch can run.
+    if nodes.is_empty() {
+        return Err(LoweringRefusal::NothingPushed);
+    }
 
     // The fetch bound: a row cap the scoper found safe to apply, which claims
     // nothing -- the engine still applies the query's own `LIMIT` and this

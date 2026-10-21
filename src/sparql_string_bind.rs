@@ -600,6 +600,37 @@ mod tests {
         );
     }
 
+    /// **A sub-select that groups over a bound variable is never a plan with
+    /// no operators.** Whatever route answers it, the plan has a statement to
+    /// run or an engine pass over fetched records.
+    #[test]
+    fn a_subselect_grouping_over_a_bind_is_never_an_empty_statement() {
+        let schema = test_schema_view();
+        for bind in ["STRLEN(?nm)", "STRBEFORE(?nm, \"a\")"] {
+            let query = format!(
+                "SELECT ?t ?c WHERE {{ {{ SELECT ?t (COUNT(*) AS ?c) WHERE {{ \
+                 ?s a asset360:Signal ; asset360:name ?nm . BIND({bind} AS ?t) }} \
+                 GROUP BY ?t }} }}"
+            );
+            let plan = plan_of(&query, &schema);
+            let Some(PassKind::Sql(sql)) = plan.passes.first().map(|pass| &pass.kind) else {
+                panic!("{plan}");
+            };
+            // The fetch reads the sub-select's class, and the engine finishes.
+            assert!(
+                sql.ops
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node.op, Op::Scan { .. })),
+                "{query}\n{plan}"
+            );
+            assert!(
+                matches!(plan.refinement, Refinement::Fallback { .. }),
+                "{plan}"
+            );
+        }
+    }
+
     /// Every rewrite of queries with these binds keeps the answer -- the
     /// oracle holds the plan before and after each rule to the original --
     /// over names that are absent (`signal/C`), repeated, and cut at the
