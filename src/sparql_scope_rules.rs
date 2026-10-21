@@ -346,13 +346,16 @@ impl Rule for PushJoinOnIdentity<'_> {
 /// node `X`, the mandatory core of the body.
 ///
 /// **Guards.** `?e` is bound in every row of `X`, and `X` binds `?e` as no
-/// structure yet -- which is what ends the rule's own repetition. It is a
-/// [`Rule::last_resort`]: it adds work for the other rules and must not
-/// preempt one that takes the body as it stands.
+/// structure yet -- which is what ends the rule's own repetition; **the
+/// core is made only of reads of the element**: data-graph `Match`es whose
+/// subject is `?e`, joined by plain joins. A body that also reaches a record
+/// (`?t a :Track`) is a reference, which the left join takes as its edge; a
+/// path, a `VALUES` or a schema-graph read is not one the fold can take.
 ///
 /// **Edit.** `X := E ⋈_{?e} X`, with `E = Unnest(Scan(H as ?__h, [P → ?e]))`
 /// over the classes `A`'s scan reads, `?__h` fresh and exported by no
-/// barrier. `E` claims no obligation.
+/// barrier, and the restrictions of `A`'s scan (identity, direct type) --
+/// `E` still covers every occurrence `A` can produce. `E` claims no obligation.
 ///
 /// **Equivalence.** A left row `a` is compatible with a body row `b` only if
 /// `b.e = a.e`, both bound, and `a.e` is an occurrence of `(H, P)`. `E` holds
@@ -405,14 +408,39 @@ impl Rule for SeedElementScope<'_> {
         "seed_element_scope"
     }
 
-    /// Only once nothing else applies: the seed makes work for the other
-    /// rules, and must not preempt one that takes the body as it stands (an
-    /// element-held reference, an absorbed read).
-    fn last_resort(&self) -> bool {
-        true
-    }
-
     fn apply(&self, plan: &mut Plan) -> bool {
+        // Every candidate in one application: each seed is independent of
+        // the others, and one per round would take a round per OPTIONAL.
+        let mut seeded = false;
+        while self.seed_one(plan) {
+            seeded = true;
+        }
+        seeded
+    }
+}
+
+/// Whether `node` is made only of reads of `var`'s element: data-graph
+/// matches with `var` as subject, under plain joins.
+fn reads_only_the_element(plan: &Plan, node: NodeId, var: &str) -> bool {
+    match &plan.nodes[node].op {
+        PlanOp::Match { pattern, reads } => {
+            *reads == crate::sparql_dataset::GraphReads::Data
+                && crate::sparql_refine::subject_variable(pattern) == Some(var)
+        }
+        PlanOp::Join {
+            left,
+            right,
+            reference: None,
+            key: None,
+            ..
+        } => reads_only_the_element(plan, *left, var) && reads_only_the_element(plan, *right, var),
+        _ => false,
+    }
+}
+
+impl SeedElementScope<'_> {
+    /// One seed, when a left join qualifies.
+    fn seed_one(&self, plan: &mut Plan) -> bool {
         use crate::sparql_refine::{Node, ScanSlot, SlotPresence};
         for id in 0..plan.nodes.len() {
             let PlanOp::LeftJoin { left: a, right, .. } = &plan.nodes[id].op else {
@@ -427,13 +455,19 @@ impl Rule for SeedElementScope<'_> {
                 continue;
             };
             let (a, vars) = (*a, vars.clone());
+            if plan.nodes[a].executor != Executor::Sql {
+                continue;
+            }
             let mut core = *input;
             while let PlanOp::LeftJoin { left, .. } = &plan.nodes[core].op {
                 core = *left;
             }
             let guaranteed = plan.guaranteed(core);
             let Some((var, scan, hop)) = vars.iter().find_map(|var| {
-                if !plan.guaranteed(a).contains(var) || !guaranteed.contains(var) {
+                if !plan.guaranteed(a).contains(var)
+                    || !guaranteed.contains(var)
+                    || !reads_only_the_element(plan, core, var)
+                {
                     return None;
                 }
                 let seeded = plan
@@ -449,12 +483,18 @@ impl Rule for SeedElementScope<'_> {
                 continue;
             };
             let PlanOp::Scan {
-                class_uri, classes, ..
+                class_uri,
+                classes,
+                direct_type_in,
+                identifier_values,
+                ..
             } = &plan.nodes[scan].op
             else {
                 unreachable!("holder_scan returned a scan");
             };
             let (class_uri, classes) = (class_uri.clone(), classes.clone());
+            let (direct_type_in, identifier_values) =
+                (direct_type_in.clone(), identifier_values.clone());
             let holder_class = crate::sparql_plan::shorten(&class_uri);
             let holder = crate::sparql_lift::fresh(plan, "__h", true);
             let seed = vec![
@@ -464,14 +504,14 @@ impl Rule for SeedElementScope<'_> {
                         class_uri,
                         classes,
                         direct_type: None,
-                        direct_type_in: Vec::new(),
+                        direct_type_in,
                         slots: vec![ScanSlot {
                             path: vec![hop.clone()],
                             var: Some(var.clone()),
                             multivalued: true,
                             presence: SlotPresence::Required,
                         }],
-                        identifier_values: Vec::new(),
+                        identifier_values,
                     },
                     Vec::new(),
                 ),
@@ -1506,5 +1546,101 @@ mod seed_element_scope {
                 .any(|line| line.contains("seed_element_scope")),
             "{plan}"
         );
+    }
+
+    #[test]
+    fn review_many_element_optionals_reach_a_fixpoint() {
+        let schema = schema();
+        let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
+        let slots = ["year", "material", "elType", "elId"];
+        let n = 32;
+        let tail: String = (0..n)
+            .map(|i| format!("OPTIONAL {{ ?e asset360:{} ?v{i} }} ", slots[i % 4]))
+            .collect();
+        let sel: String = (0..n).map(|i| format!("?v{i} ")).collect();
+        let query = format!(
+            "{ASSET360}SELECT ?b {sel} WHERE {{ ?b a asset360:Bridge ; asset360:parts ?e . {tail} }}"
+        );
+        let parsed = crate::sparql_scoper::parse_query(&query, None).unwrap();
+        let mut plan = crate::sparql_refine::naive_plan(&parsed, &dataset).unwrap();
+        let rules = crate::sparql_plan::refine_rules(&schema, &dataset, true);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        let log = crate::sparql_rules::refine(&mut plan, &borrowed).unwrap();
+        assert!(log.reached_fixpoint, "{} rounds\n{plan}", log.rounds);
+    }
+
+    /// A body the seed cannot help (a property path) is left alone, and the
+    /// plan is the one it was without the rule.
+    #[test]
+    fn review_seed_on_an_unlowerable_body_does_not_strand_an_island() {
+        let schema = schema();
+        let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
+        let query = format!(
+            "{ASSET360}{PREFIX}SELECT ?b ?n WHERE {{ ?b a asset360:Bridge ; asset360:parts ?e . \
+             OPTIONAL {{ ?e asset360:track/asset360:hasName ?n }} }}"
+        );
+        let production = plan_of(&query, &schema, &dataset).unwrap();
+        assert!(
+            !matches!(production.refinement, Refinement::Fallback { .. }),
+            "{:?}",
+            production.refinement
+        );
+    }
+
+    /// Two sibling element OPTIONALs that each carry label lookups: R1 lifts
+    /// the first one's labels above its join, which leaves the second one's
+    /// left side an engine join, so it can neither be lifted from nor
+    /// pushed. Before the seed this query took the records route; with it
+    /// the plan is a fallback. Needs a rule that commutes a lifted
+    /// `X ⟕ C` above the next left join.
+    #[test]
+    #[ignore = "needs a rule commuting a lifted left join above a following one"]
+    fn review_two_sibling_element_optionals_with_labels_are_not_a_fallback() {
+        let schema = schema();
+        let dataset = crate::sparql_dataset::schema_dataset(SCHEMA);
+        let lab = |v: &str, o: &str, l: &str| {
+            format!(
+                "OPTIONAL {{ GRAPH <urn:graph:schema> {{ ?{v} skos:prefLabel ?{o} \
+                 FILTER(lang(?{o}) = \"{l}\") }} }}"
+            )
+        };
+        let query = format!(
+            "{ASSET360}{PREFIX}SELECT ?b ?m ?nl ?fr ?k ?kl WHERE {{ ?b a asset360:Bridge ; \
+             asset360:parts ?e . OPTIONAL {{ ?e asset360:material ?m . {} {} }} \
+             OPTIONAL {{ ?e asset360:elType ?k . {} }} }}",
+            lab("m", "nl", "nl-be"),
+            lab("m", "fr", "fr-be"),
+            lab("k", "kl", "nl-be")
+        );
+        let production = plan_of(&query, &schema, &dataset).unwrap();
+        assert!(
+            !matches!(production.refinement, Refinement::Fallback { .. }),
+            "{:?}",
+            production.refinement
+        );
+    }
+
+    #[test]
+    fn review_seed_keeps_the_holder_s_restriction() {
+        let schema = schema();
+        let oracle = oracle(&schema);
+        let query = format!(
+            "{PREFIX}SELECT ?y WHERE {{ <{NS}/bridge/1> a asset360:Bridge ; asset360:parts ?e . \
+             OPTIONAL {{ ?e asset360:year ?y }} }}"
+        );
+        let plan = refined_and_checked(&query, &schema, &oracle);
+        for node in &plan.nodes {
+            if let crate::sparql_refine::PlanOp::Scan {
+                star_var,
+                identifier_values,
+                ..
+            } = &node.op
+            {
+                assert!(
+                    !identifier_values.is_empty(),
+                    "?{star_var} reads every Bridge\n{plan}"
+                );
+            }
+        }
     }
 }

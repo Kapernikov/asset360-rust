@@ -1322,14 +1322,9 @@ pub(crate) mod equivalence {
 
         let mut applications = 0;
         let mut changed = true;
-        let mut ordered = rules.to_vec();
-        ordered.sort_by_key(|rule| rule.last_resort());
         while changed {
             changed = false;
-            for rule in &ordered {
-                if rule.last_resort() && changed {
-                    continue;
-                }
+            for rule in rules {
                 let before = plan.clone();
                 let kept = plan.kept_exports();
                 if !rule.apply(&mut plan) {
