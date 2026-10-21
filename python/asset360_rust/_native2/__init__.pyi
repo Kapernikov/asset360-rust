@@ -3433,6 +3433,14 @@ class JoinColumn:
         ``asset_type``, an IRI) rather than its identity: both have an empty
         ``path``.
         """
+    @property
+    def containers(self) -> builtins.list[builtins.str]:
+        r"""
+        How each step of ``path`` is stored (``"single"``, ``"list"`` or
+        ``"mapping"``) when a ``"value"`` key's path crosses a collection --
+        the key is then read off the unnested element's row, not the record's
+        own column; empty for every other column.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final

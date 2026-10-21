@@ -107,7 +107,12 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// conjunction into one obligation per conjunct did *not* bump it: that
 /// changes how many `Filter` obligations a query raises, not what kinds exist,
 /// and a consumer that reads the list rather than counting it is unaffected.
-pub(crate) const PLAN_CONTRACT: u32 = 7;
+///
+/// 8: a value key's star column may read through one unnested collection;
+/// `JoinColumn.containers` says which hop. A consumer built against 7 reads
+/// the column off the record, where the collection is not a value, and
+/// answers every label unbound.
+pub(crate) const PLAN_CONTRACT: u32 = 8;
 
 /// Index into [`ExecutionPlan::obligations`]. Printed as `o1`, `o2`, ... so a
 /// human can check the ledger by eye.
@@ -610,7 +615,18 @@ fn column_name(column: &crate::sparql_ops::ColumnRef) -> String {
         (Some(name), _) => name.clone(),
         (None, []) if column.direct_type => "<direct type>".to_owned(),
         (None, []) => "<identity>".to_owned(),
-        (None, path) => path.join("."),
+        (None, path) => {
+            let mut steps = path.to_vec();
+            // A key read off an unnested element says so.
+            if let Some(hop) = column
+                .containers
+                .iter()
+                .position(|container| *container != crate::sparql_pushdown::Container::Single)
+            {
+                steps[hop].push_str("[each]");
+            }
+            steps.join(".")
+        }
     }
 }
 

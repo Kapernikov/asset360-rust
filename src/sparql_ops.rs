@@ -525,6 +525,10 @@ pub struct ColumnRef {
     /// The star's direct type (`asset_type`) rather than its identity:
     /// `path` is empty for both, this tells them apart.
     pub direct_type: bool,
+    /// How each step of `path` is stored, when a value key's path crosses a
+    /// collection (contract 8): the hop that is not `Single` is the element
+    /// the statement reads the key off. Empty everywhere else.
+    pub containers: Vec<crate::sparql_pushdown::Container>,
 }
 
 /// One export of a relation: what the outside reads of the derived table.
@@ -1585,23 +1589,49 @@ impl Lowering<'_> {
     /// reads `var` from at `side`.
     fn value_column_ref(&self, side: usize, var: &str) -> Option<ColumnRef> {
         Some(match self.scanned_column(side, var)? {
-            Column::Star { star_var, path, .. } => ColumnRef {
-                source: star_var,
+            Column::Star {
+                star_var,
+                class_uri,
                 path,
-                column: None,
-                direct_type: false,
-            },
+            } => {
+                // Only a path through a collection says how it is stored:
+                // every other key stays as it was.
+                let containers =
+                    crate::sparql_terms::resolve_column(self.schema, &class_uri, &path)
+                        .map(|(_, modes)| modes)
+                        .filter(|modes| {
+                            modes.iter().any(|mode| {
+                                *mode != linkml_schemaview::slotview::SlotContainerMode::SingleValue
+                            })
+                        })
+                        .map(|modes| {
+                            modes
+                                .iter()
+                                .map(crate::sparql_pushdown::Container::from_mode)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                ColumnRef {
+                    source: star_var,
+                    path,
+                    column: None,
+                    direct_type: false,
+                    containers,
+                }
+            }
             Column::DirectType { star_var, .. } => ColumnRef {
                 source: star_var,
                 path: Vec::new(),
                 column: None,
                 direct_type: true,
+                containers: Vec::new(),
             },
             Column::Relation { alias, column } => ColumnRef {
                 source: alias,
                 path: Vec::new(),
                 column: Some(column.var.clone()),
                 direct_type: false,
+                containers: Vec::new(),
             },
             // A witness is never a key: it is a fresh name nothing else binds.
             Column::Witness { .. } => return None,
@@ -1623,6 +1653,7 @@ impl Lowering<'_> {
                         path: Vec::new(),
                         column: None,
                         direct_type: false,
+                        containers: Vec::new(),
                     });
                 }
                 crate::sparql_refine::PlanOp::Unnest {
@@ -1636,6 +1667,7 @@ impl Lowering<'_> {
                         path: slot_path.clone(),
                         column: None,
                         direct_type: false,
+                        containers: Vec::new(),
                     });
                 }
                 crate::sparql_refine::PlanOp::SubSelect { vars, .. }
@@ -1649,6 +1681,7 @@ impl Lowering<'_> {
                         path: Vec::new(),
                         column: Some(var.to_owned()),
                         direct_type: false,
+                        containers: Vec::new(),
                     });
                 }
                 _ => {}
@@ -1693,6 +1726,7 @@ impl Lowering<'_> {
                     path: Vec::new(),
                     column: Some(var.clone()),
                     direct_type: false,
+                    containers: Vec::new(),
                 };
                 let other = self
                     .value_column_ref(facts.other, var)

@@ -2617,10 +2617,27 @@ impl JoinColumn {
         self.inner.direct_type
     }
 
+    /// How each step of ``path`` is stored (``"single"``, ``"list"`` or
+    /// ``"mapping"``) when a ``"value"`` key's path crosses a collection --
+    /// the key is then read off the unnested element's row, not the record's
+    /// own column; empty for every other column.
+    #[getter]
+    fn containers(&self) -> Vec<&'static str> {
+        self.inner
+            .containers
+            .iter()
+            .map(crate::sparql_pushdown::Container::as_str)
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "JoinColumn(source={:?}, path={:?}, column={:?}, direct_type={})",
-            self.inner.source, self.inner.path, self.inner.column, self.inner.direct_type
+            "JoinColumn(source={:?}, path={:?}, column={:?}, direct_type={}, containers={:?})",
+            self.inner.source,
+            self.inner.path,
+            self.inner.column,
+            self.inner.direct_type,
+            self.inner.containers
         )
     }
 }
