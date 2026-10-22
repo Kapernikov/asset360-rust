@@ -2451,7 +2451,7 @@ classes:
             "PREFIX asset360: <https://data.infrabel.be/asset360/> \
              PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
              SELECT ?s ?t ?class WHERE {{ ?s a asset360:Signal . \
-             BIND(STRAFTER(STR(?s), \"signal\") AS ?t) \
+             BIND(STRLEN(STR(?s)) AS ?t) \
              GRAPH <{SCHEMA_GRAPH_IRI}> {{ ?class rdfs:label \"Signal\" }} }}"
         );
         let finish_of = |plan: &crate::sparql_plan::ExecutionPlan| {

@@ -525,6 +525,10 @@ pub struct ColumnRef {
     /// The star's direct type (`asset_type`) rather than its identity:
     /// `path` is empty for both, this tells them apart.
     pub direct_type: bool,
+    /// How each step of `path` is stored, when a value key's path crosses a
+    /// collection (contract 8): the hop that is not `Single` is the element
+    /// the statement reads the key off. Empty everywhere else.
+    pub containers: Vec<crate::sparql_pushdown::Container>,
 }
 
 /// One export of a relation: what the outside reads of the derived table.
@@ -569,6 +573,12 @@ pub enum ColumnKind {
     /// A column of a constant table inside the body, read by the body's
     /// binding (`relation` is the table's alias).
     Constant(BindingSpec),
+    /// A string the body computes (`BIND(STRAFTER(..) AS ?v)` run in SQL),
+    /// under its own name in the body's projection: the outside reads the
+    /// derived table's column and the term is `descriptor`'s.
+    Derived {
+        descriptor: crate::sparql_terms::TermDescriptor,
+    },
 }
 
 impl ColumnKind {
@@ -579,6 +589,7 @@ impl ColumnKind {
             Self::Measure { .. } => "measure",
             Self::Structure { .. } => "structure",
             Self::Constant(_) => "constant",
+            Self::Derived { .. } => "derived",
         }
     }
 }
@@ -856,7 +867,9 @@ pub fn lower_sql_pass(
 /// nobody can see is a fallback that becomes permanent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoweringRefusal {
-    /// No node runs in SQL, so there is nothing to render.
+    /// No node runs in SQL, so there is nothing to render -- or every node
+    /// that does sits inside a barrier the engine runs (a sub-select whose
+    /// projection stayed with it), where there is no statement to render.
     NothingPushed,
     /// The plan contains a `UNION`.
     ///
@@ -1269,6 +1282,12 @@ fn lower_island(
         next_alias: 0,
     };
     let mut nodes = lowering.lower_scope(None, enforcement)?;
+    // The `Sql` nodes can all sit inside a barrier the engine runs: the
+    // island is then not part of the outermost scope, and a statement with no
+    // operators is not a statement the fetch can run.
+    if nodes.is_empty() {
+        return Err(LoweringRefusal::NothingPushed);
+    }
 
     // The fetch bound: a row cap the scoper found safe to apply, which claims
     // nothing -- the engine still applies the query's own `LIMIT` and this
@@ -1576,6 +1595,9 @@ impl Lowering<'_> {
                     false,
                 ))
             }
+            TermOf::Derived { descriptor } => ColumnKind::Derived {
+                descriptor: descriptor.clone(),
+            },
             TermOf::Collection { .. } | TermOf::Computed => return None,
         })
     }
@@ -1585,26 +1607,53 @@ impl Lowering<'_> {
     /// reads `var` from at `side`.
     fn value_column_ref(&self, side: usize, var: &str) -> Option<ColumnRef> {
         Some(match self.scanned_column(side, var)? {
-            Column::Star { star_var, path, .. } => ColumnRef {
-                source: star_var,
+            Column::Star {
+                star_var,
+                class_uri,
                 path,
-                column: None,
-                direct_type: false,
-            },
+            } => {
+                // Only a path through a collection says how it is stored:
+                // every other key stays as it was.
+                let containers =
+                    crate::sparql_terms::resolve_column(self.schema, &class_uri, &path)
+                        .map(|(_, modes)| modes)
+                        .filter(|modes| {
+                            modes.iter().any(|mode| {
+                                *mode != linkml_schemaview::slotview::SlotContainerMode::SingleValue
+                            })
+                        })
+                        .map(|modes| {
+                            modes
+                                .iter()
+                                .map(crate::sparql_pushdown::Container::from_mode)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                ColumnRef {
+                    source: star_var,
+                    path,
+                    column: None,
+                    direct_type: false,
+                    containers,
+                }
+            }
             Column::DirectType { star_var, .. } => ColumnRef {
                 source: star_var,
                 path: Vec::new(),
                 column: None,
                 direct_type: true,
+                containers: Vec::new(),
             },
             Column::Relation { alias, column } => ColumnRef {
                 source: alias,
                 path: Vec::new(),
                 column: Some(column.var.clone()),
                 direct_type: false,
+                containers: Vec::new(),
             },
             // A witness is never a key: it is a fresh name nothing else binds.
-            Column::Witness { .. } => return None,
+            // Nor is a computed string: nothing keys on it.
+            Column::Witness { .. } | Column::Computed(_) => return None,
         })
     }
 
@@ -1623,6 +1672,7 @@ impl Lowering<'_> {
                         path: Vec::new(),
                         column: None,
                         direct_type: false,
+                        containers: Vec::new(),
                     });
                 }
                 crate::sparql_refine::PlanOp::Unnest {
@@ -1636,6 +1686,7 @@ impl Lowering<'_> {
                         path: slot_path.clone(),
                         column: None,
                         direct_type: false,
+                        containers: Vec::new(),
                     });
                 }
                 crate::sparql_refine::PlanOp::SubSelect { vars, .. }
@@ -1649,6 +1700,7 @@ impl Lowering<'_> {
                         path: Vec::new(),
                         column: Some(var.to_owned()),
                         direct_type: false,
+                        containers: Vec::new(),
                     });
                 }
                 _ => {}
@@ -1693,6 +1745,7 @@ impl Lowering<'_> {
                     path: Vec::new(),
                     column: Some(var.clone()),
                     direct_type: false,
+                    containers: Vec::new(),
                 };
                 let other = self
                     .value_column_ref(facts.other, var)
@@ -2440,6 +2493,7 @@ impl Lowering<'_> {
                             ColumnKind::Measure { descriptor } => Some(descriptor.clone()),
                             ColumnKind::Structure { .. } => None,
                             ColumnKind::Constant(binding) => Some(binding.descriptor.clone()),
+                            ColumnKind::Derived { descriptor } => Some(descriptor.clone()),
                         };
                         columns.push(RelationColumn {
                             var: var.clone(),
@@ -2492,6 +2546,13 @@ impl Lowering<'_> {
                         },
                         discharges: node.discharges.clone(),
                     });
+                }
+                // A string cut the statement computes (`crate::sparql_string_bind`):
+                // no operator of its own. It adds a column, read by whatever
+                // projects it, so the node is the input it extends.
+                RefinedOp::Bind { input, .. } => {
+                    remap.insert(id, remap[input]);
+                    continue;
                 }
                 other => {
                     return Err(LoweringRefusal::UnknownOperator { kind: other.kind() });
@@ -2894,6 +2955,11 @@ impl Lowering<'_> {
                     .unwrap_or_else(crate::sparql_terms::TermDescriptor::subject_iri),
                 column.descriptor.is_none(),
             )),
+            Column::Computed(computed) => Some(crate::sparql_pushdown::computed_spec(
+                name,
+                computed,
+                crate::sparql_string_bind::result_descriptor(),
+            )),
             Column::Witness { anchor } => {
                 let mut binding = self.binding_of_column(*anchor, name)?;
                 binding.witness = true;
@@ -2960,6 +3026,8 @@ impl Lowering<'_> {
                 && existing.slot_path == spec.slot_path
                 && existing.relation == spec.relation
                 && existing.direct_type == spec.direct_type
+                && existing.computed.is_none()
+                && spec.computed.is_none()
         }) {
             return Some(index);
         }
@@ -3131,6 +3199,33 @@ impl Lowering<'_> {
                         ));
                     }
                 }
+                RefinedOp::Bind {
+                    input,
+                    var: bound,
+                    expr,
+                } if bound == var => {
+                    // The leaves are read the way any consumer above the
+                    // input would read them, so a join variable takes the
+                    // preserved side's column.
+                    let shape =
+                        crate::sparql_string_bind::shape_of(self.schema, plan, *input, expr)?;
+                    let computed =
+                        shape.computed(&|leaf| match self.scanned_column(*input, leaf)? {
+                            Column::Star {
+                                star_var,
+                                class_uri,
+                                path,
+                            } => crate::sparql_pushdown::binding_spec(
+                                self.schema,
+                                &star_var,
+                                &class_uri,
+                                "",
+                                path,
+                            ),
+                            _ => None,
+                        })?;
+                    candidates.push((optional_side(id), 0, Column::Computed(computed)));
+                }
                 RefinedOp::SubSelect { vars, .. }
                     if !plan.transparent(id) && vars.iter().any(|v| v == var) =>
                 {
@@ -3271,6 +3366,8 @@ enum Column {
     /// join's right side that is non-`NULL` on every row the right side
     /// joined.
     Witness { anchor: Box<Column> },
+    /// A string the statement computes from columns it reads.
+    Computed(crate::sparql_pushdown::Computed),
 }
 
 /// A binding for a value at a path: a term, or -- when the path ends in an

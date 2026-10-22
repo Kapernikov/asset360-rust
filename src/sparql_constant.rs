@@ -34,7 +34,10 @@
 //!   enum code, a plain or fixed-language string. Numbers and dates decline
 //!   (the engine canonicalises `"01"^^xsd:integer`, stored JSON need not be
 //!   canonical), and so does a reference slot whose stored form may be a
-//!   CURIE.
+//!   CURIE. A column on an element of an inlined collection is read off the
+//!   element's own row when the other side unnests that one collection
+//!   exactly once; a column behind two collections, or behind one the other
+//!   side does not unnest, declines.
 //! * **K5** multiplicity is kept: every row of the table is rendered,
 //!   duplicates included, never under `DISTINCT`.
 //! * **K6** a left join carries no condition.
@@ -369,6 +372,7 @@ pub fn key_facts(schema: &SchemaView, plan: &Plan, join: NodeId) -> Result<KeyFa
             "direct type".to_owned(),
         ),
         Some(TermOf::Slot {
+            star_var,
             class_uri,
             path,
             reading: crate::sparql_refine::SlotReading::Column,
@@ -381,13 +385,7 @@ pub fn key_facts(schema: &SchemaView, plan: &Plan, join: NodeId) -> Result<KeyFa
                     "K4: ?{var}'s column on n{other} has no term descriptor"
                 ));
             };
-            if containers.iter().any(|container| {
-                *container != linkml_schemaview::slotview::SlotContainerMode::SingleValue
-            }) {
-                return Err(format!(
-                    "K4: ?{var} is read through a collection on n{other}"
-                ));
-            }
+            let hop = element_hop(plan, other, &star_var, &path, &containers, &var)?;
             let plain = descriptor.lang.is_none()
                 && descriptor
                     .datatype
@@ -410,7 +408,11 @@ pub fn key_facts(schema: &SchemaView, plan: &Plan, join: NodeId) -> Result<KeyFa
                     ));
                 }
             };
-            (translation, descriptor, path.join("."))
+            let mut label = path.clone();
+            if let Some(hop) = hop {
+                label[hop].push_str("[each]");
+            }
+            (translation, descriptor, label.join("."))
         }
         Some(TermOf::Slot { .. }) => {
             return Err(format!(
@@ -510,6 +512,57 @@ pub fn key_facts(schema: &SchemaView, plan: &Plan, join: NodeId) -> Result<KeyFa
         rows: rendered,
         dropped,
     })
+}
+
+/// Where the column of `path` crosses a collection, when it does: the index of
+/// the one hop through a collection that `other` unnests, exactly once, as the
+/// element the statement reads the column off (#440). `Ok(None)` for a column
+/// on the record itself. Anything else -- two collections, a collection
+/// `other` does not unnest, one it unnests twice, a collection that is the
+/// column itself -- is refused: the statement would read the column off the
+/// record, where a collection is not a value.
+fn element_hop(
+    plan: &Plan,
+    other: NodeId,
+    star_var: &str,
+    path: &[String],
+    containers: &[linkml_schemaview::slotview::SlotContainerMode],
+    var: &str,
+) -> Result<Option<usize>, String> {
+    use linkml_schemaview::slotview::SlotContainerMode::SingleValue;
+    let hops: Vec<usize> = containers
+        .iter()
+        .enumerate()
+        .filter(|(_, container)| **container != SingleValue)
+        .map(|(index, _)| index)
+        .collect();
+    let hop = match hops.as_slice() {
+        [] => return Ok(None),
+        [one] => *one,
+        many => {
+            return Err(format!(
+                "K4: ?{var} is read through {} collections on n{other}",
+                many.len()
+            ));
+        }
+    };
+    let unnests = plan
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(id, node)| {
+            node.executor == Executor::Sql
+                && plan.feeds_visibly(*id, other)
+                && matches!(&node.op, PlanOp::Unnest { star_var: s, slot_path, .. }
+                    if s == star_var && slot_path.as_slice() == &path[..=hop])
+        })
+        .count();
+    if hop + 1 >= path.len() || unnests != 1 {
+        return Err(format!(
+            "K4: ?{var} is read through a collection n{other} does not unnest (once)"
+        ));
+    }
+    Ok(Some(hop))
 }
 
 /// The alias a lowered table renders under: `c{n}`, numbered by the
@@ -727,7 +780,7 @@ pub(crate) mod tests {
     use crate::sparql_oracle::{Oracle, probe};
     use crate::sparql_refine::{Executor, Plan, PlanOp};
     use crate::sparql_rules::{Rule, tier_one_rules};
-    use crate::sparql_scoper::tests::test_schema_view;
+    use crate::sparql_scoper::tests::{test_schema_view, test_schema_view_plus};
 
     const SCHEMA_GRAPH: &str = "https://data.infrabel.be/asset360/schema";
     const SIGNAL: &str = "https://data.infrabel.be/asset360/Signal";
@@ -1068,5 +1121,226 @@ pub(crate) mod tests {
             "{refined}"
         );
         assert_eq!(lowered_tables(&plan), 0, "{refined}");
+    }
+    /// A holder of inlined plates, once as a list and once as a keyed
+    /// mapping, each plate holding an enum: what asset360's
+    /// `hasStructureElement.hasMaterial` is in miniature (#440).
+    const PLATE_CLASSES: &str = r#"
+  Plate:
+    class_uri: asset360:Plate
+    attributes:
+      plateId:
+        key: true
+      plateKind:
+        range: SignalKind
+      plateKinds:
+        range: SignalKind
+        multivalued: true
+      side:
+        range: string
+      nested:
+        range: Plate
+        multivalued: true
+        inlined: true
+  Rack:
+    class_uri: asset360:Rack
+    attributes:
+      asset360_uri:
+        identifier: true
+      plates:
+        range: Plate
+        multivalued: true
+        inlined: true
+        inlined_as_list: true
+      slots:
+        range: Plate
+        multivalued: true
+        inlined: true
+        inlined_as_list: false
+"#;
+
+    fn plate_query(holder_slot: &str, labels: &str) -> String {
+        asset360_query(&format!(
+            "SELECT ?r ?side ?kind ?nl ?fr WHERE {{ ?r a asset360:Rack . \
+             OPTIONAL {{ ?r asset360:{holder_slot} ?p . ?p asset360:side ?side ; asset360:plateKind ?kind . \
+             {labels} }} }}"
+        ))
+    }
+
+    fn label_block(var: &str, gsa: &str, kss: &str) -> String {
+        format!(
+            "OPTIONAL {{ VALUES (?kind ?{var}) {{ (<{gsa}> \"{var}-gsa\") (<{kss}> \"{var}-kss\") \
+             (<urn:outside> \"none\") }} }}"
+        )
+    }
+
+    /// #440: a label lookup on an enum held by an element of an inlined
+    /// collection (list or keyed mapping) is read off the element's own row,
+    /// inside the element's relation.
+    #[test]
+    fn an_element_enum_label_is_one_statement() {
+        let sv = test_schema_view_plus(PLATE_CLASSES);
+        for slot in ["plates", "slots"] {
+            let (gsa, kss) = (kind_iri("GSA"), kind_iri("KSS"));
+            let q = plate_query(
+                slot,
+                &format!(
+                    "{} {}",
+                    label_block("nl", &gsa, &kss),
+                    label_block("fr", &gsa, &kss)
+                ),
+            );
+            let dataset = crate::sparql_dataset::default_dataset();
+            let refined = crate::sparql_plan::plan_texts_of(&q, &sv, dataset)
+                .1
+                .unwrap();
+            assert!(
+                refined.contains("key ?kind: enum→code"),
+                "{slot}\n{refined}"
+            );
+            assert!(!refined.contains("declined"), "{slot}\n{refined}");
+            assert!(
+                refined.contains(&format!("({slot}[each].plateKind, enum→code)")),
+                "{slot}\n{refined}"
+            );
+            let plan = crate::sparql_plan::plan_of(&q, &sv, dataset).unwrap();
+            let printed = plan.to_string();
+            assert_eq!(plan.refinement.as_str(), "used_alone", "{slot}\n{printed}");
+            assert!(
+                printed.contains(&format!(
+                    "join      value r.{slot}[each].plateKind = c1.kind   left"
+                )),
+                "{slot}\n{printed}"
+            );
+            assert!(
+                printed.contains(&format!(
+                    "join      value r.{slot}[each].plateKind = c2.kind   left"
+                )),
+                "{slot}\n{printed}"
+            );
+        }
+    }
+    /// Racks for the equivalence runs: no plates; a plate without a kind;
+    /// two plates of one code; a code outside the table; a null kind; and
+    /// the same plates as a keyed mapping.
+    fn rack_oracle(schema: &SchemaView) -> Oracle {
+        let base = "https://data.infrabel.be/asset360/rack";
+        let records: Vec<(&str, String)> = [
+            ("R0", r#""plates": [], "slots": {}"#),
+            (
+                "R1",
+                r#""plates": [{"plateId": "a", "side": "left", "plateKind": "GSA"},
+                              {"plateId": "b", "side": "right"},
+                              {"plateId": "c", "side": "mid", "plateKind": "GSA"}],
+                   "slots": {"a": {"side": "left", "plateKind": "GSA"},
+                             "b": {"side": "right"},
+                             "c": {"side": "mid", "plateKind": "GSA"}}"#,
+            ),
+            (
+                "R2",
+                r#""plates": [{"plateId": "d", "side": "x", "plateKind": "KSS"},
+                              {"plateId": "e", "side": "y", "plateKind": "REP_H_D"},
+                              {"plateId": "f", "side": "z", "plateKind": null}],
+                   "slots": {"d": {"side": "x", "plateKind": "KSS"},
+                             "e": {"side": "y", "plateKind": "REP_H_D"},
+                             "f": {"side": "z", "plateKind": null}}"#,
+            ),
+            ("R3", r#""side": "none""#),
+        ]
+        .iter()
+        .map(|(id, body)| {
+            (
+                "Rack",
+                format!(r#"{{"asset360_uri": "{base}/{id}", {body}}}"#),
+            )
+        })
+        .collect();
+        let borrowed: Vec<(&str, &str)> = records.iter().map(|(c, j)| (*c, j.as_str())).collect();
+        Oracle::new(schema, &borrowed)
+    }
+
+    /// #440 against the engine: every rewrite of an element-enum label keeps
+    /// the answers -- siblings, a single label, a label outside any
+    /// `OPTIONAL`, a required one -- on a list and on a keyed mapping, over
+    /// holders with no plates, plates without the enum, repeated codes, a
+    /// code outside the table, a null.
+    #[test]
+    fn an_element_enum_label_preserves_the_answer() {
+        let schema = test_schema_view_plus(PLATE_CLASSES);
+        let oracle = rack_oracle(&schema);
+        let (gsa, kss) = (kind_iri("GSA"), kind_iri("KSS"));
+        let rules = rules(&schema);
+        let borrowed: Vec<&dyn Rule> = rules.iter().map(|rule| rule.as_ref()).collect();
+        for slot in ["plates", "slots"] {
+            let table = |var: &str| {
+                format!(
+                    "VALUES (?kind ?{var}) {{ (<{gsa}> \"{var}-gsa\") (<{gsa}> \"{var}-gsa2\") \
+                     (<{kss}> \"{var}-kss\") (<urn:outside> \"none\") }}"
+                )
+            };
+            for query in [
+                // siblings under the element's OPTIONAL
+                format!(
+                    "SELECT ?r ?side ?kind ?nl ?fr WHERE {{ ?r a asset360:Rack . \
+                     OPTIONAL {{ ?r asset360:{slot} ?p . ?p asset360:side ?side ; asset360:plateKind ?kind . \
+                     OPTIONAL {{ {} }} OPTIONAL {{ {} }} }} }}",
+                    table("nl"),
+                    table("fr")
+                ),
+                // one label
+                format!(
+                    "SELECT ?r ?side ?nl WHERE {{ ?r a asset360:Rack . \
+                     OPTIONAL {{ ?r asset360:{slot} ?p . ?p asset360:side ?side ; asset360:plateKind ?kind . \
+                     OPTIONAL {{ {} }} }} }}",
+                    table("nl")
+                ),
+                // the element read outside any OPTIONAL
+                format!(
+                    "SELECT ?r ?side ?nl WHERE {{ ?r a asset360:Rack ; asset360:{slot} ?p . \
+                     ?p asset360:side ?side ; asset360:plateKind ?kind . OPTIONAL {{ {} }} }}",
+                    table("nl")
+                ),
+                // a required label
+                format!(
+                    "SELECT ?r ?side ?nl WHERE {{ ?r a asset360:Rack ; asset360:{slot} ?p . \
+                     ?p asset360:side ?side ; asset360:plateKind ?kind . {} }}",
+                    table("nl")
+                ),
+            ] {
+                let plan = each_rewrite_preserves_answers(&query, &schema, &oracle, &borrowed);
+                assert!(lowered_tables(&plan) >= 1, "{query}\n{plan}");
+                crate::sparql_ops::lower_refined(&plan, &schema, None, None)
+                    .unwrap_or_else(|refusal| panic!("{refusal}\n{query}\n{plan}"));
+            }
+        }
+    }
+
+    /// What #440 still refuses, each by its own words: a multivalued enum on
+    /// the element, and a key read through two collections.
+    #[test]
+    fn an_element_enum_label_refuses_what_it_cannot_place() {
+        let schema = test_schema_view_plus(PLATE_CLASSES);
+        let gsa = kind_iri("GSA");
+        for (query, why) in [
+            (
+                format!(
+                    "SELECT ?r ?nl WHERE {{ ?r a asset360:Rack ; asset360:plates ?p . ?p asset360:plateKinds ?kind . \
+                     OPTIONAL {{ VALUES (?kind ?nl) {{ (<{gsa}> \"x\") }} }} }}"
+                ),
+                "K4: ?kind is an unnested element",
+            ),
+            (
+                format!(
+                    "SELECT ?r ?nl WHERE {{ ?r a asset360:Rack ; asset360:plates ?p . ?p asset360:nested ?q . \
+                     ?q asset360:plateKind ?kind . \
+                     OPTIONAL {{ VALUES (?kind ?nl) {{ (<{gsa}> \"x\") }} }} }}"
+                ),
+                "K4: ?kind is read through 2 collections",
+            ),
+        ] {
+            let refined = refined_text(&query, &schema);
+            assert!(refined.contains(why), "{why}\n{refined}");
+            assert!(!refined.contains("lowered as"), "{refined}");
+        }
     }
 }

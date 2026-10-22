@@ -107,7 +107,12 @@ use crate::sparql_scoper::{Inexact, ScopeError};
 /// conjunction into one obligation per conjunct did *not* bump it: that
 /// changes how many `Filter` obligations a query raises, not what kinds exist,
 /// and a consumer that reads the list rather than counting it is unaffected.
-pub(crate) const PLAN_CONTRACT: u32 = 7;
+///
+/// 8: a value key's star column may read through one unnested collection;
+/// `JoinColumn.containers` says which hop. A consumer built against 7 reads
+/// the column off the record, where the collection is not a value, and
+/// answers every label unbound.
+pub(crate) const PLAN_CONTRACT: u32 = 8;
 
 /// Index into [`ExecutionPlan::obligations`]. Printed as `o1`, `o2`, ... so a
 /// human can check the ledger by eye.
@@ -610,7 +615,18 @@ fn column_name(column: &crate::sparql_ops::ColumnRef) -> String {
         (Some(name), _) => name.clone(),
         (None, []) if column.direct_type => "<direct type>".to_owned(),
         (None, []) => "<identity>".to_owned(),
-        (None, path) => path.join("."),
+        (None, path) => {
+            let mut steps = path.to_vec();
+            // A key read off an unnested element says so.
+            if let Some(hop) = column
+                .containers
+                .iter()
+                .position(|container| *container != crate::sparql_pushdown::Container::Single)
+            {
+                steps[hop].push_str("[each]");
+            }
+            steps.join(".")
+        }
     }
 }
 
@@ -826,11 +842,7 @@ fn write_ops(
                             f,
                             "{indent}group     ?{} ← {}   {}",
                             binding.var,
-                            if binding.slot_path.is_empty() {
-                                "<identity>".to_owned()
-                            } else {
-                                binding.slot_path.join(".")
-                            },
+                            binding.source(),
                             binding.descriptor.shape()
                         )?;
                     }
@@ -866,11 +878,7 @@ fn write_ops(
                         f,
                         "{indent}column    ?{} ← {}   {}",
                         binding.var,
-                        if binding.slot_path.is_empty() {
-                            "<identity>".to_owned()
-                        } else {
-                            binding.slot_path.join(".")
-                        },
+                        binding.source(),
                         binding.descriptor.shape()
                     )?;
                 }
@@ -1535,7 +1543,26 @@ pub fn plan_query_refined(
             rules.iter().map(|rule| rule.as_ref()).collect();
         let mut lifted = naive.clone();
         if crate::sparql_rules::refine(&mut lifted, &borrowed).is_ok() {
-            if lifted.rewrites.is_empty() {
+            // Or when the lifts left no engine node and the statement they
+            // made answers alone: a plan that carries its lifts must not go
+            // on to a route that re-runs the whole query over records, so it
+            // is settled only once it is known to lower and answer alone;
+            // otherwise it takes the rows route, and then the no-lift
+            // refinement below.
+            if lifted.rewrites.is_empty()
+                || (lifted
+                    .nodes
+                    .iter()
+                    .all(|node| node.executor == crate::sparql_refine::Executor::Sql)
+                    && lifted_answers_alone(
+                        &obligations,
+                        &lifted,
+                        &parsed,
+                        schema_view,
+                        dataset,
+                        &recorded,
+                    )?)
+            {
                 settled = Some(lifted);
             } else {
                 let scoped = resolve(&parsed, schema_view, dataset, &recorded, Some(&lifted))?;
@@ -1625,7 +1652,7 @@ pub fn plan_query_refined(
         query: parsed.clone(),
     };
 
-    match answers_alone(&plan, &ops) {
+    match answers_alone(&plan.obligations, &ops) {
         Ok(()) => {
             let claimed: Vec<ObligationId> = ops.claims();
             plan.passes = vec![Pass {
@@ -1700,6 +1727,16 @@ pub(crate) fn refine_rules<'a>(
 ) -> Vec<Box<dyn crate::sparql_rules::Rule + 'a>> {
     let mut rules = crate::sparql_rules::tier_one_rules(schema_view, dataset);
     if lifts {
+        // R4 lifts a bind over the join above it before the bind is pushed,
+        // so the join can be pushed and an optional read absorbed.
+        if let Some(at) = rules
+            .iter()
+            .position(|rule| rule.name() == "push_string_bind")
+        {
+            rules[at] = Box::new(crate::sparql_string_bind::PushStringBind::with_lifts(
+                schema_view,
+            ));
+        }
         rules.extend(crate::sparql_lift::lifting_rules(schema_view, dataset));
     }
     rules
@@ -2560,11 +2597,14 @@ fn fetch_only(
 /// took every non-blocked query first, so nothing reached the second
 /// condition to find out it was missing. The deletion removes path A, which is
 /// exactly why [`plan_query_refined_alone`] exists before it.
-fn answers_alone(plan: &ExecutionPlan, refined: &crate::sparql_ops::OpTree) -> Result<(), String> {
+fn answers_alone(
+    obligations: &[Obligation],
+    refined: &crate::sparql_ops::OpTree,
+) -> Result<(), String> {
     let claimed: BTreeSet<ObligationId> = refined.claims().into_iter().collect();
-    let unclaimed: Vec<String> = (0..plan.obligations.len())
+    let unclaimed: Vec<String> = (0..obligations.len())
         .filter(|id| !claimed.contains(id))
-        .map(|id| plan.obligations[id].to_string())
+        .map(|id| obligations[id].to_string())
         .collect();
     if !unclaimed.is_empty() {
         return Err(format!(
@@ -2586,6 +2626,27 @@ fn answers_alone(plan: &ExecutionPlan, refined: &crate::sparql_ops::OpTree) -> R
         );
     }
     Ok(())
+}
+
+/// Whether a lifted plan with no engine node lowers to a statement that
+/// answers the whole query alone -- what lets it stand as the final plan
+/// while it still carries its rewrites.
+#[cfg(feature = "sparql-endpoint")]
+fn lifted_answers_alone(
+    obligations: &[Obligation],
+    lifted: &crate::sparql_refine::Plan,
+    parsed: &Query,
+    schema_view: &SchemaView,
+    dataset: &DatasetSpec,
+    recorded: &crate::sparql_scoper::QueryPlan,
+) -> Result<bool, ScopeError> {
+    let scoped = resolve(parsed, schema_view, dataset, recorded, Some(lifted))?;
+    Ok(crate::sparql_ops::lower_refined_with(
+        lifted,
+        schema_view,
+        &crate::sparql_ops::FetchBounds::of(&scoped),
+    )
+    .is_ok_and(|ops| answers_alone(obligations, &ops).is_ok()))
 }
 
 /// The variables a lowered statement binds, from its projection.
@@ -4707,7 +4768,8 @@ classes:
     ///
     /// The `BIND` is a volatile one (`STRUUID`), which the lift R2 declines
     /// (G2c), so it keeps the two islands this test is about. An
-    /// effect-free one is lifted, the plan is one statement, and the engine
+    /// effect-free one SQL does not run (`STRLEN`; a string cut over a plain
+    /// column is SQL's now) is lifted, the plan is one statement, and the engine
     /// finishes over its rows -- with the condition read off the element the
     /// statement bound, since that statement answers.
     #[test]
@@ -4725,7 +4787,7 @@ classes:
                 )
             };
             let lifted = plan_of(
-                &query_with("STRAFTER(STR(?nm), \"x\")"),
+                &query_with("STRLEN(?nm)"),
                 &sv,
                 crate::sparql_dataset::default_dataset(),
             )

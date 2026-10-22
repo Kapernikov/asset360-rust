@@ -178,6 +178,12 @@ pub enum TermOf {
     Constant {
         descriptor: crate::sparql_terms::TermDescriptor,
     },
+    /// A string the statement computes: a `BIND` of `STR`/`STRAFTER`/
+    /// `STRBEFORE` the plan runs in SQL ([`crate::sparql_string_bind`]).
+    /// `descriptor` is the simple literal it is.
+    Derived {
+        descriptor: crate::sparql_terms::TermDescriptor,
+    },
     /// A value the engine computes: a `BIND` of an expression, a triple
     /// pattern's binding, a `VALUES` cell. Not a column.
     Computed,
@@ -576,6 +582,14 @@ impl Plan {
                 } => {
                     out.extend(self.term_of(schema, *input, renamed));
                     continue;
+                }
+                PlanOp::Bind { .. }
+                    if self.nodes[producer].executor == Executor::Sql
+                        && crate::sparql_string_bind::is_pushable(schema, self, producer) =>
+                {
+                    TermOf::Derived {
+                        descriptor: crate::sparql_string_bind::result_descriptor(),
+                    }
                 }
                 // A constant table's column, once the table is SQL's: the
                 // one kind its cells are. A mixed column is no column.
@@ -1214,7 +1228,7 @@ pub fn representable(
             class_uri, path, ..
         } => crate::sparql_terms::resolve_column(schema, class_uri, path).is_some(),
         TermOf::Structure { .. } => !serialise,
-        TermOf::Constant { .. } => true,
+        TermOf::Constant { .. } | TermOf::Derived { .. } => true,
         TermOf::Collection { .. } | TermOf::Computed => false,
     }
 }

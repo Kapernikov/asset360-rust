@@ -1392,6 +1392,16 @@ pub(crate) mod equivalence {
                 "?s a asset360:Signal ; asset360:length ?len } GROUP BY ?s",
             ),
             ("?s ?nm", "?s a asset360:Signal ; asset360:name ?nm }"),
+            // A string cut the statement computes: a plain column, and the
+            // subject IRI.
+            (
+                "?s ?t",
+                "?s a asset360:Signal ; asset360:name ?nm . BIND(STRAFTER(?nm, \"l\") AS ?t) }",
+            ),
+            (
+                "?s ?t",
+                "?s a asset360:Signal . BIND(STRAFTER(STR(?s), \"signal/\") AS ?t) }",
+            ),
             ("?s", "?s a asset360:Signal } ORDER BY ?s LIMIT 2"),
             (
                 "?s",

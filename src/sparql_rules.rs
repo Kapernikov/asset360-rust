@@ -5495,6 +5495,13 @@ impl<'s> PushProjection<'s> {
     /// -- passes too.
     fn column_is_readable(&self, plan: &Plan, body: NodeId, var: &str, serialise: bool) -> bool {
         PushGrouping::new(self.schema).key_is_readable(plan, body, var, serialise)
+            // A string the statement computes is a column of its answer. Not
+            // a grouping key, which is why this is asked here and not in
+            // `key_is_readable`.
+            || matches!(
+                crate::sparql_scopes::resolve_terms(plan.term_of(self.schema, body, var)),
+                Some(crate::sparql_scopes::TermOf::Derived { .. })
+            )
     }
 }
 
@@ -5714,6 +5721,7 @@ pub fn tier_one_rules<'a>(
         Box::new(ConstantObjectBecomesFilter::new(schema)),
         Box::new(ValuesBecomesFilter::new(schema)),
         Box::new(PushComparisonFilter::new(schema)),
+        Box::new(crate::sparql_string_bind::PushStringBind::new(schema)),
         Box::new(PushReferenceJoin::new(schema)),
         Box::new(PushLeftJoin::new(schema)),
         Box::new(PushNotExists::new(schema)),

@@ -65,6 +65,7 @@ __all__ = [
     "PredicateVerdict",
     "Prefix",
     "PushdownBinding",
+    "PushdownComputed",
     "PushdownHaving",
     "PushdownMeasure",
     "PushdownOrder",
@@ -3433,6 +3434,14 @@ class JoinColumn:
         ``asset_type``, an IRI) rather than its identity: both have an empty
         ``path``.
         """
+    @property
+    def containers(self) -> builtins.list[builtins.str]:
+        r"""
+        How each step of ``path`` is stored (``"single"``, ``"list"`` or
+        ``"mapping"``) when a ``"value"`` key's path crosses a collection --
+        the key is then read off the unnested element's row, not the record's
+        own column; empty for every other column.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -4819,6 +4828,20 @@ class PushdownBinding:
         star's ``asset_type`` column, as an IRI. ``slot_path`` is empty.
         """
     @property
+    def computed(self) -> typing.Optional[PushdownComputed]:
+        r"""
+        The expression a **computed** column evaluates, or ``None`` for every
+        column that is read.
+        
+        A ``BIND`` of ``STR``/``STRAFTER``/``STRBEFORE`` over a plain string
+        column or a subject IRI that the plan runs in SQL. When set, the
+        binding's own ``star_var``, ``slot_path`` and ``class_uri`` are empty
+        placeholders -- a renderer must test this *before* it resolves
+        ``star_var`` to a table alias, and render the leaves of the tree through
+        their own bindings. ``term_kind`` is ``"literal"`` with no datatype and
+        no language: a simple literal, on a match and on a miss alike.
+        """
+    @property
     def numeric(self) -> builtins.bool:
         r"""
         ``True`` when the slot's values are numbers.
@@ -4857,6 +4880,49 @@ class PushdownBinding:
         For ``term_kind == "enum_iri"``: stored value → IRI. A value absent
         from this map has no ``meaning`` in the schema and stays a literal,
         which is what the turtle writer does.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class PushdownComputed:
+    r"""
+    A string expression a statement computes over columns it reads: a tree of
+    ``function`` nodes whose leaves are ``"column"`` nodes.
+    
+    ``"column"`` is a leaf: ``column`` is an ordinary binding (a plain string
+    slot, or -- ``slot_path`` empty -- a star's subject IRI), rendered exactly
+    as any binding of that star would be. ``"STRAFTER"`` and ``"STRBEFORE"``
+    have one argument in ``args`` and the constant needle in ``text``. ``STR``
+    is erased: both leaf kinds are text already.
+    
+    Semantics, with ``x`` the argument and ``n`` the needle (spareval's):
+    ``STRAFTER`` is ``''`` when ``n`` does not occur in ``x`` and otherwise the
+    text after its first occurrence; ``STRBEFORE`` is ``''`` and the text
+    before it. An empty ``n`` occurs at the start. A ``NULL`` ``x`` (unbound)
+    gives ``NULL`` (unbound), never ``''``. Positions are code points. ``text``
+    is a constant of the query and must be bound as a parameter. An unknown
+    ``function`` must be refused, not guessed.
+    """
+    @property
+    def function(self) -> builtins.str:
+        r"""
+        ``"column"``, ``"STRAFTER"`` or ``"STRBEFORE"``.
+        """
+    @property
+    def args(self) -> builtins.list[PushdownComputed]:
+        r"""
+        The argument of a function (one entry); empty for a ``"column"``.
+        """
+    @property
+    def column(self) -> typing.Optional[PushdownBinding]:
+        r"""
+        For ``"column"``: the binding the leaf reads.
+        """
+    @property
+    def text(self) -> typing.Optional[builtins.str]:
+        r"""
+        For ``"STRAFTER"`` and ``"STRBEFORE"``: the needle, a simple string
+        constant containing no NUL.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -5127,7 +5193,9 @@ class RelationColumn:
         ``"constant"`` (a column of an inline table in the body, read by the
         body's ``binding``, whose ``relation`` is the table's alias),
         ``"measure"`` (an aggregate under its own name in the body's
-        grouping) or ``"structure"`` (an inlined element's occurrence
+        grouping), ``"derived"`` (a string the body computes -- its
+        projection carries a binding whose ``computed`` is set -- read by the
+        outside as the derived table's column of that name) or ``"structure"`` (an inlined element's occurrence
         identifier, composed in the body from ``binding``'s hops).
         """
     @property
